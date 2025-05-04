@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+
+# mypy ~/env/bin/borgadm
+# black ~/env/bin/borgadm
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import configparser
+import fcntl
+import io
+import itertools
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
+
+# -----------------------------------------------------------------------------
+# Constants and Globals
+# -----------------------------------------------------------------------------
+BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
+LOGFILE: Path = Path(f"/tmp/{BASENAME}.log")
+CONFIG: Path = Path(os.path.expanduser(f"~/.{BASENAME}"))
+
+_ssh_agent_pid: Optional[str] = None
+_borg_env_initialized: bool = False  # Ensures env is only initialized once
+_logger_buffer: io.StringIO
+CFG: Config
+
+logger = logging.getLogger()
+
+
+# -----------------------------------------------------------------------------
+# Configuration, optional
+# -----------------------------------------------------------------------------
+_BORG_PASSPHRASE_FILE: str = "~/.borg_passphrase"
+_BORG_SSHKEY_FILE: str = "~/.ssh/id_borg.net"
+_BORG_REMOTE_PATH: str = ""
+_BORG_CMD_TIMEOUT: int = 2 * 3600  # Timeout for borg commands: 2 hours
+_CMD_TIMEOUT: int = 60  # Timeout for non-borg commands: 1 minute
+
+_BACKUP_NAME: str = "home"
+_BACKUP_ROOT: str = "~"
+_BACKUP_MOUNTS: list[str] = []
+
+_CHECK_AGE_SECONDS: int = 24 * 3600  # Max backup age: 24 hours
+
+_PRUNE_KEEP_HOURLY: int = 24
+_PRUNE_KEEP_DAILY: int = 7
+_PRUNE_KEEP_WEEKLY: int = 4
+_PRUNE_KEEP_MONTHLY: int = 6
+
+
+# -----------------------------------------------------------------------------
+# Configuration, required
+# -----------------------------------------------------------------------------
+_BORG_REPO: str = ""
+
+# Format: { $set1_name: "create_options": ["opt1", ...], "paths": ["path1", ...] }
+_BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
+
+
+# -----------------------------------------------------------------------------
+# Classes
+# -----------------------------------------------------------------------------
+class Config:
+    def __init__(self, path: str, args: dict[str, Any]):
+        command = args["command"]
+        path = path
+        try:
+            with open(path) as f:
+                content = f.read()
+        except (FileNotFoundError, PermissionError, IsADirectoryError, OSError) as e:
+            logger.error(f"Failed to load config file {path}: {e}")
+            sys.exit(1)
+
+        config = configparser.ConfigParser()
+        config_data = io.StringIO("[default]\n" + content)
+        try:
+            config.read_file(config_data)
+        except configparser.ParsingError as e:
+            logger.error(f"Failed to parse config file {path}: {e}")
+            sys.exit(1)
+
+        self.BORG_PASSPHRASE_FILE: Path = Path(
+            os.path.expanduser(
+                config.get(
+                    "default", "BORG_PASSPHRASE_FILE", fallback=_BORG_PASSPHRASE_FILE
+                )
+            )
+        )
+        self.BORG_SSHKEY_FILE: Path = Path(
+            os.path.expanduser(
+                config.get("default", "BORG_SSHKEY_FILE", fallback=_BORG_SSHKEY_FILE)
+            )
+        )
+        self.BORG_REMOTE_PATH: str = config.get(
+            "default", "BORG_REMOTE_PATH", fallback=_BORG_REMOTE_PATH
+        )
+        self.BORG_CMD_TIMEOUT: int = config.getint(
+            "default", "BORG_CMD_TIMEOUT", fallback=_BORG_CMD_TIMEOUT
+        )
+        self.CMD_TIMEOUT: int = config.getint(
+            "default", "CMD_TIMEOUT", fallback=_CMD_TIMEOUT
+        )
+
+        self.BACKUP_NAME: str = config.get(
+            "default", "BACKUP_NAME", fallback=_BACKUP_NAME
+        )
+        self.BACKUP_ROOT: Path = Path(
+            os.path.expanduser(
+                config.get("default", "BACKUP_ROOT", fallback=_BACKUP_ROOT)
+            )
+        )
+
+        if command == "check-age" and (v := args.pop("seconds", None)) is not None:
+            self.CHECK_AGE_SECONDS: int = v
+        else:
+            self.CHECK_AGE_SECONDS = config.getint(
+                "default", "CHECK_AGE_SECONDS", fallback=_CHECK_AGE_SECONDS
+            )
+
+        if command == "prune" and (v := args.pop("keep_hourly", None)) is not None:
+            self.PRUNE_KEEP_HOURLY: int = v
+        else:
+            self.PRUNE_KEEP_HOURLY = config.getint(
+                "default", "PRUNE_KEEP_HOURLY", fallback=_PRUNE_KEEP_HOURLY
+            )
+        if command == "prune" and (v := args.pop("keep_daily", None)) is not None:
+            self.PRUNE_KEEP_DAILY: int = v
+        else:
+            self.PRUNE_KEEP_DAILY = config.getint(
+                "default", "PRUNE_KEEP_DAILY", fallback=_PRUNE_KEEP_DAILY
+            )
+        if command == "prune" and (v := args.pop("keep_weekly", None)) is not None:
+            self.PRUNE_KEEP_WEEKLY: int = v
+        else:
+            self.PRUNE_KEEP_WEEKLY = config.getint(
+                "default", "PRUNE_KEEP_WEEKLY", fallback=_PRUNE_KEEP_WEEKLY
+            )
+        if command == "prune" and (v := args.pop("keep_monthly", None)) is not None:
+            self.PRUNE_KEEP_MONTHLY: int = v
+        else:
+            self.PRUNE_KEEP_MONTHLY = config.getint(
+                "default", "PRUNE_KEEP_MONTHLY", fallback=_PRUNE_KEEP_MONTHLY
+            )
+
+        self.BORG_REPO: str = config.get("default", "BORG_REPO", fallback=_BORG_REPO)
+        self.BACKUP_MOUNTS: list[str] = json.loads(
+            config.get("default", "BACKUP_MOUNTS", fallback=json.dumps(_BACKUP_MOUNTS))
+        )
+        self.BACKUP_SETS: dict[str, dict[str, list[str]]] = json.loads(
+            config.get("default", "BACKUP_SETS", fallback=json.dumps(_BACKUP_SETS))
+        )
+
+        error = False
+        if not self.BORG_REPO:
+            logger.error(f"BORG_REPO not defined in config: {path}")
+            error = True
+        if not self.BACKUP_SETS:
+            logger.error(f"BACKUP_SETS not defined in config: {path}")
+            error = True
+        if error:
+            sys.exit(1)
+
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+def has_tty():
+    return sys.stdin.isatty() or sys.stdout.isatty() or sys.stderr.isatty()
+
+
+def osascript_notify() -> None:
+    if not has_tty() and shutil.which("osascript"):
+        logs = _logger_buffer.getvalue().strip().replace('"', '\\"')[:10000]
+        script = f'display dialog "{logs}" with title "borg_backup.py error"'
+        cmd = ["osascript", "-e", script]
+        cmd_str = shlex.join(cmd)
+        # No timeout is needed since we don't wait for the commmand to finish.
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+class InfoFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno == logging.INFO
+
+
+class WarnOrWorseFilter(logging.Filter):
+    def __init__(self, verbose):
+        self.verbose = verbose
+
+    def filter(self, record):
+        if self.verbose:
+            # skip INFO messages
+            return record.levelno != logging.INFO
+        return record.levelno >= logging.WARNING
+
+
+def log_exceptions(exc_type, exc_value, exc_traceback):
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    osascript_notify()
+
+
+def initialize_logger(logfile_path, verbose=False):
+    logger.setLevel(logging.DEBUG)  # Capture all logs for the file
+
+    # In memory logger for osx notifications
+    global _logger_buffer
+    _logger_buffer = io.StringIO()
+    memory_handler = logging.StreamHandler(_logger_buffer)
+    memory_formatter = logging.Formatter(
+        "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
+    )
+    memory_handler.setFormatter(memory_formatter)
+    logger.addHandler(memory_handler)
+
+    # File handler - all messages with full formatting
+    file_handler = logging.FileHandler(logfile_path)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # Stdout handler for INFO messages only, unformatted
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(InfoFilter())
+    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(stdout_handler)
+
+    # Stderr handler for WARNING and worse (or DEBUG+ if verbose), formatted
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    stderr_handler.addFilter(WarnOrWorseFilter(verbose))
+    stderr_formatter = logging.Formatter("%(levelname)s: %(message)s")
+    stderr_handler.setFormatter(stderr_formatter)
+    logger.addHandler(stderr_handler)
+
+    sys.excepthook = log_exceptions
+
+
+def find_borg_bin():
+    if not shutil.which("borg"):
+        path_search = ["/opt/local/bin"]
+        for i in path_search:
+            if os.path.exists(os.path.join(i, "borg")):
+                os.environ["PATH"] = os.environ.get("PATH", "") + f":{i}"
+                break
+    if not shutil.which("borg"):
+        logger.error(f"Can't find borg executable.")
+        sys.exit(1)
+
+
+def initialize_borg_environment() -> None:
+    global _borg_env_initialized
+    if _borg_env_initialized:
+        return
+
+    if CFG.BORG_REMOTE_PATH:
+        os.environ["BORG_REMOTE_PATH"] = CFG.BORG_REMOTE_PATH
+        logger.debug(f"BORG_REMOTE_PATH={CFG.BORG_REMOTE_PATH}")
+    os.environ["BORG_PASSPHRASE"] = load_passphrase()
+    start_ssh_agent()
+    _borg_env_initialized = True
+
+
+def check_permissions(path: Path, name: str) -> None:
+    try:
+        st = os.stat(path)
+        if (st.st_mode & (stat.S_IRWXG | stat.S_IRWXO)) != 0:
+            logger.error(f"Permissions on {name} ({path}) are too open.")
+            sys.exit(4)
+    except FileNotFoundError:
+        logger.error(f"{name} not found at: {path}")
+        sys.exit(4)
+
+
+def run_cmd(cmd: list[str], **kwargs):
+    timeout: int = _BORG_CMD_TIMEOUT if cmd[0] == "borg" else _CMD_TIMEOUT
+    if CFG:
+        timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] == "borg" else CFG.CMD_TIMEOUT
+    cmd_str = shlex.join(cmd)
+    logger.debug(f"Running command: {cmd_str}")
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        **kwargs,
+    )
+
+    if result.stderr:
+        logger.debug(f"stderr:\n{result.stderr.strip()}")
+
+    if result.returncode != 0:
+        logger.error(
+            f"Command `{cmd_str}` failed with exit code {result.returncode} and stderr:\n{result.stderr.strip()}"
+        )
+        # Raise same error as check=True would
+        raise subprocess.CalledProcessError(
+            returncode=result.returncode,
+            cmd=result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+
+    return result
+
+
+def start_ssh_agent() -> None:
+    global _ssh_agent_pid
+    logger.debug("Initializing SSH agent.")
+    check_permissions(CFG.BORG_SSHKEY_FILE, "SSH private key")
+    result = run_cmd(["ssh-agent", "-s"])
+    for line in result.stdout.splitlines():
+        line = line.split(";")[0].strip()
+        if line.startswith(("SSH_AUTH_SOCK=", "SSH_AGENT_PID=")):
+            key, value = line.split("=")
+            os.environ[key] = value
+            if key == "SSH_AGENT_PID":
+                _ssh_agent_pid = value
+    result = run_cmd(["ssh-add", "-q", CFG.BORG_SSHKEY_FILE.as_posix()])
+    atexit.register(stop_ssh_agent)
+
+
+def stop_ssh_agent() -> None:
+    global _ssh_agent_pid
+    if _ssh_agent_pid:
+        logger.debug("Stopping SSH agent.")
+        try:
+            run_cmd(["kill", _ssh_agent_pid])
+        except Exception as e:
+            logger.warning(f"Failed to kill SSH agent: {e}")
+        _ssh_agent_pid = None
+
+
+def load_passphrase() -> str:
+    check_permissions(CFG.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
+    with open(CFG.BORG_PASSPHRASE_FILE, "r") as f:
+        return f.read().strip()
+
+
+def create_backup(
+    archive_name: str, extra_args: list[str], dirs: list[str], dry_run: bool
+) -> None:
+    archive = f"{CFG.BORG_REPO}::{archive_name}"
+    logger.info(f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})")
+    cmd = ["borg", "create"]
+    if dry_run:
+        cmd.append("--dry-run")
+    else:
+        cmd += ["--stats"]
+    cmd += extra_args + [archive] + [os.path.expanduser(d) for d in dirs]
+    run_cmd(cmd, cwd=CFG.BACKUP_ROOT)
+    logger.info(f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})")
+
+
+def list_backups(
+    latest: bool = False, include_partial: bool = False, only_partial: bool = False
+) -> dict[str, list[str]]:
+    assert not (
+        include_partial and only_partial
+    ), "Conflicting options: cannot include and only show partials."
+
+    result = run_cmd(
+        [
+            "borg",
+            "list",
+            "--lock-wait",
+            str(CFG.BORG_CMD_TIMEOUT),
+            "--short",
+            CFG.BORG_REPO,
+        ]
+    )
+
+    timestamps_by_type: dict[str, set[str]] = {key: set() for key in CFG.BACKUP_SETS}
+    backup_set_names = "|".join(CFG.BACKUP_SETS)
+    ts_pattern = re.compile(
+        f"{CFG.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
+    )
+    for line in result.stdout.strip().splitlines():
+        match = ts_pattern.match(line.strip())
+        if match:
+            set_name, timestamp = match.groups()
+            if set_name in timestamps_by_type:
+                timestamps_by_type[set_name].add(timestamp)
+
+    all_ts: set[str] = set().union(*timestamps_by_type.values())
+    rv: dict[str, list[str]] = {}
+
+    for ts in sorted(all_ts, reverse=True):
+
+        def include():
+            rv[ts] = [
+                f"{CFG.BORG_REPO}::{CFG.BACKUP_NAME}-{set_name}-{ts}"
+                for set_name in CFG.BACKUP_SETS
+                if ts in timestamps_by_type[set_name]
+            ]
+
+        is_full = all(
+            ts in timestamps_by_type[set_name] for set_name in CFG.BACKUP_SETS
+        )
+        if only_partial:
+            if not is_full:
+                include()
+        elif include_partial or is_full:
+            include()
+        if rv and latest:
+            break
+
+    return rv
+
+
+def is_mountpoint(path: Path):
+    try:
+        output = subprocess.check_output(["mount"], text=True)
+        for line in output.splitlines():
+            if f" on {path} " in line:
+                return True
+    except subprocess.CalledProcessError:
+        pass
+    return False
+
+
+def backup_set_paths(set_name: Optional[str] = None) -> Tuple[set[Path], set[Path]]:
+    """
+    Return sets of directories and files from BACKUP_SETS paths.
+    Directories end in a "/", all other entries are considered files.
+    """
+    paths: set[str] = {
+        k
+        for i, j in CFG.BACKUP_SETS.items()
+        if set_name is None or i == set_name
+        for k in j["paths"]
+    }
+    dirs: set[Path] = {Path(i) for i in paths if i.endswith("/")}
+    files: set[Path] = {Path(i) for i in paths if not i.endswith("/")}
+    return (dirs, files)
+
+
+def delete_paths(root: Path, relative_paths: set[Path], dry_run: bool = True) -> None:
+    """
+    Delete paths under root. Does not follow symlinks.
+    """
+    logger.info(f"Deleting {len(relative_paths)} paths in: {root}")
+    for rel in sorted(relative_paths, key=lambda p: -len(p.parts)):  # deepest first
+        abs_path = root / rel
+        if abs_path.is_dir():
+            logger.debug(f"Deleting directory: {abs_path}")
+            if not dry_run:
+                shutil.rmtree(abs_path)
+        else:
+            logger.debug(f"Deleting: {abs_path}")
+            if not dry_run:
+                abs_path.unlink()
+
+
+def timestamps_to_prune(timestamps: set[str]) -> set[str]:
+    retained: set[str] = set()
+    seen: set[str] = set()
+
+    def keep_by_interval(max_count: int, min_spacing: timedelta):
+        nonlocal retained, seen
+        last: Optional[datetime] = None
+
+        count = 0
+        for ts in sorted(timestamps, reverse=True):
+            if ts in seen:
+                continue
+            if count >= max_count:
+                break
+            dt: datetime = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+            if last is None or (last - dt) >= min_spacing:
+                retained.add(ts)
+                seen.add(ts)
+                last = dt
+                count += 1
+
+    keep_by_interval(CFG.PRUNE_KEEP_HOURLY, timedelta(hours=1))
+    keep_by_interval(CFG.PRUNE_KEEP_DAILY, timedelta(days=1))
+    keep_by_interval(CFG.PRUNE_KEEP_WEEKLY, timedelta(weeks=1))
+    keep_by_interval(CFG.PRUNE_KEEP_MONTHLY, timedelta(days=30))
+
+    prune_ts = set(timestamps) - retained
+    return prune_ts
+
+
+# -----------------------------------------------------------------------------
+# Subcommands
+# -----------------------------------------------------------------------------
+def do_break_lock() -> None:
+    logger.info(f"Breaking repo lock: {CFG.BORG_REPO}")
+    run_cmd(
+        [
+            "borg",
+            "break-lock",
+            CFG.BORG_REPO,
+        ]
+    )
+
+
+def do_check_age() -> None:
+    seconds = CFG.CHECK_AGE_SECONDS
+    backups = list_backups(latest=True)
+    if not backups:
+        logger.error("No full backups found.")
+        sys.exit(2)
+    assert len(backups.keys()) == 1, backups
+    latest = list(backups.keys())[0]
+
+    ts = datetime.strptime(latest, "%Y%m%d_%H%M%S")
+    age = int((datetime.now() - ts).total_seconds())
+    if age > seconds:
+        logger.error(
+            f"Latest full backup ({latest}) is too old: {age} seconds; limit is: {seconds} seconds"
+        )
+        sys.exit(3)
+
+    logger.info(
+        f"Latest full backup ({latest}) age is: {age} seconds; limit is: {seconds} seconds"
+    )
+
+
+def do_check_archives() -> None:
+    backups = list_backups(latest=True)
+    if not backups:
+        logger.error("No full backups found.")
+        sys.exit(1)
+    assert len(backups.keys()) == 1
+    archives = list(backups.values())[0]
+    for archive in archives:
+        logger.info(f"Checking archive metadata: {archive}")
+        run_cmd(["borg", "check", archive])
+
+
+def do_check_repo() -> None:
+    logger.info(f"Checking repo metadata.")
+    run_cmd(["borg", "check", CFG.BORG_REPO])
+
+
+def do_compact() -> None:
+    logger.info(f"Compacting repo: {CFG.BORG_REPO}")
+    run_cmd(
+        [
+            "borg",
+            "compact",
+            CFG.BORG_REPO,
+        ]
+    )
+
+
+def do_create(dry_run: bool, noprune: bool) -> None:
+    def backup_set_tests(set_name: str) -> None:
+        error: bool = False
+        dirs, files = backup_set_paths(set_name)
+        for d in dirs:
+            full_path = CFG.BACKUP_ROOT / d
+            if not os.path.isdir(full_path):
+                logger.error(f"Missing backup dir (set: '{set_name}'): {full_path}")
+                error = True
+            elif not os.listdir(full_path):
+                logger.error(f"Empty backup dir (set: '{set_name}'): {full_path}")
+                error = True
+        for f in files:
+            full_path = CFG.BACKUP_ROOT / f
+            if os.path.isdir(full_path):
+                logger.error(
+                    f"Missing trailing slash for backup directory in config (set: '{set_name}'): {full_path}"
+                )
+                error = True
+            if not os.path.exists(full_path):
+                logger.error(f"Missing backup path (set: '{set_name}'): {full_path}")
+                error = True
+        if error:
+            sys.exit(1)
+
+    # Run all tests before backups to fail-fast in case of errors
+    for set_name in CFG.BACKUP_SETS:
+        backup_set_tests(set_name)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for set_name, cfg in CFG.BACKUP_SETS.items():
+        # Backups can take a while, so re-run tests before each backup
+        backup_set_tests(set_name)
+        for path in CFG.BACKUP_MOUNTS:
+            full_path = CFG.BACKUP_ROOT / path
+            if not is_mountpoint(full_path):
+                logger.error(f"Missing backup mount: {full_path}")
+                sys.exit(1)
+        create_options = cfg.get("create_options", [])
+        paths = cfg["paths"]
+        create_backup(
+            f"{CFG.BACKUP_NAME}-{set_name}-{timestamp}", create_options, paths, dry_run
+        )
+
+    if not noprune:
+        do_prune(dry_run=dry_run)
+
+
+def do_extract(
+    target_dir: Path, patterns: list[str], dry_run: bool, delete: bool
+) -> None:
+    backups = list_backups(latest=True)
+    if not backups:
+        logger.error("No full backups found.")
+        sys.exit(1)
+    assert len(backups.keys()) == 1
+    archives = list(backups.values())[0]
+
+    target_dir = target_dir.resolve()
+    if not os.path.isdir(target_dir):
+        logger.error(f"Invalid extraction dirctory: {target_dir}")
+        sys.exit(1)
+
+    logger.info(f"Extract target dirctory: {target_dir}")
+
+    cleanup_paths: set[Path] = set()
+    if delete:
+        archive_paths: set[Path] = set()
+        for archive in archives:
+            logger.info(f"Getting archive contents: {archive}")
+            cmd = ["borg", "list", "--format", "{path}{NL}"]
+            for pattern in patterns:
+                cmd += ["--pattern", pattern]
+            cmd.append(archive)
+            for i in run_cmd(cmd).stdout.splitlines():
+                archive_paths.add(Path(i))
+
+        logger.info(f"Getting target-path contents: {target_dir}")
+        local_paths: set[Path] = set()
+        for walk_root, walk_dirs, walk_files in os.walk(target_dir):
+            root_path = Path(walk_root)
+            for name in walk_files + walk_dirs:
+                full_path = root_path / name
+                rel_path = full_path.relative_to(target_dir)
+                local_paths.add(rel_path)
+
+        logger.info(
+            "Filtering local contents against backup paths and archive contents"
+        )
+        bs_dirs, bs_files = backup_set_paths()
+
+        def backup_set_filter(path: Path, set_name: Optional[str] = None) -> bool:
+            if path in bs_files:
+                return True
+            for d in bs_dirs:
+                if path.is_relative_to(d):
+                    return True
+            return False
+
+        local_paths = set(filter(backup_set_filter, local_paths))
+        extras = sorted(
+            local_paths - archive_paths, key=lambda x: len(x.parts)
+        )  # shallowest first
+        for path in extras:
+            if not any(path.relative_to(p) for p in cleanup_paths):
+                cleanup_paths.add(path)
+
+        logger.info(
+            f"Found {len(cleanup_paths)} paths to delete after archive extraction."
+        )
+
+    lockfile = target_dir / f".{BASENAME}_extract.lock"
+    with open(lockfile, "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error("Another extract process is already running for this path.")
+            sys.exit(1)
+
+        for archive in archives:
+            logger.info(f"Extracting: {archive} to {target_dir}")
+
+            cmd = ["borg", "extract"]
+            if dry_run:
+                cmd.append("--dry-run")
+            for pattern in patterns:
+                cmd += ["--pattern", pattern]
+            cmd.append(archive)
+            run_cmd(cmd, cwd=target_dir)
+
+    if cleanup_paths:
+        delete_paths(target_dir, cleanup_paths, dry_run=dry_run)
+
+
+def do_list(
+    latest: bool, full_names: bool, include_partial: bool, only_partial: bool
+) -> None:
+    backups = list_backups(
+        latest=latest, include_partial=include_partial, only_partial=only_partial
+    )
+    for ts, archives in backups.items():
+        if full_names:
+            for archive in archives:
+                logger.info(archive)
+        else:
+            logger.info(ts)
+
+
+def do_prune(dry_run: bool) -> None:
+    partial_archives = [
+        a.removeprefix(f"{CFG.BORG_REPO}::")
+        for archives in list_backups(only_partial=True).values()
+        for a in archives
+    ]
+    if partial_archives:
+        logger.info(f"Pruning partial archives: {partial_archives}")
+        cmd = ["borg", "delete"]
+        if dry_run:
+            cmd.append("--dry-run")
+        else:
+            cmd.append("--stats")
+        cmd.append(CFG.BORG_REPO)
+        cmd += partial_archives
+        run_cmd(cmd)
+
+    archives = list_backups()
+    prune_ts = timestamps_to_prune(set(archives.keys()))
+    retain_count = len(archives) - len(prune_ts)
+    prune_archives = [
+        a.removeprefix(f"{CFG.BORG_REPO}::") for ts in prune_ts for a in archives[ts]
+    ]
+    logger.info(f"Pruning {len(prune_ts)} backups, retaining {retain_count}.")
+    if prune_archives:
+        logger.info(f"Pruning archives: {prune_archives}")
+        cmd = ["borg", "delete"]
+        if dry_run:
+            cmd.append("--dry-run")
+        else:
+            cmd.append("--stats")
+        cmd.append(CFG.BORG_REPO)
+        cmd += prune_archives
+        run_cmd(cmd)
+
+    logger.info(f"Compacting {CFG.BORG_REPO}")
+    run_cmd(
+        [
+            "borg",
+            "compact",
+            CFG.BORG_REPO,
+        ]
+    )
+
+
+def do_setup_commands() -> None:
+    logger.info(f"ssh-add -q {CFG.BORG_SSHKEY_FILE}")
+    logger.info(f"export BORG_PASSPHRASE=$(cat {CFG.BORG_PASSPHRASE_FILE})")
+    logger.info(f"export BORG_REPO={CFG.BORG_REPO}")
+    if CFG.BORG_REMOTE_PATH:
+        logger.info(f"export BORG_REMOTE_PATH={CFG.BORG_REMOTE_PATH}")
+
+
+# -----------------------------------------------------------------------------
+# Argument Parsing
+# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Borg backup manager",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Always set formatter_class so that we display default values.
+    def add_parser(name: str, **kwargs) -> argparse.ArgumentParser:
+        kwargs["formatter_class"] = argparse.ArgumentDefaultsHelpFormatter
+        return subparsers.add_parser(name, **kwargs)
+
+    add_parser("break-lock", help="Break repo lock")
+
+    check_age = add_parser("check-age", help="Check full backup age")
+    check_age.add_argument("seconds", type=int, nargs="?")
+
+    add_parser("check-repo", help="Check repo metadata")
+    add_parser("check-archives", help="Check archive metadata")
+
+    add_parser("compact", help="Check full backup metadata")
+
+    create = add_parser("create", help="Create full backup")
+    create.add_argument("--dry-run", action="store_true")
+    create.add_argument("--noprune", action="store_true")
+
+    extract = add_parser("extract", help="Extract latest full backup")
+    extract.add_argument("--dry-run", action="store_true")
+    extract.add_argument("--delete", action="store_true")
+    extract.add_argument("target_dir", type=Path)
+    extract.add_argument("patterns", nargs="*")
+
+    list_cmd = add_parser("list", help="List backups")
+    list_cmd.add_argument("--latest", action="store_true")
+    list_cmd.add_argument("--full-names", action="store_true")
+    group = list_cmd.add_mutually_exclusive_group()
+    group.add_argument("--include-partial", action="store_true")
+    group.add_argument("--only-partial", action="store_true")
+
+    prune = add_parser("prune", help="Prune partial and old backups")
+    prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--keep-hourly", type=int)
+    prune.add_argument("--keep-daily", type=int)
+    prune.add_argument("--keep-weekly", type=int)
+    prune.add_argument("--keep-monthly", type=int)
+
+    add_parser("setup-commands", help="Display commands to run borg cli")
+
+    for subparser in subparsers.choices.values():
+        subparser.add_argument(
+            "--config", type=str, default=CONFIG, help="borgadm config file"
+        )
+        subparser.add_argument(
+            "--verbose", action="store_true", help="Enable verbose output"
+        )
+
+    return parser.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main() -> None:
+    args = parse_args()
+    args_dict = vars(args).copy()
+    initialize_logger(LOGFILE, verbose=args_dict.pop("verbose"))
+
+    invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
+    logger.debug(f"Invocation: {invocation}")
+
+    global CFG
+    CFG = Config(args_dict.pop("config"), args_dict)
+
+    initialize_borg_environment()
+    find_borg_bin()
+
+    command = args_dict.pop("command")
+    if command not in ["break-lock", "check", "compact", "setup-commands"]:
+        logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
+
+    command_callbacks: dict[str, Callable[..., Any]] = {
+        "break-lock": do_break_lock,
+        "check-age": do_check_age,
+        "check-archives": do_check_archives,
+        "check-repo": do_check_repo,
+        "compact": do_compact,
+        "create": do_create,
+        "extract": do_extract,
+        "list": do_list,
+        "prune": do_prune,
+        "setup-commands": do_setup_commands,
+    }
+    try:
+        command_callbacks[command](**args_dict)
+    except SystemExit as e:
+        if e.code != 0:
+            osascript_notify()
+        raise
+
+
+if __name__ == "__main__":
+    main()
