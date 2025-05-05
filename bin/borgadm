@@ -14,6 +14,7 @@ import itertools
 import json
 import logging
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -21,6 +22,8 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import typing
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +39,7 @@ CONFIG: Path = Path(os.path.expanduser(f"~/.{BASENAME}"))
 _ssh_agent_pid: Optional[str] = None
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _logger_buffer: io.StringIO
+_hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
 CFG: Config
 
 logger = logging.getLogger()
@@ -66,6 +70,7 @@ _PRUNE_KEEP_MONTHLY: int = 6
 # Configuration, required
 # -----------------------------------------------------------------------------
 _BORG_REPO: str = ""
+_BORG_REPO_HOSTKEY: str = ""
 
 # Format: { $set1_name: "create_options": ["opt1", ...], "paths": ["path1", ...] }
 _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
@@ -157,6 +162,9 @@ class Config:
             )
 
         self.BORG_REPO: str = config.get("default", "BORG_REPO", fallback=_BORG_REPO)
+        self.BORG_REPO_HOSTKEY: str = config.get(
+            "default", "BORG_REPO_HOSTKEY", fallback=_BORG_REPO_HOSTKEY
+        )
         self.BACKUP_MOUNTS: list[str] = json.loads(
             config.get("default", "BACKUP_MOUNTS", fallback=json.dumps(_BACKUP_MOUNTS))
         )
@@ -271,14 +279,20 @@ def find_borg_bin():
 
 
 def initialize_borg_environment() -> None:
-    global _borg_env_initialized
+    global _borg_env_initialized, _hostkey_file
     if _borg_env_initialized:
         return
 
     if CFG.BORG_REMOTE_PATH:
         os.environ["BORG_REMOTE_PATH"] = CFG.BORG_REMOTE_PATH
-        logger.debug(f"BORG_REMOTE_PATH={CFG.BORG_REMOTE_PATH}")
+        logger.debug(f"BORG_REMOTE_PATH={os.environ['BORG_REMOTE_PATH']}")
     os.environ["BORG_PASSPHRASE"] = load_passphrase()
+    _hostkey_file.write(CFG.BORG_REPO_HOSTKEY)
+    _hostkey_file.flush()
+    os.environ["BORG_RSH"] = (
+        f"ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile={_hostkey_file.name}"
+    )
+    logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
     start_ssh_agent()
     _borg_env_initialized = True
 
@@ -294,10 +308,12 @@ def check_permissions(path: Path, name: str) -> None:
         sys.exit(4)
 
 
-def run_cmd(cmd: list[str], **kwargs):
+def run_cmd(cmd: list[str], sudo: bool = False, errok: bool = False, **kwargs):
     timeout: int = _BORG_CMD_TIMEOUT if cmd[0] == "borg" else _CMD_TIMEOUT
     if CFG:
         timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] == "borg" else CFG.CMD_TIMEOUT
+    if sudo:
+        cmd = ["sudo", "-n", "-E"] + cmd
     cmd_str = shlex.join(cmd)
     logger.debug(f"Running command: {cmd_str}")
     result = subprocess.run(
@@ -317,12 +333,13 @@ def run_cmd(cmd: list[str], **kwargs):
             f"Command `{cmd_str}` failed with exit code {result.returncode} and stderr:\n{result.stderr.strip()}"
         )
         # Raise same error as check=True would
-        raise subprocess.CalledProcessError(
-            returncode=result.returncode,
-            cmd=result.args,
-            output=result.stdout,
-            stderr=result.stderr,
-        )
+        if not errok:
+            raise subprocess.CalledProcessError(
+                returncode=result.returncode,
+                cmd=result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
 
     return result
 
@@ -440,6 +457,23 @@ def is_mountpoint(path: Path):
     except subprocess.CalledProcessError:
         pass
     return False
+
+
+def check_sudo():
+    try:
+        subprocess.run(
+            ["sudo", "-n", "-E", "true"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=CFG.CMD_TIMEOUT,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+    except FileNotFoundError:
+        # sudo not installed
+        return False
 
 
 def backup_set_paths(set_name: Optional[str] = None) -> Tuple[set[Path], set[Path]]:
@@ -680,7 +714,7 @@ def do_extract(
             f"Found {len(cleanup_paths)} paths to delete after archive extraction."
         )
 
-    lockfile = target_dir / f".{BASENAME}_extract.lock"
+    lockfile = target_dir / f".{BASENAME}_target_dir.lock"
     with open(lockfile, "w") as lf:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -762,6 +796,107 @@ def do_prune(dry_run: bool) -> None:
     )
 
 
+def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
+    if platform.system() != "Linux":
+        logger.error("Rsync subcommand is only supported on linux")
+        sys.exit(1)
+
+    if not check_sudo():
+        logger.error(
+            "Rsync subcommand requires non-interractive sudo support with the ability to set environment variables."
+        )
+        sys.exit(1)
+
+    backups = list_backups(latest=True)
+    if not backups:
+        logger.error("No full backups found.")
+        sys.exit(1)
+    assert len(backups.keys()) == 1
+    archives = list(backups.values())[0]
+
+    target_dir = target_dir.resolve()
+    if not os.path.isdir(target_dir):
+        logger.error(f"Invalid extraction dirctory: {target_dir}")
+        sys.exit(1)
+
+    logger.info(f"Rsync target dirctory: {target_dir}")
+    lockfile = target_dir / f".{BASENAME}_target_dir.lock"
+    with open(lockfile, "w") as lf, tempfile.TemporaryDirectory(
+        dir=str(Path.home()), prefix=f".{BASENAME}_rsync_"
+    ) as tdir:
+        tmpdir = Path(tdir)
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error("Another extract process is already running for this path.")
+            sys.exit(1)
+
+        cleanup_mounts: list[Path] = []
+        cleanup_dirs: list[Path] = []
+        try:
+            archive_mounts: list[Path] = []
+            for archive in archives:
+                archive_name = archive.split("::", 1)[1]
+                mount_dir = tmpdir / archive_name
+
+                os.makedirs(mount_dir)
+                cmd = [
+                    "borg",
+                    "mount",
+                    "-o",
+                    "allow_other",
+                    "--bypass-lock",
+                    archive,
+                    mount_dir.as_posix(),
+                ]
+                logger.info(f"Mounting {archive} to: {mount_dir}")
+                run_cmd(cmd, sudo=True)
+                cleanup_mounts.append(mount_dir)
+                archive_mounts.append(mount_dir)
+
+            lowerdir = ":".join([i.as_posix() for i in archive_mounts])
+            upperdir = tmpdir / "upperdir"
+            workdir = tmpdir / "workdir"
+            merged = tmpdir / "merged"
+            os.makedirs(upperdir)
+            os.makedirs(workdir)
+            os.makedirs(merged)
+            cmd = [
+                "mount",
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                f"lowerdir={lowerdir},upperdir={upperdir},workdir={workdir}",
+                merged.as_posix(),
+            ]
+            logger.info(f"Merging archives with overlayfs: {merged}")
+            run_cmd(cmd, sudo=True)
+            cleanup_mounts.append(merged)
+            cleanup_dirs.append(workdir)
+
+            logger.info(f"Starting rsync to: {target_dir}")
+            cmd = [
+                "rsync",
+                "-a",
+                "--stats",
+                "--human-readable",
+            ]
+            if delete:
+                cmd.append("--delete")
+            if dry_run:
+                cmd.append("--dry-run")
+            cmd += [merged.as_posix() + "/", target_dir.as_posix() + "/"]
+            run_cmd(cmd)
+            logger.info(f"Finished rsync to: {target_dir}")
+        finally:
+            # Cleanup root owned resources
+            for m in cleanup_mounts:
+                run_cmd(["umount", "-f", m.as_posix()], sudo=True, errok=True)
+            for d in cleanup_dirs:
+                run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
+
+
 def do_setup_commands() -> None:
     logger.info(f"ssh-add -q {CFG.BORG_SSHKEY_FILE}")
     logger.info(f"export BORG_PASSPHRASE=$(cat {CFG.BORG_PASSPHRASE_FILE})")
@@ -819,6 +954,11 @@ def parse_args() -> argparse.Namespace:
     prune.add_argument("--keep-weekly", type=int)
     prune.add_argument("--keep-monthly", type=int)
 
+    rsync = add_parser("rsync", help="Rsync latest archive")
+    rsync.add_argument("--dry-run", action="store_true")
+    rsync.add_argument("--delete", action="store_true")
+    rsync.add_argument("target_dir", type=Path)
+
     add_parser("setup-commands", help="Display commands to run borg cli")
 
     for subparser in subparsers.choices.values():
@@ -863,6 +1003,7 @@ def main() -> None:
         "extract": do_extract,
         "list": do_list,
         "prune": do_prune,
+        "rsync": do_rsync,
         "setup-commands": do_setup_commands,
     }
     try:
