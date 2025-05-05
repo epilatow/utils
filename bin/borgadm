@@ -872,6 +872,10 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
                 cleanup_mounts.append(mount_dir)
                 archive_mounts.append(mount_dir)
 
+                if not os.listdir(mount_dir):
+                    logger.error(f"Empty archive mount: {archive}")
+                    sys.exit(1)
+
             lowerdir = ":".join([i.as_posix() for i in archive_mounts])
             upperdir = tmpdir / "upperdir"
             workdir = tmpdir / "workdir"
@@ -892,6 +896,9 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
             run_cmd(cmd, sudo=True)
             cleanup_mounts.append(merged)
             cleanup_dirs.append(workdir)
+            if not os.listdir(merged):
+                logger.error(f"Empty overlayfs mount: {merged}")
+                sys.exit(1)
 
             logger.info(f"Starting rsync to: {target_dir}")
             cmd = [
