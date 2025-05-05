@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
-# mypy ~/env/bin/borgadm
-# black ~/env/bin/borgadm
+# Running mypy and black:
+#     python3 -m venv /tmp/env
+#     . /tmp/env/bin/activate
+#     pip install mypy black
+#     mypy ~/env/bin/borgadm
+#     black ~/env/bin/borgadm
 
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import typing
 
 from datetime import datetime, timedelta
@@ -40,6 +45,8 @@ _ssh_agent_pid: Optional[str] = None
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _logger_buffer: io.StringIO
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
+_start_time: float = time.perf_counter()
+
 CFG: Config
 
 logger = logging.getLogger()
@@ -80,7 +87,7 @@ _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 # Classes
 # -----------------------------------------------------------------------------
 class Config:
-    def __init__(self, path: str, args: dict[str, Any]):
+    def __init__(self, path: str, args: dict[str, Any]) -> None:
         command = args["command"]
         path = path
         try:
@@ -186,7 +193,7 @@ class Config:
 # -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
-def has_tty():
+def has_tty() -> bool:
     return sys.stdin.isatty() or sys.stdout.isatty() or sys.stderr.isatty()
 
 
@@ -206,27 +213,27 @@ def osascript_notify() -> None:
 
 
 class InfoFilter(logging.Filter):
-    def filter(self, record):
+    def filter(self, record) -> bool:
         return record.levelno == logging.INFO
 
 
 class WarnOrWorseFilter(logging.Filter):
-    def __init__(self, verbose):
+    def __init__(self, verbose) -> None:
         self.verbose = verbose
 
-    def filter(self, record):
+    def filter(self, record) -> bool:
         if self.verbose:
             # skip INFO messages
             return record.levelno != logging.INFO
         return record.levelno >= logging.WARNING
 
 
-def log_exceptions(exc_type, exc_value, exc_traceback):
+def log_exceptions(exc_type, exc_value, exc_traceback) -> None:
     logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
     osascript_notify()
 
 
-def initialize_logger(logfile_path, verbose=False):
+def initialize_logger(logfile_path, verbose=False) -> None:
     logger.setLevel(logging.DEBUG)  # Capture all logs for the file
 
     # In memory logger for osx notifications
@@ -266,7 +273,7 @@ def initialize_logger(logfile_path, verbose=False):
     sys.excepthook = log_exceptions
 
 
-def find_borg_bin():
+def find_borg_bin() -> None:
     if not shutil.which("borg"):
         path_search = ["/opt/local/bin"]
         for i in path_search:
@@ -308,10 +315,13 @@ def check_permissions(path: Path, name: str) -> None:
         sys.exit(4)
 
 
-def run_cmd(cmd: list[str], sudo: bool = False, errok: bool = False, **kwargs):
-    timeout: int = _BORG_CMD_TIMEOUT if cmd[0] == "borg" else _CMD_TIMEOUT
+def run_cmd(
+    cmd: list[str], sudo: bool = False, errok: bool = False, **kwargs
+) -> subprocess.CompletedProcess[Any]:
+    slow_cmds = ["borg", "rsync"]
+    timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
     if CFG:
-        timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] == "borg" else CFG.CMD_TIMEOUT
+        timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else CFG.CMD_TIMEOUT
     if sudo:
         cmd = ["sudo", "-n", "-E"] + cmd
     cmd_str = shlex.join(cmd)
@@ -403,6 +413,7 @@ def list_backups(
         [
             "borg",
             "list",
+            "--bypass-lock",
             "--lock-wait",
             str(CFG.BORG_CMD_TIMEOUT),
             "--short",
@@ -427,7 +438,7 @@ def list_backups(
 
     for ts in sorted(all_ts, reverse=True):
 
-        def include():
+        def include() -> None:
             rv[ts] = [
                 f"{CFG.BORG_REPO}::{CFG.BACKUP_NAME}-{set_name}-{ts}"
                 for set_name in CFG.BACKUP_SETS
@@ -448,7 +459,7 @@ def list_backups(
     return rv
 
 
-def is_mountpoint(path: Path):
+def is_mountpoint(path: Path) -> bool:
     try:
         output = subprocess.check_output(["mount"], text=True)
         for line in output.splitlines():
@@ -459,7 +470,7 @@ def is_mountpoint(path: Path):
     return False
 
 
-def check_sudo():
+def check_sudo() -> bool:
     try:
         subprocess.run(
             ["sudo", "-n", "-E", "true"],
@@ -513,7 +524,7 @@ def timestamps_to_prune(timestamps: set[str]) -> set[str]:
     retained: set[str] = set()
     seen: set[str] = set()
 
-    def keep_by_interval(max_count: int, min_spacing: timedelta):
+    def keep_by_interval(max_count: int, min_spacing: timedelta) -> None:
         nonlocal retained, seen
         last: Optional[datetime] = None
 
@@ -537,6 +548,13 @@ def timestamps_to_prune(timestamps: set[str]) -> set[str]:
 
     prune_ts = set(timestamps) - retained
     return prune_ts
+
+
+def report_runtime() -> None:
+    global _start_time
+    elapsed_time = time.perf_counter() - _start_time
+    elapsed_time_str = str(timedelta(seconds=int(elapsed_time)))
+    logger.debug(f"Execution time (hh:mm:ss): {elapsed_time_str}")
 
 
 # -----------------------------------------------------------------------------
@@ -982,6 +1000,7 @@ def main() -> None:
 
     invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
     logger.debug(f"Invocation: {invocation}")
+    atexit.register(report_runtime)
 
     global CFG
     CFG = Config(args_dict.pop("config"), args_dict)
