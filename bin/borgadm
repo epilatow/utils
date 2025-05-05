@@ -830,6 +830,7 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
         logger.error("No full backups found.")
         sys.exit(1)
     assert len(backups.keys()) == 1
+    ts = list(backups.keys())[0]
     archives = list(backups.values())[0]
 
     target_dir = target_dir.resolve()
@@ -839,8 +840,10 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
 
     logger.info(f"Rsync target dirctory: {target_dir}")
     lockfile = target_dir / f".{BASENAME}_target_dir.lock"
+    tmpdir_prefix = f".{BASENAME}_rsync_{ts}_"
     with open(lockfile, "w") as lf, tempfile.TemporaryDirectory(
-        dir=str(Path.home()), prefix=f".{BASENAME}_rsync_"
+        dir=str(Path.home()),
+        prefix=tmpdir_prefix,
     ) as tdir:
         tmpdir = Path(tdir)
         try:
