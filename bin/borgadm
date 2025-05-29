@@ -812,7 +812,7 @@ def do_compact() -> None:
     )
 
 
-def do_create(dry_run: bool, noprune: bool) -> None:
+def do_create(dry_run: bool, no_prune: bool) -> None:
     def backup_set_tests(set_name: str) -> None:
         error: bool = False
         dirs, files = backup_set_paths(set_name)
@@ -856,7 +856,7 @@ def do_create(dry_run: bool, noprune: bool) -> None:
             f"{CFG.BACKUP_NAME}-{set_name}-{timestamp}", create_options, paths, dry_run
         )
 
-    if not noprune:
+    if not no_prune:
         do_prune(dry_run=dry_run)
 
 
@@ -1231,7 +1231,7 @@ def args_parser() -> argparse.ArgumentParser:
     add_parser("compact", help="Check full backup metadata")
 
     create = add_parser("create", help="Create full backup")
-    create.add_argument("--noprune", action="store_true", help="Skip backup pruning")
+    create.add_argument("--no-prune", action="store_true", help="Skip backup pruning")
     add_dry_run(create)
     add_prune_args(create)
 
