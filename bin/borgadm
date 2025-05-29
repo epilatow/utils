@@ -41,6 +41,8 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, OrderedDict, Tuple
+from xml.dom import minidom
+from xml.etree import ElementTree
 
 # -----------------------------------------------------------------------------
 # Constants and Globals
@@ -67,7 +69,7 @@ logger = logging.getLogger()
 _BORG_PASSPHRASE_FILE: str = "~/.borg_passphrase"
 _BORG_SSHKEY_FILE: str = "~/.ssh/id_borg.net"
 _BORG_REMOTE_PATH: str = ""
-_BORG_CMD_TIMEOUT: int = 2 * 3600  # Timeout for borg commands: 2 hours
+_BORG_CMD_TIMEOUT: int = 4 * 3600  # Timeout for borg commands: 4 hours
 _CMD_TIMEOUT: int = 60  # Timeout for non-borg commands: 1 minute
 
 _BACKUP_NAME: str = "home"
@@ -261,7 +263,6 @@ def osascript_notify() -> None:
         logs = _logger_buffer.getvalue().strip().replace('"', '\\"')[:10000]
         script = f'display dialog "{logs}" with title "borg_backup.py error"'
         cmd = ["osascript", "-e", script]
-        cmd_str = shlex.join(cmd)
         # No timeout is needed since we don't wait for the commmand to finish.
         subprocess.Popen(
             cmd,
@@ -299,6 +300,8 @@ def initialize_logger(logfile_path, verbose=False) -> None:
     global _logger_buffer
     _logger_buffer = io.StringIO()
     memory_handler = logging.StreamHandler(_logger_buffer)
+    memory_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    memory_handler.addFilter(WarnOrWorseFilter(verbose))
     memory_formatter = logging.Formatter(
         "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
     )
@@ -632,9 +635,116 @@ def report_runtime() -> None:
     logger.debug(f"Execution time (hh:mm:ss): {elapsed_time_str}")
 
 
+def create_plist_element(
+    task: str, args: list[str], interval: int
+) -> ElementTree.Element:
+
+    plist = ElementTree.Element("plist", version="1.0")
+    dict_elem = ElementTree.SubElement(plist, "dict")
+
+    def add_kv(key, value):
+        ElementTree.SubElement(dict_elem, "key").text = key
+        ElementTree.SubElement(dict_elem, "string").text = value
+
+    def add_bool(key, val: bool):
+        ElementTree.SubElement(dict_elem, "key").text = key
+        ElementTree.SubElement(dict_elem, "true" if val else "false")
+
+    def add_int(key, val: int):
+        ElementTree.SubElement(dict_elem, "key").text = key
+        ElementTree.SubElement(dict_elem, "integer").text = str(val)
+
+    add_kv("Label", f"com.example.borgadm.{task}")
+
+    # ProgramArguments
+    ElementTree.SubElement(dict_elem, "key").text = "ProgramArguments"
+    arr = ElementTree.SubElement(dict_elem, "array")
+    for part in args:
+        ElementTree.SubElement(arr, "string").text = part
+
+    # Log paths
+    log_path = f"/tmp/borgadm.{task}.launchd.log"
+    add_kv("StandardOutPath", log_path)
+    add_kv("StandardErrorPath", log_path)
+
+    add_int("StartInterval", interval)
+    add_kv("ProcessType", "Interactive")
+    add_bool("LowPriorityIO", False)
+    add_int("Nice", -5)
+
+    return plist
+
+
+def create_plist_file(element: ElementTree.Element, path: Path) -> None:
+    rough_string = ElementTree.tostring(element, encoding="utf-8")
+    reparsed = minidom.parseString(rough_string)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n')
+        f.write(' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n')
+        f.write(reparsed.toprettyxml(indent="    "))
+
+
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
+def do_automated_execution(enable: bool) -> None:
+    if platform.system() != "Darwin":
+        logger.error("automated-execution subcommand is only supported on osx")
+        sys.exit(1)
+
+    if not shutil.which("plutil"):
+        logger.error("plutil not found in PATH")
+        sys.exit(1)
+
+    if not shutil.which("launchctl"):
+        logger.error("launchctl not found in PATH")
+        sys.exit(1)
+
+    common_args: list[str] = ["/opt/local/bin/python3", os.path.abspath(__file__)]
+    tasks: dict[str, dict[str, Any]] = {
+        "create": {"args": ["create"], "interval": (60 * 60)},
+        "check_age": {
+            "args": ["check-age", "--enable-notifications"],
+            "interval": (60 * 60 * 4),
+        },
+        "check_all": {
+            "args": ["check-all", "--enable-notifications"],
+            "interval": (60 * 60 * 24 * 7),
+        },
+    }
+    home: Path = Path(os.environ["HOME"])
+    task2path: dict[str, Path] = {
+        task: home / "Library" / "LaunchAgents" / f"com.example.borgadm.{task}.plist"
+        for task in tasks
+    }
+    cmd: list[str] = []
+
+    # Always remove any existing configs
+    for task, path in task2path.items():
+        if not path.exists():
+            continue
+        logger.info(f"Removing {task} launchd config: {str(path)}")
+        cmd = ["launchctl", "unload", str(path)]
+        run_cmd(cmd, errok=True)
+        path.unlink()
+
+    if not enable:
+        return
+
+    for task, cfg in tasks.items():
+        logger.info(f"Creating {task} launchd config: {str(path)}")
+        task_args = common_args + cfg["args"]
+        pe = create_plist_element(task, task_args, cfg["interval"])
+        path = task2path[task]
+        create_plist_file(pe, path)
+        cmd = ["plutil", str(path)]
+        run_cmd(cmd)
+        cmd = ["launchctl", "load", str(path)]
+        run_cmd(cmd)
+
+
 def do_break_lock() -> None:
     logger.info(f"Breaking repo lock: {CFG.BORG_REPO}")
     run_cmd(
@@ -1089,6 +1199,24 @@ def args_parser() -> argparse.ArgumentParser:
             "target_dir", type=Path, help="Target directly for extracted backup"
         )
 
+    automated_execution = add_parser(
+        "automated-execution",
+        help="Enable/Disable automated backup execution and checks",
+    )
+    enable_disable = automated_execution.add_mutually_exclusive_group(required=True)
+    enable_disable.add_argument(
+        "--enable",
+        action="store_true",
+        dest="enable",
+        help="Enable automated backup creation and checks",
+    )
+    enable_disable.add_argument(
+        "--disable",
+        action="store_false",
+        dest="enable",
+        help="Disable automated backup creation and checks",
+    )
+
     add_parser("break-lock", help="Break repo lock")
 
     check_age = add_parser("check-age", help="Check full backup age")
@@ -1187,6 +1315,7 @@ def main() -> None:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
     command_callbacks: dict[str, Callable[..., Any]] = {
+        "automated-execution": do_automated_execution,
         "break-lock": do_break_lock,
         "check-age": do_check_age,
         "check-all": do_check_all,
