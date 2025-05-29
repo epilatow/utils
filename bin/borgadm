@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 
 # Running mypy and black:
-#     python3 -m venv /tmp/env
-#     . /tmp/env/bin/activate
-#     pip install mypy black
+#     VENV=/tmp/venv
+#     PYTHON=python3
+#     mkdir -p $VENV
+#     $PYTHON -m venv $VENV
+#     . $VENV/bin/activate
+#     pip install --upgrade pip mypy black
 #     mypy ~/env/bin/borgadm
 #     black ~/env/bin/borgadm
+#     deactivate
+#     rm -rf $VENV
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import collections
 import configparser
+import enum
 import fcntl
 import io
 import itertools
@@ -29,10 +36,11 @@ import sys
 import tempfile
 import time
 import typing
+import unittest
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, OrderedDict, Tuple
 
 # -----------------------------------------------------------------------------
 # Constants and Globals
@@ -70,7 +78,8 @@ _CHECK_AGE_SECONDS: int = 24 * 3600  # Max backup age: 24 hours
 _PRUNE_KEEP_HOURLY: int = 24
 _PRUNE_KEEP_DAILY: int = 7
 _PRUNE_KEEP_WEEKLY: int = 4
-_PRUNE_KEEP_MONTHLY: int = 6
+_PRUNE_KEEP_MONTHLY: int = 12
+_PRUNE_KEEP_YEARLY: int = 2
 
 
 # -----------------------------------------------------------------------------
@@ -136,36 +145,43 @@ class Config:
             )
         )
 
-        if command == "check-age" and (v := args.pop("seconds", None)) is not None:
+        if (v := args.pop("seconds", None)) is not None:
             self.CHECK_AGE_SECONDS: int = v
         else:
             self.CHECK_AGE_SECONDS = config.getint(
                 "default", "CHECK_AGE_SECONDS", fallback=_CHECK_AGE_SECONDS
             )
 
-        if command == "prune" and (v := args.pop("keep_hourly", None)) is not None:
+        if (v := args.pop("keep_hourly", None)) is not None:
             self.PRUNE_KEEP_HOURLY: int = v
         else:
             self.PRUNE_KEEP_HOURLY = config.getint(
                 "default", "PRUNE_KEEP_HOURLY", fallback=_PRUNE_KEEP_HOURLY
             )
-        if command == "prune" and (v := args.pop("keep_daily", None)) is not None:
+        if (v := args.pop("keep_daily", None)) is not None:
             self.PRUNE_KEEP_DAILY: int = v
         else:
             self.PRUNE_KEEP_DAILY = config.getint(
                 "default", "PRUNE_KEEP_DAILY", fallback=_PRUNE_KEEP_DAILY
             )
-        if command == "prune" and (v := args.pop("keep_weekly", None)) is not None:
+        if (v := args.pop("keep_weekly", None)) is not None:
             self.PRUNE_KEEP_WEEKLY: int = v
         else:
             self.PRUNE_KEEP_WEEKLY = config.getint(
                 "default", "PRUNE_KEEP_WEEKLY", fallback=_PRUNE_KEEP_WEEKLY
             )
-        if command == "prune" and (v := args.pop("keep_monthly", None)) is not None:
+        if (v := args.pop("keep_monthly", None)) is not None:
             self.PRUNE_KEEP_MONTHLY: int = v
         else:
             self.PRUNE_KEEP_MONTHLY = config.getint(
                 "default", "PRUNE_KEEP_MONTHLY", fallback=_PRUNE_KEEP_MONTHLY
+            )
+
+        if (v := args.pop("keep_yearly", None)) is not None:
+            self.PRUNE_KEEP_YEARLY: int = v
+        else:
+            self.PRUNE_KEEP_YEARLY = config.getint(
+                "default", "PRUNE_KEEP_YEARLY", fallback=_PRUNE_KEEP_YEARLY
             )
 
         self.BORG_REPO: str = config.get("default", "BORG_REPO", fallback=_BORG_REPO)
@@ -188,6 +204,45 @@ class Config:
             error = True
         if error:
             sys.exit(1)
+
+
+class Interval(enum.Enum):
+    HOUR = "hour"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    YEAR = "year"
+
+    def __str__(self) -> str:
+        return self.value
+
+    def timedelta(self) -> timedelta:
+        if self == Interval.HOUR:
+            return timedelta(hours=1)
+        elif self == Interval.DAY:
+            return timedelta(days=1)
+        elif self == Interval.WEEK:
+            return timedelta(weeks=1)
+        elif self == Interval.MONTH:
+            return timedelta(days=30)
+        elif self == Interval.YEAR:
+            return timedelta(days=365)
+        else:
+            raise ValueError(f"Unsupported timedelta interval: {self}")
+
+    def keep(self) -> int:
+        if self == Interval.HOUR:
+            return CFG.PRUNE_KEEP_HOURLY
+        elif self == Interval.DAY:
+            return CFG.PRUNE_KEEP_DAILY
+        elif self == Interval.WEEK:
+            return CFG.PRUNE_KEEP_WEEKLY
+        elif self == Interval.MONTH:
+            return CFG.PRUNE_KEEP_MONTHLY
+        elif self == Interval.YEAR:
+            return CFG.PRUNE_KEEP_YEARLY
+        else:
+            raise ValueError(f"Unsupported keep interval: {self}")
 
 
 # -----------------------------------------------------------------------------
@@ -520,34 +575,50 @@ def delete_paths(root: Path, relative_paths: set[Path], dry_run: bool = True) ->
                 abs_path.unlink()
 
 
-def timestamps_to_prune(timestamps: set[str]) -> set[str]:
-    retained: set[str] = set()
-    seen: set[str] = set()
+def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
+    """
+    Given a list of timestamps, return a ordered dictionary (sorted by timestamp) of
+    which ones to keep, implementing a retention GFS (Grandfather-father-son) retention
+    policy. This duplicates the retention policy implemented by borg itself. We do this
+    to enable testing of the policy, and because we borg doesn't support grouping of
+    backups into sets like we do.
+    """
+    if not timestamps:
+        return collections.OrderedDict()
+    ts_keep: OrderedDict[str, str] = collections.OrderedDict()
 
-    def keep_by_interval(max_count: int, min_spacing: timedelta) -> None:
-        nonlocal retained, seen
+    def keep_by_interval(interval: Interval) -> None:
+        nonlocal timestamps, ts_keep
+
         last: Optional[datetime] = None
-
-        count = 0
-        for ts in sorted(timestamps, reverse=True):
-            if ts in seen:
-                continue
-            if count >= max_count:
-                break
+        ts: Optional[str] = None
+        ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
+        for ts in sorted(timestamps - set(ts_keep.keys())):
             dt: datetime = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-            if last is None or (last - dt) >= min_spacing:
-                retained.add(ts)
-                seen.add(ts)
+            if last is None or (dt - last) >= interval.timedelta():
                 last = dt
-                count += 1
+                ts_keep_new[ts] = str(interval)
+        if (
+            len(ts_keep_new) < interval.keep()
+            and ts is not None
+            and ts not in ts_keep_new
+        ):
+            ts_keep_new[ts] = str(interval) + "-next"
 
-    keep_by_interval(CFG.PRUNE_KEEP_HOURLY, timedelta(hours=1))
-    keep_by_interval(CFG.PRUNE_KEEP_DAILY, timedelta(days=1))
-    keep_by_interval(CFG.PRUNE_KEEP_WEEKLY, timedelta(weeks=1))
-    keep_by_interval(CFG.PRUNE_KEEP_MONTHLY, timedelta(days=30))
+        for k in list(ts_keep_new.keys())[-interval.keep() :]:
+            ts_keep[k] = ts_keep_new[k]
 
-    prune_ts = set(timestamps) - retained
-    return prune_ts
+    keep_by_interval(Interval.HOUR)
+    keep_by_interval(Interval.DAY)
+    keep_by_interval(Interval.WEEK)
+    keep_by_interval(Interval.MONTH)
+    keep_by_interval(Interval.YEAR)
+
+    # Sort the results by timestamp
+    ts_keep = collections.OrderedDict(
+        [(k, ts_keep[k]) for k in sorted(ts_keep.keys(), reverse=True)]
+    )
+    return ts_keep
 
 
 def report_runtime() -> None:
@@ -591,6 +662,12 @@ def do_check_age() -> None:
     logger.info(
         f"Latest full backup ({latest}) age is: {age} seconds; limit is: {seconds} seconds"
     )
+
+
+def do_check_all() -> None:
+    do_check_age()
+    do_check_repo()
+    do_check_archives()
 
 
 def do_check_archives() -> None:
@@ -787,14 +864,17 @@ def do_prune(dry_run: bool) -> None:
         run_cmd(cmd)
 
     archives = list_backups()
-    prune_ts = timestamps_to_prune(set(archives.keys()))
-    retain_count = len(archives) - len(prune_ts)
+    ts_keep = ts_to_keep(set(archives.keys()))
+    ts_prune = archives.keys() - ts_keep.keys()
     prune_archives = [
-        a.removeprefix(f"{CFG.BORG_REPO}::") for ts in prune_ts for a in archives[ts]
+        a.removeprefix(f"{CFG.BORG_REPO}::") for ts in ts_prune for a in archives[ts]
     ]
-    logger.info(f"Pruning {len(prune_ts)} backups, retaining {retain_count}.")
+    logger.info(f"Keeping {len(ts_keep)} and pruning {len(ts_prune)} backups.")
+    for k, v in ts_keep.items():
+        logger.info(f"Keeping backup: {k} ({v})")
+    pruning = [f"{i}" for i in sorted(ts_prune, reverse=True)]
+    logger.info(f"Pruning backups: {', '.join(pruning)}")
     if prune_archives:
-        logger.info(f"Pruning archives: {prune_archives}")
         cmd = ["borg", "delete"]
         if dry_run:
             cmd.append("--dry-run")
@@ -933,10 +1013,28 @@ def do_setup_commands() -> None:
         logger.info(f"export BORG_REMOTE_PATH={CFG.BORG_REMOTE_PATH}")
 
 
+def do_unittest() -> None:
+
+    config_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
+    config_file.write(
+        """
+    BORG_REPO = "foobar"
+    BACKUP_SETS = { "set1": ["foo"] }
+    """
+    )
+    config_file.flush()
+
+    global CFG
+    CFG = Config(config_file.name, {"command": "unittest"})
+
+    unittest.main(argv=["first-arg-is-ignored"])
+    sys.exit(0)
+
+
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
-def parse_args() -> argparse.Namespace:
+def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Borg backup manager",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -948,10 +1046,52 @@ def parse_args() -> argparse.Namespace:
         kwargs["formatter_class"] = argparse.ArgumentDefaultsHelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
+    def add_delete(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--delete",
+            action="store_true",
+            help="Delete files in the destination which don't exist in the backup",
+        )
+
+    def add_dry_run(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--dry-run", action="store_true", help="don't make any changes"
+        )
+
+    def add_prune_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--keep-hourly", type=int, help="Number of hourly backups to keep"
+        )
+        parser.add_argument(
+            "--keep-daily", type=int, help="Number of daily backups to keep"
+        )
+        parser.add_argument(
+            "--keep-weekly", type=int, help="Number of weekly backups to keep"
+        )
+        parser.add_argument(
+            "--keep-monthly", type=int, help="Number of monthly backups to keep"
+        )
+        parser.add_argument(
+            "--keep-yearly", type=int, help="Number of yearly backups to keep"
+        )
+
+    def add_seconds(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "seconds", type=int, nargs="?", help="Maximum backup age, in seconds"
+        )
+
+    def add_target_dir(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "target_dir", type=Path, help="Target directly for extracted backup"
+        )
+
     add_parser("break-lock", help="Break repo lock")
 
     check_age = add_parser("check-age", help="Check full backup age")
-    check_age.add_argument("seconds", type=int, nargs="?")
+    add_seconds(check_age)
+
+    check_all = add_parser("check-all", help="Run all checks")
+    add_seconds(check_all)
 
     add_parser("check-repo", help="Check repo metadata")
     add_parser("check-archives", help="Check archive metadata")
@@ -959,33 +1099,43 @@ def parse_args() -> argparse.Namespace:
     add_parser("compact", help="Check full backup metadata")
 
     create = add_parser("create", help="Create full backup")
-    create.add_argument("--dry-run", action="store_true")
-    create.add_argument("--noprune", action="store_true")
+    create.add_argument("--noprune", action="store_true", help="Skip backup pruning")
+    add_dry_run(create)
+    add_prune_args(create)
 
     extract = add_parser("extract", help="Extract latest full backup")
-    extract.add_argument("--dry-run", action="store_true")
-    extract.add_argument("--delete", action="store_true")
-    extract.add_argument("target_dir", type=Path)
-    extract.add_argument("patterns", nargs="*")
+    add_target_dir(extract)
+    extract.add_argument(
+        "patterns",
+        nargs="*",
+        help="include/exclude paths matching PATTERN, see 'borg help patterns' for details",
+    )
+    add_delete(extract)
+    add_dry_run(extract)
 
     list_cmd = add_parser("list", help="List backups")
-    list_cmd.add_argument("--latest", action="store_true")
-    list_cmd.add_argument("--full-names", action="store_true")
+    list_cmd.add_argument(
+        "--latest", action="store_true", help="Only list latest complete backup set"
+    )
+    list_cmd.add_argument(
+        "--full-names",
+        action="store_true",
+        help="List full names of backups (instead of just timestamps)",
+    )
     group = list_cmd.add_mutually_exclusive_group()
-    group.add_argument("--include-partial", action="store_true")
-    group.add_argument("--only-partial", action="store_true")
+    group.add_argument(
+        "--include-partial", action="store_true", help="Include partial backups"
+    )
+    group.add_argument("--only-partial", action="store_true", help="Only list partial")
 
     prune = add_parser("prune", help="Prune partial and old backups")
-    prune.add_argument("--dry-run", action="store_true")
-    prune.add_argument("--keep-hourly", type=int)
-    prune.add_argument("--keep-daily", type=int)
-    prune.add_argument("--keep-weekly", type=int)
-    prune.add_argument("--keep-monthly", type=int)
+    add_dry_run(prune)
+    add_prune_args(prune)
 
     rsync = add_parser("rsync", help="Rsync latest archive")
-    rsync.add_argument("--dry-run", action="store_true")
-    rsync.add_argument("--delete", action="store_true")
-    rsync.add_argument("target_dir", type=Path)
+    add_target_dir(rsync)
+    add_delete(rsync)
+    add_dry_run(rsync)
 
     add_parser("setup-commands", help="Display commands to run borg cli")
 
@@ -997,34 +1147,38 @@ def parse_args() -> argparse.Namespace:
             "--verbose", action="store_true", help="Enable verbose output"
         )
 
-    return parser.parse_args()
+    return parser
 
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
-    args = parse_args()
+    args = args_parser().parse_args()
     args_dict = vars(args).copy()
-    initialize_logger(LOGFILE, verbose=args_dict.pop("verbose"))
+    config = args_dict.pop("config")
+    verbose = args_dict.pop("verbose")
+
+    initialize_logger(LOGFILE, verbose)
 
     invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
     logger.debug(f"Invocation: {invocation}")
     atexit.register(report_runtime)
 
     global CFG
-    CFG = Config(args_dict.pop("config"), args_dict)
+    CFG = Config(config, args_dict)
+    command = args_dict.pop("command")
 
     initialize_borg_environment()
     find_borg_bin()
 
-    command = args_dict.pop("command")
-    if command not in ["break-lock", "check", "compact", "setup-commands"]:
+    if command not in ["break-lock", "check-repo", "compact", "setup-commands"]:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
     command_callbacks: dict[str, Callable[..., Any]] = {
         "break-lock": do_break_lock,
         "check-age": do_check_age,
+        "check-all": do_check_all,
         "check-archives": do_check_archives,
         "check-repo": do_check_repo,
         "compact": do_compact,
@@ -1043,5 +1197,92 @@ def main() -> None:
         raise
 
 
+# -----------------------------------------------------------------------------
+# Tests
+# -----------------------------------------------------------------------------
+class TestArgparseHelp(unittest.TestCase):
+    def test_help_messages_present(self):
+        parser = args_parser()
+
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for subcmd_name, subparser in action.choices.items():
+                    for sub_action in subparser._actions:
+                        # Ignore default help option added by argparse
+                        if isinstance(sub_action, argparse._HelpAction):
+                            continue
+                        self.assertTrue(
+                            sub_action.help and sub_action.help.strip(),
+                            msg=f"Missing help for argument(s) {sub_action.option_strings or sub_action.dest} in subcommand '{subcmd_name}'",
+                        )
+
+
+class TestTimestampPruning(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Set CFG values before tests run
+        pass
+        CFG.PRUNE_KEEP_HOURLY = 2
+        CFG.PRUNE_KEEP_DAILY = 2
+        CFG.PRUNE_KEEP_WEEKLY = 2
+        CFG.PRUNE_KEEP_MONTHLY = 2
+        CFG.PRUNE_KEEP_YEARLY = 2
+
+    def test_empty_set(self) -> None:
+        self.assertEqual(ts_to_keep(set()), collections.OrderedDict())
+
+    def test_incremental_prune(self) -> None:
+        start = datetime(2000, 1, 1, 0, 0, 0)
+        ts_all: set[str] = set()
+        for i in range(int(24 * 365 * 3.5)):
+            ts = start + timedelta(hours=i)
+            ts_all.add(ts.strftime("%Y%m%d_%H%M%S"))
+            ts_keep = ts_to_keep(ts_all)
+            ts_all = set(ts_keep)
+        ts_keep_verify = collections.OrderedDict(
+            [
+                ("20030701_110000", "hour"),
+                ("20030701_100000", "hour"),
+                ("20030701_000000", "day"),
+                ("20030630_000000", "day"),
+                ("20030629_000000", "week"),
+                ("20030623_000000", "month"),
+                ("20030620_000000", "week"),
+                ("20030521_000000", "month"),
+                ("20021231_000000", "year"),
+                ("20011231_000000", "year"),
+            ]
+        )
+        self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
+
+    def test_bulk_prune(self) -> None:
+        start = datetime(2000, 1, 1, 0, 0, 0)
+        ts_all = set(
+            [
+                (start + timedelta(hours=i)).strftime("%Y%m%d_%H%M%S")
+                for i in range(int(24 * 365 * 3.5))
+            ]
+        )
+        ts_keep = ts_to_keep(ts_all)
+        ts_keep_verify = collections.OrderedDict(
+            [
+                ("20030701_110000", "hour"),
+                ("20030701_100000", "hour"),
+                ("20030701_000000", "day"),
+                ("20030630_000000", "day"),
+                ("20030628_000000", "week"),
+                ("20030621_000000", "week"),
+                ("20030614_000000", "month"),
+                ("20030515_000000", "month"),
+                ("20021231_000000", "year"),
+                ("20011231_000000", "year"),
+            ]
+        )
+        self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "unittest":
+        do_unittest()
     main()
