@@ -49,10 +49,11 @@ BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
 LOGFILE: Path = Path(f"/tmp/{BASENAME}.log")
 CONFIG: Path = Path(os.path.expanduser(f"~/.{BASENAME}"))
 
-_ssh_agent_pid: Optional[str] = None
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
-_logger_buffer: io.StringIO
+_enable_notifications: bool = False
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
+_logger_buffer: io.StringIO
+_ssh_agent_pid: Optional[str] = None
 _start_time: float = time.perf_counter()
 
 CFG: Config
@@ -253,6 +254,9 @@ def has_tty() -> bool:
 
 
 def osascript_notify() -> None:
+    global _enable_notifications, _logger_buffer
+    if not _enable_notifications:
+        return
     if not has_tty() and shutil.which("osascript"):
         logs = _logger_buffer.getvalue().strip().replace('"', '\\"')[:10000]
         script = f'display dialog "{logs}" with title "borg_backup.py error"'
@@ -291,7 +295,7 @@ def log_exceptions(exc_type, exc_value, exc_traceback) -> None:
 def initialize_logger(logfile_path, verbose=False) -> None:
     logger.setLevel(logging.DEBUG)  # Capture all logs for the file
 
-    # In memory logger for osx notifications
+    # In memory logger for notifications
     global _logger_buffer
     _logger_buffer = io.StringIO()
     memory_handler = logging.StreamHandler(_logger_buffer)
@@ -1144,6 +1148,11 @@ def args_parser() -> argparse.ArgumentParser:
             "--config", type=str, default=CONFIG, help="borgadm config file"
         )
         subparser.add_argument(
+            "--enable-notifications",
+            action="store_true",
+            help="Enable system notifications for command failures (only supported on osx)",
+        )
+        subparser.add_argument(
             "--verbose", action="store_true", help="Enable verbose output"
         )
 
@@ -1158,6 +1167,8 @@ def main() -> None:
     args_dict = vars(args).copy()
     config = args_dict.pop("config")
     verbose = args_dict.pop("verbose")
+    global _enable_notifications
+    _enable_notifications = args_dict.pop("enable_notifications")
 
     initialize_logger(LOGFILE, verbose)
 
