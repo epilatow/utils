@@ -666,7 +666,7 @@ def create_plist_element(
         ElementTree.SubElement(dict_elem, "key").text = key
         ElementTree.SubElement(dict_elem, "integer").text = str(val)
 
-    add_kv("Label", f"com.example.borgadm.{task}")
+    add_kv("Label", f"local.borgadm.{task}")
 
     # ProgramArguments
     ElementTree.SubElement(dict_elem, "key").text = "ProgramArguments"
