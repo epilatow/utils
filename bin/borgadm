@@ -601,16 +601,28 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
         ts: Optional[str] = None
         ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
         for ts in sorted(timestamps - set(ts_keep.keys())):
+            assert ts not in ts_keep
             dt: datetime = datetime.strptime(ts, "%Y%m%d_%H%M%S")
             if last is None or (dt - last) >= interval.timedelta():
                 last = dt
                 ts_keep_new[ts] = str(interval)
+        ts_latest = ts
+
+        i: int = 0
+        for ts in sorted(ts_keep_new.keys(), reverse=True):
+            ts_keep_new[ts] = ts_keep_new[ts] + f"-{i}"
+            i += 1
+
+        logger.debug(
+            f"interval={interval}, keep={interval.keep()}, len={len(ts_keep_new)}, ts={ts}"
+        )
+
         if (
             len(ts_keep_new) < interval.keep()
-            and ts is not None
-            and ts not in ts_keep_new
+            and ts_latest is not None
+            and ts_latest not in ts_keep_new
         ):
-            ts_keep_new[ts] = str(interval) + "-next"
+            ts_keep_new[ts_latest] = str(interval) + "-next"
 
         for k in list(ts_keep_new.keys())[-interval.keep() :]:
             ts_keep[k] = ts_keep_new[k]
@@ -689,9 +701,9 @@ def create_plist_file(element: ElementTree.Element, path: Path) -> None:
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
-def do_automated_execution(enable: bool) -> None:
+def do_automate(enable: bool, disable: bool) -> None:
     if platform.system() != "Darwin":
-        logger.error("automated-execution subcommand is only supported on osx")
+        logger.error("automate subcommand is only supported on osx")
         sys.exit(1)
 
     if not shutil.which("plutil"):
@@ -714,12 +726,25 @@ def do_automated_execution(enable: bool) -> None:
             "interval": (60 * 60 * 24 * 7),
         },
     }
-    home: Path = Path(os.environ["HOME"])
+    task_name = "local.borgadm.{task}"
+    task_dir: Path = Path(os.environ["HOME"]) / "Library" / "LaunchAgents"
     task2path: dict[str, Path] = {
-        task: home / "Library" / "LaunchAgents" / f"com.example.borgadm.{task}.plist"
-        for task in tasks
+        task: task_dir / (task_name.format(task=task) + ".plist") for task in tasks
     }
     cmd: list[str] = []
+
+    if not (enable or disable):
+        tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
+        for task in task2path:
+            tname = task_name.format(task=task)
+            pattern = r"[ \t]" + re.escape(tname) + r"$"
+            cpattern = re.compile(pattern)
+            if any(cpattern.search(i) for i in tasks):
+                status = "enabled"
+            else:
+                status = "disabled"
+            logger.info(f"{tname}: {status}")
+        return
 
     # Always remove any existing configs
     for task, path in task2path.items():
@@ -1119,7 +1144,7 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
                 run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
 
 
-def do_setup_commands() -> None:
+def do_environment() -> None:
     logger.info(f"ssh-add -q {CFG.BORG_SSHKEY_FILE}")
     logger.info(f"export BORG_PASSPHRASE=$(cat {CFG.BORG_PASSPHRASE_FILE})")
     logger.info(f"export BORG_REPO={CFG.BORG_REPO}")
@@ -1199,11 +1224,11 @@ def args_parser() -> argparse.ArgumentParser:
             "target_dir", type=Path, help="Target directly for extracted backup"
         )
 
-    automated_execution = add_parser(
-        "automated-execution",
-        help="Enable/Disable automated backup execution and checks",
+    automate = add_parser(
+        "automate",
+        help="Enable/Disable automated backups and checks",
     )
-    enable_disable = automated_execution.add_mutually_exclusive_group(required=True)
+    enable_disable = automate.add_mutually_exclusive_group()
     enable_disable.add_argument(
         "--enable",
         action="store_true",
@@ -1212,8 +1237,8 @@ def args_parser() -> argparse.ArgumentParser:
     )
     enable_disable.add_argument(
         "--disable",
-        action="store_false",
-        dest="enable",
+        action="store_true",
+        dest="disable",
         help="Disable automated backup creation and checks",
     )
 
@@ -1269,7 +1294,7 @@ def args_parser() -> argparse.ArgumentParser:
     add_delete(rsync)
     add_dry_run(rsync)
 
-    add_parser("setup-commands", help="Display commands to run borg cli")
+    add_parser("environment", help="Display environment settings to run borg cli")
 
     for subparser in subparsers.choices.values():
         subparser.add_argument(
@@ -1311,11 +1336,11 @@ def main() -> None:
     initialize_borg_environment()
     find_borg_bin()
 
-    if command not in ["break-lock", "check-repo", "compact", "setup-commands"]:
+    if command not in ["break-lock", "check-repo", "compact", "environment"]:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
     command_callbacks: dict[str, Callable[..., Any]] = {
-        "automated-execution": do_automated_execution,
+        "automate": do_automate,
         "break-lock": do_break_lock,
         "check-age": do_check_age,
         "check-all": do_check_all,
@@ -1323,11 +1348,11 @@ def main() -> None:
         "check-repo": do_check_repo,
         "compact": do_compact,
         "create": do_create,
+        "environment": do_environment,
         "extract": do_extract,
         "list": do_list,
         "prune": do_prune,
         "rsync": do_rsync,
-        "setup-commands": do_setup_commands,
     }
     try:
         command_callbacks[command](**args_dict)
@@ -1382,16 +1407,16 @@ class TestTimestampPruning(unittest.TestCase):
             ts_all = set(ts_keep)
         ts_keep_verify = collections.OrderedDict(
             [
-                ("20030701_110000", "hour"),
-                ("20030701_100000", "hour"),
-                ("20030701_000000", "day"),
-                ("20030630_000000", "day"),
-                ("20030629_000000", "week"),
-                ("20030623_000000", "month"),
-                ("20030620_000000", "week"),
-                ("20030521_000000", "month"),
-                ("20021231_000000", "year"),
-                ("20011231_000000", "year"),
+                ("20030701_110000", "hour-0"),
+                ("20030701_100000", "hour-1"),
+                ("20030701_000000", "day-0"),
+                ("20030630_000000", "day-1"),
+                ("20030629_000000", "week-0"),
+                ("20030623_000000", "month-0"),
+                ("20030620_000000", "week-1"),
+                ("20030521_000000", "month-1"),
+                ("20021231_000000", "year-0"),
+                ("20011231_000000", "year-1"),
             ]
         )
         self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
@@ -1407,16 +1432,16 @@ class TestTimestampPruning(unittest.TestCase):
         ts_keep = ts_to_keep(ts_all)
         ts_keep_verify = collections.OrderedDict(
             [
-                ("20030701_110000", "hour"),
-                ("20030701_100000", "hour"),
-                ("20030701_000000", "day"),
-                ("20030630_000000", "day"),
-                ("20030628_000000", "week"),
-                ("20030621_000000", "week"),
-                ("20030614_000000", "month"),
-                ("20030515_000000", "month"),
-                ("20021231_000000", "year"),
-                ("20011231_000000", "year"),
+                ("20030701_110000", "hour-0"),
+                ("20030701_100000", "hour-1"),
+                ("20030701_000000", "day-0"),
+                ("20030630_000000", "day-1"),
+                ("20030628_000000", "week-0"),
+                ("20030621_000000", "week-1"),
+                ("20030614_000000", "month-0"),
+                ("20030515_000000", "month-1"),
+                ("20021231_000000", "year-0"),
+                ("20011231_000000", "year-1"),
             ]
         )
         self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
