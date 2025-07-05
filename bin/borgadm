@@ -464,13 +464,7 @@ def create_backup(
     logger.info(f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})")
 
 
-def list_backups(
-    latest: bool = False, include_partial: bool = False, only_partial: bool = False
-) -> dict[str, list[str]]:
-    assert not (
-        include_partial and only_partial
-    ), "Conflicting options: cannot include and only show partials."
-
+def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[str]]:
     result = run_cmd(
         [
             "borg",
@@ -510,10 +504,9 @@ def list_backups(
         is_full = all(
             ts in timestamps_by_type[set_name] for set_name in CFG.BACKUP_SETS
         )
-        if only_partial:
-            if not is_full:
-                include()
-        elif include_partial or is_full:
+        if not partial and is_full:
+            include()
+        if partial and not is_full:
             include()
         if rv and latest:
             break
@@ -972,23 +965,46 @@ def do_extract(
 
 
 def do_list(
-    latest: bool, full_names: bool, include_partial: bool, only_partial: bool
+    latest: bool,
+    full_names: bool,
+    include_partial: bool,
+    only_partial: bool,
+    keep_tags: bool,
 ) -> None:
-    backups = list_backups(
-        latest=latest, include_partial=include_partial, only_partial=only_partial
-    )
+    full_backups: dict[str, list[str]] = {}
+    partial_backups: dict[str, list[str]] = {}
+    if not only_partial:
+        full_backups = list_backups(latest=latest)
+    if include_partial or only_partial:
+        partial_backups = list_backups(latest=latest, partial=True)
+    backups = full_backups | partial_backups
+
+    ts_keep: OrderedDict[str, str] = collections.OrderedDict()
+    if keep_tags:
+        ts_keep = ts_to_keep(set(full_backups.keys()))
+
+    def get_keep_tag(ts) -> str:
+        if not keep_tags:
+            return ""
+        if ts not in ts_keep:
+            tag = "prune"
+        else:
+            tag = ts_keep[ts]
+        return f" ({tag})"
+
     for ts, archives in backups.items():
+        keep_tag = get_keep_tag(ts)
         if full_names:
             for archive in archives:
-                logger.info(archive)
+                logger.info(f"{archive}{keep_tag}")
         else:
-            logger.info(ts)
+            logger.info(f"{ts}{keep_tag}")
 
 
 def do_prune(dry_run: bool) -> None:
     partial_archives = [
         a.removeprefix(f"{CFG.BORG_REPO}::")
-        for archives in list_backups(only_partial=True).values()
+        for archives in list_backups(partial=True).values()
         for a in archives
     ]
     if partial_archives:
@@ -1279,6 +1295,12 @@ def args_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List full names of backups (instead of just timestamps)",
     )
+    list_cmd.add_argument(
+        "--keep-tags",
+        action="store_true",
+        help="Include keep tags (indicating what would be kept and deleted during a prune)",
+    )
+    add_prune_args(list_cmd)
     group = list_cmd.add_mutually_exclusive_group()
     group.add_argument(
         "--include-partial", action="store_true", help="Include partial backups"
