@@ -20,6 +20,7 @@ import collections
 import configparser
 import enum
 import fcntl
+import functools
 import io
 import itertools
 import json
@@ -464,8 +465,9 @@ def create_backup(
     logger.info(f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})")
 
 
-def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[str]]:
-    result = run_cmd(
+@functools.cache
+def list_backups_raw() -> subprocess.CompletedProcess[Any]:
+    return run_cmd(
         [
             "borg",
             "list",
@@ -476,6 +478,10 @@ def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[
             CFG.BORG_REPO,
         ]
     )
+
+
+def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[str]]:
+    result = list_backups_raw()
 
     timestamps_by_type: dict[str, set[str]] = {key: set() for key in CFG.BACKUP_SETS}
     backup_set_names = "|".join(CFG.BACKUP_SETS)
