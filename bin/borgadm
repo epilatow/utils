@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 
-# Running mypy and black:
-#     VENV=/tmp/venv
-#     PYTHON=python3
-#     mkdir -p $VENV
-#     $PYTHON -m venv $VENV
-#     . $VENV/bin/activate
-#     pip install --upgrade pip mypy black
-#     mypy ~/env/bin/borgadm
-#     black ~/env/bin/borgadm
-#     deactivate
-#     rm -rf $VENV
+# Run black, flake8, and mypy:
+#     uvx black ~/env/bin/borgadm
+#     uvx flake8 ~/env/bin/borgadm
+#     uvx mypy ~/env/bin/borgadm
 
 from __future__ import annotations
 
@@ -22,7 +15,6 @@ import enum
 import fcntl
 import functools
 import io
-import itertools
 import json
 import logging
 import os
@@ -30,7 +22,6 @@ import platform
 import re
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -41,7 +32,7 @@ import unittest
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, OrderedDict, Tuple
+from typing import Any, Callable, Optional, OrderedDict, Tuple
 from xml.dom import minidom
 from xml.etree import ElementTree
 
@@ -59,7 +50,7 @@ _logger_buffer: io.StringIO
 _ssh_agent_pid: Optional[str] = None
 _start_time: float = time.perf_counter()
 
-CFG: Config
+CFG: Optional[Config] = None
 
 logger = logging.getLogger()
 
@@ -101,8 +92,6 @@ _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 # -----------------------------------------------------------------------------
 class Config:
     def __init__(self, path: str, args: dict[str, Any]) -> None:
-        command = args["command"]
-        path = path
         try:
             with open(path) as f:
                 content = f.read()
@@ -235,16 +224,17 @@ class Interval(enum.Enum):
             raise ValueError(f"Unsupported timedelta interval: {self}")
 
     def keep(self) -> int:
+        cfg = get_cfg()
         if self == Interval.HOUR:
-            return CFG.PRUNE_KEEP_HOURLY
+            return cfg.PRUNE_KEEP_HOURLY
         elif self == Interval.DAY:
-            return CFG.PRUNE_KEEP_DAILY
+            return cfg.PRUNE_KEEP_DAILY
         elif self == Interval.WEEK:
-            return CFG.PRUNE_KEEP_WEEKLY
+            return cfg.PRUNE_KEEP_WEEKLY
         elif self == Interval.MONTH:
-            return CFG.PRUNE_KEEP_MONTHLY
+            return cfg.PRUNE_KEEP_MONTHLY
         elif self == Interval.YEAR:
-            return CFG.PRUNE_KEEP_YEARLY
+            return cfg.PRUNE_KEEP_YEARLY
         else:
             raise ValueError(f"Unsupported keep interval: {self}")
 
@@ -252,12 +242,16 @@ class Interval(enum.Enum):
 # -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
+def get_cfg() -> Config:
+    assert CFG is not None, "CFG not initialized"
+    return CFG
+
+
 def has_tty() -> bool:
     return sys.stdin.isatty() or sys.stdout.isatty() or sys.stderr.isatty()
 
 
 def osascript_notify() -> None:
-    global _enable_notifications, _logger_buffer
     if not _enable_notifications:
         return
     if not has_tty() and shutil.which("osascript"):
@@ -344,20 +338,22 @@ def find_borg_bin() -> None:
                 os.environ["PATH"] = os.environ.get("PATH", "") + f":{i}"
                 break
     if not shutil.which("borg"):
-        logger.error(f"Can't find borg executable.")
+        logger.error("Can't find borg executable.")
         sys.exit(1)
 
 
 def initialize_borg_environment() -> None:
-    global _borg_env_initialized, _hostkey_file
+    cfg = get_cfg()
+
+    global _borg_env_initialized
     if _borg_env_initialized:
         return
 
-    if CFG.BORG_REMOTE_PATH:
-        os.environ["BORG_REMOTE_PATH"] = CFG.BORG_REMOTE_PATH
+    if cfg.BORG_REMOTE_PATH:
+        os.environ["BORG_REMOTE_PATH"] = cfg.BORG_REMOTE_PATH
         logger.debug(f"BORG_REMOTE_PATH={os.environ['BORG_REMOTE_PATH']}")
     os.environ["BORG_PASSPHRASE"] = load_passphrase()
-    _hostkey_file.write(CFG.BORG_REPO_HOSTKEY)
+    _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
     _hostkey_file.flush()
     os.environ["BORG_RSH"] = (
         f"ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile={_hostkey_file.name}"
@@ -403,7 +399,10 @@ def run_cmd(
 
     if result.returncode != 0:
         logger.error(
-            f"Command `{cmd_str}` failed with exit code {result.returncode} and stderr:\n{result.stderr.strip()}"
+            "Command %s failed with exit code %s and stderr:\n%s",
+            cmd_str,
+            result.returncode,
+            result.stderr.strip(),
         )
         # Raise same error as check=True would
         if not errok:
@@ -418,9 +417,11 @@ def run_cmd(
 
 
 def start_ssh_agent() -> None:
+    cfg = get_cfg()
+
     global _ssh_agent_pid
     logger.debug("Initializing SSH agent.")
-    check_permissions(CFG.BORG_SSHKEY_FILE, "SSH private key")
+    check_permissions(cfg.BORG_SSHKEY_FILE, "SSH private key")
     result = run_cmd(["ssh-agent", "-s"])
     for line in result.stdout.splitlines():
         line = line.split(";")[0].strip()
@@ -429,7 +430,7 @@ def start_ssh_agent() -> None:
             os.environ[key] = value
             if key == "SSH_AGENT_PID":
                 _ssh_agent_pid = value
-    result = run_cmd(["ssh-add", "-q", CFG.BORG_SSHKEY_FILE.as_posix()])
+    result = run_cmd(["ssh-add", "-q", cfg.BORG_SSHKEY_FILE.as_posix()])
     atexit.register(stop_ssh_agent)
 
 
@@ -445,15 +446,19 @@ def stop_ssh_agent() -> None:
 
 
 def load_passphrase() -> str:
-    check_permissions(CFG.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
-    with open(CFG.BORG_PASSPHRASE_FILE, "r") as f:
+    cfg = get_cfg()
+
+    check_permissions(cfg.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
+    with open(cfg.BORG_PASSPHRASE_FILE, "r") as f:
         return f.read().strip()
 
 
 def create_backup(
     archive_name: str, extra_args: list[str], dirs: list[str], dry_run: bool
 ) -> None:
-    archive = f"{CFG.BORG_REPO}::{archive_name}"
+    cfg = get_cfg()
+
+    archive = f"{cfg.BORG_REPO}::{archive_name}"
     logger.info(f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})")
     cmd = ["borg", "create"]
     if dry_run:
@@ -461,32 +466,36 @@ def create_backup(
     else:
         cmd += ["--stats"]
     cmd += extra_args + [archive] + [os.path.expanduser(d) for d in dirs]
-    run_cmd(cmd, cwd=CFG.BACKUP_ROOT)
+    run_cmd(cmd, cwd=cfg.BACKUP_ROOT)
     logger.info(f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})")
 
 
 @functools.cache
 def list_backups_raw() -> subprocess.CompletedProcess[Any]:
+    cfg = get_cfg()
+
     return run_cmd(
         [
             "borg",
             "list",
             "--bypass-lock",
             "--lock-wait",
-            str(CFG.BORG_CMD_TIMEOUT),
+            str(cfg.BORG_CMD_TIMEOUT),
             "--short",
-            CFG.BORG_REPO,
+            cfg.BORG_REPO,
         ]
     )
 
 
 def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[str]]:
+    cfg = get_cfg()
+
     result = list_backups_raw()
 
-    timestamps_by_type: dict[str, set[str]] = {key: set() for key in CFG.BACKUP_SETS}
-    backup_set_names = "|".join(CFG.BACKUP_SETS)
+    timestamps_by_type: dict[str, set[str]] = {key: set() for key in cfg.BACKUP_SETS}
+    backup_set_names = "|".join(cfg.BACKUP_SETS)
     ts_pattern = re.compile(
-        f"{CFG.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
+        f"{cfg.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
     )
     for line in result.stdout.strip().splitlines():
         match = ts_pattern.match(line.strip())
@@ -502,13 +511,13 @@ def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[
 
         def include() -> None:
             rv[ts] = [
-                f"{CFG.BORG_REPO}::{CFG.BACKUP_NAME}-{set_name}-{ts}"
-                for set_name in CFG.BACKUP_SETS
+                f"{cfg.BORG_REPO}::{cfg.BACKUP_NAME}-{set_name}-{ts}"
+                for set_name in cfg.BACKUP_SETS
                 if ts in timestamps_by_type[set_name]
             ]
 
         is_full = all(
-            ts in timestamps_by_type[set_name] for set_name in CFG.BACKUP_SETS
+            ts in timestamps_by_type[set_name] for set_name in cfg.BACKUP_SETS
         )
         if not partial and is_full:
             include()
@@ -532,13 +541,15 @@ def is_mountpoint(path: Path) -> bool:
 
 
 def check_sudo() -> bool:
+    cfg = get_cfg()
+
     try:
         subprocess.run(
             ["sudo", "-n", "-E", "true"],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=CFG.CMD_TIMEOUT,
+            timeout=cfg.CMD_TIMEOUT,
         )
         return True
     except subprocess.CalledProcessError:
@@ -553,9 +564,11 @@ def backup_set_paths(set_name: Optional[str] = None) -> Tuple[set[Path], set[Pat
     Return sets of directories and files from BACKUP_SETS paths.
     Directories end in a "/", all other entries are considered files.
     """
+    cfg = get_cfg()
+
     paths: set[str] = {
         k
-        for i, j in CFG.BACKUP_SETS.items()
+        for i, j in cfg.BACKUP_SETS.items()
         if set_name is None or i == set_name
         for k in j["paths"]
     }
@@ -594,8 +607,6 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
     ts_keep: OrderedDict[str, str] = collections.OrderedDict()
 
     def keep_by_interval(interval: Interval) -> None:
-        nonlocal timestamps, ts_keep
-
         last: Optional[datetime] = None
         ts: Optional[str] = None
         ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
@@ -613,7 +624,11 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
             i += 1
 
         logger.debug(
-            f"interval={interval}, keep={interval.keep()}, len={len(ts_keep_new)}, ts={ts}"
+            "interval=%s, keep=%s, len=%s, ts=%s",
+            interval,
+            interval.keep(),
+            len(ts_keep_new),
+            ts,
         )
 
         if (
@@ -640,7 +655,6 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
 
 
 def report_runtime() -> None:
-    global _start_time
     elapsed_time = time.perf_counter() - _start_time
     elapsed_time_str = str(timedelta(seconds=int(elapsed_time)))
     logger.debug(f"Execution time (hh:mm:ss): {elapsed_time_str}")
@@ -649,7 +663,6 @@ def report_runtime() -> None:
 def create_plist_element(
     task: str, args: list[str], interval: int
 ) -> ElementTree.Element:
-
     plist = ElementTree.Element("plist", version="1.0")
     dict_elem = ElementTree.SubElement(plist, "dict")
 
@@ -770,18 +783,21 @@ def do_automate(enable: bool, disable: bool) -> None:
 
 
 def do_break_lock() -> None:
-    logger.info(f"Breaking repo lock: {CFG.BORG_REPO}")
+    cfg = get_cfg()
+
+    logger.info(f"Breaking repo lock: {cfg.BORG_REPO}")
     run_cmd(
         [
             "borg",
             "break-lock",
-            CFG.BORG_REPO,
+            cfg.BORG_REPO,
         ]
     )
 
 
 def do_check_age() -> None:
-    seconds = CFG.CHECK_AGE_SECONDS
+    cfg = get_cfg()
+    seconds = cfg.CHECK_AGE_SECONDS
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
@@ -793,12 +809,18 @@ def do_check_age() -> None:
     age = int((datetime.now() - ts).total_seconds())
     if age > seconds:
         logger.error(
-            f"Latest full backup ({latest}) is too old: {age} seconds; limit is: {seconds} seconds"
+            "Latest full backup (%s) is too old: %s seconds; limit is: %s seconds",
+            latest,
+            age,
+            seconds,
         )
         sys.exit(3)
 
     logger.info(
-        f"Latest full backup ({latest}) age is: {age} seconds; limit is: {seconds} seconds"
+        "Latest full backup (%s) age is: %s seconds; limit is: %s seconds",
+        latest,
+        age,
+        seconds,
     )
 
 
@@ -821,27 +843,31 @@ def do_check_archives() -> None:
 
 
 def do_check_repo() -> None:
-    logger.info(f"Checking repo metadata.")
-    run_cmd(["borg", "check", CFG.BORG_REPO])
+    cfg = get_cfg()
+    logger.info("Checking repo metadata.")
+    run_cmd(["borg", "check", cfg.BORG_REPO])
 
 
 def do_compact() -> None:
-    logger.info(f"Compacting repo: {CFG.BORG_REPO}")
+    cfg = get_cfg()
+    logger.info(f"Compacting repo: {cfg.BORG_REPO}")
     run_cmd(
         [
             "borg",
             "compact",
-            CFG.BORG_REPO,
+            cfg.BORG_REPO,
         ]
     )
 
 
 def do_create(dry_run: bool, no_prune: bool) -> None:
+    cfg = get_cfg()
+
     def backup_set_tests(set_name: str) -> None:
         error: bool = False
         dirs, files = backup_set_paths(set_name)
         for d in dirs:
-            full_path = CFG.BACKUP_ROOT / d
+            full_path = cfg.BACKUP_ROOT / d
             if not os.path.isdir(full_path):
                 logger.error(f"Missing backup dir (set: '{set_name}'): {full_path}")
                 error = True
@@ -849,10 +875,13 @@ def do_create(dry_run: bool, no_prune: bool) -> None:
                 logger.error(f"Empty backup dir (set: '{set_name}'): {full_path}")
                 error = True
         for f in files:
-            full_path = CFG.BACKUP_ROOT / f
+            full_path = cfg.BACKUP_ROOT / f
             if os.path.isdir(full_path):
                 logger.error(
-                    f"Missing trailing slash for backup directory in config (set: '{set_name}'): {full_path}"
+                    "Missing trailing slash for backup directory in config "
+                    "(set: '%s'): %s",
+                    set_name,
+                    full_path,
                 )
                 error = True
             if not os.path.exists(full_path):
@@ -862,22 +891,22 @@ def do_create(dry_run: bool, no_prune: bool) -> None:
             sys.exit(1)
 
     # Run all tests before backups to fail-fast in case of errors
-    for set_name in CFG.BACKUP_SETS:
+    for set_name in cfg.BACKUP_SETS:
         backup_set_tests(set_name)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for set_name, cfg in CFG.BACKUP_SETS.items():
+    for set_name, set_cfg in cfg.BACKUP_SETS.items():
         # Backups can take a while, so re-run tests before each backup
         backup_set_tests(set_name)
-        for path in CFG.BACKUP_MOUNTS:
-            full_path = CFG.BACKUP_ROOT / path
+        for path in cfg.BACKUP_MOUNTS:
+            full_path = cfg.BACKUP_ROOT / path
             if not is_mountpoint(full_path):
                 logger.error(f"Missing backup mount: {full_path}")
                 sys.exit(1)
-        create_options = cfg.get("create_options", [])
-        paths = cfg["paths"]
+        create_options = set_cfg.get("create_options", [])
+        paths = set_cfg["paths"]
         create_backup(
-            f"{CFG.BACKUP_NAME}-{set_name}-{timestamp}", create_options, paths, dry_run
+            f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}", create_options, paths, dry_run
         )
 
     if not no_prune:
@@ -1008,8 +1037,9 @@ def do_list(
 
 
 def do_prune(dry_run: bool) -> None:
+    cfg = get_cfg()
     partial_archives = [
-        a.removeprefix(f"{CFG.BORG_REPO}::")
+        a.removeprefix(f"{cfg.BORG_REPO}::")
         for archives in list_backups(partial=True).values()
         for a in archives
     ]
@@ -1020,7 +1050,7 @@ def do_prune(dry_run: bool) -> None:
             cmd.append("--dry-run")
         else:
             cmd.append("--stats")
-        cmd.append(CFG.BORG_REPO)
+        cmd.append(cfg.BORG_REPO)
         cmd += partial_archives
         run_cmd(cmd)
 
@@ -1028,7 +1058,7 @@ def do_prune(dry_run: bool) -> None:
     ts_keep = ts_to_keep(set(archives.keys()))
     ts_prune = archives.keys() - ts_keep.keys()
     prune_archives = [
-        a.removeprefix(f"{CFG.BORG_REPO}::") for ts in ts_prune for a in archives[ts]
+        a.removeprefix(f"{cfg.BORG_REPO}::") for ts in ts_prune for a in archives[ts]
     ]
     logger.info(f"Keeping {len(ts_keep)} and pruning {len(ts_prune)} backups.")
     for k, v in ts_keep.items():
@@ -1041,16 +1071,16 @@ def do_prune(dry_run: bool) -> None:
             cmd.append("--dry-run")
         else:
             cmd.append("--stats")
-        cmd.append(CFG.BORG_REPO)
+        cmd.append(cfg.BORG_REPO)
         cmd += prune_archives
         run_cmd(cmd)
 
-    logger.info(f"Compacting {CFG.BORG_REPO}")
+    logger.info(f"Compacting {cfg.BORG_REPO}")
     run_cmd(
         [
             "borg",
             "compact",
-            CFG.BORG_REPO,
+            cfg.BORG_REPO,
         ]
     )
 
@@ -1062,7 +1092,8 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
 
     if not check_sudo():
         logger.error(
-            "Rsync subcommand requires non-interractive sudo support with the ability to set environment variables."
+            "Rsync subcommand requires non-interractive sudo support "
+            "with the ability to set environment variables."
         )
         sys.exit(1)
 
@@ -1082,10 +1113,13 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
     logger.info(f"Rsync target dirctory: {target_dir}")
     lockfile = target_dir / f".{BASENAME}_target_dir.lock"
     tmpdir_prefix = f".{BASENAME}_rsync_{ts}_"
-    with open(lockfile, "w") as lf, tempfile.TemporaryDirectory(
-        dir=str(Path.home()),
-        prefix=tmpdir_prefix,
-    ) as tdir:
+    with (
+        open(lockfile, "w") as lf,
+        tempfile.TemporaryDirectory(
+            dir=str(Path.home()),
+            prefix=tmpdir_prefix,
+        ) as tdir,
+    ):
         tmpdir = Path(tdir)
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1167,15 +1201,15 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
 
 
 def do_environment() -> None:
-    logger.info(f"ssh-add -q {CFG.BORG_SSHKEY_FILE}")
-    logger.info(f"export BORG_PASSPHRASE=$(cat {CFG.BORG_PASSPHRASE_FILE})")
-    logger.info(f"export BORG_REPO={CFG.BORG_REPO}")
-    if CFG.BORG_REMOTE_PATH:
-        logger.info(f"export BORG_REMOTE_PATH={CFG.BORG_REMOTE_PATH}")
+    cfg = get_cfg()
+    logger.info(f"ssh-add -q {cfg.BORG_SSHKEY_FILE}")
+    logger.info(f"export BORG_PASSPHRASE=$(cat {cfg.BORG_PASSPHRASE_FILE})")
+    logger.info(f"export BORG_REPO={cfg.BORG_REPO}")
+    if cfg.BORG_REMOTE_PATH:
+        logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
 def do_unittest() -> None:
-
     config_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
     config_file.write(
         """
@@ -1287,7 +1321,10 @@ def args_parser() -> argparse.ArgumentParser:
     extract.add_argument(
         "patterns",
         nargs="*",
-        help="include/exclude paths matching PATTERN, see 'borg help patterns' for details",
+        help=(
+            "include/exclude paths matching PATTERN, "
+            "see 'borg help patterns' for details"
+        ),
     )
     add_delete(extract)
     add_dry_run(extract)
@@ -1304,7 +1341,10 @@ def args_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument(
         "--keep-tags",
         action="store_true",
-        help="Include keep tags (indicating what would be kept and deleted during a prune)",
+        help=(
+            "Include keep tags (indicating what would be kept and "
+            "deleted during a prune)"
+        ),
     )
     add_prune_args(list_cmd)
     group = list_cmd.add_mutually_exclusive_group()
@@ -1331,7 +1371,10 @@ def args_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--enable-notifications",
             action="store_true",
-            help="Enable system notifications for command failures (only supported on osx)",
+            help=(
+                "Enable system notifications for command failures "
+                "(only supported on osx)"
+            ),
         )
         subparser.add_argument(
             "--verbose", action="store_true", help="Enable verbose output"
@@ -1406,21 +1449,24 @@ class TestArgparseHelp(unittest.TestCase):
                             continue
                         self.assertTrue(
                             sub_action.help and sub_action.help.strip(),
-                            msg=f"Missing help for argument(s) {sub_action.option_strings or sub_action.dest} in subcommand '{subcmd_name}'",
+                            msg=(
+                                "Missing help for argument(s) "
+                                f"{sub_action.option_strings or sub_action.dest} "
+                                f"in subcommand '{subcmd_name}'"
+                            ),
                         )
 
 
 class TestTimestampPruning(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls) -> None:
         # Set CFG values before tests run
-        pass
-        CFG.PRUNE_KEEP_HOURLY = 2
-        CFG.PRUNE_KEEP_DAILY = 2
-        CFG.PRUNE_KEEP_WEEKLY = 2
-        CFG.PRUNE_KEEP_MONTHLY = 2
-        CFG.PRUNE_KEEP_YEARLY = 2
+        cfg = get_cfg()
+        cfg.PRUNE_KEEP_HOURLY = 2
+        cfg.PRUNE_KEEP_DAILY = 2
+        cfg.PRUNE_KEEP_WEEKLY = 2
+        cfg.PRUNE_KEEP_MONTHLY = 2
+        cfg.PRUNE_KEEP_YEARLY = 2
 
     def test_empty_set(self) -> None:
         self.assertEqual(ts_to_keep(set()), collections.OrderedDict())
