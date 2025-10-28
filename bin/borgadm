@@ -330,16 +330,26 @@ def initialize_logger(logfile_path, verbose=False) -> None:
     sys.excepthook = log_exceptions
 
 
-def find_borg_bin() -> None:
-    if not shutil.which("borg"):
-        path_search = ["/opt/local/bin"]
-        for i in path_search:
-            if os.path.exists(os.path.join(i, "borg")):
-                os.environ["PATH"] = os.environ.get("PATH", "") + f":{i}"
-                break
-    if not shutil.which("borg"):
-        logger.error("Can't find borg executable.")
-        sys.exit(1)
+@functools.cache
+def borg_cmd() -> list[str]:
+
+    # Default to the version in PATH.
+    if rv := shutil.which("borg"):
+        return [rv]
+
+    # Explicitly search common dirs.
+    path_search = [os.environ["HOME"] + "/.local/bin", "/opt/local/bin"]
+    for i in path_search:
+        rv = os.path.join(i, "borg")
+        if os.path.exists(rv):
+            return [rv]
+
+    # Run it via uvx if it's installed.
+    if uvx := shutil.which("uvx"):
+        return [uvx, "-q", "--from", "borgbackup", "borg"]
+
+    logger.error("Can't find borg or uvx executables.")
+    sys.exit(1)
 
 
 def initialize_borg_environment() -> None:
@@ -377,7 +387,7 @@ def check_permissions(path: Path, name: str) -> None:
 def run_cmd(
     cmd: list[str], sudo: bool = False, errok: bool = False, **kwargs
 ) -> subprocess.CompletedProcess[Any]:
-    slow_cmds = ["borg", "rsync"]
+    slow_cmds = borg_cmd() + ["rsync"]
     timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
     if CFG:
         timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else CFG.CMD_TIMEOUT
@@ -460,7 +470,7 @@ def create_backup(
 
     archive = f"{cfg.BORG_REPO}::{archive_name}"
     logger.info(f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})")
-    cmd = ["borg", "create"]
+    cmd = borg_cmd() + ["create"]
     if dry_run:
         cmd.append("--dry-run")
     else:
@@ -475,8 +485,8 @@ def list_backups_raw() -> subprocess.CompletedProcess[Any]:
     cfg = get_cfg()
 
     return run_cmd(
-        [
-            "borg",
+        borg_cmd()
+        + [
             "list",
             "--bypass-lock",
             "--lock-wait",
@@ -787,8 +797,8 @@ def do_break_lock() -> None:
 
     logger.info(f"Breaking repo lock: {cfg.BORG_REPO}")
     run_cmd(
-        [
-            "borg",
+        borg_cmd()
+        + [
             "break-lock",
             cfg.BORG_REPO,
         ]
@@ -839,21 +849,21 @@ def do_check_archives() -> None:
     archives = list(backups.values())[0]
     for archive in archives:
         logger.info(f"Checking archive metadata: {archive}")
-        run_cmd(["borg", "check", archive])
+        run_cmd(borg_cmd() + ["check", archive])
 
 
 def do_check_repo() -> None:
     cfg = get_cfg()
     logger.info("Checking repo metadata.")
-    run_cmd(["borg", "check", cfg.BORG_REPO])
+    run_cmd(borg_cmd() + ["check", cfg.BORG_REPO])
 
 
 def do_compact() -> None:
     cfg = get_cfg()
     logger.info(f"Compacting repo: {cfg.BORG_REPO}")
     run_cmd(
-        [
-            "borg",
+        borg_cmd()
+        + [
             "compact",
             cfg.BORG_REPO,
         ]
@@ -935,7 +945,7 @@ def do_extract(
         archive_paths: set[Path] = set()
         for archive in archives:
             logger.info(f"Getting archive contents: {archive}")
-            cmd = ["borg", "list", "--format", "{path}{NL}"]
+            cmd = borg_cmd() + ["list", "--format", "{path}{NL}"]
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
             cmd.append(archive)
@@ -987,7 +997,7 @@ def do_extract(
         for archive in archives:
             logger.info(f"Extracting: {archive} to {target_dir}")
 
-            cmd = ["borg", "extract"]
+            cmd = borg_cmd() + ["extract"]
             if dry_run:
                 cmd.append("--dry-run")
             for pattern in patterns:
@@ -1045,7 +1055,7 @@ def do_prune(dry_run: bool) -> None:
     ]
     if partial_archives:
         logger.info(f"Pruning partial archives: {partial_archives}")
-        cmd = ["borg", "delete"]
+        cmd = borg_cmd() + ["delete"]
         if dry_run:
             cmd.append("--dry-run")
         else:
@@ -1066,7 +1076,7 @@ def do_prune(dry_run: bool) -> None:
     pruning = [f"{i}" for i in sorted(ts_prune, reverse=True)]
     logger.info(f"Pruning backups: {', '.join(pruning)}")
     if prune_archives:
-        cmd = ["borg", "delete"]
+        cmd = borg_cmd() + ["delete"]
         if dry_run:
             cmd.append("--dry-run")
         else:
@@ -1077,8 +1087,8 @@ def do_prune(dry_run: bool) -> None:
 
     logger.info(f"Compacting {cfg.BORG_REPO}")
     run_cmd(
-        [
-            "borg",
+        borg_cmd()
+        + [
             "compact",
             cfg.BORG_REPO,
         ]
@@ -1136,8 +1146,7 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
                 mount_dir = tmpdir / archive_name
 
                 os.makedirs(mount_dir)
-                cmd = [
-                    "borg",
+                cmd = borg_cmd() + [
                     "mount",
                     "-o",
                     "allow_other",
@@ -1405,7 +1414,6 @@ def main() -> None:
     command = args_dict.pop("command")
 
     initialize_borg_environment()
-    find_borg_bin()
 
     if command not in ["break-lock", "check-repo", "compact", "environment"]:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
