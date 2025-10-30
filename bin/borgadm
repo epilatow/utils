@@ -89,6 +89,7 @@ _BORG_REPO_HOSTKEY: str = ""
 # BACKUP_SETS = {
 #   $set1_name: {
 #       "create_options": ["opt1", ...],
+#       "excludes": ["pattern1", ...], # optional
 #       "paths": ["path1", ...]
 #   }
 # }
@@ -945,6 +946,8 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         create_args = set_cfg.get("create_options", [])
         create_args += ["--progress"] if progress else []
         create_args += ["--dry-run"] if dry_run else ["--stats"]
+        for e in set_cfg.get("excludes", []):
+            create_args += ["--exclude", e]
         archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}"
         archive = f"{cfg.BORG_REPO}::{archive_name}"
         logger.info(
