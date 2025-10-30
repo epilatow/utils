@@ -2,7 +2,7 @@
 
 # Run black, flake8, and mypy:
 #     uvx black ~/env/bin/borgadm
-#     uvx flake8 ~/env/bin/borgadm
+#     uvx flake8 --config $HOME/.flake8 ~/env/bin/borgadm
 #     uvx mypy ~/env/bin/borgadm
 
 from __future__ import annotations
@@ -26,13 +26,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import typing
 import unittest
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional, OrderedDict, Tuple
+from typing import Any, Callable, Optional, OrderedDict, Tuple, TextIO, cast
+
 from xml.dom import minidom
 from xml.etree import ElementTree
 
@@ -83,7 +85,13 @@ _PRUNE_KEEP_YEARLY: int = 2
 _BORG_REPO: str = ""
 _BORG_REPO_HOSTKEY: str = ""
 
-# Format: { $set1_name: "create_options": ["opt1", ...], "paths": ["path1", ...] }
+# Format:
+# BACKUP_SETS = {
+#   $set1_name: {
+#       "create_options": ["opt1", ...],
+#       "paths": ["path1", ...]
+#   }
+# }
 _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 
 
@@ -385,7 +393,11 @@ def check_permissions(path: Path, name: str) -> None:
 
 
 def run_cmd(
-    cmd: list[str], sudo: bool = False, errok: bool = False, **kwargs
+    cmd: list[str],
+    sudo: bool = False,
+    errok: bool = False,
+    allow_output: bool = False,
+    **kwargs,
 ) -> subprocess.CompletedProcess[Any]:
     slow_cmds = borg_cmd() + ["rsync"]
     timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
@@ -395,35 +407,72 @@ def run_cmd(
         cmd = ["sudo", "-n", "-E"] + cmd
     cmd_str = shlex.join(cmd)
     logger.debug(f"Running command: {cmd_str}")
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        bufsize=1,
         **kwargs,
     )
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    stdout = cast(TextIO, proc.stdout)
+    stderr = cast(TextIO, proc.stderr)
 
-    if result.stderr:
-        logger.debug(f"stderr:\n{result.stderr.strip()}")
+    def pump(src: TextIO, sink: TextIO, acc: io.StringIO) -> None:
+        while True:
+            chunk = src.readline()
+            if chunk == "":
+                break
+            acc.write(chunk)
+            if allow_output:
+                sink.write(chunk)
+                sink.flush()
 
-    if result.returncode != 0:
+    t_stdout = threading.Thread(
+        target=pump, args=(stdout, sys.stdout, stdout_buf), daemon=True
+    )
+    t_stdout.start()
+    t_stderr = threading.Thread(
+        target=pump, args=(stderr, sys.stderr, stderr_buf), daemon=True
+    )
+    t_stderr.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+    t_stdout.join()
+    t_stderr.join()
+
+    stdout_str = stdout_buf.getvalue()
+    stderr_str = stderr_buf.getvalue()
+
+    if stderr_str:
+        logger.debug(f"stderr:\n{stderr_str.strip()}")
+
+    if proc.returncode != 0:
         logger.error(
             "Command %s failed with exit code %s and stderr:\n%s",
             cmd_str,
-            result.returncode,
-            result.stderr.strip(),
+            proc.returncode,
+            stderr_str.strip(),
         )
         # Raise same error as check=True would
         if not errok:
             raise subprocess.CalledProcessError(
-                returncode=result.returncode,
-                cmd=result.args,
-                output=result.stdout,
-                stderr=result.stderr,
+                returncode=proc.returncode,
+                cmd=proc.args,
+                output=stdout_str,
+                stderr=stderr_str,
             )
 
-    return result
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode, stdout=stdout_str, stderr=stderr_str
+    )
 
 
 def start_ssh_agent() -> None:
@@ -461,23 +510,6 @@ def load_passphrase() -> str:
     check_permissions(cfg.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
     with open(cfg.BORG_PASSPHRASE_FILE, "r") as f:
         return f.read().strip()
-
-
-def create_backup(
-    archive_name: str, extra_args: list[str], dirs: list[str], dry_run: bool
-) -> None:
-    cfg = get_cfg()
-
-    archive = f"{cfg.BORG_REPO}::{archive_name}"
-    logger.info(f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})")
-    cmd = borg_cmd() + ["create"]
-    if dry_run:
-        cmd.append("--dry-run")
-    else:
-        cmd += ["--stats"]
-    cmd += extra_args + [archive] + [os.path.expanduser(d) for d in dirs]
-    run_cmd(cmd, cwd=cfg.BACKUP_ROOT)
-    logger.info(f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})")
 
 
 @functools.cache
@@ -834,13 +866,13 @@ def do_check_age() -> None:
     )
 
 
-def do_check_all() -> None:
+def do_check_all(progress: bool) -> None:
     do_check_age()
-    do_check_repo()
-    do_check_archives()
+    do_check_repo(progress)
+    do_check_archives(progress)
 
 
-def do_check_archives() -> None:
+def do_check_archives(progress: bool) -> None:
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
@@ -849,28 +881,25 @@ def do_check_archives() -> None:
     archives = list(backups.values())[0]
     for archive in archives:
         logger.info(f"Checking archive metadata: {archive}")
-        run_cmd(borg_cmd() + ["check", archive])
+        args = ["check", *(["--progress"] if progress else []), archive]
+        run_cmd(borg_cmd() + args, allow_output=progress)
 
 
-def do_check_repo() -> None:
+def do_check_repo(progress: bool) -> None:
     cfg = get_cfg()
     logger.info("Checking repo metadata.")
-    run_cmd(borg_cmd() + ["check", cfg.BORG_REPO])
+    args = ["check", *(["--progress"] if progress else []), cfg.BORG_REPO]
+    run_cmd(borg_cmd() + args, allow_output=progress)
 
 
-def do_compact() -> None:
+def do_compact(progress: bool) -> None:
     cfg = get_cfg()
     logger.info(f"Compacting repo: {cfg.BORG_REPO}")
-    run_cmd(
-        borg_cmd()
-        + [
-            "compact",
-            cfg.BORG_REPO,
-        ]
-    )
+    args = ["compact", *(["--progress"] if progress else []), cfg.BORG_REPO]
+    run_cmd(borg_cmd() + args, allow_output=progress)
 
 
-def do_create(dry_run: bool, no_prune: bool) -> None:
+def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
     cfg = get_cfg()
 
     def backup_set_tests(set_name: str) -> None:
@@ -913,18 +942,32 @@ def do_create(dry_run: bool, no_prune: bool) -> None:
             if not is_mountpoint(full_path):
                 logger.error(f"Missing backup mount: {full_path}")
                 sys.exit(1)
-        create_options = set_cfg.get("create_options", [])
-        paths = set_cfg["paths"]
-        create_backup(
-            f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}", create_options, paths, dry_run
+        create_args = set_cfg.get("create_options", [])
+        create_args += ["--progress"] if progress else []
+        create_args += ["--dry-run"] if dry_run else ["--stats"]
+        archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}"
+        archive = f"{cfg.BORG_REPO}::{archive_name}"
+        logger.info(
+            f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})"
+        )
+        cmd = (
+            borg_cmd()
+            + ["create"]
+            + create_args
+            + [archive]
+            + [os.path.expanduser(p) for p in set_cfg["paths"]]
+        )
+        run_cmd(cmd, cwd=cfg.BACKUP_ROOT, allow_output=progress)
+        logger.info(
+            f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})"
         )
 
     if not no_prune:
-        do_prune(dry_run=dry_run)
+        do_prune(dry_run=dry_run, progress=progress)
 
 
 def do_extract(
-    target_dir: Path, patterns: list[str], dry_run: bool, delete: bool
+    target_dir: Path, patterns: list[str], dry_run: bool, delete: bool, progress: bool
 ) -> None:
     backups = list_backups(latest=True)
     if not backups:
@@ -998,12 +1041,13 @@ def do_extract(
             logger.info(f"Extracting: {archive} to {target_dir}")
 
             cmd = borg_cmd() + ["extract"]
+            cmd += ["--progress"] if progress else []
             if dry_run:
                 cmd.append("--dry-run")
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
             cmd.append(archive)
-            run_cmd(cmd, cwd=target_dir)
+            run_cmd(cmd, cwd=target_dir, allow_output=progress)
 
     if cleanup_paths:
         delete_paths(target_dir, cleanup_paths, dry_run=dry_run)
@@ -1046,7 +1090,7 @@ def do_list(
             logger.info(f"{ts}{keep_tag}")
 
 
-def do_prune(dry_run: bool) -> None:
+def do_prune(dry_run: bool, progress: bool) -> None:
     cfg = get_cfg()
     partial_archives = [
         a.removeprefix(f"{cfg.BORG_REPO}::")
@@ -1056,13 +1100,14 @@ def do_prune(dry_run: bool) -> None:
     if partial_archives:
         logger.info(f"Pruning partial archives: {partial_archives}")
         cmd = borg_cmd() + ["delete"]
+        cmd += ["--progress"] if progress else []
         if dry_run:
             cmd.append("--dry-run")
         else:
             cmd.append("--stats")
         cmd.append(cfg.BORG_REPO)
         cmd += partial_archives
-        run_cmd(cmd)
+        run_cmd(cmd, allow_output=progress)
 
     archives = list_backups()
     ts_keep = ts_to_keep(set(archives.keys()))
@@ -1077,25 +1122,19 @@ def do_prune(dry_run: bool) -> None:
     logger.info(f"Pruning backups: {', '.join(pruning)}")
     if prune_archives:
         cmd = borg_cmd() + ["delete"]
+        cmd += ["--progress"] if progress else []
         if dry_run:
             cmd.append("--dry-run")
         else:
             cmd.append("--stats")
         cmd.append(cfg.BORG_REPO)
         cmd += prune_archives
-        run_cmd(cmd)
+        run_cmd(cmd, allow_output=progress)
 
-    logger.info(f"Compacting {cfg.BORG_REPO}")
-    run_cmd(
-        borg_cmd()
-        + [
-            "compact",
-            cfg.BORG_REPO,
-        ]
-    )
+    do_compact(progress)
 
 
-def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
+def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> None:
     if platform.system() != "Linux":
         logger.error("Rsync subcommand is only supported on linux")
         sys.exit(1)
@@ -1194,12 +1233,11 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool) -> None:
                 "--stats",
                 "--human-readable",
             ]
-            if delete:
-                cmd.append("--delete")
-            if dry_run:
-                cmd.append("--dry-run")
+            cmd += ["--progress"] if progress else []
+            cmd += ["--delete"] if delete else []
+            cmd += ["--dry-run"] if dry_run else []
             cmd += [merged.as_posix() + "/", target_dir.as_posix() + "/"]
-            run_cmd(cmd)
+            run_cmd(cmd, allow_output=progress)
             logger.info(f"Finished rsync to: {target_dir}")
         finally:
             # Cleanup root owned resources
@@ -1262,6 +1300,11 @@ def args_parser() -> argparse.ArgumentParser:
             "--dry-run", action="store_true", help="don't make any changes"
         )
 
+    def add_progress(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--progress", action="store_true", help="show progress information"
+        )
+
     def add_prune_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--keep-hourly", type=int, help="Number of hourly backups to keep"
@@ -1313,16 +1356,22 @@ def args_parser() -> argparse.ArgumentParser:
     add_seconds(check_age)
 
     check_all = add_parser("check-all", help="Run all checks")
+    add_progress(check_all)
     add_seconds(check_all)
 
-    add_parser("check-repo", help="Check repo metadata")
-    add_parser("check-archives", help="Check archive metadata")
+    check_repo = add_parser("check-repo", help="Check repo metadata")
+    add_progress(check_repo)
 
-    add_parser("compact", help="Check full backup metadata")
+    check_archives = add_parser("check-archives", help="Check archive metadata")
+    add_progress(check_archives)
+
+    compact = add_parser("compact", help="Check full backup metadata")
+    add_progress(compact)
 
     create = add_parser("create", help="Create full backup")
     create.add_argument("--no-prune", action="store_true", help="Skip backup pruning")
     add_dry_run(create)
+    add_progress(create)
     add_prune_args(create)
 
     extract = add_parser("extract", help="Extract latest full backup")
@@ -1337,6 +1386,7 @@ def args_parser() -> argparse.ArgumentParser:
     )
     add_delete(extract)
     add_dry_run(extract)
+    add_progress(extract)
 
     list_cmd = add_parser("list", help="List backups")
     list_cmd.add_argument(
@@ -1364,12 +1414,14 @@ def args_parser() -> argparse.ArgumentParser:
 
     prune = add_parser("prune", help="Prune partial and old backups")
     add_dry_run(prune)
+    add_progress(prune)
     add_prune_args(prune)
 
     rsync = add_parser("rsync", help="Rsync latest archive")
     add_target_dir(rsync)
     add_delete(rsync)
     add_dry_run(rsync)
+    add_progress(rsync)
 
     add_parser("environment", help="Display environment settings to run borg cli")
 
