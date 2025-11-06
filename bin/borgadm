@@ -2,7 +2,7 @@
 
 # Run black, flake8, and mypy:
 #     uvx black ~/env/bin/borgadm
-#     uvx flake8 --config $HOME/.flake8 ~/env/bin/borgadm
+#     uvx flake8 --max-line-length=88 --extend-ignore=E203,W503 ~/env/bin/borgadm
 #     uvx mypy ~/env/bin/borgadm
 
 from __future__ import annotations
@@ -1032,7 +1032,9 @@ def do_extract(
             f"Found {len(cleanup_paths)} paths to delete after archive extraction."
         )
 
-    lockfile = target_dir / f".{BASENAME}_target_dir.lock"
+    tdir_dirname = target_dir.parent
+    tdir_basename = target_dir.name
+    lockfile = tdir_dirname / f".{BASENAME}_{tdir_basename}.lock"
     with open(lockfile, "w") as lf:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1163,12 +1165,14 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> N
         sys.exit(1)
 
     logger.info(f"Rsync target dirctory: {target_dir}")
-    lockfile = target_dir / f".{BASENAME}_target_dir.lock"
-    tmpdir_prefix = f".{BASENAME}_rsync_{ts}_"
+    tdir_dirname = target_dir.parent
+    tdir_basename = target_dir.name
+    lockfile = tdir_dirname / f".{BASENAME}_{tdir_basename}.lock"
+    tmpdir_prefix = f".{BASENAME}_{tdir_basename}.tmp."
     with (
         open(lockfile, "w") as lf,
         tempfile.TemporaryDirectory(
-            dir=str(Path.home()),
+            dir=tdir_dirname,
             prefix=tmpdir_prefix,
         ) as tdir,
     ):
@@ -1240,7 +1244,11 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> N
             cmd += ["--delete"] if delete else []
             cmd += ["--dry-run"] if dry_run else []
             cmd += [merged.as_posix() + "/", target_dir.as_posix() + "/"]
-            run_cmd(cmd, allow_output=progress)
+            run_cmd(cmd, allow_output=progress, sudo=True)
+
+            # Record the version we extraced
+            (tdir_dirname / f".{BASENAME}_{tdir_basename}.ts").write_text(f"{ts}")
+
             logger.info(f"Finished rsync to: {target_dir}")
         finally:
             # Cleanup root owned resources
