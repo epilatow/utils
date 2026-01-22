@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:  # Run on all branches including main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Run borgadm self-test
+        run: bin/borgadm self-test
+
+      - name: Run dotfiles self-test
+        run: bin/dotfiles self-test
+
+      - name: Run secure-archiver self-test
+        run: bin/secure-archiver self-test
+
+      - name: Run all tests directly with pytest
+        run: uvx pytest -p no:cacheprovider tests/
