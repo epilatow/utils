@@ -1,0 +1,885 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_dotfiles.py
+# Always run the `self-test` subcommand after making modifications.
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import List, Optional, Set
+
+# =============================================================================
+# DOTFILES DESIGN
+# =============================================================================
+#
+# This tool manages dotfiles by creating symlinks from $HOME to files in
+# "dotfile directories". Each file in a dotfile directory gets a
+# corresponding dotfile symlink in $HOME with a "." prefix.
+#
+# SYMLINK STRUCTURE:
+#   Given a dotfile directory containing:
+#     dotfile1
+#     dir1/dir2/dotfile2
+#     dotfile_symlink -> dotfile1
+#
+#   Installing creates:
+#     $HOME/.dotfile1 -> $RELATIVE_DOTFILE_DIR/dotfile1
+#     $HOME/.dir1/dir2/dotfile2 -> $RELATIVE_DOTFILE_DIR/dir1/dir2/dotfile2
+#     $HOME/.dotfile_symlink -> $RELATIVE_DOTFILE_DIR/dotfile_symlink
+#
+#   All symlinks are relative paths for portability.
+#
+# TRACKING:
+#   Installed directories are tracked in ~/.dotfiles.installed, one
+#   absolute path per line.
+#
+# CONFLICTS:
+#   A conflict occurs when a target path exists but doesn't point to the
+#   expected location. With --force, conflicting symlinks are replaced.
+#   Regular files/directories are never removed by --force.
+#
+# =============================================================================
+
+INSTALLED_FILE = Path.home() / ".dotfiles.installed"
+
+# Configure logging
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# EXCEPTIONS
+# =============================================================================
+
+
+class MissingDotfilesDirectory(RuntimeError):
+    """Raised when a dotfile directory does not exist or is invalid."""
+
+    pass
+
+
+class TestError(RuntimeError):
+    pass
+
+
+class UsageError(RuntimeError):
+    pass
+
+
+# =============================================================================
+# STATUS ENUM
+# =============================================================================
+
+
+class DotfileStatus(Enum):
+    """Status of a dotfile during operations."""
+
+    FILE_CONFLICT = "file-conflict"
+    LINK_CONFLICT = "link-conflict"
+    OK = "ok"
+    MISSING = "missing"
+    INSTALLED = "installed"
+    REMOVED = "removed"
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+
+@dataclass
+class DotfileEntry:
+    """Represents a single dotfile entry."""
+
+    relative_path: Path  # Path relative to dotfile directory
+    dotfile_dir: Path  # Absolute path to dotfile directory
+
+    @property
+    def source_path(self) -> Path:
+        """Absolute path to the source file in dotfile directory."""
+        return self.dotfile_dir / self.relative_path
+
+    @property
+    def target_path(self) -> Path:
+        """Absolute path to the target symlink in $HOME."""
+        # Add "." prefix to top-level entry
+        parts = self.relative_path.parts
+        dotted_parts = ("." + parts[0],) + parts[1:]
+        return Path.home() / Path(*dotted_parts)
+
+    def compute_relative_symlink(self) -> Path:
+        """Compute relative path from target to source."""
+        target_dir = self.target_path.parent
+        return Path(os.path.relpath(self.source_path, target_dir))
+
+
+@dataclass
+class OperationResult:
+    """Result of a dotfile operation."""
+
+    entry: DotfileEntry
+    status: DotfileStatus
+
+
+# =============================================================================
+# INSTALLED DIRECTORIES MANAGEMENT
+# =============================================================================
+
+
+def load_installed_directories() -> List[Path]:
+    """Load list of installed dotfile directories."""
+    if not INSTALLED_FILE.exists():
+        return []
+
+    directories: List[Path] = []
+    content = INSTALLED_FILE.read_text(encoding="utf-8")
+    for line in content.strip().split("\n"):
+        line = line.strip()
+        if line:
+            directories.append(Path(line))
+    return directories
+
+
+def save_installed_directories(directories: List[Path]) -> None:
+    """Save list of installed dotfile directories."""
+    content = "\n".join(str(d) for d in directories)
+    if content:
+        content += "\n"
+    INSTALLED_FILE.write_text(content, encoding="utf-8")
+
+
+def add_installed_directory(directory: Path) -> None:
+    """Add a directory to the installed list if not already present."""
+    directories = load_installed_directories()
+    abs_dir = directory.resolve()
+    if abs_dir not in directories:
+        directories.append(abs_dir)
+        save_installed_directories(directories)
+
+
+def remove_installed_directory(directory: Path) -> None:
+    """Remove a directory from the installed list."""
+    directories = load_installed_directories()
+    abs_dir = directory.resolve()
+    if abs_dir in directories:
+        directories.remove(abs_dir)
+        save_installed_directories(directories)
+
+
+# =============================================================================
+# DOTFILE DISCOVERY
+# =============================================================================
+
+
+# Version control directories to skip when discovering dotfiles
+VCS_DIRS = {".git", ".hg"}
+
+# Ignore file names to load patterns from
+IGNORE_FILES = {".gitignore", ".hgignore"}
+
+
+def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
+    """
+    Load ignore patterns from .gitignore and .hgignore files.
+
+    Patterns are simple glob patterns (supports *, ?, []).
+    Lines starting with # are comments.
+    Empty lines are skipped.
+    Negation patterns (!) are not supported.
+
+    Returns:
+        Set of glob patterns to ignore.
+    """
+    patterns: Set[str] = set()
+
+    for ignore_file in IGNORE_FILES:
+        ignore_path = dotfile_dir / ignore_file
+        if ignore_path.exists() and ignore_path.is_file():
+            try:
+                content = ignore_path.read_text(encoding="utf-8")
+                for line in content.splitlines():
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith("#"):
+                        continue
+                    # Skip negation patterns (not supported)
+                    if line.startswith("!"):
+                        continue
+                    patterns.add(line)
+            except OSError:
+                # If we can't read the file, skip it
+                pass
+
+    return patterns
+
+
+def matches_ignore_pattern(path: Path, patterns: Set[str]) -> bool:
+    """
+    Check if a path matches any of the ignore patterns.
+
+    The path is checked against patterns using fnmatch.
+    Both the full path and the filename are checked.
+
+    Args:
+        path: Relative path to check
+        patterns: Set of glob patterns
+
+    Returns:
+        True if the path matches any pattern.
+    """
+    path_str = str(path)
+    filename = path.name
+
+    for pattern in patterns:
+        # Check if pattern matches the filename
+        if fnmatch.fnmatch(filename, pattern):
+            return True
+        # Check if pattern matches the full relative path
+        if fnmatch.fnmatch(path_str, pattern):
+            return True
+        # Check if pattern matches any path component
+        for part in path.parts:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+
+    return False
+
+
+def discover_dotfiles(dotfile_dir: Path) -> List[DotfileEntry]:
+    """
+    Discover all dotfiles in a dotfile directory.
+
+    This finds all files and symlinks (but not directories) recursively,
+    skipping:
+    - Version control directories (.git, .hg)
+    - Root-level dotfiles (files starting with '.' in the repo root)
+    - Files matching patterns in .gitignore or .hgignore
+
+    Returns DotfileEntry objects for each discovered item.
+
+    Raises:
+        MissingDotfilesDirectory: If the directory doesn't exist or isn't valid.
+    """
+    if not dotfile_dir.exists():
+        raise MissingDotfilesDirectory(
+            f"Dotfile directory does not exist: {dotfile_dir}"
+        )
+    if not dotfile_dir.is_dir():
+        raise MissingDotfilesDirectory(f"Not a directory: {dotfile_dir}")
+
+    abs_dotfile_dir = dotfile_dir.resolve()
+    entries: List[DotfileEntry] = []
+
+    # Load ignore patterns from .gitignore and .hgignore
+    ignore_patterns = load_ignore_patterns(abs_dotfile_dir)
+
+    for item in abs_dotfile_dir.rglob("*"):
+        # Include files and symlinks, but not directories
+        # (symlinks are included even if they point to directories)
+        if item.is_file() or item.is_symlink():
+            relative = item.relative_to(abs_dotfile_dir)
+            # Skip files inside version control directories
+            if relative.parts[0] in VCS_DIRS:
+                continue
+            # Skip root-level dotfiles (files starting with '.')
+            if len(relative.parts) == 1 and relative.name.startswith("."):
+                continue
+            # Skip files matching ignore patterns
+            if matches_ignore_pattern(relative, ignore_patterns):
+                continue
+            entries.append(
+                DotfileEntry(
+                    relative_path=relative, dotfile_dir=abs_dotfile_dir
+                )
+            )
+
+    # Sort for consistent output
+    entries.sort(key=lambda e: str(e.relative_path))
+    return entries
+
+
+# =============================================================================
+# DOTFILE OPERATIONS
+# =============================================================================
+
+
+def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
+    """
+    Check the current status of a dotfile entry.
+
+    Returns:
+        OK - if correctly linked
+        MISSING - if target doesn't exist
+        FILE_CONFLICT - if target is a regular file or directory
+        LINK_CONFLICT - if target is a symlink to wrong location
+    """
+    target = entry.target_path
+
+    if not target.exists() and not target.is_symlink():
+        return DotfileStatus.MISSING
+
+    if target.is_symlink():
+        # Check if it points to the correct location
+        try:
+            current = Path(os.readlink(target))
+        except OSError:
+            return DotfileStatus.LINK_CONFLICT
+
+        # Resolve both to compare
+        try:
+            current_resolved = (target.parent / current).resolve()
+            expected_resolved = entry.source_path.resolve()
+            if current_resolved == expected_resolved:
+                return DotfileStatus.OK
+        except OSError:
+            pass
+        return DotfileStatus.LINK_CONFLICT
+
+    # It's a regular file or directory
+    return DotfileStatus.FILE_CONFLICT
+
+
+def install_dotfile(
+    entry: DotfileEntry,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+) -> OperationResult:
+    """
+    Install a single dotfile.
+
+    Args:
+        entry: The dotfile entry to install
+        dry_run: If True, don't make any changes
+        force: If True, replace conflicting symlinks (not files)
+
+    Returns:
+        OperationResult with appropriate status
+    """
+    status = check_dotfile_status(entry)
+
+    if status == DotfileStatus.OK:
+        return OperationResult(entry=entry, status=DotfileStatus.OK)
+
+    if status == DotfileStatus.FILE_CONFLICT:
+        return OperationResult(entry=entry, status=DotfileStatus.FILE_CONFLICT)
+
+    if status == DotfileStatus.LINK_CONFLICT:
+        if not force:
+            return OperationResult(
+                entry=entry, status=DotfileStatus.LINK_CONFLICT
+            )
+        # Force mode: remove the conflicting symlink
+        if not dry_run:
+            entry.target_path.unlink()
+        # Continue to install
+
+    # MISSING or (LINK_CONFLICT with force) - proceed with installation
+    if not dry_run:
+        # Ensure parent directory exists
+        entry.target_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create relative symlink
+        relative_link = entry.compute_relative_symlink()
+        entry.target_path.symlink_to(relative_link)
+
+    return OperationResult(entry=entry, status=DotfileStatus.INSTALLED)
+
+
+def remove_dotfile(
+    entry: DotfileEntry,
+    *,
+    dry_run: bool = False,
+) -> OperationResult:
+    """
+    Remove a single dotfile.
+
+    Only removes symlinks that point to the correct source.
+    Leaves invalid/conflicting dotfiles alone.
+
+    Args:
+        entry: The dotfile entry to remove
+        dry_run: If True, don't make any changes
+
+    Returns:
+        OperationResult with appropriate status
+    """
+    status = check_dotfile_status(entry)
+
+    if status == DotfileStatus.MISSING:
+        # Already gone, nothing to do
+        return OperationResult(entry=entry, status=DotfileStatus.MISSING)
+
+    if status == DotfileStatus.OK:
+        # Correctly linked, safe to remove
+        if not dry_run:
+            entry.target_path.unlink()
+            # Remove empty parent directories up to $HOME
+            _cleanup_empty_parents(entry.target_path.parent)
+        return OperationResult(entry=entry, status=DotfileStatus.REMOVED)
+
+    # FILE_CONFLICT or LINK_CONFLICT - leave alone
+    return OperationResult(entry=entry, status=status)
+
+
+def _cleanup_empty_parents(directory: Path) -> None:
+    """Remove empty parent directories up to but not including $HOME."""
+    home = Path.home()
+    current = directory
+    while current != home and current.exists():
+        try:
+            current.rmdir()  # Only succeeds if empty
+            current = current.parent
+        except OSError:
+            break
+
+
+def audit_dotfile(entry: DotfileEntry) -> OperationResult:
+    """
+    Audit a single dotfile.
+
+    Returns the current status without making any changes.
+    """
+    status = check_dotfile_status(entry)
+    return OperationResult(entry=entry, status=status)
+
+
+# =============================================================================
+# DIRECTORY OPERATIONS
+# =============================================================================
+
+
+def process_directory(
+    dotfile_dir: Path,
+    operation: str,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+) -> List[OperationResult]:
+    """
+    Process all dotfiles in a directory.
+
+    Args:
+        dotfile_dir: Path to dotfile directory
+        operation: One of "install", "remove", "audit"
+        dry_run: If True, don't make any changes
+        force: If True, replace conflicting symlinks (install only)
+
+    Returns:
+        List of OperationResult objects
+    """
+    entries = discover_dotfiles(dotfile_dir)
+    results: List[OperationResult] = []
+
+    for entry in entries:
+        if operation == "install":
+            result = install_dotfile(entry, dry_run=dry_run, force=force)
+        elif operation == "remove":
+            result = remove_dotfile(entry, dry_run=dry_run)
+        elif operation == "audit":
+            result = audit_dotfile(entry)
+        else:
+            raise ValueError(f"Unknown operation: {operation}")
+        results.append(result)
+
+    return results
+
+
+def log_results(dotfile_dir: Path, results: List[OperationResult]) -> None:
+    """Log the results of processing a directory."""
+    logger.info("%s", dotfile_dir)
+    for result in results:
+        logger.info(
+            "  %s: %s",
+            result.entry.relative_path,
+            result.status.value,
+        )
+
+
+def has_conflicts(results: List[OperationResult]) -> bool:
+    """Check if any results indicate a conflict."""
+    conflict_statuses = {
+        DotfileStatus.FILE_CONFLICT,
+        DotfileStatus.LINK_CONFLICT,
+    }
+    return any(r.status in conflict_statuses for r in results)
+
+
+def has_missing(results: List[OperationResult]) -> bool:
+    """Check if any results indicate missing dotfiles."""
+    return any(r.status == DotfileStatus.MISSING for r in results)
+
+
+# =============================================================================
+# SUBCOMMAND IMPLEMENTATIONS
+# =============================================================================
+
+
+def do_install(
+    directory: Optional[Path],
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+) -> int:
+    """
+    Install dotfiles.
+
+    Args:
+        directory: Specific directory to install, or None for all installed
+        dry_run: If True, don't make any changes
+        force: If True, replace conflicting symlinks
+
+    Returns:
+        0 for success, 1 for conflicts
+    """
+    if directory is not None:
+        # Install from specific directory
+        directories = [directory.resolve()]
+        # Record it (unless dry-run)
+        if not dry_run:
+            add_installed_directory(directory)
+    else:
+        # Install from all recorded directories
+        directories = load_installed_directories()
+        if not directories:
+            logger.info("No dotfile directories installed.")
+            return 0
+
+    had_conflicts = False
+    for dotfile_dir in directories:
+        if not dotfile_dir.exists():
+            raise MissingDotfilesDirectory(
+                f"Dotfile directory does not exist: {dotfile_dir}"
+            )
+
+        results = process_directory(
+            dotfile_dir, "install", dry_run=dry_run, force=force
+        )
+        log_results(dotfile_dir, results)
+        if has_conflicts(results):
+            had_conflicts = True
+
+    return 1 if had_conflicts else 0
+
+
+def do_remove(
+    directory: Optional[Path],
+    *,
+    dry_run: bool = False,
+) -> int:
+    """
+    Remove dotfiles.
+
+    Args:
+        directory: Specific directory to remove, or None for all installed
+        dry_run: If True, don't make any changes
+
+    Returns:
+        0 for success
+    """
+    if directory is not None:
+        directories = [directory.resolve()]
+    else:
+        directories = load_installed_directories()
+        if not directories:
+            logger.info("No dotfile directories installed.")
+            return 0
+
+    for dotfile_dir in directories:
+        if not dotfile_dir.exists():
+            raise MissingDotfilesDirectory(
+                f"Dotfile directory does not exist: {dotfile_dir}"
+            )
+
+        results = process_directory(dotfile_dir, "remove", dry_run=dry_run)
+        log_results(dotfile_dir, results)
+
+        # Remove from installed list (unless dry-run)
+        if not dry_run:
+            remove_installed_directory(dotfile_dir)
+
+    return 0
+
+
+def do_audit(directory: Optional[Path]) -> int:
+    """
+    Audit dotfiles.
+
+    Args:
+        directory: Specific directory to audit, or None for all installed
+
+    Returns:
+        0 for all OK, 1 for conflicts or missing
+    """
+    if directory is not None:
+        directories = [directory.resolve()]
+    else:
+        directories = load_installed_directories()
+        if not directories:
+            return 0
+
+    had_issues = False
+    for dotfile_dir in directories:
+        if not dotfile_dir.exists():
+            # Skip non-existent directories silently
+            continue
+
+        results = process_directory(dotfile_dir, "audit")
+        log_results(dotfile_dir, results)
+        if has_conflicts(results) or has_missing(results):
+            had_issues = True
+
+    return 1 if had_issues else 0
+
+
+def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
+    """
+    Run tests using pytest via uvx.
+
+    Args:
+        verbose: Enable verbose output
+        coverage: Run with coverage report
+
+    Raises:
+        TestError: If any tests fail or pytest encounters an error.
+    """
+    # Repository root is parent of bin/ where this script lives
+    repo_root = Path(__file__).parent.parent
+    tests_dir = repo_root / "tests"
+    bin_dir = repo_root / "bin"
+
+    # Build uvx command
+    cmd = ["uvx", "--with", "pytest"]
+    if coverage:
+        cmd.extend(["--with", "pytest-cov"])
+
+    cmd.extend(
+        [
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            str(tests_dir / "test_dotfiles.py"),
+        ]
+    )
+
+    if verbose:
+        cmd.append("-v")
+    if coverage:
+        htmlcov_dir = Path(tempfile.gettempdir()) / "dotfiles_htmlcov"
+        cmd.extend(
+            [
+                "--cov=dotfiles",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{htmlcov_dir}",
+            ]
+        )
+
+    # Run pytest with PYTHONDONTWRITEBYTECODE=1 to prevent __pycache__
+    # Add bin/ to PYTHONPATH so coverage can find the dotfiles module
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = str(bin_dir)
+    if coverage:
+        # Redirect .coverage data file to temp directory
+        env["COVERAGE_FILE"] = str(
+            Path(tempfile.gettempdir()) / "dotfiles.coverage"
+        )
+    cp = subprocess.run(
+        cmd,
+        check=False,
+        env=env,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.stdout:
+        print(cp.stdout, end="")
+    if cp.stderr:
+        sys.stderr.write(cp.stderr)
+
+    if cp.returncode != 0:
+        raise TestError("Tests failed")
+
+
+# =============================================================================
+# ARGUMENT PARSER
+# =============================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build and return the argument parser.
+
+    Returns:
+        Configured ArgumentParser instance
+    """
+    parser = argparse.ArgumentParser(
+        description="Manage dotfiles by creating symlinks from $HOME",
+        epilog="""\
+exit codes:
+  0  Success
+  1  Conflicts or missing dotfiles (install/audit result)
+  2  Usage/argument error
+  3  Missing dotfiles directory
+  4  Other errors (test failures, etc.)
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    # Install subcommand
+    install_parser = subparsers.add_parser(
+        "install", help="Install dotfiles from a directory"
+    )
+    install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    install_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Replace conflicting symlinks (not files)",
+    )
+    install_parser.add_argument(
+        "directory",
+        type=Path,
+        nargs="?",
+        help="Directory containing dotfiles to install",
+    )
+
+    # Remove subcommand
+    remove_parser = subparsers.add_parser(
+        "remove", help="Remove installed dotfiles"
+    )
+    remove_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    remove_parser.add_argument(
+        "directory",
+        type=Path,
+        nargs="?",
+        help="Directory whose dotfiles should be removed",
+    )
+
+    # Audit subcommand
+    audit_parser = subparsers.add_parser(
+        "audit", help="Audit installed dotfiles"
+    )
+    audit_parser.add_argument(
+        "directory",
+        type=Path,
+        nargs="?",
+        help="Directory to audit",
+    )
+
+    # Self-test subcommand
+    test_parser = subparsers.add_parser("self-test", help="Run tests")
+    test_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose test output",
+    )
+    test_parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Run with coverage report",
+    )
+
+    return parser
+
+
+# =============================================================================
+# MAIN AND CLI
+# =============================================================================
+
+
+def main(args: argparse.Namespace) -> int:
+    """
+    Dispatch to subcommand based on parsed arguments.
+
+    Returns:
+        Exit code (0 for success, non-zero for errors/conflicts)
+    """
+    # Handle missing subcommand
+    if not args.command:
+        raise UsageError("No subcommand specified. Use --help for usage.")
+
+    match args.command:
+        case "install":
+            return do_install(
+                args.directory,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+        case "remove":
+            return do_remove(
+                args.directory,
+                dry_run=args.dry_run,
+            )
+        case "audit":
+            return do_audit(args.directory)
+        case "self-test":
+            do_self_test(verbose=args.verbose, coverage=args.coverage)
+            return 0
+        case _:
+            raise UsageError(f"Unknown command '{args.command}'")
+
+
+def cli() -> int:
+    """
+    CLI entry point with argument parsing and exception handling.
+
+    Exit codes:
+        0: Success
+        1: Conflicts or missing dotfiles
+        2: Usage/argument error
+        3: Missing dotfiles directory
+        4: Other errors (test failures, etc.)
+    """
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        # argparse calls sys.exit(0) for --help, sys.exit(2) for errors
+        if e.code == 0:
+            return 0
+        return 2
+    try:
+        return main(args)
+    except UsageError as e:
+        logger.error("ERROR: %s", e)
+        return 2
+    except MissingDotfilesDirectory as e:
+        logger.error("ERROR: %s", e)
+        return 3
+    except TestError as e:
+        logger.error("ERROR: %s", e)
+        return 4
+    except Exception as e:
+        logger.error("ERROR: %s", e)
+        return 4
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
