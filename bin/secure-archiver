@@ -1,0 +1,1368 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_secure_archiver.py
+# Always run the `self-test` subcommand after making modifications.
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import hashlib
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+
+try:
+    import tomllib
+except Exception:
+    raise RuntimeError("Python 3.11+ required (tomllib not available).")
+
+
+# =============================================================================
+# ARCHIVE DESIGN
+# =============================================================================
+#
+# This tool creates encrypted 7z archives with passwords stored in 1Password.
+# Each archive has a corresponding readme file with instructions for opening it.
+#
+# FILE NAMING:
+#   Every archive and readme includes a timestamp in its filename:
+#     - Archive: {name}.{YYYYMMDD_HHMMSS}.7z
+#     - Readme:  {name}.{YYYYMMDD_HHMMSS}.txt
+#
+#   The timestamp is generated once per run, so all archives created in a
+#   single run share the same timestamp. Each archive and its readme share
+#   the same timestamp.
+#
+# UPDATE DETECTION:
+#   Each archive contains a manifest.json with SHA256 hashes of all files.
+#   To detect changes, we:
+#     1. Find the latest existing archive via find_latest_archive()
+#     2. Extract its manifest and compare to the new manifest
+#     3. Only publish if contents changed (or --force-update is set)
+#
+# PUBLISHING:
+#   When publishing, we create both the .7z and .txt files with the same
+#   timestamp. If either file already exists with that timestamp, it's an
+#   error (indicates concurrent runs of the script).
+#
+# PRUNING:
+#   Old archives are pruned to keep only the N most recent (keep_revisions).
+#   When an archive is pruned, its corresponding readme is also deleted.
+#
+# =============================================================================
+
+DEFAULT_CONFIG_NAME = "secure_archiver.toml"
+
+EXAMPLE_CONFIG = """\
+# Example configuration for secure_archiver
+#
+# Run: secure_archiver create --config <this-file>
+
+[general]
+# Required: Directory where archives will be written. Supports ~ and env vars.
+output_dir = "~/secure_archives"
+
+# Optional: Number of old archive versions to keep (default: 3)
+keep_revisions = 3
+
+# Optional: Content to write to README.txt in the output directory.
+# Use triple quotes for multi-line text. The file is updated on each run.
+readme = \"\"\"
+This directory contains encrypted archives.
+See each .txt file for instructions on opening the corresponding .7z archive.
+\"\"\"
+
+# Each [archive.NAME] section defines one encrypted archive.
+# NAME becomes part of the output filename: NAME.YYYYMMDD_HHMMSS.7z
+
+[archive.Example_Archive]
+# Required: 1Password reference to the encryption password
+op_password = "op://Vault/Item/password"
+
+# Required: Description included in the readme file
+description = \"\"\"
+This archive contains important documents.
+The readme will include instructions for opening the .7z file.
+\"\"\"
+
+# Required: List of files to include in the archive
+include = [
+  # Include files matching a glob pattern:
+  { path = "~/Documents/*.pdf" },
+
+  # Include a directory (non-recursive by default):
+  { path = "~/Documents/folder" },
+
+  # Include a directory recursively:
+  { path = "~/Documents/nested", recurse = true },
+
+  # Include only the latest file matching a pattern (by name sort):
+  { path = "~/Backups/backup_*.tar.gz", latest = true },
+
+  # Fetch content from 1Password and save as a file:
+  { op_ref = "op://Vault/Item/notes", filename = "secrets.txt" },
+
+  # Store files in a subdirectory within the archive using 'dir':
+  { path = "~/Work/*.doc", dir = "work_docs" },
+  { op_ref = "op://Vault/Item/key", filename = "key.pem", dir = "certs" },
+]
+"""
+
+
+# =============================================================================
+# CONFIG DATACLASSES
+# =============================================================================
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+class TestError(RuntimeError):
+    pass
+
+
+class UsageError(RuntimeError):
+    pass
+
+
+@dataclass
+class GeneralConfig:
+    """Configuration for the [general] section."""
+
+    output_dir: str
+    keep_revisions: int = 3
+    readme: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: Any, errors: List[str]) -> Optional["GeneralConfig"]:
+        """Parse and validate [general] section from dict."""
+        if d is None:
+            errors.append("[general] section is required")
+            return None
+        if not isinstance(d, dict):
+            errors.append("[general] must be a table")
+            return None
+
+        output_dir = d.get("output_dir", "")
+        if not isinstance(output_dir, str) or output_dir.strip() == "":
+            errors.append("general.output_dir is required")
+            output_dir = ""
+
+        keep_revisions = d.get("keep_revisions", 3)
+        if not isinstance(keep_revisions, int) or keep_revisions < 0:
+            errors.append("general.keep_revisions must be a non-negative int")
+            keep_revisions = 3
+
+        readme = d.get("readme")
+        if readme is not None:
+            if not isinstance(readme, str):
+                errors.append("general.readme must be a string")
+                readme = None
+
+        if errors:
+            return None
+        return cls(
+            output_dir=output_dir, keep_revisions=keep_revisions, readme=readme
+        )
+
+
+@dataclass
+class PathIncludeEntry:
+    """Include entry for filesystem paths."""
+
+    path: str
+    recurse: bool = False
+    latest: bool = False
+    dir: Optional[str] = None
+
+    @classmethod
+    def from_dict(
+        cls, d: Dict[str, Any], prefix: str, errors: List[str]
+    ) -> Optional["PathIncludeEntry"]:
+        """Parse and validate a path include entry."""
+        valid_keys = {"path", "recurse", "latest", "dir"}
+        invalid_keys = set(d.keys()) - valid_keys
+        if invalid_keys:
+            errors.append(
+                f"{prefix} has invalid keys for path entry: "
+                f"{sorted(invalid_keys)}"
+            )
+            return None
+
+        path_val = d.get("path")
+        if not isinstance(path_val, str) or path_val.strip() == "":
+            errors.append(f"{prefix} path must be a non-empty string")
+            return None
+
+        dir_val = d.get("dir")
+        if dir_val is not None:
+            if not isinstance(dir_val, str) or dir_val.strip() == "":
+                errors.append(f"{prefix} dir must be a non-empty string")
+                return None
+            dir_val = dir_val.strip()
+
+        return cls(
+            path=path_val,
+            recurse=bool(d.get("recurse", False)),
+            latest=bool(d.get("latest", False)),
+            dir=dir_val,
+        )
+
+
+@dataclass
+class OpRefIncludeEntry:
+    """Include entry for 1Password references."""
+
+    op_ref: str
+    filename: str
+    dir: Optional[str] = None
+
+    @classmethod
+    def from_dict(
+        cls, d: Dict[str, Any], prefix: str, errors: List[str]
+    ) -> Optional["OpRefIncludeEntry"]:
+        """Parse and validate an op_ref include entry."""
+        valid_keys = {"op_ref", "filename", "dir"}
+        invalid_keys = set(d.keys()) - valid_keys
+        if invalid_keys:
+            errors.append(
+                f"{prefix} has invalid keys for op_ref entry: "
+                f"{sorted(invalid_keys)}"
+            )
+            return None
+
+        op_ref_val = d.get("op_ref")
+        if not isinstance(op_ref_val, str) or op_ref_val.strip() == "":
+            errors.append(f"{prefix} op_ref must be a non-empty string")
+            return None
+
+        filename_val = d.get("filename")
+        if not isinstance(filename_val, str) or filename_val.strip() == "":
+            errors.append(f"{prefix} filename is required with op_ref")
+            return None
+
+        dir_val = d.get("dir")
+        if dir_val is not None:
+            if not isinstance(dir_val, str) or dir_val.strip() == "":
+                errors.append(f"{prefix} dir must be a non-empty string")
+                return None
+            dir_val = dir_val.strip()
+
+        return cls(op_ref=op_ref_val, filename=filename_val, dir=dir_val)
+
+
+IncludeEntry = Union[PathIncludeEntry, OpRefIncludeEntry]
+
+
+@dataclass
+class ArchiveConfig:
+    """Configuration for an [archive.*] section."""
+
+    op_password: str
+    description: str
+    include: List[IncludeEntry]
+
+    @classmethod
+    def from_dict(
+        cls, d: Dict[str, Any], name: str, errors: List[str]
+    ) -> Optional["ArchiveConfig"]:
+        """Parse and validate an archive section."""
+        prefix = f"[archive.{name}]"
+
+        op_password = d.get("op_password", "")
+        if not isinstance(op_password, str) or op_password.strip() == "":
+            errors.append(f"{prefix} op_password is required")
+
+        description = d.get("description", "")
+        if not isinstance(description, str) or description.strip() == "":
+            errors.append(f"{prefix} description is required")
+
+        include_list = d.get("include")
+        if include_list is None:
+            errors.append(f"{prefix} include is required")
+            return None
+        if not isinstance(include_list, list):
+            errors.append(f"{prefix} include must be an array")
+            return None
+        if len(include_list) == 0:
+            errors.append(f"{prefix} include must not be empty")
+            return None
+
+        include: List[IncludeEntry] = []
+        for i, entry in enumerate(include_list):
+            entry_prefix = f"{prefix} include[{i}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{entry_prefix} must be a table")
+                continue
+
+            has_path = "path" in entry
+            has_op_ref = "op_ref" in entry
+
+            if not has_path and not has_op_ref:
+                errors.append(f"{entry_prefix} must have 'path' or 'op_ref'")
+            elif has_path and has_op_ref:
+                errors.append(
+                    f"{entry_prefix} cannot have both 'path' and 'op_ref'"
+                )
+            elif has_path:
+                path_entry = PathIncludeEntry.from_dict(
+                    entry, entry_prefix, errors
+                )
+                if path_entry:
+                    include.append(path_entry)
+            else:
+                op_ref_entry = OpRefIncludeEntry.from_dict(
+                    entry, entry_prefix, errors
+                )
+                if op_ref_entry:
+                    include.append(op_ref_entry)
+
+        if errors:
+            return None
+        return cls(
+            op_password=op_password,
+            description=description,
+            include=include,
+        )
+
+
+@dataclass
+class Config:
+    """Top-level configuration."""
+
+    general: GeneralConfig
+    archives: Dict[str, ArchiveConfig]
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any], config_path: Path) -> "Config":
+        """
+        Parse and validate config from dict.
+
+        Raises ConfigError if validation fails.
+        """
+        errors: List[str] = []
+
+        general = GeneralConfig.from_dict(d.get("general"), errors)
+
+        archives_dict = d.get("archive")
+        if archives_dict is None or len(archives_dict) == 0:
+            errors.append("At least one [archive.<NAME>] section is required")
+            archives: Dict[str, ArchiveConfig] = {}
+        elif not isinstance(archives_dict, dict):
+            errors.append("[archive] must contain sub-tables")
+            archives = {}
+        else:
+            archives = {}
+            for name, archive_d in archives_dict.items():
+                if not isinstance(archive_d, dict):
+                    errors.append(f"[archive.{name}] must be a table")
+                    continue
+                parsed = ArchiveConfig.from_dict(archive_d, name, errors)
+                if parsed:
+                    archives[name] = parsed
+
+        if errors:
+            msg = f"Config validation failed ({config_path}):\n"
+            msg += "\n".join(f"  - {err}" for err in errors)
+            raise ConfigError(msg)
+
+        assert general is not None  # errors would have been raised
+        return cls(general=general, archives=archives)
+
+
+class CollisionError(RuntimeError):
+    pass
+
+
+def eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ConfigError(msg)
+
+
+def run_cmd(
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(cmd),
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+        env=env,
+    )
+
+
+def ensure_tools() -> None:
+    for tool in ("op", "7zz"):
+        if shutil.which(tool) is None:
+            raise RuntimeError(f"Required tool not found in PATH: {tool}")
+
+
+def op_read(secret_ref: str) -> str:
+    cp = run_cmd(["op", "read", secret_ref])
+    return cp.stdout.rstrip("\n")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_config(explicit_path: Optional[Path] = None) -> Path:
+    """
+    Find config file with priority: explicit > CWD > home dotfile.
+
+    Args:
+        explicit_path: Explicitly provided config path (highest priority)
+
+    Returns:
+        Path to config file
+
+    Raises:
+        ConfigError: If no config file found
+    """
+    if explicit_path:
+        if not explicit_path.exists():
+            raise ConfigError(f"Config file not found: {explicit_path}")
+        return explicit_path
+
+    # Check current working directory
+    cwd_config = Path.cwd() / DEFAULT_CONFIG_NAME
+    if cwd_config.exists():
+        return cwd_config
+
+    # Check home directory dotfile
+    dotfile_path = Path.home() / f".{DEFAULT_CONFIG_NAME}"
+    if dotfile_path.exists():
+        return dotfile_path
+
+    raise ConfigError(
+        f"No config file found. Searched:\n"
+        f"  - {cwd_config}\n"
+        f"  - {dotfile_path}\n"
+        f"Use --config to specify a config file."
+    )
+
+
+def load_config(path: Optional[Path]) -> Config:
+    """
+    Load and validate a config file.
+
+    Args:
+        path: Explicit config path, or None to search default locations.
+
+    Returns:
+        Validated Config object.
+
+    Raises:
+        ConfigError: If config not found or validation fails.
+    """
+    config_path = find_config(path)
+    if not config_path.exists():
+        raise ConfigError(f"Config file not found: {config_path}")
+    try:
+        cfg_dict = tomllib.loads(config_path.read_text("utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"Invalid TOML in {config_path}: {e}")
+    return Config.from_dict(cfg_dict, config_path)
+
+
+def ensure_out_dir_exists_writable(out_dir: Path) -> None:
+    require(out_dir.exists(), f"output_dir does not exist: {out_dir}")
+    require(out_dir.is_dir(), f"output_dir is not a directory: {out_dir}")
+    require(
+        os.access(out_dir, os.W_OK), f"output_dir is not writable: {out_dir}"
+    )
+
+
+def expand_pattern(pattern: str) -> List[Path]:
+    """
+    Expand env vars + ~ and then glob. Returns Paths.
+    We pass recursive=True to support ** patterns.
+    """
+    p = os.path.expandvars(os.path.expanduser(pattern))
+    matches = glob.glob(p, recursive=True)
+    return [Path(m) for m in matches]
+
+
+def iter_files_in_dir(dirpath: Path, recurse: bool) -> Iterable[Path]:
+    if recurse:
+        for p in dirpath.rglob("*"):
+            if p.is_file():
+                yield p
+    else:
+        # Only direct child files
+        for p in dirpath.iterdir():
+            if p.is_file():
+                yield p
+
+
+def stage_flat_copy(
+    staging_dir: Path,
+    sources: Iterable[Path],
+    *,
+    seen_names: set[str],
+    target_dir: Optional[str] = None,
+) -> List[str]:
+    staged: List[str] = []
+
+    # Create subdirectory if specified
+    if target_dir:
+        subdir = staging_dir / target_dir
+        subdir.mkdir(parents=True, exist_ok=True)
+    else:
+        subdir = staging_dir
+
+    for src in sources:
+        require(src.exists(), f"Source does not exist: {src}")
+        require(src.is_file(), f"Expected file but got non-file: {src}")
+
+        name = src.name
+        # Use full relative path for collision detection
+        rel_path = f"{target_dir}/{name}" if target_dir else name
+        if rel_path in seen_names:
+            raise CollisionError(
+                f"Name collision while staging: {rel_path} ({src})"
+            )
+        seen_names.add(rel_path)
+
+        dst = subdir / name
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o600)
+        staged.append(rel_path)
+    return staged
+
+
+def stage_op_ref(
+    staging_dir: Path,
+    filename: str,
+    op_ref: str,
+    *,
+    seen_names: set[str],
+    target_dir: Optional[str] = None,
+) -> str:
+    """Stage a file by fetching its content from 1Password."""
+    # Use full relative path for collision detection
+    rel_path = f"{target_dir}/{filename}" if target_dir else filename
+    if rel_path in seen_names:
+        raise CollisionError(f"Name collision while staging: {rel_path}")
+    seen_names.add(rel_path)
+
+    content = op_read(op_ref)
+    if not content.strip():
+        raise ConfigError(f"1Password returned empty content for: {op_ref}")
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    if not content.endswith("\n"):
+        content += "\n"
+
+    # Create subdirectory if specified
+    if target_dir:
+        subdir = staging_dir / target_dir
+        subdir.mkdir(parents=True, exist_ok=True)
+    else:
+        subdir = staging_dir
+
+    out = subdir / filename
+    out.write_text(content, encoding="utf-8")
+    os.chmod(out, 0o600)
+    return rel_path
+
+
+def build_manifest(staging_dir: Path, names: Iterable[str]) -> Dict[str, Any]:
+    entries = []
+    for name in sorted(names):
+        p = staging_dir / name
+        entries.append(
+            {
+                "name": name,
+                "size": p.stat().st_size,
+                "sha256": sha256_file(p),
+            }
+        )
+    return {"version": 1, "entries": entries}
+
+
+def write_manifest(staging_dir: Path, manifest: Dict[str, Any]) -> None:
+    out = staging_dir / "manifest.json"
+    out.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.chmod(out, 0o600)
+
+
+def extract_manifest_from_archive(
+    archive_path: Path, password: str
+) -> Optional[Dict[str, Any]]:
+    if not archive_path.exists():
+        return None
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        cp = run_cmd(
+            [
+                "7zz",
+                "e",
+                "-y",
+                f"-p{password}",
+                str(archive_path),
+                "manifest.json",
+                f"-o{td_path}",
+            ],
+            check=False,
+        )
+        if cp.returncode != 0:
+            raise RuntimeError(
+                f"Failed to extract manifest from {archive_path}.\n"
+                f"7zz stderr:\n{cp.stderr.strip()}"
+            )
+
+        manifest_file = td_path / "manifest.json"
+        if not manifest_file.exists():
+            return None
+        return json.loads(manifest_file.read_text("utf-8"))
+
+
+def make_archive_with_7zz(
+    staging_dir: Path,
+    out_archive: Path,
+    password: str,
+    filenames: List[str],
+) -> None:
+    listfile = staging_dir / ".filelist.txt"
+    listfile.write_text("\n".join(filenames) + "\n", encoding="utf-8")
+    os.chmod(listfile, 0o600)
+
+    cmd = [
+        "7zz",
+        "a",
+        "-t7z",
+        "-y",
+        "-mx=9",
+        "-mhe=on",
+        f"-p{password}",
+        str(out_archive),
+        f"@{listfile.name}",
+    ]
+    cp = run_cmd(cmd, cwd=staging_dir, check=False)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create archive {out_archive.name}.\n"
+            f"7zz stderr:\n{cp.stderr.strip()}"
+        )
+
+
+TS_RE = re.compile(r"^\d{8}_\d{6}$")
+
+
+def timestamp_now() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def list_archives(out_dir: Path, archive_name: str) -> List[Path]:
+    """List all timestamped archives for a given name, sorted by time."""
+    archives = []
+    for p in out_dir.glob(f"{archive_name}.*.7z"):
+        parts = p.name.split(".")
+        if (
+            len(parts) == 3
+            and parts[0] == archive_name
+            and parts[2] == "7z"
+            and TS_RE.match(parts[1])
+        ):
+            archives.append(p)
+    # timestamp format sorts chronologically
+    archives.sort(key=lambda x: x.name)
+    return archives
+
+
+def find_latest_archive(out_dir: Path, archive_name: str) -> Optional[Path]:
+    """Find the most recent timestamped archive, or None if none exist."""
+    archives = list_archives(out_dir, archive_name)
+    return archives[-1] if archives else None
+
+
+def prune_archives(out_dir: Path, archive_name: str, keep: int) -> None:
+    """Prune old archives and their readmes, keeping only the most recent N."""
+    if keep < 0:
+        raise ConfigError("keep_revisions must be >= 0")
+    archives = list_archives(out_dir, archive_name)
+    if len(archives) <= keep:
+        return
+    for archive_path in archives[: len(archives) - keep]:
+        archive_path.unlink()
+        # Also delete corresponding readme
+        readme_path = archive_path.with_suffix(".txt")
+        if readme_path.exists():
+            readme_path.unlink()
+
+
+ARCHIVE_README_TEMPLATE = """\
+# {archive_name} Description
+{description}
+
+# {archive_name} Password
+{op_password_uri}
+
+# Opening Encrypted `.7z` Archives (macOS / Windows)
+
+---
+## macOS
+
+### Option A: App Store (GUI) — Keka (Purchase required)
+* Install **[Keka](https://apps.apple.com/us/app/keka/id470158793)**
+  from the Mac App Store.
+* Open the `.7z` file with Keka and enter the password.
+
+### Option B: Homebrew (Terminal)
+* [Install Homebrew](https://brew.sh/), then install 7zip, then extract:
+  ```sh
+  brew install sevenzip
+  7z x YOUR_ARCHIVE.7z
+  ```
+
+### Option C: MacPorts (Terminal)
+* [Install MacPorts](https://www.macports.org/install.php), then install
+  7zip, then extract:
+  ```sh
+  sudo port install 7zip
+  7z x YOUR_ARCHIVE.7z
+  ```
+
+---
+## Windows
+* Download [official 7-Zip installer](https://www.7-zip.org/download.html).
+* Right-click the `.7z` file → **7-Zip** → **Extract Here** or **Extract to…**
+* Enter the password when prompted.
+"""
+
+
+def generate_readme_content(
+    archive_name: str,
+    op_password_uri: str,
+    description: str,
+) -> str:
+    """Generate the readme content for an archive."""
+    return ARCHIVE_README_TEMPLATE.format(
+        archive_name=archive_name,
+        op_password_uri=op_password_uri,
+        description=description,
+    )
+
+
+def write_archive_readme(
+    out_dir: Path,
+    archive_name: str,
+    timestamp: str,
+    op_password_uri: str,
+    description: str,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """
+    Write a readme text file for an archive.
+
+    Creates {archive_name}.{timestamp}.txt alongside the .7z archive.
+    Substitutes {archive_name}, {op_password_uri}, and {description}.
+    Raises RuntimeError if the file already exists (concurrent run).
+    """
+    out_file = out_dir / f"{archive_name}.{timestamp}.txt"
+    if out_file.exists():
+        raise RuntimeError(
+            f"Readme already exists (concurrent run?): {out_file}"
+        )
+    if dry_run:
+        eprint(f"[{archive_name}] DRY RUN: would write {out_file}")
+        return
+    content = generate_readme_content(
+        archive_name, op_password_uri, description
+    )
+    out_file.write_text(content, encoding="utf-8")
+
+
+def write_output_readme(
+    out_dir: Path,
+    content: str,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """
+    Write or update README.txt in the output directory.
+
+    Args:
+        out_dir: Output directory path
+        content: Content to write to README.txt
+        dry_run: If True, don't actually write the file
+
+    Returns:
+        True if the file was written/updated, False if unchanged.
+    """
+    readme_path = out_dir / "README.txt"
+
+    # Normalize content: ensure it ends with a single newline
+    content = content.strip() + "\n"
+
+    # Check if content has changed
+    if readme_path.exists():
+        existing = readme_path.read_text(encoding="utf-8")
+        if existing == content:
+            return False
+
+    if dry_run:
+        if readme_path.exists():
+            eprint("[general] DRY RUN: would update README.txt")
+        else:
+            eprint("[general] DRY RUN: would create README.txt")
+        return True
+
+    readme_path.write_text(content, encoding="utf-8")
+    if readme_path.exists():
+        eprint("[general] Updated README.txt")
+    else:
+        eprint("[general] Created README.txt")
+    return True
+
+
+def locale_sorted_paths(paths: List[Path]) -> List[Path]:
+    # Use current locale collation rules
+    key = locale.strxfrm
+    return sorted(paths, key=lambda p: key(str(p)))
+
+
+def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
+    """
+    Convert a path include entry into a list of source FILE paths to include.
+
+    Rules:
+      - path can include globs
+      - recurse defaults false
+      - latest defaults false (select last match after locale-aware sort)
+      - if match is a file => include that file
+      - if match is a directory => include its files (recurse controls depth)
+      - if an entry results in zero included files => ERROR
+    """
+    matches = expand_pattern(entry.path)
+    if not matches:
+        raise FileNotFoundError(
+            f"No matches for include path pattern: {entry.path}"
+        )
+
+    if entry.latest:
+        matches = locale_sorted_paths(matches)
+        matches = [matches[-1]]
+
+    sources: List[Path] = []
+    for m in matches:
+        if m.is_file():
+            sources.append(m)
+        elif m.is_dir():
+            sources.extend(list(iter_files_in_dir(m, recurse=entry.recurse)))
+        else:
+            raise FileNotFoundError(
+                f"Matched path is neither file nor directory: {m}"
+            )
+
+    if not sources:
+        raise FileNotFoundError(
+            "Include entry matched, but resulted in zero files to include: "
+            f"path={entry.path} recurse={entry.recurse} latest={entry.latest}"
+        )
+
+    return sources
+
+
+def build_staging_for_archive(
+    archive_cfg: ArchiveConfig,
+    staging_dir: Path,
+) -> List[str]:
+    """
+    Stage files for an archive based on the include config.
+
+    Each include entry is either:
+      - PathIncludeEntry - files from filesystem
+      - OpRefIncludeEntry - content fetched from 1Password
+
+    Files can be placed in subdirectories using the optional 'dir' parameter.
+    Collision detection uses full relative paths (dir/filename).
+    Returns staged filenames (excluding manifest.json).
+    """
+    seen: set[str] = set()
+    staged_names: List[str] = []
+
+    for entry in archive_cfg.include:
+        if isinstance(entry, OpRefIncludeEntry):
+            staged_names.append(
+                stage_op_ref(
+                    staging_dir,
+                    entry.filename,
+                    entry.op_ref,
+                    seen_names=seen,
+                    target_dir=entry.dir,
+                )
+            )
+        elif isinstance(entry, PathIncludeEntry):
+            sources = include_entry_to_sources(entry)
+            staged_names += stage_flat_copy(
+                staging_dir, sources, seen_names=seen, target_dir=entry.dir
+            )
+
+    return staged_names
+
+
+def publish(
+    archive_name: str,
+    out_dir: Path,
+    password: str,
+    staging_dir: Path,
+    staged_names: List[str],
+    *,
+    timestamp: str,
+    op_password_uri: str,
+    description: str,
+    keep_revisions: int,
+    dry_run: bool,
+    force_update: bool,
+) -> bool:
+    """
+    Publish an archive if contents or readme have changed.
+
+    Compares the staged files against the latest existing archive (if any),
+    and also checks if the readme content would differ from the existing one.
+    If either changed (or force_update=True), creates:
+      - {archive_name}.{timestamp}.7z  (encrypted archive)
+      - {archive_name}.{timestamp}.txt (readme)
+
+    The timestamp is passed in (not generated here) so that all archives
+    from a single run share the same timestamp.
+
+    Returns True if published, False if skipped due to no changes.
+    Raises RuntimeError if files already exist (concurrent run detection).
+    """
+    manifest = build_manifest(staging_dir, staged_names)
+    write_manifest(staging_dir, manifest)
+
+    # Compare with latest existing archive
+    latest_archive = find_latest_archive(out_dir, archive_name)
+    existing_manifest = None
+    if latest_archive:
+        existing_manifest = extract_manifest_from_archive(
+            latest_archive, password=password
+        )
+
+    content_changed = existing_manifest != manifest
+
+    # Check if readme has changed
+    new_readme_content = generate_readme_content(
+        archive_name, op_password_uri, description
+    )
+    readme_changed = False
+    if latest_archive:
+        latest_readme = latest_archive.with_suffix(".txt")
+        if latest_readme.exists():
+            existing_readme = latest_readme.read_text(encoding="utf-8")
+            readme_changed = existing_readme != new_readme_content
+        else:
+            # Readme missing but should exist - treat as changed
+            readme_changed = True
+
+    changed = content_changed or readme_changed
+    if not changed and not force_update:
+        eprint(f"[{archive_name}] No changes detected; not publishing.")
+        return False
+
+    all_files = sorted(staged_names + ["manifest.json"])
+    new_archive = out_dir / f"{archive_name}.{timestamp}.7z"
+
+    # Compute change reason for logging
+    if not changed:
+        change_reason = "forced"
+    else:
+        parts = []
+        if content_changed:
+            parts.append("content")
+        if readme_changed:
+            parts.append("readme")
+        change_reason = "+".join(parts) + " changed"
+
+    # Check for concurrent run (same timestamp)
+    if new_archive.exists():
+        raise RuntimeError(
+            f"Archive already exists (concurrent run?): {new_archive}"
+        )
+
+    if dry_run:
+        with tempfile.TemporaryDirectory() as td:
+            tmp_out = Path(td) / f"{archive_name}.{timestamp}.7z"
+            make_archive_with_7zz(
+                staging_dir, tmp_out, password=password, filenames=all_files
+            )
+        write_archive_readme(
+            out_dir,
+            archive_name,
+            timestamp,
+            op_password_uri,
+            description,
+            dry_run=True,
+        )
+        eprint(
+            f"[{archive_name}] DRY RUN: would publish {new_archive}"
+            + f" ({change_reason})"
+        )
+        return True
+
+    # Create archive with timestamp in filename
+    tmp_archive = out_dir / f".{archive_name}.{timestamp}.new.7z"
+    if tmp_archive.exists():
+        raise RuntimeError(f"Temp archive already exists: {tmp_archive}")
+
+    make_archive_with_7zz(
+        staging_dir, tmp_archive, password=password, filenames=all_files
+    )
+    tmp_archive.rename(new_archive)
+
+    # Write corresponding readme
+    write_archive_readme(
+        out_dir,
+        archive_name,
+        timestamp,
+        op_password_uri,
+        description,
+        dry_run=False,
+    )
+
+    prune_archives(out_dir, archive_name, keep=keep_revisions)
+
+    eprint(f"[{archive_name}] Published: {new_archive} ({change_reason})")
+    return True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build and return the argument parser.
+
+    Returns:
+        Configured ArgumentParser instance
+    """
+
+    def add_config(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--config",
+            type=Path,
+            help="Path to config TOML",
+        )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate 7z encrypted archives containing files and "
+            "1Password data that are encrypted using passwords "
+            "stored in 1Password"
+        ),
+        epilog="""\
+exit codes:
+  0  Success
+  1  Usage/argument error
+  2  Configuration error
+  3  File not found
+  4  Subprocess/external command error
+  5  Other errors (test failures, collisions, etc.)
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    # Create subcommand
+    create_parser = subparsers.add_parser(
+        "create", help="Create archives based on configuration"
+    )
+    add_config(create_parser)
+    create_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do all work but never modify output directory",
+    )
+    create_parser.add_argument(
+        "--force-update",
+        action="store_true",
+        help="Publish even if archive contents are unchanged",
+    )
+
+    # Code-test subcommand
+    test_parser = subparsers.add_parser("self-test", help="Run tests")
+    test_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose test output",
+    )
+    test_parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Run with coverage report",
+    )
+
+    # Write-example-config subcommand
+    example_parser = subparsers.add_parser(
+        "write-example-config",
+        help="Write an example config file",
+    )
+    example_parser.add_argument(
+        "output_file",
+        type=Path,
+        help="Path to write the example config",
+    )
+
+    # Check-config subcommand
+    check_parser = subparsers.add_parser(
+        "check-config",
+        help="Validate a config file",
+    )
+    add_config(check_parser)
+
+    return parser
+
+
+def do_update(
+    cfg: Config,
+    *,
+    dry_run: bool,
+    force_update: bool,
+) -> None:
+    """
+    Execute archive update operation.
+
+    Args:
+        cfg: Validated configuration
+        dry_run: Do all work but don't modify output directory
+        force_update: Publish even if archive contents unchanged
+    """
+    # Locale-aware lexical sorting per current locale
+    locale.setlocale(locale.LC_COLLATE, "")
+
+    ensure_tools()
+
+    out_dir = Path(cfg.general.output_dir).expanduser()
+    keep_revisions = cfg.general.keep_revisions
+
+    # Fail-fast: output dir must exist and be writable BEFORE doing work
+    ensure_out_dir_exists_writable(out_dir)
+
+    # Write README.txt if configured
+    if cfg.general.readme:
+        write_output_readme(out_dir, cfg.general.readme, dry_run=dry_run)
+
+    # Generate timestamp once so all archives from this run share it
+    ts = timestamp_now()
+    published_any = False
+
+    for archive_name in sorted(cfg.archives.keys(), key=locale.strxfrm):
+        archive_cfg = cfg.archives[archive_name]
+        op_password_uri = archive_cfg.op_password
+        description = archive_cfg.description
+
+        password = op_read(op_password_uri)
+
+        eprint(f"=== {archive_name} ===")
+
+        with tempfile.TemporaryDirectory() as td:
+            staging_dir = Path(td)
+            staged = build_staging_for_archive(archive_cfg, staging_dir)
+
+            published_any |= publish(
+                archive_name=archive_name,
+                out_dir=out_dir,
+                password=password,
+                staging_dir=staging_dir,
+                staged_names=staged,
+                timestamp=ts,
+                op_password_uri=op_password_uri,
+                description=description,
+                keep_revisions=keep_revisions,
+                dry_run=dry_run,
+                force_update=force_update,
+            )
+
+    eprint("Done." if published_any else "Done (no archives updated).")
+
+
+def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
+    """
+    Run tests using pytest via uvx.
+
+    Args:
+        verbose: Enable verbose output
+        coverage: Run with coverage report
+
+    Raises:
+        TestError: If any tests fail or pytest encounters an error.
+    """
+    # Repository root is parent of bin/ where this script lives
+    repo_root = Path(__file__).parent.parent
+    tests_dir = repo_root / "tests"
+    bin_dir = repo_root / "bin"
+
+    # Build uvx command
+    cmd = ["uvx", "--with", "pytest"]
+    if coverage:
+        cmd.extend(["--with", "pytest-cov"])
+
+    cmd.extend(
+        [
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            str(tests_dir / "test_secure_archiver.py"),
+        ]
+    )
+
+    if verbose:
+        cmd.append("-v")
+    if coverage:
+        htmlcov_dir = Path(tempfile.gettempdir()) / "secure_archiver_htmlcov"
+        cmd.extend(
+            [
+                "--cov=secure_archiver",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{htmlcov_dir}",
+            ]
+        )
+
+    # Run pytest with PYTHONDONTWRITEBYTECODE=1 to prevent __pycache__
+    # Add bin/ to PYTHONPATH so coverage can find the secure_archiver module
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = str(bin_dir)
+    if coverage:
+        # Redirect .coverage data file to temp directory
+        env["COVERAGE_FILE"] = str(
+            Path(tempfile.gettempdir()) / "secure_archiver.coverage"
+        )
+    cp = run_cmd(cmd, check=False, env=env, cwd=repo_root)
+    if cp.stdout:
+        print(cp.stdout, end="")
+    if cp.stderr:
+        sys.stderr.write(cp.stderr)
+
+    if cp.returncode != 0:
+        raise TestError("Tests failed")
+
+
+def do_write_example_config(output_path: Path) -> None:
+    """Write an example config file."""
+    if output_path.exists():
+        raise ConfigError(f"File already exists: {output_path}")
+    output_path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+    eprint(f"Wrote example config to: {output_path}")
+
+
+def do_check_config(config_path: Optional[Path]) -> None:
+    """
+    Check if a config file is valid.
+
+    Args:
+        config_path: Explicit config path, or None to search default locations.
+
+    Raises:
+        ConfigError: If the config is invalid.
+    """
+    load_config(config_path)
+    resolved_path = find_config(config_path)
+    eprint(f"Config is valid: {resolved_path}")
+
+
+def main(args: argparse.Namespace) -> None:
+    """Dispatch to subcommand based on parsed arguments."""
+    # Handle missing subcommand
+    if not args.command:
+        raise UsageError("No subcommand specified. Use --help for usage.")
+
+    match args.command:
+        case "self-test":
+            do_self_test(verbose=args.verbose, coverage=args.coverage)
+        case "create":
+            cfg = load_config(args.config)
+            do_update(
+                cfg,
+                dry_run=args.dry_run,
+                force_update=args.force_update,
+            )
+        case "write-example-config":
+            do_write_example_config(args.output_file)
+        case "check-config":
+            do_check_config(args.config)
+        case _:
+            raise UsageError(f"Unknown command '{args.command}'")
+
+
+def cli() -> int:
+    """
+    CLI entry point with argument parsing and exception handling.
+
+    Exit codes:
+        0: Success
+        1: Usage/argument error
+        2: Configuration error
+        3: File not found
+        4: Subprocess/external command error
+        5: Other errors (test failures, collisions, etc.)
+    """
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        # argparse calls sys.exit(0) for --help, sys.exit(2) for errors
+        if e.code == 0:
+            return 0
+        return 1
+    try:
+        main(args)
+        return 0
+    except UsageError as e:
+        eprint(f"ERROR: {e}")
+        return 1
+    except ConfigError as e:
+        eprint(f"ERROR: {e}")
+        return 2
+    except FileNotFoundError as e:
+        eprint(f"ERROR: {e}")
+        return 3
+    except subprocess.CalledProcessError as e:
+        cmd_str = " ".join(e.cmd) if isinstance(e.cmd, list) else e.cmd
+        eprint(f"ERROR: Command failed: {cmd_str}")
+        if e.stdout:
+            eprint(f"stdout: {e.stdout.strip()}")
+        if e.stderr:
+            eprint(f"stderr: {e.stderr.strip()}")
+        return 4
+    except Exception as e:
+        eprint(f"ERROR: {e}")
+        return 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
