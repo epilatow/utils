@@ -1,0 +1,8 @@
+#!/bin/bash
+# Wrapper script for borgadm to enable Full Disk Access on macOS
+# Grant this app FDA in System Settings → Privacy & Security → Full Disk Access
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+exec "$REPO_DIR/bin/borgadm" "$@"

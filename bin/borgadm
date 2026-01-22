@@ -1,9 +1,11 @@
-#!/usr/bin/env python3
-
-# Run black, flake8, and mypy:
-#     uvx black ~/env/bin/borgadm
-#     uvx flake8 --max-line-length=88 --extend-ignore=E203,W503 ~/env/bin/borgadm
-#     uvx mypy ~/env/bin/borgadm
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# This is human generated code that's been AI modified
+#
+# IMPORTANT: This script has tests in tests/test_borgadm.py
+# Always run the `self-test` subcommand after making modifications.
 
 from __future__ import annotations
 
@@ -29,7 +31,6 @@ import tempfile
 import threading
 import time
 import typing
-import unittest
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,62 @@ _PRUNE_KEEP_WEEKLY: int = 4
 _PRUNE_KEEP_MONTHLY: int = 12
 _PRUNE_KEEP_YEARLY: int = 2
 
+# macOS TCC-protected directories that cannot be accessed even with Full Disk
+# Access. These require Apple-private entitlements only available to Apple-
+# signed apps. Auto-excluded on Darwin to prevent backup errors.
+_MACOS_TCC_EXCLUDES: list[str] = [
+    # Application Support - TCC protected
+    "Library/Application Support/AddressBook",
+    "Library/Application Support/CallHistoryDB",
+    "Library/Application Support/CallHistoryTransactions",
+    "Library/Application Support/com.apple.TCC",
+    "Library/Application Support/com.apple.avfoundation",
+    "Library/Application Support/com.apple.sharedfilelist",
+    "Library/Application Support/DifferentialPrivacy",
+    "Library/Application Support/FaceTime",
+    "Library/Application Support/Knowledge",
+    # Library top-level - TCC protected
+    "Library/Accounts",
+    "Library/AppleMediaServices",
+    "Library/Assistant/SiriVocabulary",
+    "Library/Autosave Information",
+    "Library/Biome",
+    "Library/Calendars",
+    "Library/com.apple.aiml.instrumentation",
+    "Library/com.apple.bluetooth.services.cloud",
+    "Library/ContainerManager",
+    "Library/Cookies",
+    "Library/CoreFollowUp",
+    "Library/DoNotDisturb",
+    "Library/DuetExpertCenter",
+    "Library/HomeKit",
+    "Library/IdentityServices",
+    "Library/IntelligencePlatform",
+    "Library/Mail",
+    "Library/Messages",
+    "Library/PersonalizationPortrait",
+    "Library/Reminders",
+    "Library/Safari",
+    "Library/Sharing",
+    "Library/Shortcuts",
+    "Library/StatusKit",
+    "Library/Suggestions",
+    "Library/Trial",
+    "Library/Weather",
+    # Preferences - specific TCC-protected plists
+    "Library/Preferences/com.apple.AddressBook.plist",
+    "Library/Preferences/com.apple.homed.notbackedup.plist",
+    "Library/Preferences/com.apple.homed.plist",
+    "Library/Preferences/com.apple.mail-shared.plist",
+    "Library/Preferences/com.apple.messages.pinning.plist",
+    "Library/Preferences/com.apple.MobileSMS.CKDNDList.plist",
+    "Library/Preferences/com.apple.MobileSMS.plist",
+    # iCloud - causes deadlocks during sync
+    "Library/Mobile Documents",
+    # Other permission issues
+    "Library/Google/GoogleSoftwareUpdate",
+]
+
 
 # -----------------------------------------------------------------------------
 # Configuration, required
@@ -104,7 +161,12 @@ class Config:
         try:
             with open(path) as f:
                 content = f.read()
-        except (FileNotFoundError, PermissionError, IsADirectoryError, OSError) as e:
+        except (
+            FileNotFoundError,
+            PermissionError,
+            IsADirectoryError,
+            OSError,
+        ) as e:
             logger.error(f"Failed to load config file {path}: {e}")
             sys.exit(1)
 
@@ -119,13 +181,17 @@ class Config:
         self.BORG_PASSPHRASE_FILE: Path = Path(
             os.path.expanduser(
                 config.get(
-                    "default", "BORG_PASSPHRASE_FILE", fallback=_BORG_PASSPHRASE_FILE
+                    "default",
+                    "BORG_PASSPHRASE_FILE",
+                    fallback=_BORG_PASSPHRASE_FILE,
                 )
             )
         )
         self.BORG_SSHKEY_FILE: Path = Path(
             os.path.expanduser(
-                config.get("default", "BORG_SSHKEY_FILE", fallback=_BORG_SSHKEY_FILE)
+                config.get(
+                    "default", "BORG_SSHKEY_FILE", fallback=_BORG_SSHKEY_FILE
+                )
             )
         )
         self.BORG_REMOTE_PATH: str = config.get(
@@ -186,15 +252,21 @@ class Config:
                 "default", "PRUNE_KEEP_YEARLY", fallback=_PRUNE_KEEP_YEARLY
             )
 
-        self.BORG_REPO: str = config.get("default", "BORG_REPO", fallback=_BORG_REPO)
+        self.BORG_REPO: str = config.get(
+            "default", "BORG_REPO", fallback=_BORG_REPO
+        )
         self.BORG_REPO_HOSTKEY: str = config.get(
             "default", "BORG_REPO_HOSTKEY", fallback=_BORG_REPO_HOSTKEY
         )
         self.BACKUP_MOUNTS: list[str] = json.loads(
-            config.get("default", "BACKUP_MOUNTS", fallback=json.dumps(_BACKUP_MOUNTS))
+            config.get(
+                "default", "BACKUP_MOUNTS", fallback=json.dumps(_BACKUP_MOUNTS)
+            )
         )
         self.BACKUP_SETS: dict[str, dict[str, list[str]]] = json.loads(
-            config.get("default", "BACKUP_SETS", fallback=json.dumps(_BACKUP_SETS))
+            config.get(
+                "default", "BACKUP_SETS", fallback=json.dumps(_BACKUP_SETS)
+            )
         )
 
         error = False
@@ -293,7 +365,9 @@ class WarnOrWorseFilter(logging.Filter):
 
 
 def log_exceptions(exc_type, exc_value, exc_traceback) -> None:
-    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    logger.critical(
+        "Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback)
+    )
     osascript_notify()
 
 
@@ -375,7 +449,8 @@ def initialize_borg_environment() -> None:
     _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
     _hostkey_file.flush()
     os.environ["BORG_RSH"] = (
-        f"ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile={_hostkey_file.name}"
+        f"ssh -o StrictHostKeyChecking=yes "
+        f"-o UserKnownHostsFile={_hostkey_file.name}"
     )
     logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
     start_ssh_agent()
@@ -403,7 +478,9 @@ def run_cmd(
     slow_cmds = borg_cmd() + ["rsync"]
     timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
     if CFG:
-        timeout = CFG.BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else CFG.CMD_TIMEOUT
+        timeout = (
+            CFG.BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else CFG.CMD_TIMEOUT
+        )
     if sudo:
         cmd = ["sudo", "-n", "-E"] + cmd
     cmd_str = shlex.join(cmd)
@@ -472,7 +549,10 @@ def run_cmd(
             )
 
     return subprocess.CompletedProcess(
-        args=cmd, returncode=proc.returncode, stdout=stdout_str, stderr=stderr_str
+        args=cmd,
+        returncode=proc.returncode,
+        stdout=stdout_str,
+        stderr=stderr_str,
     )
 
 
@@ -530,12 +610,16 @@ def list_backups_raw() -> subprocess.CompletedProcess[Any]:
     )
 
 
-def list_backups(latest: bool = False, partial: bool = False) -> dict[str, list[str]]:
+def list_backups(
+    latest: bool = False, partial: bool = False
+) -> dict[str, list[str]]:
     cfg = get_cfg()
 
     result = list_backups_raw()
 
-    timestamps_by_type: dict[str, set[str]] = {key: set() for key in cfg.BACKUP_SETS}
+    timestamps_by_type: dict[str, set[str]] = {
+        key: set() for key in cfg.BACKUP_SETS
+    }
     backup_set_names = "|".join(cfg.BACKUP_SETS)
     ts_pattern = re.compile(
         f"{cfg.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
@@ -602,7 +686,9 @@ def check_sudo() -> bool:
         return False
 
 
-def backup_set_paths(set_name: Optional[str] = None) -> Tuple[set[Path], set[Path]]:
+def backup_set_paths(
+    set_name: Optional[str] = None,
+) -> Tuple[set[Path], set[Path]]:
     """
     Return sets of directories and files from BACKUP_SETS paths.
     Directories end in a "/", all other entries are considered files.
@@ -620,12 +706,16 @@ def backup_set_paths(set_name: Optional[str] = None) -> Tuple[set[Path], set[Pat
     return (dirs, files)
 
 
-def delete_paths(root: Path, relative_paths: set[Path], dry_run: bool = True) -> None:
+def delete_paths(
+    root: Path, relative_paths: set[Path], dry_run: bool = True
+) -> None:
     """
     Delete paths under root. Does not follow symlinks.
     """
     logger.info(f"Deleting {len(relative_paths)} paths in: {root}")
-    for rel in sorted(relative_paths, key=lambda p: -len(p.parts)):  # deepest first
+    for rel in sorted(
+        relative_paths, key=lambda p: -len(p.parts)
+    ):  # deepest first
         abs_path = root / rel
         if abs_path.is_dir():
             logger.debug(f"Deleting directory: {abs_path}")
@@ -639,11 +729,12 @@ def delete_paths(root: Path, relative_paths: set[Path], dry_run: bool = True) ->
 
 def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
     """
-    Given a list of timestamps, return a ordered dictionary (sorted by timestamp) of
-    which ones to keep, implementing a retention GFS (Grandfather-father-son) retention
-    policy. This duplicates the retention policy implemented by borg itself. We do this
-    to enable testing of the policy, and because we borg doesn't support grouping of
-    backups into sets like we do.
+    Given a list of timestamps, return a ordered dictionary (sorted by
+    timestamp) of which ones to keep, implementing a retention GFS
+    (Grandfather-father-son) retention policy. This duplicates the retention
+    policy implemented by borg itself. We do this to enable testing of the
+    policy, and because we borg doesn't support grouping of backups into
+    sets like we do.
     """
     if not timestamps:
         return collections.OrderedDict()
@@ -704,7 +795,11 @@ def report_runtime() -> None:
 
 
 def create_plist_element(
-    task: str, args: list[str], interval: int
+    task: str,
+    args: list[str],
+    interval: int,
+    env: dict[str, str],
+    log_path: str,
 ) -> ElementTree.Element:
     plist = ElementTree.Element("plist", version="1.0")
     dict_elem = ElementTree.SubElement(plist, "dict")
@@ -721,7 +816,18 @@ def create_plist_element(
         ElementTree.SubElement(dict_elem, "key").text = key
         ElementTree.SubElement(dict_elem, "integer").text = str(val)
 
+    def add_env(env_vars: dict[str, str]):
+        ElementTree.SubElement(dict_elem, "key").text = "EnvironmentVariables"
+        env_dict = ElementTree.SubElement(dict_elem, "dict")
+        for k, v in env_vars.items():
+            ElementTree.SubElement(env_dict, "key").text = k
+            ElementTree.SubElement(env_dict, "string").text = v
+
     add_kv("Label", f"local.borgadm.{task}")
+
+    # EnvironmentVariables
+    if env:
+        add_env(env)
 
     # ProgramArguments
     ElementTree.SubElement(dict_elem, "key").text = "ProgramArguments"
@@ -730,7 +836,6 @@ def create_plist_element(
         ElementTree.SubElement(arr, "string").text = part
 
     # Log paths
-    log_path = f"/tmp/borgadm.{task}.launchd.log"
     add_kv("StandardOutPath", log_path)
     add_kv("StandardErrorPath", log_path)
 
@@ -745,18 +850,23 @@ def create_plist_element(
 def create_plist_file(element: ElementTree.Element, path: Path) -> None:
     rough_string = ElementTree.tostring(element, encoding="utf-8")
     reparsed = minidom.parseString(rough_string)
+    # Get pretty-printed XML and skip the XML declaration line added by minidom
+    pretty_xml = reparsed.toprettyxml(indent="    ")
+    xml_lines = pretty_xml.split("\n")
+    if xml_lines[0].startswith("<?xml"):
+        xml_lines = xml_lines[1:]
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n')
         f.write(' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n')
-        f.write(reparsed.toprettyxml(indent="    "))
+        f.write("\n".join(xml_lines))
 
 
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
-def do_automate(enable: bool, disable: bool) -> None:
+def do_automate(action: str) -> None:
     if platform.system() != "Darwin":
         logger.error("automate subcommand is only supported on osx")
         sys.exit(1)
@@ -769,39 +879,66 @@ def do_automate(enable: bool, disable: bool) -> None:
         logger.error("launchctl not found in PATH")
         sys.exit(1)
 
-    common_args: list[str] = ["/opt/local/bin/python3", os.path.abspath(__file__)]
+    # Use the wrapper app for Full Disk Access support on macOS
+    repo_dir = Path(__file__).parent.parent
+    wrapper_app = repo_dir / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    if wrapper_app.exists():
+        script_path: str = str(wrapper_app)
+        logger.debug(f"Using wrapper app: {script_path}")
+    else:
+        script_path = os.path.abspath(__file__)
+        logger.warning(
+            f"Wrapper app not found at {wrapper_app}. "
+            "Full Disk Access may not work. "
+            "See Applications/BorgBackup.app in the repo."
+        )
+    launchd_env: dict[str, str] = {
+        "PATH": os.path.expanduser("~/.local/bin")
+        + ":/usr/bin:/bin:/usr/sbin:/sbin",
+    }
     tasks: dict[str, dict[str, Any]] = {
-        "create": {"args": ["create"], "interval": (60 * 60)},
+        "create": {"args": [script_path, "create"], "interval": (60 * 60)},
         "check_age": {
-            "args": ["check-age", "--enable-notifications"],
+            "args": [script_path, "check-age", "--enable-notifications"],
             "interval": (60 * 60 * 4),
         },
         "check_all": {
-            "args": ["check-all", "--enable-notifications"],
+            "args": [script_path, "check-all", "--enable-notifications"],
             "interval": (60 * 60 * 24 * 7),
         },
     }
     task_name = "local.borgadm.{task}"
     task_dir: Path = Path(os.environ["HOME"]) / "Library" / "LaunchAgents"
     task2path: dict[str, Path] = {
-        task: task_dir / (task_name.format(task=task) + ".plist") for task in tasks
+        task: task_dir / (task_name.format(task=task) + ".plist")
+        for task in tasks
     }
     cmd: list[str] = []
 
-    if not (enable or disable):
-        tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
-        for task in task2path:
+    if action == "status":
+        launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
+        enabled_count = 0
+        for task, path in task2path.items():
             tname = task_name.format(task=task)
             pattern = r"[ \t]" + re.escape(tname) + r"$"
             cpattern = re.compile(pattern)
-            if any(cpattern.search(i) for i in tasks):
-                status = "enabled"
+            if any(cpattern.search(i) for i in launchctl_tasks):
+                enabled_count += 1
+                logger.info(f"{tname}: enabled ({path})")
             else:
-                status = "disabled"
-            logger.info(f"{tname}: {status}")
+                logger.info(f"{tname}: disabled")
+        if enabled_count == len(task2path):
+            logger.info("Automation is enabled")
+        elif enabled_count == 0:
+            logger.info("Automation is disabled")
+        else:
+            total = len(task2path)
+            logger.info(
+                f"Automation is partially enabled ({enabled_count}/{total})"
+            )
         return
 
-    # Always remove any existing configs
+    # Always remove any existing configs for enable/disable
     for task, path in task2path.items():
         if not path.exists():
             continue
@@ -810,19 +947,46 @@ def do_automate(enable: bool, disable: bool) -> None:
         run_cmd(cmd, errok=True)
         path.unlink()
 
-    if not enable:
+    if action == "disable":
         return
 
+    log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.debug(f"Log directory: {log_dir}")
+
     for task, cfg in tasks.items():
-        logger.info(f"Creating {task} launchd config: {str(path)}")
-        task_args = common_args + cfg["args"]
-        pe = create_plist_element(task, task_args, cfg["interval"])
         path = task2path[task]
+        log_path = str(log_dir / f"{task}.log")
+        logger.info(f"Creating {task} launchd config: {str(path)}")
+        pe = create_plist_element(
+            task, cfg["args"], cfg["interval"], launchd_env, log_path
+        )
         create_plist_file(pe, path)
         cmd = ["plutil", str(path)]
         run_cmd(cmd)
         cmd = ["launchctl", "load", str(path)]
         run_cmd(cmd)
+
+    # Print Full Disk Access instructions if using wrapper app
+    if wrapper_app.exists():
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("IMPORTANT: Grant Full Disk Access to enable backups")
+        logger.info("=" * 60)
+        logger.info("")
+        logger.info("1. Run this command to open System Settings:")
+        logger.info("")
+        logger.info(
+            '   open "x-apple.systempreferences:'
+            'com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"'
+        )
+        logger.info("")
+        logger.info("2. Click the '+' button")
+        logger.info(
+            f"3. Navigate to and add: {wrapper_app.parent.parent.parent}"
+        )
+        logger.info("4. Toggle the switch ON for BorgAdm")
+        logger.info("")
 
 
 def do_break_lock() -> None:
@@ -852,7 +1016,7 @@ def do_check_age() -> None:
     age = int((datetime.now() - ts).total_seconds())
     if age > seconds:
         logger.error(
-            "Latest full backup (%s) is too old: %s seconds; limit is: %s seconds",
+            "Latest full backup (%s) is too old: %ss; limit is: %ss",
             latest,
             age,
             seconds,
@@ -909,10 +1073,14 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         for d in dirs:
             full_path = cfg.BACKUP_ROOT / d
             if not os.path.isdir(full_path):
-                logger.error(f"Missing backup dir (set: '{set_name}'): {full_path}")
+                logger.error(
+                    f"Missing backup dir (set: '{set_name}'): {full_path}"
+                )
                 error = True
             elif not os.listdir(full_path):
-                logger.error(f"Empty backup dir (set: '{set_name}'): {full_path}")
+                logger.error(
+                    f"Empty backup dir (set: '{set_name}'): {full_path}"
+                )
                 error = True
         for f in files:
             full_path = cfg.BACKUP_ROOT / f
@@ -925,7 +1093,9 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 )
                 error = True
             if not os.path.exists(full_path):
-                logger.error(f"Missing backup path (set: '{set_name}'): {full_path}")
+                logger.error(
+                    f"Missing backup path (set: '{set_name}'): {full_path}"
+                )
                 error = True
         if error:
             sys.exit(1)
@@ -946,13 +1116,31 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         create_args = set_cfg.get("create_options", [])
         create_args += ["--progress"] if progress else []
         create_args += ["--dry-run"] if dry_run else ["--stats"]
-        for e in set_cfg.get("excludes", []):
+        excludes = list(set_cfg.get("excludes", []))
+        if platform.system() == "Darwin":
+            backup_paths = [Path(p.rstrip("/")) for p in set_cfg["paths"]]
+
+            def is_under_backup_path(exclude: str) -> bool:
+                exc_path = Path(exclude)
+                return any(exc_path.is_relative_to(bp) for bp in backup_paths)
+
+            tcc_excludes = [
+                e
+                for e in _MACOS_TCC_EXCLUDES
+                if e not in excludes and is_under_backup_path(e)
+            ]
+            if tcc_excludes:
+                logger.debug(
+                    f"Auto-excluding {len(tcc_excludes)} macOS TCC-protected "
+                    f"paths for set '{set_name}'"
+                )
+                excludes.extend(tcc_excludes)
+        for e in excludes:
             create_args += ["--exclude", e]
         archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}"
         archive = f"{cfg.BORG_REPO}::{archive_name}"
-        logger.info(
-            f"Create archive, start: {archive}{' (dry-run)' if dry_run else ''})"
-        )
+        dry = " (dry-run)" if dry_run else ""
+        logger.info(f"Create archive, start: {archive}{dry})")
         cmd = (
             borg_cmd()
             + ["create"]
@@ -961,16 +1149,18 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
             + [os.path.expanduser(p) for p in set_cfg["paths"]]
         )
         run_cmd(cmd, cwd=cfg.BACKUP_ROOT, allow_output=progress)
-        logger.info(
-            f"Create archive, finish: {archive}{' (dry-run)' if dry_run else ''})"
-        )
+        logger.info(f"Create archive, finish: {archive}{dry})")
 
     if not no_prune:
         do_prune(dry_run=dry_run, progress=progress)
 
 
 def do_extract(
-    target_dir: Path, patterns: list[str], dry_run: bool, delete: bool, progress: bool
+    target_dir: Path,
+    patterns: list[str],
+    dry_run: bool,
+    delete: bool,
+    progress: bool,
 ) -> None:
     backups = list_backups(latest=True)
     if not backups:
@@ -1012,7 +1202,9 @@ def do_extract(
         )
         bs_dirs, bs_files = backup_set_paths()
 
-        def backup_set_filter(path: Path, set_name: Optional[str] = None) -> bool:
+        def backup_set_filter(
+            path: Path, set_name: Optional[str] = None
+        ) -> bool:
             if path in bs_files:
                 return True
             for d in bs_dirs:
@@ -1029,7 +1221,7 @@ def do_extract(
                 cleanup_paths.add(path)
 
         logger.info(
-            f"Found {len(cleanup_paths)} paths to delete after archive extraction."
+            f"Found {len(cleanup_paths)} paths to delete after extraction."
         )
 
     tdir_dirname = target_dir.parent
@@ -1039,7 +1231,9 @@ def do_extract(
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            logger.error("Another extract process is already running for this path.")
+            logger.error(
+                "Another extract process is already running for this path."
+            )
             sys.exit(1)
 
         for archive in archives:
@@ -1118,7 +1312,9 @@ def do_prune(dry_run: bool, progress: bool) -> None:
     ts_keep = ts_to_keep(set(archives.keys()))
     ts_prune = archives.keys() - ts_keep.keys()
     prune_archives = [
-        a.removeprefix(f"{cfg.BORG_REPO}::") for ts in ts_prune for a in archives[ts]
+        a.removeprefix(f"{cfg.BORG_REPO}::")
+        for ts in ts_prune
+        for a in archives[ts]
     ]
     logger.info(f"Keeping {len(ts_keep)} and pruning {len(ts_prune)} backups.")
     for k, v in ts_keep.items():
@@ -1139,7 +1335,9 @@ def do_prune(dry_run: bool, progress: bool) -> None:
     do_compact(progress)
 
 
-def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> None:
+def do_rsync(
+    target_dir: Path, dry_run: bool, delete: bool, progress: bool
+) -> None:
     if platform.system() != "Linux":
         logger.error("Rsync subcommand is only supported on linux")
         sys.exit(1)
@@ -1180,7 +1378,9 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> N
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            logger.error("Another extract process is already running for this path.")
+            logger.error(
+                "Another extract process is already running for this path."
+            )
             sys.exit(1)
 
         cleanup_mounts: list[Path] = []
@@ -1247,7 +1447,9 @@ def do_rsync(target_dir: Path, dry_run: bool, delete: bool, progress: bool) -> N
             run_cmd(cmd, allow_output=progress, sudo=True)
 
             # Record the version we extraced
-            (tdir_dirname / f".{BASENAME}_{tdir_basename}.ts").write_text(f"{ts}")
+            (tdir_dirname / f".{BASENAME}_{tdir_basename}.ts").write_text(
+                f"{ts}"
+            )
 
             logger.info(f"Finished rsync to: {target_dir}")
         finally:
@@ -1267,21 +1469,42 @@ def do_environment() -> None:
         logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
-def do_unittest() -> None:
-    config_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
-    config_file.write(
-        """
-    BORG_REPO = "foobar"
-    BACKUP_SETS = { "set1": ["foo"] }
-    """
+def do_self_test(verbose: bool = False, coverage: bool = False) -> None:
+    """Run tests using pytest via uvx."""
+    repo_root = Path(__file__).parent.parent
+    tests_dir = repo_root / "tests"
+    bin_dir = repo_root / "bin"
+
+    cmd = ["uvx", "--with", "pytest"]
+    if coverage:
+        cmd.extend(["--with", "pytest-cov"])
+
+    cmd.extend(
+        ["pytest", "-p", "no:cacheprovider", str(tests_dir / "test_borgadm.py")]
     )
-    config_file.flush()
 
-    global CFG
-    CFG = Config(config_file.name, {"command": "unittest"})
+    if verbose:
+        cmd.append("-v")
+    if coverage:
+        htmlcov_dir = Path(tempfile.gettempdir()) / "borgadm_htmlcov"
+        cmd.extend(
+            [
+                "--cov=borgadm",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{htmlcov_dir}",
+            ]
+        )
 
-    unittest.main(argv=["first-arg-is-ignored"])
-    sys.exit(0)
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = str(bin_dir)
+    if coverage:
+        env["COVERAGE_FILE"] = str(
+            Path(tempfile.gettempdir()) / "borgadm.coverage"
+        )
+
+    result = subprocess.run(cmd, env=env, cwd=repo_root)
+    sys.exit(result.returncode)
 
 
 # -----------------------------------------------------------------------------
@@ -1303,7 +1526,7 @@ def args_parser() -> argparse.ArgumentParser:
         parser.add_argument(
             "--delete",
             action="store_true",
-            help="Delete files in the destination which don't exist in the backup",
+            help="Delete files in destination not in backup",
         )
 
     def add_dry_run(parser: argparse.ArgumentParser) -> None:
@@ -1335,7 +1558,10 @@ def args_parser() -> argparse.ArgumentParser:
 
     def add_seconds(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
-            "seconds", type=int, nargs="?", help="Maximum backup age, in seconds"
+            "seconds",
+            type=int,
+            nargs="?",
+            help="Maximum backup age, in seconds",
         )
 
     def add_target_dir(parser: argparse.ArgumentParser) -> None:
@@ -1347,18 +1573,21 @@ def args_parser() -> argparse.ArgumentParser:
         "automate",
         help="Enable/Disable automated backups and checks",
     )
-    enable_disable = automate.add_mutually_exclusive_group()
-    enable_disable.add_argument(
-        "--enable",
-        action="store_true",
-        dest="enable",
+    automate_subparsers = automate.add_subparsers(dest="action", required=True)
+    automate_subparsers.add_parser(
+        "enable",
         help="Enable automated backup creation and checks",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    enable_disable.add_argument(
-        "--disable",
-        action="store_true",
-        dest="disable",
+    automate_subparsers.add_parser(
+        "disable",
         help="Disable automated backup creation and checks",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    automate_subparsers.add_parser(
+        "status",
+        help="Show automation status and launchd file paths",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     add_parser("break-lock", help="Break repo lock")
@@ -1380,7 +1609,9 @@ def args_parser() -> argparse.ArgumentParser:
     add_progress(compact)
 
     create = add_parser("create", help="Create full backup")
-    create.add_argument("--no-prune", action="store_true", help="Skip backup pruning")
+    create.add_argument(
+        "--no-prune", action="store_true", help="Skip backup pruning"
+    )
     add_dry_run(create)
     add_progress(create)
     add_prune_args(create)
@@ -1401,7 +1632,9 @@ def args_parser() -> argparse.ArgumentParser:
 
     list_cmd = add_parser("list", help="List backups")
     list_cmd.add_argument(
-        "--latest", action="store_true", help="Only list latest complete backup set"
+        "--latest",
+        action="store_true",
+        help="Only list latest complete backup set",
     )
     list_cmd.add_argument(
         "--full-names",
@@ -1421,7 +1654,9 @@ def args_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--include-partial", action="store_true", help="Include partial backups"
     )
-    group.add_argument("--only-partial", action="store_true", help="Only list partial")
+    group.add_argument(
+        "--only-partial", action="store_true", help="Only list partial"
+    )
 
     prune = add_parser("prune", help="Prune partial and old backups")
     add_dry_run(prune)
@@ -1434,9 +1669,27 @@ def args_parser() -> argparse.ArgumentParser:
     add_dry_run(rsync)
     add_progress(rsync)
 
-    add_parser("environment", help="Display environment settings to run borg cli")
+    add_parser(
+        "environment", help="Display environment settings to run borg cli"
+    )
 
-    for subparser in subparsers.choices.values():
+    self_test = add_parser("self-test", help="Run tests")
+    self_test.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose test output",
+    )
+    self_test.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Run with coverage report",
+    )
+
+    for name, subparser in subparsers.choices.items():
+        # self-test doesn't need config or notification args
+        if name == "self-test":
+            continue
         subparser.add_argument(
             "--config", type=str, default=CONFIG, help="borgadm config file"
         )
@@ -1461,6 +1714,13 @@ def args_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = args_parser().parse_args()
     args_dict = vars(args).copy()
+    command = args_dict.pop("command")
+
+    # Handle self-test early - it doesn't need config or borg environment
+    if command == "self-test":
+        do_self_test(**args_dict)
+        return
+
     config = args_dict.pop("config")
     verbose = args_dict.pop("verbose")
     global _enable_notifications
@@ -1474,7 +1734,6 @@ def main() -> None:
 
     global CFG
     CFG = Config(config, args_dict)
-    command = args_dict.pop("command")
 
     initialize_borg_environment()
 
@@ -1504,95 +1763,5 @@ def main() -> None:
         raise
 
 
-# -----------------------------------------------------------------------------
-# Tests
-# -----------------------------------------------------------------------------
-class TestArgparseHelp(unittest.TestCase):
-    def test_help_messages_present(self):
-        parser = args_parser()
-
-        for action in parser._actions:
-            if isinstance(action, argparse._SubParsersAction):
-                for subcmd_name, subparser in action.choices.items():
-                    for sub_action in subparser._actions:
-                        # Ignore default help option added by argparse
-                        if isinstance(sub_action, argparse._HelpAction):
-                            continue
-                        self.assertTrue(
-                            sub_action.help and sub_action.help.strip(),
-                            msg=(
-                                "Missing help for argument(s) "
-                                f"{sub_action.option_strings or sub_action.dest} "
-                                f"in subcommand '{subcmd_name}'"
-                            ),
-                        )
-
-
-class TestTimestampPruning(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        # Set CFG values before tests run
-        cfg = get_cfg()
-        cfg.PRUNE_KEEP_HOURLY = 2
-        cfg.PRUNE_KEEP_DAILY = 2
-        cfg.PRUNE_KEEP_WEEKLY = 2
-        cfg.PRUNE_KEEP_MONTHLY = 2
-        cfg.PRUNE_KEEP_YEARLY = 2
-
-    def test_empty_set(self) -> None:
-        self.assertEqual(ts_to_keep(set()), collections.OrderedDict())
-
-    def test_incremental_prune(self) -> None:
-        start = datetime(2000, 1, 1, 0, 0, 0)
-        ts_all: set[str] = set()
-        for i in range(int(24 * 365 * 3.5)):
-            ts = start + timedelta(hours=i)
-            ts_all.add(ts.strftime("%Y%m%d_%H%M%S"))
-            ts_keep = ts_to_keep(ts_all)
-            ts_all = set(ts_keep)
-        ts_keep_verify = collections.OrderedDict(
-            [
-                ("20030701_110000", "hour-0"),
-                ("20030701_100000", "hour-1"),
-                ("20030701_000000", "day-0"),
-                ("20030630_000000", "day-1"),
-                ("20030629_000000", "week-0"),
-                ("20030623_000000", "month-0"),
-                ("20030620_000000", "week-1"),
-                ("20030521_000000", "month-1"),
-                ("20021231_000000", "year-0"),
-                ("20011231_000000", "year-1"),
-            ]
-        )
-        self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
-
-    def test_bulk_prune(self) -> None:
-        start = datetime(2000, 1, 1, 0, 0, 0)
-        ts_all = set(
-            [
-                (start + timedelta(hours=i)).strftime("%Y%m%d_%H%M%S")
-                for i in range(int(24 * 365 * 3.5))
-            ]
-        )
-        ts_keep = ts_to_keep(ts_all)
-        ts_keep_verify = collections.OrderedDict(
-            [
-                ("20030701_110000", "hour-0"),
-                ("20030701_100000", "hour-1"),
-                ("20030701_000000", "day-0"),
-                ("20030630_000000", "day-1"),
-                ("20030628_000000", "week-0"),
-                ("20030621_000000", "week-1"),
-                ("20030614_000000", "month-0"),
-                ("20030515_000000", "month-1"),
-                ("20021231_000000", "year-0"),
-                ("20011231_000000", "year-1"),
-            ]
-        )
-        self.assertTrue(ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}")
-
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "unittest":
-        do_unittest()
     main()
