@@ -448,8 +448,11 @@ def initialize_borg_environment() -> None:
     os.environ["BORG_PASSPHRASE"] = load_passphrase()
     _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
     _hostkey_file.flush()
+    # Use -F /dev/null to ignore user's ~/.ssh/config which may contain
+    # settings (like IdentityAgent) that conflict with our ssh-agent setup.
     os.environ["BORG_RSH"] = (
-        f"ssh -o StrictHostKeyChecking=yes "
+        f"ssh -F /dev/null "
+        f"-o StrictHostKeyChecking=yes "
         f"-o UserKnownHostsFile={_hostkey_file.name}"
     )
     logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
