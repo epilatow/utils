@@ -65,12 +65,12 @@ except Exception:
 #
 # =============================================================================
 
-DEFAULT_CONFIG_NAME = "secure_archiver.toml"
+DEFAULT_CONFIG_NAME = "secure-archiver.toml"
 
 EXAMPLE_CONFIG = """\
-# Example configuration for secure_archiver
+# Example configuration for secure-archiver
 #
-# Run: secure_archiver create --config <this-file>
+# Run: secure-archiver create --config <this-file>
 
 [general]
 # Required: Directory where archives will be written. Supports ~ and env vars.

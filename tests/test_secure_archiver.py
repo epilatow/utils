@@ -96,7 +96,7 @@ class TestConfigFinding:
         # Create a temporary home directory
         home = tmp_path / "home"
         home.mkdir()
-        dotfile = home / ".secure_archiver.toml"
+        dotfile = home / ".secure-archiver.toml"
         dotfile.write_text("[general]\n")
 
         # Create a different CWD without config
