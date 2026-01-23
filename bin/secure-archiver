@@ -828,24 +828,28 @@ def write_output_readme(
     # Normalize content: ensure it ends with a single newline
     content = content.strip() + "\n"
 
+    eprint("=== README.txt ===")
+
     # Check if content has changed
     if readme_path.exists():
         existing = readme_path.read_text(encoding="utf-8")
         if existing == content:
+            eprint("[README.txt] No changes detected; not updating.")
             return False
 
     if dry_run:
         if readme_path.exists():
-            eprint("[general] DRY RUN: would update README.txt")
+            eprint("[README.txt] DRY RUN: would update README.txt")
         else:
-            eprint("[general] DRY RUN: would create README.txt")
+            eprint("[README.txt] DRY RUN: would create README.txt")
         return True
 
+    is_update = readme_path.exists()
     readme_path.write_text(content, encoding="utf-8")
-    if readme_path.exists():
-        eprint("[general] Updated README.txt")
+    if is_update:
+        eprint("[README.txt] Updated README.txt")
     else:
-        eprint("[general] Created README.txt")
+        eprint("[README.txt] Created README.txt")
     return True
 
 
