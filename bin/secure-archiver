@@ -735,16 +735,21 @@ ARCHIVE_README_TEMPLATE = """\
 ---
 ## macOS
 
-### Option A: App Store (GUI) — Keka (Purchase required)
-* Install **[Keka](https://apps.apple.com/us/app/keka/id470158793)**
-  from the Mac App Store.
-* Open the `.7z` file with Keka and enter the password.
+### Option A: Use the latest official 7-Zip release (Terminal)
+* Download [official 7-Zip installer](https://www.7-zip.org/download.html).
+* Open the 7-Zip installer archive and run 7zz to extract the archive
+  ```sh
+  open 7z2501-mac.tar.xz
+  mkdir OUTPUT_DIR
+  7z2501-mac/7zz x -oOUTPUT_DIR YOUR_ARCHIVE.7z
+  ```
 
 ### Option B: Homebrew (Terminal)
 * [Install Homebrew](https://brew.sh/), then install 7zip, then extract:
   ```sh
   brew install sevenzip
-  7z x YOUR_ARCHIVE.7z
+  mkdir OUTPUT_DIR
+  7z x -oOUTPUT_DIR YOUR_ARCHIVE.7z
   ```
 
 ### Option C: MacPorts (Terminal)
@@ -752,8 +757,15 @@ ARCHIVE_README_TEMPLATE = """\
   7zip, then extract:
   ```sh
   sudo port install 7zip
-  7z x YOUR_ARCHIVE.7z
+  mkdir OUTPUT_DIR
+  7z x -oOUTPUT_DIR YOUR_ARCHIVE.7z
   ```
+
+### Option D: App Store (GUI) — Keka (Purchase required)
+* Install **[Keka](https://apps.apple.com/us/app/keka/id470158793)**
+  from the Mac App Store.
+* Open the `.7z` file with Keka and enter the password.
+
 
 ---
 ## Windows
