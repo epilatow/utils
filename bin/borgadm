@@ -24,6 +24,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -31,6 +32,11 @@ import tempfile
 import threading
 import time
 import typing
+
+# Handle broken pipes gracefully (e.g., when piping to `head`).
+# Restore default SIGPIPE behavior so the process exits cleanly.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 from datetime import datetime, timedelta
 from pathlib import Path

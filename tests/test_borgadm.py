@@ -171,6 +171,57 @@ class TestTimestampPruning:
         assert ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}"
 
 
+class TestBrokenPipeHandling:
+    """Test that broken pipes are handled gracefully."""
+
+    def test_no_broken_pipe_error_when_piped_to_head(
+        self, tmp_path: Path
+    ) -> None:
+        """Test that piping output to head doesn't cause BrokenPipeError."""
+        # Create a script that imports borgadm (which sets up the SIGPIPE
+        # handler) and outputs many lines via logging to stdout.
+        # borgadm has no .py extension so we must use importlib to load it.
+        script_file = tmp_path / "test_sigpipe.py"
+        script_file.write_text(f"""
+import importlib.machinery
+import importlib.util
+import logging
+import sys
+
+# Load borgadm module (no .py extension, so use importlib)
+script_path = {str(REPO_ROOT / "bin" / "borgadm")!r}
+loader = importlib.machinery.SourceFileLoader("borgadm", script_path)
+spec = importlib.util.spec_from_loader("borgadm", loader)
+borgadm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(borgadm)
+
+# Now test logging output with many lines
+logger = logging.getLogger("test_sigpipe")
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+for i in range(1000):
+    logger.info(f"line {{i}}")
+""")
+        # Pipe to head -1 which will close the pipe after reading one line
+        result = subprocess.run(
+            f"python3 {script_file} | head -1",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        # The key assertion: no Python exceptions in stderr
+        assert (
+            "BrokenPipeError" not in result.stderr
+        ), f"BrokenPipeError found in stderr:\n{result.stderr}"
+        assert (
+            "Traceback" not in result.stderr
+        ), f"Traceback found in stderr:\n{result.stderr}"
+        # First line should be in output
+        assert "line 0" in result.stdout
+
+
 class TestCodeQuality:
     """Test code quality with black, flake8, and mypy."""
 
