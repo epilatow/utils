@@ -1,8 +1,12 @@
 # Development Guidelines
 
-- After modifying any utility, check for associated tests (e.g., a
-  `self-test` subcommand, test files in `tests/`, etc). Always run tests
-  before considering changes complete.
+- Before modifying any code or utilities, check for any associated tests
+  (e.g., a `self-test` subcommand, test files in `tests/`, etc) and run
+  those tests to get a baseline before making any changes. Flag any
+  testing problems before implementing any planned changes.
+
+- After modifying any code or utility, always run the associated tests
+  before considering any changes complete.
 
 - If a utility has tests and new functionality is being added, be sure
   to add tests for the new functionality.
