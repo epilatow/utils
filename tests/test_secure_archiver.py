@@ -1533,53 +1533,41 @@ include = [
 class TestRunTests:
     """Test do_self_test function."""
 
-    @patch("secure_archiver.run_cmd", autospec=True)
-    def test_run_tests_basic(self, mock_run_cmd: MagicMock) -> None:
-        """Test do_self_test executes pytest via uvx."""
-        mock_run_cmd.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
+    @patch("subprocess.run", autospec=True)
+    def test_run_tests_basic(self, mock_run: MagicMock) -> None:
+        """Test do_self_test invokes the test file."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         sa.do_self_test(verbose=False, coverage=False)
 
-        assert mock_run_cmd.called
-        # Verify command structure
-        cmd = mock_run_cmd.call_args[0][0]
-        assert "uvx" in cmd
-        assert "pytest" in cmd
+        assert mock_run.called
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0].endswith("test_secure_archiver.py")
 
-    @patch("secure_archiver.run_cmd", autospec=True)
-    def test_run_tests_with_verbose(self, mock_run_cmd: MagicMock) -> None:
-        """Test do_self_test passes verbose flag to pytest."""
-        mock_run_cmd.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
+    @patch("subprocess.run", autospec=True)
+    def test_run_tests_with_verbose(self, mock_run: MagicMock) -> None:
+        """Test do_self_test passes --verbose flag."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         sa.do_self_test(verbose=True, coverage=False)
 
-        cmd = mock_run_cmd.call_args[0][0]
-        assert "-v" in cmd
+        cmd = mock_run.call_args[0][0]
+        assert "--verbose" in cmd
 
-    @patch("secure_archiver.run_cmd", autospec=True)
-    def test_run_tests_with_coverage(self, mock_run_cmd: MagicMock) -> None:
-        """Test do_self_test passes coverage flags to pytest."""
-        mock_run_cmd.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
+    @patch("subprocess.run", autospec=True)
+    def test_run_tests_with_coverage(self, mock_run: MagicMock) -> None:
+        """Test do_self_test passes --coverage flag."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         sa.do_self_test(verbose=False, coverage=True)
 
-        cmd = mock_run_cmd.call_args[0][0]
-        assert "--cov=secure_archiver" in cmd
-        assert "--with" in cmd
-        assert "pytest-cov" in cmd
+        cmd = mock_run.call_args[0][0]
+        assert "--coverage" in cmd
 
-    @patch("secure_archiver.run_cmd", autospec=True)
-    def test_run_tests_raises_on_failure(self, mock_run_cmd: MagicMock) -> None:
+    @patch("subprocess.run", autospec=True)
+    def test_run_tests_raises_on_failure(self, mock_run: MagicMock) -> None:
         """Test do_self_test raises TestError when tests fail."""
-        mock_run_cmd.return_value = MagicMock(
-            returncode=1, stdout="FAILED", stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=1)
 
         with pytest.raises(sa.TestError, match="Tests failed"):
             sa.do_self_test(verbose=False, coverage=False)
@@ -2456,4 +2444,6 @@ class TestCodeQuality:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

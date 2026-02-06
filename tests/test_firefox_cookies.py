@@ -2618,9 +2618,9 @@ class TestDoSelfTest:
     def test_basic(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test executes pytest via uvx."""
+        """Test do_self_test invokes the test file."""
         mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
+            returncode=0
         )
 
         fc.do_self_test(
@@ -2628,13 +2628,10 @@ class TestDoSelfTest:
         )
 
         assert mock_run.called
-        cmd = mock_run.call_args[1].get(
-            "args", mock_run.call_args[0][0]
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0].endswith(
+            "test_firefox_cookies.py"
         )
-        assert cmd[0] == "uvx"
-        assert "pytest" in cmd
-        assert "--with" in cmd
-        assert "lz4" in cmd
 
     @patch.object(
         fc.subprocess, "run", autospec=True
@@ -2642,9 +2639,9 @@ class TestDoSelfTest:
     def test_with_verbose(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test passes -v to pytest."""
+        """Test do_self_test passes --verbose."""
         mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
+            returncode=0
         )
 
         fc.do_self_test(
@@ -2652,7 +2649,7 @@ class TestDoSelfTest:
         )
 
         cmd = mock_run.call_args[0][0]
-        assert "-v" in cmd
+        assert "--verbose" in cmd
 
     @patch.object(
         fc.subprocess, "run", autospec=True
@@ -2660,9 +2657,9 @@ class TestDoSelfTest:
     def test_without_verbose(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test omits -v by default."""
+        """Test do_self_test omits --verbose."""
         mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
+            returncode=0
         )
 
         fc.do_self_test(
@@ -2670,7 +2667,7 @@ class TestDoSelfTest:
         )
 
         cmd = mock_run.call_args[0][0]
-        assert "-v" not in cmd
+        assert "--verbose" not in cmd
 
     @patch.object(
         fc.subprocess, "run", autospec=True
@@ -2678,9 +2675,9 @@ class TestDoSelfTest:
     def test_with_coverage(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test passes coverage flags."""
+        """Test do_self_test passes --coverage."""
         mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
+            returncode=0
         )
 
         fc.do_self_test(
@@ -2688,13 +2685,7 @@ class TestDoSelfTest:
         )
 
         cmd = mock_run.call_args[0][0]
-        assert "--cov=firefox_cookies" in cmd
-        assert "pytest-cov" in cmd
-        cov_report = [
-            c for c in cmd
-            if c.startswith("--cov-report=")
-        ]
-        assert len(cov_report) == 2
+        assert "--coverage" in cmd
 
     @patch.object(
         fc.subprocess, "run", autospec=True
@@ -2702,9 +2693,9 @@ class TestDoSelfTest:
     def test_without_coverage(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test omits coverage flags."""
+        """Test do_self_test omits --coverage."""
         mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
+            returncode=0
         )
 
         fc.do_self_test(
@@ -2712,8 +2703,7 @@ class TestDoSelfTest:
         )
 
         cmd = mock_run.call_args[0][0]
-        assert "--cov=firefox_cookies" not in cmd
-        assert "pytest-cov" not in cmd
+        assert "--coverage" not in cmd
 
     @patch.object(
         fc.subprocess, "run", autospec=True
@@ -2721,9 +2711,9 @@ class TestDoSelfTest:
     def test_raises_on_failure(
         self, mock_run: MagicMock
     ) -> None:
-        """Test do_self_test raises TestError on failure."""
+        """Test do_self_test raises TestError."""
         mock_run.return_value = MagicMock(
-            returncode=1, stdout="FAILED", stderr=""
+            returncode=1
         )
 
         with pytest.raises(
@@ -2732,107 +2722,6 @@ class TestDoSelfTest:
             fc.do_self_test(
                 verbose=False, coverage=False
             )
-
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_prints_stdout(
-        self,
-        mock_run: MagicMock,
-        capsys: Any,
-    ) -> None:
-        """Test do_self_test prints subprocess stdout."""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="all tests passed\n",
-            stderr="",
-        )
-
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
-
-        captured = capsys.readouterr()
-        assert "all tests passed" in captured.out
-
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_prints_stderr(
-        self,
-        mock_run: MagicMock,
-        capsys: Any,
-    ) -> None:
-        """Test do_self_test prints subprocess stderr."""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="",
-            stderr="warning: something\n",
-        )
-
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
-
-        captured = capsys.readouterr()
-        assert "warning: something" in captured.err
-
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_env_pythondontwritebytecode(
-        self, mock_run: MagicMock
-    ) -> None:
-        """Test do_self_test sets PYTHONDONTWRITEBYTECODE."""
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
-
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
-
-        env = mock_run.call_args[1]["env"]
-        assert env["PYTHONDONTWRITEBYTECODE"] == "1"
-
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_env_pythonpath(
-        self, mock_run: MagicMock
-    ) -> None:
-        """Test do_self_test sets PYTHONPATH to bin/."""
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
-
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
-
-        env = mock_run.call_args[1]["env"]
-        assert env["PYTHONPATH"].endswith("bin")
-
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_coverage_env_file(
-        self, mock_run: MagicMock
-    ) -> None:
-        """Test coverage sets COVERAGE_FILE env var."""
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="", stderr=""
-        )
-
-        fc.do_self_test(
-            verbose=False, coverage=True
-        )
-
-        env = mock_run.call_args[1]["env"]
-        assert "COVERAGE_FILE" in env
-        assert "firefox_cookies" in env[
-            "COVERAGE_FILE"
-        ]
 
 
 class TestDoListDomainsWithSession:
@@ -2858,3 +2747,9 @@ class TestDoListDomainsWithSession:
             )
         captured = capsys.readouterr()
         assert "wordpress.com" in captured.out
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

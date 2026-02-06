@@ -14,8 +14,6 @@ import fnmatch
 import logging
 import os
 import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -648,71 +646,21 @@ def do_audit(directory: Optional[Path]) -> int:
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
-    """
-    Run tests using pytest via uvx.
-
-    Args:
-        verbose: Enable verbose output
-        coverage: Run with coverage report
+    """Run tests by invoking the test file directly.
 
     Raises:
         TestError: If any tests fail or pytest encounters an error.
     """
-    # Repository root is parent of bin/ where this script lives
     repo_root = Path(__file__).parent.parent
-    tests_dir = repo_root / "tests"
-    bin_dir = repo_root / "bin"
+    test_file = repo_root / "tests" / "test_dotfiles.py"
 
-    # Build uvx command
-    cmd = ["uvx", "--with", "pytest"]
-    if coverage:
-        cmd.extend(["--with", "pytest-cov"])
-
-    cmd.extend(
-        [
-            "pytest",
-            "-p",
-            "no:cacheprovider",
-            str(tests_dir / "test_dotfiles.py"),
-        ]
-    )
-
+    cmd = [str(test_file)]
     if verbose:
-        cmd.append("-v")
+        cmd.append("--verbose")
     if coverage:
-        htmlcov_dir = Path(tempfile.gettempdir()) / "dotfiles_htmlcov"
-        cmd.extend(
-            [
-                "--cov=dotfiles",
-                "--cov-report=term-missing",
-                f"--cov-report=html:{htmlcov_dir}",
-            ]
-        )
+        cmd.append("--coverage")
 
-    # Run pytest with PYTHONDONTWRITEBYTECODE=1 to prevent __pycache__
-    # Add bin/ to PYTHONPATH so coverage can find the dotfiles module
-    env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONPATH"] = str(bin_dir)
-    if coverage:
-        # Redirect .coverage data file to temp directory
-        env["COVERAGE_FILE"] = str(
-            Path(tempfile.gettempdir()) / "dotfiles.coverage"
-        )
-    cp = subprocess.run(
-        cmd,
-        check=False,
-        env=env,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if cp.stdout:
-        print(cp.stdout, end="")
-    if cp.stderr:
-        sys.stderr.write(cp.stderr)
-
+    cp = subprocess.run(cmd, cwd=repo_root)
     if cp.returncode != 0:
         raise TestError("Tests failed")
 

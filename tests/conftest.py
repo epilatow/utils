@@ -2,6 +2,7 @@
 # This is AI generated code
 
 import atexit
+import os
 import shutil
 import sys
 import tempfile
@@ -43,3 +44,54 @@ def pytest_sessionfinish(
 ) -> None:
     """Clean up pycache directories after test session."""
     _cleanup_all_caches()
+
+
+def run_tests(
+    test_file: str,
+    script_path: Path,
+    repo_root: Path,
+) -> None:
+    """Entry point for running a test file directly.
+
+    Handles ``--verbose`` and ``--coverage`` flags, then
+    invokes ``pytest.main()``.  Called from each test
+    file's ``__main__`` block.
+
+    Args:
+        test_file: The test file's ``__file__`` path.
+        script_path: Path to the script under test
+            (used to derive the coverage module name).
+        repo_root: Repository root directory.
+    """
+    import argparse
+
+    import pytest  # type: ignore[import-not-found]
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose test output",
+    )
+    parser.add_argument(
+        "--coverage", action="store_true",
+        help="Run with coverage report",
+    )
+    args = parser.parse_args()
+
+    pytest_args = [test_file, "-p", "no:cacheprovider"]
+    if args.verbose:
+        pytest_args.append("-v")
+    if args.coverage:
+        module = script_path.stem.replace("-", "_")
+        cov_dir = Path(tempfile.gettempdir())
+        pytest_args.extend([
+            f"--cov={module}",
+            "--cov-report=term-missing",
+            f"--cov-report=html:{cov_dir / (module + '_htmlcov')}",
+        ])
+        os.environ["PYTHONPATH"] = str(repo_root / "bin")
+        os.environ["COVERAGE_FILE"] = str(
+            cov_dir / f"{module}.coverage"
+        )
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    raise SystemExit(pytest.main(pytest_args))

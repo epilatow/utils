@@ -314,4 +314,6 @@ class TestCodeQuality:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

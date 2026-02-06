@@ -1353,42 +1353,41 @@ class TestDoAudit:
 class TestDoSelfTest:
     """Test do_self_test function."""
 
-    @patch("subprocess.run")
+    @patch("subprocess.run", autospec=True)
     def test_do_self_test_basic(self, mock_run: MagicMock) -> None:
-        """Test do_self_test executes pytest via uvx."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        """Test do_self_test invokes the test file."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         df.do_self_test(verbose=False, coverage=False)
 
         assert mock_run.called
         cmd = mock_run.call_args[0][0]
-        assert "uvx" in cmd
-        assert "pytest" in cmd
+        assert cmd[0].endswith("test_dotfiles.py")
 
-    @patch("subprocess.run")
+    @patch("subprocess.run", autospec=True)
     def test_do_self_test_with_verbose(self, mock_run: MagicMock) -> None:
-        """Test do_self_test with verbose flag."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        """Test do_self_test passes --verbose flag."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         df.do_self_test(verbose=True, coverage=False)
 
         cmd = mock_run.call_args[0][0]
-        assert "-v" in cmd
+        assert "--verbose" in cmd
 
-    @patch("subprocess.run")
+    @patch("subprocess.run", autospec=True)
     def test_do_self_test_with_coverage(self, mock_run: MagicMock) -> None:
-        """Test do_self_test with coverage flag."""
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        """Test do_self_test passes --coverage flag."""
+        mock_run.return_value = MagicMock(returncode=0)
 
         df.do_self_test(verbose=False, coverage=True)
 
         cmd = mock_run.call_args[0][0]
-        assert "--cov=dotfiles" in cmd
+        assert "--coverage" in cmd
 
-    @patch("subprocess.run")
+    @patch("subprocess.run", autospec=True)
     def test_do_self_test_raises_on_failure(self, mock_run: MagicMock) -> None:
         """Test do_self_test raises TestError on failure."""
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        mock_run.return_value = MagicMock(returncode=1)
 
         with pytest.raises(df.TestError, match="Tests failed"):
             df.do_self_test(verbose=False, coverage=False)
@@ -1659,4 +1658,6 @@ class TestCodeQuality:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

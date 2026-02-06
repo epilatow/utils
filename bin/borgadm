@@ -1479,40 +1479,17 @@ def do_environment() -> None:
 
 
 def do_self_test(verbose: bool = False, coverage: bool = False) -> None:
-    """Run tests using pytest via uvx."""
+    """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
-    tests_dir = repo_root / "tests"
-    bin_dir = repo_root / "bin"
+    test_file = repo_root / "tests" / "test_borgadm.py"
 
-    cmd = ["uvx", "--with", "pytest"]
-    if coverage:
-        cmd.extend(["--with", "pytest-cov"])
-
-    cmd.extend(
-        ["pytest", "-p", "no:cacheprovider", str(tests_dir / "test_borgadm.py")]
-    )
-
+    cmd = [str(test_file)]
     if verbose:
-        cmd.append("-v")
+        cmd.append("--verbose")
     if coverage:
-        htmlcov_dir = Path(tempfile.gettempdir()) / "borgadm_htmlcov"
-        cmd.extend(
-            [
-                "--cov=borgadm",
-                "--cov-report=term-missing",
-                f"--cov-report=html:{htmlcov_dir}",
-            ]
-        )
+        cmd.append("--coverage")
 
-    env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONPATH"] = str(bin_dir)
-    if coverage:
-        env["COVERAGE_FILE"] = str(
-            Path(tempfile.gettempdir()) / "borgadm.coverage"
-        )
-
-    result = subprocess.run(cmd, env=env, cwd=repo_root)
+    result = subprocess.run(cmd, cwd=repo_root)
     sys.exit(result.returncode)
 
 
