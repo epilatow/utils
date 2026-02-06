@@ -1,0 +1,1374 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["lz4"]
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_firefox_cookies.py
+# Always run the `self-test` subcommand after making modifications.
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import signal
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+
+# Handle broken pipes gracefully (e.g., when piping to `head`).
+# Restore default SIGPIPE behavior so the process exits cleanly.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+# Configure logging to stderr
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+    stream=sys.stderr,
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Exit Codes
+# =============================================================================
+EXIT_SUCCESS = 0
+EXIT_USAGE = 1
+EXIT_CONFIG = 2
+EXIT_NOT_FOUND = 3
+EXIT_SUBPROCESS = 4
+EXIT_OTHER = 5
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+
+class UsageError(RuntimeError):
+    """Raised for usage/argument errors."""
+
+
+class ConfigError(RuntimeError):
+    """Raised for configuration errors."""
+
+
+class NotFoundError(RuntimeError):
+    """Raised when a required file or directory is not found."""
+
+
+class TestError(RuntimeError):
+    """Raised when tests fail."""
+
+
+# =============================================================================
+# Data Structures
+# =============================================================================
+
+
+@dataclass
+class Profile:
+    name: str
+    path: Path
+    is_default: bool
+
+
+@dataclass
+class Container:
+    id: int
+    name: str
+    icon: str
+    color: str
+
+
+@dataclass
+class Cookie:
+    host: str
+    name: str
+    value: str
+    path: str
+    expiry: int
+    is_secure: bool
+    is_http_only: bool
+    same_site: int
+    origin_attributes: str
+
+
+@dataclass
+class ContainerConflict:
+    host: str
+    name: str
+    path: str
+    kept_container_id: int
+    omitted_container_ids: list[int]
+
+
+# =============================================================================
+# Core Functions
+# =============================================================================
+
+
+def find_firefox_dir() -> Path:
+    """Find the Firefox profile directory based on platform."""
+    system = platform.system()
+    if system == "Darwin":
+        ff_dir = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Firefox"
+        )
+    elif system == "Linux":
+        ff_dir = Path.home() / ".mozilla" / "firefox"
+    else:
+        raise ConfigError(f"Unsupported platform: {system}")
+
+    if not ff_dir.is_dir():
+        raise NotFoundError(
+            f"Firefox directory not found: {ff_dir}"
+        )
+    return ff_dir
+
+
+def parse_profiles(firefox_dir: Path) -> list[Profile]:
+    """Parse profiles.ini and return list of profiles."""
+    ini_path = firefox_dir / "profiles.ini"
+    if not ini_path.is_file():
+        raise NotFoundError(
+            f"profiles.ini not found: {ini_path}"
+        )
+
+    config = configparser.ConfigParser()
+    config.read(ini_path)
+
+    # Find the default profile path from [Install*] sections
+    install_default: str | None = None
+    for section in config.sections():
+        if section.startswith("Install"):
+            if config.has_option(section, "Default"):
+                install_default = config.get(
+                    section, "Default"
+                )
+                break
+
+    profiles: list[Profile] = []
+    for section in config.sections():
+        if not section.startswith("Profile"):
+            continue
+
+        name = config.get(section, "Name", fallback="")
+        path_str = config.get(section, "Path", fallback="")
+        is_relative = config.getboolean(
+            section, "IsRelative", fallback=True
+        )
+
+        if is_relative:
+            profile_path = firefox_dir / path_str
+        else:
+            profile_path = Path(path_str)
+
+        # Determine if this is the default profile
+        is_default = False
+        if install_default:
+            is_default = path_str == install_default
+        else:
+            is_default = config.getboolean(
+                section, "Default", fallback=False
+            )
+
+        profiles.append(
+            Profile(
+                name=name,
+                path=profile_path,
+                is_default=is_default,
+            )
+        )
+
+    if not profiles:
+        raise ConfigError("No profiles found in profiles.ini")
+
+    return profiles
+
+
+def resolve_profile(
+    firefox_dir: Path,
+    profile_arg: str | None = None,
+) -> Profile:
+    """Resolve --profile argument to a Profile.
+
+    If profile_arg is None, auto-detect the default profile.
+    If profile_arg is a directory path, use it directly.
+    Otherwise, match by name (case-insensitive).
+    """
+    profiles = parse_profiles(firefox_dir)
+
+    if profile_arg is None:
+        # Auto-detect: use the default profile
+        defaults = [p for p in profiles if p.is_default]
+        if len(defaults) == 1:
+            return defaults[0]
+        if len(defaults) > 1:
+            raise ConfigError(
+                "Multiple default profiles found. "
+                "Use --profile to specify one."
+            )
+        # No default marked - use the first profile
+        return profiles[0]
+
+    # Check if profile_arg is a path to a directory
+    profile_path = Path(profile_arg)
+    if profile_path.is_dir():
+        return Profile(
+            name=profile_path.name,
+            path=profile_path,
+            is_default=False,
+        )
+
+    # Match by name (case-insensitive)
+    matches = [
+        p
+        for p in profiles
+        if p.name.lower() == profile_arg.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ConfigError(
+            f"Ambiguous profile name '{profile_arg}'. "
+            "Use --profile with the full path."
+        )
+
+    raise ConfigError(f"Profile not found: {profile_arg}")
+
+
+def load_containers(profile_path: Path) -> list[Container]:
+    """Load containers from containers.json."""
+    containers_path = profile_path / "containers.json"
+    if not containers_path.is_file():
+        return []
+
+    with open(containers_path) as f:
+        data = json.load(f)
+
+    containers: list[Container] = []
+    for identity in data.get("identities", []):
+        if not identity.get("public", True):
+            continue
+
+        ctx_id = identity.get("userContextId", 0)
+        name = identity.get("name", "")
+        if not name:
+            # Built-in containers use l10nID instead of name
+            l10n_id = identity.get("l10nID", "")
+            match = re.match(
+                r"userContext(\w+)\.label", l10n_id
+            )
+            if match:
+                name = match.group(1)
+            else:
+                name = f"Container {ctx_id}"
+
+        containers.append(
+            Container(
+                id=ctx_id,
+                name=name,
+                icon=identity.get("icon", ""),
+                color=identity.get("color", ""),
+            )
+        )
+
+    return containers
+
+
+def resolve_container(
+    containers: list[Container],
+    container_arg: str,
+) -> Container:
+    """Resolve --container argument to a Container.
+
+    Accepts numeric ID or name (case-insensitive, partial match).
+    """
+    # Try numeric ID first
+    if container_arg.isdigit():
+        ctx_id = int(container_arg)
+        for c in containers:
+            if c.id == ctx_id:
+                return c
+        raise ConfigError(
+            f"Container ID not found: {ctx_id}"
+        )
+
+    # Case-insensitive exact name match
+    lower_arg = container_arg.lower()
+    exact = [
+        c for c in containers if c.name.lower() == lower_arg
+    ]
+    if len(exact) == 1:
+        return exact[0]
+
+    # Partial name match
+    partial = [
+        c for c in containers if lower_arg in c.name.lower()
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        names = ", ".join(c.name for c in partial)
+        raise ConfigError(
+            f"Ambiguous container name '{container_arg}'. "
+            f"Matches: {names}"
+        )
+
+    raise ConfigError(
+        f"Container not found: {container_arg}"
+    )
+
+
+def get_user_context_id(origin_attributes: str) -> int:
+    """Extract userContextId from originAttributes string.
+
+    Firefox stores origin attributes as ^-separated
+    key=value pairs, e.g. "^userContextId=5" or
+    "^userContextId=5^privateBrowsingId=1".
+    Values may also contain &-separated sub-parameters
+    like "&partitionKey=...".
+    Returns 0 for the default (no container) context.
+    """
+    for part in origin_attributes.split("^"):
+        if part.startswith("userContextId="):
+            value = part.split("=", 1)[1]
+            # Strip any &-separated sub-parameters
+            value = value.split("&", 1)[0]
+            return int(value)
+    return 0
+
+
+def origin_attributes_from_dict(
+    attrs: dict[str, int | str],
+) -> str:
+    """Convert originAttributes dict to ^key=value string.
+
+    In recovery.jsonlz4, originAttributes is a dict like
+    {"userContextId": 5}. In moz_cookies (and the Cookie
+    dataclass), it's a string like "^userContextId=5".
+    Values that are 0 or empty are omitted since Firefox
+    omits default values.
+    """
+    if not attrs:
+        return ""
+    parts: list[str] = []
+    for key, value in sorted(attrs.items()):
+        if value == 0 or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    if not parts:
+        return ""
+    return "^" + "^".join(parts)
+
+
+def decompress_mozlz4(data: bytes) -> bytes:
+    """Decompress Mozilla's custom LZ4 format (mozlz4).
+
+    Mozilla LZ4 format:
+      Bytes 0-7:  magic b"mozLz40\\0"
+      Bytes 8-11: little-endian uint32 uncompressed size
+      Bytes 12+:  LZ4 block compressed data
+
+    Raises:
+        ValueError: If the magic header is invalid.
+    """
+    import lz4.block  # type: ignore[import-untyped]
+
+    MOZLZ4_MAGIC = b"mozLz40\0"
+    if not data.startswith(MOZLZ4_MAGIC):
+        raise ValueError(
+            "Invalid mozlz4 file: wrong magic header"
+        )
+    (uncompressed_size,) = struct.unpack_from(
+        "<I", data, len(MOZLZ4_MAGIC)
+    )
+    compressed = data[len(MOZLZ4_MAGIC) + 4 :]
+    return lz4.block.decompress(
+        compressed, uncompressed_size=uncompressed_size
+    )
+
+
+def load_session_cookies(
+    profile_path: Path,
+    domains: list[str] | None = None,
+    container_id: int | None = None,
+) -> list[Cookie]:
+    """Load session cookies from recovery.jsonlz4.
+
+    Session cookies (no Expires/Max-Age) are stored only
+    in memory by Firefox, but Session Restore persists
+    them to sessionstore-backups/recovery.jsonlz4.
+
+    Args:
+        profile_path: Path to the Firefox profile.
+        domains: If set, filter to cookies matching
+            any of these domains.
+        container_id: If set, filter to this container ID.
+
+    Returns:
+        List of Cookie objects from the session store.
+        Returns empty list if the file doesn't exist or
+        cannot be read.
+    """
+    recovery_path = (
+        profile_path
+        / "sessionstore-backups"
+        / "recovery.jsonlz4"
+    )
+    if not recovery_path.is_file():
+        return []
+
+    try:
+        raw = recovery_path.read_bytes()
+        decompressed = decompress_mozlz4(raw)
+        data = json.loads(decompressed)
+    except (ValueError, json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            "Could not read session cookies: %s", e
+        )
+        return []
+
+    raw_cookies: list[dict[str, Any]] = data.get(
+        "cookies", []
+    )
+    cookies: list[Cookie] = []
+    for entry in raw_cookies:
+        host: str = entry.get("host", "")
+        name: str = entry.get("name", "")
+        value: str = entry.get("value", "")
+        path: str = entry.get("path", "/")
+        expiry: int = entry.get("expiry", 0)
+        is_secure: bool = entry.get("secure", False)
+        is_http_only: bool = entry.get(
+            "httponly", False
+        )
+
+        raw_attrs = entry.get("originAttributes", {})
+        if isinstance(raw_attrs, dict):
+            origin_attributes = (
+                origin_attributes_from_dict(raw_attrs)
+            )
+        else:
+            origin_attributes = str(raw_attrs)
+
+        cookie = Cookie(
+            host=host,
+            name=name,
+            value=value,
+            path=path,
+            expiry=expiry,
+            is_secure=is_secure,
+            is_http_only=is_http_only,
+            same_site=0,
+            origin_attributes=origin_attributes,
+        )
+
+        if domains:
+            matched = False
+            for d in domains:
+                if host == d or host.endswith(f".{d}"):
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+        if container_id is not None:
+            ctx_id = get_user_context_id(
+                origin_attributes
+            )
+            if ctx_id != container_id:
+                continue
+
+        cookies.append(cookie)
+
+    cookies.sort(key=lambda c: (c.host, c.name))
+    return cookies
+
+
+def merge_cookies(
+    sqlite_cookies: list[Cookie],
+    session_cookies: list[Cookie],
+) -> list[Cookie]:
+    """Merge sqlite and session cookies, deduplicating.
+
+    When the same cookie exists in both sources (matched
+    by host + name + path + origin_attributes), the sqlite
+    version takes precedence.
+
+    Args:
+        sqlite_cookies: Cookies from cookies.sqlite.
+        session_cookies: Cookies from recovery.jsonlz4.
+
+    Returns:
+        Merged list, sorted by host then name.
+    """
+    seen: set[tuple[str, str, str, str]] = set()
+    for c in sqlite_cookies:
+        seen.add(
+            (c.host, c.name, c.path,
+             c.origin_attributes)
+        )
+
+    merged = list(sqlite_cookies)
+    for c in session_cookies:
+        key = (
+            c.host, c.name, c.path,
+            c.origin_attributes,
+        )
+        if key not in seen:
+            merged.append(c)
+            seen.add(key)
+
+    merged.sort(key=lambda c: (c.host, c.name))
+    return merged
+
+
+def dedup_container_conflicts(
+    cookies: list[Cookie],
+) -> tuple[list[Cookie], list[ContainerConflict]]:
+    """Deduplicate cookies that exist in multiple containers.
+
+    When the same (host, name, path) exists in multiple
+    containers, keep the one from the default context
+    (container_id=0). If no default context version exists,
+    keep the one from the lowest container ID.
+
+    Returns:
+        Tuple of (deduped cookies, list of conflicts).
+    """
+    groups: dict[
+        tuple[str, str, str], list[Cookie]
+    ] = {}
+    for c in cookies:
+        key = (c.host, c.name, c.path)
+        groups.setdefault(key, []).append(c)
+
+    deduped: list[Cookie] = []
+    conflicts: list[ContainerConflict] = []
+
+    for key, group in groups.items():
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+
+        # Check if group actually spans multiple
+        # containers vs just differing in partition
+        # keys within the same container.
+        ctx_ids = {
+            get_user_context_id(c.origin_attributes)
+            for c in group
+        }
+        if len(ctx_ids) == 1:
+            # Same container, different partition keys
+            # or other sub-attributes — keep all.
+            deduped.extend(group)
+            continue
+
+        group.sort(
+            key=lambda c: get_user_context_id(
+                c.origin_attributes
+            )
+        )
+
+        default = [
+            c for c in group
+            if get_user_context_id(
+                c.origin_attributes
+            ) == 0
+        ]
+        if default:
+            winner = default[0]
+        else:
+            winner = group[0]
+
+        kept_id = get_user_context_id(
+            winner.origin_attributes
+        )
+        omitted_ids = sorted(
+            {
+                get_user_context_id(c.origin_attributes)
+                for c in group
+                if c is not winner
+            }
+            - {kept_id}
+        )
+
+        deduped.append(winner)
+        conflicts.append(
+            ContainerConflict(
+                host=key[0],
+                name=key[1],
+                path=key[2],
+                kept_container_id=kept_id,
+                omitted_container_ids=omitted_ids,
+            )
+        )
+        logger.warning(
+            "Cookie %r on %s exists in multiple "
+            "containers; keeping container %d, "
+            "omitting %s",
+            key[1],
+            key[0],
+            kept_id,
+            omitted_ids,
+        )
+
+    deduped.sort(key=lambda c: (c.host, c.name))
+    return deduped, conflicts
+
+
+def safe_copy_db(profile_path: Path) -> Path:
+    """Copy cookies.sqlite to a temp directory for safe access.
+
+    Firefox locks the database while running, so we copy it
+    (along with any WAL/SHM files) to a temporary location.
+    Returns the path to the copied database file.
+    The caller is responsible for cleaning up the temp
+    directory (db_path.parent).
+    """
+    db_path = profile_path / "cookies.sqlite"
+    if not db_path.is_file():
+        raise NotFoundError(
+            f"cookies.sqlite not found: {db_path}"
+        )
+
+    tmp_dir = Path(
+        tempfile.mkdtemp(prefix="firefox-cookies-")
+    )
+
+    shutil.copy2(db_path, tmp_dir / "cookies.sqlite")
+    for suffix in ("-wal", "-shm"):
+        wal_path = profile_path / f"cookies.sqlite{suffix}"
+        if wal_path.is_file():
+            shutil.copy2(
+                wal_path,
+                tmp_dir / f"cookies.sqlite{suffix}",
+            )
+
+    return tmp_dir / "cookies.sqlite"
+
+
+def query_cookies(
+    db_path: Path,
+    domains: list[str] | None = None,
+    container_id: int | None = None,
+) -> list[Cookie]:
+    """Query cookies from the database.
+
+    Args:
+        db_path: Path to the (copied) cookies.sqlite file.
+        domains: If set, filter to cookies matching
+            any of these domains.
+        container_id: If set, filter to this container ID.
+
+    Returns:
+        List of Cookie objects, sorted by host then name.
+    """
+    conn = sqlite3.connect(
+        f"file:{db_path}?mode=ro", uri=True
+    )
+    try:
+        sql = (
+            "SELECT host, name, value, path, expiry, "
+            "isSecure, isHttpOnly, sameSite, "
+            "originAttributes FROM moz_cookies"
+        )
+        conditions: list[str] = []
+        params: list[str] = []
+
+        if domains:
+            domain_clauses = []
+            for d in domains:
+                domain_clauses.append(
+                    "(host = ? OR host LIKE ?)"
+                )
+                params.extend([d, f"%.{d}"])
+            conditions.append(
+                "(" + " OR ".join(domain_clauses) + ")"
+            )
+
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+
+        sql += " ORDER BY host, name"
+
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    cookies = [
+        Cookie(
+            host=row[0],
+            name=row[1],
+            value=row[2],
+            path=row[3],
+            expiry=row[4],
+            is_secure=bool(row[5]),
+            is_http_only=bool(row[6]),
+            same_site=row[7],
+            origin_attributes=row[8],
+        )
+        for row in rows
+    ]
+
+    # Filter by container in Python for exact ID matching
+    if container_id is not None:
+        cookies = [
+            c
+            for c in cookies
+            if get_user_context_id(c.origin_attributes)
+            == container_id
+        ]
+
+    return cookies
+
+
+def format_netscape(
+    cookies: list[Cookie],
+    conflicts: list[ContainerConflict] | None = None,
+) -> str:
+    """Format cookies in Netscape cookie file format."""
+    conflict_map: dict[tuple[str, str, str],
+                        ContainerConflict] = {}
+    if conflicts:
+        for cf in conflicts:
+            conflict_map[(cf.host, cf.name, cf.path)] = cf
+
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# https://curl.se/docs/http-cookies.html",
+        "#",
+        "# host\tsubdomains\tpath\tsecure"
+        "\texpiry\tname\tvalue",
+    ]
+    for c in cookies:
+        key = (c.host, c.name, c.path)
+        if key in conflict_map:
+            cf = conflict_map[key]
+            lines.append(
+                f"# Cookie {c.name!r} on {c.host}"
+                f" has conflicting values in"
+                f" containers:"
+                f" {cf.omitted_container_ids}"
+                f" (omitted); keeping"
+                f" container {cf.kept_container_id}"
+            )
+        subdomain = (
+            "TRUE" if c.host.startswith(".") else "FALSE"
+        )
+        secure = "TRUE" if c.is_secure else "FALSE"
+        lines.append(
+            f"{c.host}\t{subdomain}\t{c.path}\t"
+            f"{secure}\t{c.expiry}\t{c.name}\t{c.value}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_json(
+    cookies: list[Cookie],
+    conflicts: list[ContainerConflict] | None = None,
+) -> str:
+    """Format cookies as JSON."""
+    conflict_map: dict[tuple[str, str, str],
+                        ContainerConflict] = {}
+    if conflicts:
+        for cf in conflicts:
+            conflict_map[(cf.host, cf.name, cf.path)] = cf
+
+    data: list[dict[str, Any]] = []
+    for c in cookies:
+        entry: dict[str, Any] = {
+            "host": c.host,
+            "name": c.name,
+            "value": c.value,
+            "path": c.path,
+            "expiry": c.expiry,
+            "secure": c.is_secure,
+            "httpOnly": c.is_http_only,
+            "sameSite": c.same_site,
+        }
+        key = (c.host, c.name, c.path)
+        if key in conflict_map:
+            cf = conflict_map[key]
+            entry["containerConflict"] = {
+                "keptContainerId": cf.kept_container_id,
+                "omittedContainerIds": (
+                    cf.omitted_container_ids
+                ),
+            }
+        data.append(entry)
+    return json.dumps(data, indent=2) + "\n"
+
+
+# =============================================================================
+# Subcommand Handlers
+# =============================================================================
+
+
+def normalize_sources(
+    src: list[str] | None,
+) -> set[str]:
+    """Normalize --src argument to a set of sources.
+
+    Returns {"db", "recovery"} when src is None (default).
+    """
+    if src is None:
+        return {"db", "recovery"}
+    return set(src)
+
+
+def collect_cookies(
+    prof_path: Path,
+    sources: set[str],
+    domains: list[str] | None = None,
+    container_id: int | None = None,
+) -> list[Cookie]:
+    """Collect cookies from the requested sources.
+
+    Queries cookies.sqlite and/or recovery.jsonlz4 based
+    on the sources set, then merges if both are present.
+    """
+    sqlite_cookies: list[Cookie] = []
+    session_cookies: list[Cookie] = []
+
+    if "db" in sources:
+        db_path = safe_copy_db(prof_path)
+        try:
+            sqlite_cookies = query_cookies(
+                db_path, domains, container_id
+            )
+        finally:
+            shutil.rmtree(
+                db_path.parent, ignore_errors=True
+            )
+
+    if "recovery" in sources:
+        session_cookies = load_session_cookies(
+            prof_path, domains, container_id
+        )
+
+    if sqlite_cookies and session_cookies:
+        return merge_cookies(
+            sqlite_cookies, session_cookies
+        )
+    return sqlite_cookies + session_cookies
+
+
+def do_list(
+    profile: str | None,
+    domains: list[str] | None,
+    container: str | None,
+    fmt: str,
+    sources: list[str] | None = None,
+) -> int:
+    """Extract/list cookies to stdout."""
+    firefox_dir = find_firefox_dir()
+    prof = resolve_profile(firefox_dir, profile)
+    src = normalize_sources(sources)
+
+    container_id: int | None = None
+    if container is not None:
+        containers = load_containers(prof.path)
+        resolved = resolve_container(
+            containers, container
+        )
+        container_id = resolved.id
+
+    cookies = collect_cookies(
+        prof.path, src, domains, container_id
+    )
+
+    conflicts: list[ContainerConflict] = []
+    if container is None:
+        cookies, conflicts = (
+            dedup_container_conflicts(cookies)
+        )
+
+    if fmt == "json":
+        sys.stdout.write(
+            format_json(cookies, conflicts)
+        )
+    else:
+        sys.stdout.write(
+            format_netscape(cookies, conflicts)
+        )
+
+    return EXIT_SUCCESS
+
+
+def do_list_domains(
+    profile: str | None,
+    container: str | None,
+    sources: list[str] | None = None,
+) -> int:
+    """List domains with cookie counts."""
+    firefox_dir = find_firefox_dir()
+    prof = resolve_profile(firefox_dir, profile)
+    src = normalize_sources(sources)
+
+    container_id: int | None = None
+    if container is not None:
+        containers = load_containers(prof.path)
+        resolved = resolve_container(
+            containers, container
+        )
+        container_id = resolved.id
+
+    cookies = collect_cookies(
+        prof.path, src,
+        container_id=container_id,
+    )
+
+    # Count cookies per (domain, container_id)
+    key_counts: dict[tuple[str, int], int] = {}
+    for c in cookies:
+        host = c.host.lstrip(".")
+        ctx_id = get_user_context_id(
+            c.origin_attributes
+        )
+        key = (host, ctx_id)
+        key_counts[key] = key_counts.get(key, 0) + 1
+
+    # Sort by domain, then container ID
+    rows = [
+        (count, ctx_id, domain)
+        for (domain, ctx_id), count in key_counts.items()
+    ]
+    rows.sort(key=lambda x: (x[2], x[1]))
+
+    if rows:
+        count_w = max(
+            len(str(r[0])) for r in rows
+        )
+        ctx_w = max(len(str(r[1])) for r in rows)
+        for count, ctx_id, domain in rows:
+            print(
+                f"{count:{count_w}d}  "
+                f"{ctx_id:{ctx_w}d}  "
+                f"{domain}"
+            )
+
+    return EXIT_SUCCESS
+
+
+def do_list_profiles() -> int:
+    """List available Firefox profiles."""
+    firefox_dir = find_firefox_dir()
+    profiles = parse_profiles(firefox_dir)
+
+    for p in profiles:
+        default = " (default)" if p.is_default else ""
+        print(f"{p.name}{default}")
+        print(f"  {p.path}")
+
+    return EXIT_SUCCESS
+
+
+def do_list_containers(
+    profile: str | None,
+    sources: list[str] | None = None,
+) -> int:
+    """List containers with cookie counts."""
+    firefox_dir = find_firefox_dir()
+    prof = resolve_profile(firefox_dir, profile)
+    src = normalize_sources(sources)
+    containers = load_containers(prof.path)
+
+    if not containers:
+        logger.info("No containers found.")
+        return EXIT_SUCCESS
+
+    # Get cookie counts per container
+    all_cookies = collect_cookies(prof.path, src)
+
+    container_counts: dict[int, int] = {}
+    for c in all_cookies:
+        ctx_id = get_user_context_id(c.origin_attributes)
+        if ctx_id > 0:
+            container_counts[ctx_id] = (
+                container_counts.get(ctx_id, 0) + 1
+            )
+
+    rows = [
+        (container_counts.get(cont.id, 0), cont.id,
+         cont.name)
+        for cont in containers
+    ]
+    # Sort by name, with tmp* containers last
+    rows.sort(
+        key=lambda x: (
+            x[2].lower().startswith("tmp"),
+            x[2].lower(),
+        )
+    )
+
+    if rows:
+        count_w = max(
+            len(str(r[0])) for r in rows
+        )
+        id_w = max(len(str(r[1])) for r in rows)
+        for count, ctx_id, name in rows:
+            print(
+                f"{count:{count_w}d}  "
+                f"{ctx_id:{id_w}d}  "
+                f"{name}"
+            )
+
+    return EXIT_SUCCESS
+
+
+def do_self_test(
+    *, verbose: bool = False, coverage: bool = False
+) -> None:
+    """Run tests using pytest via uvx.
+
+    Raises:
+        TestError: If any tests fail.
+    """
+    repo_root = Path(__file__).parent.parent
+    tests_dir = repo_root / "tests"
+    bin_dir = repo_root / "bin"
+
+    cmd = ["uvx", "--with", "pytest", "--with", "lz4"]
+    if coverage:
+        cmd.extend(["--with", "pytest-cov"])
+
+    cmd.extend(
+        [
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            str(tests_dir / "test_firefox_cookies.py"),
+        ]
+    )
+
+    if verbose:
+        cmd.append("-v")
+    if coverage:
+        htmlcov_dir = (
+            Path(tempfile.gettempdir())
+            / "firefox_cookies_htmlcov"
+        )
+        cmd.extend(
+            [
+                "--cov=firefox_cookies",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{htmlcov_dir}",
+            ]
+        )
+
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = str(bin_dir)
+    if coverage:
+        env["COVERAGE_FILE"] = str(
+            Path(tempfile.gettempdir())
+            / "firefox_cookies.coverage"
+        )
+
+    cp = subprocess.run(
+        cmd,
+        check=False,
+        env=env,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.stdout:
+        print(cp.stdout, end="")
+    if cp.stderr:
+        sys.stderr.write(cp.stderr)
+
+    if cp.returncode != 0:
+        raise TestError("Tests failed")
+
+
+# =============================================================================
+# Argument Parser
+# =============================================================================
+
+
+class _SingleUseAction(argparse.Action):
+    """Argparse action that errors if a flag is repeated."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        seen: set[str] = getattr(
+            namespace, "_seen_flags", set()
+        )
+        if self.dest in seen:
+            parser.error(
+                f"{option_string} can only be"
+                " specified once"
+            )
+        seen.add(self.dest)
+        namespace._seen_flags = seen
+        setattr(namespace, self.dest, values)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Firefox cookie extraction utility",
+        epilog="""\
+exit codes:
+  0  Success
+  1  Usage error
+  2  Configuration error
+  3  File not found
+  4  Subprocess error
+  5  Other error""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(
+        dest="command", required=True
+    )
+
+    def add_profile_arg(
+        p: argparse.ArgumentParser,
+    ) -> None:
+        p.add_argument(
+            "-p",
+            "--profile",
+            action=_SingleUseAction,
+            help=(
+                "Profile name or path"
+                " (default: auto-detect)"
+            ),
+        )
+
+    def add_container_arg(
+        p: argparse.ArgumentParser,
+    ) -> None:
+        p.add_argument(
+            "-c",
+            "--container",
+            action=_SingleUseAction,
+            help="Container ID or name",
+        )
+
+    def add_src_arg(
+        p: argparse.ArgumentParser,
+    ) -> None:
+        p.add_argument(
+            "-s",
+            "--source",
+            dest="sources",
+            action="append",
+            choices=["db", "recovery"],
+            help=(
+                "Cookie source (repeatable)."
+                " db=cookies.sqlite,"
+                " recovery=recovery.jsonlz4."
+                " Default: both"
+            ),
+        )
+
+    # list
+    list_cmd = subparsers.add_parser(
+        "list",
+        help="Extract/list cookies to stdout",
+        description=(
+            "Output cookies in Netscape or JSON format."
+            " Netscape columns: host, subdomain flag,"
+            " path, secure, expiry, name, value"
+            " (tab-separated)."
+        ),
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
+    )
+    add_profile_arg(list_cmd)
+    list_cmd.add_argument(
+        "-d",
+        "--domain",
+        dest="domains",
+        action="append",
+        help="Filter by domain (repeatable)",
+    )
+    add_container_arg(list_cmd)
+    add_src_arg(list_cmd)
+    list_cmd.add_argument(
+        "--format",
+        dest="fmt",
+        choices=["netscape", "json"],
+        default="netscape",
+        action=_SingleUseAction,
+        help="Output format",
+    )
+
+    # list-domains
+    list_domains = subparsers.add_parser(
+        "list-domains",
+        help="List domains with cookie counts",
+        description=(
+            "Output columns: cookie count,"
+            " container ID, domain."
+            " Sorted by domain."
+            " Container ID 0 is the default context."
+        ),
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
+    )
+    add_profile_arg(list_domains)
+    add_container_arg(list_domains)
+    add_src_arg(list_domains)
+
+    # list-profiles
+    subparsers.add_parser(
+        "list-profiles",
+        help="List available Firefox profiles",
+        description=(
+            "Output: profile name (with default marker),"
+            " followed by its path on the next line."
+        ),
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
+    )
+
+    # list-containers
+    list_containers = subparsers.add_parser(
+        "list-containers",
+        help="List containers with cookie counts",
+        description=(
+            "Output columns: cookie count,"
+            " container ID, container name."
+            " Sorted by name."
+        ),
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
+    )
+    add_profile_arg(list_containers)
+    add_src_arg(list_containers)
+
+    # self-test
+    test_parser = subparsers.add_parser(
+        "self-test",
+        help="Run tests",
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
+    )
+    test_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose test output",
+    )
+    test_parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Run with coverage report",
+    )
+
+    return parser
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main(args: argparse.Namespace) -> int:
+    """Dispatch to subcommand based on parsed arguments."""
+    match args.command:
+        case "list":
+            return do_list(
+                profile=args.profile,
+                domains=args.domains,
+                container=args.container,
+                fmt=args.fmt,
+                sources=args.sources,
+            )
+        case "list-domains":
+            return do_list_domains(
+                profile=args.profile,
+                container=args.container,
+                sources=args.sources,
+            )
+        case "list-profiles":
+            return do_list_profiles()
+        case "list-containers":
+            return do_list_containers(
+                profile=args.profile,
+                sources=args.sources,
+            )
+        case "self-test":
+            do_self_test(
+                verbose=args.verbose,
+                coverage=args.coverage,
+            )
+            return EXIT_SUCCESS
+        case _:
+            raise UsageError(
+                f"Unknown command: {args.command}"
+            )
+
+
+def cli() -> int:
+    """CLI entry point with exception handling.
+
+    Exit codes:
+        0: Success
+        1: Usage error
+        2: Configuration error
+        3: File not found
+        4: Subprocess error (test failures)
+        5: Other errors
+    """
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        if e.code == 0:
+            return EXIT_SUCCESS
+        return EXIT_USAGE
+    try:
+        return main(args)
+    except UsageError as e:
+        logger.error("ERROR: %s", e)
+        return EXIT_USAGE
+    except ConfigError as e:
+        logger.error("ERROR: %s", e)
+        return EXIT_CONFIG
+    except NotFoundError as e:
+        logger.error("ERROR: %s", e)
+        return EXIT_NOT_FOUND
+    except TestError as e:
+        logger.error("ERROR: %s", e)
+        return EXIT_SUBPROCESS
+    except Exception as e:
+        logger.error("ERROR: %s", e)
+        return EXIT_OTHER
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
