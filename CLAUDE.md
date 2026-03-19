@@ -26,7 +26,9 @@
 - For python code:
     - Strive to be consistent in form and layout with other python code
       in the repo.
-    - Use "uv run --script" for their shebang interpreter.
+    - Use "/usr/bin/env -S uv run --script" for their shebang interpreter.
+    - Don't globally install python dependencies, instead use the
+      "dependencies" uv directive in script files.
     - Line wrap at 80 chars.
     - Be black, flake8, and mypy compliant (which should be enforced via
       tests).
