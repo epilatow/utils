@@ -1469,6 +1469,22 @@ def do_rsync(
                 run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
 
 
+def do_repair(action: str) -> None:
+    cfg = get_cfg()
+
+    if action == "delete-cache":
+        logger.info(f"Deleting local cache for: {cfg.BORG_REPO}")
+        run_cmd(
+            borg_cmd()
+            + [
+                "delete",
+                "--cache-only",
+                cfg.BORG_REPO,
+            ]
+        )
+        logger.info("Cache deleted successfully.")
+
+
 def do_environment() -> None:
     cfg = get_cfg()
     logger.info(f"ssh-add -q {cfg.BORG_SSHKEY_FILE}")
@@ -1644,6 +1660,17 @@ def args_parser() -> argparse.ArgumentParser:
         "--only-partial", action="store_true", help="Only list partial"
     )
 
+    repair = add_parser(
+        "repair",
+        help="Repair operations for the borg repository",
+    )
+    repair_subparsers = repair.add_subparsers(dest="action", required=True)
+    repair_subparsers.add_parser(
+        "delete-cache",
+        help="Delete the local borg cache for the repository",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
     prune = add_parser("prune", help="Prune partial and old backups")
     add_dry_run(prune)
     add_progress(prune)
@@ -1723,7 +1750,13 @@ def main() -> None:
 
     initialize_borg_environment()
 
-    if command not in ["break-lock", "check-repo", "compact", "environment"]:
+    if command not in [
+        "break-lock",
+        "check-repo",
+        "compact",
+        "environment",
+        "repair",
+    ]:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
     command_callbacks: dict[str, Callable[..., Any]] = {
@@ -1739,6 +1772,7 @@ def main() -> None:
         "extract": do_extract,
         "list": do_list,
         "prune": do_prune,
+        "repair": do_repair,
         "rsync": do_rsync,
     }
     try:

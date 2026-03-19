@@ -21,6 +21,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest  # type: ignore[import-not-found]
 
@@ -65,34 +66,32 @@ class TestArgumentParser:
         assert parser is not None
 
     def test_all_subcommands_have_help(self) -> None:
-        """Verify all subcommands and their arguments have help text."""
+        """Verify all subcommands and arguments have help text."""
         parser = ba.args_parser()
 
-        for action in parser._actions:
-            if isinstance(action, argparse._SubParsersAction):
-                for subcmd_name, subparser in action.choices.items():
-                    for sub_action in subparser._actions:
-                        # Ignore default help option added by argparse
-                        if isinstance(sub_action, argparse._HelpAction):
-                            continue
-                        # Skip subparsers (automate's enable/disable/status)
-                        if isinstance(sub_action, argparse._SubParsersAction):
-                            continue
-                        assert sub_action.help and sub_action.help.strip(), (
-                            f"Missing help for argument(s) "
-                            f"{sub_action.option_strings or sub_action.dest} "
-                            f"in subcommand '{subcmd_name}'"
-                        )
+        def check_parser(p: argparse.ArgumentParser, path: str) -> None:
+            for action in p._actions:
+                if isinstance(action, argparse._HelpAction):
+                    continue
+                if isinstance(action, argparse._SubParsersAction):
+                    assert action.choices, f"Empty subparsers in '{path}'"
+                    for name, subparser in action.choices.items():
+                        check_parser(subparser, f"{path} {name}")
+                    continue
+                assert action.help and action.help.strip(), (
+                    f"Missing help for argument(s) "
+                    f"{action.option_strings or action.dest} "
+                    f"in '{path}'"
+                )
 
-    def test_automate_subcommands_have_help(self) -> None:
-        """Smoke test: verify automate subcommands can show help."""
+        check_parser(parser, "borgadm")
+
+    def test_repair_subcommand_parses(self) -> None:
+        """Test repair delete-cache subcommand parses."""
         parser = ba.args_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["automate", "enable", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["automate", "disable", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["automate", "status", "--help"])
+        args = parser.parse_args(["repair", "delete-cache"])
+        assert args.command == "repair"
+        assert args.action == "delete-cache"
 
     def test_self_test_subcommand_parses(self) -> None:
         """Test self-test subcommand parses flags."""
@@ -101,6 +100,31 @@ class TestArgumentParser:
         assert args.command == "self-test"
         assert args.verbose is True
         assert args.coverage is True
+
+
+class TestRepair:
+    """Test repair subcommand."""
+
+    def test_delete_cache(self, mock_cfg: Any) -> None:
+        """Test that delete-cache calls borg delete --cache-only."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+        ):
+            ba.do_repair(action="delete-cache")
+            mock_run_cmd.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--cache-only",
+                    mock_cfg.BORG_REPO,
+                ]
+            )
 
 
 class TestTimestampPruning:
