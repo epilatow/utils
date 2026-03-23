@@ -875,6 +875,27 @@ def create_plist_file(element: ElementTree.Element, path: Path) -> None:
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
+def automation_script_path() -> str:
+    """Determine the script path for automation plists.
+
+    Prefers the BorgAdm.app wrapper for Full Disk Access support
+    on macOS. Falls back to the direct script path if the wrapper
+    is not found.
+    """
+    repo_dir = Path(__file__).parent.parent
+    wrapper_app = repo_dir / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    if wrapper_app.exists():
+        logger.debug(f"Using wrapper app: {wrapper_app}")
+        return str(wrapper_app)
+    script_path = os.path.abspath(__file__)
+    logger.warning(
+        f"Wrapper app not found at {wrapper_app}. "
+        "Full Disk Access may not work. "
+        "See Applications/BorgBackup.app in the repo."
+    )
+    return script_path
+
+
 def do_automate(action: str) -> None:
     if platform.system() != "Darwin":
         logger.error("automate subcommand is only supported on osx")
@@ -888,33 +909,25 @@ def do_automate(action: str) -> None:
         logger.error("launchctl not found in PATH")
         sys.exit(1)
 
-    # Use the wrapper app for Full Disk Access support on macOS
-    repo_dir = Path(__file__).parent.parent
-    wrapper_app = repo_dir / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
-    if wrapper_app.exists():
-        script_path: str = str(wrapper_app)
-        logger.debug(f"Using wrapper app: {script_path}")
-    else:
-        script_path = os.path.abspath(__file__)
-        logger.warning(
-            f"Wrapper app not found at {wrapper_app}. "
-            "Full Disk Access may not work. "
-            "See Applications/BorgBackup.app in the repo."
-        )
+    script_path = automation_script_path()
     launchd_env: dict[str, str] = {
         "PATH": os.path.expanduser("~/.local/bin")
         + ":/usr/bin:/bin:/usr/sbin:/sbin",
     }
     tasks: dict[str, dict[str, Any]] = {
         "create": {"args": [script_path, "create"], "interval": (60 * 60)},
-        "check_age": {
+        "check-daily": {
             "args": [script_path, "check-age", "--enable-notifications"],
-            "interval": (60 * 60 * 4),
+            "interval": (60 * 60 * 24),
         },
-        "check_all": {
+        "check-weekly": {
             "args": [script_path, "check-all", "--enable-notifications"],
             "interval": (60 * 60 * 24 * 7),
         },
+        # Legacy task names (pre-rename); kept so disable/status can
+        # find and clean them up on systems that upgraded in-place.
+        "check_age": {"legacy": True},
+        "check_all": {"legacy": True},
     }
     task_name = "local.borgadm.{task}"
     task_dir: Path = Path(os.environ["HOME"]) / "Library" / "LaunchAgents"
@@ -927,21 +940,37 @@ def do_automate(action: str) -> None:
     if action == "status":
         launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
         enabled_count = 0
+        legacy_count = 0
         for task, path in task2path.items():
+            is_legacy = tasks[task].get("legacy", False)
             tname = task_name.format(task=task)
             pattern = r"[ \t]" + re.escape(tname) + r"$"
             cpattern = re.compile(pattern)
-            if any(cpattern.search(i) for i in launchctl_tasks):
+            loaded = any(cpattern.search(i) for i in launchctl_tasks)
+            if is_legacy:
+                if loaded:
+                    legacy_count += 1
+                    logger.warning(f"{tname}: enabled (legacy, {path})")
+                elif path.exists():
+                    legacy_count += 1
+                    logger.warning(f"{tname}: stale plist (legacy, {path})")
+            elif loaded:
                 enabled_count += 1
                 logger.info(f"{tname}: enabled ({path})")
             else:
                 logger.info(f"{tname}: disabled")
-        if enabled_count == len(task2path):
+        if legacy_count:
+            logger.warning(
+                "Legacy automations found. "
+                "Run 'borgadm automate enable' to update."
+            )
+
+        total = len([t for t in tasks if not tasks[t].get("legacy", False)])
+        if enabled_count == total:
             logger.info("Automation is enabled")
-        elif enabled_count == 0:
+        elif enabled_count == 0 and legacy_count == 0:
             logger.info("Automation is disabled")
         else:
-            total = len(task2path)
             logger.info(
                 f"Automation is partially enabled ({enabled_count}/{total})"
             )
@@ -951,7 +980,9 @@ def do_automate(action: str) -> None:
     for task, path in task2path.items():
         if not path.exists():
             continue
-        logger.info(f"Removing {task} launchd config: {str(path)}")
+        is_legacy = tasks[task].get("legacy", False)
+        label = "legacy " if is_legacy else ""
+        logger.info(f"Removing {label}{task} launchd config: {str(path)}")
         cmd = ["launchctl", "unload", str(path)]
         run_cmd(cmd, errok=True)
         path.unlink()
@@ -964,6 +995,8 @@ def do_automate(action: str) -> None:
     logger.debug(f"Log directory: {log_dir}")
 
     for task, cfg in tasks.items():
+        if cfg.get("legacy", False):
+            continue
         path = task2path[task]
         log_path = str(log_dir / f"{task}.log")
         logger.info(f"Creating {task} launchd config: {str(path)}")
@@ -977,6 +1010,10 @@ def do_automate(action: str) -> None:
         run_cmd(cmd)
 
     # Print Full Disk Access instructions if using wrapper app
+    wrapper_app = (
+        Path(__file__).parent.parent
+        / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    )
     if wrapper_app.exists():
         logger.info("")
         logger.info("=" * 60)
