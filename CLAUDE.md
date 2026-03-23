@@ -30,8 +30,7 @@
     - Don't globally install python dependencies, instead use the
       "dependencies" uv directive in script files.
     - Line wrap at 80 chars.
-    - Be black, flake8, and mypy compliant (which should be enforced via
-      tests).
+    - Be ruff and mypy compliant (which should be enforced via tests).
     - Be strongly typed, avoiding the storage of structured data in a
       Dict with Any values.
     - By default, tests should use pytest, unless there is a good reason

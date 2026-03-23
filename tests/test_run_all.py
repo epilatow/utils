@@ -105,9 +105,7 @@ class TestRunTestFile:
         """Return success result for passing test."""
         tests_dir = tmp_repo / "tests"
         script = tests_dir / "test_ok.py"
-        script.write_text(
-            "#!/usr/bin/env python3\n" "import sys\n" "sys.exit(0)\n"
-        )
+        script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
         script.chmod(0o755)
         result = ra.run_test_file(script)
         assert result.name == "test_ok"
@@ -118,9 +116,7 @@ class TestRunTestFile:
         """Return failure result for failing test."""
         tests_dir = tmp_repo / "tests"
         script = tests_dir / "test_fail.py"
-        script.write_text(
-            "#!/usr/bin/env python3\n" "import sys\n" "sys.exit(1)\n"
-        )
+        script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n")
         script.chmod(0o755)
         result = ra.run_test_file(script)
         assert result.name == "test_fail"
@@ -281,7 +277,6 @@ class TestCodeQuality(CodeQualityBase):
 
     SCRIPT_PATH = _script_path
     TEST_PATH = REPO_ROOT / "tests" / "test_run_all.py"
-    FLAKE8_EXTRA_ARGS = ["--extend-ignore=E203,W503"]
 
 
 if __name__ == "__main__":

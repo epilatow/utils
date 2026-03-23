@@ -19,7 +19,7 @@ import shutil
 import sqlite3
 import struct
 import sys
-import tempfile
+
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -38,9 +38,7 @@ if not _script_path.exists():
 _loader = importlib.machinery.SourceFileLoader(
     "firefox_cookies", str(_script_path)
 )
-_spec = importlib.util.spec_from_loader(
-    "firefox_cookies", _loader
-)
+_spec = importlib.util.spec_from_loader("firefox_cookies", _loader)
 assert _spec and _spec.loader
 fc = importlib.util.module_from_spec(_spec)
 sys.modules["firefox_cookies"] = fc
@@ -94,9 +92,7 @@ def containers_json(profile_dir: Path) -> Path:
                 "icon": "fingerprint",
                 "color": "blue",
                 "l10nID": "userContextPersonal.label",
-                "accessKey": (
-                    "userContextPersonal.accesskey"
-                ),
+                "accessKey": ("userContextPersonal.accesskey"),
             },
             {
                 "userContextId": 2,
@@ -104,9 +100,7 @@ def containers_json(profile_dir: Path) -> Path:
                 "icon": "briefcase",
                 "color": "orange",
                 "l10nID": "userContextWork.label",
-                "accessKey": (
-                    "userContextWork.accesskey"
-                ),
+                "accessKey": ("userContextWork.accesskey"),
             },
             {
                 "userContextId": 3,
@@ -163,34 +157,76 @@ def cookies_db(profile_dir: Path) -> Path:
         #  host, path, expiry, isSecure, isHttpOnly,
         #  sameSite)
         (
-            "example.com", "", "session", "abc123",
-            ".example.com", "/", 1700000000, 1, 0, 0,
+            "example.com",
+            "",
+            "session",
+            "abc123",
+            ".example.com",
+            "/",
+            1700000000,
+            1,
+            0,
+            0,
         ),
         (
-            "example.com", "", "pref", "dark",
-            "example.com", "/", 1700000000, 0, 0, 0,
+            "example.com",
+            "",
+            "pref",
+            "dark",
+            "example.com",
+            "/",
+            1700000000,
+            0,
+            0,
+            0,
         ),
         (
-            "other.org", "", "id", "xyz",
-            ".other.org", "/", 1700000000, 1, 1, 2,
+            "other.org",
+            "",
+            "id",
+            "xyz",
+            ".other.org",
+            "/",
+            1700000000,
+            1,
+            1,
+            2,
         ),
         (
             "example.com",
             "^userContextId=1",
-            "container_cookie", "val1",
-            ".example.com", "/", 1700000000, 0, 0, 0,
+            "container_cookie",
+            "val1",
+            ".example.com",
+            "/",
+            1700000000,
+            0,
+            0,
+            0,
         ),
         (
             "test.net",
             "^userContextId=2",
-            "work_cookie", "val2",
-            ".test.net", "/app", 1700000000, 1, 0, 1,
+            "work_cookie",
+            "val2",
+            ".test.net",
+            "/app",
+            1700000000,
+            1,
+            0,
+            1,
         ),
         (
             "example.com",
             "^userContextId=2^privateBrowsingId=0",
-            "multi_attr", "val3",
-            ".example.com", "/", 1700000000, 0, 0, 0,
+            "multi_attr",
+            "val3",
+            ".example.com",
+            "/",
+            1700000000,
+            0,
+            0,
+            0,
         ),
     ]
     for row in test_cookies:
@@ -210,9 +246,7 @@ def cookies_db(profile_dir: Path) -> Path:
 def _make_mozlz4(data: dict[str, Any]) -> bytes:
     """Compress a dict as mozlz4 (for test fixtures)."""
     json_bytes = json.dumps(data).encode("utf-8")
-    compressed = lz4.block.compress(
-        json_bytes, store_size=False
-    )
+    compressed = lz4.block.compress(json_bytes, store_size=False)
     magic = b"mozLz40\0"
     size_bytes = struct.pack("<I", len(json_bytes))
     return magic + size_bytes + compressed
@@ -291,9 +325,7 @@ def recovery_jsonlz4(profile_dir: Path) -> Path:
             },
         ],
     }
-    backups_dir = (
-        profile_dir / "sessionstore-backups"
-    )
+    backups_dir = profile_dir / "sessionstore-backups"
     backups_dir.mkdir(parents=True, exist_ok=True)
     path = backups_dir / "recovery.jsonlz4"
     path.write_bytes(_make_mozlz4(session_data))
@@ -332,10 +364,14 @@ class TestArgumentParser:
         args = parser.parse_args(
             [
                 "list",
-                "-p", "myprofile",
-                "-d", "example.com",
-                "-c", "1",
-                "--format", "json",
+                "-p",
+                "myprofile",
+                "-d",
+                "example.com",
+                "-c",
+                "1",
+                "--format",
+                "json",
             ]
         )
         assert args.command == "list"
@@ -357,9 +393,7 @@ class TestArgumentParser:
     def test_list_domains_parses_options(self) -> None:
         """Test list-domains subcommand."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["list-domains", "-p", "prof", "-c", "2"]
-        )
+        args = parser.parse_args(["list-domains", "-p", "prof", "-c", "2"])
         assert args.command == "list-domains"
         assert args.profile == "prof"
         assert args.container == "2"
@@ -374,18 +408,14 @@ class TestArgumentParser:
     def test_list_containers_parses_profile(self) -> None:
         """Test list-containers accepts --profile."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["list-containers", "-p", "myprof"]
-        )
+        args = parser.parse_args(["list-containers", "-p", "myprof"])
         assert args.command == "list-containers"
         assert args.profile == "myprof"
 
     def test_self_test_parses_options(self) -> None:
         """Test self-test subcommand options."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["self-test", "-v", "--coverage"]
-        )
+        args = parser.parse_args(["self-test", "-v", "--coverage"])
         assert args.command == "self-test"
         assert args.verbose is True
         assert args.coverage is True
@@ -400,9 +430,7 @@ class TestArgumentParser:
         """Test that invalid format produces an error."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(
-                ["list", "--format", "xml"]
-            )
+            parser.parse_args(["list", "--format", "xml"])
 
     def test_multiple_domains(self) -> None:
         """Test -d can be repeated for multiple domains."""
@@ -410,8 +438,10 @@ class TestArgumentParser:
         args = parser.parse_args(
             [
                 "list",
-                "-d", "foo.com",
-                "-d", "bar.com",
+                "-d",
+                "foo.com",
+                "-d",
+                "bar.com",
             ]
         )
         assert args.domains == ["foo.com", "bar.com"]
@@ -420,17 +450,13 @@ class TestArgumentParser:
         """Test -p cannot be specified twice."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(
-                ["list", "-p", "a", "-p", "b"]
-            )
+            parser.parse_args(["list", "-p", "a", "-p", "b"])
 
     def test_duplicate_container_errors(self) -> None:
         """Test -c cannot be specified twice."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(
-                ["list", "-c", "1", "-c", "2"]
-            )
+            parser.parse_args(["list", "-c", "1", "-c", "2"])
 
     def test_duplicate_format_errors(self) -> None:
         """Test --format cannot be specified twice."""
@@ -439,8 +465,10 @@ class TestArgumentParser:
             parser.parse_args(
                 [
                     "list",
-                    "--format", "json",
-                    "--format", "netscape",
+                    "--format",
+                    "json",
+                    "--format",
+                    "netscape",
                 ]
             )
 
@@ -453,26 +481,18 @@ class TestArgumentParser:
 class TestParseProfiles:
     """Test profiles.ini parsing."""
 
-    def test_parse_single_profile(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_parse_single_profile(self, firefox_dir: Path) -> None:
         """Parse profiles.ini with a single profile."""
         profiles = fc.parse_profiles(firefox_dir)
         assert len(profiles) == 1
         assert profiles[0].name == "default"
         assert profiles[0].is_default is True
-        assert profiles[0].path == (
-            firefox_dir / "Profiles" / "abc123.default"
-        )
+        assert profiles[0].path == (firefox_dir / "Profiles" / "abc123.default")
 
-    def test_parse_multiple_profiles(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_parse_multiple_profiles(self, firefox_dir: Path) -> None:
         """Parse profiles.ini with multiple profiles."""
         # Add a second profile
-        second = (
-            firefox_dir / "Profiles" / "def456.work"
-        )
+        second = firefox_dir / "Profiles" / "def456.work"
         second.mkdir(parents=True)
         ini = """\
 [Install1234]
@@ -494,13 +514,9 @@ Path=Profiles/def456.work
         names = {p.name for p in profiles}
         assert names == {"default", "work"}
 
-    def test_install_section_sets_default(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_install_section_sets_default(self, firefox_dir: Path) -> None:
         """Install section Default takes precedence."""
-        second = (
-            firefox_dir / "Profiles" / "def456.work"
-        )
+        second = firefox_dir / "Profiles" / "def456.work"
         second.mkdir(parents=True)
         ini = """\
 [Install1234]
@@ -540,22 +556,16 @@ Default=1
         profiles = fc.parse_profiles(firefox_dir)
         assert profiles[0].path == abs_profile
 
-    def test_missing_profiles_ini(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_profiles_ini(self, tmp_path: Path) -> None:
         """Raise NotFoundError for missing profiles.ini."""
         ff_dir = tmp_path / "firefox"
         ff_dir.mkdir()
         with pytest.raises(fc.NotFoundError):
             fc.parse_profiles(ff_dir)
 
-    def test_empty_profiles_ini(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_empty_profiles_ini(self, firefox_dir: Path) -> None:
         """Raise ConfigError when no profiles found."""
-        (firefox_dir / "profiles.ini").write_text(
-            "[General]\n"
-        )
+        (firefox_dir / "profiles.ini").write_text("[General]\n")
         with pytest.raises(fc.ConfigError):
             fc.parse_profiles(firefox_dir)
 
@@ -563,9 +573,7 @@ Default=1
 class TestResolveProfile:
     """Test profile resolution."""
 
-    def test_auto_detect_default(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_auto_detect_default(self, firefox_dir: Path) -> None:
         """Auto-detect the default profile."""
         profile = fc.resolve_profile(firefox_dir)
         assert profile.name == "default"
@@ -573,39 +581,25 @@ class TestResolveProfile:
 
     def test_by_name(self, firefox_dir: Path) -> None:
         """Resolve profile by name."""
-        profile = fc.resolve_profile(
-            firefox_dir, "default"
-        )
+        profile = fc.resolve_profile(firefox_dir, "default")
         assert profile.name == "default"
 
-    def test_by_name_case_insensitive(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_by_name_case_insensitive(self, firefox_dir: Path) -> None:
         """Resolve profile by name case-insensitively."""
-        profile = fc.resolve_profile(
-            firefox_dir, "DEFAULT"
-        )
+        profile = fc.resolve_profile(firefox_dir, "DEFAULT")
         assert profile.name == "default"
 
-    def test_by_path(
-        self, firefox_dir: Path, profile_dir: Path
-    ) -> None:
+    def test_by_path(self, firefox_dir: Path, profile_dir: Path) -> None:
         """Resolve profile by directory path."""
-        profile = fc.resolve_profile(
-            firefox_dir, str(profile_dir)
-        )
+        profile = fc.resolve_profile(firefox_dir, str(profile_dir))
         assert profile.path == profile_dir
 
     def test_not_found(self, firefox_dir: Path) -> None:
         """Raise ConfigError for unknown profile name."""
         with pytest.raises(fc.ConfigError):
-            fc.resolve_profile(
-                firefox_dir, "nonexistent"
-            )
+            fc.resolve_profile(firefox_dir, "nonexistent")
 
-    def test_no_default_uses_first(
-        self, firefox_dir: Path
-    ) -> None:
+    def test_no_default_uses_first(self, firefox_dir: Path) -> None:
         """Use first profile when no default is marked."""
         ini = """\
 [Profile0]
@@ -641,9 +635,7 @@ class TestLoadContainers:
         assert containers[2].id == 3
         assert containers[2].name == "My Custom"
 
-    def test_no_containers_file(
-        self, profile_dir: Path
-    ) -> None:
+    def test_no_containers_file(self, profile_dir: Path) -> None:
         """Return empty list when no containers.json."""
         containers = fc.load_containers(profile_dir)
         assert containers == []
@@ -708,63 +700,41 @@ class TestResolveContainer:
             ),
         ]
 
-    def test_by_id(
-        self, containers: list[Any]
-    ) -> None:
+    def test_by_id(self, containers: list[Any]) -> None:
         """Resolve container by numeric ID."""
         result = fc.resolve_container(containers, "1")
         assert result.id == 1
         assert result.name == "Personal"
 
-    def test_by_exact_name(
-        self, containers: list[Any]
-    ) -> None:
+    def test_by_exact_name(self, containers: list[Any]) -> None:
         """Resolve container by exact name."""
-        result = fc.resolve_container(
-            containers, "Personal"
-        )
+        result = fc.resolve_container(containers, "Personal")
         assert result.id == 1
 
-    def test_by_name_case_insensitive(
-        self, containers: list[Any]
-    ) -> None:
+    def test_by_name_case_insensitive(self, containers: list[Any]) -> None:
         """Resolve container by name, case-insensitive."""
-        result = fc.resolve_container(
-            containers, "personal"
-        )
+        result = fc.resolve_container(containers, "personal")
         assert result.id == 1
 
-    def test_partial_match(
-        self, containers: list[Any]
-    ) -> None:
+    def test_partial_match(self, containers: list[Any]) -> None:
         """Resolve container by unique partial match."""
-        result = fc.resolve_container(
-            containers, "Person"
-        )
+        result = fc.resolve_container(containers, "Person")
         assert result.id == 1
 
-    def test_ambiguous_name(
-        self, containers: list[Any]
-    ) -> None:
+    def test_ambiguous_name(self, containers: list[Any]) -> None:
         """Error on ambiguous partial container name."""
         with pytest.raises(fc.ConfigError, match="Ambig"):
             fc.resolve_container(containers, "Wor")
 
-    def test_id_not_found(
-        self, containers: list[Any]
-    ) -> None:
+    def test_id_not_found(self, containers: list[Any]) -> None:
         """Error when container ID doesn't exist."""
         with pytest.raises(fc.ConfigError):
             fc.resolve_container(containers, "99")
 
-    def test_name_not_found(
-        self, containers: list[Any]
-    ) -> None:
+    def test_name_not_found(self, containers: list[Any]) -> None:
         """Error when container name doesn't match."""
         with pytest.raises(fc.ConfigError):
-            fc.resolve_container(
-                containers, "Nonexistent"
-            )
+            fc.resolve_container(containers, "Nonexistent")
 
 
 # =============================================================================
@@ -781,10 +751,7 @@ class TestGetUserContextId:
 
     def test_single_attribute(self) -> None:
         """Parse single userContextId attribute."""
-        assert (
-            fc.get_user_context_id("^userContextId=5")
-            == 5
-        )
+        assert fc.get_user_context_id("^userContextId=5") == 5
 
     def test_multiple_attributes(self) -> None:
         """Parse userContextId with other attributes."""
@@ -793,20 +760,12 @@ class TestGetUserContextId:
 
     def test_with_partition_key(self) -> None:
         """Parse userContextId with &partitionKey."""
-        attrs = (
-            "^userContextId=1324"
-            "&partitionKey=%28https%2Cexample.com%29"
-        )
+        attrs = "^userContextId=1324&partitionKey=%28https%2Cexample.com%29"
         assert fc.get_user_context_id(attrs) == 1324
 
     def test_no_context_id(self) -> None:
         """Return 0 when userContextId not present."""
-        assert (
-            fc.get_user_context_id(
-                "^privateBrowsingId=1"
-            )
-            == 0
-        )
+        assert fc.get_user_context_id("^privateBrowsingId=1") == 0
 
 
 class TestQueryCookies:
@@ -817,44 +776,30 @@ class TestQueryCookies:
         cookies = fc.query_cookies(cookies_db)
         assert len(cookies) == 6
 
-    def test_filter_by_domain(
-        self, cookies_db: Path
-    ) -> None:
+    def test_filter_by_domain(self, cookies_db: Path) -> None:
         """Filter cookies by domain."""
-        cookies = fc.query_cookies(
-            cookies_db, domains=["example.com"]
-        )
+        cookies = fc.query_cookies(cookies_db, domains=["example.com"])
         # Should match .example.com and example.com
         hosts = {c.host for c in cookies}
         assert ".example.com" in hosts
         assert "example.com" in hosts
         assert ".other.org" not in hosts
 
-    def test_filter_by_container(
-        self, cookies_db: Path
-    ) -> None:
+    def test_filter_by_container(self, cookies_db: Path) -> None:
         """Filter cookies by container ID."""
-        cookies = fc.query_cookies(
-            cookies_db, container_id=1
-        )
+        cookies = fc.query_cookies(cookies_db, container_id=1)
         assert len(cookies) == 1
         assert cookies[0].name == "container_cookie"
 
-    def test_filter_by_container_2(
-        self, cookies_db: Path
-    ) -> None:
+    def test_filter_by_container_2(self, cookies_db: Path) -> None:
         """Filter cookies by container 2."""
-        cookies = fc.query_cookies(
-            cookies_db, container_id=2
-        )
+        cookies = fc.query_cookies(cookies_db, container_id=2)
         assert len(cookies) == 2
         names = {c.name for c in cookies}
         assert "work_cookie" in names
         assert "multi_attr" in names
 
-    def test_filter_multiple_domains(
-        self, cookies_db: Path
-    ) -> None:
+    def test_filter_multiple_domains(self, cookies_db: Path) -> None:
         """Filter cookies by multiple domains."""
         cookies = fc.query_cookies(
             cookies_db,
@@ -865,9 +810,7 @@ class TestQueryCookies:
         assert ".other.org" in hosts
         assert ".test.net" not in hosts
 
-    def test_filter_domain_and_container(
-        self, cookies_db: Path
-    ) -> None:
+    def test_filter_domain_and_container(self, cookies_db: Path) -> None:
         """Filter by both domain and container."""
         cookies = fc.query_cookies(
             cookies_db,
@@ -877,29 +820,16 @@ class TestQueryCookies:
         assert len(cookies) == 1
         assert cookies[0].name == "multi_attr"
 
-    def test_default_context_cookies(
-        self, cookies_db: Path
-    ) -> None:
+    def test_default_context_cookies(self, cookies_db: Path) -> None:
         """Filter to default context (no container)."""
-        cookies = fc.query_cookies(
-            cookies_db, container_id=0
-        )
+        cookies = fc.query_cookies(cookies_db, container_id=0)
         assert len(cookies) == 3
         for c in cookies:
-            assert (
-                fc.get_user_context_id(
-                    c.origin_attributes
-                )
-                == 0
-            )
+            assert fc.get_user_context_id(c.origin_attributes) == 0
 
-    def test_cookie_fields(
-        self, cookies_db: Path
-    ) -> None:
+    def test_cookie_fields(self, cookies_db: Path) -> None:
         """Verify cookie field mapping."""
-        cookies = fc.query_cookies(
-            cookies_db, domains=["other.org"]
-        )
+        cookies = fc.query_cookies(cookies_db, domains=["other.org"])
         assert len(cookies) == 1
         c = cookies[0]
         assert c.host == ".other.org"
@@ -911,14 +841,10 @@ class TestQueryCookies:
         assert c.is_http_only is True
         assert c.same_site == 2
 
-    def test_sorted_output(
-        self, cookies_db: Path
-    ) -> None:
+    def test_sorted_output(self, cookies_db: Path) -> None:
         """Verify cookies are sorted by host, name."""
         cookies = fc.query_cookies(cookies_db)
-        hosts_names = [
-            (c.host, c.name) for c in cookies
-        ]
+        hosts_names = [(c.host, c.name) for c in cookies]
         assert hosts_names == sorted(hosts_names)
 
 
@@ -933,9 +859,7 @@ class TestFormatNetscape:
     def test_header(self) -> None:
         """Output includes Netscape header."""
         output = fc.format_netscape([])
-        assert output.startswith(
-            "# Netscape HTTP Cookie File"
-        )
+        assert output.startswith("# Netscape HTTP Cookie File")
 
     def test_cookie_format(self) -> None:
         """Verify tab-separated Netscape format."""
@@ -1044,9 +968,7 @@ class TestFormatJson:
 class TestSafeCopyDb:
     """Test safe database copy."""
 
-    def test_copies_db(
-        self, cookies_db: Path, profile_dir: Path
-    ) -> None:
+    def test_copies_db(self, cookies_db: Path, profile_dir: Path) -> None:
         """Database file is copied to temp location."""
         tmp_db = fc.safe_copy_db(profile_dir)
         try:
@@ -1054,33 +976,21 @@ class TestSafeCopyDb:
             assert tmp_db.name == "cookies.sqlite"
             assert tmp_db.parent != profile_dir
         finally:
-            shutil.rmtree(
-                tmp_db.parent, ignore_errors=True
-            )
+            shutil.rmtree(tmp_db.parent, ignore_errors=True)
 
     def test_copies_wal_files(
         self, cookies_db: Path, profile_dir: Path
     ) -> None:
         """WAL and SHM files are copied if present."""
         # Create mock WAL/SHM files
-        (profile_dir / "cookies.sqlite-wal").write_text(
-            "wal"
-        )
-        (profile_dir / "cookies.sqlite-shm").write_text(
-            "shm"
-        )
+        (profile_dir / "cookies.sqlite-wal").write_text("wal")
+        (profile_dir / "cookies.sqlite-shm").write_text("shm")
         tmp_db = fc.safe_copy_db(profile_dir)
         try:
-            assert (
-                tmp_db.parent / "cookies.sqlite-wal"
-            ).is_file()
-            assert (
-                tmp_db.parent / "cookies.sqlite-shm"
-            ).is_file()
+            assert (tmp_db.parent / "cookies.sqlite-wal").is_file()
+            assert (tmp_db.parent / "cookies.sqlite-shm").is_file()
         finally:
-            shutil.rmtree(
-                tmp_db.parent, ignore_errors=True
-            )
+            shutil.rmtree(tmp_db.parent, ignore_errors=True)
 
     def test_missing_db(self, tmp_path: Path) -> None:
         """Raise NotFoundError when db doesn't exist."""
@@ -1098,12 +1008,7 @@ class TestFindFirefoxDir:
 
     def test_darwin(self, tmp_path: Path) -> None:
         """Find Firefox dir on macOS."""
-        ff_dir = (
-            tmp_path
-            / "Library"
-            / "Application Support"
-            / "Firefox"
-        )
+        ff_dir = tmp_path / "Library" / "Application Support" / "Firefox"
         ff_dir.mkdir(parents=True)
         with (
             patch.object(
@@ -1156,9 +1061,7 @@ class TestFindFirefoxDir:
         ):
             fc.find_firefox_dir()
 
-    def test_missing_directory(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_directory(self, tmp_path: Path) -> None:
         """Error when Firefox directory doesn't exist."""
         with (
             patch.object(
@@ -1264,9 +1167,7 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_domains(
-                profile=None, container=None
-            )
+            result = fc.do_list_domains(profile=None, container=None)
         assert result == 0
         captured = capsys.readouterr()
         assert "example.com" in captured.out
@@ -1286,17 +1187,13 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(
-                profile=None, container=None
-            )
+            fc.do_list_domains(profile=None, container=None)
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
         # Each line should have 3 columns
         for line in lines:
             parts = line.split()
-            assert len(parts) == 3, (
-                f"Expected 3 columns: {line!r}"
-            )
+            assert len(parts) == 3, f"Expected 3 columns: {line!r}"
             # First col is count, second is container ID
             assert parts[0].isdigit()
             assert parts[1].isdigit()
@@ -1315,9 +1212,7 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(
-                profile=None, container=None
-            )
+            fc.do_list_domains(profile=None, container=None)
         captured = capsys.readouterr()
         # example.com appears in default (0), container
         # 1, and container 2
@@ -1343,9 +1238,7 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_domains(
-                profile=None, container="1"
-            )
+            result = fc.do_list_domains(profile=None, container="1")
         assert result == 0
         captured = capsys.readouterr()
         assert "example.com" in captured.out
@@ -1468,9 +1361,7 @@ class TestMain:
     """Test main function and command dispatch."""
 
     @patch.object(fc, "do_list", autospec=True)
-    def test_main_list_command(
-        self, mock_do_list: MagicMock
-    ) -> None:
+    def test_main_list_command(self, mock_do_list: MagicMock) -> None:
         """Test main dispatches to do_list."""
         mock_do_list.return_value = 0
         args = argparse.Namespace(
@@ -1494,9 +1385,7 @@ class TestMain:
         )
 
     @patch.object(fc, "do_list", autospec=True)
-    def test_main_list_defaults(
-        self, mock_do_list: MagicMock
-    ) -> None:
+    def test_main_list_defaults(self, mock_do_list: MagicMock) -> None:
         """Test main passes None defaults for list."""
         mock_do_list.return_value = 0
         args = argparse.Namespace(
@@ -1519,9 +1408,7 @@ class TestMain:
             sources=None,
         )
 
-    @patch.object(
-        fc, "do_list_domains", autospec=True
-    )
+    @patch.object(fc, "do_list_domains", autospec=True)
     def test_main_list_domains_command(
         self, mock_do_list_domains: MagicMock
     ) -> None:
@@ -1543,9 +1430,7 @@ class TestMain:
             sources=["recovery"],
         )
 
-    @patch.object(
-        fc, "do_list_profiles", autospec=True
-    )
+    @patch.object(fc, "do_list_profiles", autospec=True)
     def test_main_list_profiles_command(
         self, mock_do_list_profiles: MagicMock
     ) -> None:
@@ -1560,9 +1445,7 @@ class TestMain:
         assert result == 0
         mock_do_list_profiles.assert_called_once()
 
-    @patch.object(
-        fc, "do_list_containers", autospec=True
-    )
+    @patch.object(fc, "do_list_containers", autospec=True)
     def test_main_list_containers_command(
         self, mock_do_list_containers: MagicMock
     ) -> None:
@@ -1583,9 +1466,7 @@ class TestMain:
         )
 
     @patch.object(fc, "do_self_test", autospec=True)
-    def test_main_self_test_command(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
+    def test_main_self_test_command(self, mock_do_self_test: MagicMock) -> None:
         """Test main dispatches to do_self_test."""
         args = argparse.Namespace(
             command="self-test",
@@ -1623,9 +1504,7 @@ class TestMain:
     def test_main_unknown_command(self) -> None:
         """Unknown command raises UsageError."""
         args = argparse.Namespace(command="bogus")
-        with pytest.raises(
-            fc.UsageError, match="Unknown command"
-        ):
+        with pytest.raises(fc.UsageError, match="Unknown command"):
             fc.main(args)
 
 
@@ -1634,17 +1513,13 @@ class TestCli:
 
     def test_no_args_returns_usage_error(self) -> None:
         """No arguments returns EXIT_USAGE."""
-        with patch(
-            "sys.argv", ["firefox-cookies"]
-        ):
+        with patch("sys.argv", ["firefox-cookies"]):
             result = fc.cli()
         assert result == fc.EXIT_USAGE
 
     def test_help_returns_success(self) -> None:
         """--help returns EXIT_SUCCESS."""
-        with patch(
-            "sys.argv", ["firefox-cookies", "--help"]
-        ):
+        with patch("sys.argv", ["firefox-cookies", "--help"]):
             result = fc.cli()
         assert result == fc.EXIT_SUCCESS
 
@@ -1744,20 +1619,24 @@ class TestCli:
         assert result == fc.EXIT_OTHER
 
     @patch.object(fc, "main", autospec=True)
-    def test_cli_list_passes_args(
-        self, mock_main: MagicMock
-    ) -> None:
+    def test_cli_list_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list args to main."""
         mock_main.return_value = 0
         with patch(
             "sys.argv",
             [
-                "firefox-cookies", "list",
-                "-p", "myprof",
-                "-d", "example.com",
-                "-c", "1",
-                "--format", "json",
-                "--source", "db",
+                "firefox-cookies",
+                "list",
+                "-p",
+                "myprof",
+                "-d",
+                "example.com",
+                "-c",
+                "1",
+                "--format",
+                "json",
+                "--source",
+                "db",
             ],
         ):
             result = fc.cli()
@@ -1771,18 +1650,20 @@ class TestCli:
         assert args.sources == ["db"]
 
     @patch.object(fc, "main", autospec=True)
-    def test_cli_list_domains_passes_args(
-        self, mock_main: MagicMock
-    ) -> None:
+    def test_cli_list_domains_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list-domains args."""
         mock_main.return_value = 0
         with patch(
             "sys.argv",
             [
-                "firefox-cookies", "list-domains",
-                "-p", "prof",
-                "-c", "Work",
-                "--source", "recovery",
+                "firefox-cookies",
+                "list-domains",
+                "-p",
+                "prof",
+                "-c",
+                "Work",
+                "--source",
+                "recovery",
             ],
         ):
             result = fc.cli()
@@ -1794,9 +1675,7 @@ class TestCli:
         assert args.sources == ["recovery"]
 
     @patch.object(fc, "main", autospec=True)
-    def test_cli_list_profiles_passes_args(
-        self, mock_main: MagicMock
-    ) -> None:
+    def test_cli_list_profiles_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list-profiles args."""
         mock_main.return_value = 0
         with patch(
@@ -1817,9 +1696,12 @@ class TestCli:
         with patch(
             "sys.argv",
             [
-                "firefox-cookies", "list-containers",
-                "-p", "myprof",
-                "--source", "db",
+                "firefox-cookies",
+                "list-containers",
+                "-p",
+                "myprof",
+                "--source",
+                "db",
             ],
         ):
             result = fc.cli()
@@ -1830,16 +1712,16 @@ class TestCli:
         assert args.sources == ["db"]
 
     @patch.object(fc, "main", autospec=True)
-    def test_cli_self_test_passes_args(
-        self, mock_main: MagicMock
-    ) -> None:
+    def test_cli_self_test_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed self-test args."""
         mock_main.return_value = 0
         with patch(
             "sys.argv",
             [
-                "firefox-cookies", "self-test",
-                "-v", "--coverage",
+                "firefox-cookies",
+                "self-test",
+                "-v",
+                "--coverage",
             ],
         ):
             result = fc.cli()
@@ -1864,16 +1746,12 @@ class TestOriginAttributesFromDict:
 
     def test_single_user_context_id(self) -> None:
         """Convert single userContextId."""
-        result = fc.origin_attributes_from_dict(
-            {"userContextId": 5}
-        )
+        result = fc.origin_attributes_from_dict({"userContextId": 5})
         assert result == "^userContextId=5"
 
     def test_zero_value_omitted(self) -> None:
         """Zero values are omitted (default context)."""
-        result = fc.origin_attributes_from_dict(
-            {"userContextId": 0}
-        )
+        result = fc.origin_attributes_from_dict({"userContextId": 0})
         assert result == ""
 
     def test_multiple_attributes(self) -> None:
@@ -1881,10 +1759,7 @@ class TestOriginAttributesFromDict:
         result = fc.origin_attributes_from_dict(
             {"privateBrowsingId": 1, "userContextId": 3}
         )
-        assert (
-            result
-            == "^privateBrowsingId=1^userContextId=3"
-        )
+        assert result == "^privateBrowsingId=1^userContextId=3"
 
     def test_empty_string_value_omitted(self) -> None:
         """Empty string values are omitted."""
@@ -1897,9 +1772,7 @@ class TestOriginAttributesFromDict:
         self,
     ) -> None:
         """Converted string works with get_user_context_id."""
-        s = fc.origin_attributes_from_dict(
-            {"userContextId": 42}
-        )
+        s = fc.origin_attributes_from_dict({"userContextId": 42})
         assert fc.get_user_context_id(s) == 42
 
 
@@ -1913,7 +1786,6 @@ class TestDecompressMozlz4:
 
     def test_decompress_valid(self) -> None:
         """Decompress a valid mozlz4 payload."""
-        original = b'{"test": true}'
         data = _make_mozlz4({"test": True})
         result = fc.decompress_mozlz4(data)
         assert json.loads(result) == {"test": True}
@@ -1968,15 +1840,10 @@ class TestLoadSessionCookies:
         recovery_jsonlz4: Path,
     ) -> None:
         """Filter session cookies by container ID."""
-        cookies = fc.load_session_cookies(
-            profile_dir, container_id=5
-        )
+        cookies = fc.load_session_cookies(profile_dir, container_id=5)
         assert len(cookies) == 1
         assert cookies[0].name == "container_sess"
-        assert (
-            cookies[0].origin_attributes
-            == "^userContextId=5"
-        )
+        assert cookies[0].origin_attributes == "^userContextId=5"
 
     def test_filter_default_container(
         self,
@@ -1984,21 +1851,12 @@ class TestLoadSessionCookies:
         recovery_jsonlz4: Path,
     ) -> None:
         """Filter to default container (id=0)."""
-        cookies = fc.load_session_cookies(
-            profile_dir, container_id=0
-        )
+        cookies = fc.load_session_cookies(profile_dir, container_id=0)
         assert len(cookies) == 3
         for c in cookies:
-            assert (
-                fc.get_user_context_id(
-                    c.origin_attributes
-                )
-                == 0
-            )
+            assert fc.get_user_context_id(c.origin_attributes) == 0
 
-    def test_missing_recovery_file(
-        self, profile_dir: Path
-    ) -> None:
+    def test_missing_recovery_file(self, profile_dir: Path) -> None:
         """Return empty list if file doesn't exist."""
         cookies = fc.load_session_cookies(profile_dir)
         assert cookies == []
@@ -2039,25 +1897,14 @@ class TestLoadSessionCookies:
         recovery_jsonlz4: Path,
     ) -> None:
         """Dict originAttributes converted to string."""
-        cookies = fc.load_session_cookies(
-            profile_dir, container_id=5
-        )
-        assert (
-            cookies[0].origin_attributes
-            == "^userContextId=5"
-        )
+        cookies = fc.load_session_cookies(profile_dir, container_id=5)
+        assert cookies[0].origin_attributes == "^userContextId=5"
 
-    def test_corrupt_file_returns_empty(
-        self, profile_dir: Path
-    ) -> None:
+    def test_corrupt_file_returns_empty(self, profile_dir: Path) -> None:
         """Return empty list for corrupt file."""
-        backups = (
-            profile_dir / "sessionstore-backups"
-        )
+        backups = profile_dir / "sessionstore-backups"
         backups.mkdir(parents=True, exist_ok=True)
-        (backups / "recovery.jsonlz4").write_bytes(
-            b"garbage data not mozlz4"
-        )
+        (backups / "recovery.jsonlz4").write_bytes(b"garbage data not mozlz4")
         cookies = fc.load_session_cookies(profile_dir)
         assert cookies == []
 
@@ -2079,16 +1926,8 @@ class TestMergeCookies:
 
     def test_sqlite_takes_precedence(self) -> None:
         """Sqlite cookie wins on duplicate key."""
-        sqlite = [
-            _make_cookie(
-                name="x", value="from_sqlite"
-            )
-        ]
-        session = [
-            _make_cookie(
-                name="x", value="from_session"
-            )
-        ]
+        sqlite = [_make_cookie(name="x", value="from_sqlite")]
+        session = [_make_cookie(name="x", value="from_session")]
         merged = fc.merge_cookies(sqlite, session)
         assert len(merged) == 1
         assert merged[0].value == "from_sqlite"
@@ -2099,7 +1938,8 @@ class TestMergeCookies:
         """Same name/host in different containers kept."""
         sqlite = [
             _make_cookie(
-                name="x", origin_attributes="",
+                name="x",
+                origin_attributes="",
             )
         ]
         session = [
@@ -2113,12 +1953,8 @@ class TestMergeCookies:
 
     def test_different_paths_not_deduped(self) -> None:
         """Same name/host with different paths kept."""
-        sqlite = [
-            _make_cookie(name="x", path="/a")
-        ]
-        session = [
-            _make_cookie(name="x", path="/b")
-        ]
+        sqlite = [_make_cookie(name="x", path="/a")]
+        session = [_make_cookie(name="x", path="/b")]
         merged = fc.merge_cookies(sqlite, session)
         assert len(merged) == 2
 
@@ -2157,9 +1993,7 @@ class TestDedupContainerConflicts:
             _make_cookie(name="a"),
             _make_cookie(name="b"),
         ]
-        deduped, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        deduped, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(deduped) == 2
         assert conflicts == []
 
@@ -2179,9 +2013,7 @@ class TestDedupContainerConflicts:
                 value="from_default",
             ),
         ]
-        deduped, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        deduped, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(deduped) == 1
         assert deduped[0].value == "from_default"
         assert len(conflicts) == 1
@@ -2204,9 +2036,7 @@ class TestDedupContainerConflicts:
                 value="from_3",
             ),
         ]
-        deduped, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        deduped, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(deduped) == 1
         assert deduped[0].value == "from_3"
         assert conflicts[0].kept_container_id == 3
@@ -2220,9 +2050,7 @@ class TestDedupContainerConflicts:
             _make_cookie(name="x", path="/a"),
             _make_cookie(name="x", path="/b"),
         ]
-        deduped, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        deduped, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(deduped) == 2
         assert conflicts == []
 
@@ -2237,15 +2065,10 @@ class TestDedupContainerConflicts:
             ),
             _make_cookie(
                 name="x",
-                origin_attributes=(
-                    "^userContextId=5"
-                    "&partitionKey=example.com"
-                ),
+                origin_attributes=("^userContextId=5&partitionKey=example.com"),
             ),
         ]
-        deduped, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        deduped, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(deduped) == 2
         assert conflicts == []
 
@@ -2265,9 +2088,7 @@ class TestDedupContainerConflicts:
                 origin_attributes="^userContextId=7",
             ),
         ]
-        _, conflicts = (
-            fc.dedup_container_conflicts(cookies)
-        )
+        _, conflicts = fc.dedup_container_conflicts(cookies)
         assert len(conflicts) == 1
         cf = conflicts[0]
         assert cf.host == ".test.com"
@@ -2302,16 +2123,12 @@ class TestNormalizeSources:
 
     def test_both_explicit(self) -> None:
         """Both sources specified explicitly."""
-        result = fc.normalize_sources(
-            ["db", "recovery"]
-        )
+        result = fc.normalize_sources(["db", "recovery"])
         assert result == {"db", "recovery"}
 
     def test_both_reversed(self) -> None:
         """Both sources in reverse order."""
-        result = fc.normalize_sources(
-            ["recovery", "db"]
-        )
+        result = fc.normalize_sources(["recovery", "db"])
         assert result == {"db", "recovery"}
 
 
@@ -2327,9 +2144,7 @@ class TestSrcArgParser:
     def test_src_recovery(self) -> None:
         """Parse --src recovery."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["list", "--source", "recovery"]
-        )
+        args = parser.parse_args(["list", "--source", "recovery"])
         assert args.sources == ["recovery"]
 
     def test_src_both(self) -> None:
@@ -2350,24 +2165,18 @@ class TestSrcArgParser:
         """Invalid source value is rejected."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(
-                ["list", "--source", "invalid"]
-            )
+            parser.parse_args(["list", "--source", "invalid"])
 
     def test_src_on_list_domains(self) -> None:
         """--src works on list-domains."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["list-domains", "--source", "recovery"]
-        )
+        args = parser.parse_args(["list-domains", "--source", "recovery"])
         assert args.sources == ["recovery"]
 
     def test_src_on_list_containers(self) -> None:
         """--src works on list-containers."""
         parser = fc.build_parser()
-        args = parser.parse_args(
-            ["list-containers", "--source", "db"]
-        )
+        args = parser.parse_args(["list-containers", "--source", "db"])
         assert args.sources == ["db"]
 
 
@@ -2389,9 +2198,7 @@ class TestConflictOutput:
             kept_container_id=0,
             omitted_container_ids=[5, 12],
         )
-        output = fc.format_netscape(
-            [cookie], [conflict]
-        )
+        output = fc.format_netscape([cookie], [conflict])
         assert "# Cookie 'sid'" in output
         assert "[5, 12]" in output
         assert "keeping container 0" in output
@@ -2403,8 +2210,9 @@ class TestConflictOutput:
         cookie = _make_cookie(name="safe")
         output = fc.format_netscape([cookie])
         lines = [
-            l for l in output.split("\n")
-            if l and not l.startswith("#")
+            line
+            for line in output.split("\n")
+            if line and not line.startswith("#")
         ]
         assert len(lines) == 1
 
@@ -2493,9 +2301,7 @@ class TestDoListWithSessionCookies:
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
-        session_cookies = [
-            c for c in data if c["name"] == "session"
-        ]
+        session_cookies = [c for c in data if c["name"] == "session"]
         assert len(session_cookies) == 1
         assert session_cookies[0]["value"] == "abc123"
 
@@ -2612,116 +2418,64 @@ class TestDoListWithSessionCookies:
 class TestDoSelfTest:
     """Test do_self_test function."""
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_basic(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_basic(self, mock_run: MagicMock) -> None:
         """Test do_self_test invokes the test file."""
-        mock_run.return_value = MagicMock(
-            returncode=0
-        )
+        mock_run.return_value = MagicMock(returncode=0)
 
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
+        fc.do_self_test(verbose=False, coverage=False)
 
         assert mock_run.called
         cmd = mock_run.call_args[0][0]
-        assert cmd[0].endswith(
-            "test_firefox_cookies.py"
-        )
+        assert cmd[0].endswith("test_firefox_cookies.py")
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_with_verbose(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_with_verbose(self, mock_run: MagicMock) -> None:
         """Test do_self_test passes --verbose."""
-        mock_run.return_value = MagicMock(
-            returncode=0
-        )
+        mock_run.return_value = MagicMock(returncode=0)
 
-        fc.do_self_test(
-            verbose=True, coverage=False
-        )
+        fc.do_self_test(verbose=True, coverage=False)
 
         cmd = mock_run.call_args[0][0]
         assert "--verbose" in cmd
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_without_verbose(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_without_verbose(self, mock_run: MagicMock) -> None:
         """Test do_self_test omits --verbose."""
-        mock_run.return_value = MagicMock(
-            returncode=0
-        )
+        mock_run.return_value = MagicMock(returncode=0)
 
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
+        fc.do_self_test(verbose=False, coverage=False)
 
         cmd = mock_run.call_args[0][0]
         assert "--verbose" not in cmd
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_with_coverage(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_with_coverage(self, mock_run: MagicMock) -> None:
         """Test do_self_test passes --coverage."""
-        mock_run.return_value = MagicMock(
-            returncode=0
-        )
+        mock_run.return_value = MagicMock(returncode=0)
 
-        fc.do_self_test(
-            verbose=False, coverage=True
-        )
+        fc.do_self_test(verbose=False, coverage=True)
 
         cmd = mock_run.call_args[0][0]
         assert "--coverage" in cmd
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_without_coverage(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_without_coverage(self, mock_run: MagicMock) -> None:
         """Test do_self_test omits --coverage."""
-        mock_run.return_value = MagicMock(
-            returncode=0
-        )
+        mock_run.return_value = MagicMock(returncode=0)
 
-        fc.do_self_test(
-            verbose=False, coverage=False
-        )
+        fc.do_self_test(verbose=False, coverage=False)
 
         cmd = mock_run.call_args[0][0]
         assert "--coverage" not in cmd
 
-    @patch.object(
-        fc.subprocess, "run", autospec=True
-    )
-    def test_raises_on_failure(
-        self, mock_run: MagicMock
-    ) -> None:
+    @patch.object(fc.subprocess, "run", autospec=True)
+    def test_raises_on_failure(self, mock_run: MagicMock) -> None:
         """Test do_self_test raises TestError."""
-        mock_run.return_value = MagicMock(
-            returncode=1
-        )
+        mock_run.return_value = MagicMock(returncode=1)
 
-        with pytest.raises(
-            fc.TestError, match="Tests failed"
-        ):
-            fc.do_self_test(
-                verbose=False, coverage=False
-            )
+        with pytest.raises(fc.TestError, match="Tests failed"):
+            fc.do_self_test(verbose=False, coverage=False)
 
 
 class TestDoListDomainsWithSession:
@@ -2742,9 +2496,7 @@ class TestDoListDomainsWithSession:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(
-                profile=None, container=None
-            )
+            fc.do_list_domains(profile=None, container=None)
         captured = capsys.readouterr()
         assert "wordpress.com" in captured.out
 

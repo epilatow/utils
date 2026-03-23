@@ -53,66 +53,66 @@ def pytest_sessionfinish(
 class CodeQualityBase:
     """Base class for code quality tests.
 
-    Subclasses must define SCRIPT_PATH and TEST_PATH. Optionally
-    override FLAKE8_EXTRA_ARGS for project-specific flake8 flags.
+    Subclasses must define SCRIPT_PATH and TEST_PATH.
     """
 
     SCRIPT_PATH: ClassVar[Path]
     TEST_PATH: ClassVar[Path]
-    FLAKE8_EXTRA_ARGS: ClassVar[list[str]] = []
 
-    def test_black_compliance(self) -> None:
-        """Test that code is formatted with black."""
+    def test_ruff_check_compliance(self) -> None:
+        """Test that code passes ruff linting."""
         result = subprocess.run(
-            ["uvx", "black", "-l80", "--check", str(self.SCRIPT_PATH)],
+            ["uvx", "ruff", "check", str(self.SCRIPT_PATH)],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0, (
-            f"black check failed:\n{result.stderr}"
+            f"ruff check failed:\n{result.stdout}"
         )
 
-    def test_black_compliance_tests(self) -> None:
-        """Test that tests are formatted with black."""
+    def test_ruff_check_compliance_tests(self) -> None:
+        """Test that tests pass ruff linting."""
         result = subprocess.run(
-            ["uvx", "black", "-l80", "--check", str(self.TEST_PATH)],
+            ["uvx", "ruff", "check", str(self.TEST_PATH)],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0, (
-            f"black check failed:\n{result.stderr}"
+            f"ruff check failed:\n{result.stdout}"
         )
 
-    def test_flake8_compliance(self) -> None:
-        """Test that code passes flake8."""
-        cmd = [
-            "uvx",
-            "flake8",
-            "--max-line-length=80",
-            *self.FLAKE8_EXTRA_ARGS,
-            str(self.SCRIPT_PATH),
-        ]
+    def test_ruff_format_compliance(self) -> None:
+        """Test that code is formatted with ruff."""
         result = subprocess.run(
-            cmd, capture_output=True, text=True
+            [
+                "uvx",
+                "ruff",
+                "format",
+                "--check",
+                str(self.SCRIPT_PATH),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, (
-            f"flake8 check failed:\n{result.stdout}"
+            f"ruff format check failed:\n{result.stderr}"
         )
 
-    def test_flake8_compliance_tests(self) -> None:
-        """Test that tests pass flake8."""
-        cmd = [
-            "uvx",
-            "flake8",
-            "--max-line-length=80",
-            *self.FLAKE8_EXTRA_ARGS,
-            str(self.TEST_PATH),
-        ]
+    def test_ruff_format_compliance_tests(self) -> None:
+        """Test that tests are formatted with ruff."""
         result = subprocess.run(
-            cmd, capture_output=True, text=True
+            [
+                "uvx",
+                "ruff",
+                "format",
+                "--check",
+                str(self.TEST_PATH),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, (
-            f"flake8 check failed:\n{result.stdout}"
+            f"ruff format check failed:\n{result.stderr}"
         )
 
     def test_mypy_compliance(self, tmp_path: Path) -> None:
@@ -180,11 +180,14 @@ def run_tests(
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v",
+        "--verbose",
+        action="store_true",
         help="Verbose test output",
     )
     parser.add_argument(
-        "--coverage", action="store_true",
+        "--coverage",
+        action="store_true",
         help="Run with coverage report",
     )
     args = parser.parse_args()
@@ -195,14 +198,14 @@ def run_tests(
     if args.coverage:
         module = script_path.stem.replace("-", "_")
         cov_dir = Path(tempfile.gettempdir())
-        pytest_args.extend([
-            f"--cov={module}",
-            "--cov-report=term-missing",
-            f"--cov-report=html:{cov_dir / (module + '_htmlcov')}",
-        ])
-        os.environ["PYTHONPATH"] = str(repo_root / "bin")
-        os.environ["COVERAGE_FILE"] = str(
-            cov_dir / f"{module}.coverage"
+        pytest_args.extend(
+            [
+                f"--cov={module}",
+                "--cov-report=term-missing",
+                f"--cov-report=html:{cov_dir / (module + '_htmlcov')}",
+            ]
         )
+        os.environ["PYTHONPATH"] = str(repo_root / "bin")
+        os.environ["COVERAGE_FILE"] = str(cov_dir / f"{module}.coverage")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     raise SystemExit(pytest.main(pytest_args))

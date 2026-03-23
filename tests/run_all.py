@@ -176,7 +176,7 @@ def main() -> int:
     test_files = discover_test_files(TESTS_DIR)
     if not test_files:
         print(
-            "ERROR: No test files found " f"in {TESTS_DIR}",
+            f"ERROR: No test files found in {TESTS_DIR}",
             file=sys.stderr,
         )
         return EXIT_INFRA_ERROR

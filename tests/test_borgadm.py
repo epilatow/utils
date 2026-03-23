@@ -237,12 +237,12 @@ for i in range(1000):
             text=True,
         )
         # The key assertion: no Python exceptions in stderr
-        assert (
-            "BrokenPipeError" not in result.stderr
-        ), f"BrokenPipeError found in stderr:\n{result.stderr}"
-        assert (
-            "Traceback" not in result.stderr
-        ), f"Traceback found in stderr:\n{result.stderr}"
+        assert "BrokenPipeError" not in result.stderr, (
+            f"BrokenPipeError found in stderr:\n{result.stderr}"
+        )
+        assert "Traceback" not in result.stderr, (
+            f"Traceback found in stderr:\n{result.stderr}"
+        )
         # First line should be in output
         assert "line 0" in result.stdout
 
@@ -252,7 +252,6 @@ class TestCodeQuality(CodeQualityBase):
 
     SCRIPT_PATH = _script_path
     TEST_PATH = REPO_ROOT / "tests" / "test_borgadm.py"
-    FLAKE8_EXTRA_ARGS = ["--extend-ignore=E203,W503"]
 
 
 if __name__ == "__main__":
