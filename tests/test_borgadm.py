@@ -89,6 +89,36 @@ class TestArgumentParser:
 
         check_parser(parser, "borgadm")
 
+    def test_check_legacy_rewrite(self) -> None:
+        """Test legacy check-* commands are rewritten to check *."""
+        cases: dict[str, list[str]] = {
+            "check-age": ["borgadm", "check", "age"],
+            "check-all": ["borgadm", "check", "all"],
+        }
+        for old_cmd, expected in cases.items():
+            result = ba.rewrite_legacy_args(["borgadm", old_cmd])
+            assert result == expected, (
+                f"rewrite_legacy_args({old_cmd!r}): "
+                f"expected {expected}, got {result}"
+            )
+
+    def test_check_legacy_rewrite_preserves_args(self) -> None:
+        """Test legacy rewrite preserves trailing arguments."""
+        result = ba.rewrite_legacy_args(
+            ["borgadm", "check-age", "--enable-notifications"]
+        )
+        assert result == [
+            "borgadm",
+            "check",
+            "age",
+            "--enable-notifications",
+        ]
+
+    def test_check_legacy_rewrite_ignores_non_legacy(self) -> None:
+        """Test that non-legacy commands pass through unchanged."""
+        argv = ["borgadm", "create", "--dry-run"]
+        assert ba.rewrite_legacy_args(argv) == argv
+
     def test_repair_subcommand_parses(self) -> None:
         """Test repair delete-cache subcommand parses."""
         parser = ba.args_parser()
@@ -366,6 +396,129 @@ class TestAutomate:
             pytest.raises(SystemExit, match="1"),
         ):
             ba.do_automate(action="enable")
+
+
+class TestCheck:
+    """Test check subcommands."""
+
+    @staticmethod
+    def _check_subcommands() -> set[str]:
+        """Discover check subcommands from the parser."""
+        parser = ba.args_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                check_parser = action.choices.get("check")
+                if check_parser:
+                    for sub in check_parser._actions:
+                        if isinstance(sub, argparse._SubParsersAction):
+                            return set(sub.choices.keys())
+        return set()
+
+    def test_check_subcommands_accept_common_args(self) -> None:
+        """Verify all check subcommands accept --enable-notifications."""
+        parser = ba.args_parser()
+        for action in self._check_subcommands():
+            # Should parse without error
+            args = parser.parse_args(
+                ["check", action, "--enable-notifications"]
+            )
+            assert args.enable_notifications is True, (
+                f"check {action} did not accept --enable-notifications"
+            )
+
+    def test_dispatcher_handles_all_subcommands(self, mock_cfg: Any) -> None:
+        """Verify do_check can dispatch every check subcommand."""
+        actions = self._check_subcommands()
+        assert actions, "No check subcommands found in parser"
+
+        # Mock all do_check_* functions so dispatch doesn't run
+        # real checks. Discovered dynamically so new check functions
+        # are picked up automatically.
+        check_fn_names = [
+            name
+            for name in dir(ba)
+            if name.startswith("do_check_") and callable(getattr(ba, name))
+        ]
+        patches = [patch.object(ba, name) for name in check_fn_names]
+        for p in patches:
+            p.start()
+        try:
+            for action in actions:
+                ba.do_check(action=action)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_check_all_runs_all_checks(self, mock_cfg: Any) -> None:
+        """Verify do_check_all calls every individual check function."""
+        actions = self._check_subcommands() - {"all"}
+        assert actions, "No individual check subcommands found"
+
+        mocks: dict[str, Any] = {}
+        patches = []
+        for action in actions:
+            p = patch.object(ba, f"do_check_{action}", autospec=True)
+            mocks[action] = p.start()
+            patches.append(p)
+
+        try:
+            ba.do_check_all(progress=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        for action, mock_fn in mocks.items():
+            assert mock_fn.called, (
+                f"do_check_all did not call do_check_{action}"
+            )
+
+    def test_check_age_no_backups(self, mock_cfg: Any) -> None:
+        """Test check age exits with code 2 when no backups found."""
+        with (
+            patch.object(ba, "list_backups", autospec=True, return_value={}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_check_age()
+        assert exc_info.value.code == 2
+
+    def test_check_age_too_old(self, mock_cfg: Any) -> None:
+        """Test check age exits with code 3 when backup is too old."""
+        old_ts = (datetime.now() - timedelta(hours=48)).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                return_value={old_ts: ["repo::backup"]},
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_check_age()
+        assert exc_info.value.code == 3
+
+    def test_check_age_ok(self, mock_cfg: Any) -> None:
+        """Test check age succeeds when backup is recent."""
+        recent_ts = (datetime.now() - timedelta(hours=1)).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        with patch.object(
+            ba,
+            "list_backups",
+            autospec=True,
+            return_value={recent_ts: ["repo::backup"]},
+        ):
+            ba.do_check_age()  # Should not raise
+
+    def test_check_archives_no_backups(self, mock_cfg: Any) -> None:
+        """Test check archives exits with code 1 when no backups."""
+        with (
+            patch.object(ba, "list_backups", autospec=True, return_value={}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_check_archives(progress=False)
+        assert exc_info.value.code == 1
 
 
 class TestTimestampPruning:

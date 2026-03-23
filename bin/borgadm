@@ -1048,6 +1048,16 @@ def do_break_lock() -> None:
     )
 
 
+def do_check(action: str, **kwargs: Any) -> None:
+    check_callbacks: dict[str, Callable[..., Any]] = {
+        "age": do_check_age,
+        "all": do_check_all,
+        "archives": do_check_archives,
+        "repo": do_check_repo,
+    }
+    check_callbacks[action](**kwargs)
+
+
 def do_check_age() -> None:
     cfg = get_cfg()
     seconds = cfg.CHECK_AGE_SECONDS
@@ -1631,18 +1641,37 @@ def args_parser() -> argparse.ArgumentParser:
 
     add_parser("break-lock", help="Break repo lock")
 
-    check_age = add_parser("check-age", help="Check full backup age")
+    check = add_parser("check", help="Run backup checks")
+    check_subparsers = check.add_subparsers(dest="action", required=True)
+
+    check_age = check_subparsers.add_parser(
+        "age",
+        help="Check full backup age",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     add_seconds(check_age)
 
-    check_all = add_parser("check-all", help="Run all checks")
+    check_all = check_subparsers.add_parser(
+        "all",
+        help="Run all checks",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     add_progress(check_all)
     add_seconds(check_all)
 
-    check_repo = add_parser("check-repo", help="Check repo metadata")
-    add_progress(check_repo)
-
-    check_archives = add_parser("check-archives", help="Check archive metadata")
+    check_archives = check_subparsers.add_parser(
+        "archives",
+        help="Check archive metadata",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     add_progress(check_archives)
+
+    check_repo = check_subparsers.add_parser(
+        "repo",
+        help="Check repo metadata",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_progress(check_repo)
 
     compact = add_parser("compact", help="Check full backup metadata")
     add_progress(compact)
@@ -1736,14 +1765,14 @@ def args_parser() -> argparse.ArgumentParser:
         help="Run with coverage report",
     )
 
-    for name, subparser in subparsers.choices.items():
-        # self-test doesn't need config or notification args
-        if name == "self-test":
-            continue
-        subparser.add_argument(
-            "--config", type=str, default=CONFIG, help="borgadm config file"
+    def add_common_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--config",
+            type=str,
+            default=CONFIG,
+            help="borgadm config file",
         )
-        subparser.add_argument(
+        p.add_argument(
             "--enable-notifications",
             action="store_true",
             help=(
@@ -1751,9 +1780,23 @@ def args_parser() -> argparse.ArgumentParser:
                 "(only supported on osx)"
             ),
         )
-        subparser.add_argument(
-            "--verbose", action="store_true", help="Enable verbose output"
+        p.add_argument(
+            "--verbose",
+            action="store_true",
+            help="Enable verbose output",
         )
+
+    for name, subparser in subparsers.choices.items():
+        # self-test doesn't need config or notification args
+        if name == "self-test":
+            continue
+        add_common_args(subparser)
+        # Also add common args to nested subparsers so that
+        # e.g. "borgadm check age --verbose" works.
+        for action in subparser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for nested in action.choices.values():
+                    add_common_args(nested)
 
     return parser
 
@@ -1761,7 +1804,19 @@ def args_parser() -> argparse.ArgumentParser:
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+def rewrite_legacy_args(argv: list[str]) -> list[str]:
+    """Rewrite legacy check-* commands to check * subcommands."""
+    legacy_check_cmds: dict[str, list[str]] = {
+        "check-age": ["check", "age"],
+        "check-all": ["check", "all"],
+    }
+    if len(argv) > 1 and argv[1] in legacy_check_cmds:
+        argv = argv[:1] + legacy_check_cmds[argv[1]] + argv[2:]
+    return argv
+
+
 def main() -> None:
+    sys.argv = rewrite_legacy_args(sys.argv)
     args = args_parser().parse_args()
     args_dict = vars(args).copy()
     command = args_dict.pop("command")
@@ -1789,7 +1844,6 @@ def main() -> None:
 
     if command not in [
         "break-lock",
-        "check-repo",
         "compact",
         "environment",
         "repair",
@@ -1799,10 +1853,7 @@ def main() -> None:
     command_callbacks: dict[str, Callable[..., Any]] = {
         "automate": do_automate,
         "break-lock": do_break_lock,
-        "check-age": do_check_age,
-        "check-all": do_check_all,
-        "check-archives": do_check_archives,
-        "check-repo": do_check_repo,
+        "check": do_check,
         "compact": do_compact,
         "create": do_create,
         "environment": do_environment,
