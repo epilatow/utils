@@ -371,18 +371,20 @@ class TestAutomate:
         """Test that automate exits with error on non-Darwin."""
         with (
             patch.object(ba.platform, "system", return_value="Linux"),
-            pytest.raises(SystemExit, match="1"),
+            pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_automate(action="enable")
+        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_plutil(self, mock_cfg: Any) -> None:
         """Test that automate exits when plutil is not found."""
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba.shutil, "which", side_effect=lambda x: None),
-            pytest.raises(SystemExit, match="1"),
+            pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_automate(action="enable")
+        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_launchctl(self, mock_cfg: Any) -> None:
         """Test that automate exits when launchctl is not found."""
@@ -393,9 +395,10 @@ class TestAutomate:
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba.shutil, "which", side_effect=which_side_effect),
-            pytest.raises(SystemExit, match="1"),
+            pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_automate(action="enable")
+        assert exc_info.value.code == ba.ExitCode.ERROR
 
 
 class TestCheck:
@@ -473,16 +476,16 @@ class TestCheck:
             )
 
     def test_check_age_no_backups(self, mock_cfg: Any) -> None:
-        """Test check age exits with code 2 when no backups found."""
+        """Test check age exits with EXIT_CHECK_NO_BACKUPS."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_check_age()
-        assert exc_info.value.code == 2
+        assert exc_info.value.code == ba.ExitCode.CHECK_NO_BACKUPS
 
     def test_check_age_too_old(self, mock_cfg: Any) -> None:
-        """Test check age exits with code 3 when backup is too old."""
+        """Test check age exits with EXIT_CHECK_AGE."""
         old_ts = (datetime.now() - timedelta(hours=48)).strftime(
             "%Y%m%d_%H%M%S"
         )
@@ -496,7 +499,7 @@ class TestCheck:
             pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_check_age()
-        assert exc_info.value.code == 3
+        assert exc_info.value.code == ba.ExitCode.CHECK_AGE
 
     def test_check_age_ok(self, mock_cfg: Any) -> None:
         """Test check age succeeds when backup is recent."""
@@ -512,13 +515,48 @@ class TestCheck:
             ba.do_check_age()  # Should not raise
 
     def test_check_archives_no_backups(self, mock_cfg: Any) -> None:
-        """Test check archives exits with code 1 when no backups."""
+        """Test check archives exits with EXIT_CHECK_NO_BACKUPS."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             pytest.raises(SystemExit) as exc_info,
         ):
             ba.do_check_archives(progress=False)
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == ba.ExitCode.CHECK_NO_BACKUPS
+
+    def test_warning_exit_triggers_notification(self, mock_cfg: Any) -> None:
+        """Verify osascript_notify is called when exiting via WARNING."""
+        original_warning = getattr(ba, "_warning_occurred")
+        original_notifications = getattr(ba, "_enable_notifications")
+        try:
+            setattr(ba, "_warning_occurred", True)
+            setattr(ba, "_enable_notifications", True)
+            with (
+                patch.object(
+                    ba, "osascript_notify", autospec=True
+                ) as mock_notify,
+                patch(
+                    "sys.argv",
+                    ["borgadm", "check", "age"],
+                ),
+                patch.object(
+                    ba,
+                    "initialize_logger",
+                    autospec=True,
+                ),
+                patch.object(
+                    ba,
+                    "initialize_borg_environment",
+                    autospec=True,
+                ),
+                patch.object(ba, "do_check", autospec=True),
+                pytest.raises(SystemExit) as exc_info,
+            ):
+                ba.main()
+            assert exc_info.value.code == ba.ExitCode.WARNING
+            mock_notify.assert_called_once()
+        finally:
+            setattr(ba, "_warning_occurred", original_warning)
+            setattr(ba, "_enable_notifications", original_notifications)
 
 
 class TestTimestampPruning:

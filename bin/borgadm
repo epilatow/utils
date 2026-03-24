@@ -52,8 +52,38 @@ BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
 LOGFILE: Path = Path(f"/tmp/{BASENAME}.log")
 CONFIG: Path = Path(os.path.expanduser(f"~/.{BASENAME}"))
 
+
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0, "Success"
+    WARNING = 1, "Warning (borg subprocess warnings)"
+    USAGE = 2, "Usage/argument error"
+    CONFIG = 3, "Config file error"
+    ERROR = 4, "General error"
+    SUBPROCESS = 5, "Subprocess error"
+    CHECK_NO_BACKUPS = 6, "Check failed: no full backups"
+    CHECK_AGE = 7, "Check failed: backup too old"
+    CHECK_REPO = 8, "Check failed: repo metadata"
+    CHECK_ARCHIVES = 9, "Check failed: archive metadata"
+
+    def __new__(cls, value: int, description: str = "") -> ExitCode:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description  # type: ignore[attr-defined]
+        return obj
+
+    @classmethod
+    def epilog(cls) -> str:
+        lines = ["exit codes:"]
+        for member in cls:
+            lines.append(
+                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
+            )
+        return "\n".join(lines)
+
+
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _enable_notifications: bool = False
+_warning_occurred: bool = False
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
 _logger_buffer: io.StringIO
 _ssh_agent_pid: Optional[str] = None
@@ -174,7 +204,7 @@ class Config:
             OSError,
         ) as e:
             logger.error(f"Failed to load config file {path}: {e}")
-            sys.exit(1)
+            sys.exit(ExitCode.CONFIG)
 
         config = configparser.ConfigParser()
         config_data = io.StringIO("[default]\n" + content)
@@ -182,7 +212,7 @@ class Config:
             config.read_file(config_data)
         except configparser.ParsingError as e:
             logger.error(f"Failed to parse config file {path}: {e}")
-            sys.exit(1)
+            sys.exit(ExitCode.CONFIG)
 
         self.BORG_PASSPHRASE_FILE: Path = Path(
             os.path.expanduser(
@@ -283,7 +313,7 @@ class Config:
             logger.error(f"BACKUP_SETS not defined in config: {path}")
             error = True
         if error:
-            sys.exit(1)
+            sys.exit(ExitCode.CONFIG)
 
 
 class Interval(enum.Enum):
@@ -438,7 +468,7 @@ def borg_cmd() -> list[str]:
         return [uvx, "-q", "--from", "borgbackup", "borg"]
 
     logger.error("Can't find borg or uvx executables.")
-    sys.exit(1)
+    sys.exit(ExitCode.ERROR)
 
 
 def initialize_borg_environment() -> None:
@@ -471,10 +501,10 @@ def check_permissions(path: Path, name: str) -> None:
         st = os.stat(path)
         if (st.st_mode & (stat.S_IRWXG | stat.S_IRWXO)) != 0:
             logger.error(f"Permissions on {name} ({path}) are too open.")
-            sys.exit(4)
+            sys.exit(ExitCode.CONFIG)
     except FileNotFoundError:
         logger.error(f"{name} not found at: {path}")
-        sys.exit(4)
+        sys.exit(ExitCode.CONFIG)
 
 
 def run_cmd(
@@ -541,7 +571,19 @@ def run_cmd(
     if stderr_str:
         logger.debug(f"stderr:\n{stderr_str.strip()}")
 
-    if proc.returncode != 0:
+    is_borg = "borg" in cmd[0] or "borg" in cmd
+    if is_borg and proc.returncode == ExitCode.WARNING:
+        # Borg exit code 1 means the operation completed with
+        # non-fatal warnings (e.g., files changed during backup).
+        logger.warning(
+            "Command %s completed with warnings (exit code %s):\n%s",
+            cmd_str,
+            proc.returncode,
+            stderr_str.strip(),
+        )
+        global _warning_occurred
+        _warning_occurred = True
+    elif proc.returncode != 0:
         logger.error(
             "Command %s failed with exit code %s and stderr:\n%s",
             cmd_str,
@@ -899,15 +941,15 @@ def automation_script_path() -> str:
 def do_automate(action: str) -> None:
     if platform.system() != "Darwin":
         logger.error("automate subcommand is only supported on osx")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     if not shutil.which("plutil"):
         logger.error("plutil not found in PATH")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     if not shutil.which("launchctl"):
         logger.error("launchctl not found in PATH")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     script_path = automation_script_path()
     launchd_env: dict[str, str] = {
@@ -1064,7 +1106,7 @@ def do_check_age() -> None:
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
-        sys.exit(2)
+        sys.exit(ExitCode.CHECK_NO_BACKUPS)
     assert len(backups.keys()) == 1, backups
     latest = list(backups.keys())[0]
 
@@ -1077,7 +1119,7 @@ def do_check_age() -> None:
             age,
             seconds,
         )
-        sys.exit(3)
+        sys.exit(ExitCode.CHECK_AGE)
 
     logger.info(
         "Latest full backup (%s) age is: %s seconds; limit is: %s seconds",
@@ -1097,20 +1139,26 @@ def do_check_archives(progress: bool) -> None:
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
-        sys.exit(1)
+        sys.exit(ExitCode.CHECK_NO_BACKUPS)
     assert len(backups.keys()) == 1
     archives = list(backups.values())[0]
     for archive in archives:
         logger.info(f"Checking archive metadata: {archive}")
         args = ["check", *(["--progress"] if progress else []), archive]
-        run_cmd(borg_cmd() + args, allow_output=progress)
+        try:
+            run_cmd(borg_cmd() + args, allow_output=progress)
+        except subprocess.CalledProcessError:
+            sys.exit(ExitCode.CHECK_ARCHIVES)
 
 
 def do_check_repo(progress: bool) -> None:
     cfg = get_cfg()
     logger.info("Checking repo metadata.")
     args = ["check", *(["--progress"] if progress else []), cfg.BORG_REPO]
-    run_cmd(borg_cmd() + args, allow_output=progress)
+    try:
+        run_cmd(borg_cmd() + args, allow_output=progress)
+    except subprocess.CalledProcessError:
+        sys.exit(ExitCode.CHECK_REPO)
 
 
 def do_compact(progress: bool) -> None:
@@ -1154,7 +1202,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 )
                 error = True
         if error:
-            sys.exit(1)
+            sys.exit(ExitCode.ERROR)
 
     # Run all tests before backups to fail-fast in case of errors
     for set_name in cfg.BACKUP_SETS:
@@ -1168,7 +1216,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
             full_path = cfg.BACKUP_ROOT / path
             if not is_mountpoint(full_path):
                 logger.error(f"Missing backup mount: {full_path}")
-                sys.exit(1)
+                sys.exit(ExitCode.ERROR)
         create_args = set_cfg.get("create_options", [])
         create_args += ["--progress"] if progress else []
         create_args += ["--dry-run"] if dry_run else ["--stats"]
@@ -1221,14 +1269,14 @@ def do_extract(
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
     assert len(backups.keys()) == 1
     archives = list(backups.values())[0]
 
     target_dir = target_dir.resolve()
     if not os.path.isdir(target_dir):
         logger.error(f"Invalid extraction dirctory: {target_dir}")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     logger.info(f"Extract target dirctory: {target_dir}")
 
@@ -1290,7 +1338,7 @@ def do_extract(
             logger.error(
                 "Another extract process is already running for this path."
             )
-            sys.exit(1)
+            sys.exit(ExitCode.ERROR)
 
         for archive in archives:
             logger.info(f"Extracting: {archive} to {target_dir}")
@@ -1396,19 +1444,19 @@ def do_rsync(
 ) -> None:
     if platform.system() != "Linux":
         logger.error("Rsync subcommand is only supported on linux")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     if not check_sudo():
         logger.error(
             "Rsync subcommand requires non-interractive sudo support "
             "with the ability to set environment variables."
         )
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     backups = list_backups(latest=True)
     if not backups:
         logger.error("No full backups found.")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
     assert len(backups.keys()) == 1
     ts = list(backups.keys())[0]
     archives = list(backups.values())[0]
@@ -1416,7 +1464,7 @@ def do_rsync(
     target_dir = target_dir.resolve()
     if not os.path.isdir(target_dir):
         logger.error(f"Invalid extraction dirctory: {target_dir}")
-        sys.exit(1)
+        sys.exit(ExitCode.ERROR)
 
     logger.info(f"Rsync target dirctory: {target_dir}")
     tdir_dirname = target_dir.parent
@@ -1437,7 +1485,7 @@ def do_rsync(
             logger.error(
                 "Another extract process is already running for this path."
             )
-            sys.exit(1)
+            sys.exit(ExitCode.ERROR)
 
         cleanup_mounts: list[Path] = []
         cleanup_dirs: list[Path] = []
@@ -1463,7 +1511,7 @@ def do_rsync(
 
                 if not os.listdir(mount_dir):
                     logger.error(f"Empty archive mount: {archive}")
-                    sys.exit(1)
+                    sys.exit(ExitCode.ERROR)
 
             lowerdir = ":".join([i.as_posix() for i in archive_mounts])
             upperdir = tmpdir / "upperdir"
@@ -1487,7 +1535,7 @@ def do_rsync(
             cleanup_dirs.append(workdir)
             if not os.listdir(merged):
                 logger.error(f"Empty overlayfs mount: {merged}")
-                sys.exit(1)
+                sys.exit(ExitCode.ERROR)
 
             logger.info(f"Starting rsync to: {target_dir}")
             cmd = [
@@ -1559,16 +1607,24 @@ def do_self_test(verbose: bool = False, coverage: bool = False) -> None:
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
+class HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    pass
+
+
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Borg backup manager",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=HelpFormatter,
+        epilog=ExitCode.epilog(),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Always set formatter_class so that we display default values.
     def add_parser(name: str, **kwargs) -> argparse.ArgumentParser:
-        kwargs["formatter_class"] = argparse.ArgumentDefaultsHelpFormatter
+        kwargs["formatter_class"] = HelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
     def add_delete(parser: argparse.ArgumentParser) -> None:
@@ -1869,6 +1925,18 @@ def main() -> None:
         if e.code != 0:
             osascript_notify()
         raise
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            "Subprocess failed with exit code %s: %s",
+            e.returncode,
+            shlex.join(e.cmd),
+        )
+        osascript_notify()
+        sys.exit(ExitCode.SUBPROCESS)
+
+    if _warning_occurred:
+        osascript_notify()
+        sys.exit(ExitCode.WARNING)
 
 
 if __name__ == "__main__":
