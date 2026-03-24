@@ -64,6 +64,7 @@ class ExitCode(enum.IntEnum):
     CHECK_AGE = 7, "Check failed: backup too old"
     CHECK_REPO = 8, "Check failed: repo metadata"
     CHECK_ARCHIVES = 9, "Check failed: archive metadata"
+    CHECK_PRUNE = 10, "Check failed: unpruned archives"
 
     def __new__(cls, value: int, description: str = "") -> ExitCode:
         obj = int.__new__(cls, value)
@@ -973,7 +974,14 @@ def do_automate(action: str) -> None:
     tasks: dict[str, dict[str, Any]] = {
         "create": {"args": [script_path, "create"], "interval": (60 * 60)},
         "check-daily": {
-            "args": [script_path, "check-age", "--enable-notifications"],
+            "args": [
+                "/bin/sh",
+                "-c",
+                f"{shlex.quote(script_path)} check age"
+                f" --enable-notifications"
+                f" && {shlex.quote(script_path)} check prune"
+                f" --enable-notifications",
+            ],
             "interval": (60 * 60 * 24),
         },
         "check-weekly": {
@@ -1109,6 +1117,7 @@ def do_check(action: str, **kwargs: Any) -> None:
         "age": do_check_age,
         "all": do_check_all,
         "archives": do_check_archives,
+        "prune": do_check_prune,
         "repo": do_check_repo,
     }
     check_callbacks[action](**kwargs)
@@ -1145,6 +1154,7 @@ def do_check_age() -> None:
 
 def do_check_all(progress: bool) -> None:
     do_check_age()
+    do_check_prune()
     do_check_repo(progress)
     do_check_archives(progress)
 
@@ -1163,6 +1173,31 @@ def do_check_archives(progress: bool) -> None:
             run_cmd(borg_cmd() + args, allow_output=progress)
         except subprocess.CalledProcessError:
             sys.exit(ExitCode.CHECK_ARCHIVES)
+
+
+def do_check_prune() -> None:
+    cfg = get_cfg()
+    error = False
+
+    partial_backups = list_backups(partial=True)
+    if partial_backups:
+        for ts, archives in partial_backups.items():
+            names = [a.removeprefix(f"{cfg.BORG_REPO}::") for a in archives]
+            logger.error(f"Partial archive(s): {', '.join(names)}")
+        error = True
+
+    full_backups = list_backups()
+    ts_keep = ts_to_keep(set(full_backups.keys()))
+    ts_prune = full_backups.keys() - ts_keep.keys()
+    if ts_prune:
+        pruning = sorted(ts_prune, reverse=True)
+        logger.error(f"Unpruned backups: {', '.join(pruning)}")
+        error = True
+
+    if error:
+        sys.exit(ExitCode.CHECK_PRUNE)
+
+    logger.info("No unpruned archives found.")
 
 
 def do_check_repo(progress: bool) -> None:
@@ -1736,10 +1771,16 @@ def args_parser() -> argparse.ArgumentParser:
     )
     add_progress(check_archives)
 
+    check_subparsers.add_parser(
+        "prune",
+        help="Check for unpruned archives",
+        formatter_class=HelpFormatter,
+    )
+
     check_repo = check_subparsers.add_parser(
         "repo",
         help="Check repo metadata",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=HelpFormatter,
     )
     add_progress(check_repo)
 

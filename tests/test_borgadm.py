@@ -523,6 +523,84 @@ class TestCheck:
             ba.do_check_archives(progress=False)
         assert exc_info.value.code == ba.ExitCode.CHECK_NO_BACKUPS
 
+    def test_check_prune_partial_archives(self, mock_cfg: Any) -> None:
+        """Test check prune fails on partial archives."""
+
+        def list_backups_side_effect(
+            partial: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {
+                    "20250101_000000": ["foobar::home-set1-20250101_000000"]
+                }
+            return {}
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_check_prune()
+        assert exc_info.value.code == ba.ExitCode.CHECK_PRUNE
+
+    def test_check_prune_unpruned_backups(self, mock_cfg: Any) -> None:
+        """Test check prune fails when old backups need pruning."""
+        mock_cfg.PRUNE_KEEP_HOURLY = 1
+        mock_cfg.PRUNE_KEEP_DAILY = 0
+        mock_cfg.PRUNE_KEEP_WEEKLY = 0
+        mock_cfg.PRUNE_KEEP_MONTHLY = 0
+        mock_cfg.PRUNE_KEEP_YEARLY = 0
+
+        def list_backups_side_effect(
+            partial: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {}
+            # Two backups but only 1 hourly kept
+            return {
+                "20250101_020000": ["foobar::home-set1-20250101_020000"],
+                "20250101_010000": ["foobar::home-set1-20250101_010000"],
+            }
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_check_prune()
+        assert exc_info.value.code == ba.ExitCode.CHECK_PRUNE
+
+    def test_check_prune_ok(self, mock_cfg: Any) -> None:
+        """Test check prune succeeds when no pruning needed."""
+        mock_cfg.PRUNE_KEEP_HOURLY = 24
+        mock_cfg.PRUNE_KEEP_DAILY = 7
+        mock_cfg.PRUNE_KEEP_WEEKLY = 4
+        mock_cfg.PRUNE_KEEP_MONTHLY = 12
+        mock_cfg.PRUNE_KEEP_YEARLY = 2
+
+        def list_backups_side_effect(
+            partial: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {}
+            return {"20250101_000000": ["foobar::home-set1-20250101_000000"]}
+
+        with patch.object(
+            ba,
+            "list_backups",
+            autospec=True,
+            side_effect=list_backups_side_effect,
+        ):
+            ba.do_check_prune()  # Should not raise
+
     def test_warning_exit_triggers_notification(self, mock_cfg: Any) -> None:
         """Verify osascript_notify is called when exiting via WARNING."""
         original_warning = getattr(ba, "_warning_occurred")
