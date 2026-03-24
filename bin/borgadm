@@ -2014,13 +2014,20 @@ def args_parser() -> argparse.ArgumentParser:
         # self-test doesn't need config or notification args
         if name == "self-test":
             continue
-        add_common_args(subparser)
-        # Also add common args to nested subparsers so that
-        # e.g. "borgadm check age --verbose" works.
-        for action in subparser._actions:
-            if isinstance(action, argparse._SubParsersAction):
-                for nested in action.choices.values():
-                    add_common_args(nested)
+        has_actions = any(
+            isinstance(a, argparse._SubParsersAction)
+            for a in subparser._actions
+        )
+        if has_actions:
+            # Only add to action-level parsers so that e.g.
+            # "borgadm check age --verbose" works but
+            # "borgadm check --verbose age" does not.
+            for action in subparser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for nested in action.choices.values():
+                        add_common_args(nested)
+        else:
+            add_common_args(subparser)
 
     return parser
 

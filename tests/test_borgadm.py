@@ -134,6 +134,94 @@ class TestArgumentParser:
         assert args.verbose is True
         assert args.coverage is True
 
+    def test_common_args_rejected_before_action(self) -> None:
+        """Common args between subcommand and action should fail."""
+        parser = ba.args_parser()
+        cases = [
+            ["check", "--verbose", "age"],
+            ["check", "--config", "/tmp/c", "age"],
+            ["check", "--enable-notifications", "age"],
+            ["automate", "--verbose", "enable"],
+            ["repair", "--verbose", "delete-cache"],
+        ]
+        for argv in cases:
+            with pytest.raises(SystemExit) as exc_info:
+                parser.parse_args(argv)
+            assert exc_info.value.code == 2, (
+                f"Expected parse error for {argv!r}"
+            )
+
+    def test_common_args_accepted_after_action(self) -> None:
+        """Common args are accepted after the action name."""
+        parser = ba.args_parser()
+        cases: list[tuple[list[str], str, object]] = [
+            (["check", "age", "--verbose"], "verbose", True),
+            (
+                ["check", "age", "--enable-notifications"],
+                "enable_notifications",
+                True,
+            ),
+            (
+                ["check", "age", "--config", "/tmp/c"],
+                "config",
+                "/tmp/c",
+            ),
+            (
+                ["automate", "enable", "--verbose"],
+                "verbose",
+                True,
+            ),
+            (
+                ["repair", "delete-cache", "--verbose"],
+                "verbose",
+                True,
+            ),
+        ]
+        for argv, attr, expected in cases:
+            args = parser.parse_args(argv)
+            assert getattr(args, attr) == expected, (
+                f"Failed for {argv!r}: expected {attr}={expected!r}"
+            )
+
+    def test_common_args_on_subcommands_without_actions(
+        self,
+    ) -> None:
+        """Subcommands without actions accept common args."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["break-lock", "--verbose"])
+        assert args.verbose is True
+        args = parser.parse_args(["create", "--enable-notifications"])
+        assert args.enable_notifications is True
+        args = parser.parse_args(["list", "--config", "/tmp/c"])
+        assert args.config == "/tmp/c"
+
+    def test_help_shows_common_args_at_correct_level(
+        self,
+    ) -> None:
+        """Common args shown in help only where accepted."""
+        parser = ba.args_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                check_parser = action.choices["check"]
+                check_help = check_parser.format_help()
+                assert "--verbose" not in check_help, (
+                    "check help should not show --verbose"
+                )
+                assert "--config" not in check_help, (
+                    "check help should not show --config"
+                )
+                for sub in check_parser._actions:
+                    if isinstance(sub, argparse._SubParsersAction):
+                        age_parser = sub.choices["age"]
+                        age_help = age_parser.format_help()
+                        assert "--verbose" in age_help, (
+                            "check age help should show --verbose"
+                        )
+                        assert "--config" in age_help, (
+                            "check age help should show --config"
+                        )
+                break
+
 
 class TestRepair:
     """Test repair subcommand."""
