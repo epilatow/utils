@@ -626,6 +626,39 @@ class TestTimestampPruning:
         )
         assert ts_keep == ts_keep_verify, f"Incorrect ts_keep: {ts_keep}"
 
+    def test_zero_keep_retains_nothing(self, mock_cfg: Any) -> None:
+        """Test that keep=0 for an interval keeps nothing for it."""
+        mock_cfg.PRUNE_KEEP_HOURLY = 1
+        mock_cfg.PRUNE_KEEP_DAILY = 0
+        mock_cfg.PRUNE_KEEP_WEEKLY = 0
+        mock_cfg.PRUNE_KEEP_MONTHLY = 0
+        mock_cfg.PRUNE_KEEP_YEARLY = 0
+
+        # Two hourly timestamps — only 1 hourly kept, nothing
+        # from other intervals since they're all 0
+        ts_all = {"20250101_010000", "20250101_020000"}
+        ts_keep = ba.ts_to_keep(ts_all)
+        assert len(ts_keep) == 1
+        assert "20250101_020000" in ts_keep
+
+    def test_all_zero_keep_is_config_error(self) -> None:
+        """Test that all keep=0 is rejected as a config error."""
+        config_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
+        config_file.write(
+            'BORG_REPO = "foobar"\n'
+            'BACKUP_SETS = { "set1": {"paths": ["foo"]} }\n'
+            "PRUNE_KEEP_HOURLY = 0\n"
+            "PRUNE_KEEP_DAILY = 0\n"
+            "PRUNE_KEEP_WEEKLY = 0\n"
+            "PRUNE_KEEP_MONTHLY = 0\n"
+            "PRUNE_KEEP_YEARLY = 0\n"
+        )
+        config_file.flush()
+
+        with pytest.raises(SystemExit) as exc_info:
+            ba.Config(config_file.name, {})
+        assert exc_info.value.code == ba.ExitCode.CONFIG
+
 
 class TestBrokenPipeHandling:
     """Test that broken pipes are handled gracefully."""

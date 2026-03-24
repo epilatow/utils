@@ -312,6 +312,19 @@ class Config:
         if not self.BACKUP_SETS:
             logger.error(f"BACKUP_SETS not defined in config: {path}")
             error = True
+        if not any(
+            [
+                self.PRUNE_KEEP_HOURLY,
+                self.PRUNE_KEEP_DAILY,
+                self.PRUNE_KEEP_WEEKLY,
+                self.PRUNE_KEEP_MONTHLY,
+                self.PRUNE_KEEP_YEARLY,
+            ]
+        ):
+            logger.error(
+                "All PRUNE_KEEP intervals are 0; this would delete all backups"
+            )
+            error = True
         if error:
             sys.exit(ExitCode.CONFIG)
 
@@ -823,8 +836,9 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
         ):
             ts_keep_new[ts_latest] = str(interval) + "-next"
 
-        for k in list(ts_keep_new.keys())[-interval.keep() :]:
-            ts_keep[k] = ts_keep_new[k]
+        if interval.keep() > 0:
+            for k in list(ts_keep_new.keys())[-interval.keep() :]:
+                ts_keep[k] = ts_keep_new[k]
 
     keep_by_interval(Interval.HOUR)
     keep_by_interval(Interval.DAY)
