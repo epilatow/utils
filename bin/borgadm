@@ -1001,6 +1001,33 @@ def do_automate(action: str) -> None:
     }
     cmd: list[str] = []
 
+    if action == "log-files":
+        log_paths: list[str] = []
+        for task, path in task2path.items():
+            if not path.exists():
+                continue
+            tree = ElementTree.parse(path)
+            dict_elem = tree.find("dict")
+            if dict_elem is None:
+                continue
+            children = list(dict_elem)
+            for i, elem in enumerate(children):
+                if (
+                    elem.tag == "key"
+                    and elem.text in ("StandardOutPath", "StandardErrorPath")
+                    and i + 1 < len(children)
+                    and children[i + 1].tag == "string"
+                ):
+                    val = children[i + 1].text
+                    if val and val not in log_paths:
+                        log_paths.append(val)
+        if not log_paths:
+            logger.info("No automation log files found")
+        else:
+            for lp in log_paths:
+                logger.info(lp)
+        return
+
     if action == "status":
         launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
         enabled_count = 0
@@ -1813,6 +1840,11 @@ def args_parser() -> argparse.ArgumentParser:
     automate_subparsers.add_parser(
         "status",
         help="Show automation status and launchd file paths",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    automate_subparsers.add_parser(
+        "log-files",
+        help="Show log file paths for enabled automations",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

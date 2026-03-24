@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 import pytest  # type: ignore[import-not-found]
 from conftest import CodeQualityBase
@@ -968,6 +969,99 @@ class TestAutomate:
         ):
             ba.do_automate(action="enable")
         assert exc_info.value.code == ba.ExitCode.ERROR
+
+    @staticmethod
+    def _write_plist(
+        path: Path, log_path: str, stderr_path: str | None = None
+    ) -> None:
+        """Write a minimal plist file with log path entries."""
+        plist = ElementTree.Element("plist", version="1.0")
+        d = ElementTree.SubElement(plist, "dict")
+        ElementTree.SubElement(d, "key").text = "Label"
+        ElementTree.SubElement(d, "string").text = "test"
+        ElementTree.SubElement(d, "key").text = "StandardOutPath"
+        ElementTree.SubElement(d, "string").text = log_path
+        ElementTree.SubElement(d, "key").text = "StandardErrorPath"
+        ElementTree.SubElement(d, "string").text = (
+            stderr_path if stderr_path else log_path
+        )
+        tree = ElementTree.ElementTree(plist)
+        tree.write(path, xml_declaration=True, encoding="UTF-8")
+
+    def test_log_files_shows_paths_from_plists(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that log-files shows paths from existing plists."""
+        task_dir, _mock_run, _ = automate_env
+        for name in self.CURRENT_TASKS:
+            plist_path = task_dir / f"local.borgadm.{name}.plist"
+            log = f"/tmp/logs/{name}.log"
+            self._write_plist(plist_path, log)
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate(action="log-files")
+
+        for name in self.CURRENT_TASKS:
+            assert any(
+                f"/tmp/logs/{name}.log" in r.message for r in caplog.records
+            )
+
+    def test_log_files_deduplicates_stdout_stderr(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that identical stdout/stderr paths appear only once."""
+        task_dir, _mock_run, _ = automate_env
+        plist_path = task_dir / "local.borgadm.create.plist"
+        self._write_plist(plist_path, "/tmp/logs/create.log")
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate(action="log-files")
+
+        matches = [
+            r for r in caplog.records if "/tmp/logs/create.log" in r.message
+        ]
+        assert len(matches) == 1
+
+    def test_log_files_shows_distinct_stderr(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that distinct stderr path is also shown."""
+        task_dir, _mock_run, _ = automate_env
+        plist_path = task_dir / "local.borgadm.create.plist"
+        self._write_plist(plist_path, "/tmp/logs/out.log", "/tmp/logs/err.log")
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate(action="log-files")
+
+        messages = [r.message for r in caplog.records]
+        assert any("/tmp/logs/out.log" in m for m in messages)
+        assert any("/tmp/logs/err.log" in m for m in messages)
+
+    def test_log_files_no_plists(self, automate_env: Any, caplog: Any) -> None:
+        """Test message when no plist files exist."""
+        _task_dir, _mock_run, _ = automate_env
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate(action="log-files")
+
+        assert any(
+            "No automation log files found" in r.message for r in caplog.records
+        )
+
+    def test_log_files_reads_legacy_plists(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that log-files reads legacy plist files too."""
+        task_dir, _mock_run, _ = automate_env
+        plist_path = task_dir / "local.borgadm.check_age.plist"
+        self._write_plist(plist_path, "/tmp/logs/check_age.log")
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate(action="log-files")
+
+        assert any(
+            "/tmp/logs/check_age.log" in r.message for r in caplog.records
+        )
 
 
 class TestCheck:
