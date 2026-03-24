@@ -1300,6 +1300,167 @@ class TestCheck:
             setattr(ba, "_enable_notifications", original_notifications)
 
 
+class TestTimestampMessages:
+    """Test --timestamp-messages flag."""
+
+    def test_timestamp_messages_adds_timestamps(self, tmp_path: Path) -> None:
+        """Test that timestamp_messages adds asctime to formatters."""
+        root = logging.getLogger()
+        old_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            logfile = tmp_path / "test.log"
+            ba.initialize_logger(str(logfile), timestamp_messages=True)
+            for h in root.handlers:
+                if not isinstance(h, logging.StreamHandler):
+                    continue
+                if getattr(h, "stream", None) is sys.stdout:
+                    assert h.formatter is not None
+                    fmt = h.formatter._fmt or ""
+                    assert "asctime" in fmt
+                elif getattr(h, "stream", None) is sys.stderr:
+                    assert h.formatter is not None
+                    fmt = h.formatter._fmt or ""
+                    assert "asctime" in fmt
+        finally:
+            root.handlers = old_handlers
+
+    def test_default_no_timestamps_on_stdout(self, tmp_path: Path) -> None:
+        """Test that stdout has no timestamps by default."""
+        root = logging.getLogger()
+        old_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            logfile = tmp_path / "test.log"
+            ba.initialize_logger(str(logfile))
+            for h in root.handlers:
+                if not isinstance(h, logging.StreamHandler):
+                    continue
+                if getattr(h, "stream", None) is sys.stdout:
+                    assert h.formatter is not None
+                    fmt = h.formatter._fmt or ""
+                    assert "asctime" not in fmt
+        finally:
+            root.handlers = old_handlers
+
+
+class TestStartEndMarkers:
+    """Test start/end timing markers for repo-operating commands."""
+
+    def test_timed_command_emits_start_and_end(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """Test that repo-operating commands emit start/end."""
+        with (
+            patch("sys.argv", ["borgadm", "break-lock"]),
+            patch.object(ba, "initialize_logger", autospec=True),
+            patch.object(ba, "initialize_borg_environment", autospec=True),
+            patch.object(ba, "do_break_lock", autospec=True),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.main()
+
+        assert any(
+            "borgadm break-lock: started" in r.message for r in caplog.records
+        )
+        assert any(
+            "borgadm break-lock: finished (elapsed:" in r.message
+            for r in caplog.records
+        )
+
+    def test_quick_command_no_timing(self, mock_cfg: Any, caplog: Any) -> None:
+        """Test that quick commands don't emit start/end."""
+        with (
+            patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(ba, "initialize_logger", autospec=True),
+            patch.object(ba, "initialize_borg_environment", autospec=True),
+            patch.object(ba, "do_environment", autospec=True),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.main()
+
+        assert not any("started" in r.message for r in caplog.records)
+        assert not any("finished" in r.message for r in caplog.records)
+
+    def test_timed_command_includes_action(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """Test that action name is included in timing message."""
+        with (
+            patch("sys.argv", ["borgadm", "check", "age"]),
+            patch.object(ba, "initialize_logger", autospec=True),
+            patch.object(ba, "initialize_borg_environment", autospec=True),
+            patch.object(ba, "do_check", autospec=True),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.main()
+
+        assert any(
+            "borgadm check age: started" in r.message for r in caplog.records
+        )
+        assert any(
+            "borgadm check age: finished (elapsed:" in r.message
+            for r in caplog.records
+        )
+
+    def test_timed_command_emits_end_on_error(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """Test that finished is emitted even on exception."""
+        with (
+            patch("sys.argv", ["borgadm", "compact"]),
+            patch.object(ba, "initialize_logger", autospec=True),
+            patch.object(ba, "initialize_borg_environment", autospec=True),
+            patch.object(
+                ba,
+                "do_compact",
+                autospec=True,
+                side_effect=subprocess.CalledProcessError(
+                    1, ["borg", "compact"]
+                ),
+            ),
+            patch.object(ba, "osascript_notify", autospec=True),
+            caplog.at_level(logging.INFO),
+            pytest.raises(SystemExit),
+        ):
+            ba.main()
+
+        assert any(
+            "borgadm compact: finished (elapsed:" in r.message
+            for r in caplog.records
+        )
+
+
+class TestAutomateTimestampFlag:
+    """Test that automation plists include --timestamp-messages."""
+
+    def test_enable_includes_timestamp_messages(
+        self, tmp_path: Path, mock_cfg: Any
+    ) -> None:
+        """Test that plist args include --timestamp-messages."""
+        task_dir = tmp_path / "Library" / "LaunchAgents"
+        task_dir.mkdir(parents=True)
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "create_plist_element", autospec=True) as mock_cpe,
+            patch.object(ba, "create_plist_file", autospec=True),
+            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            ba.do_automate(action="enable")
+
+        for call in mock_cpe.call_args_list:
+            task_args: list[str] = call.args[1]
+            args_str = " ".join(task_args)
+            assert "--timestamp-messages" in args_str, (
+                f"--timestamp-messages missing from: {task_args}"
+            )
+
+
 class TestTimestampPruning:
     """Test timestamp pruning logic."""
 
