@@ -1,12 +1,16 @@
 """Pytest configuration - runs before test collection."""
 # This is AI generated code
 
+from __future__ import annotations
+
 import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import ClassVar
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -44,6 +48,113 @@ def pytest_sessionfinish(
 ) -> None:
     """Clean up pycache directories after test session."""
     _cleanup_all_caches()
+
+
+class CodeQualityBase:
+    """Base class for code quality tests.
+
+    Subclasses must define SCRIPT_PATH and TEST_PATH. Optionally
+    override FLAKE8_EXTRA_ARGS for project-specific flake8 flags.
+    """
+
+    SCRIPT_PATH: ClassVar[Path]
+    TEST_PATH: ClassVar[Path]
+    FLAKE8_EXTRA_ARGS: ClassVar[list[str]] = []
+
+    def test_black_compliance(self) -> None:
+        """Test that code is formatted with black."""
+        result = subprocess.run(
+            ["uvx", "black", "-l80", "--check", str(self.SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"black check failed:\n{result.stderr}"
+        )
+
+    def test_black_compliance_tests(self) -> None:
+        """Test that tests are formatted with black."""
+        result = subprocess.run(
+            ["uvx", "black", "-l80", "--check", str(self.TEST_PATH)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"black check failed:\n{result.stderr}"
+        )
+
+    def test_flake8_compliance(self) -> None:
+        """Test that code passes flake8."""
+        cmd = [
+            "uvx",
+            "flake8",
+            "--max-line-length=80",
+            *self.FLAKE8_EXTRA_ARGS,
+            str(self.SCRIPT_PATH),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True
+        )
+        assert result.returncode == 0, (
+            f"flake8 check failed:\n{result.stdout}"
+        )
+
+    def test_flake8_compliance_tests(self) -> None:
+        """Test that tests pass flake8."""
+        cmd = [
+            "uvx",
+            "flake8",
+            "--max-line-length=80",
+            *self.FLAKE8_EXTRA_ARGS,
+            str(self.TEST_PATH),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True
+        )
+        assert result.returncode == 0, (
+            f"flake8 check failed:\n{result.stdout}"
+        )
+
+    def test_mypy_compliance(self, tmp_path: Path) -> None:
+        """Test that code passes mypy."""
+        cache_dir = tmp_path / "mypy_cache"
+        result = subprocess.run(
+            [
+                "uvx",
+                "mypy",
+                "--cache-dir",
+                str(cache_dir),
+                str(self.SCRIPT_PATH),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"mypy check failed:\n{result.stdout}"
+        )
+
+    def test_mypy_compliance_tests(self, tmp_path: Path) -> None:
+        """Test that tests pass mypy."""
+        cache_dir = tmp_path / "mypy_cache"
+        env = os.environ.copy()
+        env["MYPYPATH"] = str(_REPO_ROOT / "bin")
+        result = subprocess.run(
+            [
+                "uvx",
+                "--with",
+                "pytest",
+                "mypy",
+                "--cache-dir",
+                str(cache_dir),
+                str(self.TEST_PATH),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"mypy check failed:\n{result.stdout}"
+        )
 
 
 def run_tests(

@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
-import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest  # type: ignore[import-not-found]
+from conftest import CodeQualityBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -276,102 +276,12 @@ class TestMain:
 # =============================================================
 
 
-class TestCodeQuality:
+class TestCodeQuality(CodeQualityBase):
     """Code quality checks for run_all.py."""
 
-    def test_black_compliance(self) -> None:
-        """Test that run_all.py is formatted with black."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "black",
-                "-l80",
-                "--check",
-                str(_script_path),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"black check failed:\n{result.stderr}"
-
-    def test_black_compliance_tests(self) -> None:
-        """Test that tests are formatted with black."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "black",
-                "-l80",
-                "--check",
-                str(REPO_ROOT / "tests" / "test_run_all.py"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"black check failed:\n{result.stderr}"
-
-    def test_flake8_compliance(self) -> None:
-        """Test that run_all.py passes flake8."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "flake8",
-                "--max-line-length=80",
-                "--extend-ignore=E203,W503",
-                str(_script_path),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"flake8 check failed:\n{result.stdout}"
-
-    def test_flake8_compliance_tests(self) -> None:
-        """Test that tests pass flake8."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "flake8",
-                "--max-line-length=80",
-                "--extend-ignore=E203,W503",
-                str(REPO_ROOT / "tests" / "test_run_all.py"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"flake8 check failed:\n{result.stdout}"
-
-    def test_mypy_compliance(self, tmp_path: Path) -> None:
-        """Test that run_all.py passes mypy."""
-        cache_dir = tmp_path / "mypy_cache"
-        result = subprocess.run(
-            [
-                "uvx",
-                "mypy",
-                "--cache-dir",
-                str(cache_dir),
-                str(_script_path),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"mypy check failed:\n{result.stdout}"
-
-    def test_mypy_compliance_tests(self, tmp_path: Path) -> None:
-        """Test that tests pass mypy."""
-        cache_dir = tmp_path / "mypy_cache"
-        result = subprocess.run(
-            [
-                "uvx",
-                "--with",
-                "pytest",
-                "mypy",
-                "--cache-dir",
-                str(cache_dir),
-                str(REPO_ROOT / "tests" / "test_run_all.py"),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"mypy check failed:\n{result.stdout}"
+    SCRIPT_PATH = _script_path
+    TEST_PATH = REPO_ROOT / "tests" / "test_run_all.py"
+    FLAKE8_EXTRA_ARGS = ["--extend-ignore=E203,W503"]
 
 
 if __name__ == "__main__":
