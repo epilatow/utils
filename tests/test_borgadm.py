@@ -160,6 +160,440 @@ class TestRepair:
             )
 
 
+class TestDelete:
+    """Test delete subcommand."""
+
+    def test_delete_parses_timestamp(self) -> None:
+        """Test delete subcommand parses a timestamp argument."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["delete", "20250101_120000"])
+        assert args.command == "delete"
+        assert args.archive == "20250101_120000"
+        assert args.latest is False
+
+    def test_delete_parses_latest(self) -> None:
+        """Test delete subcommand parses --latest flag."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["delete", "--latest"])
+        assert args.command == "delete"
+        assert args.archive is None
+        assert args.latest is True
+
+    def test_delete_parses_archive_name(self) -> None:
+        """Test delete subcommand parses a full archive name."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["delete", "home-local-20250101_120000"])
+        assert args.command == "delete"
+        assert args.archive == "home-local-20250101_120000"
+
+    def test_delete_latest_and_archive_errors(self) -> None:
+        """Test that --latest with an archive is a parser error."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["delete", "--latest", "20250101_120000"])
+        with pytest.raises(SystemExit) as exc_info:
+            args.validate(args)
+        assert exc_info.value.code == 2
+
+    def test_delete_no_args_errors(self) -> None:
+        """Test that no archive and no --latest is a parser error."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["delete"])
+        with pytest.raises(SystemExit) as exc_info:
+            args.validate(args)
+        assert exc_info.value.code == 2
+
+    def test_delete_latest(self, mock_cfg: Any) -> None:
+        """Test deleting the latest full backup."""
+        repo = mock_cfg.BORG_REPO
+        backups = {
+            "20250101_120000": [
+                f"{repo}::home-set1-20250101_120000",
+            ]
+        }
+
+        def list_backups_side_effect(
+            latest: bool = False,
+            partial: bool = False,
+        ) -> dict[str, list[str]]:
+            return backups
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive=None,
+                dry_run=False,
+                latest=True,
+                progress=False,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=False,
+            )
+
+    def test_delete_latest_no_backups(self, mock_cfg: Any) -> None:
+        """Test --latest with no backups exits with error."""
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                return_value={},
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_delete(
+                archive=None,
+                dry_run=False,
+                latest=True,
+                progress=False,
+            )
+        assert exc_info.value.code == ba.ExitCode.ERROR
+
+    def test_delete_by_timestamp(self, mock_cfg: Any) -> None:
+        """Test deleting all archives at a timestamp."""
+        repo = mock_cfg.BORG_REPO
+
+        def list_backups_side_effect(
+            partial: bool = False,
+            latest: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {}
+            return {
+                "20250101_120000": [
+                    f"{repo}::home-set1-20250101_120000",
+                ]
+            }
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive="20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=False,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=False,
+            )
+
+    def test_delete_by_timestamp_not_found(self, mock_cfg: Any) -> None:
+        """Test deleting a nonexistent timestamp exits with error."""
+
+        def list_backups_side_effect(
+            partial: bool = False,
+            latest: bool = False,
+        ) -> dict[str, list[str]]:
+            return {}
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_delete(
+                archive="20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=False,
+            )
+        assert exc_info.value.code == ba.ExitCode.ERROR
+
+    def test_delete_by_archive_name(self, mock_cfg: Any) -> None:
+        """Test deleting a single archive by full name."""
+        repo = mock_cfg.BORG_REPO
+        raw_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="home-set1-20250101_120000\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                return_value=raw_result,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive="home-set1-20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=False,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=False,
+            )
+
+    def test_delete_by_archive_name_not_found(self, mock_cfg: Any) -> None:
+        """Test deleting a nonexistent archive name exits with error."""
+        raw_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="other-archive-20250101_120000\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                return_value=raw_result,
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_delete(
+                archive="home-set1-20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=False,
+            )
+        assert exc_info.value.code == ba.ExitCode.ERROR
+
+    def test_delete_dry_run(self, mock_cfg: Any) -> None:
+        """Test that --dry-run passes --dry-run to borg."""
+        repo = mock_cfg.BORG_REPO
+        raw_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="home-set1-20250101_120000\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                return_value=raw_result,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive="home-set1-20250101_120000",
+                dry_run=True,
+                latest=False,
+                progress=False,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--dry-run",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=True,
+            )
+
+    def test_delete_progress(self, mock_cfg: Any) -> None:
+        """Test that --progress passes --progress to borg."""
+        repo = mock_cfg.BORG_REPO
+        raw_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="home-set1-20250101_120000\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                return_value=raw_result,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive="home-set1-20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=True,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--progress",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=True,
+            )
+
+    def test_delete_timestamp_includes_partial(self, mock_cfg: Any) -> None:
+        """Test timestamp deletion includes partial archives."""
+        repo = mock_cfg.BORG_REPO
+
+        def list_backups_side_effect(
+            partial: bool = False,
+            latest: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {
+                    "20250101_120000": [
+                        f"{repo}::home-set1-20250101_120000",
+                    ]
+                }
+            return {}
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive="20250101_120000",
+                dry_run=False,
+                latest=False,
+                progress=False,
+            )
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=False,
+            )
+
+    def test_delete_latest_excludes_partial(self, mock_cfg: Any) -> None:
+        """Test --latest only deletes full backups, not partials."""
+        repo = mock_cfg.BORG_REPO
+
+        def list_backups_side_effect(
+            partial: bool = False,
+            latest: bool = False,
+        ) -> dict[str, list[str]]:
+            if partial:
+                # Partial archive exists at the same timestamp
+                return {
+                    "20250101_120000": [
+                        f"{repo}::home-set2-20250101_120000",
+                    ]
+                }
+            return {
+                "20250101_120000": [
+                    f"{repo}::home-set1-20250101_120000",
+                ]
+            }
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_delete(
+                archive=None,
+                dry_run=False,
+                latest=True,
+                progress=False,
+            )
+            # Should only delete the full backup, not the partial
+            mock_run.assert_called_once_with(
+                [
+                    "borg",
+                    "delete",
+                    "--stats",
+                    repo,
+                    "home-set1-20250101_120000",
+                ],
+                allow_output=False,
+            )
+
+
 class TestAutomate:
     """Test automate subcommand."""
 

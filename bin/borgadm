@@ -1308,6 +1308,65 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         do_prune(dry_run=dry_run, progress=progress)
 
 
+def do_delete(
+    archive: Optional[str],
+    dry_run: bool,
+    latest: bool,
+    progress: bool,
+) -> None:
+    cfg = get_cfg()
+
+    assert not (latest and archive), "latest and archive are mutually exclusive"
+    assert latest or archive, "one of latest or archive is required"
+
+    include_partial = True
+    if latest:
+        backups = list_backups(latest=True)
+        if not backups:
+            logger.error("No full backups found.")
+            sys.exit(ExitCode.ERROR)
+        archive = list(backups.keys())[0]
+        include_partial = False
+
+    assert archive is not None
+    archives_to_delete: list[str] = []
+    ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+
+    if ts_pattern.match(archive):
+        all_backups = list_backups()
+        if include_partial:
+            all_backups |= list_backups(partial=True)
+        if archive not in all_backups:
+            logger.error(f"No archives found for timestamp: {archive}")
+            sys.exit(ExitCode.ERROR)
+        archives_to_delete = [
+            a.removeprefix(f"{cfg.BORG_REPO}::") for a in all_backups[archive]
+        ]
+        logger.info(
+            f"Deleting {len(archives_to_delete)} archive(s)"
+            f" at timestamp: {archive}"
+        )
+    else:
+        # Full archive name: verify it exists.
+        result = list_backups_raw()
+        raw_names = result.stdout.strip().splitlines()
+        if archive not in raw_names:
+            logger.error(f"Archive not found: {archive}")
+            sys.exit(ExitCode.ERROR)
+        archives_to_delete = [archive]
+        logger.info(f"Deleting archive: {archive}")
+
+    cmd = borg_cmd() + ["delete"]
+    cmd += ["--progress"] if progress else []
+    if dry_run:
+        cmd.append("--dry-run")
+    else:
+        cmd.append("--stats")
+    cmd.append(cfg.BORG_REPO)
+    cmd += archives_to_delete
+    run_cmd(cmd, allow_output=progress or dry_run)
+
+
 def do_extract(
     target_dir: Path,
     patterns: list[str],
@@ -1787,6 +1846,38 @@ def args_parser() -> argparse.ArgumentParser:
     compact = add_parser("compact", help="Check full backup metadata")
     add_progress(compact)
 
+    delete_cmd = add_parser(
+        "delete", help="Delete archives by timestamp or name"
+    )
+    delete_cmd.add_argument(
+        "archive",
+        nargs="?",
+        help=(
+            "Timestamp (YYYYMMDD_HHMMSS) to delete all archives "
+            "at that time, or a full archive name to delete a "
+            "single archive"
+        ),
+    )
+    delete_cmd.add_argument(
+        "--latest",
+        action="store_true",
+        help="Delete the latest full backup",
+    )
+    add_dry_run(delete_cmd)
+    add_progress(delete_cmd)
+
+    def validate_delete_args(
+        p: argparse.ArgumentParser, args: argparse.Namespace
+    ) -> None:
+        if args.latest and args.archive:
+            p.error("Cannot specify both --latest and an archive.")
+        if not args.latest and not args.archive:
+            p.error("Must specify an archive or --latest.")
+
+    delete_cmd.set_defaults(
+        validate=lambda args: validate_delete_args(delete_cmd, args)
+    )
+
     create = add_parser("create", help="Create full backup")
     create.add_argument(
         "--no-prune", action="store_true", help="Skip backup pruning"
@@ -1929,7 +2020,11 @@ def rewrite_legacy_args(argv: list[str]) -> list[str]:
 def main() -> None:
     sys.argv = rewrite_legacy_args(sys.argv)
     args = args_parser().parse_args()
+    validate = getattr(args, "validate", None)
+    if validate:
+        validate(args)
     args_dict = vars(args).copy()
+    args_dict.pop("validate", None)
     command = args_dict.pop("command")
 
     # Handle self-test early - it doesn't need config or borg environment
@@ -1967,6 +2062,7 @@ def main() -> None:
         "check": do_check,
         "compact": do_compact,
         "create": do_create,
+        "delete": do_delete,
         "environment": do_environment,
         "extract": do_extract,
         "list": do_list,
