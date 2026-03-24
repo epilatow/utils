@@ -1672,7 +1672,7 @@ def do_rsync(
                 run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
 
 
-def do_repair(action: str) -> None:
+def do_repair(action: str, **kwargs: Any) -> None:
     cfg = get_cfg()
 
     if action == "delete-cache":
@@ -1686,6 +1686,19 @@ def do_repair(action: str) -> None:
             ]
         )
         logger.info("Cache deleted successfully.")
+
+    elif action == "repo":
+        progress: bool = kwargs.get("progress", False)
+        logger.info(f"Repairing repo metadata: {cfg.BORG_REPO}")
+        args = [
+            "check",
+            "--repair",
+            "--repository-only",
+            *(["--progress"] if progress else []),
+            cfg.BORG_REPO,
+        ]
+        run_cmd(borg_cmd() + args, allow_output=True)
+        logger.info("Repo repair completed.")
 
 
 def do_environment() -> None:
@@ -1938,6 +1951,15 @@ def args_parser() -> argparse.ArgumentParser:
         help="Delete the local borg cache for the repository",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    repair_repo = repair_subparsers.add_parser(
+        "repo",
+        help=(
+            "Repair repository metadata "
+            "(runs borg check --repair --repository-only)"
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_progress(repair_repo)
 
     prune = add_parser("prune", help="Prune partial and old backups")
     add_dry_run(prune)

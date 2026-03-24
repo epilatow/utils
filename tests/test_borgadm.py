@@ -159,6 +159,53 @@ class TestRepair:
                 ]
             )
 
+    def test_repair_repo(self, mock_cfg: Any) -> None:
+        """Test that repair repo calls borg check --repair."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+        ):
+            ba.do_repair(action="repo")
+            mock_run_cmd.assert_called_once_with(
+                [
+                    "borg",
+                    "check",
+                    "--repair",
+                    "--repository-only",
+                    mock_cfg.BORG_REPO,
+                ],
+                allow_output=True,
+            )
+
+    def test_repair_repo_progress(self, mock_cfg: Any) -> None:
+        """Test that repair repo passes --progress to borg."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+        ):
+            ba.do_repair(action="repo", progress=True)
+            mock_run_cmd.assert_called_once_with(
+                [
+                    "borg",
+                    "check",
+                    "--repair",
+                    "--repository-only",
+                    "--progress",
+                    mock_cfg.BORG_REPO,
+                ],
+                allow_output=True,
+            )
+
 
 class TestDelete:
     """Test delete subcommand."""
