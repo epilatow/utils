@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import collections
 import importlib.machinery
+import io
 import importlib.util
 import logging
 import os
@@ -1046,7 +1047,8 @@ class TestAutomate:
         """Daily task uses ';' not '&&' so all checks run."""
         _task_dir, _mock_run, _mock_create_file = automate_env
         tasks, _ = ba._automate_tasks()
-        shell_cmd = tasks["check-daily"]["args"][2]
+        daily_args = tasks["check-daily"]["args"]
+        shell_cmd = daily_args[2]
         assert "&&" not in shell_cmd, "Daily checks should use ';' not '&&'"
         assert "; " in shell_cmd
         assert "check age" in shell_cmd
@@ -1058,7 +1060,8 @@ class TestAutomate:
         """Weekly task runs only repo and archives checks."""
         _task_dir, _mock_run, _mock_create_file = automate_env
         tasks, _ = ba._automate_tasks()
-        shell_cmd = tasks["check-weekly"]["args"][2]
+        weekly_args = tasks["check-weekly"]["args"]
+        shell_cmd = weekly_args[2]
         assert "check repo" in shell_cmd
         assert "check archives" in shell_cmd
         assert "check age" not in shell_cmd
@@ -1363,6 +1366,7 @@ class TestCheck:
         """Verify osascript_notify is called when exiting via WARNING."""
         original_warning = getattr(ba, "_warning_occurred")
         original_notifications = getattr(ba, "_enable_notifications")
+        original_title = getattr(ba, "_notify_title")
         try:
             setattr(ba, "_warning_occurred", True)
             setattr(ba, "_enable_notifications", True)
@@ -1398,6 +1402,73 @@ class TestCheck:
         finally:
             setattr(ba, "_warning_occurred", original_warning)
             setattr(ba, "_enable_notifications", original_notifications)
+            setattr(ba, "_notify_title", original_title)
+
+
+class TestNotifyTitle:
+    """Test osascript_notify uses _notify_title."""
+
+    def test_notify_title_default(self) -> None:
+        """Default _notify_title is the script basename."""
+        assert getattr(ba, "_notify_title") == ba.BASENAME
+
+    def test_notify_title_used_in_dialog(self) -> None:
+        """osascript_notify uses _notify_title in the dialog title."""
+        original_title = getattr(ba, "_notify_title")
+        original_notifications = getattr(ba, "_enable_notifications")
+        original_buffer = getattr(ba, "_logger_buffer", None)
+        try:
+            setattr(ba, "_notify_title", "borgadm check repo")
+            setattr(ba, "_enable_notifications", True)
+            setattr(ba, "_logger_buffer", io.StringIO("test error"))
+            with (
+                patch.object(ba, "has_tty", return_value=False),
+                patch.object(
+                    ba.shutil, "which", return_value="/usr/bin/osascript"
+                ),
+                patch.object(
+                    ba.subprocess, "Popen", autospec=True
+                ) as mock_popen,
+            ):
+                ba.osascript_notify()
+            script_arg: str = mock_popen.call_args[0][0][2]
+            assert '"borgadm check repo error"' in script_arg
+        finally:
+            setattr(ba, "_notify_title", original_title)
+            setattr(ba, "_enable_notifications", original_notifications)
+            if original_buffer is not None:
+                setattr(ba, "_logger_buffer", original_buffer)
+
+    def test_main_sets_notify_title(self, mock_cfg: Any) -> None:
+        """main() sets _notify_title to 'borgadm <command>'."""
+        original_title = getattr(ba, "_notify_title")
+        try:
+            with (
+                patch(
+                    "sys.argv",
+                    ["borgadm", "check", "repo"],
+                ),
+                patch.object(
+                    ba,
+                    "Config",
+                    return_value=mock_cfg,
+                ),
+                patch.object(
+                    ba,
+                    "initialize_logger",
+                    autospec=True,
+                ),
+                patch.object(
+                    ba,
+                    "initialize_borg_environment",
+                    autospec=True,
+                ),
+                patch.object(ba, "do_check", autospec=True),
+            ):
+                ba.main()
+            assert getattr(ba, "_notify_title") == "borgadm check repo"
+        finally:
+            setattr(ba, "_notify_title", original_title)
 
 
 class TestTimestampMessages:

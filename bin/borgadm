@@ -84,6 +84,7 @@ class ExitCode(enum.IntEnum):
 
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _enable_notifications: bool = False
+_notify_title: str = BASENAME
 _warning_occurred: bool = False
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
 _logger_buffer: io.StringIO
@@ -387,7 +388,7 @@ def osascript_notify() -> None:
         return
     if not has_tty() and shutil.which("osascript"):
         logs = _logger_buffer.getvalue().strip().replace('"', '\\"')[:10000]
-        script = f'display dialog "{logs}" with title "borg_backup.py error"'
+        script = f'display dialog "{logs}" with title "{_notify_title} error"'
         cmd = ["osascript", "-e", script]
         # No timeout is needed since we don't wait for the commmand to finish.
         subprocess.Popen(
@@ -2227,6 +2228,8 @@ def main() -> None:
     action = args_dict.get("action")
     if action:
         cmd_label += f" {action}"
+    global _notify_title
+    _notify_title = f"borgadm {cmd_label}"
     timed = command not in quick_commands
     if timed:
         logger.info(f"borgadm {cmd_label}: started")
