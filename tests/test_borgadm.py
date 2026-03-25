@@ -1351,6 +1351,11 @@ class TestCheck:
                 ),
                 patch.object(
                     ba,
+                    "Config",
+                    return_value=mock_cfg,
+                ),
+                patch.object(
+                    ba,
                     "initialize_logger",
                     autospec=True,
                 ),
@@ -1423,6 +1428,7 @@ class TestStartEndMarkers:
         """Test that repo-operating commands emit start/end."""
         with (
             patch("sys.argv", ["borgadm", "break-lock"]),
+            patch.object(ba, "Config", return_value=mock_cfg),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.object(ba, "do_break_lock", autospec=True),
@@ -1442,6 +1448,7 @@ class TestStartEndMarkers:
         """Test that quick commands don't emit start/end."""
         with (
             patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(ba, "Config", return_value=mock_cfg),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.object(ba, "do_environment", autospec=True),
@@ -1458,6 +1465,7 @@ class TestStartEndMarkers:
         """Test that action name is included in timing message."""
         with (
             patch("sys.argv", ["borgadm", "check", "age"]),
+            patch.object(ba, "Config", return_value=mock_cfg),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.object(ba, "do_check", autospec=True),
@@ -1479,6 +1487,7 @@ class TestStartEndMarkers:
         """Test that finished is emitted even on exception."""
         with (
             patch("sys.argv", ["borgadm", "compact"]),
+            patch.object(ba, "Config", return_value=mock_cfg),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.object(
