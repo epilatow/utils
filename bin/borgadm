@@ -1724,47 +1724,53 @@ def do_rsync(
 
 
 def do_repair(action: str, **kwargs: Any) -> None:
+    repair_callbacks: dict[str, Callable[..., Any]] = {
+        "delete-cache": do_repair_delete_cache,
+        "repo": do_repair_repo,
+    }
+    repair_callbacks[action](**kwargs)
+
+
+def do_repair_delete_cache() -> None:
     cfg = get_cfg()
-
-    if action == "delete-cache":
-        logger.info(f"Deleting local cache for: {cfg.BORG_REPO}")
-        run_cmd(
-            borg_cmd()
-            + [
-                "delete",
-                "--cache-only",
-                cfg.BORG_REPO,
-            ]
-        )
-        logger.info("Cache deleted successfully.")
-
-    elif action == "repo":
-        progress: bool = kwargs.get("progress", False)
-        yes: bool = kwargs.get("yes", False)
-        if not yes:
-            logger.error(
-                "This is a potentially dangerous function.\n"
-                "check --repair might lead to data loss (for kinds"
-                " of corruption it is not\n"
-                "capable of dealing with). BE VERY CAREFUL!\n"
-                "\n"
-                "Pass --yes to confirm you understand the risks."
-            )
-            sys.exit(ExitCode.ERROR)
-        logger.info(f"Repairing repo metadata: {cfg.BORG_REPO}")
-        args = [
-            "check",
-            "--repair",
-            "--repository-only",
-            *(["--progress"] if progress else []),
+    logger.info(f"Deleting local cache for: {cfg.BORG_REPO}")
+    run_cmd(
+        borg_cmd()
+        + [
+            "delete",
+            "--cache-only",
             cfg.BORG_REPO,
         ]
-        env = {
-            **os.environ,
-            "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
-        }
-        run_cmd(borg_cmd() + args, allow_output=True, env=env)
-        logger.info("Repo repair completed.")
+    )
+    logger.info("Cache deleted successfully.")
+
+
+def do_repair_repo(progress: bool = False, yes: bool = False) -> None:
+    cfg = get_cfg()
+    if not yes:
+        logger.error(
+            "This is a potentially dangerous function.\n"
+            "check --repair might lead to data loss (for kinds"
+            " of corruption it is not\n"
+            "capable of dealing with). BE VERY CAREFUL!\n"
+            "\n"
+            "Pass --yes to confirm you understand the risks."
+        )
+        sys.exit(ExitCode.ERROR)
+    logger.info(f"Repairing repo metadata: {cfg.BORG_REPO}")
+    args = [
+        "check",
+        "--repair",
+        "--repository-only",
+        *(["--progress"] if progress else []),
+        cfg.BORG_REPO,
+    ]
+    env = {
+        **os.environ,
+        "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
+    }
+    run_cmd(borg_cmd() + args, allow_output=True, env=env)
+    logger.info("Repo repair completed.")
 
 
 def do_environment() -> None:

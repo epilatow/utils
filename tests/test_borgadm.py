@@ -254,7 +254,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair(action="delete-cache")
+            ba.do_repair_delete_cache()
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
@@ -276,7 +276,7 @@ class TestRepair:
             ),
             pytest.raises(SystemExit) as exc_info,
         ):
-            ba.do_repair(action="repo")
+            ba.do_repair_repo()
         assert exc_info.value.code == ba.ExitCode.ERROR
         mock_run_cmd.assert_not_called()
 
@@ -291,7 +291,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair(action="repo", yes=True)
+            ba.do_repair_repo(yes=True)
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
@@ -318,7 +318,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair(action="repo", progress=True, yes=True)
+            ba.do_repair_repo(progress=True, yes=True)
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
