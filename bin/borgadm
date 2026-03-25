@@ -1008,7 +1008,7 @@ def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
                 f"{shlex.quote(script_path)} check age"
                 f" --enable-notifications"
                 f" --timestamp-messages"
-                f" && {shlex.quote(script_path)} check prune"
+                f"; {shlex.quote(script_path)} check prune"
                 f" --enable-notifications"
                 f" --timestamp-messages",
             ],
@@ -1016,10 +1016,14 @@ def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
         },
         "check-weekly": {
             "args": [
-                script_path,
-                "check-all",
-                "--enable-notifications",
-                "--timestamp-messages",
+                "/bin/sh",
+                "-c",
+                f"{shlex.quote(script_path)} check repo"
+                f" --enable-notifications"
+                f" --timestamp-messages"
+                f"; {shlex.quote(script_path)} check archives"
+                f" --enable-notifications"
+                f" --timestamp-messages",
             ],
             "interval": (60 * 60 * 24 * 7),
         },

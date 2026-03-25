@@ -1040,6 +1040,31 @@ class TestAutomate:
             ba.do_automate_enable()
         assert exc_info.value.code == ba.ExitCode.ERROR
 
+    def test_daily_task_runs_checks_independently(
+        self, automate_env: Any
+    ) -> None:
+        """Daily task uses ';' not '&&' so all checks run."""
+        _task_dir, _mock_run, _mock_create_file = automate_env
+        tasks, _ = ba._automate_tasks()
+        shell_cmd = tasks["check-daily"]["args"][2]
+        assert "&&" not in shell_cmd, "Daily checks should use ';' not '&&'"
+        assert "; " in shell_cmd
+        assert "check age" in shell_cmd
+        assert "check prune" in shell_cmd
+
+    def test_weekly_task_only_runs_repo_and_archives(
+        self, automate_env: Any
+    ) -> None:
+        """Weekly task runs only repo and archives checks."""
+        _task_dir, _mock_run, _mock_create_file = automate_env
+        tasks, _ = ba._automate_tasks()
+        shell_cmd = tasks["check-weekly"]["args"][2]
+        assert "check repo" in shell_cmd
+        assert "check archives" in shell_cmd
+        assert "check age" not in shell_cmd
+        assert "check prune" not in shell_cmd
+        assert "check-all" not in shell_cmd
+
     @staticmethod
     def _write_plist(
         path: Path, log_path: str, stderr_path: str | None = None
