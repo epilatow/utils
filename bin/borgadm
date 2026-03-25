@@ -1793,11 +1793,10 @@ def do_repair_repo(progress: bool = False, yes: bool = False) -> None:
             "Pass --yes to confirm you understand the risks."
         )
         sys.exit(ExitCode.ERROR)
-    logger.info(f"Repairing repo metadata: {cfg.BORG_REPO}")
+    logger.info(f"Repairing repo: {cfg.BORG_REPO}")
     args = [
         "check",
         "--repair",
-        "--repository-only",
         *(["--progress"] if progress else []),
         cfg.BORG_REPO,
     ]
