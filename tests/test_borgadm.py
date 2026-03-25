@@ -22,7 +22,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from unittest.mock import patch
 from xml.etree import ElementTree
 
@@ -42,6 +42,36 @@ assert _spec and _spec.loader
 ba = importlib.util.module_from_spec(_spec)
 sys.modules["borgadm"] = ba
 _spec.loader.exec_module(ba)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path: Path) -> Iterator[Path]:
+    """Redirect HOME to an empty temp directory.
+
+    Prevents tests from accidentally accessing real user files
+    (e.g., ~/.borgadm, ~/.borg_passphrase, ~/.ssh/id_borg.net).
+    Any test that needs these files must create them explicitly.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    old_home = os.environ.get("HOME")
+    basename: str = getattr(ba, "BASENAME")
+    old_config = getattr(ba, "CONFIG")
+    old_logfile = getattr(ba, "LOGFILE")
+
+    os.environ["HOME"] = str(fake_home)
+    setattr(ba, "CONFIG", Path(fake_home / f".{basename}"))
+    setattr(ba, "LOGFILE", tmp_path / f"{basename}.log")
+
+    try:
+        yield fake_home
+    finally:
+        if old_home is not None:
+            os.environ["HOME"] = old_home
+        else:
+            del os.environ["HOME"]
+        setattr(ba, "CONFIG", old_config)
+        setattr(ba, "LOGFILE", old_logfile)
 
 
 @pytest.fixture
