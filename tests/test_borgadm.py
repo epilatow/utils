@@ -807,7 +807,7 @@ class TestAutomate:
         """Test that enable creates plists for current tasks."""
         _task_dir, _mock_run, mock_create_file = automate_env
 
-        ba.do_automate(action="enable")
+        ba.do_automate_enable()
 
         created = self._created_task_names(mock_create_file)
         assert created == self.CURRENT_TASKS
@@ -816,7 +816,7 @@ class TestAutomate:
         """Test that enable does not create plists for legacy tasks."""
         _task_dir, _mock_run, mock_create_file = automate_env
 
-        ba.do_automate(action="enable")
+        ba.do_automate_enable()
 
         created = self._created_task_names(mock_create_file)
         legacy_names = {"check_age", "check_all"}
@@ -830,7 +830,7 @@ class TestAutomate:
         for name in self.CURRENT_TASKS:
             (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
 
-        ba.do_automate(action="disable")
+        ba.do_automate_disable()
 
         remaining = list(task_dir.glob("*.plist"))
         assert remaining == [], f"Plists not removed: {remaining}"
@@ -841,7 +841,7 @@ class TestAutomate:
         for name in ["check_age", "check_all"]:
             (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
 
-        ba.do_automate(action="disable")
+        ba.do_automate_disable()
 
         remaining = list(task_dir.glob("*.plist"))
         assert remaining == [], f"Legacy plists not removed: {remaining}"
@@ -863,7 +863,7 @@ class TestAutomate:
         )
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="status")
+            ba.do_automate_status()
 
         assert any("Automation is enabled" in r.message for r in caplog.records)
 
@@ -874,7 +874,7 @@ class TestAutomate:
         _task_dir, _mock_run, _ = automate_env
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="status")
+            ba.do_automate_status()
 
         assert any(
             "Automation is disabled" in r.message for r in caplog.records
@@ -893,7 +893,7 @@ class TestAutomate:
         )
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="status")
+            ba.do_automate_status()
 
         assert any("partially enabled" in r.message for r in caplog.records)
 
@@ -913,7 +913,7 @@ class TestAutomate:
         )
 
         with caplog.at_level(logging.WARNING):
-            ba.do_automate(action="status")
+            ba.do_automate_status()
 
         legacy_warnings = [
             r
@@ -936,7 +936,7 @@ class TestAutomate:
         stale.write_text("<plist/>")
 
         with caplog.at_level(logging.WARNING):
-            ba.do_automate(action="status")
+            ba.do_automate_status()
 
         stale_warnings = [
             r
@@ -952,7 +952,7 @@ class TestAutomate:
         for name in ["check_age", "check_all"]:
             (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
 
-        ba.do_automate(action="enable")
+        ba.do_automate_enable()
 
         # Legacy plists should be removed
         for name in ["check_age", "check_all"]:
@@ -983,7 +983,7 @@ class TestAutomate:
             patch.object(ba.platform, "system", return_value="Linux"),
             pytest.raises(SystemExit) as exc_info,
         ):
-            ba.do_automate(action="enable")
+            ba.do_automate_enable()
         assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_plutil(self, mock_cfg: Any) -> None:
@@ -993,7 +993,7 @@ class TestAutomate:
             patch.object(ba.shutil, "which", side_effect=lambda x: None),
             pytest.raises(SystemExit) as exc_info,
         ):
-            ba.do_automate(action="enable")
+            ba.do_automate_enable()
         assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_launchctl(self, mock_cfg: Any) -> None:
@@ -1007,7 +1007,7 @@ class TestAutomate:
             patch.object(ba.shutil, "which", side_effect=which_side_effect),
             pytest.raises(SystemExit) as exc_info,
         ):
-            ba.do_automate(action="enable")
+            ba.do_automate_enable()
         assert exc_info.value.code == ba.ExitCode.ERROR
 
     @staticmethod
@@ -1039,7 +1039,7 @@ class TestAutomate:
             self._write_plist(plist_path, log)
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="log-files")
+            ba.do_automate_log_files()
 
         for name in self.CURRENT_TASKS:
             assert any(
@@ -1055,7 +1055,7 @@ class TestAutomate:
         self._write_plist(plist_path, "/tmp/logs/create.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="log-files")
+            ba.do_automate_log_files()
 
         matches = [
             r for r in caplog.records if "/tmp/logs/create.log" in r.message
@@ -1071,7 +1071,7 @@ class TestAutomate:
         self._write_plist(plist_path, "/tmp/logs/out.log", "/tmp/logs/err.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="log-files")
+            ba.do_automate_log_files()
 
         messages = [r.message for r in caplog.records]
         assert any("/tmp/logs/out.log" in m for m in messages)
@@ -1082,7 +1082,7 @@ class TestAutomate:
         _task_dir, _mock_run, _ = automate_env
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="log-files")
+            ba.do_automate_log_files()
 
         assert any(
             "No automation log files found" in r.message for r in caplog.records
@@ -1097,7 +1097,7 @@ class TestAutomate:
         self._write_plist(plist_path, "/tmp/logs/check_age.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate(action="log-files")
+            ba.do_automate_log_files()
 
         assert any(
             "/tmp/logs/check_age.log" in r.message for r in caplog.records
@@ -1491,7 +1491,7 @@ class TestAutomateTimestampFlag:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
-            ba.do_automate(action="enable")
+            ba.do_automate_enable()
 
         for call in mock_cpe.call_args_list:
             task_args: list[str] = call.args[1]

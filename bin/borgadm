@@ -963,7 +963,17 @@ def automation_script_path() -> str:
     return script_path
 
 
-def do_automate(action: str) -> None:
+def do_automate(action: str, **kwargs: Any) -> None:
+    automate_callbacks: dict[str, Callable[..., Any]] = {
+        "disable": do_automate_disable,
+        "enable": do_automate_enable,
+        "log-files": do_automate_log_files,
+        "status": do_automate_status,
+    }
+    automate_callbacks[action](**kwargs)
+
+
+def _automate_check_platform() -> None:
     if platform.system() != "Darwin":
         logger.error("automate subcommand is only supported on osx")
         sys.exit(ExitCode.ERROR)
@@ -976,11 +986,12 @@ def do_automate(action: str) -> None:
         logger.error("launchctl not found in PATH")
         sys.exit(ExitCode.ERROR)
 
+
+_TASK_NAME_TEMPLATE = "local.borgadm.{task}"
+
+
+def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
     script_path = automation_script_path()
-    launchd_env: dict[str, str] = {
-        "PATH": os.path.expanduser("~/.local/bin")
-        + ":/usr/bin:/bin:/usr/sbin:/sbin",
-    }
     tasks: dict[str, dict[str, Any]] = {
         "create": {
             "args": [
@@ -1017,93 +1028,110 @@ def do_automate(action: str) -> None:
         "check_age": {"legacy": True},
         "check_all": {"legacy": True},
     }
-    task_name = "local.borgadm.{task}"
     task_dir: Path = Path(os.environ["HOME"]) / "Library" / "LaunchAgents"
     task2path: dict[str, Path] = {
-        task: task_dir / (task_name.format(task=task) + ".plist")
+        task: task_dir / (_TASK_NAME_TEMPLATE.format(task=task) + ".plist")
         for task in tasks
     }
-    cmd: list[str] = []
+    return tasks, task2path
 
-    if action == "log-files":
-        log_paths: list[str] = []
-        for task, path in task2path.items():
-            if not path.exists():
-                continue
-            tree = ElementTree.parse(path)
-            dict_elem = tree.find("dict")
-            if dict_elem is None:
-                continue
-            children = list(dict_elem)
-            for i, elem in enumerate(children):
-                if (
-                    elem.tag == "key"
-                    and elem.text in ("StandardOutPath", "StandardErrorPath")
-                    and i + 1 < len(children)
-                    and children[i + 1].tag == "string"
-                ):
-                    val = children[i + 1].text
-                    if val and val not in log_paths:
-                        log_paths.append(val)
-        if not log_paths:
-            logger.info("No automation log files found")
+
+def do_automate_log_files() -> None:
+    _automate_check_platform()
+    _tasks, task2path = _automate_tasks()
+
+    log_paths: list[str] = []
+    for task, path in task2path.items():
+        if not path.exists():
+            continue
+        tree = ElementTree.parse(path)
+        dict_elem = tree.find("dict")
+        if dict_elem is None:
+            continue
+        children = list(dict_elem)
+        for i, elem in enumerate(children):
+            if (
+                elem.tag == "key"
+                and elem.text in ("StandardOutPath", "StandardErrorPath")
+                and i + 1 < len(children)
+                and children[i + 1].tag == "string"
+            ):
+                val = children[i + 1].text
+                if val and val not in log_paths:
+                    log_paths.append(val)
+    if not log_paths:
+        logger.info("No automation log files found")
+    else:
+        for lp in log_paths:
+            logger.info(lp)
+
+
+def do_automate_status() -> None:
+    _automate_check_platform()
+    tasks, task2path = _automate_tasks()
+
+    launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
+    enabled_count = 0
+    legacy_count = 0
+    for task, path in task2path.items():
+        is_legacy = tasks[task].get("legacy", False)
+        tname = _TASK_NAME_TEMPLATE.format(task=task)
+        pattern = r"[ \t]" + re.escape(tname) + r"$"
+        cpattern = re.compile(pattern)
+        loaded = any(cpattern.search(i) for i in launchctl_tasks)
+        if is_legacy:
+            if loaded:
+                legacy_count += 1
+                logger.warning(f"{tname}: enabled (legacy, {path})")
+            elif path.exists():
+                legacy_count += 1
+                logger.warning(f"{tname}: stale plist (legacy, {path})")
+        elif loaded:
+            enabled_count += 1
+            logger.info(f"{tname}: enabled ({path})")
         else:
-            for lp in log_paths:
-                logger.info(lp)
-        return
+            logger.info(f"{tname}: disabled")
+    if legacy_count:
+        logger.warning(
+            "Legacy automations found. Run 'borgadm automate enable' to update."
+        )
 
-    if action == "status":
-        launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
-        enabled_count = 0
-        legacy_count = 0
-        for task, path in task2path.items():
-            is_legacy = tasks[task].get("legacy", False)
-            tname = task_name.format(task=task)
-            pattern = r"[ \t]" + re.escape(tname) + r"$"
-            cpattern = re.compile(pattern)
-            loaded = any(cpattern.search(i) for i in launchctl_tasks)
-            if is_legacy:
-                if loaded:
-                    legacy_count += 1
-                    logger.warning(f"{tname}: enabled (legacy, {path})")
-                elif path.exists():
-                    legacy_count += 1
-                    logger.warning(f"{tname}: stale plist (legacy, {path})")
-            elif loaded:
-                enabled_count += 1
-                logger.info(f"{tname}: enabled ({path})")
-            else:
-                logger.info(f"{tname}: disabled")
-        if legacy_count:
-            logger.warning(
-                "Legacy automations found. "
-                "Run 'borgadm automate enable' to update."
-            )
+    total = len([t for t in tasks if not tasks[t].get("legacy", False)])
+    if enabled_count == total:
+        logger.info("Automation is enabled")
+    elif enabled_count == 0 and legacy_count == 0:
+        logger.info("Automation is disabled")
+    else:
+        logger.info(
+            f"Automation is partially enabled ({enabled_count}/{total})"
+        )
 
-        total = len([t for t in tasks if not tasks[t].get("legacy", False)])
-        if enabled_count == total:
-            logger.info("Automation is enabled")
-        elif enabled_count == 0 and legacy_count == 0:
-            logger.info("Automation is disabled")
-        else:
-            logger.info(
-                f"Automation is partially enabled ({enabled_count}/{total})"
-            )
-        return
 
-    # Always remove any existing configs for enable/disable
+def do_automate_disable() -> None:
+    _automate_check_platform()
+    tasks, task2path = _automate_tasks()
+
     for task, path in task2path.items():
         if not path.exists():
             continue
         is_legacy = tasks[task].get("legacy", False)
         label = "legacy " if is_legacy else ""
         logger.info(f"Removing {label}{task} launchd config: {str(path)}")
-        cmd = ["launchctl", "unload", str(path)]
-        run_cmd(cmd, errok=True)
+        run_cmd(["launchctl", "unload", str(path)], errok=True)
         path.unlink()
 
-    if action == "disable":
-        return
+
+def do_automate_enable() -> None:
+    _automate_check_platform()
+    tasks, task2path = _automate_tasks()
+
+    # Remove any existing configs first
+    do_automate_disable()
+
+    launchd_env: dict[str, str] = {
+        "PATH": os.path.expanduser("~/.local/bin")
+        + ":/usr/bin:/bin:/usr/sbin:/sbin",
+    }
 
     log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1116,13 +1144,15 @@ def do_automate(action: str) -> None:
         log_path = str(log_dir / f"{task}.log")
         logger.info(f"Creating {task} launchd config: {str(path)}")
         pe = create_plist_element(
-            task, cfg["args"], cfg["interval"], launchd_env, log_path
+            task,
+            cfg["args"],
+            cfg["interval"],
+            launchd_env,
+            log_path,
         )
         create_plist_file(pe, path)
-        cmd = ["plutil", str(path)]
-        run_cmd(cmd)
-        cmd = ["launchctl", "load", str(path)]
-        run_cmd(cmd)
+        run_cmd(["plutil", str(path)])
+        run_cmd(["launchctl", "load", str(path)])
 
     # Print Full Disk Access instructions if using wrapper app
     wrapper_app = (
@@ -1139,7 +1169,8 @@ def do_automate(action: str) -> None:
         logger.info("")
         logger.info(
             '   open "x-apple.systempreferences:'
-            'com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"'
+            "com.apple.settings.PrivacySecurity.extension"
+            '?Privacy_AllFiles"'
         )
         logger.info("")
         logger.info("2. Click the '+' button")
