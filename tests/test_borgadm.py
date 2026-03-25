@@ -127,6 +127,22 @@ class TestArgumentParser:
         assert args.command == "repair"
         assert args.action == "delete-cache"
 
+    def test_repair_repo_yes_parses(self) -> None:
+        """Test repair repo --yes parses."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["repair", "repo", "--yes"])
+        assert args.command == "repair"
+        assert args.action == "repo"
+        assert args.yes is True
+
+    def test_repair_repo_no_yes_parses(self) -> None:
+        """Test repair repo without --yes defaults to False."""
+        parser = ba.args_parser()
+        args = parser.parse_args(["repair", "repo"])
+        assert args.command == "repair"
+        assert args.action == "repo"
+        assert args.yes is False
+
     def test_self_test_subcommand_parses(self) -> None:
         """Test self-test subcommand parses flags."""
         parser = ba.args_parser()
@@ -248,6 +264,22 @@ class TestRepair:
                 ]
             )
 
+    def test_repair_repo_without_yes_exits(self, mock_cfg: Any) -> None:
+        """Test that repair repo without --yes exits with error."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(
+                ba,
+                "borg_cmd",
+                autospec=True,
+                return_value=["borg"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.do_repair(action="repo")
+        assert exc_info.value.code == ba.ExitCode.ERROR
+        mock_run_cmd.assert_not_called()
+
     def test_repair_repo(self, mock_cfg: Any) -> None:
         """Test that repair repo calls borg check --repair."""
         with (
@@ -259,7 +291,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair(action="repo")
+            ba.do_repair(action="repo", yes=True)
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
@@ -269,6 +301,10 @@ class TestRepair:
                     mock_cfg.BORG_REPO,
                 ],
                 allow_output=True,
+                env={
+                    **os.environ,
+                    "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
+                },
             )
 
     def test_repair_repo_progress(self, mock_cfg: Any) -> None:
@@ -282,7 +318,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair(action="repo", progress=True)
+            ba.do_repair(action="repo", progress=True, yes=True)
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
@@ -293,6 +329,10 @@ class TestRepair:
                     mock_cfg.BORG_REPO,
                 ],
                 allow_output=True,
+                env={
+                    **os.environ,
+                    "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
+                },
             )
 
 
