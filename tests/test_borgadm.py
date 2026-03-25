@@ -47,22 +47,29 @@ _spec.loader.exec_module(ba)
 
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path: Path) -> Iterator[Path]:
-    """Redirect HOME to an empty temp directory.
+    """Redirect HOME and tempdir to empty temp directories.
 
     Prevents tests from accidentally accessing real user files
-    (e.g., ~/.borgadm, ~/.borg_passphrase, ~/.ssh/id_borg.net).
+    (e.g., ~/.borgadm, ~/.borg_passphrase, ~/.ssh/id_borg.net)
+    or writing to the real system temp directory.
     Any test that needs these files must create them explicitly.
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     old_home = os.environ.get("HOME")
+    old_tempdir = tempfile.tempdir
     basename: str = getattr(ba, "BASENAME")
     old_config = getattr(ba, "CONFIG")
     old_logfile = getattr(ba, "LOGFILE")
 
     os.environ["HOME"] = str(fake_home)
+    tempfile.tempdir = str(tmp_path)
     setattr(ba, "CONFIG", Path(fake_home / f".{basename}"))
-    setattr(ba, "LOGFILE", tmp_path / f"{basename}.log")
+    setattr(
+        ba,
+        "LOGFILE",
+        Path(tempfile.gettempdir()) / f"{basename}.log",
+    )
 
     try:
         yield fake_home
@@ -71,6 +78,7 @@ def _isolate_home(tmp_path: Path) -> Iterator[Path]:
             os.environ["HOME"] = old_home
         else:
             del os.environ["HOME"]
+        tempfile.tempdir = old_tempdir
         setattr(ba, "CONFIG", old_config)
         setattr(ba, "LOGFILE", old_logfile)
 
@@ -1084,6 +1092,46 @@ class TestAutomate:
         tree = ElementTree.ElementTree(plist)
         tree.write(path, xml_declaration=True, encoding="UTF-8")
 
+    def test_log_files_shows_default_logfile(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that log-files always includes the default log file."""
+        _task_dir, _mock_run, _ = automate_env
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert str(ba.LOGFILE) in messages
+
+    def test_log_files_default_logfile_listed_first(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test that the default log file is listed first."""
+        task_dir, _mock_run, _ = automate_env
+        plist_path = task_dir / "local.borgadm.create.plist"
+        self._write_plist(plist_path, "/tmp/logs/create.log")
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert messages[0] == str(ba.LOGFILE)
+
+    def test_log_files_default_logfile_not_duplicated(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        """Test default log file isn't duplicated if a plist uses it."""
+        task_dir, _mock_run, _ = automate_env
+        plist_path = task_dir / "local.borgadm.create.plist"
+        self._write_plist(plist_path, str(ba.LOGFILE))
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_log_files()
+
+        matches = [r for r in caplog.records if r.message == str(ba.LOGFILE)]
+        assert len(matches) == 1
+
     def test_log_files_shows_paths_from_plists(
         self, automate_env: Any, caplog: Any
     ) -> None:
@@ -1134,15 +1182,15 @@ class TestAutomate:
         assert any("/tmp/logs/err.log" in m for m in messages)
 
     def test_log_files_no_plists(self, automate_env: Any, caplog: Any) -> None:
-        """Test message when no plist files exist."""
+        """Test that default log file is shown even with no plists."""
         _task_dir, _mock_run, _ = automate_env
 
         with caplog.at_level(logging.INFO):
             ba.do_automate_log_files()
 
-        assert any(
-            "No automation log files found" in r.message for r in caplog.records
-        )
+        messages = [r.message for r in caplog.records]
+        assert str(ba.LOGFILE) in messages
+        assert len(messages) == 1
 
     def test_log_files_reads_legacy_plists(
         self, automate_env: Any, caplog: Any
