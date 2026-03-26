@@ -883,10 +883,10 @@ class TestAutomate:
         remaining = list(task_dir.glob("*.plist"))
         assert remaining == [], f"Legacy plists not removed: {remaining}"
 
-    def test_status_reports_enabled(
+    def test_status_no_recommendation_when_all_enabled(
         self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status reports all-enabled correctly."""
+        """Test that status shows no recommendation when all enabled."""
         _task_dir, mock_run, _ = automate_env
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -902,25 +902,23 @@ class TestAutomate:
         with caplog.at_level(logging.INFO):
             ba.do_automate_status()
 
-        assert any("Automation is enabled" in r.message for r in caplog.records)
+        assert not any("automate enable" in r.message for r in caplog.records)
 
-    def test_status_reports_disabled(
+    def test_status_recommends_enable_when_disabled(
         self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status reports all-disabled correctly."""
+        """Test that status recommends enable when all disabled."""
         _task_dir, _mock_run, _ = automate_env
 
         with caplog.at_level(logging.INFO):
             ba.do_automate_status()
 
-        assert any(
-            "Automation is disabled" in r.message for r in caplog.records
-        )
+        assert any("automate enable" in r.message for r in caplog.records)
 
-    def test_status_reports_partially_enabled(
+    def test_status_recommends_enable_when_partial(
         self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status reports partial enablement."""
+        """Test that status recommends enable when partially enabled."""
         _task_dir, mock_run, _ = automate_env
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -932,12 +930,12 @@ class TestAutomate:
         with caplog.at_level(logging.INFO):
             ba.do_automate_status()
 
-        assert any("partially enabled" in r.message for r in caplog.records)
+        assert any("automate enable" in r.message for r in caplog.records)
 
-    def test_status_warns_on_legacy_tasks(
+    def test_status_recommends_enable_on_legacy_tasks(
         self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status warns about loaded legacy tasks."""
+        """Test that status recommends enable for loaded legacy tasks."""
         _task_dir, mock_run, _ = automate_env
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
@@ -949,38 +947,130 @@ class TestAutomate:
             stderr="",
         )
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             ba.do_automate_status()
 
-        legacy_warnings = [
-            r
-            for r in caplog.records
-            if r.levelno >= logging.WARNING and "legacy" in r.message.lower()
+        legacy_msgs = [
+            r for r in caplog.records if "legacy" in r.message.lower()
         ]
-        # One warning per legacy task + one summary
-        assert len(legacy_warnings) >= 3
-        # Summary should tell user to run enable (not disable+enable)
-        summary = [r for r in legacy_warnings if "automate enable" in r.message]
-        assert len(summary) == 1
-        assert "disable" not in summary[0].message
+        # One message per legacy task
+        assert len(legacy_msgs) >= 2
+        # Summary should tell user to run enable
+        assert any("automate enable" in r.message for r in caplog.records)
 
-    def test_status_warns_on_stale_legacy_plist(
+    def test_status_recommends_enable_on_unloaded_legacy(
         self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status warns about stale legacy plist files."""
+        """Test that status recommends enable for unloaded legacy plists."""
         task_dir, _mock_run, _ = automate_env
         stale = task_dir / "local.borgadm.check_age.plist"
         stale.write_text("<plist/>")
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             ba.do_automate_status()
 
-        stale_warnings = [
+        unloaded_msgs = [
             r
             for r in caplog.records
-            if r.levelno >= logging.WARNING and "stale" in r.message
+            if "unloaded" in r.message and "legacy" in r.message
         ]
-        assert len(stale_warnings) >= 1
+        assert len(unloaded_msgs) >= 1
+
+    @pytest.fixture
+    def status_env(self, tmp_path: Path, mock_cfg: Any) -> Iterator[Any]:
+        """Set up environment for status tests that need real plists."""
+        task_dir = tmp_path / "Library" / "LaunchAgents"
+        task_dir.mkdir(parents=True)
+
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            yield mock_run
+
+    def _write_current_plist(
+        self, task: str, cfg: dict[str, Any], path: Path
+    ) -> None:
+        """Write a plist file matching current create_plist_element."""
+        elem = ba.create_plist_element(
+            task,
+            cfg["args"],
+            cfg["interval"],
+            ba._launchd_env(),
+            ba._task_log_path(task),
+        )
+        ba.create_plist_file(elem, path)
+
+    def test_status_recommends_enable_on_outdated(
+        self, status_env: Any, caplog: Any
+    ) -> None:
+        """Test that status recommends enable for outdated plists."""
+        mock_run = status_env
+        tasks, task2path = ba._automate_tasks()
+
+        # Write stale plist content for all current tasks
+        for task, cfg in tasks.items():
+            if cfg.get("legacy", False):
+                continue
+            task2path[task].write_text("<plist>stale</plist>")
+
+        # All current tasks loaded in launchd
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "123\t0\tlocal.borgadm.create\n"
+                "456\t0\tlocal.borgadm.check-daily\n"
+                "789\t0\tlocal.borgadm.check-weekly\n"
+            ),
+            stderr="",
+        )
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_status()
+
+        outdated_msgs = [
+            r for r in caplog.records if "outdated" in r.message.lower()
+        ]
+        # One message per outdated task
+        assert len(outdated_msgs) >= 3
+        # Summary should tell user to run enable
+        assert any("automate enable" in r.message for r in caplog.records)
+
+    def test_status_no_recommendation_when_current(
+        self, status_env: Any, caplog: Any
+    ) -> None:
+        """Test no recommendation when plists match current config."""
+        mock_run = status_env
+        tasks, task2path = ba._automate_tasks()
+
+        # Write current plist content for all current tasks
+        for task, cfg in tasks.items():
+            if cfg.get("legacy", False):
+                continue
+            self._write_current_plist(task, cfg, task2path[task])
+
+        # All current tasks loaded in launchd
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "123\t0\tlocal.borgadm.create\n"
+                "456\t0\tlocal.borgadm.check-daily\n"
+                "789\t0\tlocal.borgadm.check-weekly\n"
+            ),
+            stderr="",
+        )
+
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_status()
+
+        assert not any("outdated" in r.message.lower() for r in caplog.records)
 
     def test_enable_replaces_legacy_plists(self, automate_env: Any) -> None:
         """Test that enable removes legacy plists and creates current."""

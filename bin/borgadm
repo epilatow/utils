@@ -927,20 +927,27 @@ def create_plist_element(
     return plist
 
 
-def create_plist_file(element: ElementTree.Element, path: Path) -> None:
+def render_plist_string(element: ElementTree.Element) -> str:
+    """Render a plist ElementTree element to a plist file string."""
     rough_string = ElementTree.tostring(element, encoding="utf-8")
     reparsed = minidom.parseString(rough_string)
-    # Get pretty-printed XML and skip the XML declaration line added by minidom
     pretty_xml = reparsed.toprettyxml(indent="    ")
     xml_lines = pretty_xml.split("\n")
     if xml_lines[0].startswith("<?xml"):
         xml_lines = xml_lines[1:]
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n'
+        ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        + "\n".join(xml_lines)
+    )
+
+
+def create_plist_file(element: ElementTree.Element, path: Path) -> None:
+    content = render_plist_string(element)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w") as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write('<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n')
-        f.write(' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n')
-        f.write("\n".join(xml_lines))
+        f.write(content)
 
 
 # -----------------------------------------------------------------------------
@@ -1076,44 +1083,83 @@ def do_automate_log_files() -> None:
         logger.info(lp)
 
 
+def _is_task_outdated(
+    task: str,
+    cfg: dict[str, Any],
+    path: Path,
+) -> bool:
+    """Check if an installed plist differs from what would be generated."""
+    if not path.exists():
+        return False
+    expected = render_plist_string(
+        create_plist_element(
+            task,
+            cfg["args"],
+            cfg["interval"],
+            _launchd_env(),
+            _task_log_path(task),
+        )
+    )
+    try:
+        current = path.read_text()
+    except OSError:
+        return False
+    return current != expected
+
+
 def do_automate_status() -> None:
     _automate_check_platform()
     tasks, task2path = _automate_tasks()
 
     launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
     enabled_count = 0
-    legacy_count = 0
+    needs_update = False
     for task, path in task2path.items():
-        is_legacy = tasks[task].get("legacy", False)
+        cfg = tasks[task]
+        is_legacy = cfg.get("legacy", False)
         tname = _TASK_NAME_TEMPLATE.format(task=task)
         pattern = r"[ \t]" + re.escape(tname) + r"$"
         cpattern = re.compile(pattern)
         loaded = any(cpattern.search(i) for i in launchctl_tasks)
-        if is_legacy:
-            if loaded:
-                legacy_count += 1
-                logger.warning(f"{tname}: enabled (legacy, {path})")
-            elif path.exists():
-                legacy_count += 1
-                logger.warning(f"{tname}: stale plist (legacy, {path})")
-        elif loaded:
-            enabled_count += 1
-            logger.info(f"{tname}: enabled ({path})")
+        has_plist = path.exists()
+
+        # Skip legacy tasks that have been fully cleaned up.
+        if is_legacy and not loaded and not has_plist:
+            continue
+
+        tags: list[str] = []
+        if loaded:
+            tags.append("enabled")
+            if not is_legacy:
+                enabled_count += 1
+        elif has_plist:
+            tags.append("unloaded")
         else:
-            logger.info(f"{tname}: disabled")
-    if legacy_count:
-        logger.warning(
-            "Legacy automations found. Run 'borgadm automate enable' to update."
-        )
+            tags.append("disabled")
+
+        if is_legacy:
+            tags.append("legacy")
+        if not is_legacy and has_plist:
+            if _is_task_outdated(task, cfg, path):
+                tags.append("outdated")
+
+        tag_str = ", ".join(tags)
+        if has_plist or loaded:
+            msg = f"{tname}: {tag_str}: {path}"
+        else:
+            msg = f"{tname}: {tag_str}"
+
+        problematic = (tags[0] != "enabled" and tags[0] != "disabled") or len(
+            tags
+        ) > 1
+        if problematic:
+            needs_update = True
+        logger.info(msg)
 
     total = len([t for t in tasks if not tasks[t].get("legacy", False)])
-    if enabled_count == total:
-        logger.info("Automation is enabled")
-    elif enabled_count == 0 and legacy_count == 0:
-        logger.info("Automation is disabled")
-    else:
+    if enabled_count < total or needs_update:
         logger.info(
-            f"Automation is partially enabled ({enabled_count}/{total})"
+            "Run 'borgadm automate enable' to update and enable automations."
         )
 
 
@@ -1131,6 +1177,20 @@ def do_automate_disable() -> None:
         path.unlink()
 
 
+def _launchd_env() -> dict[str, str]:
+    """Return environment variables for launchd plist configs."""
+    return {
+        "PATH": os.path.expanduser("~/.local/bin")
+        + ":/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+
+
+def _task_log_path(task: str) -> str:
+    """Return the log file path for a given automation task."""
+    log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
+    return str(log_dir / f"{task}.log")
+
+
 def do_automate_enable() -> None:
     _automate_check_platform()
     tasks, task2path = _automate_tasks()
@@ -1138,10 +1198,7 @@ def do_automate_enable() -> None:
     # Remove any existing configs first
     do_automate_disable()
 
-    launchd_env: dict[str, str] = {
-        "PATH": os.path.expanduser("~/.local/bin")
-        + ":/usr/bin:/bin:/usr/sbin:/sbin",
-    }
+    launchd_env = _launchd_env()
 
     log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1151,7 +1208,7 @@ def do_automate_enable() -> None:
         if cfg.get("legacy", False):
             continue
         path = task2path[task]
-        log_path = str(log_dir / f"{task}.log")
+        log_path = _task_log_path(task)
         logger.info(f"Creating {task} launchd config: {str(path)}")
         pe = create_plist_element(
             task,
