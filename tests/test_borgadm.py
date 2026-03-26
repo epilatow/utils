@@ -1834,6 +1834,51 @@ for i in range(1000):
         assert "line 0" in result.stdout
 
 
+class TestCreatePlistElement:
+    """Test that create_plist_element produces correct plist fields."""
+
+    def _plist_dict(
+        self, element: ElementTree.Element
+    ) -> dict[str, str | bool | int]:
+        """Parse plist element into a flat dict of key-value pairs."""
+        result: dict[str, str | bool | int] = {}
+        dict_elem = element.find("dict")
+        assert dict_elem is not None
+        keys = list(dict_elem)
+        i = 0
+        while i < len(keys):
+            if keys[i].tag == "key":
+                key_text = keys[i].text or ""
+                val_elem = keys[i + 1]
+                if val_elem.tag == "string":
+                    result[key_text] = val_elem.text or ""
+                elif val_elem.tag == "integer":
+                    result[key_text] = int(val_elem.text or "0")
+                elif val_elem.tag == "true":
+                    result[key_text] = True
+                elif val_elem.tag == "false":
+                    result[key_text] = False
+                i += 2
+            else:
+                i += 1
+        return result
+
+    def test_scheduling_fields(self) -> None:
+        """Verify ProcessType, Nice, LowPriorityIO, PreventSleep."""
+        elem = ba.create_plist_element(
+            task="test",
+            args=["/usr/bin/true"],
+            interval=3600,
+            env={},
+            log_path="/dev/null",
+        )
+        d = self._plist_dict(elem)
+        assert d["ProcessType"] == "Interactive"
+        assert d["Nice"] == 0
+        assert d["LowPriorityIO"] is False
+        assert d["PreventSleep"] is True
+
+
 class TestCodeQuality(CodeQualityBase):
     """Test code quality with black, flake8, and mypy."""
 

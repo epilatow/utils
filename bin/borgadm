@@ -917,9 +917,12 @@ def create_plist_element(
     add_kv("StandardErrorPath", log_path)
 
     add_int("StartInterval", interval)
+    # Interactive avoids QoS throttling that can drastically slow
+    # I/O-bound backups (4x+ slower observed with Standard).
     add_kv("ProcessType", "Interactive")
     add_bool("LowPriorityIO", False)
-    add_int("Nice", -5)
+    add_int("Nice", 0)
+    add_bool("PreventSleep", True)
 
     return plist
 
