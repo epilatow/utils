@@ -811,7 +811,9 @@ class TestAutomate:
     """Test automate subcommand."""
 
     @pytest.fixture
-    def automate_env(self, tmp_path: Path, mock_cfg: Any) -> Any:
+    def automate_env(
+        self, tmp_path: Path, mock_cfg: Any
+    ) -> Iterator[tuple[Path, Any, Any]]:
         """Set up mocked environment for automate tests."""
         task_dir = tmp_path / "Library" / "LaunchAgents"
         task_dir.mkdir(parents=True)
