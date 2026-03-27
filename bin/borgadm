@@ -2100,7 +2100,8 @@ def args_parser() -> argparse.ArgumentParser:
     )
     list_cmd.add_argument(
         "--keep-tags",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Include keep tags (indicating what would be kept and "
             "deleted during a prune)"
@@ -2109,10 +2110,15 @@ def args_parser() -> argparse.ArgumentParser:
     add_prune_args(list_cmd)
     group = list_cmd.add_mutually_exclusive_group()
     group.add_argument(
-        "--include-partial", action="store_true", help="Include partial backups"
+        "--include-partial",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include partial backups",
     )
     group.add_argument(
-        "--only-partial", action="store_true", help="Only list partial"
+        "--only-partial",
+        action="store_true",
+        help="Only list partial",
     )
 
     repair = add_parser(

@@ -807,6 +807,119 @@ class TestDelete:
             )
 
 
+class TestList:
+    """Test list subcommand."""
+
+    FULL_BACKUPS: dict[str, list[str]] = {
+        "20250103_120000": ["foobar::home-set1-20250103_120000"],
+        "20250102_120000": ["foobar::home-set1-20250102_120000"],
+        "20250101_120000": ["foobar::home-set1-20250101_120000"],
+    }
+    PARTIAL_BACKUPS: dict[str, list[str]] = {
+        "20250104_060000": ["foobar::home-set1-20250104_060000"],
+    }
+
+    def _list_side_effect(
+        self,
+        full_backups: dict[str, list[str]],
+        partial_backups: dict[str, list[str]],
+    ) -> Any:
+        def side_effect(
+            latest: bool = False, partial: bool = False
+        ) -> dict[str, list[str]]:
+            src = partial_backups if partial else full_backups
+            if latest and src:
+                first_key = next(iter(src))
+                return {first_key: src[first_key]}
+            return src
+
+        return side_effect
+
+    def _run_list(
+        self,
+        caplog: Any,
+        full: dict[str, list[str]] | None = None,
+        partial: dict[str, list[str]] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        if full is None:
+            full = self.FULL_BACKUPS
+        if partial is None:
+            partial = self.PARTIAL_BACKUPS
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=self._list_side_effect(full, partial),
+            ),
+            patch.object(
+                ba,
+                "ts_to_keep",
+                autospec=True,
+                return_value=collections.OrderedDict(
+                    {
+                        "20250103_120000": "hour",
+                        "20250102_120000": "day",
+                    }
+                ),
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_list(
+                latest=kwargs.get("latest", False),
+                full_names=kwargs.get("full_names", False),
+                include_partial=kwargs.get("include_partial", True),
+                only_partial=kwargs.get("only_partial", False),
+                keep_tags=kwargs.get("keep_tags", True),
+            )
+        return [r.message for r in caplog.records]
+
+    def test_list_defaults(self, mock_cfg: Any, caplog: Any) -> None:
+        """Default list shows full + partial with keep tags."""
+        msgs = self._run_list(caplog)
+        # All timestamps present (3 full + 1 partial)
+        assert any("20250103_120000" in m for m in msgs)
+        assert any("20250102_120000" in m for m in msgs)
+        assert any("20250101_120000" in m for m in msgs)
+        assert any("20250104_060000" in m for m in msgs)
+        # Keep tags present
+        assert any("(hour)" in m for m in msgs)
+        assert any("(day)" in m for m in msgs)
+        assert any("(prune)" in m for m in msgs)
+
+    def test_list_no_keep_tags(self, mock_cfg: Any, caplog: Any) -> None:
+        """--no-keep-tags omits keep tags."""
+        msgs = self._run_list(caplog, keep_tags=False)
+        assert any("20250103_120000" in m for m in msgs)
+        assert not any("(hour)" in m for m in msgs)
+        assert not any("(prune)" in m for m in msgs)
+
+    def test_list_no_include_partial(self, mock_cfg: Any, caplog: Any) -> None:
+        """--no-include-partial excludes partial backups."""
+        msgs = self._run_list(caplog, include_partial=False)
+        assert any("20250103_120000" in m for m in msgs)
+        assert not any("20250104_060000" in m for m in msgs)
+
+    def test_list_only_partial(self, mock_cfg: Any, caplog: Any) -> None:
+        """--only-partial shows only partial backups."""
+        msgs = self._run_list(caplog, only_partial=True)
+        assert any("20250104_060000" in m for m in msgs)
+        assert not any("20250103_120000" in m for m in msgs)
+
+    def test_list_full_names(self, mock_cfg: Any, caplog: Any) -> None:
+        """--full-names shows full archive names."""
+        msgs = self._run_list(caplog, full_names=True)
+        assert any("foobar::home-set1-20250103_120000" in m for m in msgs)
+
+    def test_list_latest(self, mock_cfg: Any, caplog: Any) -> None:
+        """--latest shows only the most recent backup."""
+        msgs = self._run_list(caplog, latest=True)
+        assert any("20250103_120000" in m for m in msgs)
+        assert not any("20250102_120000" in m for m in msgs)
+        assert not any("20250101_120000" in m for m in msgs)
+
+
 class TestAutomate:
     """Test automate subcommand."""
 
