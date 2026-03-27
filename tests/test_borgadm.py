@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import collections
 import importlib.machinery
+import inspect
 import io
 import importlib.util
 import logging
@@ -24,7 +25,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 import pytest  # type: ignore[import-not-found]
@@ -81,6 +82,27 @@ def _isolate_home(tmp_path: Path) -> Iterator[Path]:
         tempfile.tempdir = old_tempdir
         setattr(ba, "CONFIG", old_config)
         setattr(ba, "LOGFILE", old_logfile)
+
+
+_CONFIG_CONSUMED_KEYS = (
+    "seconds",
+    "keep_hourly",
+    "keep_daily",
+    "keep_weekly",
+    "keep_monthly",
+    "keep_yearly",
+)
+
+
+def mock_config_constructor(cfg: Any) -> Any:
+    """Return a Config side_effect that pops args like the real one."""
+
+    def constructor(_config_path: str, args: dict[str, Any]) -> Any:
+        for key in _CONFIG_CONSUMED_KEYS:
+            args.pop(key, None)
+        return cfg
+
+    return constructor
 
 
 @pytest.fixture
@@ -278,6 +300,41 @@ class TestArgumentParser:
                         )
                 break
 
+    @staticmethod
+    def _parser_commands() -> set[str]:
+        """Discover all command[+action] strings from the parser."""
+        parser = ba.args_parser()
+        commands: set[str] = set()
+        for action in parser._actions:
+            if not isinstance(action, argparse._SubParsersAction):
+                continue
+            for cmd, cmd_parser in action.choices.items():
+                has_sub = False
+                for sub in cmd_parser._actions:
+                    if isinstance(sub, argparse._SubParsersAction):
+                        has_sub = True
+                        for act in sub.choices:
+                            commands.add(f"{cmd} {act}")
+                if not has_sub:
+                    commands.add(cmd)
+        return commands
+
+    def test_dispatch_covers_all_commands(self) -> None:
+        """Verify COMMAND_CALLBACKS matches parser commands exactly."""
+        parser_cmds = self._parser_commands() - {"self-test"}
+        dispatch_cmds = set(ba.COMMAND_CALLBACKS.keys())
+        assert parser_cmds == dispatch_cmds
+
+    def test_dispatch_handlers_have_no_defaults(self) -> None:
+        """Verify dispatch handlers don't define default arg values."""
+        for cmd, fn in ba.COMMAND_CALLBACKS.items():
+            sig = inspect.signature(fn)
+            for name, param in sig.parameters.items():
+                assert param.default is inspect.Parameter.empty, (
+                    f"{fn.__name__}({name}=...) has a default;"
+                    f" defaults belong in the argument parser"
+                )
+
 
 class TestRepair:
     """Test repair subcommand."""
@@ -315,7 +372,7 @@ class TestRepair:
             ),
             pytest.raises(SystemExit) as exc_info,
         ):
-            ba.do_repair_repo()
+            ba.do_repair_repo(progress=False, yes=False)
         assert exc_info.value.code == ba.ExitCode.ERROR
         mock_run_cmd.assert_not_called()
 
@@ -330,7 +387,7 @@ class TestRepair:
                 return_value=["borg"],
             ),
         ):
-            ba.do_repair_repo(yes=True)
+            ba.do_repair_repo(progress=False, yes=True)
             mock_run_cmd.assert_called_once_with(
                 [
                     "borg",
@@ -1441,29 +1498,6 @@ class TestCheck:
                 f"check {action} did not accept --enable-notifications"
             )
 
-    def test_dispatcher_handles_all_subcommands(self, mock_cfg: Any) -> None:
-        """Verify do_check can dispatch every check subcommand."""
-        actions = self._check_subcommands()
-        assert actions, "No check subcommands found in parser"
-
-        # Mock all do_check_* functions so dispatch doesn't run
-        # real checks. Discovered dynamically so new check functions
-        # are picked up automatically.
-        check_fn_names = [
-            name
-            for name in dir(ba)
-            if name.startswith("do_check_") and callable(getattr(ba, name))
-        ]
-        patches = [patch.object(ba, name) for name in check_fn_names]
-        for p in patches:
-            p.start()
-        try:
-            for action in actions:
-                ba.do_check(action=action)
-        finally:
-            for p in patches:
-                p.stop()
-
     def test_check_all_runs_all_checks(self, mock_cfg: Any) -> None:
         """Verify do_check_all calls every individual check function."""
         actions = self._check_subcommands() - {"all"}
@@ -1632,7 +1666,7 @@ class TestCheck:
                 patch.object(
                     ba,
                     "Config",
-                    return_value=mock_cfg,
+                    side_effect=mock_config_constructor(mock_cfg),
                 ),
                 patch.object(
                     ba,
@@ -1644,7 +1678,10 @@ class TestCheck:
                     "initialize_borg_environment",
                     autospec=True,
                 ),
-                patch.object(ba, "do_check", autospec=True),
+                patch.dict(
+                    ba.COMMAND_CALLBACKS,
+                    {"check age": lambda **_: None},
+                ),
                 pytest.raises(SystemExit) as exc_info,
             ):
                 ba.main()
@@ -1702,7 +1739,7 @@ class TestNotifyTitle:
                 patch.object(
                     ba,
                     "Config",
-                    return_value=mock_cfg,
+                    side_effect=mock_config_constructor(mock_cfg),
                 ),
                 patch.object(
                     ba,
@@ -1714,7 +1751,10 @@ class TestNotifyTitle:
                     "initialize_borg_environment",
                     autospec=True,
                 ),
-                patch.object(ba, "do_check", autospec=True),
+                patch.dict(
+                    ba.COMMAND_CALLBACKS,
+                    {"check repo": lambda **_: None},
+                ),
             ):
                 ba.main()
             assert getattr(ba, "_notify_title") == "borgadm check repo"
@@ -1775,10 +1815,12 @@ class TestStartEndMarkers:
         """Test that repo-operating commands emit start/end."""
         with (
             patch("sys.argv", ["borgadm", "break-lock"]),
-            patch.object(ba, "Config", return_value=mock_cfg),
+            patch.object(
+                ba, "Config", side_effect=mock_config_constructor(mock_cfg)
+            ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.object(ba, "do_break_lock", autospec=True),
+            patch.dict(ba.COMMAND_CALLBACKS, {"break-lock": lambda **_: None}),
             caplog.at_level(logging.INFO),
         ):
             ba.main()
@@ -1795,10 +1837,12 @@ class TestStartEndMarkers:
         """Test that quick commands don't emit start/end."""
         with (
             patch("sys.argv", ["borgadm", "environment"]),
-            patch.object(ba, "Config", return_value=mock_cfg),
+            patch.object(
+                ba, "Config", side_effect=mock_config_constructor(mock_cfg)
+            ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.object(ba, "do_environment", autospec=True),
+            patch.dict(ba.COMMAND_CALLBACKS, {"environment": lambda **_: None}),
             caplog.at_level(logging.INFO),
         ):
             ba.main()
@@ -1812,10 +1856,15 @@ class TestStartEndMarkers:
         """Test that action name is included in timing message."""
         with (
             patch("sys.argv", ["borgadm", "check", "age"]),
-            patch.object(ba, "Config", return_value=mock_cfg),
+            patch.object(
+                ba, "Config", side_effect=mock_config_constructor(mock_cfg)
+            ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.object(ba, "do_check", autospec=True),
+            patch.dict(
+                ba.COMMAND_CALLBACKS,
+                {"check age": lambda **_: None},
+            ),
             caplog.at_level(logging.INFO),
         ):
             ba.main()
@@ -1834,16 +1883,20 @@ class TestStartEndMarkers:
         """Test that finished is emitted even on exception."""
         with (
             patch("sys.argv", ["borgadm", "compact"]),
-            patch.object(ba, "Config", return_value=mock_cfg),
+            patch.object(
+                ba, "Config", side_effect=mock_config_constructor(mock_cfg)
+            ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.object(
-                ba,
-                "do_compact",
-                autospec=True,
-                side_effect=subprocess.CalledProcessError(
-                    1, ["borg", "compact"]
-                ),
+            patch.dict(
+                ba.COMMAND_CALLBACKS,
+                {
+                    "compact": Mock(
+                        side_effect=subprocess.CalledProcessError(
+                            1, ["borg", "compact"]
+                        )
+                    )
+                },
             ),
             patch.object(ba, "osascript_notify", autospec=True),
             caplog.at_level(logging.INFO),

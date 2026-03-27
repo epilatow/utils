@@ -974,16 +974,6 @@ def automation_script_path() -> str:
     return script_path
 
 
-def do_automate(action: str, **kwargs: Any) -> None:
-    automate_callbacks: dict[str, Callable[..., Any]] = {
-        "disable": do_automate_disable,
-        "enable": do_automate_enable,
-        "log-files": do_automate_log_files,
-        "status": do_automate_status,
-    }
-    automate_callbacks[action](**kwargs)
-
-
 def _automate_check_platform() -> None:
     if platform.system() != "Darwin":
         logger.error("automate subcommand is only supported on osx")
@@ -1259,17 +1249,6 @@ def do_break_lock() -> None:
             cfg.BORG_REPO,
         ]
     )
-
-
-def do_check(action: str, **kwargs: Any) -> None:
-    check_callbacks: dict[str, Callable[..., Any]] = {
-        "age": do_check_age,
-        "all": do_check_all,
-        "archives": do_check_archives,
-        "prune": do_check_prune,
-        "repo": do_check_repo,
-    }
-    check_callbacks[action](**kwargs)
 
 
 def do_check_age() -> None:
@@ -1821,14 +1800,6 @@ def do_rsync(
                 run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
 
 
-def do_repair(action: str, **kwargs: Any) -> None:
-    repair_callbacks: dict[str, Callable[..., Any]] = {
-        "delete-cache": do_repair_delete_cache,
-        "repo": do_repair_repo,
-    }
-    repair_callbacks[action](**kwargs)
-
-
 def do_repair_delete_cache() -> None:
     cfg = get_cfg()
     logger.info(f"Deleting local cache for: {cfg.BORG_REPO}")
@@ -1843,7 +1814,7 @@ def do_repair_delete_cache() -> None:
     logger.info("Cache deleted successfully.")
 
 
-def do_repair_repo(progress: bool = False, yes: bool = False) -> None:
+def do_repair_repo(progress: bool, yes: bool) -> None:
     cfg = get_cfg()
     if not yes:
         logger.error(
@@ -2236,6 +2207,34 @@ def rewrite_legacy_args(argv: list[str]) -> list[str]:
     return argv
 
 
+# Dispatch table mapping CLI commands to handler functions.
+# Handler signatures must not use default argument values;
+# defaults are owned by the argument parser so they stay in
+# one place and argparse help text stays accurate.
+COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
+    "automate disable": do_automate_disable,
+    "automate enable": do_automate_enable,
+    "automate log-files": do_automate_log_files,
+    "automate status": do_automate_status,
+    "break-lock": do_break_lock,
+    "check age": do_check_age,
+    "check all": do_check_all,
+    "check archives": do_check_archives,
+    "check prune": do_check_prune,
+    "check repo": do_check_repo,
+    "compact": do_compact,
+    "create": do_create,
+    "delete": do_delete,
+    "environment": do_environment,
+    "extract": do_extract,
+    "list": do_list,
+    "prune": do_prune,
+    "repair delete-cache": do_repair_delete_cache,
+    "repair repo": do_repair_repo,
+    "rsync": do_rsync,
+}
+
+
 def main() -> None:
     sys.argv = rewrite_legacy_args(sys.argv)
     args = args_parser().parse_args()
@@ -2268,33 +2267,21 @@ def main() -> None:
 
     initialize_borg_environment()
 
-    if command not in [
-        "break-lock",
-        "compact",
-        "environment",
-        "repair",
-    ]:
+    backup_set_commands = {
+        "check",
+        "create",
+        "delete",
+        "extract",
+        "list",
+        "prune",
+        "rsync",
+    }
+    if command in backup_set_commands:
         logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
-    command_callbacks: dict[str, Callable[..., Any]] = {
-        "automate": do_automate,
-        "break-lock": do_break_lock,
-        "check": do_check,
-        "compact": do_compact,
-        "create": do_create,
-        "delete": do_delete,
-        "environment": do_environment,
-        "extract": do_extract,
-        "list": do_list,
-        "prune": do_prune,
-        "repair": do_repair,
-        "rsync": do_rsync,
-    }
     quick_commands = {"automate", "environment", "list", "self-test"}
-    cmd_label = command
-    action = args_dict.get("action")
-    if action:
-        cmd_label += f" {action}"
+    action = args_dict.pop("action", None)
+    cmd_label = f"{command} {action}" if action else command
     global _notify_title
     _notify_title = f"borgadm {cmd_label}"
     timed = command not in quick_commands
@@ -2303,7 +2290,7 @@ def main() -> None:
         cmd_start = time.perf_counter()
 
     try:
-        command_callbacks[command](**args_dict)
+        COMMAND_CALLBACKS[cmd_label](**args_dict)
     except SystemExit as e:
         if e.code != 0:
             osascript_notify()
