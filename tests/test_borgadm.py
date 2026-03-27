@@ -361,7 +361,7 @@ class TestRepair:
             )
 
     def test_repair_repo_without_yes_exits(self, mock_cfg: Any) -> None:
-        """Test that repair repo without --yes exits with error."""
+        """Test that repair repo without --yes raises BorgadmError."""
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
             patch.object(
@@ -370,10 +370,9 @@ class TestRepair:
                 autospec=True,
                 return_value=["borg"],
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_repair_repo(progress=False, yes=False)
-        assert exc_info.value.code == ba.ExitCode.ERROR
         mock_run_cmd.assert_not_called()
 
     def test_repair_repo(self, mock_cfg: Any) -> None:
@@ -520,7 +519,7 @@ class TestDelete:
             )
 
     def test_delete_latest_no_backups(self, mock_cfg: Any) -> None:
-        """Test --latest with no backups exits with error."""
+        """Test --latest with no backups raises BorgadmError."""
         with (
             patch.object(
                 ba,
@@ -528,7 +527,7 @@ class TestDelete:
                 autospec=True,
                 return_value={},
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_delete(
                 archive=None,
@@ -536,7 +535,6 @@ class TestDelete:
                 latest=True,
                 progress=False,
             )
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_delete_by_timestamp(self, mock_cfg: Any) -> None:
         """Test deleting all archives at a timestamp."""
@@ -602,7 +600,7 @@ class TestDelete:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_delete(
                 archive="20250101_120000",
@@ -610,7 +608,6 @@ class TestDelete:
                 latest=False,
                 progress=False,
             )
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_delete_by_archive_name(self, mock_cfg: Any) -> None:
         """Test deleting a single archive by full name."""
@@ -668,7 +665,7 @@ class TestDelete:
                 autospec=True,
                 return_value=raw_result,
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_delete(
                 archive="home-set1-20250101_120000",
@@ -676,7 +673,6 @@ class TestDelete:
                 latest=False,
                 progress=False,
             )
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_delete_dry_run(self, mock_cfg: Any) -> None:
         """Test that --dry-run passes --dry-run to borg."""
@@ -1277,26 +1273,24 @@ class TestAutomate:
         assert result == os.path.abspath(ba.__file__)
 
     def test_automate_exits_on_non_darwin(self, mock_cfg: Any) -> None:
-        """Test that automate exits with error on non-Darwin."""
+        """Test that automate raises BorgadmError on non-Darwin."""
         with (
             patch.object(ba.platform, "system", return_value="Linux"),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_automate_enable()
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_plutil(self, mock_cfg: Any) -> None:
-        """Test that automate exits when plutil is not found."""
+        """Test that automate raises when plutil is not found."""
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba.shutil, "which", side_effect=lambda x: None),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_automate_enable()
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_automate_exits_without_launchctl(self, mock_cfg: Any) -> None:
-        """Test that automate exits when launchctl is not found."""
+        """Test that automate raises when launchctl is not found."""
 
         def which_side_effect(cmd: str) -> str | None:
             return "/usr/bin/plutil" if cmd == "plutil" else None
@@ -1304,10 +1298,9 @@ class TestAutomate:
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba.shutil, "which", side_effect=which_side_effect),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.BorgadmError),
         ):
             ba.do_automate_enable()
-        assert exc_info.value.code == ba.ExitCode.ERROR
 
     def test_daily_task_runs_checks_independently(
         self, automate_env: Any
@@ -1522,16 +1515,15 @@ class TestCheck:
             )
 
     def test_check_age_no_backups(self, mock_cfg: Any) -> None:
-        """Test check age exits with EXIT_CHECK_NO_BACKUPS."""
+        """Test check age raises CheckNoBackupsError."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.CheckNoBackupsError),
         ):
             ba.do_check_age()
-        assert exc_info.value.code == ba.ExitCode.CHECK_NO_BACKUPS
 
     def test_check_age_too_old(self, mock_cfg: Any) -> None:
-        """Test check age exits with EXIT_CHECK_AGE."""
+        """Test check age raises CheckAgeError."""
         old_ts = (datetime.now() - timedelta(hours=48)).strftime(
             "%Y%m%d_%H%M%S"
         )
@@ -1542,10 +1534,9 @@ class TestCheck:
                 autospec=True,
                 return_value={old_ts: ["repo::backup"]},
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.CheckAgeError),
         ):
             ba.do_check_age()
-        assert exc_info.value.code == ba.ExitCode.CHECK_AGE
 
     def test_check_age_ok(self, mock_cfg: Any) -> None:
         """Test check age succeeds when backup is recent."""
@@ -1561,13 +1552,12 @@ class TestCheck:
             ba.do_check_age()  # Should not raise
 
     def test_check_archives_no_backups(self, mock_cfg: Any) -> None:
-        """Test check archives exits with EXIT_CHECK_NO_BACKUPS."""
+        """Test check archives raises CheckNoBackupsError."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.CheckNoBackupsError),
         ):
             ba.do_check_archives(progress=False)
-        assert exc_info.value.code == ba.ExitCode.CHECK_NO_BACKUPS
 
     def test_check_prune_partial_archives(self, mock_cfg: Any) -> None:
         """Test check prune fails on partial archives."""
@@ -1588,10 +1578,9 @@ class TestCheck:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.CheckPruneError),
         ):
             ba.do_check_prune()
-        assert exc_info.value.code == ba.ExitCode.CHECK_PRUNE
 
     def test_check_prune_unpruned_backups(self, mock_cfg: Any) -> None:
         """Test check prune fails when old backups need pruning."""
@@ -1619,10 +1608,9 @@ class TestCheck:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(SystemExit) as exc_info,
+            pytest.raises(ba.CheckPruneError),
         ):
             ba.do_check_prune()
-        assert exc_info.value.code == ba.ExitCode.CHECK_PRUNE
 
     def test_check_prune_ok(self, mock_cfg: Any) -> None:
         """Test check prune succeeds when no pruning needed."""
@@ -1648,13 +1636,11 @@ class TestCheck:
             ba.do_check_prune()  # Should not raise
 
     def test_warning_exit_triggers_notification(self, mock_cfg: Any) -> None:
-        """Verify osascript_notify is called when exiting via WARNING."""
+        """Verify osascript_notify is called when _warning_occurred."""
         original_warning = getattr(ba, "_warning_occurred")
-        original_notifications = getattr(ba, "_enable_notifications")
         original_title = getattr(ba, "_notify_title")
         try:
             setattr(ba, "_warning_occurred", True)
-            setattr(ba, "_enable_notifications", True)
             with (
                 patch.object(
                     ba, "osascript_notify", autospec=True
@@ -1682,14 +1668,18 @@ class TestCheck:
                     ba.COMMAND_CALLBACKS,
                     {"check age": lambda **_: None},
                 ),
-                pytest.raises(SystemExit) as exc_info,
             ):
-                ba.main()
-            assert exc_info.value.code == ba.ExitCode.WARNING
+                ba.main(
+                    command="check",
+                    config=str(ba.CONFIG),
+                    verbose=False,
+                    timestamp_messages=False,
+                    enable_notifications=True,
+                    args_dict={"action": "age"},
+                )
             mock_notify.assert_called_once()
         finally:
             setattr(ba, "_warning_occurred", original_warning)
-            setattr(ba, "_enable_notifications", original_notifications)
             setattr(ba, "_notify_title", original_title)
 
 
@@ -1703,11 +1693,9 @@ class TestNotifyTitle:
     def test_notify_title_used_in_dialog(self) -> None:
         """osascript_notify uses _notify_title in the dialog title."""
         original_title = getattr(ba, "_notify_title")
-        original_notifications = getattr(ba, "_enable_notifications")
         original_buffer = getattr(ba, "_logger_buffer", None)
         try:
             setattr(ba, "_notify_title", "borgadm check repo")
-            setattr(ba, "_enable_notifications", True)
             setattr(ba, "_logger_buffer", io.StringIO("test error"))
             with (
                 patch.object(ba, "has_tty", return_value=False),
@@ -1723,7 +1711,6 @@ class TestNotifyTitle:
             assert '"borgadm check repo error"' in script_arg
         finally:
             setattr(ba, "_notify_title", original_title)
-            setattr(ba, "_enable_notifications", original_notifications)
             if original_buffer is not None:
                 setattr(ba, "_logger_buffer", original_buffer)
 
@@ -1756,7 +1743,14 @@ class TestNotifyTitle:
                     {"check repo": lambda **_: None},
                 ),
             ):
-                ba.main()
+                ba.main(
+                    command="check",
+                    config=str(ba.CONFIG),
+                    verbose=False,
+                    timestamp_messages=False,
+                    enable_notifications=False,
+                    args_dict={"action": "repo"},
+                )
             assert getattr(ba, "_notify_title") == "borgadm check repo"
         finally:
             setattr(ba, "_notify_title", original_title)
@@ -1820,10 +1814,20 @@ class TestStartEndMarkers:
             ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.dict(ba.COMMAND_CALLBACKS, {"break-lock": lambda **_: None}),
+            patch.dict(
+                ba.COMMAND_CALLBACKS,
+                {"break-lock": lambda **_: None},
+            ),
             caplog.at_level(logging.INFO),
         ):
-            ba.main()
+            ba.main(
+                command="break-lock",
+                config=str(ba.CONFIG),
+                verbose=False,
+                timestamp_messages=False,
+                enable_notifications=False,
+                args_dict={},
+            )
 
         assert any(
             "borgadm break-lock: started" in r.message for r in caplog.records
@@ -1842,10 +1846,20 @@ class TestStartEndMarkers:
             ),
             patch.object(ba, "initialize_logger", autospec=True),
             patch.object(ba, "initialize_borg_environment", autospec=True),
-            patch.dict(ba.COMMAND_CALLBACKS, {"environment": lambda **_: None}),
+            patch.dict(
+                ba.COMMAND_CALLBACKS,
+                {"environment": lambda **_: None},
+            ),
             caplog.at_level(logging.INFO),
         ):
-            ba.main()
+            ba.main(
+                command="environment",
+                config=str(ba.CONFIG),
+                verbose=False,
+                timestamp_messages=False,
+                enable_notifications=False,
+                args_dict={},
+            )
 
         assert not any("started" in r.message for r in caplog.records)
         assert not any("finished" in r.message for r in caplog.records)
@@ -1867,7 +1881,14 @@ class TestStartEndMarkers:
             ),
             caplog.at_level(logging.INFO),
         ):
-            ba.main()
+            ba.main(
+                command="check",
+                config=str(ba.CONFIG),
+                verbose=False,
+                timestamp_messages=False,
+                enable_notifications=False,
+                args_dict={"action": "age"},
+            )
 
         assert any(
             "borgadm check age: started" in r.message for r in caplog.records
@@ -1890,19 +1911,20 @@ class TestStartEndMarkers:
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.dict(
                 ba.COMMAND_CALLBACKS,
-                {
-                    "compact": Mock(
-                        side_effect=subprocess.CalledProcessError(
-                            1, ["borg", "compact"]
-                        )
-                    )
-                },
+                {"compact": Mock(side_effect=ba.BorgadmError("test error"))},
             ),
             patch.object(ba, "osascript_notify", autospec=True),
             caplog.at_level(logging.INFO),
-            pytest.raises(SystemExit),
+            pytest.raises(ba.BorgadmError),
         ):
-            ba.main()
+            ba.main(
+                command="compact",
+                config=str(ba.CONFIG),
+                verbose=False,
+                timestamp_messages=False,
+                enable_notifications=False,
+                args_dict={},
+            )
 
         assert any(
             "borgadm compact: finished (elapsed:" in r.message
@@ -2036,9 +2058,8 @@ class TestTimestampPruning:
         )
         config_file.flush()
 
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(ba.ConfigError):
             ba.Config(config_file.name, {})
-        assert exc_info.value.code == ba.ExitCode.CONFIG
 
 
 class TestBrokenPipeHandling:
@@ -2135,6 +2156,72 @@ class TestCreatePlistElement:
         assert d["Nice"] == 0
         assert d["LowPriorityIO"] is False
         assert d["PreventSleep"] is True
+
+
+class TestCli:
+    """Test cli() entry point."""
+
+    def test_cli_returns_success(self, mock_cfg: Any, caplog: Any) -> None:
+        """cli() returns SUCCESS when main() completes normally."""
+        with (
+            patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(ba, "main", autospec=True),
+        ):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+
+    def test_cli_returns_warning(self, mock_cfg: Any) -> None:
+        """cli() returns WARNING when _warning_occurred is set."""
+        original = getattr(ba, "_warning_occurred")
+        try:
+            with (
+                patch("sys.argv", ["borgadm", "environment"]),
+                patch.object(ba, "main", autospec=True),
+            ):
+                setattr(ba, "_warning_occurred", True)
+                assert ba.cli() == ba.ExitCode.WARNING
+        finally:
+            setattr(ba, "_warning_occurred", original)
+
+    def test_cli_catches_borgadm_error(self, mock_cfg: Any) -> None:
+        """cli() catches BorgadmError and returns its exit_code."""
+        with (
+            patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(
+                ba,
+                "main",
+                autospec=True,
+                side_effect=ba.ConfigError("bad config"),
+            ),
+        ):
+            assert ba.cli() == ba.ExitCode.CONFIG
+
+    def test_cli_help_returns_success(self) -> None:
+        """--help returns SUCCESS."""
+        with patch("sys.argv", ["borgadm", "--help"]):
+            try:
+                ba.cli()
+            except SystemExit as e:
+                assert e.code == 0
+
+
+class TestExceptionHierarchy:
+    """Test BorgadmError exception hierarchy."""
+
+    def test_all_exit_codes_have_exception(self) -> None:
+        """Every non-success/warning ExitCode has an exception."""
+        all_classes = [ba.BorgadmError] + ba.BorgadmError.__subclasses__()
+        covered = {cls.exit_code for cls in all_classes}
+        expected = set(ba.ExitCode) - {
+            ba.ExitCode.SUCCESS,
+            ba.ExitCode.WARNING,
+            ba.ExitCode.USAGE,
+        }
+        assert covered == expected
+
+    def test_exception_exit_codes_are_unique(self) -> None:
+        """No two exception subclasses share an exit_code."""
+        codes = [cls.exit_code for cls in ba.BorgadmError.__subclasses__()]
+        assert len(codes) == len(set(codes))
 
 
 class TestCodeQuality(CodeQualityBase):
