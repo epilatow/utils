@@ -11,7 +11,6 @@ Comprehensive unit tests for secure_archiver
 
 from __future__ import annotations
 
-import argparse
 import importlib.machinery
 import importlib.util
 import json
@@ -21,7 +20,7 @@ from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase, ExceptionHierarchyBase
+from conftest import CmdCallbacksBase, CodeQualityBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -1378,8 +1377,7 @@ include = [
 """)
 
         # Run update
-        cfg = sa.load_config(config_file)
-        sa.do_update(cfg, dry_run=False, force_update=False)
+        sa.do_update(config_file, dry_run=False, force_update=False)
 
         # Verify archive was created (with timestamp in filename)
         archive = sa.find_latest_archive(out_dir, "TestArchive")
@@ -1511,8 +1509,7 @@ include = [
 ]
 """)
 
-        cfg = sa.load_config(config_file)
-        sa.do_update(cfg, dry_run=False, force_update=False)
+        sa.do_update(config_file, dry_run=False, force_update=False)
 
         # Verify archive was created
         archive = sa.find_latest_archive(out_dir, "ReadmeTest")
@@ -1571,122 +1568,94 @@ class TestRunTests:
         assert sa.do_self_test(verbose=False, coverage=False) == 1
 
 
-class TestMain:
-    """Test main function and command dispatch."""
+class TestCmdCallbacks(CmdCallbacksBase):
+    """Test COMMAND_CALLBACKS dispatch table."""
 
-    @patch("secure_archiver.do_update", autospec=True)
-    @patch("secure_archiver.load_config", autospec=True)
-    def test_main_create_command(
-        self, mock_load_config: MagicMock, mock_do_update: MagicMock
-    ) -> None:
-        """Test main dispatches to do_update for create command."""
-        mock_load_config.return_value = {"general": {}, "archive": {}}
-        args = argparse.Namespace(
-            command="create", config=None, dry_run=False, force_update=False
-        )
+    CALLBACKS = sa.COMMAND_CALLBACKS
+    PARSER_FUNC = staticmethod(sa.build_parser)
 
-        sa.main(args)
-
-        assert mock_do_update.called
-        assert mock_load_config.called
-
-    @patch("secure_archiver.do_write_example_config", autospec=True)
-    def test_main_write_example_config_command(
-        self, mock_do_write_example_config: MagicMock
-    ) -> None:
-        """Test main dispatches to do_write_example_config."""
-        args = argparse.Namespace(
-            command="write-example-config", output_file=Path("/tmp/test.toml")
-        )
-
-        sa.main(args)
-
-        assert mock_do_write_example_config.called
-        # Verify the path argument was passed correctly
-        call_args = mock_do_write_example_config.call_args
-        assert call_args[0][0] == Path("/tmp/test.toml")
-
-    @patch("secure_archiver.do_check_config", autospec=True)
-    def test_main_check_config_command(
-        self, mock_do_check_config: MagicMock
-    ) -> None:
-        """Test main dispatches to do_check_config."""
-        args = argparse.Namespace(
-            command="check-config", config=Path("/tmp/test.toml")
-        )
-
-        sa.main(args)
-
-        assert mock_do_check_config.called
-        # Verify the config argument was passed correctly
-        call_args = mock_do_check_config.call_args
-        assert call_args[0][0] == Path("/tmp/test.toml")
-
-    def test_main_no_command(self) -> None:
-        """Test main raises UsageError if no subcommand is specified."""
-        args = argparse.Namespace(command=None)
-
-        with pytest.raises(sa.UsageError, match="No subcommand"):
-            sa.main(args)
+    def test_no_command_returns_usage(self) -> None:
+        """cli() returns USAGE when no subcommand given."""
+        with patch("sys.argv", ["prog"]):
+            result = sa.cli()
+        assert result == sa.ExitCode.USAGE
 
 
 class TestCli:
     """Test cli() function argument parsing and exception handling."""
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_returns_success(self, mock_main: MagicMock) -> None:
-        """cli() returns SUCCESS when main() succeeds."""
-        with patch("sys.argv", ["prog", "check-config"]):
+    def test_cli_returns_success(self) -> None:
+        """cli() returns SUCCESS when callback succeeds."""
+        mock_cb = MagicMock()
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.SUCCESS
+        assert mock_cb.called
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_usage_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_usage_error(self) -> None:
         """cli() catches UsageError and returns USAGE."""
-        mock_main.side_effect = sa.UsageError("test usage error")
-        with patch("sys.argv", ["prog", "check-config"]):
+        mock_cb = MagicMock(side_effect=sa.UsageError("test usage error"))
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.USAGE
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_config_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_config_error(self) -> None:
         """cli() catches ConfigError and returns CONFIG."""
-        mock_main.side_effect = sa.ConfigError("test config error")
-        with patch("sys.argv", ["prog", "check-config"]):
+        mock_cb = MagicMock(side_effect=sa.ConfigError("test config error"))
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.CONFIG
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_not_found_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_not_found_error(self) -> None:
         """cli() catches NotFoundError and returns NOT_FOUND."""
-        mock_main.side_effect = sa.NotFoundError("not found")
-        with patch("sys.argv", ["prog", "check-config"]):
+        mock_cb = MagicMock(side_effect=sa.NotFoundError("not found"))
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.NOT_FOUND
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_subprocess_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_subprocess_error(self) -> None:
         """cli() catches SubprocessError and returns SUBPROCESS."""
-        mock_main.side_effect = sa.SubprocessError(
-            1, ["test", "command"], "stdout", "stderr"
+        mock_cb = MagicMock(
+            side_effect=sa.SubprocessError(
+                1, ["test", "command"], "stdout", "stderr"
+            )
         )
-        with patch("sys.argv", ["prog", "check-config"]):
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.SUBPROCESS
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_unexpected_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_unexpected_error(self) -> None:
         """cli() catches unexpected exceptions and returns ERROR."""
-        mock_main.side_effect = RuntimeError("unexpected error")
-        with patch("sys.argv", ["prog", "check-config"]):
+        mock_cb = MagicMock(side_effect=RuntimeError("unexpected error"))
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.ERROR
 
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_collision_error(self, mock_main: MagicMock) -> None:
+    def test_cli_handles_collision_error(self) -> None:
         """cli() catches CollisionError and returns ERROR."""
-        mock_main.side_effect = sa.CollisionError("collision")
-        with patch("sys.argv", ["prog", "check-config"]):
+        mock_cb = MagicMock(side_effect=sa.CollisionError("collision"))
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
+            patch("sys.argv", ["prog", "check-config"]),
+        ):
             result = sa.cli()
         assert result == sa.ExitCode.ERROR
 

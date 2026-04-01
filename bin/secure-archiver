@@ -25,7 +25,16 @@ import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 try:
     import tomllib
@@ -1223,7 +1232,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def do_update(
-    cfg: Config,
+    config: Optional[Path],
     *,
     dry_run: bool,
     force_update: bool,
@@ -1232,10 +1241,11 @@ def do_update(
     Execute archive update operation.
 
     Args:
-        cfg: Validated configuration
+        config: Path to config TOML file
         dry_run: Do all work but don't modify output directory
         force_update: Publish even if archive contents unchanged
     """
+    cfg = load_config(config)
     # Locale-aware lexical sorting per current locale
     locale.setlocale(locale.LC_COLLATE, "")
 
@@ -1322,26 +1332,11 @@ def do_check_config(config_path: Optional[Path]) -> None:
     eprint(f"Config is valid: {resolved_path}")
 
 
-def main(args: argparse.Namespace) -> None:
-    """Dispatch to subcommand based on parsed arguments."""
-    # Handle missing subcommand
-    if not args.command:
-        raise UsageError("No subcommand specified. Use --help for usage.")
-
-    match args.command:
-        case "create":
-            cfg = load_config(args.config)
-            do_update(
-                cfg,
-                dry_run=args.dry_run,
-                force_update=args.force_update,
-            )
-        case "write-example-config":
-            do_write_example_config(args.output_file)
-        case "check-config":
-            do_check_config(args.config)
-        case _:
-            raise UsageError(f"Unknown command '{args.command}'")
+COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+    "create": do_update,
+    "write-example-config": do_write_example_config,
+    "check-config": do_check_config,
+}
 
 
 def cli() -> int:
@@ -1354,11 +1349,23 @@ def cli() -> int:
             return ExitCode.SUCCESS
         return ExitCode.USAGE
 
-    if args.command == "self-test":
-        return do_self_test(verbose=args.verbose, coverage=args.coverage)
+    args_dict = vars(args)
+    command = args_dict.pop("command")
+
+    if not command:
+        eprint("ERROR: No subcommand specified. Use --help for usage.")
+        return ExitCode.USAGE
+
+    if command == "self-test":
+        return do_self_test(
+            verbose=args_dict.pop("verbose"),
+            coverage=args_dict.pop("coverage"),
+        )
 
     try:
-        main(args)
+        COMMAND_CALLBACKS[command](**args_dict)
+    except KeyError:
+        raise UsageError(f"Unknown command '{command}'")
     except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
         return e.exit_code

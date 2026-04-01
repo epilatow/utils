@@ -33,7 +33,7 @@ if hasattr(signal, "SIGPIPE"):
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Configure logging to stderr
 logging.basicConfig(
@@ -807,7 +807,7 @@ def do_list(
     domains: list[str] | None,
     container: str | None,
     fmt: str,
-    sources: list[str] | None = None,
+    sources: list[str] | None,
 ) -> None:
     """Extract/list cookies to stdout."""
     firefox_dir = find_firefox_dir()
@@ -835,7 +835,7 @@ def do_list(
 def do_list_domains(
     profile: str | None,
     container: str | None,
-    sources: list[str] | None = None,
+    sources: list[str] | None,
 ) -> None:
     """List domains with cookie counts."""
     firefox_dir = find_firefox_dir()
@@ -889,7 +889,7 @@ def do_list_profiles() -> None:
 
 def do_list_containers(
     profile: str | None,
-    sources: list[str] | None = None,
+    sources: list[str] | None,
 ) -> None:
     """List containers with cookie counts."""
     firefox_dir = find_firefox_dir()
@@ -1106,36 +1106,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # =============================================================================
-# Main
+# Command Dispatch
 # =============================================================================
 
-
-def main(args: argparse.Namespace) -> None:
-    """Dispatch to subcommand based on parsed arguments."""
-    match args.command:
-        case "list":
-            do_list(
-                profile=args.profile,
-                domains=args.domains,
-                container=args.container,
-                fmt=args.fmt,
-                sources=args.sources,
-            )
-        case "list-domains":
-            do_list_domains(
-                profile=args.profile,
-                container=args.container,
-                sources=args.sources,
-            )
-        case "list-profiles":
-            do_list_profiles()
-        case "list-containers":
-            do_list_containers(
-                profile=args.profile,
-                sources=args.sources,
-            )
-        case _:
-            raise UsageError(f"Unknown command: {args.command}")
+COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+    "list": do_list,
+    "list-domains": do_list_domains,
+    "list-profiles": do_list_profiles,
+    "list-containers": do_list_containers,
+}
 
 
 def cli() -> int:
@@ -1148,14 +1127,20 @@ def cli() -> int:
             return ExitCode.SUCCESS
         return ExitCode.USAGE
 
-    if args.command == "self-test":
+    args_dict = vars(args)
+    command = args_dict.pop("command")
+    args_dict.pop("_seen_flags", None)
+
+    if command == "self-test":
         return do_self_test(
-            verbose=args.verbose,
-            coverage=args.coverage,
+            verbose=args_dict.pop("verbose"),
+            coverage=args_dict.pop("coverage"),
         )
 
     try:
-        main(args)
+        COMMAND_CALLBACKS[command](**args_dict)
+    except KeyError:
+        raise UsageError(f"Unknown command: {command}")
     except FirefoxCookiesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code

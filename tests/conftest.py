@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import atexit
+import inspect
 import os
 import shutil
 import subprocess
@@ -190,6 +192,94 @@ class ExceptionHierarchyBase:
             if "exit_code" in cls.__dict__
         ]
         assert len(codes) == len(set(codes))
+
+
+class CmdCallbacksBase:
+    """Base class for command callback table tests.
+
+    Subclasses must define CALLBACKS, PARSER_FUNC, and
+    SELF_TEST_CMD.
+    """
+
+    CALLBACKS: ClassVar[Any]
+    PARSER_FUNC: ClassVar[Any]
+    SELF_TEST_CMD: ClassVar[str] = "self-test"
+
+    @staticmethod
+    def _parser_commands(
+        parser: argparse.ArgumentParser,
+        prefix: str = "",
+    ) -> set[str]:
+        """Discover all command strings from the parser.
+
+        Handles both flat and nested subparsers, building
+        compound keys like ``"check age"`` for nested ones.
+        """
+        commands: set[str] = set()
+        for action in parser._actions:
+            if not isinstance(
+                action, argparse._SubParsersAction
+            ):
+                continue
+            for cmd, sub in action.choices.items():
+                label = f"{prefix} {cmd}".strip()
+                nested = CmdCallbacksBase._parser_commands(
+                    sub, label
+                )
+                if nested:
+                    commands |= nested
+                else:
+                    commands.add(label)
+        return commands
+
+    def test_dispatch_covers_all_commands(self) -> None:
+        """COMMAND_CALLBACKS matches parser commands."""
+        parser = type(self).PARSER_FUNC()
+        parser_cmds = self._parser_commands(parser)
+        parser_cmds.discard(self.SELF_TEST_CMD)
+        assert set(self.CALLBACKS.keys()) == parser_cmds
+
+    def test_dispatch_handlers_have_no_defaults(
+        self,
+    ) -> None:
+        """Dispatch handlers don't define default values."""
+        for cmd, fn in self.CALLBACKS.items():
+            sig = inspect.signature(fn)
+            for name, param in sig.parameters.items():
+                assert (
+                    param.default is inspect.Parameter.empty
+                ), (
+                    f"{fn.__name__}({name}=...) has a "
+                    f"default; defaults belong in the "
+                    f"argument parser"
+                )
+
+    def test_all_subcommands_have_help(self) -> None:
+        """All subcommands and arguments have help text."""
+        parser = type(self).PARSER_FUNC()
+
+        def check_parser(
+            p: argparse.ArgumentParser, path: str
+        ) -> None:
+            for action in p._actions:
+                if isinstance(action, argparse._HelpAction):
+                    continue
+                if isinstance(
+                    action, argparse._SubParsersAction
+                ):
+                    assert action.choices, (
+                        f"Empty subparsers in '{path}'"
+                    )
+                    for name, sub in action.choices.items():
+                        check_parser(sub, f"{path} {name}")
+                    continue
+                assert action.help and action.help.strip(), (
+                    f"Missing help for argument(s) "
+                    f"{action.option_strings or action.dest}"
+                    f" in '{path}'"
+                )
+
+        check_parser(parser, parser.prog)
 
 
 def run_tests(

@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import collections
 import importlib.machinery
-import inspect
 import io
 import importlib.util
 import logging
@@ -29,7 +28,11 @@ from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase, ExceptionHierarchyBase
+from conftest import (
+    CmdCallbacksBase,
+    CodeQualityBase,
+    ExceptionHierarchyBase,
+)
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -129,27 +132,6 @@ class TestArgumentParser:
         """Verify parser can be built without errors."""
         parser = ba.args_parser()
         assert parser is not None
-
-    def test_all_subcommands_have_help(self) -> None:
-        """Verify all subcommands and arguments have help text."""
-        parser = ba.args_parser()
-
-        def check_parser(p: argparse.ArgumentParser, path: str) -> None:
-            for action in p._actions:
-                if isinstance(action, argparse._HelpAction):
-                    continue
-                if isinstance(action, argparse._SubParsersAction):
-                    assert action.choices, f"Empty subparsers in '{path}'"
-                    for name, subparser in action.choices.items():
-                        check_parser(subparser, f"{path} {name}")
-                    continue
-                assert action.help and action.help.strip(), (
-                    f"Missing help for argument(s) "
-                    f"{action.option_strings or action.dest} "
-                    f"in '{path}'"
-                )
-
-        check_parser(parser, "borgadm")
 
     def test_check_legacy_rewrite(self) -> None:
         """Test legacy check-* commands are rewritten to check *."""
@@ -300,40 +282,12 @@ class TestArgumentParser:
                         )
                 break
 
-    @staticmethod
-    def _parser_commands() -> set[str]:
-        """Discover all command[+action] strings from the parser."""
-        parser = ba.args_parser()
-        commands: set[str] = set()
-        for action in parser._actions:
-            if not isinstance(action, argparse._SubParsersAction):
-                continue
-            for cmd, cmd_parser in action.choices.items():
-                has_sub = False
-                for sub in cmd_parser._actions:
-                    if isinstance(sub, argparse._SubParsersAction):
-                        has_sub = True
-                        for act in sub.choices:
-                            commands.add(f"{cmd} {act}")
-                if not has_sub:
-                    commands.add(cmd)
-        return commands
 
-    def test_dispatch_covers_all_commands(self) -> None:
-        """Verify COMMAND_CALLBACKS matches parser commands exactly."""
-        parser_cmds = self._parser_commands() - {"self-test"}
-        dispatch_cmds = set(ba.COMMAND_CALLBACKS.keys())
-        assert parser_cmds == dispatch_cmds
+class TestCmdCallbacks(CmdCallbacksBase):
+    """Test COMMAND_CALLBACKS table."""
 
-    def test_dispatch_handlers_have_no_defaults(self) -> None:
-        """Verify dispatch handlers don't define default arg values."""
-        for cmd, fn in ba.COMMAND_CALLBACKS.items():
-            sig = inspect.signature(fn)
-            for name, param in sig.parameters.items():
-                assert param.default is inspect.Parameter.empty, (
-                    f"{fn.__name__}({name}=...) has a default;"
-                    f" defaults belong in the argument parser"
-                )
+    CALLBACKS = ba.COMMAND_CALLBACKS
+    PARSER_FUNC = ba.args_parser
 
 
 class TestRepair:

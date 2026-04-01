@@ -19,7 +19,7 @@ import traceback
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 
 # =============================================================================
 # DOTFILES DESIGN
@@ -574,8 +574,8 @@ def has_missing(results: List[OperationResult]) -> bool:
 def do_install(
     directory: Optional[Path],
     *,
-    dry_run: bool = False,
-    force: bool = False,
+    dry_run: bool,
+    force: bool,
 ) -> None:
     """Install dotfiles.
 
@@ -622,7 +622,7 @@ def do_install(
 def do_remove(
     directory: Optional[Path],
     *,
-    dry_run: bool = False,
+    dry_run: bool,
 ) -> None:
     """Remove dotfiles.
 
@@ -786,32 +786,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # =============================================================================
-# MAIN AND CLI
+# COMMAND DISPATCH
 # =============================================================================
 
-
-def main(args: argparse.Namespace) -> None:
-    """Dispatch to subcommand based on parsed arguments."""
-    # Handle missing subcommand
-    if not args.command:
-        raise UsageError("No subcommand specified. Use --help for usage.")
-
-    match args.command:
-        case "install":
-            do_install(
-                args.directory,
-                dry_run=args.dry_run,
-                force=args.force,
-            )
-        case "remove":
-            do_remove(
-                args.directory,
-                dry_run=args.dry_run,
-            )
-        case "audit":
-            do_audit(args.directory)
-        case _:
-            raise UsageError(f"Unknown command '{args.command}'")
+COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+    "install": do_install,
+    "remove": do_remove,
+    "audit": do_audit,
+}
 
 
 def cli() -> int:
@@ -824,11 +806,23 @@ def cli() -> int:
             return ExitCode.SUCCESS
         return ExitCode.USAGE
 
-    if args.command == "self-test":
-        return do_self_test(verbose=args.verbose, coverage=args.coverage)
+    args_dict = vars(args)
+    command = args_dict.pop("command")
+
+    if not command:
+        logger.error("ERROR: No subcommand specified. Use --help for usage.")
+        return ExitCode.USAGE
+
+    if command == "self-test":
+        return do_self_test(
+            verbose=args_dict.pop("verbose"),
+            coverage=args_dict.pop("coverage"),
+        )
 
     try:
-        main(args)
+        COMMAND_CALLBACKS[command](**args_dict)
+    except KeyError:
+        raise UsageError(f"Unknown command '{command}'")
     except DotfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
