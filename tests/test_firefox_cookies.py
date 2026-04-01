@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import lz4.block  # type: ignore[import-untyped]
+import lz4.block  # type: ignore[import-untyped,import-not-found]
 
 import pytest  # type: ignore[import-not-found]
-from conftest import ExceptionHierarchyBase
+from conftest import CodeQualityBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -259,7 +259,7 @@ def _make_cookie(
     value: str = "val",
     path: str = "/",
     origin_attributes: str = "",
-) -> fc.Cookie:
+) -> Any:
     """Create a Cookie with sensible defaults for tests."""
     return fc.Cookie(
         host=host,
@@ -2436,6 +2436,13 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         fc.ExitCode.WARNING,
         fc.ExitCode.SUBPROCESS,
     }
+
+
+class TestCodeQuality(CodeQualityBase):
+    """Test code quality with ruff and mypy."""
+
+    SCRIPT_PATH = _script_path
+    TEST_PATH = REPO_ROOT / "tests" / "test_firefox_cookies.py"
 
 
 if __name__ == "__main__":
