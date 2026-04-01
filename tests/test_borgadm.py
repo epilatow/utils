@@ -288,6 +288,21 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
     CALLBACKS = ba.COMMAND_CALLBACKS
     PARSER_FUNC = ba.args_parser
+    POPPED_ARGS = {
+        "validate",
+        "config",
+        "verbose",
+        "timestamp_messages",
+        "enable_notifications",
+        "action",
+        # Consumed by Config constructor:
+        "seconds",
+        "keep_hourly",
+        "keep_daily",
+        "keep_weekly",
+        "keep_monthly",
+        "keep_yearly",
+    }
 
 
 class TestRepair:

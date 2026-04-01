@@ -1309,26 +1309,26 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
     return subprocess.run(cmd, cwd=repo_root).returncode
 
 
-def do_write_example_config(output_path: Path) -> None:
+def do_write_example_config(output_file: Path) -> None:
     """Write an example config file."""
-    if output_path.exists():
-        raise ConfigError(f"File already exists: {output_path}")
-    output_path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
-    eprint(f"Wrote example config to: {output_path}")
+    if output_file.exists():
+        raise ConfigError(f"File already exists: {output_file}")
+    output_file.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+    eprint(f"Wrote example config to: {output_file}")
 
 
-def do_check_config(config_path: Optional[Path]) -> None:
+def do_check_config(config: Optional[Path]) -> None:
     """
     Check if a config file is valid.
 
     Args:
-        config_path: Explicit config path, or None to search default locations.
+        config: Explicit config path, or None to search default locations.
 
     Raises:
         ConfigError: If the config is invalid.
     """
-    load_config(config_path)
-    resolved_path = find_config(config_path)
+    load_config(config)
+    resolved_path = find_config(config)
     eprint(f"Config is valid: {resolved_path}")
 
 

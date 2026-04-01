@@ -12,7 +12,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Iterator
+from unittest.mock import create_autospec
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -204,18 +205,18 @@ class CmdCallbacksBase:
     CALLBACKS: ClassVar[Any]
     PARSER_FUNC: ClassVar[Any]
     SELF_TEST_CMD: ClassVar[str] = "self-test"
+    POPPED_ARGS: ClassVar[set[str]] = set()
 
     @staticmethod
-    def _parser_commands(
+    def _leaf_subparsers(
         parser: argparse.ArgumentParser,
         prefix: str = "",
-    ) -> set[str]:
-        """Discover all command strings from the parser.
+    ) -> Iterator[tuple[str, argparse.ArgumentParser]]:
+        """Yield ``(command_key, subparser)`` for leaf commands.
 
         Handles both flat and nested subparsers, building
         compound keys like ``"check age"`` for nested ones.
         """
-        commands: set[str] = set()
         for action in parser._actions:
             if not isinstance(
                 action, argparse._SubParsersAction
@@ -223,19 +224,23 @@ class CmdCallbacksBase:
                 continue
             for cmd, sub in action.choices.items():
                 label = f"{prefix} {cmd}".strip()
-                nested = CmdCallbacksBase._parser_commands(
-                    sub, label
+                nested = list(
+                    CmdCallbacksBase._leaf_subparsers(
+                        sub, label
+                    )
                 )
                 if nested:
-                    commands |= nested
+                    yield from nested
                 else:
-                    commands.add(label)
-        return commands
+                    yield label, sub
 
     def test_dispatch_covers_all_commands(self) -> None:
         """COMMAND_CALLBACKS matches parser commands."""
         parser = type(self).PARSER_FUNC()
-        parser_cmds = self._parser_commands(parser)
+        parser_cmds = {
+            cmd
+            for cmd, _ in self._leaf_subparsers(parser)
+        }
         parser_cmds.discard(self.SELF_TEST_CMD)
         assert set(self.CALLBACKS.keys()) == parser_cmds
 
@@ -253,6 +258,44 @@ class CmdCallbacksBase:
                     f"default; defaults belong in the "
                     f"argument parser"
                 )
+
+    def test_dispatch_signatures_match_parsers(
+        self,
+    ) -> None:
+        """Callback signatures match their subparser args."""
+        parser = type(self).PARSER_FUNC()
+        subs = dict(self._leaf_subparsers(parser))
+        skip = {"command"} | self.POPPED_ARGS
+
+        for cmd, fn in self.CALLBACKS.items():
+            sub = subs[cmd]
+            # Collect arg dest names from the subparser
+            arg_names = set()
+            for action in sub._actions:
+                if isinstance(
+                    action,
+                    (
+                        argparse._HelpAction,
+                        argparse._SubParsersAction,
+                    ),
+                ):
+                    continue
+                arg_names.add(action.dest)
+            arg_names -= skip
+            arg_names = {
+                n for n in arg_names if not n.startswith("_")
+            }
+
+            # autospec enforces the real signature
+            mock_fn = create_autospec(fn)
+            kwargs = {name: None for name in arg_names}
+            try:
+                mock_fn(**kwargs)
+            except TypeError as e:
+                raise AssertionError(
+                    f"Signature mismatch for '{cmd}' "
+                    f"({fn.__name__}): {e}"
+                ) from e
 
     def test_all_subcommands_have_help(self) -> None:
         """All subcommands and arguments have help text."""
