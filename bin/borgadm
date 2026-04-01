@@ -166,59 +166,11 @@ _PRUNE_KEEP_WEEKLY: int = 4
 _PRUNE_KEEP_MONTHLY: int = 12
 _PRUNE_KEEP_YEARLY: int = 2
 
-# macOS TCC-protected directories that cannot be accessed even with Full Disk
-# Access. These require Apple-private entitlements only available to Apple-
-# signed apps. Auto-excluded on Darwin to prevent backup errors.
-_MACOS_TCC_EXCLUDES: list[str] = [
-    # Application Support - TCC protected
-    "Library/Application Support/AddressBook",
-    "Library/Application Support/CallHistoryDB",
-    "Library/Application Support/CallHistoryTransactions",
-    "Library/Application Support/com.apple.TCC",
-    "Library/Application Support/com.apple.avfoundation",
-    "Library/Application Support/com.apple.sharedfilelist",
-    "Library/Application Support/DifferentialPrivacy",
-    "Library/Application Support/FaceTime",
-    "Library/Application Support/Knowledge",
-    # Library top-level - TCC protected
-    "Library/Accounts",
-    "Library/AppleMediaServices",
-    "Library/Assistant/SiriVocabulary",
-    "Library/Autosave Information",
-    "Library/Biome",
-    "Library/Calendars",
-    "Library/com.apple.aiml.instrumentation",
-    "Library/com.apple.bluetooth.services.cloud",
-    "Library/ContainerManager",
-    "Library/Cookies",
-    "Library/CoreFollowUp",
-    "Library/DoNotDisturb",
-    "Library/DuetExpertCenter",
-    "Library/HomeKit",
-    "Library/IdentityServices",
-    "Library/IntelligencePlatform",
-    "Library/Mail",
-    "Library/Messages",
-    "Library/PersonalizationPortrait",
-    "Library/Reminders",
-    "Library/Safari",
-    "Library/Sharing",
-    "Library/Shortcuts",
-    "Library/StatusKit",
-    "Library/Suggestions",
-    "Library/Trial",
-    "Library/Weather",
-    # Preferences - specific TCC-protected plists
-    "Library/Preferences/com.apple.AddressBook.plist",
-    "Library/Preferences/com.apple.homed.notbackedup.plist",
-    "Library/Preferences/com.apple.homed.plist",
-    "Library/Preferences/com.apple.mail-shared.plist",
-    "Library/Preferences/com.apple.messages.pinning.plist",
-    "Library/Preferences/com.apple.MobileSMS.CKDNDList.plist",
-    "Library/Preferences/com.apple.MobileSMS.plist",
-    # iCloud - causes deadlocks during sync
+# macOS paths auto-excluded on Darwin to prevent backup failures.
+_MACOS_EXCLUDES: list[str] = [
+    # iCloud — causes deadlocks when borg reads during active sync
     "Library/Mobile Documents",
-    # Other permission issues
+    # Contains root-owned files (not a TCC/FDA issue)
     "Library/Google/GoogleSoftwareUpdate",
 ]
 
@@ -1541,17 +1493,17 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 exc_path = Path(exclude)
                 return any(exc_path.is_relative_to(bp) for bp in backup_paths)
 
-            tcc_excludes = [
+            auto_excludes = [
                 e
-                for e in _MACOS_TCC_EXCLUDES
+                for e in _MACOS_EXCLUDES
                 if e not in excludes and is_under_backup_path(e)
             ]
-            if tcc_excludes:
+            if auto_excludes:
                 logger.debug(
-                    f"Auto-excluding {len(tcc_excludes)} macOS TCC-protected "
-                    f"paths for set '{set_name}'"
+                    f"Auto-excluding {len(auto_excludes)} macOS paths"
+                    f" for set '{set_name}'"
                 )
-                excludes.extend(tcc_excludes)
+                excludes.extend(auto_excludes)
         for e in excludes:
             create_args += ["--exclude", e]
         archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}"
