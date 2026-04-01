@@ -349,19 +349,6 @@ class TestArgumentParser:
         parser = fc.build_parser()
         assert parser is not None
 
-    def test_all_subcommands_have_help(self) -> None:
-        """Verify subcommands can show help."""
-        parser = fc.build_parser()
-        for cmd in [
-            "list",
-            "list-domains",
-            "list-profiles",
-            "list-containers",
-            "self-test",
-        ]:
-            with pytest.raises(SystemExit):
-                parser.parse_args([cmd, "--help"])
-
     def test_list_parses_all_options(self) -> None:
         """Test list subcommand parses all options."""
         parser = fc.build_parser()

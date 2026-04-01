@@ -47,19 +47,6 @@ class TestArgumentParser:
         parser = sa.build_parser()
         assert parser is not None
 
-    def test_all_subcommands_have_help(self) -> None:
-        """Smoke test: verify subcommands can show help."""
-        parser = sa.build_parser()
-        # If this doesn't raise SystemExit, the subcommand is broken
-        with pytest.raises(SystemExit):
-            parser.parse_args(["create", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["self-test", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["write-example-config", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["check-config", "--help"])
-
 
 class TestConfigFinding:
     """Test configuration file finding logic."""

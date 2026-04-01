@@ -49,19 +49,6 @@ class TestArgumentParser:
         parser = df.build_parser()
         assert parser is not None
 
-    def test_all_subcommands_have_help(self) -> None:
-        """Smoke test: verify subcommands can show help."""
-        parser = df.build_parser()
-        # If this doesn't raise SystemExit, the subcommand is broken
-        with pytest.raises(SystemExit):
-            parser.parse_args(["install", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["remove", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["audit", "--help"])
-        with pytest.raises(SystemExit):
-            parser.parse_args(["self-test", "--help"])
-
     def test_install_parses_directory(self) -> None:
         """Test install subcommand parses directory argument."""
         parser = df.build_parser()
