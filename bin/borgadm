@@ -16,6 +16,7 @@ import configparser
 import enum
 import fcntl
 import functools
+import hashlib
 import io
 import json
 import logging
@@ -995,25 +996,111 @@ def create_plist_file(element: ElementTree.Element, path: Path) -> None:
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
-def automation_script_path() -> str:
-    """Determine the script path for automation plists.
+def _wrapper_source_path() -> Path:
+    """Return path to the BorgAdm.app C wrapper source."""
+    repo = Path(__file__).parent.parent
+    return repo / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
 
-    Prefers the BorgAdm.app wrapper for Full Disk Access support
-    on macOS. Falls back to the direct script path if the wrapper
-    is not found.
+
+def _wrapper_binary_path() -> Path:
+    """Return path to the compiled BorgAdm.app wrapper binary."""
+    repo = Path(__file__).parent.parent
+    return repo / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+
+
+def _wrapper_app_path() -> Path:
+    """Return path to the BorgAdm.app bundle."""
+    repo = Path(__file__).parent.parent
+    return repo / "Applications/BorgAdm.app"
+
+
+def _wrapper_hash_path() -> Path:
+    """Return path to the stored source hash for the wrapper."""
+    return _wrapper_binary_path().parent / ".BorgAdm.source-sha256"
+
+
+def _source_sha256(path: Path) -> str:
+    """Return hex SHA-256 of a file's contents."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _wrapper_needs_rebuild() -> tuple[bool, str]:
+    """Check if the compiled BorgAdm wrapper needs rebuilding.
+
+    Returns (needs_rebuild, reason).  Reason is empty when no
+    rebuild is needed.  Raises BorgadmError if the C source is
+    missing (incomplete repo).
     """
-    repo_dir = Path(__file__).parent.parent
-    wrapper_app = repo_dir / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
-    if wrapper_app.exists():
-        logger.debug(f"Using wrapper app: {wrapper_app}")
-        return str(wrapper_app)
-    script_path = os.path.abspath(__file__)
-    logger.warning(
-        f"Wrapper app not found at {wrapper_app}. "
-        "Full Disk Access may not work. "
-        "See Applications/BorgBackup.app in the repo."
+    src = _wrapper_source_path()
+    if not src.exists():
+        raise BorgadmError(f"BorgAdm wrapper source missing: {src}")
+    binary = _wrapper_binary_path()
+    if not binary.exists():
+        return True, "binary does not exist"
+    hash_file = _wrapper_hash_path()
+    if not hash_file.exists():
+        return True, "source hash file does not exist"
+    if _source_sha256(src) != hash_file.read_text().strip():
+        return True, "source hash mismatch (source changed)"
+    return False, ""
+
+
+def _build_wrapper() -> None:
+    """Compile and sign the BorgAdm.app wrapper binary.
+
+    Requires Xcode Command Line Tools (provides cc and codesign).
+    """
+    if not shutil.which("cc"):
+        raise BorgadmError(
+            "C compiler (cc) not found. "
+            "Install Xcode Command Line Tools: xcode-select --install"
+        )
+    src = _wrapper_source_path()
+    binary = _wrapper_binary_path()
+    app = _wrapper_app_path()
+
+    # Remove stale artifacts so a failed build can't leave a
+    # hash file that masks an outdated or missing binary.
+    hash_file = _wrapper_hash_path()
+    if hash_file.exists():
+        hash_file.unlink()
+    if binary.exists():
+        binary.unlink()
+
+    logger.info(f"Compiling BorgAdm wrapper: {src}")
+    run_cmd(
+        [
+            "cc",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-O2",
+            "-o",
+            str(binary),
+            str(src),
+        ]
     )
-    return script_path
+    run_cmd(
+        [
+            "codesign",
+            "--force",
+            "--deep",
+            "--sign",
+            "-",
+            str(app),
+        ]
+    )
+
+    # Write hash only after successful compile + sign.
+    hash_file.write_text(_source_sha256(src) + "\n")
+    logger.info("BorgAdm wrapper compiled (FDA re-grant may be needed)")
+
+
+def automation_script_path() -> str:
+    """Return the path to the BorgAdm.app wrapper binary."""
+    binary = _wrapper_binary_path()
+    logger.debug(f"Using wrapper app: {binary}")
+    return str(binary)
 
 
 def _automate_check_platform() -> None:
@@ -1030,12 +1117,20 @@ def _automate_check_platform() -> None:
 _TASK_NAME_TEMPLATE = "local.borgadm.{task}"
 
 
+def _direct_script_path() -> str:
+    """Return the path to borgadm itself (no FDA wrapper)."""
+    return os.path.abspath(__file__)
+
+
 def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
-    script_path = automation_script_path()
+    wrapper_path = automation_script_path()
+    # Check tasks don't read user files — run borgadm directly
+    # (least privilege: no FDA wrapper needed).
+    direct_path = _direct_script_path()
     tasks: dict[str, dict[str, Any]] = {
         "create": {
             "args": [
-                script_path,
+                wrapper_path,
                 "create",
                 "--timestamp-messages",
             ],
@@ -1045,10 +1140,10 @@ def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
             "args": [
                 "/bin/sh",
                 "-c",
-                f"{shlex.quote(script_path)} check age"
+                f"{shlex.quote(direct_path)} check age"
                 f" --enable-notifications"
                 f" --timestamp-messages"
-                f"; {shlex.quote(script_path)} check prune"
+                f"; {shlex.quote(direct_path)} check prune"
                 f" --enable-notifications"
                 f" --timestamp-messages",
             ],
@@ -1058,10 +1153,10 @@ def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
             "args": [
                 "/bin/sh",
                 "-c",
-                f"{shlex.quote(script_path)} check repo"
+                f"{shlex.quote(direct_path)} check repo"
                 f" --enable-notifications"
                 f" --timestamp-messages"
-                f"; {shlex.quote(script_path)} check archives"
+                f"; {shlex.quote(direct_path)} check archives"
                 f" --enable-notifications"
                 f" --timestamp-messages",
             ],
@@ -1185,6 +1280,11 @@ def do_automate_status() -> None:
             needs_update = True
         logger.info(msg)
 
+    rebuild, reason = _wrapper_needs_rebuild()
+    if rebuild:
+        logger.info(f"BorgAdm wrapper needs rebuilding: {reason}")
+        needs_update = True
+
     total = len([t for t in tasks if not tasks[t].get("legacy", False)])
     if enabled_count < total or needs_update:
         logger.info(
@@ -1222,6 +1322,14 @@ def _task_log_path(task: str) -> str:
 
 def do_automate_enable() -> None:
     _automate_check_platform()
+
+    # Build wrapper before generating plists (so the plist paths
+    # point to the compiled binary, not a stale or missing one).
+    rebuild, reason = _wrapper_needs_rebuild()
+    if rebuild:
+        logger.info(f"Rebuilding BorgAdm wrapper: {reason}")
+        _build_wrapper()
+
     tasks, task2path = _automate_tasks()
 
     # Remove any existing configs first
@@ -1250,31 +1358,25 @@ def do_automate_enable() -> None:
         run_cmd(["plutil", str(path)])
         run_cmd(["launchctl", "load", str(path)])
 
-    # Print Full Disk Access instructions if using wrapper app
-    wrapper_app = (
-        Path(__file__).parent.parent
-        / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    # Print Full Disk Access instructions
+    app = _wrapper_app_path()
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("IMPORTANT: Grant Full Disk Access to enable backups")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("1. Run this command to open System Settings:")
+    logger.info("")
+    logger.info(
+        '   open "x-apple.systempreferences:'
+        "com.apple.settings.PrivacySecurity.extension"
+        '?Privacy_AllFiles"'
     )
-    if wrapper_app.exists():
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("IMPORTANT: Grant Full Disk Access to enable backups")
-        logger.info("=" * 60)
-        logger.info("")
-        logger.info("1. Run this command to open System Settings:")
-        logger.info("")
-        logger.info(
-            '   open "x-apple.systempreferences:'
-            "com.apple.settings.PrivacySecurity.extension"
-            '?Privacy_AllFiles"'
-        )
-        logger.info("")
-        logger.info("2. Click the '+' button")
-        logger.info(
-            f"3. Navigate to and add: {wrapper_app.parent.parent.parent}"
-        )
-        logger.info("4. Toggle the switch ON for BorgAdm")
-        logger.info("")
+    logger.info("")
+    logger.info("2. Click the '+' button")
+    logger.info(f"3. Navigate to and add: {app}")
+    logger.info("4. Toggle the switch ON for BorgAdm")
+    logger.info("")
 
 
 def do_break_lock() -> None:

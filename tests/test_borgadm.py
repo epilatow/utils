@@ -18,6 +18,7 @@ import io
 import importlib.util
 import logging
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -961,6 +962,17 @@ class TestAutomate:
             patch.object(
                 ba, "create_plist_file", autospec=True
             ) as mock_create_file,
+            patch.object(
+                ba,
+                "_wrapper_needs_rebuild",
+                autospec=True,
+                return_value=(False, ""),
+            ),
+            patch.object(
+                ba,
+                "_build_wrapper",
+                autospec=True,
+            ),
             patch.dict(os.environ, {"HOME": str(tmp_path)}),
         ):
             mock_run.return_value = subprocess.CompletedProcess(
@@ -1123,6 +1135,12 @@ class TestAutomate:
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(
+                ba,
+                "_wrapper_needs_rebuild",
+                autospec=True,
+                return_value=(False, ""),
+            ),
             patch.dict(os.environ, {"HOME": str(tmp_path)}),
         ):
             mock_run.return_value = subprocess.CompletedProcess(
@@ -1227,19 +1245,69 @@ class TestAutomate:
         assert created == self.CURRENT_TASKS
 
     def test_script_path_uses_wrapper_app(self) -> None:
-        """Test that automation uses wrapper app when it exists."""
+        """Test that automation uses wrapper app path."""
         result = ba.automation_script_path()
-        # The wrapper app exists in this repo
         assert result.endswith(
             "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
         )
 
-    def test_script_path_fallback(self) -> None:
-        """Test fallback to direct script path without wrapper."""
-        with patch("pathlib.Path.exists", return_value=False):
-            result = ba.automation_script_path()
-        assert ba.__file__ is not None
-        assert result == os.path.abspath(ba.__file__)
+    def test_enable_compiles_wrapper(
+        self, tmp_path: Path, mock_cfg: Any
+    ) -> None:
+        """Test that enable calls _build_wrapper when needed."""
+        task_dir = tmp_path / "Library" / "LaunchAgents"
+        task_dir.mkdir(parents=True)
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "create_plist_element", autospec=True),
+            patch.object(ba, "create_plist_file", autospec=True),
+            patch.object(
+                ba,
+                "_wrapper_needs_rebuild",
+                autospec=True,
+                return_value=(True, "test"),
+            ),
+            patch.object(
+                ba,
+                "_build_wrapper",
+                autospec=True,
+            ) as mock_build,
+            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            ba.do_automate_enable()
+        mock_build.assert_called()
+
+    def test_status_reports_wrapper_outdated(
+        self, tmp_path: Path, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """Test that status reports when wrapper needs rebuilding."""
+        task_dir = tmp_path / "Library" / "LaunchAgents"
+        task_dir.mkdir(parents=True)
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(
+                ba,
+                "_wrapper_needs_rebuild",
+                autospec=True,
+                return_value=(True, "test"),
+            ),
+            patch.object(ba, "_build_wrapper", autospec=True),
+            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+            caplog.at_level(logging.INFO),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            ba.do_automate_status()
+        assert any("wrapper" in r.message.lower() for r in caplog.records)
+        assert any("automate enable" in r.message for r in caplog.records)
 
     def test_automate_exits_on_non_darwin(self, mock_cfg: Any) -> None:
         """Test that automate raises BorgadmError on non-Darwin."""
@@ -2184,6 +2252,354 @@ class TestCli:
                 ba.cli()
             except SystemExit as e:
                 assert e.code == 0
+
+
+class TestWrapperRebuild:
+    """Test _wrapper_needs_rebuild() and _build_wrapper()."""
+
+    @pytest.fixture
+    def wrapper_env(self, tmp_path: Path) -> Iterator[tuple[Path, Path, Path]]:
+        """Set up source, binary, and hash paths in tmp_path."""
+        src = tmp_path / "BorgAdm.c"
+        binary = tmp_path / "BorgAdm"
+        hash_file = tmp_path / ".BorgAdm.source-sha256"
+        with (
+            patch.object(
+                ba,
+                "_wrapper_source_path",
+                autospec=True,
+                return_value=src,
+            ),
+            patch.object(
+                ba,
+                "_wrapper_binary_path",
+                autospec=True,
+                return_value=binary,
+            ),
+            patch.object(
+                ba,
+                "_wrapper_hash_path",
+                autospec=True,
+                return_value=hash_file,
+            ),
+        ):
+            yield src, binary, hash_file
+
+    def test_needs_rebuild_no_binary(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Rebuild needed when binary does not exist."""
+        src, _binary, _hash_file = wrapper_env
+        src.write_text("int main(){}")
+        rebuild, reason = ba._wrapper_needs_rebuild()
+        assert rebuild is True
+        assert "binary" in reason
+
+    def test_needs_rebuild_no_hash(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Rebuild needed when hash file does not exist."""
+        src, binary, _hash_file = wrapper_env
+        src.write_text("int main(){}")
+        binary.write_text("binary")
+        rebuild, reason = ba._wrapper_needs_rebuild()
+        assert rebuild is True
+        assert "hash" in reason
+
+    def test_needs_rebuild_hash_mismatch(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Rebuild needed when source hash differs from stored."""
+        src, binary, hash_file = wrapper_env
+        src.write_text("int main(){}")
+        binary.write_text("binary")
+        hash_file.write_text("stale_hash\n")
+        rebuild, reason = ba._wrapper_needs_rebuild()
+        assert rebuild is True
+        assert "mismatch" in reason
+
+    def test_needs_rebuild_current(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """No rebuild when hash matches."""
+        src, binary, hash_file = wrapper_env
+        src.write_text("int main(){}")
+        binary.write_text("binary")
+        hash_file.write_text(ba._source_sha256(src) + "\n")
+        rebuild, reason = ba._wrapper_needs_rebuild()
+        assert rebuild is False
+        assert reason == ""
+
+    def test_needs_rebuild_no_source(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Raises BorgadmError when source is missing."""
+        _src, _binary, _hash_file = wrapper_env
+        # src not created → doesn't exist
+        with pytest.raises(ba.BorgadmError, match="source missing"):
+            ba._wrapper_needs_rebuild()
+
+    def test_build_calls_cc_and_codesign(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Build compiles source and signs the app bundle."""
+        src, binary, _hash_file = wrapper_env
+        src.write_text("int main(){}")
+        with (
+            patch.object(ba.shutil, "which", return_value="/usr/bin/cc"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(
+                ba,
+                "_wrapper_app_path",
+                autospec=True,
+                return_value=Path("/fake/BorgAdm.app"),
+            ),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            ba._build_wrapper()
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        # First call: cc
+        assert calls[0][0] == "cc"
+        assert str(src) in calls[0]
+        assert str(binary) in calls[0]
+        # Second call: codesign
+        assert calls[1][0] == "codesign"
+
+    def test_build_writes_hash(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Build writes source hash after compilation."""
+        src, _binary, hash_file = wrapper_env
+        src.write_text("int main(){}")
+        with (
+            patch.object(ba.shutil, "which", return_value="/usr/bin/cc"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(
+                ba,
+                "_wrapper_app_path",
+                autospec=True,
+                return_value=Path("/fake/BorgAdm.app"),
+            ),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            ba._build_wrapper()
+
+        assert hash_file.exists()
+        assert hash_file.read_text().strip() == ba._source_sha256(src)
+
+    def test_build_raises_without_cc(
+        self, wrapper_env: tuple[Path, Path, Path]
+    ) -> None:
+        """Build raises BorgadmError when cc not found."""
+        src, _binary, _hash_file = wrapper_env
+        src.write_text("int main(){}")
+        with (
+            patch.object(ba.shutil, "which", return_value=None),
+            pytest.raises(ba.BorgadmError, match="cc.*not found"),
+        ):
+            ba._build_wrapper()
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin",
+    reason="BorgAdm wrapper uses macOS-specific APIs (mach-o/dyld.h)",
+)
+class TestWrapperBinary:
+    """Integration tests for the compiled BorgAdm wrapper binary."""
+
+    WRAPPER_SOURCE = REPO_ROOT / (
+        "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
+    )
+
+    @pytest.fixture
+    def wrapper_tree(self, tmp_path: Path) -> Iterator[tuple[Path, Path, Path]]:
+        """Build a temp directory tree matching the expected layout.
+
+        Compiles BorgAdm.c, creates a mock borgadm, and yields
+        (binary_path, mock_borgadm_path, fake_home).
+        """
+        # Mirror: tmp/Applications/BorgAdm.app/Contents/MacOS/
+        macos_dir = (
+            tmp_path / "Applications" / "BorgAdm.app" / "Contents" / "MacOS"
+        )
+        macos_dir.mkdir(parents=True)
+        binary = macos_dir / "BorgAdm"
+
+        # Compile the real source into the temp tree
+        result = subprocess.run(
+            [
+                "cc",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-O2",
+                "-o",
+                str(binary),
+                str(self.WRAPPER_SOURCE),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"Compilation failed: {result.stderr}"
+
+        # Create mock borgadm at tmp/bin/borgadm
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        mock_borgadm = bin_dir / "borgadm"
+        mock_borgadm.write_text(
+            '#!/bin/bash\necho "$@" > "$(dirname "$0")/../args.txt"\n'
+        )
+        mock_borgadm.chmod(0o755)
+
+        # Fake HOME (no TCC dir → FDA check sees ENOENT → proceeds)
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+
+        yield binary, mock_borgadm, fake_home
+
+    def test_source_compiles_to_macho(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Compiled wrapper is a Mach-O binary."""
+        binary, _, _ = wrapper_tree
+        result = subprocess.run(
+            ["file", str(binary)],
+            capture_output=True,
+            text=True,
+        )
+        assert "Mach-O" in result.stdout
+
+    def test_source_compiles_warning_clean(self, tmp_path: Path) -> None:
+        """Source compiles with no warnings under -Wall -Wextra."""
+        binary = tmp_path / "BorgAdm"
+        result = subprocess.run(
+            [
+                "cc",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-O2",
+                "-o",
+                str(binary),
+                str(self.WRAPPER_SOURCE),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"Warnings or errors:\n{result.stderr}"
+
+    def test_forwards_args_to_borgadm(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper forwards command-line arguments to borgadm."""
+        binary, _, fake_home = wrapper_tree
+        args_file = binary.parent.parent.parent.parent.parent / "args.txt"
+        result = subprocess.run(
+            [str(binary), "create", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(fake_home)},
+        )
+        assert result.returncode == 0, f"Wrapper failed: {result.stderr}"
+        assert args_file.exists()
+        assert args_file.read_text().strip() == "create --dry-run"
+
+    def test_forwards_no_args(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper runs borgadm with no extra args when none given."""
+        binary, _, fake_home = wrapper_tree
+        args_file = binary.parent.parent.parent.parent.parent / "args.txt"
+        result = subprocess.run(
+            [str(binary)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(fake_home)},
+        )
+        assert result.returncode == 0
+        assert args_file.exists()
+        # No args → empty line
+        assert args_file.read_text().strip() == ""
+
+    def test_fda_check_denied_exits(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper exits with code 77 when FDA is denied."""
+        binary, _, fake_home = wrapper_tree
+        # Create a TCC dir that can't be opened
+        tcc_dir = (
+            fake_home / "Library" / "Application Support" / "com.apple.TCC"
+        )
+        tcc_dir.mkdir(parents=True)
+        tcc_dir.chmod(0o000)
+        try:
+            result = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(fake_home)},
+            )
+            assert result.returncode == 77
+            assert "Full Disk Access" in result.stderr
+        finally:
+            tcc_dir.chmod(0o700)
+
+    def test_missing_borgadm_exits_with_error(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper exits with error when borgadm is not found."""
+        binary, mock_borgadm, fake_home = wrapper_tree
+        mock_borgadm.unlink()
+        result = subprocess.run(
+            [str(binary)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(fake_home)},
+        )
+        assert result.returncode != 0
+        assert "borgadm" in result.stderr.lower()
+
+    def test_rejects_world_writable_borgadm(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper refuses to exec borgadm if writable by others."""
+        binary, mock_borgadm, fake_home = wrapper_tree
+        mock_borgadm.chmod(0o757)
+        try:
+            result = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(fake_home)},
+            )
+            assert result.returncode != 0
+            assert "writable" in result.stderr.lower()
+        finally:
+            mock_borgadm.chmod(0o755)
+
+    def test_rejects_group_writable_borgadm(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper refuses to exec borgadm if writable by group."""
+        binary, mock_borgadm, fake_home = wrapper_tree
+        mock_borgadm.chmod(0o775)
+        try:
+            result = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(fake_home)},
+            )
+            assert result.returncode != 0
+            assert "writable" in result.stderr.lower()
+        finally:
+            mock_borgadm.chmod(0o755)
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
