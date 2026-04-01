@@ -21,9 +21,11 @@ import shutil
 import signal
 import sqlite3
 import struct
+import enum
 import subprocess
 import sys
 import tempfile
+import traceback
 
 # Handle broken pipes gracefully (e.g., when piping to `head`).
 # Restore default SIGPIPE behavior so the process exits cleanly.
@@ -46,12 +48,32 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Exit Codes
 # =============================================================================
-EXIT_SUCCESS = 0
-EXIT_USAGE = 1
-EXIT_CONFIG = 2
-EXIT_NOT_FOUND = 3
-EXIT_SUBPROCESS = 4
-EXIT_OTHER = 5
+
+
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0, "Success"
+    WARNING = 1, "Warning"
+    USAGE = 2, "Usage/argument error"
+    CONFIG = 3, "Configuration error"
+    ERROR = 4, "General error"
+    SUBPROCESS = 5, "Subprocess error"
+
+    def __new__(
+        cls, value: int, description: str = ""
+    ) -> ExitCode:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description  # type: ignore[attr-defined]
+        return obj
+
+    @classmethod
+    def epilog(cls) -> str:
+        lines = ["exit codes:"]
+        for member in cls:
+            lines.append(
+                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
+            )
+        return "\n".join(lines)
 
 
 # =============================================================================
@@ -59,20 +81,22 @@ EXIT_OTHER = 5
 # =============================================================================
 
 
-class UsageError(RuntimeError):
+class FirefoxCookiesError(RuntimeError):
+    """Base exception for firefox-cookies errors."""
+
+    exit_code: ExitCode = ExitCode.ERROR
+
+
+class UsageError(FirefoxCookiesError):
     """Raised for usage/argument errors."""
 
+    exit_code = ExitCode.USAGE
 
-class ConfigError(RuntimeError):
+
+class ConfigError(FirefoxCookiesError):
     """Raised for configuration errors."""
 
-
-class NotFoundError(RuntimeError):
-    """Raised when a required file or directory is not found."""
-
-
-class TestError(RuntimeError):
-    """Raised when tests fail."""
+    exit_code = ExitCode.CONFIG
 
 
 # =============================================================================
@@ -138,7 +162,7 @@ def find_firefox_dir() -> Path:
         raise ConfigError(f"Unsupported platform: {system}")
 
     if not ff_dir.is_dir():
-        raise NotFoundError(
+        raise FirefoxCookiesError(
             f"Firefox directory not found: {ff_dir}"
         )
     return ff_dir
@@ -148,7 +172,7 @@ def parse_profiles(firefox_dir: Path) -> list[Profile]:
     """Parse profiles.ini and return list of profiles."""
     ini_path = firefox_dir / "profiles.ini"
     if not ini_path.is_file():
-        raise NotFoundError(
+        raise FirefoxCookiesError(
             f"profiles.ini not found: {ini_path}"
         )
 
@@ -647,7 +671,7 @@ def safe_copy_db(profile_path: Path) -> Path:
     """
     db_path = profile_path / "cookies.sqlite"
     if not db_path.is_file():
-        raise NotFoundError(
+        raise FirefoxCookiesError(
             f"cookies.sqlite not found: {db_path}"
         )
 
@@ -879,7 +903,7 @@ def do_list(
     container: str | None,
     fmt: str,
     sources: list[str] | None = None,
-) -> int:
+) -> None:
     """Extract/list cookies to stdout."""
     firefox_dir = find_firefox_dir()
     prof = resolve_profile(firefox_dir, profile)
@@ -912,14 +936,12 @@ def do_list(
             format_netscape(cookies, conflicts)
         )
 
-    return EXIT_SUCCESS
-
 
 def do_list_domains(
     profile: str | None,
     container: str | None,
     sources: list[str] | None = None,
-) -> int:
+) -> None:
     """List domains with cookie counts."""
     firefox_dir = find_firefox_dir()
     prof = resolve_profile(firefox_dir, profile)
@@ -967,10 +989,8 @@ def do_list_domains(
                 f"{domain}"
             )
 
-    return EXIT_SUCCESS
 
-
-def do_list_profiles() -> int:
+def do_list_profiles() -> None:
     """List available Firefox profiles."""
     firefox_dir = find_firefox_dir()
     profiles = parse_profiles(firefox_dir)
@@ -980,13 +1000,11 @@ def do_list_profiles() -> int:
         print(f"{p.name}{default}")
         print(f"  {p.path}")
 
-    return EXIT_SUCCESS
-
 
 def do_list_containers(
     profile: str | None,
     sources: list[str] | None = None,
-) -> int:
+) -> None:
     """List containers with cookie counts."""
     firefox_dir = find_firefox_dir()
     prof = resolve_profile(firefox_dir, profile)
@@ -995,7 +1013,7 @@ def do_list_containers(
 
     if not containers:
         logger.info("No containers found.")
-        return EXIT_SUCCESS
+        return
 
     # Get cookie counts per container
     all_cookies = collect_cookies(prof.path, src)
@@ -1033,17 +1051,11 @@ def do_list_containers(
                 f"{name}"
             )
 
-    return EXIT_SUCCESS
-
 
 def do_self_test(
     *, verbose: bool = False, coverage: bool = False
-) -> None:
-    """Run tests by invoking the test file directly.
-
-    Raises:
-        TestError: If any tests fail.
-    """
+) -> int:
+    """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
     test_file = (
         repo_root / "tests" / "test_firefox_cookies.py"
@@ -1055,9 +1067,7 @@ def do_self_test(
     if coverage:
         cmd.append("--coverage")
 
-    cp = subprocess.run(cmd, cwd=repo_root)
-    if cp.returncode != 0:
-        raise TestError("Tests failed")
+    return subprocess.run(cmd, cwd=repo_root).returncode
 
 
 # =============================================================================
@@ -1092,14 +1102,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
     parser = argparse.ArgumentParser(
         description="Firefox cookie extraction utility",
-        epilog="""\
-exit codes:
-  0  Success
-  1  Usage error
-  2  Configuration error
-  3  File not found
-  4  Subprocess error
-  5  Other error""",
+        epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(
@@ -1254,11 +1257,11 @@ exit codes:
 # =============================================================================
 
 
-def main(args: argparse.Namespace) -> int:
+def main(args: argparse.Namespace) -> None:
     """Dispatch to subcommand based on parsed arguments."""
     match args.command:
         case "list":
-            return do_list(
+            do_list(
                 profile=args.profile,
                 domains=args.domains,
                 container=args.container,
@@ -1266,24 +1269,18 @@ def main(args: argparse.Namespace) -> int:
                 sources=args.sources,
             )
         case "list-domains":
-            return do_list_domains(
+            do_list_domains(
                 profile=args.profile,
                 container=args.container,
                 sources=args.sources,
             )
         case "list-profiles":
-            return do_list_profiles()
+            do_list_profiles()
         case "list-containers":
-            return do_list_containers(
+            do_list_containers(
                 profile=args.profile,
                 sources=args.sources,
             )
-        case "self-test":
-            do_self_test(
-                verbose=args.verbose,
-                coverage=args.coverage,
-            )
-            return EXIT_SUCCESS
         case _:
             raise UsageError(
                 f"Unknown command: {args.command}"
@@ -1291,40 +1288,30 @@ def main(args: argparse.Namespace) -> int:
 
 
 def cli() -> int:
-    """CLI entry point with exception handling.
-
-    Exit codes:
-        0: Success
-        1: Usage error
-        2: Configuration error
-        3: File not found
-        4: Subprocess error (test failures)
-        5: Other errors
-    """
+    """CLI entry point with exception handling."""
     parser = build_parser()
     try:
         args = parser.parse_args()
     except SystemExit as e:
         if e.code == 0:
-            return EXIT_SUCCESS
-        return EXIT_USAGE
+            return ExitCode.SUCCESS
+        return ExitCode.USAGE
+
+    if args.command == "self-test":
+        return do_self_test(
+            verbose=args.verbose,
+            coverage=args.coverage,
+        )
+
     try:
-        return main(args)
-    except UsageError as e:
+        main(args)
+    except FirefoxCookiesError as e:
         logger.error("ERROR: %s", e)
-        return EXIT_USAGE
-    except ConfigError as e:
-        logger.error("ERROR: %s", e)
-        return EXIT_CONFIG
-    except NotFoundError as e:
-        logger.error("ERROR: %s", e)
-        return EXIT_NOT_FOUND
-    except TestError as e:
-        logger.error("ERROR: %s", e)
-        return EXIT_SUBPROCESS
-    except Exception as e:
-        logger.error("ERROR: %s", e)
-        return EXIT_OTHER
+        return e.exit_code
+    except Exception:
+        traceback.print_exc()
+        return ExitCode.ERROR
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

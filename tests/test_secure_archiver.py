@@ -21,7 +21,7 @@ from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase
+from conftest import CodeQualityBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -467,7 +467,7 @@ class TestIncludeEntryProcessing:
         """Test error when pattern matches nothing."""
         entry = sa.PathIncludeEntry(path=str(tmp_path / "nonexistent*.txt"))
 
-        with pytest.raises(FileNotFoundError, match="No matches"):
+        with pytest.raises(sa.NotFoundError, match="No matches"):
             sa.include_entry_to_sources(entry)
 
     def test_include_zero_files_raises_error(self, tmp_path: Path) -> None:
@@ -478,7 +478,7 @@ class TestIncludeEntryProcessing:
 
         entry = sa.PathIncludeEntry(path=str(empty_dir))
 
-        with pytest.raises(FileNotFoundError, match="zero files"):
+        with pytest.raises(sa.NotFoundError, match="zero files"):
             sa.include_entry_to_sources(entry)
 
     def test_include_recurse_with_glob(self, tmp_path: Path) -> None:
@@ -1198,9 +1198,7 @@ class TestCommandExecution:
 
     def test_run_cmd_failure_check_true(self) -> None:
         """Test command failure with check=True."""
-        import subprocess
-
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(sa.SubprocessError):
             sa.run_cmd(["false"], check=True)
 
     def test_run_cmd_failure_check_false(self) -> None:
@@ -1566,27 +1564,15 @@ class TestRunTests:
         assert "--coverage" in cmd
 
     @patch("subprocess.run", autospec=True)
-    def test_run_tests_raises_on_failure(self, mock_run: MagicMock) -> None:
-        """Test do_self_test raises TestError when tests fail."""
+    def test_returns_failure_code(self, mock_run: MagicMock) -> None:
+        """Test do_self_test returns subprocess returncode."""
         mock_run.return_value = MagicMock(returncode=1)
 
-        with pytest.raises(sa.TestError, match="Tests failed"):
-            sa.do_self_test(verbose=False, coverage=False)
+        assert sa.do_self_test(verbose=False, coverage=False) == 1
 
 
 class TestMain:
     """Test main function and command dispatch."""
-
-    @patch("secure_archiver.do_self_test", autospec=True)
-    def test_main_code_test_command(self, mock_do_self_test: MagicMock) -> None:
-        """Test main dispatches to do_self_test for self-test command."""
-        args = argparse.Namespace(
-            command="self-test", verbose=False, coverage=False
-        )
-
-        sa.main(args)
-
-        assert mock_do_self_test.called
 
     @patch("secure_archiver.do_update", autospec=True)
     @patch("secure_archiver.load_config", autospec=True)
@@ -1648,91 +1634,84 @@ class TestCli:
     """Test cli() function argument parsing and exception handling."""
 
     @patch("secure_archiver.main", autospec=True)
-    def test_cli_returns_zero_on_success(self, mock_main: MagicMock) -> None:
-        """Test cli() returns 0 when main() succeeds."""
-        with patch("sys.argv", ["prog", "self-test"]):
+    def test_cli_returns_success(self, mock_main: MagicMock) -> None:
+        """cli() returns SUCCESS when main() succeeds."""
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 0
-        assert mock_main.called
+        assert result == sa.ExitCode.SUCCESS
 
     @patch("secure_archiver.main", autospec=True)
     def test_cli_handles_usage_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches UsageError and returns exit code 1."""
+        """cli() catches UsageError and returns USAGE."""
         mock_main.side_effect = sa.UsageError("test usage error")
-        with patch("sys.argv", ["prog", "self-test"]):
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 1
-
-    @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_test_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches TestError and returns exit code 5."""
-        mock_main.side_effect = sa.TestError("test error")
-        with patch("sys.argv", ["prog", "self-test"]):
-            result = sa.cli()
-        assert result == 5
+        assert result == sa.ExitCode.USAGE
 
     @patch("secure_archiver.main", autospec=True)
     def test_cli_handles_config_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches ConfigError and returns exit code 2."""
+        """cli() catches ConfigError and returns CONFIG."""
         mock_main.side_effect = sa.ConfigError("test config error")
-        with patch("sys.argv", ["prog", "self-test"]):
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 2
+        assert result == sa.ExitCode.CONFIG
 
     @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_file_not_found_error(
-        self, mock_main: MagicMock
-    ) -> None:
-        """Test cli() catches FileNotFoundError and returns exit code 3."""
-        mock_main.side_effect = FileNotFoundError("test file not found")
-        with patch("sys.argv", ["prog", "self-test"]):
+    def test_cli_handles_not_found_error(self, mock_main: MagicMock) -> None:
+        """cli() catches NotFoundError and returns NOT_FOUND."""
+        mock_main.side_effect = sa.NotFoundError("not found")
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 3
+        assert result == sa.ExitCode.NOT_FOUND
 
     @patch("secure_archiver.main", autospec=True)
-    def test_cli_handles_called_process_error(
-        self, mock_main: MagicMock
-    ) -> None:
-        """Test cli() catches CalledProcessError and returns exit code 4."""
-        import subprocess
-
-        mock_main.side_effect = subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["test", "command"],
-            output="stdout output",
-            stderr="stderr output",
+    def test_cli_handles_subprocess_error(self, mock_main: MagicMock) -> None:
+        """cli() catches SubprocessError and returns SUBPROCESS."""
+        mock_main.side_effect = sa.SubprocessError(
+            1, ["test", "command"], "stdout", "stderr"
         )
-        with patch("sys.argv", ["prog", "self-test"]):
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 4
+        assert result == sa.ExitCode.SUBPROCESS
 
     @patch("secure_archiver.main", autospec=True)
     def test_cli_handles_unexpected_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches unexpected exceptions and returns exit code 5."""
+        """cli() catches unexpected exceptions and returns ERROR."""
         mock_main.side_effect = RuntimeError("unexpected error")
-        with patch("sys.argv", ["prog", "self-test"]):
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 5
+        assert result == sa.ExitCode.ERROR
 
     @patch("secure_archiver.main", autospec=True)
     def test_cli_handles_collision_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches CollisionError and returns exit code 5."""
-        mock_main.side_effect = sa.CollisionError("test collision error")
-        with patch("sys.argv", ["prog", "self-test"]):
+        """cli() catches CollisionError and returns ERROR."""
+        mock_main.side_effect = sa.CollisionError("collision")
+        with patch("sys.argv", ["prog", "check-config"]):
             result = sa.cli()
-        assert result == 5
+        assert result == sa.ExitCode.ERROR
 
     def test_cli_invalid_command(self) -> None:
-        """Test cli() returns 1 for invalid subcommand."""
+        """cli() returns USAGE for invalid subcommand."""
         with patch("sys.argv", ["prog", "foobar"]):
             result = sa.cli()
-        assert result == 1
+        assert result == sa.ExitCode.USAGE
 
-    def test_cli_help_returns_zero(self) -> None:
-        """Test cli() returns 0 for --help."""
+    def test_cli_help_returns_success(self) -> None:
+        """cli() returns SUCCESS for --help."""
         with patch("sys.argv", ["prog", "--help"]):
             result = sa.cli()
+        assert result == sa.ExitCode.SUCCESS
+
+    @patch("secure_archiver.do_self_test", autospec=True)
+    def test_cli_dispatches_self_test(
+        self, mock_do_self_test: MagicMock
+    ) -> None:
+        """cli() dispatches self-test before try/except."""
+        mock_do_self_test.return_value = 0
+        with patch("sys.argv", ["prog", "self-test"]):
+            result = sa.cli()
         assert result == 0
+        mock_do_self_test.assert_called_once_with(verbose=False, coverage=False)
 
 
 class TestWriteExampleConfig:
@@ -2347,6 +2326,17 @@ class TestGeneralConfigReadme:
         }
         with pytest.raises(sa.ConfigError, match="readme must be a string"):
             sa.Config.from_dict(cfg_dict, tmp_path / "test.toml")
+
+
+class TestExceptionHierarchy(ExceptionHierarchyBase):
+    """Test SecureArchiverError exception hierarchy."""
+
+    BASE_ERROR = sa.SecureArchiverError
+    EXIT_CODE = sa.ExitCode
+    EXCLUDED_CODES = {
+        sa.ExitCode.SUCCESS,
+        sa.ExitCode.WARNING,
+    }
 
 
 class TestCodeQuality(CodeQualityBase):

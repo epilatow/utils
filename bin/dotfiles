@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import argparse
+import enum
 import fnmatch
 import logging
 import os
 import subprocess
+import traceback
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -62,22 +64,63 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# EXIT CODES
+# =============================================================================
+
+
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0, "Success"
+    WARNING = 1, "Warning"
+    USAGE = 2, "Usage/argument error"
+    CONFIG = 3, "Configuration error"
+    ERROR = 4, "General error"
+    SUBPROCESS = 5, "Subprocess error"
+    CONFLICTS = 6, "Conflicts or missing dotfiles"
+    MISSING_DIR = 7, "Missing dotfiles directory"
+
+    def __new__(cls, value: int, description: str = "") -> ExitCode:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description  # type: ignore[attr-defined]
+        return obj
+
+    @classmethod
+    def epilog(cls) -> str:
+        lines = ["exit codes:"]
+        for member in cls:
+            lines.append(
+                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
+            )
+        return "\n".join(lines)
+
+
+# =============================================================================
 # EXCEPTIONS
 # =============================================================================
 
 
-class MissingDotfilesDirectory(RuntimeError):
+class DotfilesError(RuntimeError):
+    """Base exception for dotfiles errors."""
+
+    exit_code: ExitCode = ExitCode.ERROR
+
+
+class ConflictsFound(DotfilesError):
+    """Raised when conflicts or missing dotfiles are found."""
+
+    exit_code = ExitCode.CONFLICTS
+
+
+class UsageError(DotfilesError):
+    """Raised for usage/argument errors."""
+
+    exit_code = ExitCode.USAGE
+
+
+class MissingDotfilesDirectory(DotfilesError):
     """Raised when a dotfile directory does not exist or is invalid."""
 
-    pass
-
-
-class TestError(RuntimeError):
-    pass
-
-
-class UsageError(RuntimeError):
-    pass
+    exit_code = ExitCode.MISSING_DIR
 
 
 # =============================================================================
@@ -533,17 +576,17 @@ def do_install(
     *,
     dry_run: bool = False,
     force: bool = False,
-) -> int:
-    """
-    Install dotfiles.
+) -> None:
+    """Install dotfiles.
 
     Args:
-        directory: Specific directory to install, or None for all installed
+        directory: Specific directory to install, or None for all
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks
 
-    Returns:
-        0 for success, 1 for conflicts
+    Raises:
+        ConflictsFound: If any conflicts were detected.
+        MissingDotfilesDirectory: If a directory does not exist.
     """
     if directory is not None:
         # Install from specific directory
@@ -556,7 +599,7 @@ def do_install(
         directories = load_installed_directories()
         if not directories:
             logger.info("No dotfile directories installed.")
-            return 0
+            return
 
     had_conflicts = False
     for dotfile_dir in directories:
@@ -572,23 +615,23 @@ def do_install(
         if has_conflicts(results):
             had_conflicts = True
 
-    return 1 if had_conflicts else 0
+    if had_conflicts:
+        raise ConflictsFound("Conflicts found during install")
 
 
 def do_remove(
     directory: Optional[Path],
     *,
     dry_run: bool = False,
-) -> int:
-    """
-    Remove dotfiles.
+) -> None:
+    """Remove dotfiles.
 
     Args:
-        directory: Specific directory to remove, or None for all installed
+        directory: Specific directory to remove, or None for all
         dry_run: If True, don't make any changes
 
-    Returns:
-        0 for success
+    Raises:
+        MissingDotfilesDirectory: If a directory does not exist.
     """
     if directory is not None:
         directories = [directory.resolve()]
@@ -596,7 +639,7 @@ def do_remove(
         directories = load_installed_directories()
         if not directories:
             logger.info("No dotfile directories installed.")
-            return 0
+            return
 
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
@@ -611,25 +654,22 @@ def do_remove(
         if not dry_run:
             remove_installed_directory(dotfile_dir)
 
-    return 0
 
-
-def do_audit(directory: Optional[Path]) -> int:
-    """
-    Audit dotfiles.
+def do_audit(directory: Optional[Path]) -> None:
+    """Audit dotfiles.
 
     Args:
-        directory: Specific directory to audit, or None for all installed
+        directory: Specific directory to audit, or None for all
 
-    Returns:
-        0 for all OK, 1 for conflicts or missing
+    Raises:
+        ConflictsFound: If conflicts or missing dotfiles found.
     """
     if directory is not None:
         directories = [directory.resolve()]
     else:
         directories = load_installed_directories()
         if not directories:
-            return 0
+            return
 
     had_issues = False
     for dotfile_dir in directories:
@@ -642,15 +682,12 @@ def do_audit(directory: Optional[Path]) -> int:
         if has_conflicts(results) or has_missing(results):
             had_issues = True
 
-    return 1 if had_issues else 0
+    if had_issues:
+        raise ConflictsFound("Conflicts or missing dotfiles found during audit")
 
 
-def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
-    """Run tests by invoking the test file directly.
-
-    Raises:
-        TestError: If any tests fail or pytest encounters an error.
-    """
+def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
+    """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
     test_file = repo_root / "tests" / "test_dotfiles.py"
 
@@ -660,9 +697,7 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
     if coverage:
         cmd.append("--coverage")
 
-    cp = subprocess.run(cmd, cwd=repo_root)
-    if cp.returncode != 0:
-        raise TestError("Tests failed")
+    return subprocess.run(cmd, cwd=repo_root).returncode
 
 
 # =============================================================================
@@ -678,15 +713,8 @@ def build_parser() -> argparse.ArgumentParser:
         Configured ArgumentParser instance
     """
     parser = argparse.ArgumentParser(
-        description="Manage dotfiles by creating symlinks from $HOME",
-        epilog="""\
-exit codes:
-  0  Success
-  1  Conflicts or missing dotfiles (install/audit result)
-  2  Usage/argument error
-  3  Missing dotfiles directory
-  4  Other errors (test failures, etc.)
-""",
+        description=("Manage dotfiles by creating symlinks from $HOME"),
+        epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommands")
@@ -762,71 +790,52 @@ exit codes:
 # =============================================================================
 
 
-def main(args: argparse.Namespace) -> int:
-    """
-    Dispatch to subcommand based on parsed arguments.
-
-    Returns:
-        Exit code (0 for success, non-zero for errors/conflicts)
-    """
+def main(args: argparse.Namespace) -> None:
+    """Dispatch to subcommand based on parsed arguments."""
     # Handle missing subcommand
     if not args.command:
         raise UsageError("No subcommand specified. Use --help for usage.")
 
     match args.command:
         case "install":
-            return do_install(
+            do_install(
                 args.directory,
                 dry_run=args.dry_run,
                 force=args.force,
             )
         case "remove":
-            return do_remove(
+            do_remove(
                 args.directory,
                 dry_run=args.dry_run,
             )
         case "audit":
-            return do_audit(args.directory)
-        case "self-test":
-            do_self_test(verbose=args.verbose, coverage=args.coverage)
-            return 0
+            do_audit(args.directory)
         case _:
             raise UsageError(f"Unknown command '{args.command}'")
 
 
 def cli() -> int:
-    """
-    CLI entry point with argument parsing and exception handling.
-
-    Exit codes:
-        0: Success
-        1: Conflicts or missing dotfiles
-        2: Usage/argument error
-        3: Missing dotfiles directory
-        4: Other errors (test failures, etc.)
-    """
+    """CLI entry point with exception handling."""
     parser = build_parser()
     try:
         args = parser.parse_args()
     except SystemExit as e:
-        # argparse calls sys.exit(0) for --help, sys.exit(2) for errors
         if e.code == 0:
-            return 0
-        return 2
+            return ExitCode.SUCCESS
+        return ExitCode.USAGE
+
+    if args.command == "self-test":
+        return do_self_test(verbose=args.verbose, coverage=args.coverage)
+
     try:
-        return main(args)
-    except UsageError as e:
+        main(args)
+    except DotfilesError as e:
         logger.error("ERROR: %s", e)
-        return 2
-    except MissingDotfilesDirectory as e:
-        logger.error("ERROR: %s", e)
-        return 3
-    except TestError as e:
-        logger.error("ERROR: %s", e)
-        return 4
-    except Exception as e:
-        logger.error("ERROR: %s", e)
-        return 4
+        return e.exit_code
+    except Exception:
+        traceback.print_exc()
+        return ExitCode.ERROR
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

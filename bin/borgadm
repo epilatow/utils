@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import typing
 
 # Handle broken pipes gracefully (e.g., when piping to `head`).
@@ -57,7 +58,7 @@ class ExitCode(enum.IntEnum):
     SUCCESS = 0, "Success"
     WARNING = 1, "Warning (borg subprocess warnings)"
     USAGE = 2, "Usage/argument error"
-    CONFIG = 3, "Config file error"
+    CONFIG = 3, "Configuration error"
     ERROR = 4, "General error"
     SUBPROCESS = 5, "Subprocess error"
     CHECK_NO_BACKUPS = 6, "Check failed: no full backups"
@@ -1870,7 +1871,7 @@ def do_environment() -> None:
         logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
-def do_self_test(verbose: bool = False, coverage: bool = False) -> None:
+def do_self_test(verbose: bool = False, coverage: bool = False) -> int:
     """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
     test_file = repo_root / "tests" / "test_borgadm.py"
@@ -1881,8 +1882,7 @@ def do_self_test(verbose: bool = False, coverage: bool = False) -> None:
     if coverage:
         cmd.append("--coverage")
 
-    result = subprocess.run(cmd, cwd=repo_root)
-    sys.exit(result.returncode)
+    return subprocess.run(cmd, cwd=repo_root).returncode
 
 
 # -----------------------------------------------------------------------------
@@ -2324,8 +2324,7 @@ def cli() -> int:
     command = args_dict.pop("command")
 
     if command == "self-test":
-        do_self_test(**args_dict)
-        return ExitCode.SUCCESS
+        return do_self_test(**args_dict)
 
     config = args_dict.pop("config")
     verbose = args_dict.pop("verbose")
@@ -2343,6 +2342,9 @@ def cli() -> int:
         )
     except BorgadmError as e:
         return e.exit_code
+    except Exception:
+        traceback.print_exc()
+        return ExitCode.ERROR
 
     if _warning_occurred:
         return ExitCode.WARNING

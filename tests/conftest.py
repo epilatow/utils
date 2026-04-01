@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -155,6 +155,41 @@ class CodeQualityBase:
         assert result.returncode == 0, (
             f"mypy check failed:\n{result.stdout}"
         )
+
+
+class ExceptionHierarchyBase:
+    """Base class for exception hierarchy tests.
+
+    Subclasses must define BASE_ERROR, EXIT_CODE, and
+    EXCLUDED_CODES.
+    """
+
+    BASE_ERROR: ClassVar[Any]
+    EXIT_CODE: ClassVar[Any]
+    EXCLUDED_CODES: ClassVar[set[Any]]
+
+    def test_all_exit_codes_have_exception(self) -> None:
+        """Every non-excluded ExitCode has an exception."""
+        all_classes = (
+            [self.BASE_ERROR]
+            + self.BASE_ERROR.__subclasses__()
+        )
+        covered = {
+            cls.exit_code
+            for cls in all_classes
+            if "exit_code" in cls.__dict__
+        }
+        expected = set(self.EXIT_CODE) - self.EXCLUDED_CODES
+        assert covered == expected
+
+    def test_exception_exit_codes_are_unique(self) -> None:
+        """Subclasses with explicit exit_code have unique codes."""
+        codes = [
+            cls.exit_code
+            for cls in self.BASE_ERROR.__subclasses__()
+            if "exit_code" in cls.__dict__
+        ]
+        assert len(codes) == len(set(codes))
 
 
 def run_tests(

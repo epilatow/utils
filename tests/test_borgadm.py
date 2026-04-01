@@ -29,7 +29,7 @@ from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase
+from conftest import CodeQualityBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -2195,6 +2195,19 @@ class TestCli:
         ):
             assert ba.cli() == ba.ExitCode.CONFIG
 
+    def test_cli_catches_unexpected_exception(self, mock_cfg: Any) -> None:
+        """cli() catches unexpected Exception and returns ERROR."""
+        with (
+            patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(
+                ba,
+                "main",
+                autospec=True,
+                side_effect=RuntimeError("unexpected"),
+            ),
+        ):
+            assert ba.cli() == ba.ExitCode.ERROR
+
     def test_cli_help_returns_success(self) -> None:
         """--help returns SUCCESS."""
         with patch("sys.argv", ["borgadm", "--help"]):
@@ -2204,24 +2217,16 @@ class TestCli:
                 assert e.code == 0
 
 
-class TestExceptionHierarchy:
+class TestExceptionHierarchy(ExceptionHierarchyBase):
     """Test BorgadmError exception hierarchy."""
 
-    def test_all_exit_codes_have_exception(self) -> None:
-        """Every non-success/warning ExitCode has an exception."""
-        all_classes = [ba.BorgadmError] + ba.BorgadmError.__subclasses__()
-        covered = {cls.exit_code for cls in all_classes}
-        expected = set(ba.ExitCode) - {
-            ba.ExitCode.SUCCESS,
-            ba.ExitCode.WARNING,
-            ba.ExitCode.USAGE,
-        }
-        assert covered == expected
-
-    def test_exception_exit_codes_are_unique(self) -> None:
-        """No two exception subclasses share an exit_code."""
-        codes = [cls.exit_code for cls in ba.BorgadmError.__subclasses__()]
-        assert len(codes) == len(set(codes))
+    BASE_ERROR = ba.BorgadmError
+    EXIT_CODE = ba.ExitCode
+    EXCLUDED_CODES = {
+        ba.ExitCode.SUCCESS,
+        ba.ExitCode.WARNING,
+        ba.ExitCode.USAGE,
+    }
 
 
 class TestCodeQuality(CodeQualityBase):

@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase
+from conftest import CodeQualityBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -1087,9 +1087,8 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_install(dotfile_dir)
+            df.do_install(dotfile_dir)
 
-        assert exit_code == 0
         assert (home / ".vimrc").is_symlink()
         # Should have recorded the directory
         assert dotfile_dir.resolve() in df.load_installed_directories()
@@ -1114,9 +1113,8 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_install(None)
+            df.do_install(None)
 
-        assert exit_code == 0
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
 
@@ -1127,14 +1125,12 @@ class TestDoInstall:
         installed_file = tmp_path / ".dotfiles.installed"
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
-        exit_code = df.do_install(None)
-
-        assert exit_code == 0
+        df.do_install(None)
 
     def test_do_install_with_conflicts(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        """Test installing with conflicts returns 1."""
+        """Test installing with conflicts raises ConflictsFound."""
         home = tmp_path / "home"
         home.mkdir()
         dotfile_dir = tmp_path / "dotfiles"
@@ -1147,9 +1143,8 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_install(dotfile_dir)
-
-        assert exit_code == 1
+            with pytest.raises(df.ConflictsFound):
+                df.do_install(dotfile_dir)
 
     def test_do_install_dry_run(self, tmp_path: Path, monkeypatch: Any) -> None:
         """Test install dry run doesn't modify anything."""
@@ -1163,9 +1158,8 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_install(dotfile_dir, dry_run=True)
+            df.do_install(dotfile_dir, dry_run=True)
 
-        assert exit_code == 0
         assert not (home / ".vimrc").exists()
         # Should NOT have recorded the directory
         assert df.load_installed_directories() == []
@@ -1193,9 +1187,8 @@ class TestDoRemove:
             assert (home / ".vimrc").is_symlink()
 
             # Then remove
-            exit_code = df.do_remove(dotfile_dir)
+            df.do_remove(dotfile_dir)
 
-        assert exit_code == 0
         assert not (home / ".vimrc").exists()
         # Should have removed from installed list
         assert dotfile_dir.resolve() not in df.load_installed_directories()
@@ -1218,9 +1211,8 @@ class TestDoRemove:
             df.do_install(dotfile_dir)
 
             # Then remove all
-            exit_code = df.do_remove(None)
+            df.do_remove(None)
 
-        assert exit_code == 0
         assert not (home / ".vimrc").exists()
         assert df.load_installed_directories() == []
 
@@ -1253,12 +1245,10 @@ class TestDoAudit:
 
         with patch.object(Path, "home", return_value=home):
             df.do_install(dotfile_dir)
-            exit_code = df.do_audit(dotfile_dir)
-
-        assert exit_code == 0
+            df.do_audit(dotfile_dir)
 
     def test_do_audit_missing(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """Test audit when dotfiles are missing."""
+        """Test audit when dotfiles are missing raises ConflictsFound."""
         home = tmp_path / "home"
         home.mkdir()
         dotfile_dir = tmp_path / "dotfiles"
@@ -1270,12 +1260,11 @@ class TestDoAudit:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_audit(None)
-
-        assert exit_code == 1
+            with pytest.raises(df.ConflictsFound):
+                df.do_audit(None)
 
     def test_do_audit_conflicts(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """Test audit when there are conflicts."""
+        """Test audit when there are conflicts raises ConflictsFound."""
         home = tmp_path / "home"
         home.mkdir()
         dotfile_dir = tmp_path / "dotfiles"
@@ -1289,21 +1278,18 @@ class TestDoAudit:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_audit(None)
-
-        assert exit_code == 1
+            with pytest.raises(df.ConflictsFound):
+                df.do_audit(None)
 
     def test_do_audit_no_installed_file(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        """Test audit returns 0 silently when no installed file exists."""
+        """Test audit succeeds silently when no installed file exists."""
         installed_file = tmp_path / ".dotfiles.installed"
         # Don't create the file - it should not exist
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
-        exit_code = df.do_audit(None)
-
-        assert exit_code == 0
+        df.do_audit(None)
 
     def test_do_audit_skips_nonexistent_directories(
         self, tmp_path: Path, monkeypatch: Any
@@ -1319,10 +1305,7 @@ class TestDoAudit:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            exit_code = df.do_audit(None)
-
-        # Should return 0, not raise an exception
-        assert exit_code == 0
+            df.do_audit(None)
 
     def test_do_audit_mixed_existing_nonexistent(
         self, tmp_path: Path, monkeypatch: Any
@@ -1345,10 +1328,7 @@ class TestDoAudit:
             (home / ".vimrc").symlink_to(
                 os.path.relpath(existing_dir / "vimrc", home)
             )
-            exit_code = df.do_audit(None)
-
-        # Should return 0 (existing dir is OK, nonexistent is skipped)
-        assert exit_code == 0
+            df.do_audit(None)
 
 
 class TestDoSelfTest:
@@ -1386,32 +1366,21 @@ class TestDoSelfTest:
         assert "--coverage" in cmd
 
     @patch("subprocess.run", autospec=True)
-    def test_do_self_test_raises_on_failure(self, mock_run: MagicMock) -> None:
-        """Test do_self_test raises TestError on failure."""
+    def test_do_self_test_returns_nonzero_on_failure(
+        self, mock_run: MagicMock
+    ) -> None:
+        """Test do_self_test returns nonzero on failure."""
         mock_run.return_value = MagicMock(returncode=1)
 
-        with pytest.raises(df.TestError, match="Tests failed"):
-            df.do_self_test(verbose=False, coverage=False)
+        assert df.do_self_test(verbose=False, coverage=False) == 1
 
 
 class TestMain:
     """Test main function and command dispatch."""
 
-    @patch.object(df, "do_self_test")
-    def test_main_self_test_command(self, mock_do_self_test: MagicMock) -> None:
-        """Test main dispatches to do_self_test."""
-        args = argparse.Namespace(
-            command="self-test", verbose=False, coverage=False
-        )
-
-        df.main(args)
-
-        assert mock_do_self_test.called
-
     @patch.object(df, "do_install")
     def test_main_install_command(self, mock_do_install: MagicMock) -> None:
         """Test main dispatches to do_install."""
-        mock_do_install.return_value = 0
         args = argparse.Namespace(
             command="install",
             directory=Path("/path"),
@@ -1426,7 +1395,6 @@ class TestMain:
     @patch.object(df, "do_remove")
     def test_main_remove_command(self, mock_do_remove: MagicMock) -> None:
         """Test main dispatches to do_remove."""
-        mock_do_remove.return_value = 0
         args = argparse.Namespace(
             command="remove", directory=Path("/path"), dry_run=False
         )
@@ -1438,7 +1406,6 @@ class TestMain:
     @patch.object(df, "do_audit")
     def test_main_audit_command(self, mock_do_audit: MagicMock) -> None:
         """Test main dispatches to do_audit."""
-        mock_do_audit.return_value = 0
         args = argparse.Namespace(command="audit", directory=Path("/path"))
 
         df.main(args)
@@ -1457,52 +1424,72 @@ class TestCli:
     """Test cli() function."""
 
     @patch.object(df, "main")
-    def test_cli_returns_zero_on_success(self, mock_main: MagicMock) -> None:
-        """Test cli() returns 0 when main() succeeds."""
-        mock_main.return_value = 0
+    def test_cli_returns_success(self, mock_main: MagicMock) -> None:
+        """Test cli() returns SUCCESS when main() succeeds."""
         with patch("sys.argv", ["prog", "audit"]):
             result = df.cli()
-        assert result == 0
+        assert result == df.ExitCode.SUCCESS
 
     @patch.object(df, "main")
-    def test_cli_returns_main_exit_code(self, mock_main: MagicMock) -> None:
-        """Test cli() returns main's exit code."""
-        mock_main.return_value = 1
+    def test_cli_handles_conflicts_found(self, mock_main: MagicMock) -> None:
+        """Test cli() catches ConflictsFound and returns CONFLICTS."""
+        mock_main.side_effect = df.ConflictsFound("test")
         with patch("sys.argv", ["prog", "audit"]):
             result = df.cli()
-        assert result == 1
+        assert result == df.ExitCode.CONFLICTS
 
     @patch.object(df, "main")
     def test_cli_handles_usage_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches UsageError and returns 2."""
+        """Test cli() catches UsageError and returns USAGE."""
         mock_main.side_effect = df.UsageError("test")
         with patch("sys.argv", ["prog", "audit"]):
             result = df.cli()
-        assert result == 2
+        assert result == df.ExitCode.USAGE
 
     @patch.object(df, "main")
     def test_cli_handles_missing_directory_error(
         self, mock_main: MagicMock
     ) -> None:
-        """Test cli() catches MissingDotfilesDirectory and returns 3."""
+        """Test cli() catches MissingDotfilesDirectory."""
         mock_main.side_effect = df.MissingDotfilesDirectory("test")
         with patch("sys.argv", ["prog", "audit"]):
             result = df.cli()
-        assert result == 3
+        assert result == df.ExitCode.MISSING_DIR
 
     @patch.object(df, "main")
-    def test_cli_handles_test_error(self, mock_main: MagicMock) -> None:
-        """Test cli() catches TestError and returns 4."""
-        mock_main.side_effect = df.TestError("test")
-        with patch("sys.argv", ["prog", "self-test"]):
+    def test_cli_handles_generic_exception(self, mock_main: MagicMock) -> None:
+        """Test cli() catches generic exceptions and returns ERROR."""
+        mock_main.side_effect = RuntimeError("unexpected")
+        with patch("sys.argv", ["prog", "audit"]):
             result = df.cli()
-        assert result == 4
+        assert result == df.ExitCode.ERROR
 
-    def test_cli_help_returns_zero(self) -> None:
-        """Test cli() returns 0 for --help."""
+    def test_cli_help_returns_success(self) -> None:
+        """Test cli() returns SUCCESS for --help."""
         with patch("sys.argv", ["prog", "--help"]):
             result = df.cli()
-        assert result == 0
+        assert result == df.ExitCode.SUCCESS
+
+    @patch.object(df, "do_self_test")
+    def test_cli_self_test_dispatches(
+        self, mock_do_self_test: MagicMock
+    ) -> None:
+        """Test cli() dispatches self-test to do_self_test."""
+        mock_do_self_test.return_value = 0
+        with patch("sys.argv", ["prog", "self-test"]):
+            result = df.cli()
+        assert mock_do_self_test.called
+        assert result == df.ExitCode.SUCCESS
+
+    @patch.object(df, "do_self_test")
+    def test_cli_self_test_returns_failure(
+        self, mock_do_self_test: MagicMock
+    ) -> None:
+        """Test cli() returns do_self_test's nonzero exit code."""
+        mock_do_self_test.return_value = 1
+        with patch("sys.argv", ["prog", "self-test"]):
+            result = df.cli()
+        assert result == 1
 
 
 class TestMultipleDirectories:
@@ -1526,12 +1513,11 @@ class TestMultipleDirectories:
 
         with patch.object(Path, "home", return_value=home):
             # Install first directory
-            exit_code1 = df.do_install(dotfile_dir1)
-            assert exit_code1 == 0
+            df.do_install(dotfile_dir1)
 
             # Install second directory - should conflict
-            exit_code2 = df.do_install(dotfile_dir2)
-            assert exit_code2 == 1
+            with pytest.raises(df.ConflictsFound):
+                df.do_install(dotfile_dir2)
 
             # Original symlink should still point to first directory
             assert (home / ".vimrc").resolve() == (
@@ -1562,6 +1548,17 @@ class TestRelativeSymlinks:
 
         # Should be relative, not absolute
         assert not Path(link_target).is_absolute()
+
+
+class TestExceptionHierarchy(ExceptionHierarchyBase):
+    BASE_ERROR = df.DotfilesError
+    EXIT_CODE = df.ExitCode
+    EXCLUDED_CODES = {
+        df.ExitCode.SUCCESS,
+        df.ExitCode.WARNING,
+        df.ExitCode.CONFIG,
+        df.ExitCode.SUBPROCESS,
+    }
 
 
 class TestCodeQuality(CodeQualityBase):

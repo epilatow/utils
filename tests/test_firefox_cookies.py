@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import lz4.block  # type: ignore[import-untyped]
 
 import pytest  # type: ignore[import-not-found]
+from conftest import ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -560,7 +561,7 @@ Default=1
         """Raise NotFoundError for missing profiles.ini."""
         ff_dir = tmp_path / "firefox"
         ff_dir.mkdir()
-        with pytest.raises(fc.NotFoundError):
+        with pytest.raises(fc.FirefoxCookiesError):
             fc.parse_profiles(ff_dir)
 
     def test_empty_profiles_ini(self, firefox_dir: Path) -> None:
@@ -994,7 +995,7 @@ class TestSafeCopyDb:
 
     def test_missing_db(self, tmp_path: Path) -> None:
         """Raise NotFoundError when db doesn't exist."""
-        with pytest.raises(fc.NotFoundError):
+        with pytest.raises(fc.FirefoxCookiesError):
             fc.safe_copy_db(tmp_path)
 
 
@@ -1076,7 +1077,7 @@ class TestFindFirefoxDir:
                 autospec=True,
                 return_value=tmp_path,
             ),
-            pytest.raises(fc.NotFoundError),
+            pytest.raises(fc.FirefoxCookiesError),
         ):
             fc.find_firefox_dir()
 
@@ -1101,8 +1102,7 @@ class TestDoListProfiles:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_profiles()
-        assert result == 0
+            fc.do_list_profiles()
         captured = capsys.readouterr()
         assert "default" in captured.out
         assert "(default)" in captured.out
@@ -1126,8 +1126,7 @@ class TestDoListContainers:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_containers(profile=None)
-        assert result == 0
+            fc.do_list_containers(profile=None)
         captured = capsys.readouterr()
         assert "Personal" in captured.out
         assert "Work" in captured.out
@@ -1146,8 +1145,7 @@ class TestDoListContainers:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_containers(profile=None)
-        assert result == 0
+            fc.do_list_containers(profile=None)
 
 
 class TestDoListDomains:
@@ -1167,8 +1165,7 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_domains(profile=None, container=None)
-        assert result == 0
+            fc.do_list_domains(profile=None, container=None)
         captured = capsys.readouterr()
         assert "example.com" in captured.out
         assert "other.org" in captured.out
@@ -1238,8 +1235,7 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list_domains(profile=None, container="1")
-        assert result == 0
+            fc.do_list_domains(profile=None, container="1")
         captured = capsys.readouterr()
         assert "example.com" in captured.out
         assert "other.org" not in captured.out
@@ -1262,13 +1258,12 @@ class TestDoList:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=None,
                 container=None,
                 fmt="netscape",
             )
-        assert result == 0
         captured = capsys.readouterr()
         assert "# Netscape HTTP Cookie File" in captured.out
         assert ".example.com" in captured.out
@@ -1287,13 +1282,12 @@ class TestDoList:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=None,
                 container=None,
                 fmt="json",
             )
-        assert result == 0
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert len(data) == 6
@@ -1312,13 +1306,12 @@ class TestDoList:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=["other.org"],
                 container=None,
                 fmt="json",
             )
-        assert result == 0
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert len(data) == 1
@@ -1339,13 +1332,12 @@ class TestDoList:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=None,
                 container="Personal",
                 fmt="json",
             )
-        assert result == 0
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert len(data) == 1
@@ -1363,7 +1355,6 @@ class TestMain:
     @patch.object(fc, "do_list", autospec=True)
     def test_main_list_command(self, mock_do_list: MagicMock) -> None:
         """Test main dispatches to do_list."""
-        mock_do_list.return_value = 0
         args = argparse.Namespace(
             command="list",
             profile="myprofile",
@@ -1373,9 +1364,8 @@ class TestMain:
             sources=["db"],
         )
 
-        result = fc.main(args)
+        fc.main(args)
 
-        assert result == 0
         mock_do_list.assert_called_once_with(
             profile="myprofile",
             domains=["example.com"],
@@ -1387,7 +1377,6 @@ class TestMain:
     @patch.object(fc, "do_list", autospec=True)
     def test_main_list_defaults(self, mock_do_list: MagicMock) -> None:
         """Test main passes None defaults for list."""
-        mock_do_list.return_value = 0
         args = argparse.Namespace(
             command="list",
             profile=None,
@@ -1397,9 +1386,8 @@ class TestMain:
             sources=None,
         )
 
-        result = fc.main(args)
+        fc.main(args)
 
-        assert result == 0
         mock_do_list.assert_called_once_with(
             profile=None,
             domains=None,
@@ -1413,7 +1401,6 @@ class TestMain:
         self, mock_do_list_domains: MagicMock
     ) -> None:
         """Test main dispatches to do_list_domains."""
-        mock_do_list_domains.return_value = 0
         args = argparse.Namespace(
             command="list-domains",
             profile="prof",
@@ -1421,9 +1408,8 @@ class TestMain:
             sources=["recovery"],
         )
 
-        result = fc.main(args)
+        fc.main(args)
 
-        assert result == 0
         mock_do_list_domains.assert_called_once_with(
             profile="prof",
             container="2",
@@ -1435,14 +1421,12 @@ class TestMain:
         self, mock_do_list_profiles: MagicMock
     ) -> None:
         """Test main dispatches to do_list_profiles."""
-        mock_do_list_profiles.return_value = 0
         args = argparse.Namespace(
             command="list-profiles",
         )
 
-        result = fc.main(args)
+        fc.main(args)
 
-        assert result == 0
         mock_do_list_profiles.assert_called_once()
 
     @patch.object(fc, "do_list_containers", autospec=True)
@@ -1450,55 +1434,17 @@ class TestMain:
         self, mock_do_list_containers: MagicMock
     ) -> None:
         """Test main dispatches to do_list_containers."""
-        mock_do_list_containers.return_value = 0
         args = argparse.Namespace(
             command="list-containers",
             profile="myprof",
             sources=["db", "recovery"],
         )
 
-        result = fc.main(args)
+        fc.main(args)
 
-        assert result == 0
         mock_do_list_containers.assert_called_once_with(
             profile="myprof",
             sources=["db", "recovery"],
-        )
-
-    @patch.object(fc, "do_self_test", autospec=True)
-    def test_main_self_test_command(self, mock_do_self_test: MagicMock) -> None:
-        """Test main dispatches to do_self_test."""
-        args = argparse.Namespace(
-            command="self-test",
-            verbose=True,
-            coverage=False,
-        )
-
-        result = fc.main(args)
-
-        assert result == fc.EXIT_SUCCESS
-        mock_do_self_test.assert_called_once_with(
-            verbose=True,
-            coverage=False,
-        )
-
-    @patch.object(fc, "do_self_test", autospec=True)
-    def test_main_self_test_defaults(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
-        """Test main passes default self-test args."""
-        args = argparse.Namespace(
-            command="self-test",
-            verbose=False,
-            coverage=False,
-        )
-
-        result = fc.main(args)
-
-        assert result == fc.EXIT_SUCCESS
-        mock_do_self_test.assert_called_once_with(
-            verbose=False,
-            coverage=False,
         )
 
     def test_main_unknown_command(self) -> None:
@@ -1512,21 +1458,21 @@ class TestCli:
     """Test CLI entry point."""
 
     def test_no_args_returns_usage_error(self) -> None:
-        """No arguments returns EXIT_USAGE."""
+        """No arguments returns USAGE."""
         with patch("sys.argv", ["firefox-cookies"]):
             result = fc.cli()
-        assert result == fc.EXIT_USAGE
+        assert result == fc.ExitCode.USAGE
 
     def test_help_returns_success(self) -> None:
-        """--help returns EXIT_SUCCESS."""
+        """--help returns SUCCESS."""
         with patch("sys.argv", ["firefox-cookies", "--help"]):
             result = fc.cli()
-        assert result == fc.EXIT_SUCCESS
+        assert result == fc.ExitCode.SUCCESS
 
     def test_config_error_returns_config_code(
         self,
     ) -> None:
-        """ConfigError maps to EXIT_CONFIG."""
+        """ConfigError maps to CONFIG."""
         with (
             patch(
                 "sys.argv",
@@ -1534,18 +1480,18 @@ class TestCli:
             ),
             patch.object(
                 fc,
-                "find_firefox_dir",
+                "main",
                 autospec=True,
                 side_effect=fc.ConfigError("bad"),
             ),
         ):
             result = fc.cli()
-        assert result == fc.EXIT_CONFIG
+        assert result == fc.ExitCode.CONFIG
 
-    def test_not_found_returns_not_found_code(
+    def test_base_error_returns_error_code(
         self,
     ) -> None:
-        """NotFoundError maps to EXIT_NOT_FOUND."""
+        """FirefoxCookiesError maps to ERROR."""
         with (
             patch(
                 "sys.argv",
@@ -1553,18 +1499,18 @@ class TestCli:
             ),
             patch.object(
                 fc,
-                "find_firefox_dir",
+                "main",
                 autospec=True,
-                side_effect=fc.NotFoundError("missing"),
+                side_effect=fc.FirefoxCookiesError("missing"),
             ),
         ):
             result = fc.cli()
-        assert result == fc.EXIT_NOT_FOUND
+        assert result == fc.ExitCode.ERROR
 
     def test_usage_error_returns_usage_code(
         self,
     ) -> None:
-        """UsageError maps to EXIT_USAGE."""
+        """UsageError maps to USAGE."""
         with (
             patch(
                 "sys.argv",
@@ -1578,31 +1524,12 @@ class TestCli:
             ),
         ):
             result = fc.cli()
-        assert result == fc.EXIT_USAGE
+        assert result == fc.ExitCode.USAGE
 
-    def test_test_error_returns_subprocess_code(
+    def test_generic_error_returns_error_code(
         self,
     ) -> None:
-        """TestError maps to EXIT_SUBPROCESS."""
-        with (
-            patch(
-                "sys.argv",
-                ["firefox-cookies", "self-test"],
-            ),
-            patch.object(
-                fc,
-                "main",
-                autospec=True,
-                side_effect=fc.TestError("failed"),
-            ),
-        ):
-            result = fc.cli()
-        assert result == fc.EXIT_SUBPROCESS
-
-    def test_generic_error_returns_other_code(
-        self,
-    ) -> None:
-        """Generic Exception maps to EXIT_OTHER."""
+        """Generic Exception maps to ERROR."""
         with (
             patch(
                 "sys.argv",
@@ -1616,12 +1543,11 @@ class TestCli:
             ),
         ):
             result = fc.cli()
-        assert result == fc.EXIT_OTHER
+        assert result == fc.ExitCode.ERROR
 
     @patch.object(fc, "main", autospec=True)
     def test_cli_list_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list args to main."""
-        mock_main.return_value = 0
         with patch(
             "sys.argv",
             [
@@ -1652,7 +1578,7 @@ class TestCli:
     @patch.object(fc, "main", autospec=True)
     def test_cli_list_domains_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list-domains args."""
-        mock_main.return_value = 0
+        mock_main.return_value = None
         with patch(
             "sys.argv",
             [
@@ -1677,7 +1603,7 @@ class TestCli:
     @patch.object(fc, "main", autospec=True)
     def test_cli_list_profiles_passes_args(self, mock_main: MagicMock) -> None:
         """CLI passes parsed list-profiles args."""
-        mock_main.return_value = 0
+        mock_main.return_value = None
         with patch(
             "sys.argv",
             ["firefox-cookies", "list-profiles"],
@@ -1692,7 +1618,7 @@ class TestCli:
         self, mock_main: MagicMock
     ) -> None:
         """CLI passes parsed list-containers args."""
-        mock_main.return_value = 0
+        mock_main.return_value = None
         with patch(
             "sys.argv",
             [
@@ -1711,10 +1637,12 @@ class TestCli:
         assert args.profile == "myprof"
         assert args.sources == ["db"]
 
-    @patch.object(fc, "main", autospec=True)
-    def test_cli_self_test_passes_args(self, mock_main: MagicMock) -> None:
+    @patch.object(fc, "do_self_test", autospec=True)
+    def test_cli_self_test_passes_args(
+        self, mock_do_self_test: MagicMock
+    ) -> None:
         """CLI passes parsed self-test args."""
-        mock_main.return_value = 0
+        mock_do_self_test.return_value = 0
         with patch(
             "sys.argv",
             [
@@ -1726,10 +1654,10 @@ class TestCli:
         ):
             result = fc.cli()
         assert result == 0
-        args = mock_main.call_args[0][0]
-        assert args.command == "self-test"
-        assert args.verbose is True
-        assert args.coverage is True
+        mock_do_self_test.assert_called_once_with(
+            verbose=True,
+            coverage=True,
+        )
 
 
 # =============================================================================
@@ -2265,13 +2193,12 @@ class TestDoListWithSessionCookies:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=None,
                 container=None,
                 fmt="json",
             )
-        assert result == 0
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         names = {c["name"] for c in data}
@@ -2375,13 +2302,12 @@ class TestDoListWithSessionCookies:
             autospec=True,
             return_value=firefox_dir,
         ):
-            result = fc.do_list(
+            fc.do_list(
                 profile=None,
                 domains=None,
                 container=None,
                 fmt="json",
             )
-        assert result == 0
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert len(data) == 6
@@ -2470,12 +2396,11 @@ class TestDoSelfTest:
         assert "--coverage" not in cmd
 
     @patch.object(fc.subprocess, "run", autospec=True)
-    def test_raises_on_failure(self, mock_run: MagicMock) -> None:
-        """Test do_self_test raises TestError."""
+    def test_returns_failure_code(self, mock_run: MagicMock) -> None:
+        """Test do_self_test returns subprocess returncode."""
         mock_run.return_value = MagicMock(returncode=1)
 
-        with pytest.raises(fc.TestError, match="Tests failed"):
-            fc.do_self_test(verbose=False, coverage=False)
+        assert fc.do_self_test(verbose=False, coverage=False) == 1
 
 
 class TestDoListDomainsWithSession:
@@ -2499,6 +2424,18 @@ class TestDoListDomainsWithSession:
             fc.do_list_domains(profile=None, container=None)
         captured = capsys.readouterr()
         assert "wordpress.com" in captured.out
+
+
+class TestExceptionHierarchy(ExceptionHierarchyBase):
+    """Test FirefoxCookiesError exception hierarchy."""
+
+    BASE_ERROR = fc.FirefoxCookiesError
+    EXIT_CODE = fc.ExitCode
+    EXCLUDED_CODES = {
+        fc.ExitCode.SUCCESS,
+        fc.ExitCode.WARNING,
+        fc.ExitCode.SUBPROCESS,
+    }
 
 
 if __name__ == "__main__":

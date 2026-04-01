@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import enum
 import glob
 import hashlib
 import json
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
@@ -124,20 +126,82 @@ include = [
 
 
 # =============================================================================
-# CONFIG DATACLASSES
+# EXIT CODES
 # =============================================================================
 
 
-class ConfigError(RuntimeError):
-    pass
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0, "Success"
+    WARNING = 1, "Warning"
+    USAGE = 2, "Usage/argument error"
+    CONFIG = 3, "Configuration error"
+    ERROR = 4, "General error"
+    SUBPROCESS = 5, "Subprocess error"
+    NOT_FOUND = 6, "File not found"
+
+    def __new__(cls, value: int, description: str = "") -> ExitCode:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description  # type: ignore[attr-defined]
+        return obj
+
+    @classmethod
+    def epilog(cls) -> str:
+        lines = ["exit codes:"]
+        for member in cls:
+            lines.append(
+                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
+            )
+        return "\n".join(lines)
 
 
-class TestError(RuntimeError):
-    pass
+# =============================================================================
+# EXCEPTIONS
+# =============================================================================
 
 
-class UsageError(RuntimeError):
-    pass
+class SecureArchiverError(RuntimeError):
+    """Base exception for secure-archiver errors."""
+
+    exit_code: ExitCode = ExitCode.ERROR
+
+
+class UsageError(SecureArchiverError):
+    """Raised for usage/argument errors."""
+
+    exit_code = ExitCode.USAGE
+
+
+class ConfigError(SecureArchiverError):
+    """Raised for configuration errors."""
+
+    exit_code = ExitCode.CONFIG
+
+
+class NotFoundError(SecureArchiverError):
+    """Raised when a required file or path is not found."""
+
+    exit_code = ExitCode.NOT_FOUND
+
+
+class SubprocessError(subprocess.CalledProcessError, SecureArchiverError):
+    """Subprocess command failed."""
+
+    exit_code = ExitCode.SUBPROCESS
+
+    def __str__(self) -> str:
+        cmd_str = " ".join(self.cmd) if isinstance(self.cmd, list) else self.cmd
+        parts = [f"Command failed: {cmd_str}"]
+        if self.stdout:
+            parts.append(f"stdout: {self.stdout.strip()}")
+        if self.stderr:
+            parts.append(f"stderr: {self.stderr.strip()}")
+        return "\n".join(parts)
+
+
+# =============================================================================
+# CONFIG DATACLASSES
+# =============================================================================
 
 
 @dataclass
@@ -385,8 +449,8 @@ class Config:
         return cls(general=general, archives=archives)
 
 
-class CollisionError(RuntimeError):
-    pass
+class CollisionError(SecureArchiverError):
+    """Raised when archive names collide."""
 
 
 def eprint(*args: Any) -> None:
@@ -405,15 +469,18 @@ def run_cmd(
     check: bool = True,
     env: Optional[Dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(cmd),
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=check,
-        env=env,
-    )
+    try:
+        return subprocess.run(
+            list(cmd),
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=check,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        raise SubprocessError(e.returncode, e.cmd, e.output, e.stderr) from e
 
 
 def ensure_tools() -> None:
@@ -885,7 +952,7 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
     """
     matches = expand_pattern(entry.path)
     if not matches:
-        raise FileNotFoundError(
+        raise NotFoundError(
             f"No matches for include path pattern: {entry.path}"
         )
 
@@ -900,12 +967,12 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
         elif m.is_dir():
             sources.extend(list(iter_files_in_dir(m, recurse=entry.recurse)))
         else:
-            raise FileNotFoundError(
+            raise NotFoundError(
                 f"Matched path is neither file nor directory: {m}"
             )
 
     if not sources:
-        raise FileNotFoundError(
+        raise NotFoundError(
             "Include entry matched, but resulted in zero files to include: "
             f"path={entry.path} recurse={entry.recurse} latest={entry.latest}"
         )
@@ -1099,15 +1166,7 @@ def build_parser() -> argparse.ArgumentParser:
             "1Password data that are encrypted using passwords "
             "stored in 1Password"
         ),
-        epilog="""\
-exit codes:
-  0  Success
-  1  Usage/argument error
-  2  Configuration error
-  3  File not found
-  4  Subprocess/external command error
-  5  Other errors (test failures, collisions, etc.)
-""",
+        epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommands")
@@ -1226,12 +1285,8 @@ def do_update(
     eprint("Done." if published_any else "Done (no archives updated).")
 
 
-def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
-    """Run tests by invoking the test file directly.
-
-    Raises:
-        TestError: If any tests fail or pytest encounters an error.
-    """
+def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
+    """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
     test_file = repo_root / "tests" / "test_secure_archiver.py"
 
@@ -1241,9 +1296,7 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> None:
     if coverage:
         cmd.append("--coverage")
 
-    cp = subprocess.run(cmd, cwd=repo_root)
-    if cp.returncode != 0:
-        raise TestError("Tests failed")
+    return subprocess.run(cmd, cwd=repo_root).returncode
 
 
 def do_write_example_config(output_path: Path) -> None:
@@ -1276,8 +1329,6 @@ def main(args: argparse.Namespace) -> None:
         raise UsageError("No subcommand specified. Use --help for usage.")
 
     match args.command:
-        case "self-test":
-            do_self_test(verbose=args.verbose, coverage=args.coverage)
         case "create":
             cfg = load_config(args.config)
             do_update(
@@ -1294,48 +1345,27 @@ def main(args: argparse.Namespace) -> None:
 
 
 def cli() -> int:
-    """
-    CLI entry point with argument parsing and exception handling.
-
-    Exit codes:
-        0: Success
-        1: Usage/argument error
-        2: Configuration error
-        3: File not found
-        4: Subprocess/external command error
-        5: Other errors (test failures, collisions, etc.)
-    """
+    """CLI entry point with exception handling."""
     parser = build_parser()
     try:
         args = parser.parse_args()
     except SystemExit as e:
-        # argparse calls sys.exit(0) for --help, sys.exit(2) for errors
         if e.code == 0:
-            return 0
-        return 1
+            return ExitCode.SUCCESS
+        return ExitCode.USAGE
+
+    if args.command == "self-test":
+        return do_self_test(verbose=args.verbose, coverage=args.coverage)
+
     try:
         main(args)
-        return 0
-    except UsageError as e:
+    except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
-        return 1
-    except ConfigError as e:
-        eprint(f"ERROR: {e}")
-        return 2
-    except FileNotFoundError as e:
-        eprint(f"ERROR: {e}")
-        return 3
-    except subprocess.CalledProcessError as e:
-        cmd_str = " ".join(e.cmd) if isinstance(e.cmd, list) else e.cmd
-        eprint(f"ERROR: Command failed: {cmd_str}")
-        if e.stdout:
-            eprint(f"stdout: {e.stdout.strip()}")
-        if e.stderr:
-            eprint(f"stderr: {e.stderr.strip()}")
-        return 4
-    except Exception as e:
-        eprint(f"ERROR: {e}")
-        return 5
+        return e.exit_code
+    except Exception:
+        traceback.print_exc()
+        return ExitCode.ERROR
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":
