@@ -344,11 +344,6 @@ def recovery_jsonlz4(profile_dir: Path) -> Path:
 class TestArgumentParser:
     """Test argument parser structure."""
 
-    def test_parser_builds_successfully(self) -> None:
-        """Verify parser can be built without errors."""
-        parser = fc.build_parser()
-        assert parser is not None
-
     def test_list_parses_all_options(self) -> None:
         """Test list subcommand parses all options."""
         parser = fc.build_parser()
@@ -402,14 +397,6 @@ class TestArgumentParser:
         args = parser.parse_args(["list-containers", "-p", "myprof"])
         assert args.command == "list-containers"
         assert args.profile == "myprof"
-
-    def test_self_test_parses_options(self) -> None:
-        """Test self-test subcommand options."""
-        parser = fc.build_parser()
-        args = parser.parse_args(["self-test", "-v", "--coverage"])
-        assert args.command == "self-test"
-        assert args.verbose is True
-        assert args.coverage is True
 
     def test_invalid_format_errors(self) -> None:
         """Test that invalid format produces an error."""
@@ -1343,119 +1330,18 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = fc.COMMAND_CALLBACKS
     PARSER_FUNC = fc.build_parser
     CLI_FUNC = staticmethod(fc.cli)
+    MODULE = fc
     EXIT_CODE_USAGE = fc.ExitCode.USAGE
-
-
-class TestCli:
-    """Test CLI entry point."""
-
-    def test_help_returns_success(self) -> None:
-        """--help returns SUCCESS."""
-        with patch("sys.argv", ["firefox-cookies", "--help"]):
-            result = fc.cli()
-        assert result == fc.ExitCode.SUCCESS
-
-    def test_config_error_returns_config_code(
-        self,
-    ) -> None:
-        """ConfigError maps to CONFIG."""
-        mock_cb = MagicMock(
-            side_effect=fc.ConfigError("bad"),
-        )
-        with (
-            patch(
-                "sys.argv",
-                ["firefox-cookies", "list-profiles"],
-            ),
-            patch.dict(
-                fc.COMMAND_CALLBACKS,
-                {"list-profiles": mock_cb},
-            ),
-        ):
-            result = fc.cli()
-        assert result == fc.ExitCode.CONFIG
-
-    def test_base_error_returns_error_code(
-        self,
-    ) -> None:
-        """FirefoxCookiesError maps to ERROR."""
-        mock_cb = MagicMock(
-            side_effect=fc.FirefoxCookiesError("missing"),
-        )
-        with (
-            patch(
-                "sys.argv",
-                ["firefox-cookies", "list-profiles"],
-            ),
-            patch.dict(
-                fc.COMMAND_CALLBACKS,
-                {"list-profiles": mock_cb},
-            ),
-        ):
-            result = fc.cli()
-        assert result == fc.ExitCode.ERROR
-
-    def test_usage_error_returns_usage_code(
-        self,
-    ) -> None:
-        """UsageError maps to USAGE."""
-        mock_cb = MagicMock(
-            side_effect=fc.UsageError("bad"),
-        )
-        with (
-            patch(
-                "sys.argv",
-                ["firefox-cookies", "list-profiles"],
-            ),
-            patch.dict(
-                fc.COMMAND_CALLBACKS,
-                {"list-profiles": mock_cb},
-            ),
-        ):
-            result = fc.cli()
-        assert result == fc.ExitCode.USAGE
-
-    def test_generic_error_returns_error_code(
-        self,
-    ) -> None:
-        """Generic Exception maps to ERROR."""
-        mock_cb = MagicMock(
-            side_effect=RuntimeError("unexpected"),
-        )
-        with (
-            patch(
-                "sys.argv",
-                ["firefox-cookies", "list-profiles"],
-            ),
-            patch.dict(
-                fc.COMMAND_CALLBACKS,
-                {"list-profiles": mock_cb},
-            ),
-        ):
-            result = fc.cli()
-        assert result == fc.ExitCode.ERROR
-
-    @patch.object(fc, "do_self_test", autospec=True)
-    def test_cli_self_test_passes_args(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
-        """CLI passes parsed self-test args."""
-        mock_do_self_test.return_value = 0
-        with patch(
-            "sys.argv",
-            [
-                "firefox-cookies",
-                "self-test",
-                "-v",
-                "--coverage",
-            ],
-        ):
-            result = fc.cli()
-        assert result == 0
-        mock_do_self_test.assert_called_once_with(
-            verbose=True,
-            coverage=True,
-        )
+    TEST_SUBCOMMAND = "list-profiles"
+    EXCEPTION_EXIT_CODE_MAP = [
+        (fc.ConfigError("t"), fc.ExitCode.CONFIG),
+        (
+            fc.FirefoxCookiesError("t"),
+            fc.ExitCode.ERROR,
+        ),
+        (fc.UsageError("t"), fc.ExitCode.USAGE),
+        (RuntimeError("t"), fc.ExitCode.ERROR),
+    ]
 
 
 # =============================================================================

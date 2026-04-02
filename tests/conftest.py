@@ -11,9 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+import pytest  # type: ignore[import-not-found]
 from pathlib import Path
 from typing import Any, ClassVar, Iterator
-from unittest.mock import create_autospec, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -185,6 +187,13 @@ class ExceptionHierarchyBase:
         expected = set(self.EXIT_CODE) - self.EXCLUDED_CODES
         assert covered == expected
 
+    def test_usage_code_matches_argparse(self) -> None:
+        """ExitCode.USAGE matches argparse's error exit code."""
+        parser = argparse.ArgumentParser()
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["--bogus"])
+        assert self.EXIT_CODE["USAGE"] == exc_info.value.code
+
     def test_exception_exit_codes_are_unique(self) -> None:
         """Subclasses with explicit exit_code have unique codes."""
         codes = [
@@ -199,15 +208,21 @@ class CmdCallbacksBase:
     """Base class for command callback table tests.
 
     Subclasses must define CALLBACKS, PARSER_FUNC,
-    CLI_FUNC, EXIT_CODE_USAGE, and SELF_TEST_CMD.
+    CLI_FUNC, MODULE, EXIT_CODE_USAGE, and
+    SELF_TEST_CMD.
     """
 
     CALLBACKS: ClassVar[Any]
     PARSER_FUNC: ClassVar[Any]
     CLI_FUNC: ClassVar[Any]
+    MODULE: ClassVar[Any]
     EXIT_CODE_USAGE: ClassVar[int]
     SELF_TEST_CMD: ClassVar[str] = "self-test"
     POPPED_ARGS: ClassVar[set[str]] = set()
+    TEST_SUBCOMMAND: ClassVar[str] = ""
+    EXCEPTION_EXIT_CODE_MAP: ClassVar[
+        list[tuple[Exception, int]]
+    ] = []
 
     @staticmethod
     def _leaf_subparsers(
@@ -326,6 +341,22 @@ class CmdCallbacksBase:
 
         check_parser(parser, parser.prog)
 
+    def test_parser_builds_successfully(self) -> None:
+        """Verify parser can be built without errors."""
+        parser = type(self).PARSER_FUNC()
+        assert parser is not None
+
+    def test_self_test_parses_flags(self) -> None:
+        """self-test subcommand parses -v/--coverage."""
+        parser = type(self).PARSER_FUNC()
+        cmd = type(self).SELF_TEST_CMD
+        args = parser.parse_args(
+            [cmd, "-v", "--coverage"]
+        )
+        assert args.command == cmd
+        assert args.verbose is True
+        assert args.coverage is True
+
     def test_no_args_parses_without_error(self) -> None:
         """parse_args([]) succeeds with command=None."""
         parser = type(self).PARSER_FUNC()
@@ -341,6 +372,100 @@ class CmdCallbacksBase:
         assert result == type(self).EXIT_CODE_USAGE
         captured = capsys.readouterr()
         assert "usage:" in captured.out.lower()
+
+    def test_help_exits_success(self) -> None:
+        """--help exits with code 0."""
+        with (
+            patch("sys.argv", ["prog", "--help"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            type(self).CLI_FUNC()
+        assert exc_info.value.code == 0
+
+    def test_cli_exception_to_exit_code(
+        self,
+    ) -> None:
+        """cli() maps exceptions to correct exit codes."""
+        exc_map = type(self).EXCEPTION_EXIT_CODE_MAP
+        if not exc_map:
+            return
+        subcommand = type(self).TEST_SUBCOMMAND
+        for exc, expected_code in exc_map:
+            mock_cb = MagicMock(side_effect=exc)
+            with (
+                patch.dict(
+                    type(self).CALLBACKS,
+                    {subcommand: mock_cb},
+                ),
+                patch(
+                    "sys.argv",
+                    ["prog", subcommand],
+                ),
+            ):
+                result = type(self).CLI_FUNC()
+            assert result == expected_code, (
+                f"Expected {expected_code} for "
+                f"{type(exc).__name__}, got {result}"
+            )
+
+    def test_cli_returns_success(self) -> None:
+        """cli() returns SUCCESS for a valid subcommand."""
+        mock_cb = MagicMock()
+        subcommand = type(self).TEST_SUBCOMMAND
+        with (
+            patch.dict(
+                type(self).CALLBACKS,
+                {subcommand: mock_cb},
+            ),
+            patch(
+                "sys.argv",
+                ["prog", subcommand],
+            ),
+        ):
+            result = type(self).CLI_FUNC()
+        assert result == 0
+        assert mock_cb.called
+
+    def test_cli_self_test_dispatches(self) -> None:
+        """cli() dispatches self-test correctly."""
+        mod = type(self).MODULE
+        with (
+            patch.object(
+                mod,
+                "do_self_test",
+                autospec=True,
+                return_value=0,
+            ) as mock,
+            patch(
+                "sys.argv",
+                ["prog", "self-test"],
+            ),
+        ):
+            result = type(self).CLI_FUNC()
+        assert result == 0
+        mock.assert_called_once_with(
+            verbose=False, coverage=False
+        )
+
+    def test_cli_self_test_returns_test_results(
+        self,
+    ) -> None:
+        """cli() passes through do_self_test exit code."""
+        mod = type(self).MODULE
+        with (
+            patch.object(
+                mod,
+                "do_self_test",
+                autospec=True,
+                return_value=1,
+            ),
+            patch(
+                "sys.argv",
+                ["prog", "self-test"],
+            ),
+        ):
+            result = type(self).CLI_FUNC()
+        assert result == 1
 
 
 def run_tests(

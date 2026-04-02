@@ -44,11 +44,6 @@ _spec.loader.exec_module(df)
 class TestArgumentParser:
     """Test argument parser structure."""
 
-    def test_parser_builds_successfully(self) -> None:
-        """Verify parser can be built without errors."""
-        parser = df.build_parser()
-        assert parser is not None
-
     def test_install_parses_directory(self) -> None:
         """Test install subcommand parses directory argument."""
         parser = df.build_parser()
@@ -83,14 +78,6 @@ class TestArgumentParser:
         args = parser.parse_args(["audit", "/path/to/dotfiles"])
         assert args.command == "audit"
         assert args.directory == Path("/path/to/dotfiles")
-
-    def test_self_test_parses_flags(self) -> None:
-        """Test self-test subcommand parses flags."""
-        parser = df.build_parser()
-        args = parser.parse_args(["self-test", "-v", "--coverage"])
-        assert args.command == "self-test"
-        assert args.verbose is True
-        assert args.coverage is True
 
 
 class TestDotfileEntry:
@@ -1375,88 +1362,18 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = df.COMMAND_CALLBACKS
     PARSER_FUNC = df.build_parser
     CLI_FUNC = staticmethod(df.cli)
+    MODULE = df
     EXIT_CODE_USAGE = df.ExitCode.USAGE
-
-
-class TestCli:
-    """Test cli() function."""
-
-    def test_cli_returns_success(self) -> None:
-        """Test cli() returns SUCCESS when command succeeds."""
-        mock = MagicMock()
-        with (
-            patch.dict(df.COMMAND_CALLBACKS, {"audit": mock}),
-            patch("sys.argv", ["prog", "audit"]),
-        ):
-            result = df.cli()
-        assert result == df.ExitCode.SUCCESS
-
-    def test_cli_handles_conflicts_found(self) -> None:
-        """Test cli() catches ConflictsFound and returns CONFLICTS."""
-        mock = MagicMock(side_effect=df.ConflictsFound("test"))
-        with (
-            patch.dict(df.COMMAND_CALLBACKS, {"audit": mock}),
-            patch("sys.argv", ["prog", "audit"]),
-        ):
-            result = df.cli()
-        assert result == df.ExitCode.CONFLICTS
-
-    def test_cli_handles_usage_error(self) -> None:
-        """Test cli() catches UsageError and returns USAGE."""
-        mock = MagicMock(side_effect=df.UsageError("test"))
-        with (
-            patch.dict(df.COMMAND_CALLBACKS, {"audit": mock}),
-            patch("sys.argv", ["prog", "audit"]),
-        ):
-            result = df.cli()
-        assert result == df.ExitCode.USAGE
-
-    def test_cli_handles_missing_directory_error(self) -> None:
-        """Test cli() catches MissingDotfilesDirectory."""
-        mock = MagicMock(side_effect=df.MissingDotfilesDirectory("test"))
-        with (
-            patch.dict(df.COMMAND_CALLBACKS, {"audit": mock}),
-            patch("sys.argv", ["prog", "audit"]),
-        ):
-            result = df.cli()
-        assert result == df.ExitCode.MISSING_DIR
-
-    def test_cli_handles_generic_exception(self) -> None:
-        """Test cli() catches generic exceptions and returns ERROR."""
-        mock = MagicMock(side_effect=RuntimeError("unexpected"))
-        with (
-            patch.dict(df.COMMAND_CALLBACKS, {"audit": mock}),
-            patch("sys.argv", ["prog", "audit"]),
-        ):
-            result = df.cli()
-        assert result == df.ExitCode.ERROR
-
-    def test_cli_help_returns_success(self) -> None:
-        """Test cli() returns SUCCESS for --help."""
-        with patch("sys.argv", ["prog", "--help"]):
-            result = df.cli()
-        assert result == df.ExitCode.SUCCESS
-
-    @patch.object(df, "do_self_test")
-    def test_cli_self_test_dispatches(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
-        """Test cli() dispatches self-test to do_self_test."""
-        mock_do_self_test.return_value = 0
-        with patch("sys.argv", ["prog", "self-test"]):
-            result = df.cli()
-        assert mock_do_self_test.called
-        assert result == df.ExitCode.SUCCESS
-
-    @patch.object(df, "do_self_test")
-    def test_cli_self_test_returns_failure(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
-        """Test cli() returns do_self_test's nonzero exit code."""
-        mock_do_self_test.return_value = 1
-        with patch("sys.argv", ["prog", "self-test"]):
-            result = df.cli()
-        assert result == 1
+    TEST_SUBCOMMAND = "audit"
+    EXCEPTION_EXIT_CODE_MAP = [
+        (df.ConflictsFound("t"), df.ExitCode.CONFLICTS),
+        (df.UsageError("t"), df.ExitCode.USAGE),
+        (
+            df.MissingDotfilesDirectory("t"),
+            df.ExitCode.MISSING_DIR,
+        ),
+        (RuntimeError("t"), df.ExitCode.ERROR),
+    ]
 
 
 class TestMultipleDirectories:

@@ -129,11 +129,6 @@ def mock_cfg() -> Any:
 class TestArgumentParser:
     """Test argument parser structure."""
 
-    def test_parser_builds_successfully(self) -> None:
-        """Verify parser can be built without errors."""
-        parser = ba.args_parser()
-        assert parser is not None
-
     def test_check_legacy_rewrite(self) -> None:
         """Test legacy check-* commands are rewritten to check *."""
         cases: dict[str, list[str]] = {
@@ -186,14 +181,6 @@ class TestArgumentParser:
         assert args.command == "repair"
         assert args.action == "repo"
         assert args.yes is False
-
-    def test_self_test_subcommand_parses(self) -> None:
-        """Test self-test subcommand parses flags."""
-        parser = ba.args_parser()
-        args = parser.parse_args(["self-test", "-v", "--coverage"])
-        assert args.command == "self-test"
-        assert args.verbose is True
-        assert args.coverage is True
 
     def test_common_args_rejected_before_action(self) -> None:
         """Common args between subcommand and action should fail."""
@@ -290,7 +277,35 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = ba.COMMAND_CALLBACKS
     PARSER_FUNC = ba.args_parser
     CLI_FUNC = staticmethod(ba.cli)
+    MODULE = ba
     EXIT_CODE_USAGE = ba.ExitCode.USAGE
+    TEST_SUBCOMMAND = "environment"
+    EXCEPTION_EXIT_CODE_MAP = [
+        (ba.ConfigError("t"), ba.ExitCode.CONFIG),
+        (
+            ba.SubprocessError(1, "cmd"),
+            ba.ExitCode.SUBPROCESS,
+        ),
+        (
+            ba.CheckNoBackupsError("t"),
+            ba.ExitCode.CHECK_NO_BACKUPS,
+        ),
+        (ba.CheckAgeError("t"), ba.ExitCode.CHECK_AGE),
+        (
+            ba.CheckRepoError("t"),
+            ba.ExitCode.CHECK_REPO,
+        ),
+        (
+            ba.CheckArchivesError("t"),
+            ba.ExitCode.CHECK_ARCHIVES,
+        ),
+        (
+            ba.CheckPruneError("t"),
+            ba.ExitCode.CHECK_PRUNE,
+        ),
+        (ba.BorgadmError("t"), ba.ExitCode.ERROR),
+        (RuntimeError("t"), ba.ExitCode.ERROR),
+    ]
     POPPED_ARGS = {
         "validate",
         "config",
@@ -306,6 +321,23 @@ class TestCmdCallbacks(CmdCallbacksBase):
         "keep_monthly",
         "keep_yearly",
     }
+
+    @pytest.fixture(autouse=True)
+    def _mock_cfg(self, mock_cfg: Any) -> Iterator[Any]:
+        """Activate mock config for all inherited tests.
+
+        Patches Config and initialize_borg_environment so
+        main() reaches COMMAND_CALLBACKS without needing
+        real config, SSH keys, or borg passphrase.
+        Saves/restores globals that main() modifies.
+        """
+        saved_title = getattr(ba, "_notify_title")
+        with (
+            patch.object(ba, "Config", return_value=mock_cfg),
+            patch.object(ba, "initialize_borg_environment"),
+        ):
+            yield mock_cfg
+        setattr(ba, "_notify_title", saved_title)
 
 
 class TestRepair:
@@ -2200,14 +2232,6 @@ class TestCreatePlistElement:
 class TestCli:
     """Test cli() entry point."""
 
-    def test_cli_returns_success(self, mock_cfg: Any, caplog: Any) -> None:
-        """cli() returns SUCCESS when main() completes normally."""
-        with (
-            patch("sys.argv", ["borgadm", "environment"]),
-            patch.object(ba, "main", autospec=True),
-        ):
-            assert ba.cli() == ba.ExitCode.SUCCESS
-
     def test_cli_returns_warning(self, mock_cfg: Any) -> None:
         """cli() returns WARNING when _warning_occurred is set."""
         original = getattr(ba, "_warning_occurred")
@@ -2220,40 +2244,6 @@ class TestCli:
                 assert ba.cli() == ba.ExitCode.WARNING
         finally:
             setattr(ba, "_warning_occurred", original)
-
-    def test_cli_catches_borgadm_error(self, mock_cfg: Any) -> None:
-        """cli() catches BorgadmError and returns its exit_code."""
-        with (
-            patch("sys.argv", ["borgadm", "environment"]),
-            patch.object(
-                ba,
-                "main",
-                autospec=True,
-                side_effect=ba.ConfigError("bad config"),
-            ),
-        ):
-            assert ba.cli() == ba.ExitCode.CONFIG
-
-    def test_cli_catches_unexpected_exception(self, mock_cfg: Any) -> None:
-        """cli() catches unexpected Exception and returns ERROR."""
-        with (
-            patch("sys.argv", ["borgadm", "environment"]),
-            patch.object(
-                ba,
-                "main",
-                autospec=True,
-                side_effect=RuntimeError("unexpected"),
-            ),
-        ):
-            assert ba.cli() == ba.ExitCode.ERROR
-
-    def test_cli_help_returns_success(self) -> None:
-        """--help returns SUCCESS."""
-        with patch("sys.argv", ["borgadm", "--help"]):
-            try:
-                ba.cli()
-            except SystemExit as e:
-                assert e.code == 0
 
 
 class TestWrapperRebuild:

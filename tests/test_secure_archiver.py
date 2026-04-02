@@ -39,15 +39,6 @@ sys.modules["secure_archiver"] = sa
 _spec.loader.exec_module(sa)
 
 
-class TestArgumentParser:
-    """Test argument parser structure."""
-
-    def test_parser_builds_successfully(self) -> None:
-        """Verify parser can be built without errors."""
-        parser = sa.build_parser()
-        assert parser is not None
-
-
 class TestConfigFinding:
     """Test configuration file finding logic."""
 
@@ -1561,109 +1552,20 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = sa.COMMAND_CALLBACKS
     PARSER_FUNC = staticmethod(sa.build_parser)
     CLI_FUNC = staticmethod(sa.cli)
+    MODULE = sa
     EXIT_CODE_USAGE = sa.ExitCode.USAGE
-
-
-class TestCli:
-    """Test cli() function argument parsing and exception handling."""
-
-    def test_cli_returns_success(self) -> None:
-        """cli() returns SUCCESS when callback succeeds."""
-        mock_cb = MagicMock()
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.SUCCESS
-        assert mock_cb.called
-
-    def test_cli_handles_usage_error(self) -> None:
-        """cli() catches UsageError and returns USAGE."""
-        mock_cb = MagicMock(side_effect=sa.UsageError("test usage error"))
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.USAGE
-
-    def test_cli_handles_config_error(self) -> None:
-        """cli() catches ConfigError and returns CONFIG."""
-        mock_cb = MagicMock(side_effect=sa.ConfigError("test config error"))
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.CONFIG
-
-    def test_cli_handles_not_found_error(self) -> None:
-        """cli() catches NotFoundError and returns NOT_FOUND."""
-        mock_cb = MagicMock(side_effect=sa.NotFoundError("not found"))
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.NOT_FOUND
-
-    def test_cli_handles_subprocess_error(self) -> None:
-        """cli() catches SubprocessError and returns SUBPROCESS."""
-        mock_cb = MagicMock(
-            side_effect=sa.SubprocessError(
-                1, ["test", "command"], "stdout", "stderr"
-            )
-        )
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.SUBPROCESS
-
-    def test_cli_handles_unexpected_error(self) -> None:
-        """cli() catches unexpected exceptions and returns ERROR."""
-        mock_cb = MagicMock(side_effect=RuntimeError("unexpected error"))
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.ERROR
-
-    def test_cli_handles_collision_error(self) -> None:
-        """cli() catches CollisionError and returns ERROR."""
-        mock_cb = MagicMock(side_effect=sa.CollisionError("collision"))
-        with (
-            patch.dict(sa.COMMAND_CALLBACKS, {"check-config": mock_cb}),
-            patch("sys.argv", ["prog", "check-config"]),
-        ):
-            result = sa.cli()
-        assert result == sa.ExitCode.ERROR
-
-    def test_cli_invalid_command(self) -> None:
-        """cli() returns USAGE for invalid subcommand."""
-        with patch("sys.argv", ["prog", "foobar"]):
-            result = sa.cli()
-        assert result == sa.ExitCode.USAGE
-
-    def test_cli_help_returns_success(self) -> None:
-        """cli() returns SUCCESS for --help."""
-        with patch("sys.argv", ["prog", "--help"]):
-            result = sa.cli()
-        assert result == sa.ExitCode.SUCCESS
-
-    @patch("secure_archiver.do_self_test", autospec=True)
-    def test_cli_dispatches_self_test(
-        self, mock_do_self_test: MagicMock
-    ) -> None:
-        """cli() dispatches self-test before try/except."""
-        mock_do_self_test.return_value = 0
-        with patch("sys.argv", ["prog", "self-test"]):
-            result = sa.cli()
-        assert result == 0
-        mock_do_self_test.assert_called_once_with(verbose=False, coverage=False)
+    TEST_SUBCOMMAND = "check-config"
+    EXCEPTION_EXIT_CODE_MAP = [
+        (sa.UsageError("t"), sa.ExitCode.USAGE),
+        (sa.ConfigError("t"), sa.ExitCode.CONFIG),
+        (sa.NotFoundError("t"), sa.ExitCode.NOT_FOUND),
+        (
+            sa.SubprocessError(1, ["cmd"], "out", "err"),
+            sa.ExitCode.SUBPROCESS,
+        ),
+        (sa.CollisionError("t"), sa.ExitCode.ERROR),
+        (RuntimeError("t"), sa.ExitCode.ERROR),
+    ]
 
 
 class TestWriteExampleConfig:
