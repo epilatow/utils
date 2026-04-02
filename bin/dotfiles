@@ -810,7 +810,7 @@ def cli() -> int:
     command = args_dict.pop("command")
 
     if not command:
-        logger.error("ERROR: No subcommand specified. Use --help for usage.")
+        parser.print_help()
         return ExitCode.USAGE
 
     if command == "self-test":

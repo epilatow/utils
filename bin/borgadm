@@ -1955,7 +1955,7 @@ def args_parser() -> argparse.ArgumentParser:
         formatter_class=HelpFormatter,
         epilog=ExitCode.epilog(),
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     # Always set formatter_class so that we display default values.
     def add_parser(name: str, **kwargs) -> argparse.ArgumentParser:
@@ -2369,13 +2369,18 @@ def main(
 
 def cli() -> int:
     sys.argv = rewrite_legacy_args(sys.argv)
-    args = args_parser().parse_args()
+    parser = args_parser()
+    args = parser.parse_args()
     validate = getattr(args, "validate", None)
     if validate:
         validate(args)
     args_dict = vars(args).copy()
     args_dict.pop("validate", None)
     command = args_dict.pop("command")
+
+    if not command:
+        parser.print_help()
+        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(**args_dict)

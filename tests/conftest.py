@@ -13,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, ClassVar, Iterator
-from unittest.mock import create_autospec
+from unittest.mock import create_autospec, patch
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -198,12 +198,14 @@ class ExceptionHierarchyBase:
 class CmdCallbacksBase:
     """Base class for command callback table tests.
 
-    Subclasses must define CALLBACKS, PARSER_FUNC, and
-    SELF_TEST_CMD.
+    Subclasses must define CALLBACKS, PARSER_FUNC,
+    CLI_FUNC, EXIT_CODE_USAGE, and SELF_TEST_CMD.
     """
 
     CALLBACKS: ClassVar[Any]
     PARSER_FUNC: ClassVar[Any]
+    CLI_FUNC: ClassVar[Any]
+    EXIT_CODE_USAGE: ClassVar[int]
     SELF_TEST_CMD: ClassVar[str] = "self-test"
     POPPED_ARGS: ClassVar[set[str]] = set()
 
@@ -323,6 +325,22 @@ class CmdCallbacksBase:
                 )
 
         check_parser(parser, parser.prog)
+
+    def test_no_args_parses_without_error(self) -> None:
+        """parse_args([]) succeeds with command=None."""
+        parser = type(self).PARSER_FUNC()
+        args = parser.parse_args([])
+        assert args.command is None
+
+    def test_no_args_shows_help(
+        self, capsys: Any
+    ) -> None:
+        """No arguments prints help and returns USAGE."""
+        with patch("sys.argv", ["prog"]):
+            result = type(self).CLI_FUNC()
+        assert result == type(self).EXIT_CODE_USAGE
+        captured = capsys.readouterr()
+        assert "usage:" in captured.out.lower()
 
 
 def run_tests(

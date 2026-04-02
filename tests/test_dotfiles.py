@@ -1374,11 +1374,8 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
     CALLBACKS = df.COMMAND_CALLBACKS
     PARSER_FUNC = df.build_parser
-
-    def test_no_command_returns_usage(self) -> None:
-        """Test cli() returns USAGE when no subcommand given."""
-        with patch("sys.argv", ["prog"]):
-            assert df.cli() == df.ExitCode.USAGE
+    CLI_FUNC = staticmethod(df.cli)
+    EXIT_CODE_USAGE = df.ExitCode.USAGE
 
 
 class TestCli:

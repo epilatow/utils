@@ -973,7 +973,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     def add_profile_arg(
         p: argparse.ArgumentParser,
@@ -1130,6 +1130,10 @@ def cli() -> int:
     args_dict = vars(args)
     command = args_dict.pop("command")
     args_dict.pop("_seen_flags", None)
+
+    if not command:
+        parser.print_help()
+        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(

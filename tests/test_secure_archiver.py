@@ -1560,12 +1560,8 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
     CALLBACKS = sa.COMMAND_CALLBACKS
     PARSER_FUNC = staticmethod(sa.build_parser)
-
-    def test_no_command_returns_usage(self) -> None:
-        """cli() returns USAGE when no subcommand given."""
-        with patch("sys.argv", ["prog"]):
-            result = sa.cli()
-        assert result == sa.ExitCode.USAGE
+    CLI_FUNC = staticmethod(sa.cli)
+    EXIT_CODE_USAGE = sa.ExitCode.USAGE
 
 
 class TestCli:

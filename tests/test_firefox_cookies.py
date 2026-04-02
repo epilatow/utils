@@ -411,12 +411,6 @@ class TestArgumentParser:
         assert args.verbose is True
         assert args.coverage is True
 
-    def test_no_subcommand_errors(self) -> None:
-        """Test that no subcommand produces an error."""
-        parser = fc.build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args([])
-
     def test_invalid_format_errors(self) -> None:
         """Test that invalid format produces an error."""
         parser = fc.build_parser()
@@ -1348,16 +1342,12 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
     CALLBACKS = fc.COMMAND_CALLBACKS
     PARSER_FUNC = fc.build_parser
+    CLI_FUNC = staticmethod(fc.cli)
+    EXIT_CODE_USAGE = fc.ExitCode.USAGE
 
 
 class TestCli:
     """Test CLI entry point."""
-
-    def test_no_args_returns_usage_error(self) -> None:
-        """No arguments returns USAGE."""
-        with patch("sys.argv", ["firefox-cookies"]):
-            result = fc.cli()
-        assert result == fc.ExitCode.USAGE
 
     def test_help_returns_success(self) -> None:
         """--help returns SUCCESS."""

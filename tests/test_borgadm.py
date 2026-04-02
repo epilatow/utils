@@ -289,6 +289,8 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
     CALLBACKS = ba.COMMAND_CALLBACKS
     PARSER_FUNC = ba.args_parser
+    CLI_FUNC = staticmethod(ba.cli)
+    EXIT_CODE_USAGE = ba.ExitCode.USAGE
     POPPED_ARGS = {
         "validate",
         "config",
