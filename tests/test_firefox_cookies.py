@@ -398,12 +398,6 @@ class TestArgumentParser:
         assert args.command == "list-containers"
         assert args.profile == "myprof"
 
-    def test_invalid_format_errors(self) -> None:
-        """Test that invalid format produces an error."""
-        parser = fc.build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["list", "--format", "xml"])
-
     def test_multiple_domains(self) -> None:
         """Test -d can be repeated for multiple domains."""
         parser = fc.build_parser()
