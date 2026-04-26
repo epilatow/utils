@@ -1827,6 +1827,34 @@ class TestNotifyTitle:
             setattr(ba, "_notify_title", original_title)
 
 
+class TestMain:
+    """Test main() error reporting."""
+
+    def test_main_logs_setup_phase_error(self, caplog: Any) -> None:
+        """BorgadmError raised before the command callback is logged."""
+        with (
+            patch("sys.argv", ["borgadm", "environment"]),
+            patch.object(
+                ba,
+                "Config",
+                autospec=True,
+                side_effect=ba.ConfigError("setup-boom"),
+            ),
+            patch.object(ba, "initialize_logger", autospec=True),
+            caplog.at_level(logging.ERROR),
+        ):
+            with pytest.raises(ba.ConfigError):
+                ba.main(
+                    command="environment",
+                    config=str(ba.CONFIG),
+                    verbose=False,
+                    timestamp_messages=False,
+                    enable_notifications=False,
+                    args_dict={},
+                )
+        assert "setup-boom" in caplog.text
+
+
 class TestTimestampMessages:
     """Test --timestamp-messages flag."""
 

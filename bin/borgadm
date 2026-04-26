@@ -2317,43 +2317,46 @@ def main(
     enable_notifications: bool,
     args_dict: dict[str, Any],
 ) -> None:
-    initialize_logger(
-        LOGFILE, verbose, timestamp_messages, enable_notifications
-    )
-
-    invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
-    logger.debug(f"Invocation: {invocation}")
-    atexit.register(report_runtime)
-
-    global CFG
-    CFG = Config(config, args_dict)
-    initialize_borg_environment()
-
-    backup_set_commands = {
-        "check",
-        "create",
-        "delete",
-        "extract",
-        "list",
-        "prune",
-        "rsync",
-    }
-    if command in backup_set_commands:
-        logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
-
     quick_commands = {"automate", "environment", "list", "self-test"}
-    action = args_dict.pop("action", None)
-    cmd_label = f"{command} {action}" if action else command
-    global _notify_title
-    _notify_title = f"borgadm {cmd_label}"
     timed = command not in quick_commands
-    if timed:
-        logger.info(f"borgadm {cmd_label}: started")
-        cmd_start = time.perf_counter()
+    cmd_start = time.perf_counter()
+    cmd_label = command  # tentative; refined below
+    global _notify_title
+    _notify_title = f"borgadm {command}"  # tentative; refined below
 
     try:
+        initialize_logger(
+            LOGFILE, verbose, timestamp_messages, enable_notifications
+        )
+
+        invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
+        logger.debug(f"Invocation: {invocation}")
+        atexit.register(report_runtime)
+
+        global CFG
+        CFG = Config(config, args_dict)
+        initialize_borg_environment()
+
+        backup_set_commands = {
+            "check",
+            "create",
+            "delete",
+            "extract",
+            "list",
+            "prune",
+            "rsync",
+        }
+        if command in backup_set_commands:
+            logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
+
+        action = args_dict.pop("action", None)
+        cmd_label = f"{command} {action}" if action else command
+        _notify_title = f"borgadm {cmd_label}"
+        if timed:
+            logger.info(f"borgadm {cmd_label}: started")
+
         COMMAND_CALLBACKS[cmd_label](**args_dict)
-    except BorgadmError as e:
+    except Exception as e:
         logger.error("%s", e)
         if enable_notifications:
             osascript_notify()
