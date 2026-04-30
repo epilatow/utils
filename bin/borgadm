@@ -35,10 +35,15 @@ import time
 import traceback
 import typing
 
-# Handle broken pipes gracefully (e.g., when piping to `head`).
-# Restore default SIGPIPE behavior so the process exits cleanly.
+# Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
+# SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
+# killing the process mid-output. The error is then absorbed at each
+# output site (logging handlers, subprocess pump) so atexit handlers
+# still run and the warning text isn't truncated mid-line.
+# subprocess.Popen's restore_signals=True default resets SIGPIPE back
+# to SIG_DFL in spawned children, so subprocess behavior is unchanged.
 if hasattr(signal, "SIGPIPE"):
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -410,6 +415,30 @@ class WarnOrWorseFilter(logging.Filter):
         return record.levelno >= logging.WARNING
 
 
+class BrokenPipeAwareStreamHandler(logging.StreamHandler):
+    """StreamHandler that silently disables itself once its underlying
+    stream is closed by a downstream pipe consumer (e.g., piping to
+    `head`). The first BrokenPipeError swaps the stream for /dev/null,
+    so subsequent records are absorbed without spamming "Logging error"
+    tracebacks for every remaining log call."""
+
+    def handleError(self, record) -> None:
+        # logging.StreamHandler.emit catches every non-RecursionError
+        # exception and routes it here. If the underlying cause is a
+        # closed pipe, swap to /dev/null so future emits no-op silently
+        # rather than printing tracebacks to (possibly also-closed)
+        # stderr.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, BrokenPipeError):
+            try:
+                self.stream.close()
+            except (BrokenPipeError, OSError):
+                pass
+            self.stream = open(os.devnull, "w")
+            return
+        super().handleError(record)
+
+
 def initialize_logger(
     logfile_path,
     verbose=False,
@@ -440,7 +469,7 @@ def initialize_logger(
     logger.addHandler(file_handler)
 
     # Stdout handler for INFO messages only
-    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler = BrokenPipeAwareStreamHandler(sys.stdout)
     stdout_handler.setLevel(logging.INFO)
     stdout_handler.addFilter(InfoFilter())
     stdout_fmt = (
@@ -450,7 +479,7 @@ def initialize_logger(
     logger.addHandler(stdout_handler)
 
     # Stderr handler for WARNING and worse (or DEBUG+ if verbose)
-    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler = BrokenPipeAwareStreamHandler(sys.stderr)
     stderr_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
     stderr_handler.addFilter(WarnOrWorseFilter(verbose))
     stderr_fmt = (
@@ -527,6 +556,28 @@ def check_permissions(path: Path, name: str) -> None:
         raise ConfigError(f"{name} not found at: {path}")
 
 
+def pump_stream(
+    src: TextIO, sink: TextIO, acc: io.StringIO, allow_output: bool
+) -> None:
+    """Drain a subprocess stream into an accumulator and (optionally)
+    a passthrough sink. If the sink's downstream consumer closes the
+    pipe (e.g., `borgadm rsync --progress | head`), stop forwarding to
+    the sink but keep draining the source so the subprocess doesn't
+    block on a full pipe."""
+    sink_broken = False
+    while True:
+        chunk = src.readline()
+        if chunk == "":
+            break
+        acc.write(chunk)
+        if allow_output and not sink_broken:
+            try:
+                sink.write(chunk)
+                sink.flush()
+            except BrokenPipeError:
+                sink_broken = True
+
+
 def run_cmd(
     cmd: list[str],
     sudo: bool = False,
@@ -558,22 +609,16 @@ def run_cmd(
     stdout = cast(TextIO, proc.stdout)
     stderr = cast(TextIO, proc.stderr)
 
-    def pump(src: TextIO, sink: TextIO, acc: io.StringIO) -> None:
-        while True:
-            chunk = src.readline()
-            if chunk == "":
-                break
-            acc.write(chunk)
-            if allow_output:
-                sink.write(chunk)
-                sink.flush()
-
     t_stdout = threading.Thread(
-        target=pump, args=(stdout, sys.stdout, stdout_buf), daemon=True
+        target=pump_stream,
+        args=(stdout, sys.stdout, stdout_buf, allow_output),
+        daemon=True,
     )
     t_stdout.start()
     t_stderr = threading.Thread(
-        target=pump, args=(stderr, sys.stderr, stderr_buf), daemon=True
+        target=pump_stream,
+        args=(stderr, sys.stderr, stderr_buf, allow_output),
+        daemon=True,
     )
     t_stderr.start()
 

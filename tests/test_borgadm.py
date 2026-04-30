@@ -2164,52 +2164,199 @@ class TestTimestampPruning:
 class TestBrokenPipeHandling:
     """Test that broken pipes are handled gracefully."""
 
-    def test_no_broken_pipe_error_when_piped_to_head(
-        self, tmp_path: Path
-    ) -> None:
-        """Test that piping output to head doesn't cause BrokenPipeError."""
-        # Create a script that imports borgadm (which sets up the SIGPIPE
-        # handler) and outputs many lines via logging to stdout.
-        # borgadm has no .py extension so we must use importlib to load it.
-        script_file = tmp_path / "test_sigpipe.py"
-        script_file.write_text(f"""
+    # Helper that imports borgadm and configures both stdout and
+    # stderr handlers using BrokenPipeAwareStreamHandler, mirroring
+    # initialize_logger() but without needing a config file.
+    _SETUP = """
 import importlib.machinery
 import importlib.util
 import logging
 import sys
 
-# Load borgadm module (no .py extension, so use importlib)
-script_path = {str(REPO_ROOT / "bin" / "borgadm")!r}
+script_path = {script!r}
 loader = importlib.machinery.SourceFileLoader("borgadm", script_path)
 spec = importlib.util.spec_from_loader("borgadm", loader)
 borgadm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(borgadm)
 
-# Now test logging output with many lines
-logger = logging.getLogger("test_sigpipe")
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter("%(message)s"))
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-for i in range(1000):
-    logger.info(f"line {{i}}")
-""")
-        # Pipe to head -1 which will close the pipe after reading one line
-        result = subprocess.run(
-            f"python3 {script_file} | head -1",
+logger = logging.getLogger("test_pipe")
+logger.setLevel(logging.DEBUG)
+
+stdout_handler = borgadm.BrokenPipeAwareStreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+stdout_handler.addFilter(borgadm.InfoFilter())
+stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(stdout_handler)
+
+stderr_handler = borgadm.BrokenPipeAwareStreamHandler(sys.stderr)
+stderr_handler.setLevel(logging.WARNING)
+stderr_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+logger.addHandler(stderr_handler)
+"""
+
+    def _run(self, tmp_path: Path, body: str, shell_cmd: str) -> Any:
+        script_file = tmp_path / "test_pipe.py"
+        setup = self._SETUP.format(script=str(REPO_ROOT / "bin" / "borgadm"))
+        script_file.write_text(setup + body)
+        return subprocess.run(
+            shell_cmd.format(script=script_file),
             shell=True,
             capture_output=True,
             text=True,
         )
-        # The key assertion: no Python exceptions in stderr
-        assert "BrokenPipeError" not in result.stderr, (
-            f"BrokenPipeError found in stderr:\n{result.stderr}"
-        )
-        assert "Traceback" not in result.stderr, (
-            f"Traceback found in stderr:\n{result.stderr}"
-        )
-        # First line should be in output
+
+    def test_stdout_closed_by_head(self, tmp_path: Path) -> None:
+        """Stdout truncated by `head -1`: no traceback, exits cleanly,
+        post-truncation log is silently dropped (handler kept process
+        alive instead of crashing)."""
+        body = """
+for i in range(1000):
+    logger.info(f"line {i}")
+logger.info("after pipe closed")
+"""
+        result = self._run(tmp_path, body, "python3 {script} | head -1")
+        # The python script's exit code is in PIPESTATUS[0], not $?,
+        # but capture_output gives us what python wrote to stderr,
+        # which is what we care about.
+        assert "BrokenPipeError" not in result.stderr, result.stderr
+        assert "Traceback" not in result.stderr, result.stderr
+        assert "Logging error" not in result.stderr, result.stderr
         assert "line 0" in result.stdout
+
+    def test_stderr_closed(self, tmp_path: Path) -> None:
+        """Stderr broken (piped to `head -1` via fd redirection):
+        WARNING-level logs that don't fit get dropped silently and
+        stdout INFO output is unaffected."""
+        body = """
+for i in range(500):
+    logger.warning(f"warn {i}")
+for i in range(5):
+    logger.info(f"info {i}")
+"""
+        # Redirect stderr through head -1, capture stdout normally.
+        # 2> >(head -1 >&2) means: replace stderr with a pipe to
+        # `head -1` which writes its (single) line back to the real
+        # stderr.
+        result = self._run(
+            tmp_path,
+            body,
+            "bash -c 'python3 {script} 2> >(head -1 >&2)'",
+        )
+        assert "BrokenPipeError" not in result.stderr, result.stderr
+        assert "Traceback" not in result.stderr, result.stderr
+        assert "Logging error" not in result.stderr, result.stderr
+        # All 5 INFO lines made it to stdout despite the stderr break.
+        for i in range(5):
+            assert f"info {i}" in result.stdout
+
+    def test_both_streams_closed(self, tmp_path: Path) -> None:
+        """Both streams merged and truncated: no tracebacks anywhere,
+        process exits cleanly."""
+        body = """
+for i in range(500):
+    logger.info(f"info {i}")
+    logger.warning(f"warn {i}")
+logger.info("end-sentinel")
+"""
+        result = self._run(tmp_path, body, "python3 {script} 2>&1 | head -1")
+        # Both captured streams must be free of error spam. The merged
+        # content goes to stdout via the pipe; stderr was redirected
+        # into the same pipe so nothing should land in stderr.
+        combined = result.stdout + result.stderr
+        assert "BrokenPipeError" not in combined, combined
+        assert "Traceback" not in combined, combined
+        assert "Logging error" not in combined, combined
+
+    def test_safe_stream_handler_swaps_stream_on_broken_pipe(
+        self,
+    ) -> None:
+        """Unit test: BrokenPipeAwareStreamHandler swaps to /dev/null
+        on the first BrokenPipeError, and subsequent emits are silent
+        no-ops."""
+
+        class BrokenStream:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            def write(self, _data: str) -> int:
+                self.writes += 1
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        broken = BrokenStream()
+        handler = ba.BrokenPipeAwareStreamHandler(broken)
+        # Capture anything written to the handleError fallback path.
+        with patch("sys.stderr", new_callable=io.StringIO) as fake_err:
+            record = logging.LogRecord(
+                name="t",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="first",
+                args=None,
+                exc_info=None,
+            )
+            handler.emit(record)
+            assert handler.stream is not broken
+            assert "Broken" not in fake_err.getvalue()
+
+            # The replacement stream must be writable so subsequent
+            # emits succeed silently.
+            for i in range(10):
+                record.msg = f"after-{i}"
+                handler.emit(record)
+            assert "Traceback" not in fake_err.getvalue()
+            assert "Logging error" not in fake_err.getvalue()
+
+    def test_pump_stream_handles_broken_sink(self) -> None:
+        """Unit test: pump_stream stops writing to a broken sink but
+        keeps draining the source so the subprocess doesn't block."""
+
+        class BrokenSink:
+            def __init__(self, fail_after: int) -> None:
+                self.fail_after = fail_after
+                self.writes = 0
+
+            def write(self, _data: str) -> int:
+                self.writes += 1
+                if self.writes > self.fail_after:
+                    raise BrokenPipeError(32, "Broken pipe")
+                return len(_data)
+
+            def flush(self) -> None:
+                pass
+
+        src = io.StringIO("".join(f"line {i}\n" for i in range(100)))
+        acc = io.StringIO()
+        sink = BrokenSink(fail_after=3)
+        ba.pump_stream(src, sink, acc, allow_output=True)
+
+        # Source fully drained into the accumulator.
+        assert acc.getvalue().count("\n") == 100
+        # Sink stopped being called after the first failure (4th
+        # write raised; nothing was attempted after that).
+        assert sink.writes == 4
+
+    def test_pump_stream_no_passthrough_when_disabled(self) -> None:
+        """Sanity check: with allow_output=False, sink is never
+        touched even if it would raise."""
+
+        class ExplodingSink:
+            def write(self, _data: str) -> int:
+                raise AssertionError("sink must not be written")
+
+            def flush(self) -> None:
+                raise AssertionError("sink must not be flushed")
+
+        src = io.StringIO("a\nb\nc\n")
+        acc = io.StringIO()
+        ba.pump_stream(src, ExplodingSink(), acc, allow_output=False)
+        assert acc.getvalue() == "a\nb\nc\n"
 
 
 class TestCreatePlistElement:
