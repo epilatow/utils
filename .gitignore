@@ -1,11 +1,36 @@
-# Editor backup files
-*~
+# Python
+.venv/
+uv.lock
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
 
-# macOS Finder metadata
+# Test / lint / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editor swap / backup files
+*~
+*.swp
+*.swo
+.*.swp
+\#*\#
 
 # Claude Code local config
 .claude/
+
+# misc
+tmp/
+nohup.out
 
 # BorgAdm.app build artifacts (binary compiled at automate-enable time)
 Applications/BorgAdm.app/Contents/MacOS/BorgAdm
