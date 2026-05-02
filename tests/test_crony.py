@@ -2425,6 +2425,47 @@ class TestLogs:
             crony._parse_since("2026-04-01T12:00:00")
 
 
+# =============================================================================
+# End-to-end lifecycle
+# =============================================================================
+
+
+class TestLifecycleSmoke:
+    """End-to-end smoke covering init -> edit -> validate -> apply ->
+    status -> destroy via the public function entry points. Catches
+    regressions where subcommands stop composing even when each one
+    passes its own tests in isolation.
+    """
+
+    def test_full_lifecycle(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Isolate state and config to tmp_path.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        # init -> default template at the redirected CONFIG_FILE
+        crony.do_init(force=False)
+        assert h.cfg_file.exists()
+        # Replace the template with a small real config so apply
+        # has something concrete to install.
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_validate()
+        # apply -> renders + activates
+        crony.do_apply(jobs=[])
+        assert (h.agents / "org.crony.j.plist").exists()
+        # status -> prints the synced/enabled tuple (sched stub)
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        capsys.readouterr()  # drop earlier output
+        crony.do_status(jobs=[])
+        out = capsys.readouterr().out
+        assert "synced" in out
+        # destroy -> factory reset
+        crony.do_destroy(jobs=[], purge_state=False)
+        assert not (h.agents / "org.crony.j.plist").exists()
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 
