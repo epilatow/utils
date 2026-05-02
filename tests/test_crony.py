@@ -2248,6 +2248,183 @@ class TestStatusReport:
         assert "orphan" in out
 
 
+# =============================================================================
+# validate / audit / list / logs
+# =============================================================================
+
+
+class TestValidate:
+    def test_clean_config(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_validate()
+        out = capsys.readouterr().out
+        assert "ok" in out
+
+    def test_orphan_warns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        inst = h.state / "installed"
+        inst.mkdir()
+        (inst / "ghost.hash").write_text("legacy\n")
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(SystemExit) as exc:
+            crony.do_validate()
+        assert exc.value.code == int(crony.ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "orphans" in out
+
+
+class TestAudit:
+    def test_all_nominal(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        last_run = h.state / "j" / "last-run.json"
+        last_run.parent.mkdir(parents=True, exist_ok=True)
+        last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
+        crony.do_audit(exclude_disabled=False)
+        out = capsys.readouterr().out
+        assert "all jobs nominal" in out
+
+    def test_failed_last_run_flagged(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        last_run = h.state / "j" / "last-run.json"
+        last_run.parent.mkdir(parents=True, exist_ok=True)
+        last_run.write_text('{"exit_class": "fail"}', encoding="utf-8")
+        with pytest.raises(crony.AuditFailedError):
+            crony.do_audit(exclude_disabled=False)
+        out = capsys.readouterr().out
+        assert "j" in out and "fail" in out
+
+    def test_disabled_excluded_when_flag_set(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "disabled")
+        last_run = h.state / "j" / "last-run.json"
+        last_run.parent.mkdir(parents=True, exist_ok=True)
+        last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
+        with pytest.raises(crony.AuditFailedError):
+            crony.do_audit(exclude_disabled=False)
+        crony.do_audit(exclude_disabled=True)
+
+
+class TestListSubcommand:
+    def test_prints_each_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 04:00"}},
+            },
+            default_target_jobs=["a", "g"],
+        )
+        crony.do_list()
+        out = capsys.readouterr().out
+        assert "a" in out
+        assert "b" in out
+        assert "g" in out
+        assert "group" in out
+        assert "job" in out
+
+
+class TestLogs:
+    def test_n_lines(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / "j" / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            "\n".join(f"line {i}" for i in range(20)) + "\n",
+            encoding="utf-8",
+        )
+        crony.do_logs(name="j", n=5, since=None, tail=False)
+        out = capsys.readouterr().out
+        assert "line 19" in out
+        assert "line 15" in out
+        assert "line 14" not in out
+
+    def test_missing_log_raises(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="no log"):
+            crony.do_logs(name="ghost", n=10, since=None, tail=False)
+
+    def test_since_filters_old_runs(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / "j" / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        old_iso = "2026-01-01T03:15:00-08:00"
+        import datetime as _dt
+
+        now_iso = (
+            _dt.datetime.now(_dt.timezone.utc)
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+        log.write_text(
+            f"=== {old_iso} j pid=1 ===\nold-line\n"
+            f"=== {now_iso} j pid=2 ===\nnew-line\n",
+            encoding="utf-8",
+        )
+        crony.do_logs(name="j", n=0, since="1h", tail=False)
+        out = capsys.readouterr().out
+        assert "new-line" in out
+        assert "old-line" not in out
+
+    def test_parse_since_unparseable(self) -> None:
+        with pytest.raises(crony.UsageError, match="unparseable"):
+            crony._parse_since("eventually")
+
+    def test_parse_since_naive_iso_rejected(self) -> None:
+        # Naive ISO would crash later when compared with tz-aware
+        # run-header timestamps; surface at parse time instead.
+        with pytest.raises(crony.UsageError, match="timezone offset"):
+            crony._parse_since("2026-04-01T12:00:00")
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

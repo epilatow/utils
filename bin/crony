@@ -2868,8 +2868,102 @@ def do_logs(
     since: str | None,
     tail: bool,
 ) -> None:
-    """Print a job's recent log output."""
-    raise NotImplementedError("logs")
+    """Print a job's recent log output.
+
+    -n N      print the last N lines (default 200)
+    --since X parse X as a duration ('1h', '2d') or ISO timestamp
+              and skip log content older than that. Run-header
+              timestamps anchor the cut.
+    --tail    follow appended output (-f semantics) until interrupted.
+    """
+    log_path = STATE_DIR / name / "run.log"
+    if not log_path.exists():
+        raise UsageError(f"no log for {name!r} (state dir: {STATE_DIR / name})")
+    if tail:
+        _follow_log(log_path)
+        return
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    if since is not None:
+        text = _filter_since(text, since)
+    if n > 0:
+        lines = text.splitlines()
+        if len(lines) > n:
+            text = "\n".join(lines[-n:]) + "\n"
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def _follow_log(log_path: Path) -> None:
+    """tail -f equivalent on the log file."""
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        f.seek(0, os.SEEK_END)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                return
+
+
+_DURATION_RE = re.compile(r"^(\d+)([smhd])$")
+
+
+def _parse_since(spec: str) -> datetime.datetime:
+    """Parse a --since argument as duration shorthand or ISO timestamp.
+
+    Returns a tz-aware datetime. ISO inputs without an offset are
+    rejected here -- comparing them against the runner's tz-aware
+    run-header timestamps would raise TypeError mid-filter, so we
+    surface the issue at parse time as a UsageError instead.
+    """
+    text = spec.strip()
+    m = _DURATION_RE.fullmatch(text)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = datetime.timedelta(
+            seconds=n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        )
+        return datetime.datetime.now(datetime.timezone.utc).astimezone() - delta
+    try:
+        ts = datetime.datetime.fromisoformat(text)
+    except ValueError as e:
+        raise UsageError(
+            f"unparseable --since value: {spec!r} "
+            f"(use NUMs/m/h/d or ISO timestamp)"
+        ) from e
+    if ts.tzinfo is None:
+        raise UsageError(
+            f"--since {spec!r} is missing a timezone offset; "
+            f"use a form like 2026-04-01T12:00:00-07:00"
+        )
+    return ts
+
+
+def _filter_since(text: str, since: str) -> str:
+    """Drop log content older than --since by run-header timestamp."""
+    cutoff = _parse_since(since)
+    header_re = re.compile(r"^=== (\S+) ")
+    keep_from: int | None = None
+    lines = text.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        m = header_re.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            keep_from = idx
+            break
+    if keep_from is None:
+        return ""
+    return "".join(lines[keep_from:])
 
 
 def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
@@ -2894,13 +2988,191 @@ def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
 
 
 def do_audit(exclude_disabled: bool) -> None:
-    """Walk every job; print bad rows; exit AUDIT_FAILED on hits."""
-    raise NotImplementedError("audit")
+    """Walk every job; print bad rows; exit AUDIT_FAILED on hits.
+
+    Bad means CONFIG drift (stale/missing/orphan), the scheduler
+    being unable to fire (failed/unknown, plus disabled by default),
+    or a recent failed/timeout run. Designed to be scheduled via
+    crony itself; the runner shim sees a non-ok exit and dispatches
+    a notification with the audit's stdout as the failure body.
+    """
+    config = load_config()
+    platform = current_platform()
+    target = resolve_target(config, current_host(), platform)
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    selected = sel_jobs | sel_groups
+    stamped = stamped_names()
+    candidates = sorted(selected | stamped)
+
+    bad_config = {"stale", "missing", "orphan"}
+    bad_sched = {"failed", "unknown"}
+    if not exclude_disabled:
+        bad_sched = bad_sched | {"disabled"}
+    bad_last = {"fail", "timeout"}
+
+    rows: list[tuple[str, str, str, str]] = []
+    for name in candidates:
+        cfg_state = _config_state(config, name, platform)
+        if cfg_state == "missing":
+            sched_state = "unknown"
+        else:
+            entry = config.jobs.get(name) or config.job_groups.get(name)
+            if entry is None:
+                sched_state = _sched_state(name, platform)
+            else:
+                schedule, interval = _entity_schedule(entry)
+                if schedule is None and interval is None:
+                    sched_state = "grouped"
+                else:
+                    sched_state = _sched_state(name, platform)
+        last_state = _last_run_state(name)
+        is_bad = (
+            cfg_state in bad_config
+            or sched_state in bad_sched
+            or last_state in bad_last
+        )
+        if is_bad:
+            rows.append((name, cfg_state, sched_state, last_state))
+
+    warnings: list[str] = []
+    if platform == "linux":
+        ling = linger_enabled()
+        if ling is False:
+            warnings.append(
+                f"linger DISABLED for {_current_user()} "
+                "-- jobs only fire while logged in"
+            )
+
+    if not rows and not warnings:
+        print("audit: all jobs nominal")
+        return
+
+    if warnings:
+        print("warnings:")
+        for w in warnings:
+            print(f"  - {w}")
+        print()
+    if rows:
+        print(f"{'JOB':30} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+        for name, cs, ss, ls in rows:
+            print(f"{name:30} {cs:10} {ss:10} {ls:10}")
+
+    raise AuditFailedError(
+        f"{len(rows)} job(s) in bad state, {len(warnings)} system warning(s)"
+    )
+
+
+def _secret_warning(
+    label: str,
+    *,
+    keychain_service: str | None,
+    keychain_account: str | None,
+    file_path: str | None,
+) -> str:
+    """Build a precise validate warning for an unresolved secret.
+
+    Distinguishes "no source configured" from "configured source(s)
+    resolved empty" so a misconfigured keychain item or missing file
+    isn't misreported as "you forgot to set anything".
+    """
+    if keychain_service is None and file_path is None:
+        return (
+            f"{label} unresolved: no source configured (set keychain or file)"
+        )
+    parts: list[str] = []
+    if keychain_service is not None:
+        ident = (
+            f"{keychain_service!r}/{keychain_account!r}"
+            if keychain_account is not None
+            else f"{keychain_service!r}"
+        )
+        parts.append(f"keychain item {ident}")
+    if file_path is not None:
+        parts.append(f"file {file_path!r}")
+    return f"{label} unresolved: tried {' and '.join(parts)}"
 
 
 def do_validate() -> None:
-    """Lint config; report orphans, linger, missing secrets."""
-    raise NotImplementedError("validate")
+    """Lint config; report orphans, linger status, broken secret files.
+
+    load_config already enforces structural and cross-cutting rules;
+    this subcommand wraps it, surfaces orphan / linger / secrets
+    warnings as informational output, and exits WARNING (1) when any
+    are present, CONFIG (3) when the config doesn't load.
+    """
+    config = load_config()
+    platform = current_platform()
+    target = resolve_target(config, current_host(), platform)
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    selected = sel_jobs | sel_groups
+    stamped = stamped_names()
+    orphans = sorted(stamped - selected)
+
+    warnings: list[str] = []
+    if orphans:
+        warnings.append(f"orphans on this host: {orphans}")
+    if platform == "linux":
+        ling = linger_enabled()
+        if ling is False:
+            warnings.append(f"linger DISABLED for {_current_user()}")
+        elif ling is None:
+            warnings.append("linger status unknown")
+
+    channel = config.defaults.notify_channel
+    if channel == "email" and config.defaults.notify_email is not None:
+        em = config.defaults.notify_email
+        try:
+            secret = _retrieve_secret(
+                keychain_service=em.smtp_pass_keychain_service,
+                keychain_account=em.smtp_pass_keychain_account,
+                file_path=em.smtp_pass_file,
+            )
+            if secret is None:
+                warnings.append(
+                    _secret_warning(
+                        "email channel: SMTP password",
+                        keychain_service=em.smtp_pass_keychain_service,
+                        keychain_account=em.smtp_pass_keychain_account,
+                        file_path=em.smtp_pass_file,
+                    )
+                )
+        except PreconditionError as e:
+            warnings.append(str(e))
+    if channel == "ntfy" and config.defaults.notify_ntfy is not None:
+        nt = config.defaults.notify_ntfy
+        try:
+            token = _retrieve_secret(
+                keychain_service=nt.token_keychain_service,
+                keychain_account=nt.token_keychain_account,
+                file_path=nt.token_file,
+            )
+            if token is None:
+                warnings.append(
+                    _secret_warning(
+                        "ntfy channel: token",
+                        keychain_service=nt.token_keychain_service,
+                        keychain_account=nt.token_keychain_account,
+                        file_path=nt.token_file,
+                    )
+                )
+        except PreconditionError as e:
+            warnings.append(str(e))
+
+    print(f"config: {CONFIG_FILE}")
+    print(
+        f"jobs: {len(config.jobs)}, "
+        f"groups: {len(config.job_groups)}, "
+        f"targets: platform={len(config.platform_targets)} "
+        f"host={len(config.host_targets)}"
+    )
+    if warnings:
+        print("warnings:")
+        for w in warnings:
+            print(f"  - {w}")
+        # WARNING is not raisable as a CronyError; SystemExit forwards
+        # the code through cli() unchanged.
+        raise SystemExit(int(ExitCode.WARNING))
+    print("ok")
 
 
 def do_notify_test(channel: str | None) -> None:
@@ -2954,8 +3226,26 @@ def do_notify_test(channel: str | None) -> None:
 
 
 def do_list() -> None:
-    """One-line summary per job."""
-    raise NotImplementedError("list")
+    """One-line summary per defined job/group.
+
+    Available for human triage -- shows what's defined, what kind
+    (job vs group), how it's scheduled, and whether the current
+    host's target selects it.
+    """
+    config = load_config()
+    platform = current_platform()
+    target = resolve_target(config, current_host(), platform)
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    selected = sel_jobs | sel_groups
+    print(f"{'NAME':30} {'KIND':6} {'SCHEDULE':22} {'SELECTED':8}")
+    for name in sorted(set(config.jobs) | set(config.job_groups)):
+        kind = "group" if name in config.job_groups else "job"
+        entry: Job | JobGroup = config.jobs.get(name) or config.job_groups[name]
+        sched_disp = entry.schedule or (
+            f"interval={entry.interval}" if entry.interval else "(group-only)"
+        )
+        is_selected = "yes" if name in selected else "no"
+        print(f"{name:30} {kind:6} {sched_disp:22} {is_selected:8}")
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
