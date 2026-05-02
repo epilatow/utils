@@ -12,7 +12,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import logging
+import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -716,6 +718,91 @@ class TestResolution:
         )
         target = crony.resolve_target(cfg, "h", "darwin")
         assert crony.resolved_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
+
+
+# =============================================================================
+# crony init
+# =============================================================================
+
+
+class TestInit:
+    """do_init writes the default config template, refuses to clobber."""
+
+    def _redirect_config(self, monkeypatch: Any, tmp_path: Path) -> Path:
+        """Point CONFIG_DIR / CONFIG_FILE at a tmp dir so do_init
+        doesn't touch the user's real ~/.config/crony.
+        """
+        cfg_dir = tmp_path / "crony"
+        cfg_file = cfg_dir / "config.toml"
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        return cfg_file
+
+    def test_creates_file_when_absent(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._redirect_config(monkeypatch, tmp_path)
+        assert not cfg_file.exists()
+        crony.do_init(force=False)
+        assert cfg_file.exists()
+        body = cfg_file.read_text(encoding="utf-8")
+        assert "[defaults]" in body
+        assert "[job." in body
+        assert "[job-group." in body
+        assert "[target." in body
+
+    def test_creates_parent_dir(self, tmp_path: Path, monkeypatch: Any) -> None:
+        cfg_file = self._redirect_config(monkeypatch, tmp_path)
+        # Parent doesn't exist yet.
+        assert not cfg_file.parent.exists()
+        crony.do_init(force=False)
+        assert cfg_file.parent.is_dir()
+
+    def test_refuses_to_overwrite_without_force(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._redirect_config(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_file.write_text("user content", encoding="utf-8")
+        with pytest.raises(crony.UsageError, match="already exists"):
+            crony.do_init(force=False)
+        # File untouched.
+        assert cfg_file.read_text() == "user content"
+
+    def test_overwrites_with_force(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._redirect_config(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_file.write_text("user content", encoding="utf-8")
+        crony.do_init(force=True)
+        body = cfg_file.read_text(encoding="utf-8")
+        assert "user content" not in body
+        assert "[defaults]" in body
+
+    def test_template_is_ascii_only(self) -> None:
+        """All persistent files in this repo are ASCII; the template
+        we ship as a starting point must be too.
+        """
+        crony._DEFAULT_CONFIG_TEMPLATE.encode("ascii")  # raises if not
+
+    def test_template_parses_when_uncommented(self) -> None:
+        """The example schema in the template must be valid TOML.
+
+        Extract section headers (`# [foo]`) and simple key = value
+        lines (`# foo = ...`), strip the leading `# `, and feed the
+        result to parse_config. Prose comments, dividers, and
+        double-commented variants (`# # foo`) don't match the
+        strict patterns and are skipped.
+        """
+        extracted: list[str] = []
+        section_re = re.compile(r"^# \[[\w.\-]+\]\s*$")
+        kv_re = re.compile(r"^# [A-Za-z_][\w.]*\s*=")
+        for line in crony._DEFAULT_CONFIG_TEMPLATE.splitlines():
+            if section_re.match(line) or kv_re.match(line):
+                extracted.append(line[2:])
+        text = "\n".join(extracted)
+        crony.parse_config(tomllib.loads(text))
 
 
 # =============================================================================
