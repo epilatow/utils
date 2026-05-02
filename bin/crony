@@ -1,0 +1,1397 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_crony.py
+# Always run the `self-test` subcommand after making modifications.
+
+from __future__ import annotations
+
+import argparse
+import enum
+import logging
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import tomllib
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+# Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
+# SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
+# killing the process mid-output. The error is then absorbed at each
+# output site (logging handlers and the runner shim's subprocess
+# pump) so atexit handlers still run and warning text isn't truncated
+# mid-line. subprocess.Popen's restore_signals=True default resets
+# SIGPIPE back to SIG_DFL in spawned children, so subprocess behavior
+# is unchanged.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+# =============================================================================
+# CRONY DESIGN
+# =============================================================================
+#
+# crony is a user-level scheduled-job manager for macOS (launchd
+# LaunchAgents) and Linux (systemd user timers). It reads a single
+# TOML config and applies the corresponding platform units, runs jobs
+# through a uniform shim (so logs, locks, gates, and notifications
+# behave the same on both platforms), and reports state via a 3-tuple
+# status:
+#   CONFIG  synced  | stale    | missing | orphan
+#   SCHED   enabled | disabled | failed  | grouped | unknown
+#   LAST    ok      | failed   | timeout | gated   | running | never
+#
+# Subcommands fall into two categories:
+#   - config-derived state (apply / destroy):  manage unit-file presence
+#   - runtime state (enable / disable):        manage scheduler arming
+# Plus operational subcommands: status, logs, run, audit, validate,
+# notify-test, list, init, self-test.
+#
+# Config lives at ~/.config/crony/config.toml. State (logs, locks,
+# last-run records, install hashes) lives at ~/.local/state/crony/.
+#
+# =============================================================================
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
+LOGFILE: Path = Path(tempfile.gettempdir()) / f"{BASENAME}.log"
+CONFIG_DIR: Path = Path(os.path.expanduser(f"~/.config/{BASENAME}"))
+CONFIG_FILE: Path = CONFIG_DIR / "config.toml"
+STATE_DIR: Path = Path(os.path.expanduser(f"~/.local/state/{BASENAME}"))
+
+logger = logging.getLogger(__name__)
+
+
+class BrokenPipeAwareStreamHandler(logging.StreamHandler):
+    """StreamHandler that silently disables itself once its downstream
+    pipe consumer closes (e.g., piping to `head`). The first
+    BrokenPipeError swaps the stream for /dev/null so subsequent log
+    records are absorbed without spamming tracebacks.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, BrokenPipeError):
+            try:
+                self.stream.close()
+            except (BrokenPipeError, OSError):
+                pass
+            self.stream = open(os.devnull, "w")
+            return
+        super().handleError(record)
+
+
+def _initialize_logger() -> None:
+    """Configure root logger with a broken-pipe-aware handler."""
+    handler = BrokenPipeAwareStreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+_initialize_logger()
+
+
+# =============================================================================
+# EXIT CODES
+# =============================================================================
+
+
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0, "Success"
+    WARNING = 1, "Warning (non-fatal issues)"
+    USAGE = 2, "Usage/argument error"
+    CONFIG = 3, "Configuration error"
+    ERROR = 4, "General error"
+    SUBPROCESS = 5, "Subprocess command failed"
+    AUDIT_FAILED = 6, "audit found jobs in a bad state"
+    LOCK_BUSY = 7, "run.lock held by another instance"
+    PRECONDITION = 8, "run precondition failed before exec"
+    TIMEOUT = 9, "run killed wrapped command on timeout"
+
+    def __new__(cls, value: int, description: str = "") -> ExitCode:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+        obj.description = description  # type: ignore[attr-defined]
+        return obj
+
+    @classmethod
+    def epilog(cls) -> str:
+        lines = ["exit codes:"]
+        for member in cls:
+            lines.append(
+                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
+            )
+        return "\n".join(lines)
+
+
+# =============================================================================
+# EXCEPTIONS
+# =============================================================================
+
+
+class CronyError(RuntimeError):
+    """Base exception for crony errors."""
+
+    exit_code: ExitCode = ExitCode.ERROR
+
+
+class UsageError(CronyError):
+    """Bad argument or unknown subcommand."""
+
+    exit_code = ExitCode.USAGE
+
+
+class ConfigError(CronyError):
+    """Unparseable or invalid config."""
+
+    exit_code = ExitCode.CONFIG
+
+
+class SubprocessError(subprocess.CalledProcessError, CronyError):
+    """Subprocess (launchctl, systemctl, etc) failed."""
+
+    exit_code = ExitCode.SUBPROCESS
+
+
+class AuditFailedError(CronyError):
+    """`crony audit` found jobs in a bad state."""
+
+    exit_code = ExitCode.AUDIT_FAILED
+
+
+class LockBusyError(CronyError):
+    """`crony run` could not acquire the per-job lock."""
+
+    exit_code = ExitCode.LOCK_BUSY
+
+
+class PreconditionError(CronyError):
+    """`crony run` precondition failed before exec."""
+
+    exit_code = ExitCode.PRECONDITION
+
+
+class JobTimeoutError(CronyError):
+    """`crony run` killed the wrapped command on timeout."""
+
+    exit_code = ExitCode.TIMEOUT
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+
+@dataclass
+class NotifyEmail:
+    """SMTP notification settings (used by the embedded SMTP channel)."""
+
+    to: str
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    from_addr: str | None = None
+    smtp_starttls: bool = True
+    smtp_pass_keychain: str | None = None
+    smtp_pass_file: str | None = None
+
+
+@dataclass
+class NotifyNtfy:
+    """ntfy notification settings."""
+
+    url: str
+    token_keychain: str | None = None
+    token_file: str | None = None
+
+
+@dataclass
+class Defaults:
+    """Tool-wide default settings cascaded to jobs."""
+
+    notify_channel: str = "log-only"
+    notify_attach_log: bool = True
+    notify_attach_max_kb: int = 256
+    timeout_sec: int = 1800
+    log_keep_runs: int = 30
+    notify_email: NotifyEmail | None = None
+    notify_ntfy: NotifyNtfy | None = None
+
+
+@dataclass
+class Job:
+    """A single schedulable unit of work."""
+
+    name: str
+    command: str | None = None
+    script: str | None = None
+    args: list[str] = field(default_factory=list)
+    gate: str | None = None
+    gate_script: str | None = None
+    gate_args: list[str] = field(default_factory=list)
+    schedule: str | None = None
+    interval: str | None = None
+    platforms: list[str] = field(default_factory=list)
+    timeout_sec: int | None = None
+    notify_channel: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class JobGroup:
+    """A scheduled sequencer that fires named jobs in order."""
+
+    name: str
+    jobs: list[str] = field(default_factory=list)
+    schedule: str | None = None
+    interval: str | None = None
+    timeout_sec: int | None = None
+    notify_channel: str | None = None
+
+
+@dataclass
+class Target:
+    """Per-platform or per-host selection of jobs/groups + cascading settings.
+
+    `kind` is "platform" (e.g. darwin/linux) or "host" (a specific host).
+    """
+
+    name: str
+    kind: str
+    jobs: list[str] = field(default_factory=list)
+    notify_channel: str | None = None
+    timeout_sec: int | None = None
+
+
+@dataclass
+class Config:
+    """Top-level parsed config."""
+
+    defaults: Defaults = field(default_factory=Defaults)
+    jobs: dict[str, Job] = field(default_factory=dict)
+    job_groups: dict[str, JobGroup] = field(default_factory=dict)
+    platform_targets: dict[str, Target] = field(default_factory=dict)
+    host_targets: dict[str, Target] = field(default_factory=dict)
+
+
+# =============================================================================
+# PLATFORM & HOST DETECTION
+# =============================================================================
+
+
+def current_platform() -> str:
+    """Return 'darwin' or 'linux'. Raise on anything else."""
+    s = sys.platform
+    if s == "darwin":
+        return "darwin"
+    if s.startswith("linux"):
+        return "linux"
+    raise CronyError(f"unsupported platform: {s}")
+
+
+def current_host() -> str:
+    """Return the short hostname (everything before the first dot)."""
+    return socket.gethostname().split(".")[0]
+
+
+# =============================================================================
+# SCHEDULE FORMAT VALIDATION
+# =============================================================================
+# Schedules use systemd OnCalendar syntax (systemd.time(7)). Intervals
+# use systemd time-span syntax. We do basic structural validation here;
+# full translation to launchd `StartCalendarInterval` happens when units
+# are rendered.
+
+
+# Reserved OnCalendar keywords supported by both systemd and our darwin
+# translator. systemd accepts more (e.g. "minutely", "quarterly") but
+# we explicitly support these.
+_ONCALENDAR_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "hourly",
+        "daily",
+        "weekly",
+        "monthly",
+        "yearly",
+        "annually",
+    }
+)
+
+
+_INTERVAL_TOKEN_RE = re.compile(
+    # Alternation is left-to-right; longer alternatives MUST come
+    # before any shorter alternative that's a prefix of them.
+    # `months?` precedes `minutes?` so that "1month" doesn't get
+    # consumed as a minutes-`m` followed by garbage.
+    r"\s*(\d+)\s*"
+    r"(seconds?|sec|s"
+    r"|months?"
+    r"|minutes?|min|m"
+    r"|hours?|hr|h"
+    r"|days?|d"
+    r"|weeks?|w"
+    r"|years?|y"
+    r"|M)",
+)
+
+_INTERVAL_UNIT_SECONDS: dict[str, int] = {
+    "s": 1,
+    "sec": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+    "w": 604800,
+    "week": 604800,
+    "weeks": 604800,
+    "M": 2592000,
+    "month": 2592000,
+    "months": 2592000,
+    "y": 31536000,
+    "year": 31536000,
+    "years": 31536000,
+}
+
+
+def parse_interval_seconds(s: str) -> int:
+    """Parse a systemd time-span string into seconds.
+
+    Accepts forms like "30min", "2h", "1h30min", "90 seconds".
+    Raises ConfigError on unparseable input.
+    """
+    text = s.strip()
+    if not text:
+        raise ConfigError("empty interval")
+    total = 0
+    pos = 0
+    matched = False
+    while pos < len(text):
+        m = _INTERVAL_TOKEN_RE.match(text, pos)
+        if not m:
+            if text[pos].isspace():
+                pos += 1
+                continue
+            raise ConfigError(
+                f"unparseable interval at offset {pos}: {text[pos:]!r}"
+            )
+        unit = m.group(2)
+        # 'M' (capital) means months; lowercase 'm' means minutes
+        if unit != "M":
+            unit_lc = unit.lower()
+        else:
+            unit_lc = unit
+        total += int(m.group(1)) * _INTERVAL_UNIT_SECONDS[unit_lc]
+        pos = m.end()
+        matched = True
+    if not matched:
+        raise ConfigError(f"no time components in interval: {s!r}")
+    if total <= 0:
+        raise ConfigError(f"interval must be positive: {s!r}")
+    return total
+
+
+def validate_schedule(s: str) -> None:
+    """Basic OnCalendar structural validation.
+
+    Full grammar parsing happens at platform-render time. Here we
+    just reject obviously-wrong input so config loading fails fast.
+    The rule: either a known keyword by itself, or a
+    string containing at least one HH:MM-style time component
+    (digit-colon-digit). Anything else lacks the minimum shape
+    of a real OnCalendar expression.
+    """
+    text = s.strip()
+    if not text:
+        raise ConfigError("empty schedule")
+    if "\n" in text or "\r" in text:
+        raise ConfigError(f"schedule must be one line: {s!r}")
+    if text in _ONCALENDAR_KEYWORDS:
+        return
+    # Require a colon followed by a digit (a time component) so "*",
+    # "1234", and "-not-a-real-schedule-" are rejected. This accepts
+    # forms like "03:15", "*:0/15", "*:00,30", "Sun *-*-* 04:00".
+    if not re.search(r":\d", text):
+        raise ConfigError(
+            f"schedule does not look like OnCalendar syntax: {s!r}"
+        )
+
+
+# =============================================================================
+# CONFIG LOADING
+# =============================================================================
+# Reads TOML, validates structurally and cross-cuttingly, and returns a
+# fully-typed Config. Raises ConfigError on any problem.
+
+
+_KNOWN_TOPLEVEL: frozenset[str] = frozenset(
+    {
+        "defaults",
+        "job",
+        "job-group",
+        "target",
+    }
+)
+
+_KNOWN_DEFAULTS: frozenset[str] = frozenset(
+    {
+        "notify_channel",
+        "notify_attach_log",
+        "notify_attach_max_kb",
+        "timeout_sec",
+        "log_keep_runs",
+        "notify",
+    }
+)
+
+_KNOWN_JOB: frozenset[str] = frozenset(
+    {
+        "command",
+        "script",
+        "args",
+        "gate",
+        "gate_script",
+        "gate_args",
+        "schedule",
+        "interval",
+        "platforms",
+        "timeout_sec",
+        "notify_channel",
+        "env",
+    }
+)
+
+_KNOWN_JOB_GROUP: frozenset[str] = frozenset(
+    {
+        "jobs",
+        "schedule",
+        "interval",
+        "timeout_sec",
+        "notify_channel",
+    }
+)
+
+_KNOWN_TARGET: frozenset[str] = frozenset(
+    {
+        "jobs",
+        "notify_channel",
+        "timeout_sec",
+    }
+)
+
+_KNOWN_NOTIFY_EMAIL: frozenset[str] = frozenset(
+    {
+        "to",
+        "from",
+        "smtp_host",
+        "smtp_port",
+        "smtp_user",
+        "smtp_starttls",
+        "smtp_pass_keychain",
+        "smtp_pass_file",
+    }
+)
+
+_KNOWN_NOTIFY_NTFY: frozenset[str] = frozenset(
+    {
+        "url",
+        "token_keychain",
+        "token_file",
+    }
+)
+
+_VALID_NOTIFY_CHANNELS: frozenset[str] = frozenset(
+    {
+        "log-only",
+        "email",
+        "ntfy",
+    }
+)
+
+_VALID_PLATFORMS: frozenset[str] = frozenset({"darwin", "linux"})
+
+
+def _reject_unknown_keys(
+    raw: dict[str, Any], known: frozenset[str], where: str
+) -> None:
+    """Raise ConfigError if raw has keys not in `known`."""
+    unknown = set(raw.keys()) - known
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {sorted(unknown)}")
+
+
+def _typed_field(
+    raw: dict[str, Any],
+    key: str,
+    expected: type,
+    where: str,
+    *,
+    default: Any = None,
+) -> Any:
+    """Extract `key` from `raw` with a type check. Returns `default` if absent.
+
+    `bool` and `int` are distinct here, even though `isinstance(True, int)`
+    is True in Python -- we explicitly reject booleans for int-typed fields
+    so `timeout_sec = true` raises clearly rather than silently meaning 1.
+    """
+    if key not in raw:
+        return default
+    val = raw[key]
+    # bool is a subclass of int; require strict separation here.
+    if expected is int and isinstance(val, bool):
+        raise ConfigError(f"{where}: '{key}' must be int, got bool")
+    if expected is bool and not isinstance(val, bool):
+        raise ConfigError(
+            f"{where}: '{key}' must be bool, got {type(val).__name__}"
+        )
+    if not isinstance(val, expected):
+        raise ConfigError(
+            f"{where}: '{key}' must be {expected.__name__}, "
+            f"got {type(val).__name__}"
+        )
+    return val
+
+
+# Job/group/host names map onto filesystem paths and platform unit
+# labels, so they must be safe filename characters. Match a subset that
+# survives both `~/.local/state/crony/<name>/` and the launchd label
+# `org.crony.<name>` and the systemd unit `crony-<name>.timer`.
+_NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_name(name: str, where: str) -> None:
+    """Reject names that would break filesystem paths or unit labels."""
+    if not _NAME_RE.match(name):
+        raise ConfigError(
+            f"{where}: name {name!r} must match "
+            f"[A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, "
+            f"empty, or leading punctuation)"
+        )
+
+
+def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
+    """Extract a list-of-strings field, defaulting to []."""
+    val = raw.get(key)
+    if val is None:
+        return []
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise ConfigError(f"{where}: '{key}' must be a list of strings")
+    return list(val)
+
+
+def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
+    """Extract a dict-of-string-to-string field, defaulting to {}."""
+    val = raw.get(key)
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        raise ConfigError(f"{where}: '{key}' must be a table (dict)")
+    out: dict[str, str] = {}
+    for k, v in val.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ConfigError(
+                f"{where}: '{key}' values must be string -> string"
+            )
+        out[k] = v
+    return out
+
+
+def _parse_notify_email(raw: dict[str, Any]) -> NotifyEmail:
+    """Parse [defaults.notify.email]."""
+    where = "[defaults.notify.email]"
+    _reject_unknown_keys(raw, _KNOWN_NOTIFY_EMAIL, where)
+    to = _typed_field(raw, "to", str, where)
+    smtp_host = _typed_field(raw, "smtp_host", str, where)
+    smtp_user = _typed_field(raw, "smtp_user", str, where)
+    smtp_port = _typed_field(raw, "smtp_port", int, where, default=587)
+    if to is None or smtp_host is None or smtp_user is None:
+        raise ConfigError(
+            f"{where}: 'to', 'smtp_host', 'smtp_user' are required"
+        )
+    return NotifyEmail(
+        to=to,
+        from_addr=_typed_field(raw, "from", str, where),
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_starttls=_typed_field(
+            raw, "smtp_starttls", bool, where, default=True
+        ),
+        smtp_pass_keychain=_typed_field(raw, "smtp_pass_keychain", str, where),
+        smtp_pass_file=_typed_field(raw, "smtp_pass_file", str, where),
+    )
+
+
+def _parse_notify_ntfy(raw: dict[str, Any]) -> NotifyNtfy:
+    """Parse [defaults.notify.ntfy]."""
+    where = "[defaults.notify.ntfy]"
+    _reject_unknown_keys(raw, _KNOWN_NOTIFY_NTFY, where)
+    url = _typed_field(raw, "url", str, where)
+    if url is None:
+        raise ConfigError(f"{where}: 'url' is required")
+    return NotifyNtfy(
+        url=url,
+        token_keychain=_typed_field(raw, "token_keychain", str, where),
+        token_file=_typed_field(raw, "token_file", str, where),
+    )
+
+
+def _positive_int(
+    raw: dict[str, Any], key: str, where: str, default: int
+) -> int:
+    """Read a positive int defaulting to `default`. Reject 0 / negative."""
+    val: int = _typed_field(raw, key, int, where, default=default)
+    if val <= 0:
+        raise ConfigError(f"{where}: '{key}' must be positive, got {val}")
+    return val
+
+
+def _parse_defaults(raw: dict[str, Any]) -> Defaults:
+    """Parse [defaults]."""
+    where = "[defaults]"
+    _reject_unknown_keys(raw, _KNOWN_DEFAULTS, where)
+    notify_channel = _typed_field(
+        raw, "notify_channel", str, where, default="log-only"
+    )
+    if notify_channel not in _VALID_NOTIFY_CHANNELS:
+        raise ConfigError(
+            f"{where}: notify_channel must be one of "
+            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
+        )
+    notify_email = None
+    notify_ntfy = None
+    nested = raw.get("notify", {})
+    if not isinstance(nested, dict):
+        raise ConfigError(f"{where}.notify must be a table (dict)")
+    for sub_key, sub_body in nested.items():
+        if sub_key == "email":
+            notify_email = _parse_notify_email(sub_body)
+        elif sub_key == "ntfy":
+            notify_ntfy = _parse_notify_ntfy(sub_body)
+        else:
+            raise ConfigError(
+                f"[defaults.notify.{sub_key}] is not a known channel"
+            )
+    return Defaults(
+        notify_channel=notify_channel,
+        notify_attach_log=_typed_field(
+            raw, "notify_attach_log", bool, where, default=True
+        ),
+        notify_attach_max_kb=_positive_int(
+            raw, "notify_attach_max_kb", where, default=256
+        ),
+        timeout_sec=_positive_int(raw, "timeout_sec", where, default=1800),
+        log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
+        notify_email=notify_email,
+        notify_ntfy=notify_ntfy,
+    )
+
+
+def _parse_job(name: str, raw: dict[str, Any]) -> Job:
+    """Parse [job.<name>]."""
+    _validate_name(name, f"[job.{name}]")
+    where = f"[job.{name}]"
+    _reject_unknown_keys(raw, _KNOWN_JOB, where)
+    command = _typed_field(raw, "command", str, where)
+    script = _typed_field(raw, "script", str, where)
+    if (command is None) == (script is None):
+        raise ConfigError(
+            f"{where}: must have exactly one of 'command' or 'script'"
+        )
+    args = _string_list(raw, "args", where)
+    if args and command is not None:
+        raise ConfigError(
+            f"{where}: 'args' is only valid with 'script', not 'command'"
+        )
+    gate = _typed_field(raw, "gate", str, where)
+    gate_script = _typed_field(raw, "gate_script", str, where)
+    if gate is not None and gate_script is not None:
+        raise ConfigError(
+            f"{where}: 'gate' and 'gate_script' are mutually exclusive"
+        )
+    gate_args = _string_list(raw, "gate_args", where)
+    if gate_args and gate_script is None:
+        raise ConfigError(
+            f"{where}: 'gate_args' is only valid with 'gate_script'"
+        )
+    schedule = _typed_field(raw, "schedule", str, where)
+    interval = _typed_field(raw, "interval", str, where)
+    if schedule is not None and interval is not None:
+        raise ConfigError(
+            f"{where}: 'schedule' and 'interval' are mutually exclusive"
+        )
+    if schedule is not None:
+        validate_schedule(schedule)
+    if interval is not None:
+        parse_interval_seconds(interval)
+    platforms = _string_list(raw, "platforms", where)
+    for p in platforms:
+        if p not in _VALID_PLATFORMS:
+            raise ConfigError(
+                f"{where}: platforms entry {p!r} not in "
+                f"{sorted(_VALID_PLATFORMS)}"
+            )
+    notify_channel = _typed_field(raw, "notify_channel", str, where)
+    if (
+        notify_channel is not None
+        and notify_channel not in _VALID_NOTIFY_CHANNELS
+    ):
+        raise ConfigError(
+            f"{where}: notify_channel must be one of "
+            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
+        )
+    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
+    if timeout_sec is not None and timeout_sec <= 0:
+        raise ConfigError(f"{where}: timeout_sec must be positive")
+    return Job(
+        name=name,
+        command=command,
+        script=script,
+        args=args,
+        gate=gate,
+        gate_script=gate_script,
+        gate_args=gate_args,
+        schedule=schedule,
+        interval=interval,
+        platforms=platforms,
+        timeout_sec=timeout_sec,
+        notify_channel=notify_channel,
+        env=_string_dict(raw, "env", where),
+    )
+
+
+def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
+    """Parse [job-group.<name>]."""
+    _validate_name(name, f"[job-group.{name}]")
+    where = f"[job-group.{name}]"
+    _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
+    jobs = _string_list(raw, "jobs", where)
+    if not jobs:
+        raise ConfigError(f"{where}: 'jobs' must be a non-empty list")
+    schedule = _typed_field(raw, "schedule", str, where)
+    interval = _typed_field(raw, "interval", str, where)
+    if schedule is not None and interval is not None:
+        raise ConfigError(
+            f"{where}: 'schedule' and 'interval' are mutually exclusive"
+        )
+    if schedule is None and interval is None:
+        raise ConfigError(
+            f"{where}: must define exactly one of 'schedule' or 'interval'"
+        )
+    if schedule is not None:
+        validate_schedule(schedule)
+    if interval is not None:
+        parse_interval_seconds(interval)
+    notify_channel = _typed_field(raw, "notify_channel", str, where)
+    if (
+        notify_channel is not None
+        and notify_channel not in _VALID_NOTIFY_CHANNELS
+    ):
+        raise ConfigError(
+            f"{where}: notify_channel must be one of "
+            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
+        )
+    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
+    if timeout_sec is not None and timeout_sec <= 0:
+        raise ConfigError(f"{where}: timeout_sec must be positive")
+    return JobGroup(
+        name=name,
+        jobs=jobs,
+        schedule=schedule,
+        interval=interval,
+        timeout_sec=timeout_sec,
+        notify_channel=notify_channel,
+    )
+
+
+def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
+    """Parse [target.<platform>] or [target.host.<name>]."""
+    where = (
+        f"[target.{name}]" if kind == "platform" else f"[target.host.{name}]"
+    )
+    if kind == "host":
+        _validate_name(name, where)
+    _reject_unknown_keys(raw, _KNOWN_TARGET, where)
+    jobs = _string_list(raw, "jobs", where)
+    notify_channel = _typed_field(raw, "notify_channel", str, where)
+    if (
+        notify_channel is not None
+        and notify_channel not in _VALID_NOTIFY_CHANNELS
+    ):
+        raise ConfigError(
+            f"{where}: notify_channel must be one of "
+            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
+        )
+    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
+    if timeout_sec is not None and timeout_sec <= 0:
+        raise ConfigError(f"{where}: timeout_sec must be positive")
+    return Target(
+        name=name,
+        kind=kind,
+        jobs=jobs,
+        notify_channel=notify_channel,
+        timeout_sec=timeout_sec,
+    )
+
+
+def _validate_config(config: Config) -> None:
+    """Cross-cutting validation: name collisions, references, applicability."""
+    # Job/group name collision
+    overlap = set(config.jobs) & set(config.job_groups)
+    if overlap:
+        raise ConfigError(
+            f"name collision: {sorted(overlap)} appear as both "
+            f"[job.*] and [job-group.*]"
+        )
+    all_names = set(config.jobs) | set(config.job_groups)
+    # Group children must reference defined jobs (not other groups in v1)
+    for gname, group in config.job_groups.items():
+        for child in group.jobs:
+            if child not in config.jobs:
+                if child in config.job_groups:
+                    raise ConfigError(
+                        f"[job-group.{gname}]: 'jobs' references "
+                        f"another group {child!r} (nested groups "
+                        f"are not supported in v1)"
+                    )
+                raise ConfigError(
+                    f"[job-group.{gname}]: 'jobs' references "
+                    f"undefined job {child!r}"
+                )
+    # Targets reference defined jobs or groups
+    for tname, target in config.platform_targets.items():
+        for ref in target.jobs:
+            if ref not in all_names:
+                raise ConfigError(
+                    f"[target.{tname}]: 'jobs' references "
+                    f"undefined name {ref!r}"
+                )
+        if tname not in _VALID_PLATFORMS:
+            raise ConfigError(
+                f"[target.{tname}]: platform must be one of "
+                f"{sorted(_VALID_PLATFORMS)}"
+            )
+    for hname, target in config.host_targets.items():
+        for ref in target.jobs:
+            if ref not in all_names:
+                raise ConfigError(
+                    f"[target.host.{hname}]: 'jobs' references "
+                    f"undefined name {ref!r}"
+                )
+    # Job platform applicability for targets that reference them
+    for tname, target in config.platform_targets.items():
+        for ref in target.jobs:
+            if ref in config.jobs:
+                job = config.jobs[ref]
+                if job.platforms and tname not in job.platforms:
+                    raise ConfigError(
+                        f"[target.{tname}] references job {ref!r} "
+                        f"whose platforms={job.platforms!r} excludes "
+                        f"{tname}"
+                    )
+    # A job with no schedule and no interval must be referenced by some
+    # group (otherwise it can never fire).
+    referenced_by_group: set[str] = set()
+    for group in config.job_groups.values():
+        referenced_by_group.update(group.jobs)
+    for jname, job in config.jobs.items():
+        if (
+            job.schedule is None
+            and job.interval is None
+            and jname not in referenced_by_group
+        ):
+            raise ConfigError(
+                f"[job.{jname}]: has no schedule/interval and is "
+                f"not referenced by any [job-group.*] (would never "
+                f"fire)"
+            )
+
+
+def load_config(path: Path | None = None) -> Config:
+    """Load and validate the crony config from a TOML file."""
+    if path is None:
+        path = CONFIG_FILE
+    if not path.exists():
+        raise ConfigError(f"config not found: {path}")
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"TOML parse error in {path}: {e}") from e
+    return parse_config(raw)
+
+
+def parse_config(raw: dict[str, Any]) -> Config:
+    """Parse a top-level config dict into a validated Config."""
+    _reject_unknown_keys(raw, _KNOWN_TOPLEVEL, "(top level)")
+
+    config = Config()
+
+    if "defaults" in raw:
+        if not isinstance(raw["defaults"], dict):
+            raise ConfigError("[defaults] must be a table")
+        config.defaults = _parse_defaults(raw["defaults"])
+
+    job_section = raw.get("job", {})
+    if not isinstance(job_section, dict):
+        raise ConfigError("[job] must be a table")
+    for name, body in job_section.items():
+        if not isinstance(body, dict):
+            raise ConfigError(f"[job.{name}] must be a table")
+        config.jobs[name] = _parse_job(name, body)
+
+    group_section = raw.get("job-group", {})
+    if not isinstance(group_section, dict):
+        raise ConfigError("[job-group] must be a table")
+    for name, body in group_section.items():
+        if not isinstance(body, dict):
+            raise ConfigError(f"[job-group.{name}] must be a table")
+        config.job_groups[name] = _parse_job_group(name, body)
+
+    target_section = raw.get("target", {})
+    if not isinstance(target_section, dict):
+        raise ConfigError("[target] must be a table")
+    for name, body in target_section.items():
+        if name == "host":
+            # [target.host.<host>] entries
+            if not isinstance(body, dict):
+                raise ConfigError("[target.host] must be a table")
+            for hostname, hostbody in body.items():
+                if not isinstance(hostbody, dict):
+                    raise ConfigError(
+                        f"[target.host.{hostname}] must be a table"
+                    )
+                config.host_targets[hostname] = _parse_target(
+                    hostname, "host", hostbody
+                )
+        else:
+            # [target.<platform>] entry
+            if not isinstance(body, dict):
+                raise ConfigError(f"[target.{name}] must be a table")
+            config.platform_targets[name] = _parse_target(
+                name, "platform", body
+            )
+
+    _validate_config(config)
+    return config
+
+
+# =============================================================================
+# RESOLUTION
+# =============================================================================
+
+
+def resolve_target(config: Config, host: str, platform: str) -> Target | None:
+    """Pick the effective target for (host, platform).
+
+    Host target wins; otherwise the platform target; otherwise None
+    (nothing selected on this host).
+    """
+    if host in config.host_targets:
+        return config.host_targets[host]
+    if platform in config.platform_targets:
+        return config.platform_targets[platform]
+    return None
+
+
+def selected_jobs_and_groups(
+    config: Config, target: Target | None
+) -> tuple[set[str], set[str]]:
+    """Compute the set of job names and group names selected by target.
+
+    Naming a group implicitly selects its constituent jobs, so they
+    don't appear as orphans on this host even though they have no
+    platform unit.
+    """
+    jobs: set[str] = set()
+    groups: set[str] = set()
+    if target is None:
+        return jobs, groups
+    for name in target.jobs:
+        if name in config.jobs:
+            jobs.add(name)
+        elif name in config.job_groups:
+            groups.add(name)
+            for child in config.job_groups[name].jobs:
+                jobs.add(child)
+    return jobs, groups
+
+
+def resolved_notify_channel(
+    config: Config, target: Target | None, job: Job
+) -> str:
+    """Cascade notify_channel: target > job > defaults."""
+    if target is not None and target.notify_channel is not None:
+        return target.notify_channel
+    if job.notify_channel is not None:
+        return job.notify_channel
+    return config.defaults.notify_channel
+
+
+def resolved_timeout_sec(
+    config: Config, target: Target | None, job: Job
+) -> int:
+    """Cascade timeout_sec: target > job > defaults."""
+    if target is not None and target.timeout_sec is not None:
+        return target.timeout_sec
+    if job.timeout_sec is not None:
+        return job.timeout_sec
+    return config.defaults.timeout_sec
+
+
+# =============================================================================
+# COMMAND HANDLERS
+# =============================================================================
+# Each handler's signature must match its argparse subparser's argument
+# `dest` names exactly; the shared CmdCallbacksBase test enforces this.
+# Handlers without behavior yet raise NotImplementedError so an
+# unfinished feature surfaces immediately rather than silently no-oping.
+
+
+def do_init(force: bool) -> None:
+    """Generate a default config file at ~/.config/crony/config.toml."""
+    raise NotImplementedError("init")
+
+
+def do_apply(jobs: list[str]) -> None:
+    """Render and activate platform units to match config."""
+    raise NotImplementedError("apply")
+
+
+def do_destroy(jobs: list[str], purge_state: bool) -> None:
+    """Remove platform units (factory reset or surgical)."""
+    raise NotImplementedError("destroy")
+
+
+def do_enable(jobs: list[str]) -> None:
+    """Tell the platform scheduler to fire the named jobs."""
+    raise NotImplementedError("enable")
+
+
+def do_disable(jobs: list[str]) -> None:
+    """Tell the platform scheduler to skip the named jobs."""
+    raise NotImplementedError("disable")
+
+
+def do_status(jobs: list[str]) -> None:
+    """Print the resolved (CONFIG, SCHED, LAST) tuple per job."""
+    raise NotImplementedError("status")
+
+
+def do_logs(
+    name: str,
+    n: int,
+    since: str | None,
+    tail: bool,
+) -> None:
+    """Print a job's recent log output."""
+    raise NotImplementedError("logs")
+
+
+def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
+    """Runner shim. Platform schedulers invoke this."""
+    raise NotImplementedError("run")
+
+
+def do_audit(exclude_disabled: bool) -> None:
+    """Walk every job; print bad rows; exit AUDIT_FAILED on hits."""
+    raise NotImplementedError("audit")
+
+
+def do_validate() -> None:
+    """Lint config; report orphans, linger, missing secrets."""
+    raise NotImplementedError("validate")
+
+
+def do_notify_test(channel: str | None) -> None:
+    """Send a synthetic failure notification."""
+    raise NotImplementedError("notify-test")
+
+
+def do_list() -> None:
+    """One-line summary per job."""
+    raise NotImplementedError("list")
+
+
+def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
+    """Run tests by invoking the test file directly."""
+    repo_root = Path(__file__).parent.parent
+    test_file = repo_root / "tests" / "test_crony.py"
+    cmd = [str(test_file)]
+    if verbose:
+        cmd.append("--verbose")
+    if coverage:
+        cmd.append("--coverage")
+    return subprocess.run(cmd, cwd=repo_root).returncode
+
+
+# =============================================================================
+# ARGUMENT PARSER
+# =============================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "User-level scheduled-job manager for macOS "
+            "(launchd LaunchAgents) and Linux (systemd user timers)."
+        ),
+        epilog=ExitCode.epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    # init
+    p_init = subparsers.add_parser(
+        "init", help="Generate a default config file"
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing config file",
+    )
+
+    # apply
+    p_apply = subparsers.add_parser(
+        "apply",
+        help="Render and activate platform units to match config",
+    )
+    p_apply.add_argument(
+        "jobs",
+        nargs="*",
+        help=(
+            "Job/group names. With no args: full sync (install "
+            "missing, fix drift, remove orphans). With names: "
+            "surgical update of those entries only."
+        ),
+    )
+
+    # destroy
+    p_destroy = subparsers.add_parser(
+        "destroy",
+        help="Remove platform units",
+    )
+    p_destroy.add_argument(
+        "jobs",
+        nargs="*",
+        help=(
+            "Job/group names. With no args: factory reset. "
+            "With names: surgical removal."
+        ),
+    )
+    p_destroy.add_argument(
+        "--purge-state",
+        action="store_true",
+        help="Also delete log/state dirs for affected jobs",
+    )
+
+    # enable
+    p_enable = subparsers.add_parser(
+        "enable",
+        help="Tell the platform scheduler to fire the named jobs",
+    )
+    p_enable.add_argument(
+        "jobs",
+        nargs="+",
+        help="Job names to enable",
+    )
+
+    # disable
+    p_disable = subparsers.add_parser(
+        "disable",
+        help="Tell the platform scheduler to skip the named jobs",
+    )
+    p_disable.add_argument(
+        "jobs",
+        nargs="+",
+        help="Job names to disable",
+    )
+
+    # status
+    p_status = subparsers.add_parser(
+        "status",
+        help="Print resolved state per job",
+    )
+    p_status.add_argument(
+        "jobs",
+        nargs="*",
+        help="Restrict to these jobs (default: all)",
+    )
+
+    # logs
+    p_logs = subparsers.add_parser(
+        "logs",
+        help="Print a job's recent log output",
+    )
+    p_logs.add_argument(
+        "name",
+        help="Job name",
+    )
+    p_logs.add_argument(
+        "-n",
+        type=int,
+        default=200,
+        help="Print the last N lines (default 200)",
+    )
+    p_logs.add_argument(
+        "--since",
+        default=None,
+        help='"1h", "2d", or ISO timestamp',
+    )
+    p_logs.add_argument(
+        "--tail",
+        action="store_true",
+        help="Follow appended output",
+    )
+
+    # run
+    p_run = subparsers.add_parser(
+        "run",
+        help="Runner shim (invoked by platform schedulers)",
+    )
+    p_run.add_argument(
+        "name",
+        help="Job or group name",
+    )
+    p_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Acquire lock, run gate, but do not exec",
+    )
+    p_run.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="Skip gate check (force run)",
+    )
+
+    # audit
+    p_audit = subparsers.add_parser(
+        "audit",
+        help="Check every job; exit nonzero on any bad state",
+    )
+    p_audit.add_argument(
+        "--exclude-disabled",
+        action="store_true",
+        help="Do not flag intentionally-disabled jobs as bad",
+    )
+
+    # validate
+    subparsers.add_parser(
+        "validate",
+        help="Lint config; report orphans, linger, etc",
+    )
+
+    # notify-test
+    p_nt = subparsers.add_parser(
+        "notify-test",
+        help="Send a synthetic failure notification",
+    )
+    p_nt.add_argument(
+        "--channel",
+        default=None,
+        help="Override channel (default: configured channel)",
+    )
+
+    # list
+    subparsers.add_parser(
+        "list",
+        help="One-line summary per job",
+    )
+
+    # self-test
+    p_st = subparsers.add_parser(
+        "self-test",
+        help="Run the bundled pytest suite",
+    )
+    p_st.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose test output",
+    )
+    p_st.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Run with coverage report",
+    )
+
+    return parser
+
+
+# =============================================================================
+# COMMAND DISPATCH
+# =============================================================================
+
+COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+    "init": do_init,
+    "apply": do_apply,
+    "destroy": do_destroy,
+    "enable": do_enable,
+    "disable": do_disable,
+    "status": do_status,
+    "logs": do_logs,
+    "run": do_run,
+    "audit": do_audit,
+    "validate": do_validate,
+    "notify-test": do_notify_test,
+    "list": do_list,
+}
+
+
+def cli() -> int:
+    """CLI entry point with exception handling."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    args_dict = vars(args)
+    command = args_dict.pop("command")
+
+    if not command:
+        parser.print_help()
+        return ExitCode.USAGE
+
+    if command == "self-test":
+        return do_self_test(
+            verbose=args_dict.pop("verbose"),
+            coverage=args_dict.pop("coverage"),
+        )
+
+    try:
+        COMMAND_CALLBACKS[command](**args_dict)
+    except KeyError:
+        raise UsageError(f"Unknown command '{command}'")
+    except CronyError as e:
+        logger.error("ERROR: %s", e)
+        return e.exit_code
+    except Exception:
+        # Catch-all so an internal bug surfaces a traceback to the
+        # user with a stable exit code rather than crashing the
+        # process and leaving the scheduler with no exit code at all.
+        traceback.print_exc()
+        return ExitCode.ERROR
+    return ExitCode.SUCCESS
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
