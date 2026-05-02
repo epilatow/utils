@@ -61,8 +61,8 @@ if hasattr(signal, "SIGPIPE"):
 # behave the same on both platforms), and reports state via a 3-tuple
 # status:
 #   CONFIG  synced  | stale    | missing | orphan
-#   SCHED   enabled | disabled | failed  | grouped | unknown
-#   LAST    ok      | failed   | timeout | gated   | running | never
+#   SCHED   enabled | disabled | grouped | unknown
+#   LAST    ok      | fail     | timeout | gated   | running | never
 #
 # Subcommands fall into two categories:
 #   - config-derived state (apply / destroy):  manage unit-file presence
@@ -2205,8 +2205,18 @@ def _has_platform_unit(name: str) -> bool:
     return True  # caller already screened group-only jobs
 
 
-def _activate_unit(name: str, platform: str) -> None:
-    """Load the unit into the platform scheduler."""
+def _activate_unit(
+    name: str, platform: str, *, prior_disabled: bool = False
+) -> None:
+    """Load the unit into the platform scheduler.
+
+    `prior_disabled=True` preserves a hand-disabled state across an
+    apply re-render: the unit is reloaded so the new content takes
+    effect, but the persistent disable record is restored afterward
+    so the scheduler doesn't fire it. Without this, a `crony disable
+    foo` followed by an unrelated config edit would silently re-arm
+    foo.
+    """
     if platform == "darwin":
         plist = _plist_path_for(name)
         # Validate the plist before asking launchd to load it -- a
@@ -2220,8 +2230,25 @@ def _activate_unit(name: str, platform: str) -> None:
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(["launchctl", "load", str(plist)], check=True)
-    else:
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        if prior_disabled:
+            label = _label_for(name)
+            subprocess.run(
+                ["launchctl", "unload", str(plist)],
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "launchctl",
+                    "disable",
+                    f"gui/{os.getuid()}/{label}",
+                ],
+                check=True,
+            )
+        return
+    # linux: daemon-reload picks up the new content. Only enable +
+    # start when the unit was NOT already deliberately disabled.
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    if not prior_disabled:
         subprocess.run(
             [
                 "systemctl",
@@ -2293,6 +2320,14 @@ def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
         return "added" if old_hash is None else "updated"
 
     if has_unit:
+        # Capture runtime state BEFORE we re-render so a hand-disabled
+        # unit stays disabled across the re-load. _sched_state returns
+        # "unknown" for a not-yet-installed unit (no platform record
+        # to query); we treat unknown as "not previously disabled" so
+        # a fresh install lands enabled.
+        prior_disabled = (
+            old_hash is not None and _sched_state(name, platform) == "disabled"
+        )
         units = _render_units(name, schedule, interval, platform)
         target_dir = (
             LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
@@ -2300,7 +2335,7 @@ def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
         target_dir.mkdir(parents=True, exist_ok=True)
         for fname, content in units.items():
             (target_dir / fname).write_text(content, encoding="utf-8")
-        _activate_unit(name, platform)
+        _activate_unit(name, platform, prior_disabled=prior_disabled)
 
     hash_path.parent.mkdir(parents=True, exist_ok=True)
     hash_path.write_text(new_hash + "\n", encoding="utf-8")
@@ -2332,6 +2367,278 @@ def stamped_names() -> set[str]:
     if not inst.exists():
         return set()
     return {p.stem for p in inst.glob("*.hash")}
+
+
+# =============================================================================
+# RUNTIME STATE (enable / disable / status / linger)
+# =============================================================================
+# Runtime state is the platform scheduler's "will I fire this unit?"
+# answer. It's orthogonal to CONFIG state: a unit can be `synced` with
+# config but `disabled` at runtime because the user paused it. apply
+# preserves this state across re-renders so a hand-disabled job stays
+# off when the user runs `crony apply` to push other changes.
+
+
+def _current_user() -> str:
+    """Best-effort resolution of the invoking user's name.
+
+    Used for linger lookup. Falls back through env vars and getpwuid
+    in turn so the typical Unix shell environment is enough.
+    """
+    for env_key in ("USER", "LOGNAME"):
+        v = os.environ.get(env_key)
+        if v:
+            return v
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return ""
+
+
+def linger_enabled(user: str | None = None) -> bool | None:
+    """Return True/False/None for "is linger enabled for this user?"
+
+    Linger keeps a user's systemd manager running across logouts, which
+    is what allows scheduled timers to fire when the user isn't logged
+    in. Without it, a "daily 03:00" job silently no-ops.
+
+    Order of operations: check the world-readable sentinel file first
+    so the common case is a single stat() with no subprocess. Fall
+    back to `loginctl show-user --property=Linger` for systems that
+    expose linger differently. Returns None when neither path can
+    answer (no logind, command missing, etc.).
+    """
+    name = user or _current_user()
+    if not name:
+        return None
+    sentinel = Path(f"/var/lib/systemd/linger/{name}")
+    if sentinel.exists():
+        return True
+    try:
+        result = subprocess.run(
+            [
+                "loginctl",
+                "show-user",
+                name,
+                "--property=Linger",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip()
+    if line.endswith("=yes"):
+        return True
+    if line.endswith("=no"):
+        return False
+    return None
+
+
+def _systemd_is_enabled(unit: str) -> str:
+    """Return systemctl --user is-enabled output, or '' on failure."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-enabled", unit],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip()
+
+
+def _launchctl_print_disabled() -> str:
+    """Stdout of `launchctl print-disabled gui/<uid>`; empty on failure."""
+    try:
+        r = subprocess.run(
+            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout
+
+
+def _launchctl_list() -> str:
+    """Stdout of `launchctl list`; empty on failure."""
+    try:
+        r = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout
+
+
+def _sched_state(name: str, platform: str) -> str:
+    """Return SCHED axis value for a stamped entity.
+
+    Distinct from CONFIG: a unit can be configured-and-stamped while
+    being disabled at the platform scheduler. Group-only jobs (no
+    schedule, no interval) report `grouped`; their callers fire them
+    via subprocess invocation rather than the scheduler.
+    """
+    if platform == "linux":
+        unit = _systemd_unit_name(name)
+        state = _systemd_is_enabled(unit)
+        if state == "enabled":
+            return "enabled"
+        if state in ("disabled", "masked"):
+            return "disabled"
+        if state == "static":
+            return "enabled"
+        if state == "":
+            return "unknown"
+        return "unknown"
+    # darwin
+    label = _label_for(name)
+    if _is_launchd_disabled(label):
+        return "disabled"
+    if _is_launchd_loaded(label):
+        return "enabled"
+    return "unknown"
+
+
+def _is_launchd_disabled(label: str) -> bool:
+    """True if `launchctl print-disabled` reports `label` disabled."""
+    out = _launchctl_print_disabled()
+    return f'"{label}" => disabled' in out or f'"{label}" => true' in out
+
+
+def _is_launchd_loaded(label: str) -> bool:
+    """True if `launchctl list` shows the label as loaded.
+
+    `launchctl list` lines have the form `<pid>\\t<exit>\\t<label>`.
+    A pid of `-` means loaded-but-idle (the normal between-fires state
+    for a calendar-scheduled agent), so we don't filter on pid here.
+    Trailing whitespace is tolerated for forward-compat with future
+    launchctl output formats.
+    """
+    out = _launchctl_list()
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        if "\t" in line and line.split("\t")[-1] == label:
+            return True
+    return False
+
+
+def _last_run_state(name: str) -> str:
+    """Return LAST axis value for a stamped entity.
+
+    Lock-held implies a run is currently in flight; otherwise read
+    last-run.json's recorded exit_class. Absence of either means the
+    entity has never run -- new install, group-only job that's never
+    been triggered, etc.
+    """
+    sd = STATE_DIR / name
+    lock_path = sd / "run.lock"
+    if lock_path.exists():
+        try:
+            with _acquire_lock(lock_path):
+                pass
+        except LockBusyError:
+            return "running"
+    last_run = sd / "last-run.json"
+    if not last_run.exists():
+        return "never"
+    try:
+        raw = json.loads(last_run.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+    cls = raw.get("exit_class")
+    if cls in ("ok", "fail", "timeout", "gated", "signal"):
+        return cls if cls != "signal" else "fail"
+    return "unknown"
+
+
+def _config_state(config: Config, name: str, platform: str) -> str:
+    """Return CONFIG axis value: synced / stale / missing / orphan."""
+    in_config = name in config.jobs or name in config.job_groups
+    has_stamp = _hash_path_for(name).exists()
+    if not in_config and has_stamp:
+        return "orphan"
+    if in_config and not has_stamp:
+        return "missing"
+    if not in_config and not has_stamp:
+        return "missing"
+    entry: Job | JobGroup = config.jobs.get(name) or config.job_groups[name]
+    schedule, interval = _entity_schedule(entry)
+    has_unit = schedule is not None or interval is not None
+    new_hash = (
+        _compute_unit_hash(name, entry, platform) if has_unit else "stamp-only"
+    )
+    old_hash = _hash_path_for(name).read_text(encoding="utf-8").strip()
+    return "synced" if old_hash == new_hash else "stale"
+
+
+def _enable_unit(name: str, platform: str) -> None:
+    """Move the platform scheduler into the `enabled` state for `name`."""
+    if platform == "linux":
+        subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "enable",
+                "--now",
+                _systemd_unit_name(name),
+            ],
+            check=True,
+        )
+        return
+    label = _label_for(name)
+    plist = _plist_path_for(name)
+    subprocess.run(
+        ["launchctl", "enable", f"gui/{os.getuid()}/{label}"],
+        check=True,
+    )
+    # unload-then-load -- mirrors apply, tolerates a stale loaded
+    # plist from before the enable.
+    subprocess.run(
+        ["launchctl", "unload", str(plist)],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(["launchctl", "load", str(plist)], check=True)
+
+
+def _disable_unit(name: str, platform: str) -> None:
+    """Move the platform scheduler into the `disabled` state for `name`."""
+    if platform == "linux":
+        subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "disable",
+                "--now",
+                _systemd_unit_name(name),
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    label = _label_for(name)
+    plist = _plist_path_for(name)
+    # Unload first so the persistent disable record actually takes
+    # effect; otherwise the still-loaded plist would keep firing
+    # until the next launchd restart.
+    subprocess.run(
+        ["launchctl", "unload", str(plist)],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["launchctl", "disable", f"gui/{os.getuid()}/{label}"],
+        check=True,
+    )
 
 
 # =============================================================================
@@ -2439,19 +2746,120 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
         )
 
 
+def _refuse_stamp_only(config: Config, jobs: list[str], verb: str) -> None:
+    """Reject group-only entries that have a stamp but no platform unit.
+
+    enable / disable manipulate the platform scheduler's view of a
+    unit; a group-only job has no platform unit so the underlying
+    launchctl / systemctl call would fail with a confusing "no such
+    unit" error. We surface the constraint here instead.
+    """
+    stamp_only: list[str] = []
+    for name in jobs:
+        entry: Job | JobGroup | None = config.jobs.get(
+            name
+        ) or config.job_groups.get(name)
+        if entry is None:
+            continue
+        sched, interval = _entity_schedule(entry)
+        if sched is None and interval is None:
+            stamp_only.append(name)
+    if stamp_only:
+        raise UsageError(
+            f"cannot {verb} group-only entries (no platform unit): "
+            f"{sorted(stamp_only)}"
+        )
+
+
 def do_enable(jobs: list[str]) -> None:
-    """Tell the platform scheduler to fire the named jobs."""
-    raise NotImplementedError("enable")
+    """Move the platform scheduler into `enabled` for the named jobs.
+
+    Refuses names that aren't stamped on this host (run apply first)
+    and group-only entries that have no platform unit to flip.
+    """
+    config = load_config()
+    stamped = stamped_names()
+    unknown = [n for n in jobs if n not in stamped]
+    if unknown:
+        raise UsageError(
+            f"not stamped on this host: {sorted(unknown)} "
+            f"(run `crony apply` first)"
+        )
+    _refuse_stamp_only(config, jobs, "enable")
+    platform = current_platform()
+    for name in jobs:
+        _enable_unit(name, platform)
+        logger.info("enable %s", name)
 
 
 def do_disable(jobs: list[str]) -> None:
-    """Tell the platform scheduler to skip the named jobs."""
-    raise NotImplementedError("disable")
+    """Move the platform scheduler into `disabled` for the named jobs.
+
+    Refuses names that aren't stamped on this host (run apply first)
+    and group-only entries that have no platform unit to flip.
+    """
+    config = load_config()
+    stamped = stamped_names()
+    unknown = [n for n in jobs if n not in stamped]
+    if unknown:
+        raise UsageError(
+            f"not stamped on this host: {sorted(unknown)} "
+            f"(run `crony apply` first)"
+        )
+    _refuse_stamp_only(config, jobs, "disable")
+    platform = current_platform()
+    for name in jobs:
+        _disable_unit(name, platform)
+        logger.info("disable %s", name)
 
 
 def do_status(jobs: list[str]) -> None:
-    """Print the resolved (CONFIG, SCHED, LAST) tuple per job."""
-    raise NotImplementedError("status")
+    """Print the resolved (CONFIG, SCHED, LAST) tuple per job.
+
+    With no args, the report covers selected jobs/groups plus any
+    orphans. Linger status on linux surfaces above the table because
+    a disabled-linger host silently fails every scheduled job and
+    that's the warning users miss the most often.
+    """
+    config = load_config()
+    platform = current_platform()
+    target = resolve_target(config, current_host(), platform)
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    selected = sel_jobs | sel_groups
+    stamped = stamped_names()
+
+    if platform == "linux":
+        ling = linger_enabled()
+        if ling is False:
+            user = _current_user()
+            logger.warning(
+                "linger DISABLED -- jobs only fire while you have "
+                "an active session. Fix: sudo loginctl enable-linger %s",
+                user,
+            )
+
+    names: list[str]
+    if jobs:
+        names = list(jobs)
+    else:
+        names = sorted(selected | stamped)
+
+    print(f"{'JOB':30} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+    for name in names:
+        cfg_state = _config_state(config, name, platform)
+        if cfg_state == "missing":
+            sched = "unknown"
+        else:
+            entry = config.jobs.get(name) or config.job_groups.get(name)
+            schedule, interval = (
+                _entity_schedule(entry) if entry is not None else (None, None)
+            )
+            if entry is not None and schedule is None and interval is None:
+                sched = "grouped"
+            else:
+                sched = _sched_state(name, platform)
+        last = _last_run_state(name)
+        print(f"{name:30} {cfg_state:10} {sched:10} {last:10}")
 
 
 def do_logs(

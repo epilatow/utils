@@ -2008,6 +2008,246 @@ class TestBrokenPipeHandler:
         handler.emit(record)
 
 
+# =============================================================================
+# Status / enable / disable / linger
+# =============================================================================
+
+
+class TestLingerDetection:
+    def test_returns_none_no_user(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        monkeypatch.setattr(crony.os, "getuid", lambda: -1)
+        assert crony.linger_enabled(user=None) is None
+
+    def test_sentinel_file_present(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        sentinel = tmp_path / "edp"
+        sentinel.touch()
+        real_path = crony.Path
+
+        def fake_path(p: Any) -> Path:
+            if str(p) == "/var/lib/systemd/linger/edp":
+                return sentinel
+            return real_path(p)
+
+        monkeypatch.setattr(crony, "Path", fake_path)
+        assert crony.linger_enabled(user="edp") is True
+
+
+class TestSchedStateDarwin:
+    def test_loaded_label_is_enabled(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
+        monkeypatch.setattr(
+            crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
+        )
+        assert crony._sched_state("j", "darwin") == "enabled"
+
+    def test_disabled_record_takes_precedence(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            crony,
+            "_launchctl_print_disabled",
+            lambda: '"org.crony.j" => disabled',
+        )
+        monkeypatch.setattr(
+            crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
+        )
+        assert crony._sched_state("j", "darwin") == "disabled"
+
+    def test_unknown_when_neither_loaded_nor_disabled(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
+        monkeypatch.setattr(crony, "_launchctl_list", lambda: "")
+        assert crony._sched_state("j", "darwin") == "unknown"
+
+
+class TestSchedStateLinux:
+    def test_enabled(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "enabled")
+        assert crony._sched_state("j", "linux") == "enabled"
+
+    def test_disabled(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
+        assert crony._sched_state("j", "linux") == "disabled"
+
+    def test_unknown_on_empty(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "")
+        assert crony._sched_state("j", "linux") == "unknown"
+
+
+class TestConfigState:
+    def test_missing_when_in_config_no_stamp(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        assert crony._config_state(cfg, "j", "darwin") == "missing"
+
+    def test_synced_after_apply(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        assert crony._config_state(cfg, "j", "darwin") == "synced"
+
+    def test_stale_when_config_changes(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        cfg2 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        assert crony._config_state(cfg2, "j", "darwin") == "stale"
+
+    def test_orphan_stamped_not_in_config(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        inst = h.state / "installed"
+        inst.mkdir()
+        (inst / "old.hash").write_text("legacy\n")
+        cfg = h.config({}, default_target_jobs=[])
+        assert crony._config_state(cfg, "old", "darwin") == "orphan"
+
+
+class TestEnableDisable:
+    def test_enable_invokes_systemctl_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.calls.clear()
+        crony.do_enable(jobs=["j"])
+        cmd = next(c for c in h.calls if c[0] == "systemctl")
+        assert cmd == [
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            "crony-j.timer",
+        ]
+
+    def test_disable_invokes_launchctl_on_darwin(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.calls.clear()
+        crony.do_disable(jobs=["j"])
+        verbs = [c[1] if len(c) > 1 else "" for c in h.calls]
+        assert "unload" in verbs
+        assert "disable" in verbs
+
+    def test_unknown_name_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="not stamped"):
+            crony.do_enable(jobs=["ghost"])
+
+    def test_unknown_name_rejected_for_disable(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="not stamped"):
+            crony.do_disable(jobs=["ghost"])
+
+    def test_stamp_only_entry_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        with pytest.raises(crony.UsageError, match="group-only entries"):
+            crony.do_enable(jobs=["a"])
+        with pytest.raises(crony.UsageError, match="group-only entries"):
+            crony.do_disable(jobs=["a"])
+
+    def test_apply_preserves_disabled_state_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
+        cfg2 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.calls.clear()
+        crony.apply_one(cfg2, "j")
+        verbs = [c[2] if len(c) > 2 else "" for c in h.calls]
+        assert "daemon-reload" in verbs
+        assert "enable" not in verbs
+
+
+class TestStatusReport:
+    def test_prints_table(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[])
+        out = capsys.readouterr().out
+        assert "JOB" in out
+        assert "CONFIG" in out
+        assert "SCHED" in out
+        assert "LAST" in out
+        assert "j" in out
+        assert "synced" in out
+
+    def test_orphan_appears(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        inst = h.state / "installed"
+        inst.mkdir()
+        (inst / "ghost.hash").write_text("legacy\n")
+        h.config({}, default_target_jobs=[])
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[])
+        out = capsys.readouterr().out
+        assert "ghost" in out
+        assert "orphan" in out
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 
