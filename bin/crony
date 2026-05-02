@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import signal
+import smtplib
 import socket
 import subprocess
 import sys
@@ -28,7 +29,10 @@ import tempfile
 import time
 import tomllib
 import traceback
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
+from email.message import EmailMessage
 from pathlib import Path
 from typing import IO, Any, Callable, Iterator, NamedTuple
 
@@ -164,17 +168,21 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # smtp_host          = "smtp.gmail.com"
 # smtp_port          = 587
 # smtp_user          = "you@gmail.com"
-# smtp_starttls      = true
+# smtp_starttls              = true
 # # Password retrieval -- first match wins. On macOS prefer the
-# # keychain item; on Linux fall back to a 0600 secrets file.
-# smtp_pass_keychain = "crony-smtp"
-# smtp_pass_file     = "~/.config/crony/secrets/smtp-password"
+# # keychain item (the optional _account narrows the lookup when
+# # multiple items share a service name); on Linux fall back to a
+# # 0600 secrets file.
+# smtp_pass_keychain_service = "crony-smtp"
+# smtp_pass_keychain_account = "you@gmail.com"   # optional
+# smtp_pass_file             = "~/.config/crony/secrets/smtp-password"
 
 # ntfy channel (used when notify_channel = "ntfy").
 # [defaults.notify.ntfy]
-# url            = "https://ntfy.example.com/automation"
-# token_keychain = "ntfy-automation"
-# token_file     = "~/.config/crony/secrets/ntfy-token"
+# url                    = "https://ntfy.example.com/automation"
+# token_keychain_service = "ntfy-automation"
+# token_keychain_account = "edp"                 # optional
+# token_file             = "~/.config/crony/secrets/ntfy-token"
 
 
 # ----------------------------------------------------------------------------
@@ -339,7 +347,8 @@ class NotifyEmail:
     smtp_user: str
     from_addr: str | None = None
     smtp_starttls: bool = True
-    smtp_pass_keychain: str | None = None
+    smtp_pass_keychain_service: str | None = None
+    smtp_pass_keychain_account: str | None = None
     smtp_pass_file: str | None = None
 
 
@@ -348,7 +357,8 @@ class NotifyNtfy:
     """ntfy notification settings."""
 
     url: str
-    token_keychain: str | None = None
+    token_keychain_service: str | None = None
+    token_keychain_account: str | None = None
     token_file: str | None = None
 
 
@@ -642,7 +652,8 @@ _KNOWN_NOTIFY_EMAIL: frozenset[str] = frozenset(
         "smtp_port",
         "smtp_user",
         "smtp_starttls",
-        "smtp_pass_keychain",
+        "smtp_pass_keychain_service",
+        "smtp_pass_keychain_account",
         "smtp_pass_file",
     }
 )
@@ -650,7 +661,8 @@ _KNOWN_NOTIFY_EMAIL: frozenset[str] = frozenset(
 _KNOWN_NOTIFY_NTFY: frozenset[str] = frozenset(
     {
         "url",
-        "token_keychain",
+        "token_keychain_service",
+        "token_keychain_account",
         "token_file",
     }
 )
@@ -772,7 +784,12 @@ def _parse_notify_email(raw: dict[str, Any]) -> NotifyEmail:
         smtp_starttls=_typed_field(
             raw, "smtp_starttls", bool, where, default=True
         ),
-        smtp_pass_keychain=_typed_field(raw, "smtp_pass_keychain", str, where),
+        smtp_pass_keychain_service=_typed_field(
+            raw, "smtp_pass_keychain_service", str, where
+        ),
+        smtp_pass_keychain_account=_typed_field(
+            raw, "smtp_pass_keychain_account", str, where
+        ),
         smtp_pass_file=_typed_field(raw, "smtp_pass_file", str, where),
     )
 
@@ -786,7 +803,12 @@ def _parse_notify_ntfy(raw: dict[str, Any]) -> NotifyNtfy:
         raise ConfigError(f"{where}: 'url' is required")
     return NotifyNtfy(
         url=url,
-        token_keychain=_typed_field(raw, "token_keychain", str, where),
+        token_keychain_service=_typed_field(
+            raw, "token_keychain_service", str, where
+        ),
+        token_keychain_account=_typed_field(
+            raw, "token_keychain_account", str, where
+        ),
         token_file=_typed_field(raw, "token_file", str, where),
     )
 
@@ -1201,7 +1223,7 @@ def resolved_timeout_sec(
 # per-job pipeline acquires a per-job flock, runs the optional gate,
 # execs the main command with a wallclock cap, writes a structured
 # last-run.json record, and dispatches a notification on non-ok exits
-# (only the log-only channel is wired; email and ntfy follow). The
+# exits via the configured channel (log-only, email, or ntfy). The
 # group pipeline acquires a group-level lock and re-invokes
 # `crony run <child>` for each named child in order; per-job
 # notifications happen inside each child's own run.
@@ -1226,6 +1248,11 @@ class JobRunResult:
     notify_channel: str
     notify_sent: bool
     notify_error: str | None
+    # Class name of the exception that caused notify_error (when
+    # set). Lets callers (e.g. notify-test) re-raise with a
+    # category-aware exit code -- a missing config field maps to
+    # CONFIG, a transport failure maps to ERROR.
+    notify_error_class: str | None = None
 
 
 @dataclass
@@ -1413,22 +1440,249 @@ def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+_NOTIFY_TIMEOUT_SEC: int = 15
+
+
+def _retrieve_secret(
+    *,
+    keychain_service: str | None,
+    keychain_account: str | None = None,
+    file_path: str | None,
+) -> str | None:
+    """Look up a secret value from macOS Keychain or a 0600 file.
+
+    Tries `security find-generic-password` first when a keychain
+    service is configured and the host is darwin; falls back to
+    reading file_path if the file exists. `keychain_account` is
+    optional and disambiguates when multiple keychain items share the
+    same service name (the (service, account) pair is the keychain's
+    composite identity for generic-password items). Returns None if
+    no source is configured or the keychain lookup fails on a darwin
+    host. Raises PreconditionError if a secrets file exists but its
+    mode allows group / world access -- a config-time check that
+    surfaces leaked-credential risk before the runtime path tries to
+    use it.
+    """
+    if keychain_service is not None and sys.platform == "darwin":
+        argv = [
+            "security",
+            "find-generic-password",
+            "-s",
+            keychain_service,
+        ]
+        if keychain_account is not None:
+            argv.extend(["-a", keychain_account])
+        argv.append("-w")
+        try:
+            r = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if r.returncode == 0:
+                return r.stdout.rstrip("\n")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    if file_path is not None:
+        p = Path(os.path.expanduser(file_path))
+        if p.exists():
+            # Parent directory: require no group / world bits. A
+            # 0700 (or 0500) parent prevents leaks of file names /
+            # mtimes / sibling presence even when the secret file
+            # itself is locked down to 0600.
+            parent = p.parent
+            parent_mode = parent.stat().st_mode & 0o777
+            if parent_mode & 0o077:
+                raise PreconditionError(
+                    f"secret directory {parent} is mode "
+                    f"0o{parent_mode:o}; require no group / world "
+                    f"bits (e.g. 0700)"
+                )
+            mode = p.stat().st_mode & 0o777
+            if mode & 0o077:
+                raise PreconditionError(
+                    f"secret file {p} is mode 0o{mode:o}; require 0600 "
+                    f"(group / world readable secrets are unsafe)"
+                )
+            return p.read_text(encoding="utf-8").rstrip("\n")
+    return None
+
+
+def _format_summary(result: JobRunResult) -> str:
+    """One-line-per-field human summary for notification bodies."""
+    return (
+        f"Job:        {result.job}\n"
+        f"Host:       {result.host}\n"
+        f"Platform:   {result.platform}\n"
+        f"Started:    {result.started_at}\n"
+        f"Ended:      {result.ended_at}\n"
+        f"Duration:   {result.duration_sec:.1f}s\n"
+        f"Exit class: {result.exit_class}\n"
+        f"Exit code:  {result.exit_code}\n"
+        f"Signal:     {result.signal}\n"
+        f"Gate exit:  {result.gate_exit}\n"
+        f"Log path:   {result.log_path}\n"
+    )
+
+
+def _truncate_log(log_text: str, max_kb: int) -> tuple[str, bool]:
+    """Tail a log to at most max_kb KB, returning (text, truncated)."""
+    max_bytes = max_kb * 1024
+    if len(log_text) <= max_bytes:
+        return log_text, False
+    return log_text[-max_bytes:], True
+
+
+def _build_email_message(
+    result: JobRunResult,
+    log_text: str,
+    cfg: NotifyEmail,
+    attach_log: bool,
+    attach_max_kb: int,
+) -> EmailMessage:
+    """Construct the RFC822 EmailMessage for a job failure."""
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"[crony/{result.host}] {result.job} {result.exit_class} "
+        f"(exit {result.exit_code})"
+    )
+    msg["From"] = cfg.from_addr or cfg.smtp_user
+    msg["To"] = cfg.to
+    body = _format_summary(result)
+    if attach_log and log_text:
+        tail, truncated = _truncate_log(log_text, attach_max_kb)
+        marker = (
+            f"\n--- log (last {len(tail)} of {len(log_text)} bytes) ---\n"
+            if truncated
+            else "\n--- log ---\n"
+        )
+        body += marker + tail
+    msg.set_content(body)
+    return msg
+
+
+def _send_email(msg: EmailMessage, cfg: NotifyEmail, password: str) -> None:
+    """SMTP send with optional STARTTLS + AUTH. Raises smtplib errors."""
+    with smtplib.SMTP(
+        cfg.smtp_host, cfg.smtp_port, timeout=_NOTIFY_TIMEOUT_SEC
+    ) as smtp:
+        if cfg.smtp_starttls:
+            smtp.starttls()
+        smtp.login(cfg.smtp_user, password)
+        smtp.send_message(msg)
+
+
+def _post_ntfy(
+    cfg: NotifyNtfy,
+    token: str,
+    title: str,
+    exit_class: str,
+    body: str,
+    log_text: str,
+    attach_log: bool,
+    attach_max_kb: int,
+) -> None:
+    """POST to ntfy. Body is the log tail when attach_log is true,
+    otherwise the human summary. urlopen raises HTTPError on >=400
+    responses; the caller's broad except records that as
+    notify_error.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Title": title,
+        "Tags": f"warning,{exit_class}",
+    }
+    if attach_log and log_text:
+        tail, _trunc = _truncate_log(log_text, attach_max_kb)
+        data = tail.encode("utf-8")
+        headers["Filename"] = "run.log"
+    else:
+        data = body.encode("utf-8")
+    req = urllib.request.Request(
+        cfg.url, data=data, headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=_NOTIFY_TIMEOUT_SEC):
+        pass
+
+
 def _dispatch_notify(
     result: JobRunResult, log_text: str, defaults: Defaults
 ) -> None:
     """Send a notification through the resolved channel.
 
-    The log-only channel is intentionally a no-op. Email and ntfy
-    channels are filled in by subsequent commits; until then they
-    record "not implemented" in the result so the user can see the
-    plumbing is wired but not yet active.
+    Failures never propagate; they're recorded in result.notify_error
+    so the runner can move on. The wrapped command's exit code is
+    crony's primary failure signal -- a missed notification matters
+    less than a missed exit code.
     """
     if result.notify_channel == "log-only":
         return
-    result.notify_sent = False
-    result.notify_error = (
-        f"channel {result.notify_channel!r} not yet implemented"
-    )
+    try:
+        if result.notify_channel == "email":
+            if defaults.notify_email is None:
+                raise ConfigError("[defaults.notify.email] not configured")
+            password = _retrieve_secret(
+                keychain_service=(
+                    defaults.notify_email.smtp_pass_keychain_service
+                ),
+                keychain_account=(
+                    defaults.notify_email.smtp_pass_keychain_account
+                ),
+                file_path=defaults.notify_email.smtp_pass_file,
+            )
+            if password is None:
+                raise ConfigError(
+                    "no SMTP password available (configure "
+                    "smtp_pass_keychain_service or smtp_pass_file)"
+                )
+            msg = _build_email_message(
+                result,
+                log_text,
+                defaults.notify_email,
+                defaults.notify_attach_log,
+                defaults.notify_attach_max_kb,
+            )
+            _send_email(msg, defaults.notify_email, password)
+        elif result.notify_channel == "ntfy":
+            if defaults.notify_ntfy is None:
+                raise ConfigError("[defaults.notify.ntfy] not configured")
+            token = _retrieve_secret(
+                keychain_service=defaults.notify_ntfy.token_keychain_service,
+                keychain_account=defaults.notify_ntfy.token_keychain_account,
+                file_path=defaults.notify_ntfy.token_file,
+            )
+            if token is None:
+                raise ConfigError(
+                    "no ntfy token available (configure "
+                    "token_keychain_service or token_file)"
+                )
+            title = (
+                f"[crony/{result.host}] {result.job} "
+                f"{result.exit_class} (exit {result.exit_code})"
+            )
+            _post_ntfy(
+                defaults.notify_ntfy,
+                token,
+                title,
+                result.exit_class,
+                _format_summary(result),
+                log_text,
+                defaults.notify_attach_log,
+                defaults.notify_attach_max_kb,
+            )
+        else:
+            raise ConfigError(
+                f"unknown notify channel: {result.notify_channel!r}"
+            )
+        result.notify_sent = True
+    except Exception as e:
+        # Notify is best-effort; a failure here can't be reported
+        # via the same broken channel, so we record it and let the
+        # runner's exit code remain the user-visible signal.
+        result.notify_sent = False
+        result.notify_error = f"{type(e).__name__}: {e}"
+        result.notify_error_class = type(e).__name__
 
 
 def run_job(
@@ -1781,8 +2035,53 @@ def do_validate() -> None:
 
 
 def do_notify_test(channel: str | None) -> None:
-    """Send a synthetic failure notification."""
-    raise NotImplementedError("notify-test")
+    """Send a synthetic failure notification through the resolved channel.
+
+    Verifies SMTP / keychain / ntfy plumbing without scheduling a
+    real job. Channel defaults to [defaults].notify_channel; pass
+    --channel to override.
+    """
+    config = load_config()
+    use_channel = channel or config.defaults.notify_channel
+    if use_channel == "log-only":
+        logger.info("notify channel is log-only; nothing to send")
+        return
+    result = JobRunResult(
+        job="notify-test",
+        host=current_host(),
+        platform=current_platform(),
+        started_at=_now_iso(),
+        ended_at=_now_iso(),
+        duration_sec=0.0,
+        exit_class="fail",
+        exit_code=1,
+        signal=None,
+        gate_exit=None,
+        log_path="(synthetic)",
+        log_bytes_this_run=0,
+        notify_channel=use_channel,
+        notify_sent=False,
+        notify_error=None,
+    )
+    log_text = (
+        "synthetic test message from `crony notify-test`.\n"
+        "if you can read this, the channel is working end-to-end.\n"
+    )
+    _dispatch_notify(result, log_text, config.defaults)
+    if result.notify_sent:
+        logger.info("notification sent via %s", use_channel)
+        return
+    # Preserve the failure category so missing-config surfaces as
+    # CONFIG (3) and transport problems surface as the more generic
+    # ERROR (4). _dispatch_notify catalogues the original exception
+    # class for exactly this lookup.
+    if result.notify_error_class == "ConfigError":
+        raise ConfigError(
+            f"notify-test failed via {use_channel}: {result.notify_error}"
+        )
+    raise CronyError(
+        f"notify-test failed via {use_channel}: {result.notify_error}"
+    )
 
 
 def do_list() -> None:

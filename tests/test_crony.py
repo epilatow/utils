@@ -17,6 +17,7 @@ import sys
 import tomllib
 from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
 
 import pytest  # type: ignore[import-not-found]
 from conftest import (
@@ -227,7 +228,8 @@ class TestParseDefaults:
                             "smtp_user": "edp",
                             "smtp_port": 465,
                             "smtp_starttls": False,
-                            "smtp_pass_keychain": "crony-smtp",
+                            "smtp_pass_keychain_service": "crony-smtp",
+                            "smtp_pass_keychain_account": "edp",
                         }
                     }
                 }
@@ -237,6 +239,10 @@ class TestParseDefaults:
         assert cfg.defaults.notify_email.to == "edp@example.com"
         assert cfg.defaults.notify_email.smtp_port == 465
         assert cfg.defaults.notify_email.smtp_starttls is False
+        assert (
+            cfg.defaults.notify_email.smtp_pass_keychain_service == "crony-smtp"
+        )
+        assert cfg.defaults.notify_email.smtp_pass_keychain_account == "edp"
 
     def test_notify_email_missing_required(self) -> None:
         with pytest.raises(crony.ConfigError, match="required"):
@@ -251,7 +257,7 @@ class TestParseDefaults:
                     "notify": {
                         "ntfy": {
                             "url": "https://ntfy.example.com/x",
-                            "token_keychain": "ntfy-token",
+                            "token_keychain_service": "ntfy-token",
                         }
                     }
                 }
@@ -1125,9 +1131,12 @@ class TestRunJobNotify:
         assert rec["notify_sent"] is False
         assert rec["notify_error"] is None
 
-    def test_unimplemented_channel_records_error(
+    def test_unconfigured_channel_records_error(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # ntfy channel selected but no [defaults.notify.ntfy] section.
+        # The runner records the misconfiguration in notify_error
+        # rather than letting the missing config crash the run.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -1145,7 +1154,7 @@ class TestRunJobNotify:
         rec = _last_run(h.state, "fail")
         assert rec["notify_channel"] == "ntfy"
         assert rec["notify_sent"] is False
-        assert "not yet implemented" in (rec["notify_error"] or "")
+        assert "not configured" in (rec["notify_error"] or "")
 
 
 class TestRunGroup:
@@ -1223,6 +1232,361 @@ class TestRunGroup:
         # No last-run.json for either group or child on dry-run
         assert not (h.state / "g" / "last-run.json").exists()
         assert not (h.state / "a" / "last-run.json").exists()
+
+
+# =============================================================================
+# Notify channels
+# =============================================================================
+
+
+class TestSecretRetrieval:
+    """_retrieve_secret reads from Keychain (mac) or 0600 file."""
+
+    def test_returns_none_when_no_source(self) -> None:
+        assert (
+            crony._retrieve_secret(keychain_service=None, file_path=None)
+            is None
+        )
+
+    def test_reads_from_file(self, tmp_path: Path) -> None:
+        f = tmp_path / "secret"
+        f.write_text("supersecret\n")
+        f.chmod(0o600)
+        assert (
+            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+            == "supersecret"
+        )
+
+    def test_rejects_loose_mode(self, tmp_path: Path) -> None:
+        f = tmp_path / "secret"
+        f.write_text("supersecret")
+        f.chmod(0o644)  # group/world readable
+        with pytest.raises(crony.PreconditionError, match="0600"):
+            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+
+    def test_rejects_loose_parent_dir(self, tmp_path: Path) -> None:
+        # File mode is fine but the directory is group/world
+        # accessible; reject so file names / mtimes don't leak.
+        d = tmp_path / "secrets"
+        d.mkdir(mode=0o755)
+        f = d / "smtp-pw"
+        f.write_text("hunter2")
+        f.chmod(0o600)
+        with pytest.raises(crony.PreconditionError, match="secret directory"):
+            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+
+    def test_keychain_falls_back_to_file_on_failure(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # When the keychain lookup fails (non-darwin or item missing),
+        # the function should try the file_path as a fallback.
+        f = tmp_path / "secret"
+        f.write_text("from-file")
+        f.chmod(0o600)
+        # Pretend we're on linux so the keychain branch is skipped
+        # entirely.
+        monkeypatch.setattr(crony.sys, "platform", "linux")
+        assert (
+            crony._retrieve_secret(
+                keychain_service="missing-item", file_path=str(f)
+            )
+            == "from-file"
+        )
+
+    def test_account_passed_as_dash_a(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # When keychain_account is set, `security` is invoked with
+        # `-a <account>` after `-s <service>` so the lookup picks the
+        # right item among multiple sharing a service name.
+        captured: dict[str, Any] = {}
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            captured["argv"] = argv
+            import subprocess as _sp
+
+            return _sp.CompletedProcess(
+                args=argv, returncode=0, stdout="thesecret\n", stderr=""
+            )
+
+        monkeypatch.setattr(crony.sys, "platform", "darwin")
+        monkeypatch.setattr(crony.subprocess, "run", _fake_run)
+        secret = crony._retrieve_secret(
+            keychain_service="svc",
+            keychain_account="acct",
+            file_path=None,
+        )
+        assert secret == "thesecret"
+        # `-s svc` precedes `-a acct`, and `-w` is the trailing flag.
+        argv = captured["argv"]
+        assert "-s" in argv and argv[argv.index("-s") + 1] == "svc"
+        assert "-a" in argv and argv[argv.index("-a") + 1] == "acct"
+        assert argv[-1] == "-w"
+
+    def test_no_account_omits_dash_a(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Without keychain_account, no `-a` is passed -- preserves
+        # the prior behavior for users who don't need to disambiguate.
+        captured: dict[str, Any] = {}
+
+        def _fake_run(argv: list[str], **kwargs: Any) -> Any:
+            captured["argv"] = argv
+            import subprocess as _sp
+
+            return _sp.CompletedProcess(
+                args=argv, returncode=0, stdout="x\n", stderr=""
+            )
+
+        monkeypatch.setattr(crony.sys, "platform", "darwin")
+        monkeypatch.setattr(crony.subprocess, "run", _fake_run)
+        crony._retrieve_secret(keychain_service="svc", file_path=None)
+        assert "-a" not in captured["argv"]
+
+
+class TestEmailNotify:
+    """Email channel routing via smtplib (mocked)."""
+
+    def _common_config(self, tmp_path: Path) -> Any:
+        secret = tmp_path / "smtp-pw"
+        secret.write_text("hunter2")
+        secret.chmod(0o600)
+        return crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channel": "email",
+                    "notify_attach_log": True,
+                    "notify_attach_max_kb": 1,
+                    "notify": {
+                        "email": {
+                            "to": "you@example.com",
+                            "from": "crony@example.com",
+                            "smtp_host": "smtp.example.com",
+                            "smtp_port": 587,
+                            "smtp_user": "u@example.com",
+                            "smtp_starttls": True,
+                            "smtp_pass_file": str(secret),
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channel="email")},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+
+    def _make_failed_result(self) -> Any:
+        return crony.JobRunResult(
+            job="j",
+            host="h",
+            platform="darwin",
+            started_at="2026-05-02T10:00:00-07:00",
+            ended_at="2026-05-02T10:00:01-07:00",
+            duration_sec=1.0,
+            exit_class="fail",
+            exit_code=2,
+            signal=None,
+            gate_exit=None,
+            log_path="/tmp/run.log",
+            log_bytes_this_run=42,
+            notify_channel="email",
+            notify_sent=False,
+            notify_error=None,
+        )
+
+    def test_sends_via_smtp(self, tmp_path: Path, monkeypatch: Any) -> None:
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result()
+
+        # autospec exercises the real SMTP signature; the resulting
+        # mock instance plays the context-manager role with the same
+        # return-value contract.
+        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_inst = smtp_cls.return_value
+        smtp_inst.__enter__.return_value = smtp_inst
+        smtp_inst.__exit__.return_value = None
+        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+
+        crony._dispatch_notify(result, "log content here", cfg.defaults)
+
+        assert result.notify_sent is True
+        assert result.notify_error is None
+        smtp_cls.assert_called_once_with("smtp.example.com", 587, timeout=15)
+        smtp_inst.starttls.assert_called_once()
+        smtp_inst.login.assert_called_once_with("u@example.com", "hunter2")
+        assert smtp_inst.send_message.call_count == 1
+        sent = smtp_inst.send_message.call_args[0][0]
+        assert sent["To"] == "you@example.com"
+        assert sent["From"] == "crony@example.com"
+        body = sent.get_content()
+        assert "Job:        j" in body
+        assert "fail" in body
+        assert "log content here" in body
+
+    def test_records_smtp_failure_no_propagate(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result()
+
+        smtp_cls = create_autospec(
+            crony.smtplib.SMTP, side_effect=ConnectionRefusedError("no")
+        )
+        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+
+        crony._dispatch_notify(result, "log", cfg.defaults)
+        assert result.notify_sent is False
+        assert "ConnectionRefusedError" in (result.notify_error or "")
+
+    def test_missing_smtp_password_records_error(self, tmp_path: Path) -> None:
+        # Build a config that omits smtp_pass_*.
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channel": "email",
+                    "notify": {
+                        "email": {
+                            "to": "y@e.com",
+                            "smtp_host": "x",
+                            "smtp_user": "u",
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channel="email")},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        result = self._make_failed_result()
+        crony._dispatch_notify(result, "log", cfg.defaults)
+        assert result.notify_sent is False
+        assert "no SMTP password" in (result.notify_error or "")
+
+
+class TestNtfyNotify:
+    """ntfy channel routing via urllib (mocked)."""
+
+    def _common_config(self, tmp_path: Path) -> Any:
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        return crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channel": "ntfy",
+                    "notify_attach_log": True,
+                    "notify_attach_max_kb": 1,
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channel="ntfy")},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+
+    def _make_failed_result(self) -> Any:
+        return crony.JobRunResult(
+            job="j",
+            host="h",
+            platform="darwin",
+            started_at="2026-05-02T10:00:00-07:00",
+            ended_at="2026-05-02T10:00:01-07:00",
+            duration_sec=1.0,
+            exit_class="fail",
+            exit_code=2,
+            signal=None,
+            gate_exit=None,
+            log_path="/tmp/run.log",
+            log_bytes_this_run=42,
+            notify_channel="ntfy",
+            notify_sent=False,
+            notify_error=None,
+        )
+
+    def test_sends_via_urllib(self, tmp_path: Path, monkeypatch: Any) -> None:
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result()
+
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: Any) -> None:
+                return None
+
+        def _fake_urlopen(req: Any, timeout: Any = None) -> Any:
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["data"] = req.data
+            captured["method"] = req.get_method()
+            return _Resp()
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
+        crony._dispatch_notify(result, "log content here", cfg.defaults)
+
+        assert result.notify_sent is True
+        assert result.notify_error is None
+        assert captured["url"] == "https://ntfy.example.com/x"
+        assert captured["method"] == "POST"
+        # urllib.request.Request normalises header keys via
+        # capitalize(); accept either form defensively.
+        auth = captured["headers"].get("Authorization") or captured[
+            "headers"
+        ].get("authorization")
+        assert auth == "Bearer tk_test"
+        tags = captured["headers"].get("Tags") or captured["headers"].get(
+            "tags"
+        )
+        assert tags == "warning,fail"
+        # attach_log=True -> body is the log content tail
+        assert b"log content here" in captured["data"]
+
+    def test_http_error_recorded(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result()
+
+        # urllib raises HTTPError for 4xx/5xx responses; mirror that
+        # so the test reflects real-world failure.
+        def _raise(req: Any, timeout: Any = None) -> Any:
+            raise crony.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", {}, None
+            )
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
+        crony._dispatch_notify(result, "log", cfg.defaults)
+        assert result.notify_sent is False
+        assert "503" in (result.notify_error or "")
+
+
+class TestNotifyTestSubcommand:
+    """`crony notify-test` synth event invocation."""
+
+    def test_log_only_is_quiet(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        # log-only path should not raise
+        crony.do_notify_test(channel=None)
+
+    def test_unconfigured_channel_raises_config_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Missing config bits should surface as CONFIG (3), not the
+        # generic ERROR (4) -- the user can act on config errors.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {"defaults": {"notify_channel": "email"}},
+            default_target_jobs=[],
+        )
+        with pytest.raises(crony.ConfigError, match="notify-test failed"):
+            crony.do_notify_test(channel=None)
 
 
 # =============================================================================
