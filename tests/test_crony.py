@@ -13,6 +13,7 @@ import importlib.machinery
 import importlib.util
 import logging
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -1587,6 +1588,265 @@ class TestNotifyTestSubcommand:
         )
         with pytest.raises(crony.ConfigError, match="notify-test failed"):
             crony.do_notify_test(channel=None)
+
+
+# =============================================================================
+# Apply / destroy + platform unit rendering
+# =============================================================================
+
+
+class _ApplyHarness(_RunnerHarness):
+    """RunnerHarness extension that also redirects platform unit dirs
+    and stubs subprocess so launchctl/systemctl never run for real.
+    """
+
+    def __init__(
+        self, tmp_path: Path, monkeypatch: Any, *, platform: str = "darwin"
+    ) -> None:
+        super().__init__(tmp_path, monkeypatch)
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        sysd = tmp_path / "systemd-user"
+        sysd.mkdir()
+        monkeypatch.setattr(crony, "LAUNCHAGENTS_DIR", agents)
+        monkeypatch.setattr(crony, "SYSTEMD_USER_DIR", sysd)
+        monkeypatch.setattr(crony, "current_platform", lambda: platform)
+        # Capture subprocess.run calls so apply/destroy don't actually
+        # invoke launchctl or systemctl.
+        self.calls: list[list[str]] = []
+
+        def fake_run(*args: Any, **kwargs: Any) -> Any:
+            argv: list[str] = list(args[0] if args else kwargs.get("args", []))
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        self.platform = platform
+        self.agents = agents
+        self.sysd = sysd
+
+
+class TestPlistRendering:
+    """_render_plist produces well-formed launchd plists."""
+
+    def test_keyword_daily(self) -> None:
+        plist = crony._render_plist("brew", "daily", None)
+        assert "<key>Label</key>" in plist
+        assert "<string>org.crony.brew</string>" in plist
+        assert "<key>StartCalendarInterval</key>" in plist
+        # daily -> 00:00
+        assert "<key>Hour</key>" in plist
+        assert "<integer>0</integer>" in plist
+
+    def test_oncalendar_simple_time(self) -> None:
+        plist = crony._render_plist("j", "*-*-* 03:15", None)
+        assert "<key>Hour</key>" in plist
+        assert "<integer>3</integer>" in plist
+        assert "<integer>15</integer>" in plist
+
+    def test_oncalendar_dow_with_time(self) -> None:
+        plist = crony._render_plist("j", "Mon *-*-* 09:00", None)
+        assert "<key>Weekday</key>" in plist
+        assert "<integer>1</integer>" in plist  # Mon=1
+
+    def test_oncalendar_first_of_month(self) -> None:
+        plist = crony._render_plist("j", "*-*-01 03:00", None)
+        assert "<key>Day</key>" in plist
+        assert "<integer>1</integer>" in plist
+
+    def test_interval(self) -> None:
+        plist = crony._render_plist("j", None, "30min")
+        assert "<key>StartInterval</key>" in plist
+        assert "<integer>1800</integer>" in plist
+
+    def test_step_pattern_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="step / range / list"):
+            crony._render_plist("j", "*:0/15", None)
+
+    def test_range_pattern_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="step / range / list"):
+            crony._render_plist("j", "Mon..Fri *-*-* 09:00", None)
+
+
+class TestSystemdRendering:
+    def test_service_unit(self) -> None:
+        svc = crony._render_systemd_service("brew")
+        assert "[Unit]" in svc
+        assert "[Service]" in svc
+        assert "Type=oneshot" in svc
+        assert "ExecStart=" in svc
+        assert " run brew" in svc
+        assert "WorkingDirectory=%h" in svc
+
+    def test_timer_oncalendar(self) -> None:
+        timer = crony._render_systemd_timer("j", "*-*-* 03:00", None)
+        assert "OnCalendar=*-*-* 03:00" in timer
+        assert "Persistent=true" in timer
+        assert "WantedBy=timers.target" in timer
+
+    def test_timer_interval(self) -> None:
+        timer = crony._render_systemd_timer("j", None, "1h")
+        assert "OnUnitActiveSec=1h" in timer
+
+
+class TestApplyDarwin:
+    def test_writes_plist_and_activates(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        result = crony.apply_one(cfg, "j")
+        assert result == "added"
+        plist_path = h.agents / "org.crony.j.plist"
+        assert plist_path.exists()
+        # Activated via launchctl (plus plutil validation)
+        commands = [c[0] for c in h.calls]
+        assert "plutil" in commands
+        assert "launchctl" in commands
+        # Hash stamp written
+        assert (h.state / "installed" / "j.hash").exists()
+
+    def test_idempotent_when_unchanged(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.calls.clear()
+        result = crony.apply_one(cfg, "j")
+        assert result == "unchanged"
+        # No further launchctl invocations on no-op apply
+        assert all(c[0] != "launchctl" for c in h.calls)
+
+    def test_drift_triggers_update(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        cfg2 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.calls.clear()
+        result = crony.apply_one(cfg2, "j")
+        assert result == "updated"
+        plist = (h.agents / "org.crony.j.plist").read_text()
+        assert "<integer>4</integer>" in plist
+
+
+class TestApplyLinux:
+    def test_writes_service_and_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        assert (h.sysd / "crony-j.service").exists()
+        assert (h.sysd / "crony-j.timer").exists()
+        commands = [c[0] for c in h.calls]
+        assert "systemctl" in commands
+
+
+class TestApplyFullSync:
+    def test_removes_orphans_on_no_arg_apply(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        # Pre-stamp an orphan
+        inst = h.state / "installed"
+        inst.mkdir()
+        (inst / "old.hash").write_text("legacy\n")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=[])
+        assert (h.state / "installed" / "j.hash").exists()
+        assert not (h.state / "installed" / "old.hash").exists()
+
+    def test_surgical_apply_leaves_orphans(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        inst = h.state / "installed"
+        inst.mkdir()
+        (inst / "old.hash").write_text("legacy\n")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=["j"])
+        assert (h.state / "installed" / "old.hash").exists()  # left alone
+
+
+class TestDestroy:
+    def test_factory_reset(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        assert (h.agents / "org.crony.j.plist").exists()
+        assert (h.state / "installed" / "j.hash").exists()
+        crony.do_destroy(jobs=[], purge_state=False)
+        assert not (h.agents / "org.crony.j.plist").exists()
+        assert not (h.state / "installed" / "j.hash").exists()
+
+    def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "b": {"command": "true", "schedule": "*-*-* 04:00"},
+                }
+            },
+            default_target_jobs=["a", "b"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "b")
+        crony.do_destroy(jobs=["a"], purge_state=False)
+        assert not (h.state / "installed" / "a.hash").exists()
+        assert (h.state / "installed" / "b.hash").exists()
+
+    def test_purge_state_removes_state_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        # Pretend a run created state
+        (h.state / "j" / "run.log").parent.mkdir(parents=True, exist_ok=True)
+        (h.state / "j" / "run.log").write_text("...")
+        crony.do_destroy(jobs=["j"], purge_state=True)
+        assert not (h.state / "j").exists()
+
+    def test_unknown_name_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown"):
+            crony.do_destroy(jobs=["ghost"], purge_state=False)
 
 
 # =============================================================================

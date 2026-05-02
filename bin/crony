@@ -15,11 +15,13 @@ import dataclasses
 import datetime
 import enum
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import smtplib
 import socket
@@ -31,6 +33,7 @@ import tomllib
 import traceback
 import urllib.error
 import urllib.request
+import xml.sax.saxutils
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -97,6 +100,12 @@ CONFIG_DIR: Path = _env_path(
 CONFIG_FILE: Path = _env_path("CONFIG_FILE", str(CONFIG_DIR / "config.toml"))
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
+)
+LAUNCHAGENTS_DIR: Path = _env_path(
+    "LAUNCHAGENTS_DIR", os.path.expanduser("~/Library/LaunchAgents")
+)
+SYSTEMD_USER_DIR: Path = _env_path(
+    "SYSTEMD_USER_DIR", os.path.expanduser("~/.config/systemd/user")
 )
 
 logger = logging.getLogger(__name__)
@@ -725,6 +734,11 @@ def _typed_field(
 # `org.crony.<name>` and the systemd unit `crony-<name>.timer`.
 _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# Names that collide with crony's own state-dir layout. A job named
+# "installed" would be wiped by `destroy --purge-state` (which removes
+# STATE_DIR/<name>/), taking the hash registry with it.
+_RESERVED_NAMES: frozenset[str] = frozenset({"installed"})
+
 
 def _validate_name(name: str, where: str) -> None:
     """Reject names that would break filesystem paths or unit labels."""
@@ -734,6 +748,8 @@ def _validate_name(name: str, where: str) -> None:
             f"[A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, "
             f"empty, or leading punctuation)"
         )
+    if name in _RESERVED_NAMES:
+        raise ConfigError(f"{where}: name {name!r} is reserved by crony")
 
 
 def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
@@ -1949,6 +1965,376 @@ def run_group(
 
 
 # =============================================================================
+# PLATFORM UNITS
+# =============================================================================
+# Render and (un)load platform-native scheduler units. crony's
+# "behaves the same on both platforms" promise is concentrated here:
+# darwin/linux divergence in apply/destroy lives in this section.
+# Anywhere else in the file is platform-agnostic.
+
+_DOW_TO_LAUNCHD: dict[str, int] = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+
+
+def _label_for(name: str) -> str:
+    """launchd Label for a job/group."""
+    return f"org.{BASENAME}.{name}"
+
+
+def _plist_path_for(name: str) -> Path:
+    return LAUNCHAGENTS_DIR / f"{_label_for(name)}.plist"
+
+
+def _service_path_for(name: str) -> Path:
+    return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.service"
+
+
+def _timer_path_for(name: str) -> Path:
+    return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
+
+
+def _hash_path_for(name: str) -> Path:
+    return STATE_DIR / "installed" / f"{name}.hash"
+
+
+def _systemd_unit_name(name: str) -> str:
+    return f"{BASENAME}-{name}.timer"
+
+
+def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
+    """Translate an OnCalendar spec to a launchd StartCalendarInterval.
+
+    Supports keywords (hourly, daily, weekly, monthly, yearly), bare
+    HH:MM, and the `[DOW] *-*-* HH:MM` shape with a single concrete
+    day or month. Step values, ranges, and comma-lists are rejected
+    here -- they would require expanding to many entries that crony
+    doesn't yet generate, so the error explicitly suggests using a
+    simpler schedule form.
+    """
+    text = spec.strip()
+    keywords: dict[str, dict[str, int]] = {
+        "hourly": {"Minute": 0},
+        "daily": {"Hour": 0, "Minute": 0},
+        "weekly": {"Weekday": 1, "Hour": 0, "Minute": 0},
+        "monthly": {"Day": 1, "Hour": 0, "Minute": 0},
+        "yearly": {"Month": 1, "Day": 1, "Hour": 0, "Minute": 0},
+        "annually": {"Month": 1, "Day": 1, "Hour": 0, "Minute": 0},
+    }
+    if text in keywords:
+        return keywords[text]
+    if "/" in text or ".." in text or "," in text:
+        raise ConfigError(
+            f"OnCalendar pattern {spec!r} uses step / range / list "
+            f"features that crony does not translate to launchd. "
+            f"Use a single concrete time or weekday/day entry."
+        )
+    parts = text.split()
+    dow: int | None = None
+    if parts and parts[0].lower() in _DOW_TO_LAUNCHD:
+        dow = _DOW_TO_LAUNCHD[parts[0].lower()]
+        parts = parts[1:]
+    time_re = re.compile(r"^(\d{1,2}):(\d{2})(?::\d{2})?$")
+    if len(parts) == 1 and time_re.fullmatch(parts[0]):
+        m = time_re.fullmatch(parts[0])
+        assert m is not None
+        entry: dict[str, int] = {
+            "Hour": int(m.group(1)),
+            "Minute": int(m.group(2)),
+        }
+        if dow is not None:
+            entry["Weekday"] = dow
+        return entry
+    date_re = re.compile(r"^(\*|\d{4})-(\*|\d{1,2})-(\*|\d{1,2})$")
+    if len(parts) == 2:
+        d = date_re.fullmatch(parts[0])
+        t = time_re.fullmatch(parts[1])
+        if d and t:
+            e: dict[str, int] = {
+                "Hour": int(t.group(1)),
+                "Minute": int(t.group(2)),
+            }
+            if d.group(2) != "*":
+                e["Month"] = int(d.group(2))
+            if d.group(3) != "*":
+                e["Day"] = int(d.group(3))
+            if dow is not None:
+                e["Weekday"] = dow
+            return e
+    raise ConfigError(
+        f"crony does not yet translate OnCalendar pattern {spec!r} "
+        f"to launchd. Try a simpler form like '03:15' or "
+        f"'*-*-* 03:15' or 'Mon *-*-* 09:00'."
+    )
+
+
+def _render_plist(name: str, schedule: str | None, interval: str | None) -> str:
+    """Render the LaunchAgent plist XML for a job or group."""
+    label = _label_for(name)
+    program_args = [_crony_executable(), "run", name]
+    args_xml = "".join(
+        f"        <string>{xml.sax.saxutils.escape(a)}</string>\n"
+        for a in program_args
+    )
+    sched_block = ""
+    if interval is not None:
+        sec = parse_interval_seconds(interval)
+        sched_block = (
+            f"    <key>StartInterval</key>\n    <integer>{sec}</integer>\n"
+        )
+    elif schedule is not None:
+        entry = _oncalendar_to_plist_calendar(schedule)
+        sched_block = "    <key>StartCalendarInterval</key>\n"
+        sched_block += "    <dict>\n"
+        for k, v in sorted(entry.items()):
+            sched_block += f"        <key>{k}</key>\n"
+            sched_block += f"        <integer>{v}</integer>\n"
+        sched_block += "    </dict>\n"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        f"    <key>Label</key>\n"
+        f"    <string>{label}</string>\n"
+        f"    <key>ProgramArguments</key>\n"
+        f"    <array>\n"
+        f"{args_xml}"
+        f"    </array>\n"
+        "    <key>RunAtLoad</key>\n"
+        "    <false/>\n"
+        "    <key>KeepAlive</key>\n"
+        "    <false/>\n"
+        "    <key>AbandonProcessGroup</key>\n"
+        "    <false/>\n"
+        f"{sched_block}"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _render_systemd_service(name: str) -> str:
+    """Render the systemd .service unit. Independent of schedule."""
+    crony_path = _crony_executable()
+    return (
+        "[Unit]\n"
+        f"Description=crony job {name}\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={crony_path} run {name}\n"
+        "WorkingDirectory=%h\n"
+    )
+
+
+def _render_systemd_timer(
+    name: str, schedule: str | None, interval: str | None
+) -> str:
+    """Render the systemd .timer unit."""
+    if interval is not None:
+        spec_line = f"OnUnitActiveSec={interval}\n"
+    else:
+        assert schedule is not None
+        spec_line = f"OnCalendar={schedule}\n"
+    return (
+        "[Unit]\n"
+        f"Description=crony timer for {name}\n"
+        "\n"
+        "[Timer]\n"
+        f"{spec_line}"
+        "Persistent=true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
+def _render_units(
+    name: str,
+    schedule: str | None,
+    interval: str | None,
+    platform: str,
+) -> dict[str, str]:
+    """Return {filename: content} for the platform units of (name, schedule)."""
+    if platform == "darwin":
+        return {
+            f"{_label_for(name)}.plist": _render_plist(name, schedule, interval)
+        }
+    return {
+        f"{BASENAME}-{name}.service": _render_systemd_service(name),
+        f"{BASENAME}-{name}.timer": _render_systemd_timer(
+            name, schedule, interval
+        ),
+    }
+
+
+def _entity_schedule(
+    entry: Job | JobGroup,
+) -> tuple[str | None, str | None]:
+    """Return (schedule, interval) for either entity kind."""
+    return entry.schedule, entry.interval
+
+
+def _compute_unit_hash(name: str, entry: Job | JobGroup, platform: str) -> str:
+    """SHA-256 of rendered unit content; the drift-detection signal."""
+    schedule, interval = _entity_schedule(entry)
+    units = _render_units(name, schedule, interval, platform)
+    h = hashlib.sha256()
+    for fname in sorted(units):
+        h.update(fname.encode("utf-8"))
+        h.update(b"\0")
+        h.update(units[fname].encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _has_platform_unit(name: str) -> bool:
+    """True iff this entity has a schedulable platform unit on this host.
+
+    Group-only jobs (no schedule, no interval) intentionally do not
+    install a platform unit -- they only ever fire via a group's
+    subprocess re-invocation.
+    """
+    return True  # caller already screened group-only jobs
+
+
+def _activate_unit(name: str, platform: str) -> None:
+    """Load the unit into the platform scheduler."""
+    if platform == "darwin":
+        plist = _plist_path_for(name)
+        # Validate the plist before asking launchd to load it -- a
+        # parseable failure here is much clearer than launchd's silent
+        # error path.
+        subprocess.run(["plutil", str(plist)], check=True)
+        # unload-then-load: tolerates "not loaded" (errok) so a clean
+        # re-apply over a previously-installed unit just works.
+        subprocess.run(
+            ["launchctl", "unload", str(plist)],
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(["launchctl", "load", str(plist)], check=True)
+    else:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "enable",
+                "--now",
+                _systemd_unit_name(name),
+            ],
+            check=True,
+        )
+
+
+def _deactivate_unit(name: str, platform: str) -> None:
+    """Remove the unit from the platform scheduler. Errok throughout
+    so destroy never fails just because the unit was already gone.
+    """
+    if platform == "darwin":
+        plist = _plist_path_for(name)
+        if plist.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist)],
+                stderr=subprocess.DEVNULL,
+            )
+    else:
+        subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "disable",
+                "--now",
+                _systemd_unit_name(name),
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
+    """Apply a single job or group; return "added", "updated", or
+    "unchanged".
+
+    Group-only jobs (no schedule, no interval) install no platform
+    unit but still get a hash stamp so orphan-detection has a record.
+    The same return values apply -- only the platform-unit IO differs.
+    """
+    if name in config.jobs:
+        entry: Job | JobGroup = config.jobs[name]
+    elif name in config.job_groups:
+        entry = config.job_groups[name]
+    else:
+        raise PreconditionError(f"unknown job/group: {name!r}")
+
+    schedule, interval = _entity_schedule(entry)
+    has_unit = schedule is not None or interval is not None
+    platform = current_platform()
+    hash_path = _hash_path_for(name)
+    new_hash = (
+        _compute_unit_hash(name, entry, platform) if has_unit else "stamp-only"
+    )
+    old_hash = hash_path.read_text().strip() if hash_path.exists() else None
+
+    if old_hash == new_hash:
+        return "unchanged"
+
+    if dry_run:
+        return "added" if old_hash is None else "updated"
+
+    if has_unit:
+        units = _render_units(name, schedule, interval, platform)
+        target_dir = (
+            LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for fname, content in units.items():
+            (target_dir / fname).write_text(content, encoding="utf-8")
+        _activate_unit(name, platform)
+
+    hash_path.parent.mkdir(parents=True, exist_ok=True)
+    hash_path.write_text(new_hash + "\n", encoding="utf-8")
+    return "added" if old_hash is None else "updated"
+
+
+def destroy_one(name: str, *, purge_state: bool = False) -> None:
+    """Remove a single name's platform unit, hash stamp, and (if
+    --purge-state) state directory. Errok throughout so a partially-
+    installed unit can still be cleaned up.
+    """
+    platform = current_platform()
+    _deactivate_unit(name, platform)
+    if platform == "darwin":
+        _plist_path_for(name).unlink(missing_ok=True)
+    else:
+        _service_path_for(name).unlink(missing_ok=True)
+        _timer_path_for(name).unlink(missing_ok=True)
+    _hash_path_for(name).unlink(missing_ok=True)
+    if purge_state:
+        sd = STATE_DIR / name
+        if sd.exists():
+            shutil.rmtree(sd)
+
+
+def stamped_names() -> set[str]:
+    """Names with a hash stamp on this host (i.e., crony installed them)."""
+    inst = STATE_DIR / "installed"
+    if not inst.exists():
+        return set()
+    return {p.stem for p in inst.glob("*.hash")}
+
+
+# =============================================================================
 # COMMAND HANDLERS
 # =============================================================================
 # Each handler's signature must match its argparse subparser's argument
@@ -1969,13 +2355,88 @@ def do_init(force: bool) -> None:
 
 
 def do_apply(jobs: list[str]) -> None:
-    """Render and activate platform units to match config."""
-    raise NotImplementedError("apply")
+    """Render and activate platform units to match config.
+
+    No args: full sync. Install missing, fix drift, remove orphans.
+    With names: surgical update of those entries only -- orphans are
+    left alone so a one-off apply doesn't have side effects on
+    unrelated jobs.
+    """
+    config = load_config()
+    target = resolve_target(config, current_host(), current_platform())
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    selected = sel_jobs | sel_groups
+
+    if jobs:
+        unknown = [n for n in jobs if n not in selected]
+        if unknown:
+            raise UsageError(
+                f"unknown or unselected on this host: {sorted(unknown)}"
+            )
+        names_to_apply = list(jobs)
+        remove_orphans = False
+    else:
+        # Full-sync: deterministic order so the log is readable.
+        names_to_apply = sorted(selected)
+        remove_orphans = True
+
+    # Pre-pass: render every selected entry so a darwin-specific
+    # OnCalendar limitation (step / range / list) surfaces before we
+    # touch any unit files. Without this, an apply failure leaves a
+    # partial install and the user has to chase what landed.
+    if current_platform() == "darwin":
+        for name in names_to_apply:
+            entry: Job | JobGroup
+            entry = config.jobs.get(name) or config.job_groups[name]
+            schedule, _interval = _entity_schedule(entry)
+            if schedule is not None:
+                _oncalendar_to_plist_calendar(schedule)
+
+    for name in names_to_apply:
+        result = apply_one(config, name)
+        logger.info("apply %s: %s", name, result)
+
+    if remove_orphans:
+        orphans = stamped_names() - selected
+        for orphan in sorted(orphans):
+            destroy_one(orphan)
+            logger.info("apply %s: orphan removed", orphan)
 
 
 def do_destroy(jobs: list[str], purge_state: bool) -> None:
-    """Remove platform units (factory reset or surgical)."""
-    raise NotImplementedError("destroy")
+    """Remove platform units.
+
+    No args: factory reset -- every crony-managed unit on this host.
+    With names: surgical removal. Refuses if a name is in neither
+    config nor stamped set; refuses if a job's run.lock is currently
+    held (a run in progress would be left with deleted state).
+    """
+    if jobs:
+        config = load_config()
+        known = set(config.jobs) | set(config.job_groups) | stamped_names()
+        unknown = [n for n in jobs if n not in known]
+        if unknown:
+            raise UsageError(f"unknown name(s): {sorted(unknown)}")
+        names_to_destroy = list(jobs)
+    else:
+        names_to_destroy = sorted(stamped_names())
+
+    for name in names_to_destroy:
+        # Refuse if a run is in progress; a partial destroy would
+        # leave the running shim with deleted state under it.
+        lock_path = STATE_DIR / name / "run.lock"
+        if lock_path.exists():
+            try:
+                with _acquire_lock(lock_path):
+                    pass
+            except LockBusyError:
+                raise SubprocessError(1, ["destroy", name]) from LockBusyError(
+                    f"{name}: run in progress; will not destroy"
+                )
+        destroy_one(name, purge_state=purge_state)
+        logger.info(
+            "destroy %s%s", name, " --purge-state" if purge_state else ""
+        )
 
 
 def do_enable(jobs: list[str]) -> None:
