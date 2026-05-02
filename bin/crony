@@ -10,20 +10,27 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
+import datetime
 import enum
+import fcntl
+import json
 import logging
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable, Iterator, NamedTuple
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -68,9 +75,25 @@ if hasattr(signal, "SIGPIPE"):
 
 BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
 LOGFILE: Path = Path(tempfile.gettempdir()) / f"{BASENAME}.log"
-CONFIG_DIR: Path = Path(os.path.expanduser(f"~/.config/{BASENAME}"))
-CONFIG_FILE: Path = CONFIG_DIR / "config.toml"
-STATE_DIR: Path = Path(os.path.expanduser(f"~/.local/state/{BASENAME}"))
+
+# Path overrides via env so the runner shim's subprocess re-invocation
+# (groups dispatching `crony run <child>`) and tests can redirect
+# config and state without filesystem games. Names follow the
+# convention CRONY_<KEY>.
+_ENV_PREFIX: str = BASENAME.upper()
+
+
+def _env_path(key: str, default: str) -> Path:
+    return Path(os.environ.get(f"{_ENV_PREFIX}_{key}") or default)
+
+
+CONFIG_DIR: Path = _env_path(
+    "CONFIG_DIR", os.path.expanduser(f"~/.config/{BASENAME}")
+)
+CONFIG_FILE: Path = _env_path("CONFIG_FILE", str(CONFIG_DIR / "config.toml"))
+STATE_DIR: Path = _env_path(
+    "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1171,6 +1194,507 @@ def resolved_timeout_sec(
 
 
 # =============================================================================
+# RUNNER
+# =============================================================================
+# `crony run <name>` dispatches to the per-job pipeline or the group
+# pipeline depending on whether <name> is a job or a job-group. The
+# per-job pipeline acquires a per-job flock, runs the optional gate,
+# execs the main command with a wallclock cap, writes a structured
+# last-run.json record, and dispatches a notification on non-ok exits
+# (only the log-only channel is wired; email and ntfy follow). The
+# group pipeline acquires a group-level lock and re-invokes
+# `crony run <child>` for each named child in order; per-job
+# notifications happen inside each child's own run.
+
+
+@dataclass
+class JobRunResult:
+    """Recorded as last-run.json for each completed job run."""
+
+    job: str
+    host: str
+    platform: str
+    started_at: str
+    ended_at: str
+    duration_sec: float
+    exit_class: str
+    exit_code: int | None
+    signal: int | None
+    gate_exit: int | None
+    log_path: str
+    log_bytes_this_run: int
+    notify_channel: str
+    notify_sent: bool
+    notify_error: str | None
+
+
+@dataclass
+class GroupChildResult:
+    """One child's outcome inside a group run."""
+
+    name: str
+    exit_class: str
+    exit_code: int
+
+
+@dataclass
+class GroupRunResult:
+    """Recorded as last-run.json for each completed group run."""
+
+    group: str
+    host: str
+    platform: str
+    started_at: str
+    ended_at: str
+    duration_sec: float
+    log_path: str
+    jobs_run: list[GroupChildResult]
+
+
+def _state_dir_for(name: str) -> Path:
+    """State directory for a named job or group, created on demand."""
+    d = STATE_DIR / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _now_iso() -> str:
+    """Current local time in ISO 8601 format with timezone offset."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+
+
+@contextlib.contextmanager
+def _acquire_lock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive non-blocking flock on lock_path.
+
+    Raises LockBusyError if another holder has the lock. The lock
+    file is left in place across runs; flock guards mutual exclusion.
+    """
+    fd = open(lock_path, "w")
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise LockBusyError(
+                f"another instance of {lock_path.parent.name} is running"
+            ) from e
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        fd.close()
+
+
+def _runtime_env(job: Job) -> dict[str, str]:
+    """Build the env dict passed to the wrapped command.
+
+    Carries forward the small set of shell-essential vars from the
+    invoking process and overlays the job's `env` dict so users can
+    inject custom settings without leaking the full parent env.
+    SSH_AUTH_SOCK is included so jobs that need to ssh out (e.g.
+    a remote backup or a git pull from a private repo) can talk to
+    the user's running ssh-agent without the user having to wire it
+    up per-job.
+    """
+    env: dict[str, str] = {}
+    for k in (
+        "HOME",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "USER",
+        "LOGNAME",
+        "SSH_AUTH_SOCK",
+    ):
+        v = os.environ.get(k)
+        if v is not None:
+            env[k] = v
+    env.update(job.env)
+    return env
+
+
+def _resolve_script(script: str) -> Path:
+    """Resolve a `script` field to an absolute path."""
+    p = Path(os.path.expanduser(script))
+    if not p.is_absolute():
+        p = (CONFIG_DIR / p).resolve()
+    return p
+
+
+def _command_argv(job: Job) -> list[str]:
+    """argv for the job's main command."""
+    if job.command is not None:
+        return ["/bin/sh", "-c", job.command]
+    assert job.script is not None
+    return [
+        str(_resolve_script(job.script)),
+        *(os.path.expanduser(a) for a in job.args),
+    ]
+
+
+def _gate_argv(job: Job) -> list[str] | None:
+    """argv for the job's gate, or None if no gate is configured."""
+    if job.gate is not None:
+        return ["/bin/sh", "-c", job.gate]
+    if job.gate_script is not None:
+        return [
+            str(_resolve_script(job.gate_script)),
+            *(os.path.expanduser(a) for a in job.gate_args),
+        ]
+    return None
+
+
+def _crony_executable() -> str:
+    """Absolute path to bin/crony for re-invocation by groups.
+
+    Uses `__file__` rather than `sys.argv[0]` so the subprocess
+    re-invocation reaches the right binary even when crony has
+    been imported as a module (e.g. by the test suite, where
+    sys.argv[0] is pytest, not crony).
+    """
+    return str(Path(__file__).resolve())
+
+
+class ExitOutcome(NamedTuple):
+    """Outcome of a wrapped subprocess invocation.
+
+    `signal` is set to the killing signal number when the process was
+    terminated by a signal, and None when it exited normally. `rc` is
+    0 in the signal case and the process's own exit code otherwise.
+    """
+
+    rc: int
+    signal: int | None
+
+
+def _exec_with_timeout(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    timeout_sec: int,
+    log_file: IO[bytes],
+) -> ExitOutcome:
+    """Exec argv, piping stdout+stderr into log_file.
+
+    On timeout, sends SIGTERM, then SIGKILL after a grace window, and
+    re-raises subprocess.TimeoutExpired.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    try:
+        rc = proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+    if rc < 0:
+        return ExitOutcome(rc=0, signal=-rc)
+    return ExitOutcome(rc=rc, signal=None)
+
+
+def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write last-run.json so partial writes can't corrupt it."""
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def _dispatch_notify(
+    result: JobRunResult, log_text: str, defaults: Defaults
+) -> None:
+    """Send a notification through the resolved channel.
+
+    The log-only channel is intentionally a no-op. Email and ntfy
+    channels are filled in by subsequent commits; until then they
+    record "not implemented" in the result so the user can see the
+    plumbing is wired but not yet active.
+    """
+    if result.notify_channel == "log-only":
+        return
+    result.notify_sent = False
+    result.notify_error = (
+        f"channel {result.notify_channel!r} not yet implemented"
+    )
+
+
+def run_job(
+    config: Config,
+    name: str,
+    *,
+    dry_run: bool = False,
+    skip_gate: bool = False,
+) -> int:
+    """Run a single job through the per-job pipeline.
+
+    Returns an exit code suitable for the platform scheduler: the
+    wrapped command's exit code on completion (0 on success or any
+    nonzero code from the command), ExitCode.LOCK_BUSY on lock
+    contention, ExitCode.TIMEOUT on wallclock cap, or 0 for a
+    gated/dry-run skip. Precondition failures (missing script,
+    unselected job, unknown name) are signalled by raising
+    PreconditionError -- cli() maps that to ExitCode.PRECONDITION.
+    """
+    if name not in config.jobs:
+        raise PreconditionError(f"unknown job: {name!r}")
+    job = config.jobs[name]
+
+    target = resolve_target(config, current_host(), current_platform())
+    selected, _ = selected_jobs_and_groups(config, target)
+    if name not in selected:
+        raise PreconditionError(f"job {name!r} is not selected on this host")
+
+    if job.script is not None:
+        sp = _resolve_script(job.script)
+        if not sp.exists():
+            raise PreconditionError(f"script not found: {sp}")
+        if not os.access(sp, os.X_OK):
+            raise PreconditionError(f"script not executable: {sp}")
+
+    sd = _state_dir_for(name)
+    lock_path = sd / "run.lock"
+    log_path = sd / "run.log"
+    last_run_path = sd / "last-run.json"
+
+    notify_channel = resolved_notify_channel(config, target, job)
+    timeout_sec = resolved_timeout_sec(config, target, job)
+    env = _runtime_env(job)
+    started = time.time()
+    started_iso = _now_iso()
+    host = current_host()
+    platform = current_platform()
+
+    try:
+        with _acquire_lock(lock_path):
+            if dry_run:
+                return 0
+
+            log_size_before = (
+                log_path.stat().st_size if log_path.exists() else 0
+            )
+            log_file = open(log_path, "ab", buffering=0)
+            try:
+                header = (
+                    f"\n=== {started_iso} {name} pid={os.getpid()} ===\n"
+                ).encode()
+                log_file.write(header)
+
+                gate_exit: int | None = None
+                gate_argv = _gate_argv(job)
+                if gate_argv is not None and not skip_gate:
+                    log_file.write(f"gate: {shlex.join(gate_argv)}\n".encode())
+                    try:
+                        gate_proc = subprocess.run(
+                            gate_argv,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                            env=env,
+                            timeout=30,
+                        )
+                        gate_exit = gate_proc.returncode
+                    except subprocess.TimeoutExpired:
+                        gate_exit = -1
+
+                    if gate_exit != 0:
+                        log_file.write(
+                            (
+                                f"gate exited {gate_exit}: skipping job\n"
+                            ).encode()
+                        )
+                        result = JobRunResult(
+                            job=name,
+                            host=host,
+                            platform=platform,
+                            started_at=started_iso,
+                            ended_at=_now_iso(),
+                            duration_sec=time.time() - started,
+                            exit_class="gated",
+                            exit_code=0,
+                            signal=None,
+                            gate_exit=gate_exit,
+                            log_path=str(log_path),
+                            log_bytes_this_run=(
+                                log_path.stat().st_size - log_size_before
+                            ),
+                            notify_channel=notify_channel,
+                            notify_sent=False,
+                            notify_error=None,
+                        )
+                        _write_last_run(
+                            last_run_path, dataclasses.asdict(result)
+                        )
+                        return 0
+
+                argv = _command_argv(job)
+                log_file.write(f"exec: {shlex.join(argv)}\n".encode())
+                try:
+                    rc, sig = _exec_with_timeout(
+                        argv,
+                        env=env,
+                        timeout_sec=timeout_sec,
+                        log_file=log_file,
+                    )
+                    if sig is not None:
+                        exit_class = "signal"
+                        exit_code: int | None = None
+                    elif rc == 0:
+                        exit_class = "ok"
+                        exit_code = 0
+                    else:
+                        exit_class = "fail"
+                        exit_code = rc
+                    surfaced_rc = rc if sig is None else 128 + sig
+                except subprocess.TimeoutExpired:
+                    exit_class = "timeout"
+                    exit_code = None
+                    sig = None
+                    surfaced_rc = int(ExitCode.TIMEOUT)
+
+                result = JobRunResult(
+                    job=name,
+                    host=host,
+                    platform=platform,
+                    started_at=started_iso,
+                    ended_at=_now_iso(),
+                    duration_sec=time.time() - started,
+                    exit_class=exit_class,
+                    exit_code=exit_code,
+                    signal=sig,
+                    gate_exit=gate_exit,
+                    log_path=str(log_path),
+                    log_bytes_this_run=(
+                        log_path.stat().st_size - log_size_before
+                    ),
+                    notify_channel=notify_channel,
+                    notify_sent=False,
+                    notify_error=None,
+                )
+
+                if exit_class != "ok":
+                    log_text = ""
+                    try:
+                        log_text = log_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[-200_000:]
+                    except OSError:
+                        pass
+                    _dispatch_notify(result, log_text, config.defaults)
+
+                _write_last_run(last_run_path, dataclasses.asdict(result))
+                return surfaced_rc
+            finally:
+                log_file.close()
+    except LockBusyError:
+        with open(log_path, "ab", buffering=0) as f:
+            f.write(
+                f"[{_now_iso()}] LOCK_BUSY: skipping (already running)\n".encode()
+            )
+        return int(ExitCode.LOCK_BUSY)
+
+
+def run_group(
+    config: Config,
+    name: str,
+    *,
+    dry_run: bool = False,
+    skip_gate: bool = False,
+) -> int:
+    """Run a job-group: dispatch each child via `crony run <child>`.
+
+    Children fire sequentially; one child failing does not stop the
+    next. The group writes its own aggregate last-run.json with a
+    per-child summary. The group itself never sends a notification;
+    each child's own runner handles notify.
+    """
+    if name not in config.job_groups:
+        raise PreconditionError(f"unknown group: {name!r}")
+    group = config.job_groups[name]
+
+    sd = _state_dir_for(name)
+    lock_path = sd / "run.lock"
+    log_path = sd / "run.log"
+    last_run_path = sd / "last-run.json"
+
+    started = time.time()
+    started_iso = _now_iso()
+    host = current_host()
+    platform = current_platform()
+
+    try:
+        with _acquire_lock(lock_path):
+            if dry_run:
+                return 0
+
+            log_file = open(log_path, "ab", buffering=0)
+            children: list[GroupChildResult] = []
+            try:
+                header = (
+                    f"\n=== {started_iso} group {name} "
+                    f"children={group.jobs} ===\n"
+                ).encode()
+                log_file.write(header)
+
+                for child in group.jobs:
+                    log_file.write(f"-> {child}\n".encode())
+                    cmd = [_crony_executable(), "run", child]
+                    if skip_gate:
+                        cmd.append("--skip-gate")
+                    proc = subprocess.run(
+                        cmd, stdout=log_file, stderr=subprocess.STDOUT
+                    )
+                    rc = proc.returncode
+                    if rc == 0:
+                        cls = "ok"
+                    elif rc == int(ExitCode.LOCK_BUSY):
+                        cls = "lock_busy"
+                    elif rc == int(ExitCode.TIMEOUT):
+                        cls = "timeout"
+                    elif rc == int(ExitCode.PRECONDITION):
+                        cls = "precondition"
+                    else:
+                        cls = "fail"
+                    children.append(
+                        GroupChildResult(
+                            name=child, exit_class=cls, exit_code=rc
+                        )
+                    )
+
+                result = GroupRunResult(
+                    group=name,
+                    host=host,
+                    platform=platform,
+                    started_at=started_iso,
+                    ended_at=_now_iso(),
+                    duration_sec=time.time() - started,
+                    log_path=str(log_path),
+                    jobs_run=children,
+                )
+                _write_last_run(last_run_path, dataclasses.asdict(result))
+                return 0
+            finally:
+                log_file.close()
+    except LockBusyError:
+        with open(log_path, "ab", buffering=0) as f:
+            f.write(
+                f"[{_now_iso()}] LOCK_BUSY: skipping (already running)\n".encode()
+            )
+        return int(ExitCode.LOCK_BUSY)
+
+
+# =============================================================================
 # COMMAND HANDLERS
 # =============================================================================
 # Each handler's signature must match its argparse subparser's argument
@@ -1226,8 +1750,24 @@ def do_logs(
 
 
 def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
-    """Runner shim. Platform schedulers invoke this."""
-    raise NotImplementedError("run")
+    """Runner shim. Platform schedulers invoke this.
+
+    Resolves whether `name` is a job or a job-group and dispatches
+    to the appropriate pipeline. The wrapped command's exit code is
+    surfaced to the caller via SystemExit so it propagates faithfully
+    to launchd/systemd; cli() converts that into the process exit.
+    """
+    config = load_config()
+    if name in config.jobs and name in config.job_groups:
+        # Validate already rejects collisions, but be defensive.
+        raise ConfigError(f"name {name!r} is both a job and a group")
+    if name in config.jobs:
+        rc = run_job(config, name, dry_run=dry_run, skip_gate=skip_gate)
+    elif name in config.job_groups:
+        rc = run_group(config, name, dry_run=dry_run, skip_gate=skip_gate)
+    else:
+        raise UsageError(f"unknown job or group: {name!r}")
+    raise SystemExit(rc)
 
 
 def do_audit(exclude_disabled: bool) -> None:
@@ -1496,6 +2036,14 @@ def cli() -> int:
 
     try:
         COMMAND_CALLBACKS[command](**args_dict)
+    except SystemExit as e:
+        # `crony run` raises SystemExit(<wrapped-rc>) so an
+        # arbitrary exit code from the executed job (0-255) reaches
+        # the platform scheduler unmodified rather than being
+        # squashed to ExitCode.SUCCESS.
+        if isinstance(e.code, int):
+            return e.code
+        return ExitCode.SUCCESS if e.code is None else ExitCode.ERROR
     except KeyError:
         raise UsageError(f"Unknown command '{command}'")
     except CronyError as e:

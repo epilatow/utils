@@ -806,6 +806,426 @@ class TestInit:
 
 
 # =============================================================================
+# Runner shim
+# =============================================================================
+
+
+class _RunnerHarness:
+    """Isolated state + config so runner tests don't touch the real
+    ~/.local/state/crony. Sets the in-process module attributes
+    (for direct calls into run_job/run_group) and the matching
+    CRONY_*_DIR / CRONY_CONFIG_FILE env vars (so subprocess
+    re-invocations from group dispatch see the same paths).
+    """
+
+    def __init__(self, tmp_path: Path, monkeypatch: Any) -> None:
+        state = tmp_path / "state"
+        state.mkdir()
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        monkeypatch.setenv("CRONY_STATE_DIR", str(state))
+        monkeypatch.setenv("CRONY_CONFIG_DIR", str(cfg_dir))
+        monkeypatch.setenv("CRONY_CONFIG_FILE", str(cfg_file))
+        monkeypatch.setattr(crony, "STATE_DIR", state)
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        self.state = state
+        self.cfg_file = cfg_file
+
+    def config(
+        self, raw: dict[str, Any], *, default_target_jobs: list[str]
+    ) -> Any:
+        """Build a Config with a darwin target selecting these jobs.
+
+        Persists the raw config to the on-disk file so subprocess
+        re-invocations of `crony run <child>` (group dispatch) load
+        the same config we hand to run_group.
+        """
+        full = dict(raw)
+        full.setdefault("target", {})
+        target_section = full["target"]
+        if isinstance(target_section, dict):
+            target_section.setdefault("darwin", {})
+            assert isinstance(target_section["darwin"], dict)
+            target_section["darwin"].setdefault("jobs", default_target_jobs)
+        self.cfg_file.write_text(_toml_dump(full), encoding="utf-8")
+        return crony.parse_config(full)
+
+
+def _toml_dump(data: dict[str, Any]) -> str:
+    """Minimal TOML emitter for the test harness's small configs.
+
+    Python's stdlib has tomllib for reading but no writer; rather
+    than pull in a third-party dep just for tests, this emits the
+    subset of TOML the harness actually produces.
+    """
+    out: list[str] = []
+
+    def _val(v: Any) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        if isinstance(v, str):
+            return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        if isinstance(v, list):
+            return "[" + ", ".join(_val(x) for x in v) + "]"
+        raise TypeError(f"unsupported value type: {type(v).__name__}")
+
+    def _emit(prefix: list[str], body: dict[str, Any]) -> None:
+        scalars = [(k, v) for k, v in body.items() if not isinstance(v, dict)]
+        tables = [(k, v) for k, v in body.items() if isinstance(v, dict)]
+        if prefix:
+            out.append(f"[{'.'.join(prefix)}]")
+        for k, v in scalars:
+            out.append(f"{k} = {_val(v)}")
+        if scalars and tables:
+            out.append("")
+        for k, v in tables:
+            _emit(prefix + [k], v)
+            out.append("")
+
+    _emit([], data)
+    return "\n".join(out) + "\n"
+
+
+def _last_run(state: Path, name: str) -> dict[str, Any]:
+    text = (state / name / "last-run.json").read_text()
+    return _cast_dict(text)
+
+
+def _cast_dict(text: str) -> dict[str, Any]:
+    """Read JSON into a typed dict for test assertions."""
+    import json as _json
+
+    out = _json.loads(text)
+    assert isinstance(out, dict)
+    return out
+
+
+class TestRuntimeEnv:
+    """`_runtime_env` carries forward shell-essential vars from the
+    invoking process (where launchd / systemd populate them) so a
+    wrapped command can reach things like the user's ssh-agent."""
+
+    def _job(self) -> Any:
+        return crony.Job(name="j", command="true")
+
+    def test_ssh_auth_sock_forwarded_when_present(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+        env = crony._runtime_env(self._job())
+        assert env.get("SSH_AUTH_SOCK") == "/tmp/agent.sock"
+
+    def test_ssh_auth_sock_absent_when_unset(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+        env = crony._runtime_env(self._job())
+        assert "SSH_AUTH_SOCK" not in env
+
+
+class TestRunJobBasics:
+    def test_simple_command_succeeds(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"ok": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["ok"],
+        )
+        rc = crony.run_job(cfg, "ok")
+        assert rc == 0
+        rec = _last_run(h.state, "ok")
+        assert rec["exit_class"] == "ok"
+        assert rec["exit_code"] == 0
+        assert rec["gate_exit"] is None
+
+    def test_command_failure_propagates_rc(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "fail": {
+                        "command": "exit 17",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["fail"],
+        )
+        rc = crony.run_job(cfg, "fail")
+        assert rc == 17
+        rec = _last_run(h.state, "fail")
+        assert rec["exit_class"] == "fail"
+        assert rec["exit_code"] == 17
+
+    def test_unknown_job_raises_precondition(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.PreconditionError, match="unknown"):
+            crony.run_job(cfg, "ghost")
+
+    def test_unselected_job_raises_precondition(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        # Job exists but the target's `jobs` list is empty.
+        cfg = h.config(
+            {"job": {"ok": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=[],
+        )
+        with pytest.raises(crony.PreconditionError, match="not selected"):
+            crony.run_job(cfg, "ok")
+
+    def test_dry_run_does_not_exec(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "ok": {
+                        "command": "exit 5",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["ok"],
+        )
+        rc = crony.run_job(cfg, "ok", dry_run=True)
+        assert rc == 0
+        # No last-run.json written on dry-run
+        assert not (h.state / "ok" / "last-run.json").exists()
+
+
+class TestRunJobGate:
+    def test_gate_pass_runs_command(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": "true",
+                        "gate": "true",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_job(cfg, "g")
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        assert rec["exit_class"] == "ok"
+        assert rec["gate_exit"] == 0
+
+    def test_gate_fail_marks_gated_no_notify(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": "exit 99",  # would fail if reached
+                        "gate": "false",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_job(cfg, "g")
+        assert rc == 0  # gated exits 0
+        rec = _last_run(h.state, "g")
+        assert rec["exit_class"] == "gated"
+        assert rec["gate_exit"] == 1
+        # Main command never ran -> exit_code recorded as 0 placeholder
+        assert rec["exit_code"] == 0
+        log = (h.state / "g" / "run.log").read_text()
+        assert "skipping job" in log
+
+    def test_skip_gate_runs_command_anyway(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": "true",
+                        "gate": "false",  # would normally skip
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_job(cfg, "g", skip_gate=True)
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        assert rec["exit_class"] == "ok"
+        assert rec["gate_exit"] is None
+
+
+class TestRunJobLockContention:
+    def test_lock_busy_returns_lock_busy_no_notify(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        # Pre-acquire the lock from another file descriptor.
+        sd = h.state / "j"
+        sd.mkdir()
+        lock = sd / "run.lock"
+        import fcntl as _fcntl
+
+        held = open(lock, "w")
+        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            rc = crony.run_job(cfg, "j")
+        finally:
+            _fcntl.flock(held, _fcntl.LOCK_UN)
+            held.close()
+        assert rc == int(crony.ExitCode.LOCK_BUSY)
+        # No last-run.json on contention; the previous holder owns
+        # that record.
+        assert not (sd / "last-run.json").exists()
+
+
+class TestRunJobNotify:
+    def test_log_only_is_noop(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "fail": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["fail"],
+        )
+        crony.run_job(cfg, "fail")
+        rec = _last_run(h.state, "fail")
+        assert rec["notify_channel"] == "log-only"
+        assert rec["notify_sent"] is False
+        assert rec["notify_error"] is None
+
+    def test_unimplemented_channel_records_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "defaults": {"notify_channel": "ntfy"},
+                "job": {
+                    "fail": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                    }
+                },
+            },
+            default_target_jobs=["fail"],
+        )
+        crony.run_job(cfg, "fail")
+        rec = _last_run(h.state, "fail")
+        assert rec["notify_channel"] == "ntfy"
+        assert rec["notify_sent"] is False
+        assert "not yet implemented" in (rec["notify_error"] or "")
+
+
+class TestRunGroup:
+    def test_group_runs_each_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "daily",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_group(cfg, "g")
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        names = [c["name"] for c in rec["jobs_run"]]
+        assert names == ["a", "b"]
+        # Each child ran via subprocess invocation of `crony run`,
+        # so they each wrote their own last-run.json.
+        for child in ("a", "b"):
+            assert (h.state / child / "last-run.json").exists()
+
+    def test_group_continues_on_child_failure(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "good": {"command": "true"},
+                    "bad": {"command": "exit 3"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["bad", "good"],
+                        "schedule": "daily",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_group(cfg, "g")
+        # Group orchestration succeeds even if a child failed.
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        assert rec["jobs_run"][0]["name"] == "bad"
+        assert rec["jobs_run"][0]["exit_class"] == "fail"
+        assert rec["jobs_run"][0]["exit_code"] == 3
+        assert rec["jobs_run"][1]["name"] == "good"
+        assert rec["jobs_run"][1]["exit_class"] == "ok"
+
+    def test_group_dry_run_skips_children(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "exit 1"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        rc = crony.run_group(cfg, "g", dry_run=True)
+        assert rc == 0
+        # No last-run.json for either group or child on dry-run
+        assert not (h.state / "g" / "last-run.json").exists()
+        assert not (h.state / "a" / "last-run.json").exists()
+
+
+# =============================================================================
 # Platform/host detection
 # =============================================================================
 
