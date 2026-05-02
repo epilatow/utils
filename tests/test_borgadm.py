@@ -1400,6 +1400,40 @@ class TestAutomate:
         assert "check prune" not in shell_cmd
         assert "check-all" not in shell_cmd
 
+
+class TestLogFiles:
+    """Test top-level log-files subcommand."""
+
+    CURRENT_TASKS = {"create", "check-daily", "check-weekly"}
+
+    @staticmethod
+    def _launchctl_output(loaded_tasks: set[str]) -> str:
+        """Build a fake `launchctl list` stdout marking given tasks loaded."""
+        lines = ["PID\tStatus\tLabel"]
+        for task in loaded_tasks:
+            lines.append(f"123\t0\tlocal.borgadm.{task}")
+        return "\n".join(lines) + "\n"
+
+    @pytest.fixture
+    def darwin_env(self, tmp_path: Path) -> Iterator[tuple[Path, Any]]:
+        """Set up a Darwin environment with all current tasks loaded."""
+        task_dir = tmp_path / "Library" / "LaunchAgents"
+        task_dir.mkdir(parents=True)
+
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=self._launchctl_output(self.CURRENT_TASKS),
+                stderr="",
+            )
+            yield task_dir, mock_run
+
     @staticmethod
     def _write_plist(
         path: Path, log_path: str, stderr_path: str | None = None
@@ -1418,120 +1452,202 @@ class TestAutomate:
         tree = ElementTree.ElementTree(plist)
         tree.write(path, xml_declaration=True, encoding="UTF-8")
 
-    def test_log_files_shows_default_logfile(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that log-files always includes the default log file."""
-        _task_dir, _mock_run, _ = automate_env
+    def test_shows_default_logfile(self, darwin_env: Any, caplog: Any) -> None:
+        """log-files always includes the default log file."""
+        _task_dir, _mock_run = darwin_env
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         messages = [r.message for r in caplog.records]
         assert str(ba.LOGFILE) in messages
 
-    def test_log_files_default_logfile_listed_first(
-        self, automate_env: Any, caplog: Any
+    def test_default_logfile_listed_first(
+        self, darwin_env: Any, caplog: Any
     ) -> None:
-        """Test that the default log file is listed first."""
-        task_dir, _mock_run, _ = automate_env
+        """The default log file is listed first."""
+        task_dir, _mock_run = darwin_env
         plist_path = task_dir / "local.borgadm.create.plist"
         self._write_plist(plist_path, "/tmp/logs/create.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         messages = [r.message for r in caplog.records]
         assert messages[0] == str(ba.LOGFILE)
 
-    def test_log_files_default_logfile_not_duplicated(
-        self, automate_env: Any, caplog: Any
+    def test_default_logfile_not_duplicated(
+        self, darwin_env: Any, caplog: Any
     ) -> None:
-        """Test default log file isn't duplicated if a plist uses it."""
-        task_dir, _mock_run, _ = automate_env
+        """Default log file isn't duplicated if a plist uses it."""
+        task_dir, _mock_run = darwin_env
         plist_path = task_dir / "local.borgadm.create.plist"
         self._write_plist(plist_path, str(ba.LOGFILE))
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         matches = [r for r in caplog.records if r.message == str(ba.LOGFILE)]
         assert len(matches) == 1
 
-    def test_log_files_shows_paths_from_plists(
-        self, automate_env: Any, caplog: Any
+    def test_shows_paths_from_enabled_plists(
+        self, darwin_env: Any, caplog: Any
     ) -> None:
-        """Test that log-files shows paths from existing plists."""
-        task_dir, _mock_run, _ = automate_env
+        """log-files shows paths from plists for enabled tasks."""
+        task_dir, _mock_run = darwin_env
         for name in self.CURRENT_TASKS:
             plist_path = task_dir / f"local.borgadm.{name}.plist"
             log = f"/tmp/logs/{name}.log"
             self._write_plist(plist_path, log)
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         for name in self.CURRENT_TASKS:
             assert any(
                 f"/tmp/logs/{name}.log" in r.message for r in caplog.records
             )
 
-    def test_log_files_deduplicates_stdout_stderr(
-        self, automate_env: Any, caplog: Any
+    def test_skips_unloaded_tasks(self, darwin_env: Any, caplog: Any) -> None:
+        """Plists for tasks not loaded in launchctl are skipped."""
+        task_dir, mock_run = darwin_env
+        # Only "create" is loaded; "check-daily" has a plist but isn't.
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=self._launchctl_output({"create"}),
+            stderr="",
+        )
+        self._write_plist(
+            task_dir / "local.borgadm.create.plist", "/tmp/logs/create.log"
+        )
+        self._write_plist(
+            task_dir / "local.borgadm.check-daily.plist",
+            "/tmp/logs/check-daily.log",
+        )
+
+        with caplog.at_level(logging.INFO):
+            ba.do_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert any("/tmp/logs/create.log" in m for m in messages)
+        assert not any("/tmp/logs/check-daily.log" in m for m in messages)
+
+    def test_no_paths_when_nothing_enabled(
+        self, darwin_env: Any, caplog: Any
     ) -> None:
-        """Test that identical stdout/stderr paths appear only once."""
-        task_dir, _mock_run, _ = automate_env
+        """Only default log file is shown when no tasks are loaded."""
+        task_dir, mock_run = darwin_env
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=self._launchctl_output(set()),
+            stderr="",
+        )
+        # Plist exists, but task isn't loaded -- should be ignored.
+        self._write_plist(
+            task_dir / "local.borgadm.create.plist", "/tmp/logs/create.log"
+        )
+
+        with caplog.at_level(logging.INFO):
+            ba.do_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert messages == [str(ba.LOGFILE)]
+
+    def test_deduplicates_stdout_stderr(
+        self, darwin_env: Any, caplog: Any
+    ) -> None:
+        """Identical stdout/stderr paths appear only once."""
+        task_dir, _mock_run = darwin_env
         plist_path = task_dir / "local.borgadm.create.plist"
         self._write_plist(plist_path, "/tmp/logs/create.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         matches = [
             r for r in caplog.records if "/tmp/logs/create.log" in r.message
         ]
         assert len(matches) == 1
 
-    def test_log_files_shows_distinct_stderr(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that distinct stderr path is also shown."""
-        task_dir, _mock_run, _ = automate_env
+    def test_shows_distinct_stderr(self, darwin_env: Any, caplog: Any) -> None:
+        """Distinct stderr path is also shown."""
+        task_dir, _mock_run = darwin_env
         plist_path = task_dir / "local.borgadm.create.plist"
         self._write_plist(plist_path, "/tmp/logs/out.log", "/tmp/logs/err.log")
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         messages = [r.message for r in caplog.records]
         assert any("/tmp/logs/out.log" in m for m in messages)
         assert any("/tmp/logs/err.log" in m for m in messages)
 
-    def test_log_files_no_plists(self, automate_env: Any, caplog: Any) -> None:
-        """Test that default log file is shown even with no plists."""
-        _task_dir, _mock_run, _ = automate_env
+    def test_no_plists(self, darwin_env: Any, caplog: Any) -> None:
+        """Default log file is shown even with no plists."""
+        _task_dir, _mock_run = darwin_env
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         messages = [r.message for r in caplog.records]
-        assert str(ba.LOGFILE) in messages
-        assert len(messages) == 1
+        assert messages == [str(ba.LOGFILE)]
 
-    def test_log_files_reads_legacy_plists(
-        self, automate_env: Any, caplog: Any
+    def test_reads_legacy_plists_when_loaded(
+        self, darwin_env: Any, caplog: Any
     ) -> None:
-        """Test that log-files reads legacy plist files too."""
-        task_dir, _mock_run, _ = automate_env
-        plist_path = task_dir / "local.borgadm.check_age.plist"
-        self._write_plist(plist_path, "/tmp/logs/check_age.log")
+        """Legacy plists are read when their task is still loaded."""
+        task_dir, mock_run = darwin_env
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=self._launchctl_output({"check_age"}),
+            stderr="",
+        )
+        self._write_plist(
+            task_dir / "local.borgadm.check_age.plist",
+            "/tmp/logs/check_age.log",
+        )
 
         with caplog.at_level(logging.INFO):
-            ba.do_automate_log_files()
+            ba.do_log_files()
 
         assert any(
             "/tmp/logs/check_age.log" in r.message for r in caplog.records
         )
+
+    def test_non_darwin_shows_only_default(
+        self, tmp_path: Path, caplog: Any
+    ) -> None:
+        """On non-Darwin platforms, only the default log file is shown."""
+        with (
+            patch.object(ba.platform, "system", return_value="Linux"),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert messages == [str(ba.LOGFILE)]
+        # launchctl must not be invoked off Darwin.
+        mock_run.assert_not_called()
+
+    def test_no_launchctl_shows_only_default(
+        self, tmp_path: Path, caplog: Any
+    ) -> None:
+        """If launchctl isn't on PATH, only the default log file is shown."""
+        with (
+            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.shutil, "which", return_value=None),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_log_files()
+
+        messages = [r.message for r in caplog.records]
+        assert messages == [str(ba.LOGFILE)]
+        mock_run.assert_not_called()
 
 
 class TestCheck:
