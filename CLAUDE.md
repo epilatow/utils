@@ -1,2 +1,1 @@
 append @DEVELOPMENT.md
-append @DEVELOPMENT_AGENT.md
