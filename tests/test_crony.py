@@ -60,6 +60,24 @@ class TestCodeQuality(CodeQualityBase):
     TEST_PATH = REPO_ROOT / "tests" / "test_crony.py"
 
 
+class TestHelpOutput:
+    """`crony --help` surfaces the design block appended to the epilog."""
+
+    def test_help_includes_design_block(self) -> None:
+        parser = crony.build_parser()
+        text = parser.format_help()
+        # Design block: 3-tuple status legend.
+        assert "CONFIG  synced" in text
+        assert "SCHED   enabled" in text
+        assert "LAST    ok" in text
+        # Exit codes still rendered.
+        assert "exit codes:" in text
+        # Design block is appended *after* the exit codes -- the
+        # short tagline lives in description, design lives in
+        # epilog after the exit-code list.
+        assert text.index("exit codes:") < text.index("CONFIG  synced")
+
+
 class TestCmdCallbacks(CmdCallbacksBase):
     """Test command callback dispatch table."""
 

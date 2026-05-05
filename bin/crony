@@ -53,27 +53,29 @@ if hasattr(signal, "SIGPIPE"):
 # =============================================================================
 # CRONY DESIGN
 # =============================================================================
-#
-# crony is a user-level scheduled-job manager for macOS (launchd
-# LaunchAgents) and Linux (systemd user timers). It reads a single
-# TOML config and applies the corresponding platform units, runs jobs
-# through a uniform shim (so logs, locks, gates, and notifications
-# behave the same on both platforms), and reports state via a 3-tuple
-# status:
-#   CONFIG  synced  | stale    | missing | orphan
-#   SCHED   enabled | disabled | grouped | unknown
-#   LAST    ok      | fail     | timeout | gated   | running | never
-#
-# Subcommands fall into two categories:
-#   - config-derived state (apply / destroy):  manage unit-file presence
-#   - runtime state (enable / disable):        manage scheduler arming
-# Plus operational subcommands: status, logs, run, audit, validate,
-# notify-test, list, init, self-test.
-#
-# Config lives at ~/.config/crony/config.toml. State (logs, locks,
-# last-run records, install hashes) lives at ~/.local/state/crony/.
-#
-# =============================================================================
+# Single source of truth: the same prose that documents the design at
+# the top of this file is also rendered into `crony --help`.
+
+_CRONY_DESIGN: str = """\
+crony is a user-level scheduled-job manager for macOS (launchd
+LaunchAgents) and Linux (systemd user timers). It reads a single
+TOML config and applies the corresponding platform units, runs jobs
+through a uniform shim (so logs, locks, gates, and notifications
+behave the same on both platforms), and reports state via a 3-tuple
+status:
+  CONFIG  synced  | stale    | missing | orphan
+  SCHED   enabled | disabled | grouped | unknown
+  LAST    ok      | fail     | timeout | gated   | running | never
+
+Subcommands fall into two categories:
+  - config-derived state (apply / destroy):  manage unit-file presence
+  - runtime state (enable / disable):        manage scheduler arming
+Plus operational subcommands: status, logs, run, audit, validate,
+notify-test, list, init, self-test.
+
+Config lives at ~/.config/crony/config.toml. State (logs, locks,
+last-run records, install hashes) lives at ~/.local/state/crony/.\
+"""
 
 
 # =============================================================================
@@ -3382,7 +3384,7 @@ def build_parser() -> argparse.ArgumentParser:
             "User-level scheduled-job manager for macOS "
             "(launchd LaunchAgents) and Linux (systemd user timers)."
         ),
-        epilog=ExitCode.epilog(),
+        epilog=f"{ExitCode.epilog()}\n\n{_CRONY_DESIGN}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommands")
