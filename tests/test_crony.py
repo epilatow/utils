@@ -948,7 +948,7 @@ class TestRunJobBasics:
         rec = _last_run(h.state, "ok")
         assert rec["exit_class"] == "ok"
         assert rec["exit_code"] == 0
-        assert rec["gate_exit"] is None
+        assert rec["gate"] == "none"
 
     def test_command_failure_propagates_rc(
         self, tmp_path: Path, monkeypatch: Any
@@ -1033,7 +1033,7 @@ class TestRunJobGate:
         assert rc == 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "ok"
-        assert rec["gate_exit"] == 0
+        assert rec["gate"] == "passed"
 
     def test_gate_fail_marks_gated_no_notify(
         self, tmp_path: Path, monkeypatch: Any
@@ -1055,7 +1055,7 @@ class TestRunJobGate:
         assert rc == 0  # gated exits 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "gated"
-        assert rec["gate_exit"] == 1
+        assert rec["gate"] == "failed"
         # Main command never ran -> exit_code recorded as 0 placeholder
         assert rec["exit_code"] == 0
         log = (h.state / "g" / "run.log").read_text()
@@ -1081,7 +1081,7 @@ class TestRunJobGate:
         assert rc == 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "ok"
-        assert rec["gate_exit"] is None
+        assert rec["gate"] == "none"
 
 
 class TestRunJobLockContention:
@@ -1386,7 +1386,7 @@ class TestEmailNotify:
             exit_class="fail",
             exit_code=2,
             signal=None,
-            gate_exit=None,
+            gate="none",
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notify_channel="email",
@@ -1498,7 +1498,7 @@ class TestNtfyNotify:
             exit_class="fail",
             exit_code=2,
             signal=None,
-            gate_exit=None,
+            gate="none",
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notify_channel="ntfy",

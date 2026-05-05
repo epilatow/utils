@@ -1258,7 +1258,11 @@ class JobRunResult:
     exit_class: str
     exit_code: int | None
     signal: int | None
-    gate_exit: int | None
+    # "none" if no gate ran (no config, or --skip-gate), "passed" on
+    # exit 0, "failed" on any non-zero or timeout. The numeric exit
+    # code stays in run.log for diagnosis; this field is the binary
+    # answer "did the gate let the job run?".
+    gate: str
     log_path: str
     log_bytes_this_run: int
     notify_channel: str
@@ -1537,7 +1541,7 @@ def _format_summary(result: JobRunResult) -> str:
         f"Exit class: {result.exit_class}\n"
         f"Exit code:  {result.exit_code}\n"
         f"Signal:     {result.signal}\n"
-        f"Gate exit:  {result.gate_exit}\n"
+        f"Gate:       {result.gate}\n"
         f"Log path:   {result.log_path}\n"
     )
 
@@ -1762,10 +1766,11 @@ def run_job(
                 ).encode()
                 log_file.write(header)
 
-                gate_exit: int | None = None
+                gate: str = "none"
                 gate_argv = _gate_argv(job)
                 if gate_argv is not None and not skip_gate:
                     log_file.write(f"gate: {shlex.join(gate_argv)}\n".encode())
+                    gate_rc: int
                     try:
                         gate_proc = subprocess.run(
                             gate_argv,
@@ -1774,15 +1779,14 @@ def run_job(
                             env=env,
                             timeout=30,
                         )
-                        gate_exit = gate_proc.returncode
+                        gate_rc = gate_proc.returncode
                     except subprocess.TimeoutExpired:
-                        gate_exit = -1
+                        gate_rc = -1
+                    gate = "passed" if gate_rc == 0 else "failed"
 
-                    if gate_exit != 0:
+                    if gate == "failed":
                         log_file.write(
-                            (
-                                f"gate exited {gate_exit}: skipping job\n"
-                            ).encode()
+                            (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
                         result = JobRunResult(
                             job=name,
@@ -1794,7 +1798,7 @@ def run_job(
                             exit_class="gated",
                             exit_code=0,
                             signal=None,
-                            gate_exit=gate_exit,
+                            gate=gate,
                             log_path=str(log_path),
                             log_bytes_this_run=(
                                 log_path.stat().st_size - log_size_before
@@ -1843,7 +1847,7 @@ def run_job(
                     exit_class=exit_class,
                     exit_code=exit_code,
                     signal=sig,
-                    gate_exit=gate_exit,
+                    gate=gate,
                     log_path=str(log_path),
                     log_bytes_this_run=(
                         log_path.stat().st_size - log_size_before
@@ -3197,7 +3201,7 @@ def do_notify_test(channel: str | None) -> None:
         exit_class="fail",
         exit_code=1,
         signal=None,
-        gate_exit=None,
+        gate="none",
         log_path="(synthetic)",
         log_bytes_this_run=0,
         notify_channel=use_channel,
