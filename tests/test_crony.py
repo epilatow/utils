@@ -999,13 +999,20 @@ def _cast_dict(text: str) -> dict[str, Any]:
     return out
 
 
-class TestRuntimeEnv:
+class TestRuntimeEnvExpansion:
     """`_runtime_env` carries forward shell-essential vars from the
-    invoking process (where launchd / systemd populate them) so a
-    wrapped command can reach things like the user's ssh-agent."""
+    invoking process (so wrapped commands reach the user's ssh-agent
+    via SSH_AUTH_SOCK) and expands `$VAR` / `${VAR}` in job.env
+    values.
+    """
 
-    def _job(self) -> Any:
-        return crony.Job(name="j", command="true")
+    def _job(self, env_dict: dict[str, str] | None = None) -> Any:
+        return crony.Job(name="j", command="true", env=env_dict or {})
+
+    def test_inherits_path_when_no_env_override(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        env = crony._runtime_env(self._job({}))
+        assert env["PATH"] == "/usr/bin:/bin"
 
     def test_ssh_auth_sock_forwarded_when_present(
         self, monkeypatch: Any
@@ -1018,6 +1025,73 @@ class TestRuntimeEnv:
         monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
         env = crony._runtime_env(self._job())
         assert "SSH_AUTH_SOCK" not in env
+
+    def test_dollar_var_resolves_against_inherited(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        env = crony._runtime_env(self._job({"PATH": "/extra:$PATH"}))
+        assert env["PATH"] == "/extra:/usr/bin:/bin"
+
+    def test_brace_form_resolves(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/Users/edp")
+        env = crony._runtime_env(self._job({"TMPDIR": "${HOME}/.local/tmp"}))
+        assert env["TMPDIR"] == "/Users/edp/.local/tmp"
+
+    def test_unknown_var_stays_literal(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("CRONY_NOPE", raising=False)
+        env = crony._runtime_env(self._job({"FOO": "$CRONY_NOPE"}))
+        assert env["FOO"] == "$CRONY_NOPE"
+
+    def test_double_dollar_escapes_to_literal(self, monkeypatch: Any) -> None:
+        env = crony._runtime_env(self._job({"MSG": "cost: $$5"}))
+        assert env["MSG"] == "cost: $5"
+
+    def test_iteration_order_lets_later_keys_see_earlier(
+        self, monkeypatch: Any
+    ) -> None:
+        # Python dicts preserve insertion order; toml parsers do too.
+        # An earlier job.env key should be visible to a later one.
+        monkeypatch.setenv("PATH", "/usr/bin")
+        env = crony._runtime_env(
+            self._job(
+                {
+                    "PATH": "/extra:$PATH",
+                    "LD_LIBRARY_PATH": "$PATH/../lib",
+                }
+            )
+        )
+        assert env["PATH"] == "/extra:/usr/bin"
+        assert env["LD_LIBRARY_PATH"] == "/extra:/usr/bin/../lib"
+
+    def test_inherited_keys_not_overridden_by_unset_job_env(
+        self, monkeypatch: Any
+    ) -> None:
+        # Job env is overlay; absent keys inherit unchanged.
+        monkeypatch.setenv("HOME", "/Users/edp")
+        monkeypatch.setenv("LANG", "en_US.UTF-8")
+        env = crony._runtime_env(self._job({"FOO": "bar"}))
+        assert env["HOME"] == "/Users/edp"
+        assert env["LANG"] == "en_US.UTF-8"
+        assert env["FOO"] == "bar"
+
+    def test_malformed_references_stay_literal(self, monkeypatch: Any) -> None:
+        # safe_substitute leaves bad-shape references untouched
+        # rather than raising. $1 isn't a valid identifier; a
+        # trailing bare $ has nothing to consume; ${UNCLOSED has
+        # no closing brace.
+        env = crony._runtime_env(
+            self._job(
+                {
+                    "DIGIT": "$1 is not an identifier",
+                    "TRAILING": "ends with $",
+                    "BRACE_NO_CLOSE": "starts ${UNCLOSED",
+                }
+            )
+        )
+        assert env["DIGIT"] == "$1 is not an identifier"
+        assert env["TRAILING"] == "ends with $"
+        assert env["BRACE_NO_CLOSE"] == "starts ${UNCLOSED"
 
 
 class TestRunJobBasics:

@@ -25,6 +25,7 @@ import shutil
 import signal
 import smtplib
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -212,7 +213,10 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # # Optional per-job overrides of [defaults]:
 # # notify_channels = ["email"]
 # # timeout_sec     = 7200
-# # env             = { "RUST_BACKTRACE" = "1" }
+# # env supports $VAR / ${VAR} expansion against the running env, so
+# # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
+# # Unresolved vars stay literal; `$$` is a literal `$`.
+# # env             = { "PATH" = "$HOME/.local/bin:$PATH", "RUST_BACKTRACE" = "1" }
 
 # [job.git-pull-utils]
 # script   = "scripts/git-pull.sh"     # path under the dotfiles repo
@@ -1369,6 +1373,18 @@ def _acquire_lock(lock_path: Path) -> Iterator[None]:
         fd.close()
 
 
+def _expand_env_value(raw: str, env: dict[str, str]) -> str:
+    """Expand `$VAR` / `${VAR}` references in `raw` against `env`.
+
+    Uses `string.Template.safe_substitute` so unresolved references
+    stay literal (shell-like behavior: `$NOTHING` becomes the string
+    `"$NOTHING"`, not an error). `$$` escapes to a literal `$`. The
+    expansion is single-pass: a value that contains another expanded
+    value's reference resolves once, not recursively.
+    """
+    return string.Template(raw).safe_substitute(env)
+
+
 def _runtime_env(job: Job) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
@@ -1378,7 +1394,10 @@ def _runtime_env(job: Job) -> dict[str, str]:
     SSH_AUTH_SOCK is included so jobs that need to ssh out (e.g.
     a remote backup or a git pull from a private repo) can talk to
     the user's running ssh-agent without the user having to wire it
-    up per-job.
+    up per-job. Each `env` value is expanded against the running
+    merged env, so a job can write `PATH = "/extra:$PATH"` and have
+    $PATH resolve to the inherited PATH (or to a value an earlier
+    job-env key set).
     """
     env: dict[str, str] = {}
     for k in (
@@ -1394,7 +1413,8 @@ def _runtime_env(job: Job) -> dict[str, str]:
         v = os.environ.get(k)
         if v is not None:
             env[k] = v
-    env.update(job.env)
+    for k, raw in job.env.items():
+        env[k] = _expand_env_value(raw, env)
     return env
 
 
