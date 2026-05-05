@@ -164,13 +164,13 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # settings can override anything here.
 
 # [defaults]
-# notify_channel       = "log-only"   # "log-only" | "email" | "ntfy"
+# notify_channels      = []           # subset of ["email", "ntfy"]
 # notify_attach_log    = true
 # notify_attach_max_kb = 256
 # timeout_sec          = 1800         # 30 min default per-job wallclock cap
 # log_keep_runs        = 30
 
-# Embedded SMTP channel (used when notify_channel = "email").
+# Embedded SMTP channel (used when "email" is in notify_channels).
 # [defaults.notify.email]
 # to                 = "you@example.com"
 # from               = "crony@example.com"
@@ -186,7 +186,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # smtp_pass_keychain_account = "you@gmail.com"   # optional
 # smtp_pass_file             = "~/.config/crony/secrets/smtp-password"
 
-# ntfy channel (used when notify_channel = "ntfy").
+# ntfy channel (used when "ntfy" is in notify_channels).
 # [defaults.notify.ntfy]
 # url                    = "https://ntfy.example.com/automation"
 # token_keychain_service = "ntfy-automation"
@@ -208,9 +208,9 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
-# # notify_channel = "email"
-# # timeout_sec    = 7200
-# # env            = { "RUST_BACKTRACE" = "1" }
+# # notify_channels = ["email"]
+# # timeout_sec     = 7200
+# # env             = { "RUST_BACKTRACE" = "1" }
 
 # [job.git-pull-utils]
 # script   = "scripts/git-pull.sh"     # path under the dotfiles repo
@@ -242,16 +242,16 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # `jobs` list IS the selection (no inherits / exclude / add).
 
 # [target.darwin]
-# jobs           = ["brew-update", "git-pull-utils", "daily-updates"]
-# notify_channel = "email"
+# jobs            = ["brew-update", "git-pull-utils", "daily-updates"]
+# notify_channels = ["email"]
 
 # [target.linux]
-# jobs           = ["git-pull-utils"]
-# notify_channel = "ntfy"
+# jobs            = ["git-pull-utils"]
+# notify_channels = ["ntfy"]
 
 # [target.host.work-laptop]
-# jobs           = ["brew-update", "git-pull-utils"]
-# notify_channel = "log-only"
+# jobs            = ["brew-update", "git-pull-utils"]
+# notify_channels = []   # no external dispatch (run.log + last-run.json only)
 """
 
 
@@ -375,7 +375,11 @@ class NotifyNtfy:
 class Defaults:
     """Tool-wide default settings cascaded to jobs."""
 
-    notify_channel: str = "log-only"
+    # Empty list = no external dispatch (log + last-run.json are
+    # always written regardless). On non-empty, every listed channel
+    # fires per failure; per-channel results are recorded
+    # independently in last-run.json's `notifications` dict.
+    notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
     notify_attach_max_kb: int = 256
     timeout_sec: int = 1800
@@ -399,20 +403,29 @@ class Job:
     interval: str | None = None
     platforms: list[str] = field(default_factory=list)
     timeout_sec: int | None = None
-    notify_channel: str | None = None
+    # None = inherit from target/defaults; [] = explicit empty (this
+    # job sends no external notifications even if defaults / target
+    # would).
+    notify_channels: list[str] | None = None
     env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class JobGroup:
-    """A scheduled sequencer that fires named jobs in order."""
+    """A scheduled sequencer that fires named jobs in order.
+
+    Groups don't carry notify settings: children run as fresh
+    subprocesses via `crony run <child>` and resolve their own
+    notify_channels through the target / job / defaults cascade. To
+    apply a notify channel to all members of a group, set it at the
+    target level (typical case) or per-job.
+    """
 
     name: str
     jobs: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
     timeout_sec: int | None = None
-    notify_channel: str | None = None
 
 
 @dataclass
@@ -425,8 +438,18 @@ class Target:
     name: str
     kind: str
     jobs: list[str] = field(default_factory=list)
-    notify_channel: str | None = None
+    # None = inherit from job/defaults; [] = explicit empty.
+    notify_channels: list[str] | None = None
     timeout_sec: int | None = None
+
+
+@dataclass
+class NotificationResult:
+    """One channel's outcome inside a JobRunResult.notifications entry."""
+
+    sent: bool
+    error: str | None = None
+    error_class: str | None = None
 
 
 @dataclass
@@ -609,7 +632,7 @@ _KNOWN_TOPLEVEL: frozenset[str] = frozenset(
 
 _KNOWN_DEFAULTS: frozenset[str] = frozenset(
     {
-        "notify_channel",
+        "notify_channels",
         "notify_attach_log",
         "notify_attach_max_kb",
         "timeout_sec",
@@ -630,7 +653,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "interval",
         "platforms",
         "timeout_sec",
-        "notify_channel",
+        "notify_channels",
         "env",
     }
 )
@@ -641,14 +664,13 @@ _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
         "schedule",
         "interval",
         "timeout_sec",
-        "notify_channel",
     }
 )
 
 _KNOWN_TARGET: frozenset[str] = frozenset(
     {
         "jobs",
-        "notify_channel",
+        "notify_channels",
         "timeout_sec",
     }
 )
@@ -676,9 +698,12 @@ _KNOWN_NOTIFY_NTFY: frozenset[str] = frozenset(
     }
 )
 
+# External notification channels. log-only is no longer a value here:
+# crony always writes run.log + last-run.json regardless, so an empty
+# notify_channels list expresses "no external dispatch" without needing
+# a special sentinel.
 _VALID_NOTIFY_CHANNELS: frozenset[str] = frozenset(
     {
-        "log-only",
         "email",
         "ntfy",
     }
@@ -839,18 +864,45 @@ def _positive_int(
     return val
 
 
+def _parse_notify_channels(
+    raw: dict[str, Any], where: str, *, required: bool
+) -> list[str] | None:
+    """Parse a `notify_channels` list with channel-name validation.
+
+    `required=True` (Defaults) returns [] when the key is absent.
+    `required=False` (Job/Target) returns None when absent so the
+    cascade can inherit from a layer below. Duplicate entries and
+    non-string / unknown channel names raise.
+    """
+    if "notify_channels" not in raw:
+        return [] if required else None
+    val = raw["notify_channels"]
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise ConfigError(
+            f"{where}: 'notify_channels' must be a list of strings"
+        )
+    seen: set[str] = set()
+    out: list[str] = []
+    for ch in val:
+        if ch not in _VALID_NOTIFY_CHANNELS:
+            raise ConfigError(
+                f"{where}: notify_channels entry {ch!r} not in "
+                f"{sorted(_VALID_NOTIFY_CHANNELS)}"
+            )
+        if ch in seen:
+            raise ConfigError(
+                f"{where}: notify_channels entry {ch!r} listed twice"
+            )
+        seen.add(ch)
+        out.append(ch)
+    return out
+
+
 def _parse_defaults(raw: dict[str, Any]) -> Defaults:
     """Parse [defaults]."""
     where = "[defaults]"
     _reject_unknown_keys(raw, _KNOWN_DEFAULTS, where)
-    notify_channel = _typed_field(
-        raw, "notify_channel", str, where, default="log-only"
-    )
-    if notify_channel not in _VALID_NOTIFY_CHANNELS:
-        raise ConfigError(
-            f"{where}: notify_channel must be one of "
-            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
-        )
+    channels = _parse_notify_channels(raw, where, required=True)
     notify_email = None
     notify_ntfy = None
     nested = raw.get("notify", {})
@@ -866,7 +918,7 @@ def _parse_defaults(raw: dict[str, Any]) -> Defaults:
                 f"[defaults.notify.{sub_key}] is not a known channel"
             )
     return Defaults(
-        notify_channel=notify_channel,
+        notify_channels=channels or [],
         notify_attach_log=_typed_field(
             raw, "notify_attach_log", bool, where, default=True
         ),
@@ -924,15 +976,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
                 f"{where}: platforms entry {p!r} not in "
                 f"{sorted(_VALID_PLATFORMS)}"
             )
-    notify_channel = _typed_field(raw, "notify_channel", str, where)
-    if (
-        notify_channel is not None
-        and notify_channel not in _VALID_NOTIFY_CHANNELS
-    ):
-        raise ConfigError(
-            f"{where}: notify_channel must be one of "
-            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
-        )
+    channels = _parse_notify_channels(raw, where, required=False)
     timeout_sec = _typed_field(raw, "timeout_sec", int, where)
     if timeout_sec is not None and timeout_sec <= 0:
         raise ConfigError(f"{where}: timeout_sec must be positive")
@@ -948,7 +992,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
         interval=interval,
         platforms=platforms,
         timeout_sec=timeout_sec,
-        notify_channel=notify_channel,
+        notify_channels=channels,
         env=_string_dict(raw, "env", where),
     )
 
@@ -975,15 +1019,6 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
-    notify_channel = _typed_field(raw, "notify_channel", str, where)
-    if (
-        notify_channel is not None
-        and notify_channel not in _VALID_NOTIFY_CHANNELS
-    ):
-        raise ConfigError(
-            f"{where}: notify_channel must be one of "
-            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
-        )
     timeout_sec = _typed_field(raw, "timeout_sec", int, where)
     if timeout_sec is not None and timeout_sec <= 0:
         raise ConfigError(f"{where}: timeout_sec must be positive")
@@ -993,7 +1028,6 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
         schedule=schedule,
         interval=interval,
         timeout_sec=timeout_sec,
-        notify_channel=notify_channel,
     )
 
 
@@ -1006,15 +1040,7 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
         _validate_name(name, where)
     _reject_unknown_keys(raw, _KNOWN_TARGET, where)
     jobs = _string_list(raw, "jobs", where)
-    notify_channel = _typed_field(raw, "notify_channel", str, where)
-    if (
-        notify_channel is not None
-        and notify_channel not in _VALID_NOTIFY_CHANNELS
-    ):
-        raise ConfigError(
-            f"{where}: notify_channel must be one of "
-            f"{sorted(_VALID_NOTIFY_CHANNELS)}"
-        )
+    channels = _parse_notify_channels(raw, where, required=False)
     timeout_sec = _typed_field(raw, "timeout_sec", int, where)
     if timeout_sec is not None and timeout_sec <= 0:
         raise ConfigError(f"{where}: timeout_sec must be positive")
@@ -1022,7 +1048,7 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
         name=name,
         kind=kind,
         jobs=jobs,
-        notify_channel=notify_channel,
+        notify_channels=channels,
         timeout_sec=timeout_sec,
     )
 
@@ -1209,15 +1235,22 @@ def selected_jobs_and_groups(
     return jobs, groups
 
 
-def resolved_notify_channel(
+def resolved_notify_channels(
     config: Config, target: Target | None, job: Job
-) -> str:
-    """Cascade notify_channel: target > job > defaults."""
-    if target is not None and target.notify_channel is not None:
-        return target.notify_channel
-    if job.notify_channel is not None:
-        return job.notify_channel
-    return config.defaults.notify_channel
+) -> list[str]:
+    """Cascade notify_channels: target > job > defaults.
+
+    Each layer's value is either None ("inherit from below") or a
+    list ("override; this is the value for this layer"). An empty
+    list at any layer is a deliberate "no external dispatch" choice
+    that wins over lower layers. The bottom-most fallback is the
+    defaults' list, which may itself be empty.
+    """
+    if target is not None and target.notify_channels is not None:
+        return list(target.notify_channels)
+    if job.notify_channels is not None:
+        return list(job.notify_channels)
+    return list(config.defaults.notify_channels)
 
 
 def resolved_timeout_sec(
@@ -1265,14 +1298,11 @@ class JobRunResult:
     gate: str
     log_path: str
     log_bytes_this_run: int
-    notify_channel: str
-    notify_sent: bool
-    notify_error: str | None
-    # Class name of the exception that caused notify_error (when
-    # set). Lets callers (e.g. notify-test) re-raise with a
-    # category-aware exit code -- a missing config field maps to
-    # CONFIG, a transport failure maps to ERROR.
-    notify_error_class: str | None = None
+    # Per-channel outcomes. Keys are channel names that were
+    # attempted (e.g. "email", "ntfy"); values are NotificationResult
+    # records. Empty dict means no external dispatch was attempted
+    # (notify_channels resolved to []).
+    notifications: dict[str, NotificationResult] = field(default_factory=dict)
 
 
 @dataclass
@@ -1454,9 +1484,15 @@ def _exec_with_timeout(
 
 
 def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write last-run.json so partial writes can't corrupt it."""
+    """Atomically write last-run.json so partial writes can't corrupt it.
+
+    Insertion order is preserved (no `sort_keys=True`): top-level keys
+    follow dataclass field order, and `notifications` keeps the
+    configured channel order so the on-disk record matches what the
+    user wrote in the toml.
+    """
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(path)
 
 
@@ -1626,83 +1662,110 @@ def _post_ntfy(
         pass
 
 
+def _send_email_for(
+    result: JobRunResult, log_text: str, defaults: Defaults
+) -> None:
+    """Send the failure email. Raises on any error."""
+    if defaults.notify_email is None:
+        raise ConfigError("[defaults.notify.email] not configured")
+    password = _retrieve_secret(
+        keychain_service=defaults.notify_email.smtp_pass_keychain_service,
+        keychain_account=defaults.notify_email.smtp_pass_keychain_account,
+        file_path=defaults.notify_email.smtp_pass_file,
+    )
+    if password is None:
+        raise ConfigError(
+            "no SMTP password available (configure "
+            "smtp_pass_keychain_service or smtp_pass_file)"
+        )
+    msg = _build_email_message(
+        result,
+        log_text,
+        defaults.notify_email,
+        defaults.notify_attach_log,
+        defaults.notify_attach_max_kb,
+    )
+    _send_email(msg, defaults.notify_email, password)
+
+
+def _send_ntfy_for(
+    result: JobRunResult, log_text: str, defaults: Defaults
+) -> None:
+    """Send the failure ntfy POST. Raises on any error."""
+    if defaults.notify_ntfy is None:
+        raise ConfigError("[defaults.notify.ntfy] not configured")
+    token = _retrieve_secret(
+        keychain_service=defaults.notify_ntfy.token_keychain_service,
+        keychain_account=defaults.notify_ntfy.token_keychain_account,
+        file_path=defaults.notify_ntfy.token_file,
+    )
+    if token is None:
+        raise ConfigError(
+            "no ntfy token available (configure "
+            "token_keychain_service or token_file)"
+        )
+    title = (
+        f"[crony/{result.host}] {result.job} "
+        f"{result.exit_class} (exit {result.exit_code})"
+    )
+    _post_ntfy(
+        defaults.notify_ntfy,
+        token,
+        title,
+        result.exit_class,
+        _format_summary(result),
+        log_text,
+        defaults.notify_attach_log,
+        defaults.notify_attach_max_kb,
+    )
+
+
+# Per-channel sender table. Each entry takes (result, log_text,
+# defaults) and raises on failure. Adding a new channel is one new
+# function plus one entry here.
+_NOTIFY_DISPATCH: dict[str, Callable[[JobRunResult, str, Defaults], None]] = {
+    "email": _send_email_for,
+    "ntfy": _send_ntfy_for,
+}
+
+# Pin parser-side and dispatcher-side enumerations together so a new
+# channel can never be accepted by the parser but unknown to dispatch
+# (or vice versa). Module-import time assertion is sufficient: both
+# sets are static.
+assert set(_NOTIFY_DISPATCH.keys()) == _VALID_NOTIFY_CHANNELS, (
+    "_NOTIFY_DISPATCH and _VALID_NOTIFY_CHANNELS have drifted"
+)
+
+
 def _dispatch_notify(
     result: JobRunResult, log_text: str, defaults: Defaults
 ) -> None:
-    """Send a notification through the resolved channel.
+    """Fan out to every channel in result.notifications.
 
-    Failures never propagate; they're recorded in result.notify_error
-    so the runner can move on. The wrapped command's exit code is
-    crony's primary failure signal -- a missed notification matters
-    less than a missed exit code.
+    The runner pre-populates result.notifications with the resolved
+    channel set (one entry per channel, sent=False). This function
+    attempts each in order, catching any exception from a single
+    channel so one transport failure can't suppress the others. The
+    wrapped command's exit code remains the primary failure signal;
+    a missed notification is recorded but never propagated.
     """
-    if result.notify_channel == "log-only":
-        return
-    try:
-        if result.notify_channel == "email":
-            if defaults.notify_email is None:
-                raise ConfigError("[defaults.notify.email] not configured")
-            password = _retrieve_secret(
-                keychain_service=(
-                    defaults.notify_email.smtp_pass_keychain_service
-                ),
-                keychain_account=(
-                    defaults.notify_email.smtp_pass_keychain_account
-                ),
-                file_path=defaults.notify_email.smtp_pass_file,
+    for channel in list(result.notifications.keys()):
+        sender = _NOTIFY_DISPATCH.get(channel)
+        try:
+            if sender is None:
+                raise ConfigError(f"unknown notify channel: {channel!r}")
+            sender(result, log_text, defaults)
+            result.notifications[channel] = NotificationResult(
+                sent=True, error=None, error_class=None
             )
-            if password is None:
-                raise ConfigError(
-                    "no SMTP password available (configure "
-                    "smtp_pass_keychain_service or smtp_pass_file)"
-                )
-            msg = _build_email_message(
-                result,
-                log_text,
-                defaults.notify_email,
-                defaults.notify_attach_log,
-                defaults.notify_attach_max_kb,
+        except Exception as e:
+            # Notify is best-effort; record the failure on this
+            # channel and continue with the next one.
+            result.notifications[channel] = NotificationResult(
+                sent=False,
+                error=f"{type(e).__name__}: {e}",
+                error_class=type(e).__name__,
             )
-            _send_email(msg, defaults.notify_email, password)
-        elif result.notify_channel == "ntfy":
-            if defaults.notify_ntfy is None:
-                raise ConfigError("[defaults.notify.ntfy] not configured")
-            token = _retrieve_secret(
-                keychain_service=defaults.notify_ntfy.token_keychain_service,
-                keychain_account=defaults.notify_ntfy.token_keychain_account,
-                file_path=defaults.notify_ntfy.token_file,
-            )
-            if token is None:
-                raise ConfigError(
-                    "no ntfy token available (configure "
-                    "token_keychain_service or token_file)"
-                )
-            title = (
-                f"[crony/{result.host}] {result.job} "
-                f"{result.exit_class} (exit {result.exit_code})"
-            )
-            _post_ntfy(
-                defaults.notify_ntfy,
-                token,
-                title,
-                result.exit_class,
-                _format_summary(result),
-                log_text,
-                defaults.notify_attach_log,
-                defaults.notify_attach_max_kb,
-            )
-        else:
-            raise ConfigError(
-                f"unknown notify channel: {result.notify_channel!r}"
-            )
-        result.notify_sent = True
-    except Exception as e:
-        # Notify is best-effort; a failure here can't be reported
-        # via the same broken channel, so we record it and let the
-        # runner's exit code remain the user-visible signal.
-        result.notify_sent = False
-        result.notify_error = f"{type(e).__name__}: {e}"
-        result.notify_error_class = type(e).__name__
 
 
 def run_job(
@@ -1743,7 +1806,7 @@ def run_job(
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
 
-    notify_channel = resolved_notify_channel(config, target, job)
+    notify_channels = resolved_notify_channels(config, target, job)
     timeout_sec = resolved_timeout_sec(config, target, job)
     env = _runtime_env(job)
     started = time.time()
@@ -1803,9 +1866,7 @@ def run_job(
                             log_bytes_this_run=(
                                 log_path.stat().st_size - log_size_before
                             ),
-                            notify_channel=notify_channel,
-                            notify_sent=False,
-                            notify_error=None,
+                            notifications={},
                         )
                         _write_last_run(
                             last_run_path, dataclasses.asdict(result)
@@ -1837,6 +1898,13 @@ def run_job(
                     sig = None
                     surfaced_rc = int(ExitCode.TIMEOUT)
 
+                # Pre-populate per-channel slots with sent=False so
+                # the dispatcher can update each entry in place. Order
+                # is preserved (Python dict insertion order) so the
+                # JSON record reflects the configured channel order.
+                notifications: dict[str, NotificationResult] = {
+                    ch: NotificationResult(sent=False) for ch in notify_channels
+                }
                 result = JobRunResult(
                     job=name,
                     host=host,
@@ -1852,12 +1920,10 @@ def run_job(
                     log_bytes_this_run=(
                         log_path.stat().st_size - log_size_before
                     ),
-                    notify_channel=notify_channel,
-                    notify_sent=False,
-                    notify_error=None,
+                    notifications=notifications,
                 )
 
-                if exit_class != "ok":
+                if exit_class != "ok" and notify_channels:
                     log_text = ""
                     try:
                         log_text = log_path.read_text(
@@ -3122,45 +3188,70 @@ def do_validate() -> None:
         elif ling is None:
             warnings.append("linger status unknown")
 
-    channel = config.defaults.notify_channel
-    if channel == "email" and config.defaults.notify_email is not None:
-        em = config.defaults.notify_email
-        try:
-            secret = _retrieve_secret(
-                keychain_service=em.smtp_pass_keychain_service,
-                keychain_account=em.smtp_pass_keychain_account,
-                file_path=em.smtp_pass_file,
+    # Walk every channel that any layer (defaults / job / target)
+    # might select on this host. A listed channel with no matching
+    # config block is itself a warning -- the user has asked for a
+    # channel crony has nothing to send through.
+    listed_channels: set[str] = set(config.defaults.notify_channels)
+    for j in config.jobs.values():
+        if j.notify_channels is not None:
+            listed_channels.update(j.notify_channels)
+    for t in list(config.platform_targets.values()) + list(
+        config.host_targets.values()
+    ):
+        if t.notify_channels is not None:
+            listed_channels.update(t.notify_channels)
+
+    if "email" in listed_channels:
+        if config.defaults.notify_email is None:
+            warnings.append(
+                "email channel listed but [defaults.notify.email] "
+                "is not configured"
             )
-            if secret is None:
-                warnings.append(
-                    _secret_warning(
-                        "email channel: SMTP password",
-                        keychain_service=em.smtp_pass_keychain_service,
-                        keychain_account=em.smtp_pass_keychain_account,
-                        file_path=em.smtp_pass_file,
-                    )
+        else:
+            em = config.defaults.notify_email
+            try:
+                secret = _retrieve_secret(
+                    keychain_service=em.smtp_pass_keychain_service,
+                    keychain_account=em.smtp_pass_keychain_account,
+                    file_path=em.smtp_pass_file,
                 )
-        except PreconditionError as e:
-            warnings.append(str(e))
-    if channel == "ntfy" and config.defaults.notify_ntfy is not None:
-        nt = config.defaults.notify_ntfy
-        try:
-            token = _retrieve_secret(
-                keychain_service=nt.token_keychain_service,
-                keychain_account=nt.token_keychain_account,
-                file_path=nt.token_file,
+                if secret is None:
+                    warnings.append(
+                        _secret_warning(
+                            "email channel: SMTP password",
+                            keychain_service=em.smtp_pass_keychain_service,
+                            keychain_account=em.smtp_pass_keychain_account,
+                            file_path=em.smtp_pass_file,
+                        )
+                    )
+            except PreconditionError as e:
+                warnings.append(str(e))
+    if "ntfy" in listed_channels:
+        if config.defaults.notify_ntfy is None:
+            warnings.append(
+                "ntfy channel listed but [defaults.notify.ntfy] "
+                "is not configured"
             )
-            if token is None:
-                warnings.append(
-                    _secret_warning(
-                        "ntfy channel: token",
-                        keychain_service=nt.token_keychain_service,
-                        keychain_account=nt.token_keychain_account,
-                        file_path=nt.token_file,
-                    )
+        else:
+            nt = config.defaults.notify_ntfy
+            try:
+                token = _retrieve_secret(
+                    keychain_service=nt.token_keychain_service,
+                    keychain_account=nt.token_keychain_account,
+                    file_path=nt.token_file,
                 )
-        except PreconditionError as e:
-            warnings.append(str(e))
+                if token is None:
+                    warnings.append(
+                        _secret_warning(
+                            "ntfy channel: token",
+                            keychain_service=nt.token_keychain_service,
+                            keychain_account=nt.token_keychain_account,
+                            file_path=nt.token_file,
+                        )
+                    )
+            except PreconditionError as e:
+                warnings.append(str(e))
 
     print(f"config: {CONFIG_FILE}")
     print(
@@ -3180,16 +3271,28 @@ def do_validate() -> None:
 
 
 def do_notify_test(channel: str | None) -> None:
-    """Send a synthetic failure notification through the resolved channel.
+    """Send a synthetic failure notification through every configured
+    channel (or just the one passed via --channel).
 
-    Verifies SMTP / keychain / ntfy plumbing without scheduling a
-    real job. Channel defaults to [defaults].notify_channel; pass
-    --channel to override.
+    Verifies plumbing end-to-end without scheduling a real job. With
+    multiple channels resolved, every one is attempted; per-channel
+    success / failure is reported. The exit code reflects whether
+    every channel succeeded: any per-channel failure surfaces as
+    CONFIG (config-shaped) or ERROR (transport-shaped), preserving
+    the original failure category for the user.
     """
     config = load_config()
-    use_channel = channel or config.defaults.notify_channel
-    if use_channel == "log-only":
-        logger.info("notify channel is log-only; nothing to send")
+    if channel is not None:
+        use_channels = [channel]
+    else:
+        # Resolve as if this were a real job on the current host: a
+        # synthetic Job with no per-job override falls through to the
+        # target / defaults cascade.
+        synthetic_job = Job(name="notify-test", command="true")
+        target = resolve_target(config, current_host(), current_platform())
+        use_channels = resolved_notify_channels(config, target, synthetic_job)
+    if not use_channels:
+        logger.info("no notify channels configured; nothing to send")
         return
     result = JobRunResult(
         job="notify-test",
@@ -3204,29 +3307,32 @@ def do_notify_test(channel: str | None) -> None:
         gate="none",
         log_path="(synthetic)",
         log_bytes_this_run=0,
-        notify_channel=use_channel,
-        notify_sent=False,
-        notify_error=None,
+        notifications={
+            ch: NotificationResult(sent=False) for ch in use_channels
+        },
     )
     log_text = (
         "synthetic test message from `crony notify-test`.\n"
         "if you can read this, the channel is working end-to-end.\n"
     )
     _dispatch_notify(result, log_text, config.defaults)
-    if result.notify_sent:
-        logger.info("notification sent via %s", use_channel)
+    failures = [
+        (ch, nr) for ch, nr in result.notifications.items() if not nr.sent
+    ]
+    successes = [ch for ch, nr in result.notifications.items() if nr.sent]
+    for ch in successes:
+        logger.info("notification sent via %s", ch)
+    if not failures:
         return
-    # Preserve the failure category so missing-config surfaces as
-    # CONFIG (3) and transport problems surface as the more generic
-    # ERROR (4). _dispatch_notify catalogues the original exception
-    # class for exactly this lookup.
-    if result.notify_error_class == "ConfigError":
-        raise ConfigError(
-            f"notify-test failed via {use_channel}: {result.notify_error}"
-        )
-    raise CronyError(
-        f"notify-test failed via {use_channel}: {result.notify_error}"
-    )
+    # Preserve the failure category: if every failure is config-shaped
+    # surface CONFIG (3); otherwise ERROR (4). A mix of config and
+    # transport failures gets ERROR -- the configurational issues
+    # would block transport anyway.
+    all_config = all(nr.error_class == "ConfigError" for _, nr in failures)
+    detail = "; ".join(f"{ch}: {nr.error}" for ch, nr in failures)
+    if all_config:
+        raise ConfigError(f"notify-test failed: {detail}")
+    raise CronyError(f"notify-test failed: {detail}")
 
 
 def do_list() -> None:
