@@ -71,8 +71,13 @@ state via a 3-tuple status:
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
-Plus operational subcommands: status, logs, run, audit, validate,
-notify-test, list, init, self-test.
+Plus operational subcommands: status, logs, run, trigger, audit,
+validate, notify-test, list, init, self-test.
+
+`run` invokes the wrapped command directly in the calling process
+(skipping the platform scheduler entirely); `trigger` asks the
+platform (launchd / systemd) to fire the unit immediately, the
+same path a scheduled fire would take.
 
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -3200,6 +3205,30 @@ def _disable_unit(name: str, platform: str) -> None:
     )
 
 
+def _trigger_unit(name: str, platform: str) -> None:
+    """Ask the platform scheduler to fire `name` immediately.
+
+    On darwin, `launchctl kickstart` invokes the agent now (rather
+    than `launchctl start` which only queues the next scheduled
+    fire). On linux, `systemctl --user start <unit>.service` runs
+    the timer's underlying service directly.
+    """
+    if platform == "linux":
+        # The timer's job is to fire the .service; trigger by
+        # starting the service directly.
+        service_unit = f"{BASENAME}-{name}.service"
+        subprocess.run(
+            ["systemctl", "--user", "start", service_unit],
+            check=True,
+        )
+        return
+    label = _label_for(name)
+    subprocess.run(
+        ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
+        check=True,
+    )
+
+
 # =============================================================================
 # COMMAND HANDLERS
 # =============================================================================
@@ -3438,6 +3467,39 @@ def do_disable(jobs: list[str]) -> None:
     for full in normalized:
         _disable_unit(full, platform)
         logger.info("disable %s", full)
+
+
+def do_trigger(jobs: list[str]) -> None:
+    """Ask the platform scheduler to fire the named jobs immediately.
+
+    Distinct from `crony run`, which executes the job's wrapped
+    command directly in the calling process tree (skipping the
+    platform scheduler entirely). `trigger` exercises the same
+    launchd / systemd path the schedule would, useful for testing
+    that the platform unit is wired up correctly without waiting
+    for the next scheduled fire.
+
+    Names are full namespaced (`<bundle>.<short>`); bare input is
+    shorthand for `default.<short>`. Refuses names not stamped on
+    this host (run apply first) and group-only / transit entries
+    that have no platform unit.
+    """
+    bundles = load_all_bundles()
+    stamped = stamped_names()
+    normalized = [
+        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
+    ]
+    unknown = [n for n in normalized if n not in stamped]
+    if unknown:
+        raise UsageError(
+            f"not stamped on this host: {sorted(unknown)} "
+            f"(run `crony apply` first)"
+        )
+    _refuse_stamp_only_full(bundles, normalized, "trigger")
+    platform = current_platform()
+    for full in normalized:
+        _trigger_unit(full, platform)
+        logger.info("trigger %s", full)
 
 
 def do_status(jobs: list[str]) -> None:
@@ -4203,6 +4265,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Job names to disable",
     )
 
+    # trigger
+    p_trigger = subparsers.add_parser(
+        "trigger",
+        help="Ask the platform scheduler to fire the named jobs now",
+    )
+    p_trigger.add_argument(
+        "jobs",
+        nargs="+",
+        help="Job names to trigger via launchd / systemctl",
+    )
+
     # status
     p_status = subparsers.add_parser(
         "status",
@@ -4361,6 +4434,7 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "destroy": do_destroy,
     "enable": do_enable,
     "disable": do_disable,
+    "trigger": do_trigger,
     "status": do_status,
     "logs": do_logs,
     "run": do_run,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -2941,6 +2942,69 @@ class TestEnableDisable:
             crony.do_enable(jobs=["a"])
         with pytest.raises(crony.UsageError, match="group-only entries"):
             crony.do_disable(jobs=["a"])
+
+    def test_trigger_invokes_launchctl_kickstart_on_darwin(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.calls.clear()
+        crony.do_trigger(jobs=["j"])
+        cmd = next(c for c in h.calls if c[0] == "launchctl")
+        assert cmd == [
+            "launchctl",
+            "kickstart",
+            f"gui/{os.getuid()}/org.crony.{h.full('j')}",
+        ]
+
+    def test_trigger_invokes_systemctl_start_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.calls.clear()
+        crony.do_trigger(jobs=["j"])
+        cmd = next(c for c in h.calls if c[0] == "systemctl")
+        assert cmd == [
+            "systemctl",
+            "--user",
+            "start",
+            f"crony-{h.full('j')}.service",
+        ]
+
+    def test_trigger_unknown_name_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="not stamped"):
+            crony.do_trigger(jobs=["ghost"])
+
+    def test_trigger_stamp_only_entry_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A schedule-less job has a stamp but no platform unit; the
+        # platform has nothing to fire, so refuse rather than letting
+        # launchctl/systemctl error with a less-clear message.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        with pytest.raises(crony.UsageError, match="group-only entries"):
+            crony.do_trigger(jobs=["a"])
 
     def test_apply_preserves_disabled_state_on_linux(
         self, tmp_path: Path, monkeypatch: Any
