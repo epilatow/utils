@@ -59,11 +59,11 @@ if hasattr(signal, "SIGPIPE"):
 
 _CRONY_DESIGN: str = """\
 crony is a user-level scheduled-job manager for macOS (launchd
-LaunchAgents) and Linux (systemd user timers). It reads a single
-TOML config and applies the corresponding platform units, runs jobs
-through a uniform shim (so logs, locks, gates, and notifications
-behave the same on both platforms), and reports state via a 3-tuple
-status:
+LaunchAgents) and Linux (systemd user timers). It reads one or
+more TOML config bundles and applies the corresponding platform
+units, runs jobs through a uniform shim (so logs, locks, gates,
+and notifications behave the same on both platforms), and reports
+state via a 3-tuple status:
   CONFIG  synced  | stale    | missing | orphan
   SCHED   enabled | disabled | grouped | unknown
   LAST    ok      | fail     | timeout | gated   | running | never
@@ -74,8 +74,18 @@ Subcommands fall into two categories:
 Plus operational subcommands: status, logs, run, audit, validate,
 notify-test, list, init, self-test.
 
-Config lives at ~/.config/crony/config.toml. State (logs, locks,
-last-run records, install hashes) lives at ~/.local/state/crony/.\
+Config bundles:
+  ~/.config/crony/config.toml     -> bundle name "default"
+  ~/.config/crony/config/<x>.toml -> bundle name "<x>"
+
+Bundles are independent: each has its own [defaults], targets, and
+notify config; jobs/groups defined in one bundle don't see another's.
+Job and group names are namespaced as <bundle>.<short>; bare CLI
+input (`crony run foo`) is shorthand for `default.foo` and only
+ever resolves to the default bundle.
+
+State (logs, locks, last-run records, install hashes) lives at
+~/.local/state/crony/.\
 """
 
 
@@ -101,6 +111,10 @@ CONFIG_DIR: Path = _env_path(
     "CONFIG_DIR", os.path.expanduser(f"~/.config/{BASENAME}")
 )
 CONFIG_FILE: Path = _env_path("CONFIG_FILE", str(CONFIG_DIR / "config.toml"))
+CONFIG_DROPIN_DIR: Path = _env_path(
+    "CONFIG_DROPIN_DIR", str(CONFIG_DIR / "config")
+)
+DEFAULT_BUNDLE_NAME: str = "default"
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
 )
@@ -151,11 +165,21 @@ _initialize_logger()
 
 _DEFAULT_CONFIG_TEMPLATE: str = """\
 # ============================================================================
-# crony config
+# crony config bundle
 # ============================================================================
-# crony manages launchd LaunchAgents (macOS) and systemd user timers
-# (Linux) from this single TOML file. Schedules use systemd OnCalendar
-# syntax; intervals use systemd time-span syntax. See:
+# crony reads bundles from:
+#   ~/.config/crony/config.toml      -> bundle name "default"
+#   ~/.config/crony/config/<x>.toml  -> bundle name "<x>"
+#                                       (filename stem matches
+#                                       [A-Za-z0-9][A-Za-z0-9_-]*)
+# Each bundle is independent: its [defaults], targets, groups, and
+# notify config apply only to the jobs defined in the same file.
+# Job and group names are namespaced as <bundle>.<short>; on the
+# CLI, a bare name (`crony run foo`) is shorthand for
+# `default.foo` and never falls through to other bundles.
+#
+# Schedules use systemd OnCalendar syntax; intervals use systemd
+# time-span syntax. See:
 #   https://www.freedesktop.org/software/systemd/man/systemd.time.html
 # ============================================================================
 
@@ -163,8 +187,9 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # ----------------------------------------------------------------------------
 # defaults section
 # ----------------------------------------------------------------------------
-# Tool-wide settings cascaded to every job. Per-job and per-target
-# settings can override anything here.
+# Settings cascaded to every job in THIS bundle. Per-job and
+# per-target settings can override anything here. Defaults from
+# other bundles never apply -- each bundle has its own.
 
 # [defaults]
 # notify_channels      = []           # subset of ["email", "ntfy"]
@@ -460,13 +485,65 @@ class NotificationResult:
 
 @dataclass
 class Config:
-    """Top-level parsed config."""
+    """Top-level parsed config (one bundle's content)."""
 
     defaults: Defaults = field(default_factory=Defaults)
     jobs: dict[str, Job] = field(default_factory=dict)
     job_groups: dict[str, JobGroup] = field(default_factory=dict)
     platform_targets: dict[str, Target] = field(default_factory=dict)
     host_targets: dict[str, Target] = field(default_factory=dict)
+
+
+@dataclass
+class Bundle:
+    """One config file's contribution: a bundle name + parsed Config.
+
+    The bundle name namespaces the bundle's job and group names: a
+    short name `daily-update` defined in bundle `borgadm` has the
+    full name `borgadm.daily-update` everywhere on disk
+    (state dir, hash stamp, launchd label, systemd unit).
+    """
+
+    name: str
+    source: Path
+    config: Config
+
+    def full_name(self, short: str) -> str:
+        return f"{self.name}.{short}"
+
+
+@dataclass
+class Bundles:
+    """All loaded bundles, keyed by bundle name. Order is the load
+    order (config.toml first, then config/*.toml lex-sorted)."""
+
+    bundles: list[Bundle] = field(default_factory=list)
+
+    def by_name(self, bundle_name: str) -> Bundle | None:
+        for b in self.bundles:
+            if b.name == bundle_name:
+                return b
+        return None
+
+    def find_for_short(self, bundle_name: str, short: str) -> Bundle | None:
+        """Return the bundle defining `<bundle_name>.<short>` (job or
+        group), or None if no such name exists in that bundle."""
+        b = self.by_name(bundle_name)
+        if b is None:
+            return None
+        if short in b.config.jobs or short in b.config.job_groups:
+            return b
+        return None
+
+    def all_full_names(self) -> set[str]:
+        """Return every defined `<bundle>.<short>` (jobs + groups)."""
+        out: set[str] = set()
+        for b in self.bundles:
+            for short in b.config.jobs:
+                out.add(b.full_name(short))
+            for short in b.config.job_groups:
+                out.add(b.full_name(short))
+        return out
 
 
 # =============================================================================
@@ -759,11 +836,18 @@ def _typed_field(
     return val
 
 
-# Job/group/host names map onto filesystem paths and platform unit
-# labels, so they must be safe filename characters. Match a subset that
-# survives both `~/.local/state/crony/<name>/` and the launchd label
-# `org.crony.<name>` and the systemd unit `crony-<name>.timer`.
+# Short job/group/host names appear inside a single bundle's TOML.
+# They become part of filesystem paths (alongside the bundle name)
+# and platform unit labels, so they must be safe filename characters.
+# Dots are allowed: a job written as `[job."foo.bar"]` still maps
+# cleanly into `<bundle>.foo.bar` on disk.
 _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Bundle names come from filenames (config.toml -> "default";
+# config/<x>.toml -> "x"). The dot is reserved as the namespace
+# separator between bundle and short name, so bundle names cannot
+# themselves contain dots.
+_BUNDLE_NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 # Names that collide with crony's own state-dir layout. A job named
 # "installed" would be wiped by `destroy --purge-state` (which removes
@@ -781,6 +865,33 @@ def _validate_name(name: str, where: str) -> None:
         )
     if name in _RESERVED_NAMES:
         raise ConfigError(f"{where}: name {name!r} is reserved by crony")
+
+
+def _validate_bundle_name(name: str, where: str) -> None:
+    """Reject filenames whose stem can't be a bundle name."""
+    if not _BUNDLE_NAME_RE.match(name):
+        raise ConfigError(
+            f"{where}: bundle name {name!r} must match "
+            f"[A-Za-z0-9][A-Za-z0-9_-]* (no dots -- the dot is "
+            f"reserved as the bundle/job-name separator)"
+        )
+
+
+def parse_full_name(arg: str) -> tuple[str, str]:
+    """Parse a CLI job/group reference into (bundle_name, short).
+
+    Bare 'foo' -> ('default', 'foo') -- bare input only ever
+    selects the default bundle, never falls through to others.
+    'borgadm.foo' -> ('borgadm', 'foo'). Multi-dot forms split on
+    the first dot, so '<bundle>.<short>' where short itself
+    contains dots stays intact.
+    """
+    if "." not in arg:
+        return (DEFAULT_BUNDLE_NAME, arg)
+    bundle, _, short = arg.partition(".")
+    if not bundle or not short:
+        raise UsageError(f"invalid job reference: {arg!r}")
+    return (bundle, short)
 
 
 def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
@@ -1132,8 +1243,84 @@ def _validate_config(config: Config) -> None:
             )
 
 
+def _load_one_bundle(name: str, path: Path) -> Bundle:
+    """Parse a single bundle file and validate it. Raises ConfigError
+    on parse / schema failure, naming the source path for context.
+    """
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"TOML parse error in {path}: {e}") from e
+    try:
+        config = parse_config(raw)
+    except ConfigError as e:
+        raise ConfigError(f"{path}: {e}") from e
+    return Bundle(name=name, source=path, config=config)
+
+
+def load_all_bundles() -> Bundles:
+    """Load every bundle: `config.toml` (-> bundle 'default') plus
+    `config/*.toml` (each -> bundle named after its filename stem).
+
+    Per-bundle failures are isolated: a bundle that fails to parse,
+    fails schema validation, or has an invalid filename is dropped
+    with a CONFIG-level error logged for that source. Subsequent
+    bundles continue loading. The returned Bundles contains only
+    the bundles that loaded successfully.
+
+    It is an error if no bundles load -- either every config file is
+    broken or no config files exist at all.
+    """
+    bundles = Bundles()
+    errors: list[str] = []
+    seen_names: set[str] = set()
+
+    candidates: list[tuple[str, Path]] = []
+    if CONFIG_FILE.exists():
+        candidates.append((DEFAULT_BUNDLE_NAME, CONFIG_FILE))
+    if CONFIG_DROPIN_DIR.exists():
+        for path in sorted(CONFIG_DROPIN_DIR.glob("*.toml")):
+            candidates.append((path.stem, path))
+
+    if not candidates:
+        raise ConfigError(
+            f"no config: expected {CONFIG_FILE} or {CONFIG_DROPIN_DIR}/*.toml"
+        )
+
+    for bundle_name, path in candidates:
+        try:
+            _validate_bundle_name(bundle_name, str(path))
+        except ConfigError as e:
+            errors.append(str(e))
+            continue
+        if bundle_name in seen_names:
+            errors.append(
+                f"{path}: bundle name {bundle_name!r} collides with "
+                f"already-loaded bundle; this file will not load"
+            )
+            continue
+        try:
+            bundle = _load_one_bundle(bundle_name, path)
+        except ConfigError as e:
+            errors.append(str(e))
+            continue
+        bundles.bundles.append(bundle)
+        seen_names.add(bundle_name)
+
+    if errors:
+        for msg in errors:
+            logger.error("%s", msg)
+    if not bundles.bundles:
+        raise ConfigError("no bundles loaded successfully")
+    return bundles
+
+
 def load_config(path: Path | None = None) -> Config:
-    """Load and validate the crony config from a TOML file."""
+    """Load a single config file as a `Config`. Used by tests and
+    callers that want the legacy single-bundle shape.
+
+    Most production code should use `load_all_bundles()` instead.
+    """
     if path is None:
         path = CONFIG_FILE
     if not path.exists():
@@ -1796,8 +1983,14 @@ def run_job(
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> int:
     """Run a single job through the per-job pipeline.
+
+    `name` is the short name (as written in the bundle's TOML).
+    `bundle_name` defaults to "default" so single-bundle callers
+    work unchanged; the full namespaced name `<bundle_name>.<name>`
+    is what lands on disk (state dir, last-run.json, log path).
 
     Returns an exit code suitable for the platform scheduler: the
     wrapped command's exit code on completion (0 on success or any
@@ -1810,11 +2003,14 @@ def run_job(
     if name not in config.jobs:
         raise PreconditionError(f"unknown job: {name!r}")
     job = config.jobs[name]
+    full_name = f"{bundle_name}.{name}"
 
     target = resolve_target(config, current_host(), current_platform())
     selected, _ = selected_jobs_and_groups(config, target)
     if name not in selected:
-        raise PreconditionError(f"job {name!r} is not selected on this host")
+        raise PreconditionError(
+            f"job {full_name!r} is not selected on this host"
+        )
 
     if job.script is not None:
         sp = _resolve_script(job.script)
@@ -1823,7 +2019,7 @@ def run_job(
         if not os.access(sp, os.X_OK):
             raise PreconditionError(f"script not executable: {sp}")
 
-    sd = _state_dir_for(name)
+    sd = _state_dir_for(full_name)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -1847,7 +2043,7 @@ def run_job(
             log_file = open(log_path, "ab", buffering=0)
             try:
                 header = (
-                    f"\n=== {started_iso} {name} pid={os.getpid()} ===\n"
+                    f"\n=== {started_iso} {full_name} pid={os.getpid()} ===\n"
                 ).encode()
                 log_file.write(header)
 
@@ -1874,7 +2070,7 @@ def run_job(
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
                         result = JobRunResult(
-                            job=name,
+                            job=full_name,
                             host=host,
                             platform=platform,
                             started_at=started_iso,
@@ -1928,7 +2124,7 @@ def run_job(
                     ch: NotificationResult(sent=False) for ch in notify_channels
                 }
                 result = JobRunResult(
-                    job=name,
+                    job=full_name,
                     host=host,
                     platform=platform,
                     started_at=started_iso,
@@ -1973,8 +2169,15 @@ def run_group(
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> int:
     """Run a job-group: dispatch each child via `crony run <child>`.
+
+    `name` is the short group name; `bundle_name` defaults to
+    "default". Children dispatch via subprocess as
+    `crony run <bundle_name>.<child-short>` so the child's runner
+    resolves into the same bundle's defaults / target / job
+    cascade.
 
     Children fire sequentially; one child failing does not stop the
     next. The group writes its own aggregate last-run.json with a
@@ -1984,8 +2187,9 @@ def run_group(
     if name not in config.job_groups:
         raise PreconditionError(f"unknown group: {name!r}")
     group = config.job_groups[name]
+    full_name = f"{bundle_name}.{name}"
 
-    sd = _state_dir_for(name)
+    sd = _state_dir_for(full_name)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -2003,15 +2207,20 @@ def run_group(
             log_file = open(log_path, "ab", buffering=0)
             children: list[GroupChildResult] = []
             try:
+                child_full = [f"{bundle_name}.{c}" for c in group.jobs]
                 header = (
-                    f"\n=== {started_iso} group {name} "
-                    f"children={group.jobs} ===\n"
+                    f"\n=== {started_iso} group {full_name} "
+                    f"children={child_full} ===\n"
                 ).encode()
                 log_file.write(header)
 
-                for child in group.jobs:
-                    log_file.write(f"-> {child}\n".encode())
-                    cmd = [_crony_executable(), "run", child]
+                for child_short, child_full_name in zip(group.jobs, child_full):
+                    log_file.write(f"-> {child_full_name}\n".encode())
+                    cmd = [
+                        _crony_executable(),
+                        "run",
+                        child_full_name,
+                    ]
                     if skip_gate:
                         cmd.append("--skip-gate")
                     proc = subprocess.run(
@@ -2030,12 +2239,14 @@ def run_group(
                         cls = "fail"
                     children.append(
                         GroupChildResult(
-                            name=child, exit_class=cls, exit_code=rc
+                            name=child_full_name,
+                            exit_class=cls,
+                            exit_code=rc,
                         )
                     )
 
                 result = GroupRunResult(
-                    group=name,
+                    group=full_name,
                     host=host,
                     platform=platform,
                     started_at=started_iso,
@@ -2381,9 +2592,20 @@ def _deactivate_unit(name: str, platform: str) -> None:
         )
 
 
-def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
+def apply_one(
+    config: Config,
+    name: str,
+    *,
+    dry_run: bool = False,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
+) -> str:
     """Apply a single job or group; return "added", "updated", or
     "unchanged".
+
+    `name` is the short name (as written in the bundle's TOML);
+    `bundle_name` defaults to "default". The full namespaced name
+    `<bundle_name>.<name>` is what lands on disk (hash stamp,
+    plist / systemd unit identifier).
 
     Group-only jobs (no schedule, no interval) install no platform
     unit but still get a hash stamp so orphan-detection has a record.
@@ -2395,13 +2617,16 @@ def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
         entry = config.job_groups[name]
     else:
         raise PreconditionError(f"unknown job/group: {name!r}")
+    full_name = f"{bundle_name}.{name}"
 
     schedule, interval = _entity_schedule(entry)
     has_unit = schedule is not None or interval is not None
     platform = current_platform()
-    hash_path = _hash_path_for(name)
+    hash_path = _hash_path_for(full_name)
     new_hash = (
-        _compute_unit_hash(name, entry, platform) if has_unit else "stamp-only"
+        _compute_unit_hash(full_name, entry, platform)
+        if has_unit
+        else "stamp-only"
     )
     old_hash = hash_path.read_text().strip() if hash_path.exists() else None
 
@@ -2418,16 +2643,17 @@ def apply_one(config: Config, name: str, *, dry_run: bool = False) -> str:
         # to query); we treat unknown as "not previously disabled" so
         # a fresh install lands enabled.
         prior_disabled = (
-            old_hash is not None and _sched_state(name, platform) == "disabled"
+            old_hash is not None
+            and _sched_state(full_name, platform) == "disabled"
         )
-        units = _render_units(name, schedule, interval, platform)
+        units = _render_units(full_name, schedule, interval, platform)
         target_dir = (
             LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
         )
         target_dir.mkdir(parents=True, exist_ok=True)
         for fname, content in units.items():
             (target_dir / fname).write_text(content, encoding="utf-8")
-        _activate_unit(name, platform, prior_disabled=prior_disabled)
+        _activate_unit(full_name, platform, prior_disabled=prior_disabled)
 
     hash_path.parent.mkdir(parents=True, exist_ok=True)
     hash_path.write_text(new_hash + "\n", encoding="utf-8")
@@ -2655,23 +2881,47 @@ def _last_run_state(name: str) -> str:
     return "unknown"
 
 
-def _config_state(config: Config, name: str, platform: str) -> str:
-    """Return CONFIG axis value: synced / stale / missing / orphan."""
-    in_config = name in config.jobs or name in config.job_groups
-    has_stamp = _hash_path_for(name).exists()
+def _config_state(
+    config: Config,
+    name: str,
+    platform: str,
+    *,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
+) -> str:
+    """Default-bundle-flavored wrapper around _config_state_for.
+
+    `name` is the short name; the full namespaced name is computed
+    as `<bundle_name>.<name>` (default bundle by default).
+    """
+    return _config_state_for(config, name, f"{bundle_name}.{name}", platform)
+
+
+def _config_state_for(
+    config: Config, short: str, full_name: str, platform: str
+) -> str:
+    """Return CONFIG axis value: synced / stale / missing / orphan.
+
+    `short` is the bundle-local name (used to look up the entry in
+    `config`); `full_name` is the namespaced name used for the
+    on-disk hash stamp and unit identifier.
+    """
+    in_config = short in config.jobs or short in config.job_groups
+    has_stamp = _hash_path_for(full_name).exists()
     if not in_config and has_stamp:
         return "orphan"
     if in_config and not has_stamp:
         return "missing"
     if not in_config and not has_stamp:
         return "missing"
-    entry: Job | JobGroup = config.jobs.get(name) or config.job_groups[name]
+    entry: Job | JobGroup = config.jobs.get(short) or config.job_groups[short]
     schedule, interval = _entity_schedule(entry)
     has_unit = schedule is not None or interval is not None
     new_hash = (
-        _compute_unit_hash(name, entry, platform) if has_unit else "stamp-only"
+        _compute_unit_hash(full_name, entry, platform)
+        if has_unit
+        else "stamp-only"
     )
-    old_hash = _hash_path_for(name).read_text(encoding="utf-8").strip()
+    old_hash = _hash_path_for(full_name).read_text(encoding="utf-8").strip()
     return "synced" if old_hash == new_hash else "stale"
 
 
@@ -2742,8 +2992,32 @@ def _disable_unit(name: str, platform: str) -> None:
 # unfinished feature surfaces immediately rather than silently no-oping.
 
 
-def do_init(force: bool) -> None:
-    """Generate a default config file at ~/.config/crony/config.toml."""
+def do_init(force: bool, bundle: str | None) -> None:
+    """Generate a default config file.
+
+    With `--bundle <name>`, writes `config/<name>.toml` (creating
+    the dropin dir if missing). Otherwise writes `config.toml`.
+    """
+    if bundle is not None:
+        if bundle == DEFAULT_BUNDLE_NAME:
+            raise UsageError(
+                f"--bundle {DEFAULT_BUNDLE_NAME!r} would shadow "
+                f"config.toml; use plain `crony init` (without "
+                f"--bundle) for the default bundle"
+            )
+        try:
+            _validate_bundle_name(bundle, "--bundle")
+        except ConfigError as e:
+            raise UsageError(str(e)) from e
+        target = CONFIG_DROPIN_DIR / f"{bundle}.toml"
+        if target.exists() and not force:
+            raise UsageError(
+                f"{target} already exists; pass --force to overwrite"
+            )
+        CONFIG_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+        target.write_text(_DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
+        logger.info("wrote bundle config to %s", target)
+        return
     if CONFIG_FILE.exists() and not force:
         raise UsageError(
             f"{CONFIG_FILE} already exists; pass --force to overwrite"
@@ -2753,30 +3027,52 @@ def do_init(force: bool) -> None:
     logger.info("wrote default config to %s", CONFIG_FILE)
 
 
+def _selected_full_names_per_bundle(
+    bundles: Bundles,
+) -> tuple[dict[str, tuple[Bundle, str]], set[str]]:
+    """Return (full_name -> (bundle, short)) and full_names set,
+    spanning every bundle's selection on the current host."""
+    host = current_host()
+    platform = current_platform()
+    by_full: dict[str, tuple[Bundle, str]] = {}
+    for b in bundles.bundles:
+        target = resolve_target(b.config, host, platform)
+        sel_jobs, sel_groups = selected_jobs_and_groups(b.config, target)
+        for short in sel_jobs | sel_groups:
+            by_full[b.full_name(short)] = (b, short)
+    return by_full, set(by_full.keys())
+
+
 def do_apply(jobs: list[str]) -> None:
     """Render and activate platform units to match config.
 
-    No args: full sync. Install missing, fix drift, remove orphans.
-    With names: surgical update of those entries only -- orphans are
-    left alone so a one-off apply doesn't have side effects on
-    unrelated jobs.
+    No args: full sync across every bundle. Install missing, fix
+    drift, remove orphans. With names: surgical update of those
+    entries only -- orphans are left alone so a one-off apply
+    doesn't have side effects on unrelated jobs.
+
+    Names on the CLI are full namespaced names
+    (`<bundle>.<short>`). Bare input is shorthand for
+    `default.<short>` and only ever resolves to the default bundle.
     """
-    config = load_config()
-    target = resolve_target(config, current_host(), current_platform())
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    selected = sel_jobs | sel_groups
+    bundles = load_all_bundles()
+    by_full, selected = _selected_full_names_per_bundle(bundles)
 
     if jobs:
-        unknown = [n for n in jobs if n not in selected]
+        # Normalize each CLI input to its full namespaced form.
+        normalized: list[str] = []
+        for arg in jobs:
+            bn, short = parse_full_name(arg)
+            normalized.append(f"{bn}.{short}")
+        unknown = [n for n in normalized if n not in by_full]
         if unknown:
             raise UsageError(
                 f"unknown or unselected on this host: {sorted(unknown)}"
             )
-        names_to_apply = list(jobs)
+        full_names_to_apply = normalized
         remove_orphans = False
     else:
-        # Full-sync: deterministic order so the log is readable.
-        names_to_apply = sorted(selected)
+        full_names_to_apply = sorted(selected)
         remove_orphans = True
 
     # Pre-pass: render every selected entry so a darwin-specific
@@ -2784,16 +3080,19 @@ def do_apply(jobs: list[str]) -> None:
     # touch any unit files. Without this, an apply failure leaves a
     # partial install and the user has to chase what landed.
     if current_platform() == "darwin":
-        for name in names_to_apply:
-            entry: Job | JobGroup
-            entry = config.jobs.get(name) or config.job_groups[name]
+        for full in full_names_to_apply:
+            bundle, short = by_full[full]
+            entry: Job | JobGroup = (
+                bundle.config.jobs.get(short) or bundle.config.job_groups[short]
+            )
             schedule, _interval = _entity_schedule(entry)
             if schedule is not None:
                 _oncalendar_to_plist_calendar(schedule)
 
-    for name in names_to_apply:
-        result = apply_one(config, name)
-        logger.info("apply %s: %s", name, result)
+    for full in full_names_to_apply:
+        bundle, short = by_full[full]
+        result = apply_one(bundle.config, short, bundle_name=bundle.name)
+        logger.info("apply %s: %s", full, result)
 
     if remove_orphans:
         orphans = stamped_names() - selected
@@ -2805,57 +3104,68 @@ def do_apply(jobs: list[str]) -> None:
 def do_destroy(jobs: list[str], purge_state: bool) -> None:
     """Remove platform units.
 
-    No args: factory reset -- every crony-managed unit on this host.
-    With names: surgical removal. Refuses if a name is in neither
-    config nor stamped set; refuses if a job's run.lock is currently
-    held (a run in progress would be left with deleted state).
+    No args: factory reset -- every crony-managed unit on this host
+    (every stamped name across all bundles).
+
+    With names: surgical removal by full namespaced name. Refuses
+    if a name is in neither any bundle's config nor the stamped set;
+    refuses if a name's run.lock is currently held.
     """
     if jobs:
-        config = load_config()
-        known = set(config.jobs) | set(config.job_groups) | stamped_names()
-        unknown = [n for n in jobs if n not in known]
+        bundles = load_all_bundles()
+        by_full, _ = _selected_full_names_per_bundle(bundles)
+        # Defined names span every bundle's full names plus any
+        # currently-stamped name (so an old stamp can still be
+        # destroyed even after the bundle is gone).
+        defined = set(by_full.keys()) | bundles.all_full_names()
+        known = defined | stamped_names()
+        normalized: list[str] = []
+        for arg in jobs:
+            bn, short = parse_full_name(arg)
+            normalized.append(f"{bn}.{short}")
+        unknown = [n for n in normalized if n not in known]
         if unknown:
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
-        names_to_destroy = list(jobs)
+        full_names_to_destroy = normalized
     else:
-        names_to_destroy = sorted(stamped_names())
+        full_names_to_destroy = sorted(stamped_names())
 
-    for name in names_to_destroy:
+    for full in full_names_to_destroy:
         # Refuse if a run is in progress; a partial destroy would
         # leave the running shim with deleted state under it.
-        lock_path = STATE_DIR / name / "run.lock"
+        lock_path = STATE_DIR / full / "run.lock"
         if lock_path.exists():
             try:
                 with _acquire_lock(lock_path):
                     pass
             except LockBusyError:
-                raise SubprocessError(1, ["destroy", name]) from LockBusyError(
-                    f"{name}: run in progress; will not destroy"
+                raise SubprocessError(1, ["destroy", full]) from LockBusyError(
+                    f"{full}: run in progress; will not destroy"
                 )
-        destroy_one(name, purge_state=purge_state)
+        destroy_one(full, purge_state=purge_state)
         logger.info(
-            "destroy %s%s", name, " --purge-state" if purge_state else ""
+            "destroy %s%s", full, " --purge-state" if purge_state else ""
         )
 
 
-def _refuse_stamp_only(config: Config, jobs: list[str], verb: str) -> None:
-    """Reject group-only entries that have a stamp but no platform unit.
-
-    enable / disable manipulate the platform scheduler's view of a
-    unit; a group-only job has no platform unit so the underlying
-    launchctl / systemctl call would fail with a confusing "no such
-    unit" error. We surface the constraint here instead.
-    """
+def _refuse_stamp_only_full(
+    bundles: Bundles, full_names: list[str], verb: str
+) -> None:
+    """Reject group-only entries that have a stamp but no platform unit."""
     stamp_only: list[str] = []
-    for name in jobs:
-        entry: Job | JobGroup | None = config.jobs.get(
-            name
-        ) or config.job_groups.get(name)
+    for full in full_names:
+        bn, short = parse_full_name(full)
+        bundle = bundles.by_name(bn)
+        if bundle is None:
+            continue
+        entry: Job | JobGroup | None = bundle.config.jobs.get(
+            short
+        ) or bundle.config.job_groups.get(short)
         if entry is None:
             continue
         sched, interval = _entity_schedule(entry)
         if sched is None and interval is None:
-            stamp_only.append(name)
+            stamp_only.append(full)
     if stamp_only:
         raise UsageError(
             f"cannot {verb} group-only entries (no platform unit): "
@@ -2866,58 +3176,65 @@ def _refuse_stamp_only(config: Config, jobs: list[str], verb: str) -> None:
 def do_enable(jobs: list[str]) -> None:
     """Move the platform scheduler into `enabled` for the named jobs.
 
-    Refuses names that aren't stamped on this host (run apply first)
-    and group-only entries that have no platform unit to flip.
+    Names are full namespaced (`<bundle>.<short>`); bare input is
+    shorthand for `default.<short>`. Refuses names not stamped on
+    this host (run apply first) and group-only entries.
     """
-    config = load_config()
+    bundles = load_all_bundles()
     stamped = stamped_names()
-    unknown = [n for n in jobs if n not in stamped]
+    normalized = [
+        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
+    ]
+    unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_stamp_only(config, jobs, "enable")
+    _refuse_stamp_only_full(bundles, normalized, "enable")
     platform = current_platform()
-    for name in jobs:
-        _enable_unit(name, platform)
-        logger.info("enable %s", name)
+    for full in normalized:
+        _enable_unit(full, platform)
+        logger.info("enable %s", full)
 
 
 def do_disable(jobs: list[str]) -> None:
     """Move the platform scheduler into `disabled` for the named jobs.
 
-    Refuses names that aren't stamped on this host (run apply first)
-    and group-only entries that have no platform unit to flip.
+    Names are full namespaced (`<bundle>.<short>`); bare input is
+    shorthand for `default.<short>`. Refuses names not stamped on
+    this host (run apply first) and group-only entries.
     """
-    config = load_config()
+    bundles = load_all_bundles()
     stamped = stamped_names()
-    unknown = [n for n in jobs if n not in stamped]
+    normalized = [
+        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
+    ]
+    unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_stamp_only(config, jobs, "disable")
+    _refuse_stamp_only_full(bundles, normalized, "disable")
     platform = current_platform()
-    for name in jobs:
-        _disable_unit(name, platform)
-        logger.info("disable %s", name)
+    for full in normalized:
+        _disable_unit(full, platform)
+        logger.info("disable %s", full)
 
 
 def do_status(jobs: list[str]) -> None:
     """Print the resolved (CONFIG, SCHED, LAST) tuple per job.
 
     With no args, the report covers selected jobs/groups plus any
-    orphans. Linger status on linux surfaces above the table because
-    a disabled-linger host silently fails every scheduled job and
-    that's the warning users miss the most often.
+    orphans across all bundles. Names are full namespaced
+    (`<bundle>.<short>`); bare CLI input is shorthand for
+    `default.<short>`. Linger status on linux surfaces above the
+    table.
     """
-    config = load_config()
+    bundles = load_all_bundles()
     platform = current_platform()
-    target = resolve_target(config, current_host(), platform)
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    selected = sel_jobs | sel_groups
+    _by_full, selected = _selected_full_names_per_bundle(bundles)
     stamped = stamped_names()
 
     if platform == "linux":
@@ -2930,28 +3247,38 @@ def do_status(jobs: list[str]) -> None:
                 user,
             )
 
-    names: list[str]
+    full_names: list[str]
     if jobs:
-        names = list(jobs)
+        full_names = [
+            f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
+        ]
     else:
-        names = sorted(selected | stamped)
+        full_names = sorted(selected | stamped)
 
     print(f"{'JOB':30} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
-    for name in names:
-        cfg_state = _config_state(config, name, platform)
+    for full in full_names:
+        bn, short = parse_full_name(full)
+        bundle = bundles.by_name(bn)
+        if bundle is None:
+            cfg_state = "orphan" if full in stamped else "missing"
+            entry = None
+        else:
+            cfg_state = _config_state_for(bundle.config, short, full, platform)
+            entry = bundle.config.jobs.get(
+                short
+            ) or bundle.config.job_groups.get(short)
         if cfg_state == "missing":
             sched = "unknown"
         else:
-            entry = config.jobs.get(name) or config.job_groups.get(name)
             schedule, interval = (
                 _entity_schedule(entry) if entry is not None else (None, None)
             )
             if entry is not None and schedule is None and interval is None:
                 sched = "grouped"
             else:
-                sched = _sched_state(name, platform)
-        last = _last_run_state(name)
-        print(f"{name:30} {cfg_state:10} {sched:10} {last:10}")
+                sched = _sched_state(full, platform)
+        last = _last_run_state(full)
+        print(f"{full:30} {cfg_state:10} {sched:10} {last:10}")
 
 
 def do_logs(
@@ -2962,15 +3289,20 @@ def do_logs(
 ) -> None:
     """Print a job's recent log output.
 
+    `name` is the full namespaced name (`<bundle>.<short>`); bare
+    input is shorthand for `default.<short>`.
+
     -n N      print the last N lines (default 200)
     --since X parse X as a duration ('1h', '2d') or ISO timestamp
               and skip log content older than that. Run-header
               timestamps anchor the cut.
     --tail    follow appended output (-f semantics) until interrupted.
     """
-    log_path = STATE_DIR / name / "run.log"
+    bn, short = parse_full_name(name)
+    full = f"{bn}.{short}"
+    log_path = STATE_DIR / full / "run.log"
     if not log_path.exists():
-        raise UsageError(f"no log for {name!r} (state dir: {STATE_DIR / name})")
+        raise UsageError(f"no log for {full!r} (state dir: {STATE_DIR / full})")
     if tail:
         _follow_log(log_path)
         return
@@ -3061,40 +3393,71 @@ def _filter_since(text: str, since: str) -> str:
 def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
     """Runner shim. Platform schedulers invoke this.
 
-    Resolves whether `name` is a job or a job-group and dispatches
-    to the appropriate pipeline. The wrapped command's exit code is
-    surfaced to the caller via SystemExit so it propagates faithfully
-    to launchd/systemd; cli() converts that into the process exit.
+    `name` is the full namespaced name (`<bundle>.<short>`); bare
+    input is shorthand for `default.<short>`. Resolves whether the
+    short name is a job or a job-group within the named bundle and
+    dispatches to the appropriate pipeline. The wrapped command's
+    exit code is surfaced via SystemExit so it propagates to
+    launchd/systemd; cli() converts that into the process exit.
     """
-    config = load_config()
-    if name in config.jobs and name in config.job_groups:
+    bn, short = parse_full_name(name)
+    bundles = load_all_bundles()
+    bundle = bundles.by_name(bn)
+    if bundle is None:
+        raise UsageError(f"unknown bundle: {bn!r} (in {name!r})")
+    config = bundle.config
+    if short in config.jobs and short in config.job_groups:
         # Validate already rejects collisions, but be defensive.
-        raise ConfigError(f"name {name!r} is both a job and a group")
-    if name in config.jobs:
-        rc = run_job(config, name, dry_run=dry_run, skip_gate=skip_gate)
-    elif name in config.job_groups:
-        rc = run_group(config, name, dry_run=dry_run, skip_gate=skip_gate)
+        raise ConfigError(f"name {short!r} is both a job and a group")
+    if short in config.jobs:
+        rc = run_job(
+            config,
+            short,
+            dry_run=dry_run,
+            skip_gate=skip_gate,
+            bundle_name=bundle.name,
+        )
+    elif short in config.job_groups:
+        rc = run_group(
+            config,
+            short,
+            dry_run=dry_run,
+            skip_gate=skip_gate,
+            bundle_name=bundle.name,
+        )
     else:
         raise UsageError(f"unknown job or group: {name!r}")
     raise SystemExit(rc)
 
 
-def do_audit(exclude_disabled: bool) -> None:
+def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     """Walk every job; print bad rows; exit AUDIT_FAILED on hits.
+
+    With no --bundle, iterates every bundle's selection plus every
+    orphan stamp on disk, and reports linger status. With --bundle
+    <name>, scopes to that bundle's selected jobs and orphan stamps
+    in that bundle's namespace (so a leftover `<name>.gone.hash` is
+    still surfaced); cross-host checks like linger are skipped --
+    they're about the whole-host picture, not any one bundle.
 
     Bad means CONFIG drift (stale/missing/orphan), the scheduler
     being unable to fire (failed/unknown, plus disabled by default),
-    or a recent failed/timeout run. Designed to be scheduled via
-    crony itself; the runner shim sees a non-ok exit and dispatches
-    a notification with the audit's stdout as the failure body.
+    or a recent failed/timeout run. Names in output are full
+    namespaced (`<bundle>.<short>`).
     """
-    config = load_config()
+    bundles = load_all_bundles()
+    if bundle is not None and bundles.by_name(bundle) is None:
+        raise UsageError(f"unknown bundle: {bundle!r}")
     platform = current_platform()
-    target = resolve_target(config, current_host(), platform)
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    selected = sel_jobs | sel_groups
+    _by_full, selected = _selected_full_names_per_bundle(bundles)
     stamped = stamped_names()
-    candidates = sorted(selected | stamped)
+    if bundle is not None:
+        prefix = f"{bundle}."
+        selected = {n for n in selected if n.startswith(prefix)}
+        scoped_stamped = {n for n in stamped if n.startswith(prefix)}
+        candidates = sorted(selected | scoped_stamped)
+    else:
+        candidates = sorted(selected | stamped)
 
     bad_config = {"stale", "missing", "orphan"}
     bad_sched = {"failed", "unknown"}
@@ -3103,31 +3466,39 @@ def do_audit(exclude_disabled: bool) -> None:
     bad_last = {"fail", "timeout"}
 
     rows: list[tuple[str, str, str, str]] = []
-    for name in candidates:
-        cfg_state = _config_state(config, name, platform)
+    for full in candidates:
+        bn, short = parse_full_name(full)
+        b = bundles.by_name(bn)
+        if b is None:
+            cfg_state = "orphan" if full in stamped else "missing"
+            entry: Job | JobGroup | None = None
+        else:
+            cfg_state = _config_state_for(b.config, short, full, platform)
+            entry = b.config.jobs.get(short) or b.config.job_groups.get(short)
         if cfg_state == "missing":
             sched_state = "unknown"
         else:
-            entry = config.jobs.get(name) or config.job_groups.get(name)
             if entry is None:
-                sched_state = _sched_state(name, platform)
+                sched_state = _sched_state(full, platform)
             else:
                 schedule, interval = _entity_schedule(entry)
                 if schedule is None and interval is None:
                     sched_state = "grouped"
                 else:
-                    sched_state = _sched_state(name, platform)
-        last_state = _last_run_state(name)
+                    sched_state = _sched_state(full, platform)
+        last_state = _last_run_state(full)
         is_bad = (
             cfg_state in bad_config
             or sched_state in bad_sched
             or last_state in bad_last
         )
         if is_bad:
-            rows.append((name, cfg_state, sched_state, last_state))
+            rows.append((full, cfg_state, sched_state, last_state))
 
     warnings: list[str] = []
-    if platform == "linux":
+    # Linger is host-wide -- skip it under --bundle scoping; the
+    # operator who needs that info runs without --bundle.
+    if bundle is None and platform == "linux":
         ling = linger_enabled()
         if ling is False:
             warnings.append(
@@ -3184,36 +3555,13 @@ def _secret_warning(
     return f"{label} unresolved: tried {' and '.join(parts)}"
 
 
-def do_validate() -> None:
-    """Lint config; report orphans, linger status, broken secret files.
-
-    load_config already enforces structural and cross-cutting rules;
-    this subcommand wraps it, surfaces orphan / linger / secrets
-    warnings as informational output, and exits WARNING (1) when any
-    are present, CONFIG (3) when the config doesn't load.
-    """
-    config = load_config()
-    platform = current_platform()
-    target = resolve_target(config, current_host(), platform)
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    selected = sel_jobs | sel_groups
-    stamped = stamped_names()
-    orphans = sorted(stamped - selected)
-
+def _validate_bundle_warnings(
+    bundle: Bundle,
+) -> list[str]:
+    """Return per-bundle warnings: notify channels listed without
+    config blocks, secret paths that don't resolve, etc."""
     warnings: list[str] = []
-    if orphans:
-        warnings.append(f"orphans on this host: {orphans}")
-    if platform == "linux":
-        ling = linger_enabled()
-        if ling is False:
-            warnings.append(f"linger DISABLED for {_current_user()}")
-        elif ling is None:
-            warnings.append("linger status unknown")
-
-    # Walk every channel that any layer (defaults / job / target)
-    # might select on this host. A listed channel with no matching
-    # config block is itself a warning -- the user has asked for a
-    # channel crony has nothing to send through.
+    config = bundle.config
     listed_channels: set[str] = set(config.defaults.notify_channels)
     for j in config.jobs.values():
         if j.notify_channels is not None:
@@ -3275,13 +3623,63 @@ def do_validate() -> None:
             except PreconditionError as e:
                 warnings.append(str(e))
 
-    print(f"config: {CONFIG_FILE}")
-    print(
-        f"jobs: {len(config.jobs)}, "
-        f"groups: {len(config.job_groups)}, "
-        f"targets: platform={len(config.platform_targets)} "
-        f"host={len(config.host_targets)}"
+    if not config.jobs and not config.job_groups:
+        warnings.append(
+            "bundle defines no jobs or groups (nothing it contains can fire)"
+        )
+    return warnings
+
+
+def do_validate(bundle: str | None) -> None:
+    """Lint configs; report orphans, linger status, broken secret files.
+
+    load_all_bundles already enforces per-bundle structural rules and
+    isolates failed bundles. This subcommand surfaces orphan / linger
+    / per-bundle warnings as informational output and exits WARNING
+    (1) when any are present, CONFIG (3) when no bundles load.
+
+    With --bundle <name>, restricts the per-bundle warnings to just
+    that bundle. Cross-bundle / cross-host checks (orphan detection,
+    linger status) only run in the unfiltered case -- they're about
+    the whole-host picture, not any one bundle.
+    """
+    bundles = load_all_bundles()
+    if bundle is not None and bundles.by_name(bundle) is None:
+        raise UsageError(f"unknown bundle: {bundle!r}")
+    platform = current_platform()
+
+    warnings: list[str] = []
+    if bundle is None:
+        _by_full, selected = _selected_full_names_per_bundle(bundles)
+        stamped = stamped_names()
+        orphans = sorted(stamped - selected)
+        if orphans:
+            warnings.append(f"orphans on this host: {orphans}")
+        if platform == "linux":
+            ling = linger_enabled()
+            if ling is False:
+                warnings.append(f"linger DISABLED for {_current_user()}")
+            elif ling is None:
+                warnings.append("linger status unknown")
+
+    target_bundles = (
+        [b for b in bundles.bundles if b.name == bundle]
+        if bundle is not None
+        else list(bundles.bundles)
     )
+    for b in target_bundles:
+        for w in _validate_bundle_warnings(b):
+            warnings.append(f"{b.source}: {w}")
+
+    print(f"bundles loaded: {len(target_bundles)}")
+    for b in target_bundles:
+        config = b.config
+        print(
+            f"  {b.name} ({b.source}): "
+            f"jobs={len(config.jobs)}, groups={len(config.job_groups)}, "
+            f"targets: platform={len(config.platform_targets)} "
+            f"host={len(config.host_targets)}"
+        )
     if warnings:
         print("warnings:")
         for w in warnings:
@@ -3292,32 +3690,21 @@ def do_validate() -> None:
     print("ok")
 
 
-def do_notify_test(channel: str | None) -> None:
-    """Send a synthetic failure notification through every configured
-    channel (or just the one passed via --channel).
-
-    Verifies plumbing end-to-end without scheduling a real job. With
-    multiple channels resolved, every one is attempted; per-channel
-    success / failure is reported. The exit code reflects whether
-    every channel succeeded: any per-channel failure surfaces as
-    CONFIG (config-shaped) or ERROR (transport-shaped), preserving
-    the original failure category for the user.
-    """
-    config = load_config()
+def _notify_test_one_bundle(
+    bundle: Bundle, channel: str | None
+) -> tuple[list[str], list[tuple[str, NotificationResult]]]:
+    """Run notify-test against one bundle. Returns (successes, failures)."""
+    config = bundle.config
     if channel is not None:
         use_channels = [channel]
     else:
-        # Resolve as if this were a real job on the current host: a
-        # synthetic Job with no per-job override falls through to the
-        # target / defaults cascade.
         synthetic_job = Job(name="notify-test", command="true")
         target = resolve_target(config, current_host(), current_platform())
         use_channels = resolved_notify_channels(config, target, synthetic_job)
     if not use_channels:
-        logger.info("no notify channels configured; nothing to send")
-        return
+        return ([], [])
     result = JobRunResult(
-        job="notify-test",
+        job=f"{bundle.name}.notify-test",
         host=current_host(),
         platform=current_platform(),
         started_at=_now_iso(),
@@ -3334,50 +3721,123 @@ def do_notify_test(channel: str | None) -> None:
         },
     )
     log_text = (
-        "synthetic test message from `crony notify-test`.\n"
+        f"synthetic test message from `crony notify-test` "
+        f"(bundle: {bundle.name}).\n"
         "if you can read this, the channel is working end-to-end.\n"
     )
     _dispatch_notify(result, log_text, config.defaults)
+    successes = [ch for ch, nr in result.notifications.items() if nr.sent]
     failures = [
         (ch, nr) for ch, nr in result.notifications.items() if not nr.sent
     ]
-    successes = [ch for ch, nr in result.notifications.items() if nr.sent]
+    return (successes, failures)
+
+
+def do_notify_test(channel: str | None, bundle: str | None) -> None:
+    """Send a synthetic failure notification.
+
+    Bundle / channel resolution follows crony's bare-input rule: when
+    nothing is specified, only the default bundle is exercised (never
+    a fan-out across every bundle).
+
+    --bundle <name>      send only through that bundle's configured
+                         channels.
+    --channel <ch>       a bare channel name resolves against the
+                         selected bundle (default if --bundle is
+                         absent).
+    --channel <bn>.<ch>  fully qualified; the bundle prefix wins,
+                         and is required to match --bundle when both
+                         are given.
+
+    Verifies plumbing end-to-end without scheduling a real job. The
+    exit code reflects whether every per-channel send succeeded: any
+    per-channel failure surfaces as CONFIG (config-shaped) or ERROR
+    (transport-shaped), preserving the original failure category.
+    """
+    bundles = load_all_bundles()
+
+    # Resolve --channel into (bundle_from_channel, channel_or_None).
+    channel_bundle: str | None = None
+    channel_short: str | None = None
+    if channel is not None:
+        if "." in channel:
+            channel_bundle, channel_short = parse_full_name(channel)
+        else:
+            channel_short = channel
+
+    # Compose --bundle and --channel's bundle prefix.
+    if channel_bundle is not None and bundle is not None:
+        if channel_bundle != bundle:
+            raise UsageError(
+                f"--bundle {bundle!r} contradicts --channel "
+                f"{channel!r} (bundle {channel_bundle!r}); pick one"
+            )
+    bundle_name = channel_bundle or bundle or DEFAULT_BUNDLE_NAME
+    target_bundle = bundles.by_name(bundle_name)
+    if target_bundle is None:
+        raise UsageError(f"unknown bundle: {bundle_name!r}")
+
+    successes, failures = _notify_test_one_bundle(target_bundle, channel_short)
     for ch in successes:
-        logger.info("notification sent via %s", ch)
+        logger.info("notification sent via %s.%s", target_bundle.name, ch)
+    if not successes and not failures:
+        logger.info("no notify channels configured; nothing to send")
+        return
     if not failures:
         return
+    all_failures: list[tuple[str, str, NotificationResult]] = [
+        (target_bundle.name, ch, nr) for ch, nr in failures
+    ]
     # Preserve the failure category: if every failure is config-shaped
     # surface CONFIG (3); otherwise ERROR (4). A mix of config and
     # transport failures gets ERROR -- the configurational issues
     # would block transport anyway.
-    all_config = all(nr.error_class == "ConfigError" for _, nr in failures)
-    detail = "; ".join(f"{ch}: {nr.error}" for ch, nr in failures)
+    all_config = all(
+        nr.error_class == "ConfigError" for _, _, nr in all_failures
+    )
+    detail = "; ".join(f"{bn}.{ch}: {nr.error}" for bn, ch, nr in all_failures)
     if all_config:
         raise ConfigError(f"notify-test failed: {detail}")
     raise CronyError(f"notify-test failed: {detail}")
 
 
-def do_list() -> None:
+def do_list(bundle: str | None) -> None:
     """One-line summary per defined job/group.
 
-    Available for human triage -- shows what's defined, what kind
-    (job vs group), how it's scheduled, and whether the current
-    host's target selects it.
+    With no --bundle, lists every bundle's contents. With --bundle
+    <name>, restricts the table to that one bundle. Names are full
+    namespaced (`<bundle>.<short>`).
     """
-    config = load_config()
+    bundles = load_all_bundles()
+    if bundle is not None and bundles.by_name(bundle) is None:
+        raise UsageError(f"unknown bundle: {bundle!r}")
     platform = current_platform()
-    target = resolve_target(config, current_host(), platform)
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    selected = sel_jobs | sel_groups
-    print(f"{'NAME':30} {'KIND':6} {'SCHEDULE':22} {'SELECTED':8}")
-    for name in sorted(set(config.jobs) | set(config.job_groups)):
-        kind = "group" if name in config.job_groups else "job"
-        entry: Job | JobGroup = config.jobs.get(name) or config.job_groups[name]
-        sched_disp = entry.schedule or (
-            f"interval={entry.interval}" if entry.interval else "(group-only)"
-        )
-        is_selected = "yes" if name in selected else "no"
-        print(f"{name:30} {kind:6} {sched_disp:22} {is_selected:8}")
+    target_bundles = (
+        [b for b in bundles.bundles if b.name == bundle]
+        if bundle is not None
+        else list(bundles.bundles)
+    )
+    print(f"{'NAME':40} {'KIND':6} {'SCHEDULE':22} {'SELECTED':8}")
+    rows: list[tuple[str, str, str, str]] = []
+    for b in target_bundles:
+        target = resolve_target(b.config, current_host(), platform)
+        sel_jobs, sel_groups = selected_jobs_and_groups(b.config, target)
+        selected = sel_jobs | sel_groups
+        for short in sorted(set(b.config.jobs) | set(b.config.job_groups)):
+            full = b.full_name(short)
+            kind = "group" if short in b.config.job_groups else "job"
+            entry: Job | JobGroup = (
+                b.config.jobs.get(short) or b.config.job_groups[short]
+            )
+            sched_disp = entry.schedule or (
+                f"interval={entry.interval}"
+                if entry.interval
+                else "(group-only)"
+            )
+            is_selected = "yes" if short in selected else "no"
+            rows.append((full, kind, sched_disp, is_selected))
+    for full, kind, sched_disp, is_selected in sorted(rows):
+        print(f"{full:40} {kind:6} {sched_disp:22} {is_selected:8}")
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
@@ -3417,6 +3877,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite an existing config file",
+    )
+    p_init.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "Write to config/<bundle>.toml instead of config.toml "
+            "(creates the dropin dir if missing)"
+        ),
     )
 
     # apply
@@ -3542,11 +4010,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not flag intentionally-disabled jobs as bad",
     )
+    p_audit.add_argument(
+        "--bundle",
+        default=None,
+        help="Restrict audit to jobs from one bundle",
+    )
 
     # validate
-    subparsers.add_parser(
+    p_validate = subparsers.add_parser(
         "validate",
         help="Lint config; report orphans, linger, etc",
+    )
+    p_validate.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "Restrict per-bundle warnings to one bundle. "
+            "Cross-host checks (orphans, linger) are skipped in "
+            "this mode -- run without --bundle for those."
+        ),
     )
 
     # notify-test
@@ -3557,13 +4039,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_nt.add_argument(
         "--channel",
         default=None,
-        help="Override channel (default: configured channel)",
+        help=(
+            "Send through one specific channel. Bare name "
+            "(`ntfy`) resolves against the selected bundle; "
+            "fully qualified `<bundle>.<channel>` overrides --bundle."
+        ),
+    )
+    p_nt.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "Send through this bundle's notify config "
+            "(default: the `default` bundle)"
+        ),
     )
 
     # list
-    subparsers.add_parser(
+    p_list = subparsers.add_parser(
         "list",
         help="One-line summary per job",
+    )
+    p_list.add_argument(
+        "--bundle",
+        default=None,
+        help="Restrict listing to one bundle",
     )
 
     # self-test
