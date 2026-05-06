@@ -3503,12 +3503,18 @@ def do_logs(
     n: int,
     since: str | None,
     tail: bool,
+    path: bool,
 ) -> None:
     """Print a job's recent log output.
 
     `name` is the full namespaced name (`<bundle>.<short>`); bare
     input is shorthand for `default.<short>`.
 
+    -p/--path print the log file's path and exit (no content read).
+              Path resolution is purely structural -- prints even
+              when the file doesn't exist yet (e.g. for a job
+              that's been applied but never run), so it composes
+              with other tools: `$EDITOR "$(crony logs j -p)"`.
     -n N      print the last N lines (default 200)
     --since X parse X as a duration ('1h', '2d') or ISO timestamp
               and skip log content older than that. Run-header
@@ -3518,6 +3524,9 @@ def do_logs(
     bn, short = parse_full_name(name)
     full = f"{bn}.{short}"
     log_path = STATE_DIR / full / "run.log"
+    if path:
+        print(log_path)
+        return
     if not log_path.exists():
         raise UsageError(f"no log for {full!r} (state dir: {STATE_DIR / full})")
     if tail:
@@ -4217,6 +4226,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--tail",
         action="store_true",
         help="Follow appended output",
+    )
+    p_logs.add_argument(
+        "-p",
+        "--path",
+        action="store_true",
+        help="Print the log file path and exit (no content)",
     )
 
     # run

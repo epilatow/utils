@@ -3307,7 +3307,7 @@ class TestLogs:
             "\n".join(f"line {i}" for i in range(20)) + "\n",
             encoding="utf-8",
         )
-        crony.do_logs(name="j", n=5, since=None, tail=False)
+        crony.do_logs(name="j", n=5, since=None, tail=False, path=False)
         out = capsys.readouterr().out
         assert "line 19" in out
         assert "line 15" in out
@@ -3317,7 +3317,42 @@ class TestLogs:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="no log"):
-            crony.do_logs(name="ghost", n=10, since=None, tail=False)
+            crony.do_logs(
+                name="ghost", n=10, since=None, tail=False, path=False
+            )
+
+    def test_path_prints_file_path(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / h.full("j") / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("hello\n", encoding="utf-8")
+        crony.do_logs(name="j", n=0, since=None, tail=False, path=True)
+        out = capsys.readouterr().out.strip()
+        assert out == str(log)
+
+    def test_path_works_without_existing_log(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # --path is purely structural: it prints the resolved path
+        # without requiring the file to exist. Useful for tooling
+        # like `mkdir -p $(dirname $(crony logs j -p))` or
+        # `tail -F "$(crony logs j -p)"` in advance of any run.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        # No log file written; --path should still succeed.
+        crony.do_logs(name="j", n=0, since=None, tail=False, path=True)
+        out = capsys.readouterr().out.strip()
+        expected = h.state / h.full("j") / "run.log"
+        assert out == str(expected)
 
     def test_since_filters_old_runs(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3342,7 +3377,7 @@ class TestLogs:
             f"=== {now_iso} j pid=2 ===\nnew-line\n",
             encoding="utf-8",
         )
-        crony.do_logs(name="j", n=0, since="1h", tail=False)
+        crony.do_logs(name="j", n=0, since="1h", tail=False, path=False)
         out = capsys.readouterr().out
         assert "new-line" in out
         assert "old-line" not in out
