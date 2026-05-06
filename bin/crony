@@ -192,19 +192,30 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # other bundles never apply -- each bundle has its own.
 
 # [defaults]
-# notify_channels      = []           # subset of ["email", "ntfy"]
+# notify_channels      = []           # any names defined below
 # notify_attach_log    = true
 # notify_attach_max_kb = 256
 # timeout_sec          = 1800         # 30 min default per-job wallclock cap
 # log_keep_runs        = 30
 
-# Embedded SMTP channel (used when "email" is in notify_channels).
+# Each notify channel is a [defaults.notify.<name>] block. The name
+# is whatever the user lists in `notify_channels`. The `transport`
+# field selects the underlying sender ("email" or "ntfy"); when
+# omitted, transport defaults to the channel name (so a block named
+# `email` or `ntfy` picks up its like-named transport
+# automatically). Optional `headers` is a table of arbitrary
+# message headers crony will attach -- crony-controlled headers
+# (To/From/Subject for email; Authorization/Tags/Title for ntfy)
+# are reserved and rejected.
+
+# Embedded SMTP channel.
 # [defaults.notify.email]
-# to                 = "you@example.com"
-# from               = "crony@example.com"
-# smtp_host          = "smtp.gmail.com"
-# smtp_port          = 587
-# smtp_user          = "you@gmail.com"
+# # transport defaults to "email" since the channel is named "email"
+# to                         = "you@example.com"
+# from                       = "crony@example.com"
+# smtp_host                  = "smtp.gmail.com"
+# smtp_port                  = 587
+# smtp_user                  = "you@gmail.com"
 # smtp_starttls              = true
 # # Password retrieval -- first match wins. On macOS prefer the
 # # keychain item (the optional _account narrows the lookup when
@@ -213,13 +224,23 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # smtp_pass_keychain_service = "crony-smtp"
 # smtp_pass_keychain_account = "you@gmail.com"   # optional
 # smtp_pass_file             = "~/.config/crony/secrets/smtp-password"
+# headers                    = { "Reply-To" = "you@example.com" }
 
-# ntfy channel (used when "ntfy" is in notify_channels).
+# ntfy channel.
 # [defaults.notify.ntfy]
 # url                    = "https://ntfy.example.com/automation"
 # token_keychain_service = "ntfy-automation"
 # token_keychain_account = "edp"                 # optional
 # token_file             = "~/.config/crony/secrets/ntfy-token"
+
+# Custom-named ntfy channel that also relays through ntfy's email
+# integration. The transport field is required because the channel
+# name `ntfy-email` doesn't match a built-in transport.
+# [defaults.notify.ntfy-email]
+# transport              = "ntfy"
+# url                    = "https://ntfy.example.com/automation"
+# token_keychain_service = "ntfy-automation"
+# headers                = { "Email" = "you@example.com", "Priority" = "high" }
 
 
 # ----------------------------------------------------------------------------
@@ -379,7 +400,7 @@ class JobTimeoutError(CronyError):
 
 @dataclass
 class NotifyEmail:
-    """SMTP notification settings (used by the embedded SMTP channel)."""
+    """SMTP transport settings."""
 
     to: str
     smtp_host: str
@@ -394,12 +415,32 @@ class NotifyEmail:
 
 @dataclass
 class NotifyNtfy:
-    """ntfy notification settings."""
+    """ntfy transport settings."""
 
     url: str
     token_keychain_service: str | None = None
     token_keychain_account: str | None = None
     token_file: str | None = None
+
+
+@dataclass
+class NotifyChannel:
+    """A user-named notification channel.
+
+    `name` is the identifier the user lists in `notify_channels`.
+    `transport` selects which sender to use (currently "email" or
+    "ntfy"). Exactly one of `email` / `ntfy` is populated based on
+    transport. `headers` is an optional dict of user-supplied
+    headers merged into the message at send time -- see
+    `_send_*_for` for which keys are crony-controlled and may not
+    be overridden.
+    """
+
+    name: str
+    transport: str
+    headers: dict[str, str] = field(default_factory=dict)
+    email: NotifyEmail | None = None
+    ntfy: NotifyNtfy | None = None
 
 
 @dataclass
@@ -409,14 +450,15 @@ class Defaults:
     # Empty list = no external dispatch (log + last-run.json are
     # always written regardless). On non-empty, every listed channel
     # fires per failure; per-channel results are recorded
-    # independently in last-run.json's `notifications` dict.
+    # independently in last-run.json's `notifications` dict. Each
+    # entry must name a key in `notify_channel_defs` below.
     notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
     notify_attach_max_kb: int = 256
     timeout_sec: int = 1800
     log_keep_runs: int = 30
-    notify_email: NotifyEmail | None = None
-    notify_ntfy: NotifyNtfy | None = None
+    # Per-bundle channel definitions: { name -> NotifyChannel }.
+    notify_channel_defs: dict[str, NotifyChannel] = field(default_factory=dict)
 
 
 @dataclass
@@ -758,7 +800,18 @@ _KNOWN_TARGET: frozenset[str] = frozenset(
     }
 )
 
-_KNOWN_NOTIFY_EMAIL: frozenset[str] = frozenset(
+# Channel-level keys -- valid in any [defaults.notify.<name>] block
+# regardless of transport.
+_KNOWN_NOTIFY_CHANNEL: frozenset[str] = frozenset(
+    {
+        "transport",
+        "headers",
+    }
+)
+
+# Transport-specific keys. Valid alongside the channel-level keys
+# inside a [defaults.notify.<name>] block whose transport matches.
+_KNOWN_TRANSPORT_EMAIL: frozenset[str] = frozenset(
     {
         "to",
         "from",
@@ -772,7 +825,7 @@ _KNOWN_NOTIFY_EMAIL: frozenset[str] = frozenset(
     }
 )
 
-_KNOWN_NOTIFY_NTFY: frozenset[str] = frozenset(
+_KNOWN_TRANSPORT_NTFY: frozenset[str] = frozenset(
     {
         "url",
         "token_keychain_service",
@@ -781,15 +834,28 @@ _KNOWN_NOTIFY_NTFY: frozenset[str] = frozenset(
     }
 )
 
-# External notification channels. log-only is no longer a value here:
-# crony always writes run.log + last-run.json regardless, so an empty
-# notify_channels list expresses "no external dispatch" without needing
-# a special sentinel.
-_VALID_NOTIFY_CHANNELS: frozenset[str] = frozenset(
+# Built-in transport names. Channel names that match these are
+# treated as their own transport when `transport=` is omitted (the
+# pre-arbitrary-naming shortcut: [defaults.notify.email] -> ntfy
+# transport with channel name "email"). Channels named anything
+# else must declare `transport=` explicitly.
+_VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
     {
         "email",
         "ntfy",
     }
+)
+
+# Headers crony controls per transport. User-supplied `headers`
+# entries that match (case-insensitively) are rejected at parse
+# time so a config can never silently overwrite them.
+_RESERVED_HEADERS_EMAIL: frozenset[str] = frozenset({"to", "from", "subject"})
+# `filename` is set automatically by _post_ntfy when attach_log is
+# true, so a user `headers = { Filename = ... }` would only take
+# effect on the no-attach path -- reserve it to keep behavior
+# predictable.
+_RESERVED_HEADERS_NTFY: frozenset[str] = frozenset(
+    {"authorization", "tags", "title", "filename"}
 )
 
 _VALID_PLATFORMS: frozenset[str] = frozenset({"darwin", "linux"})
@@ -921,10 +987,10 @@ def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
     return out
 
 
-def _parse_notify_email(raw: dict[str, Any]) -> NotifyEmail:
-    """Parse [defaults.notify.email]."""
-    where = "[defaults.notify.email]"
-    _reject_unknown_keys(raw, _KNOWN_NOTIFY_EMAIL, where)
+def _parse_notify_email_settings(
+    raw: dict[str, Any], where: str
+) -> NotifyEmail:
+    """Parse the email-transport keys from a channel block."""
     to = _typed_field(raw, "to", str, where)
     smtp_host = _typed_field(raw, "smtp_host", str, where)
     smtp_user = _typed_field(raw, "smtp_user", str, where)
@@ -952,10 +1018,8 @@ def _parse_notify_email(raw: dict[str, Any]) -> NotifyEmail:
     )
 
 
-def _parse_notify_ntfy(raw: dict[str, Any]) -> NotifyNtfy:
-    """Parse [defaults.notify.ntfy]."""
-    where = "[defaults.notify.ntfy]"
-    _reject_unknown_keys(raw, _KNOWN_NOTIFY_NTFY, where)
+def _parse_notify_ntfy_settings(raw: dict[str, Any], where: str) -> NotifyNtfy:
+    """Parse the ntfy-transport keys from a channel block."""
     url = _typed_field(raw, "url", str, where)
     if url is None:
         raise ConfigError(f"{where}: 'url' is required")
@@ -968,6 +1032,68 @@ def _parse_notify_ntfy(raw: dict[str, Any]) -> NotifyNtfy:
             raw, "token_keychain_account", str, where
         ),
         token_file=_typed_field(raw, "token_file", str, where),
+    )
+
+
+def _parse_notify_channel(name: str, raw: dict[str, Any]) -> NotifyChannel:
+    """Parse a single [defaults.notify.<name>] block.
+
+    Channel-level keys: `transport` (defaults to the channel name
+    when name is "email" or "ntfy"; required otherwise) and
+    `headers` (optional dict of user-supplied headers).
+    Transport-specific keys live alongside.
+    """
+    where = f"[defaults.notify.{name}]"
+    _validate_name(name, where)
+
+    transport = _typed_field(raw, "transport", str, where)
+    if transport is None:
+        if name in _VALID_NOTIFY_TRANSPORTS:
+            transport = name
+        else:
+            raise ConfigError(
+                f"{where}: 'transport' required for channel {name!r} "
+                f"(only {sorted(_VALID_NOTIFY_TRANSPORTS)} can omit it)"
+            )
+    if transport not in _VALID_NOTIFY_TRANSPORTS:
+        raise ConfigError(
+            f"{where}: transport {transport!r} not in "
+            f"{sorted(_VALID_NOTIFY_TRANSPORTS)}"
+        )
+
+    headers = _string_dict(raw, "headers", where)
+    reserved = (
+        _RESERVED_HEADERS_EMAIL
+        if transport == "email"
+        else _RESERVED_HEADERS_NTFY
+    )
+    for k in headers:
+        if k.lower() in reserved:
+            raise ConfigError(
+                f"{where}: header {k!r} is set by crony and cannot "
+                f"be overridden"
+            )
+
+    # Reject keys outside (channel-level + this transport's keys).
+    transport_keys = (
+        _KNOWN_TRANSPORT_EMAIL
+        if transport == "email"
+        else _KNOWN_TRANSPORT_NTFY
+    )
+    _reject_unknown_keys(raw, _KNOWN_NOTIFY_CHANNEL | transport_keys, where)
+
+    email_cfg: NotifyEmail | None = None
+    ntfy_cfg: NotifyNtfy | None = None
+    if transport == "email":
+        email_cfg = _parse_notify_email_settings(raw, where)
+    else:
+        ntfy_cfg = _parse_notify_ntfy_settings(raw, where)
+    return NotifyChannel(
+        name=name,
+        transport=transport,
+        headers=headers,
+        email=email_cfg,
+        ntfy=ntfy_cfg,
     )
 
 
@@ -984,12 +1110,14 @@ def _positive_int(
 def _parse_notify_channels(
     raw: dict[str, Any], where: str, *, required: bool
 ) -> list[str] | None:
-    """Parse a `notify_channels` list with channel-name validation.
+    """Parse a `notify_channels` list (structural validation only).
 
     `required=True` (Defaults) returns [] when the key is absent.
     `required=False` (Job/Target) returns None when absent so the
     cascade can inherit from a layer below. Duplicate entries and
-    non-string / unknown channel names raise.
+    non-string entries raise. Whether each entry actually resolves
+    to a defined channel is checked later in `_validate_config`,
+    once the bundle's channel definitions are known.
     """
     if "notify_channels" not in raw:
         return [] if required else None
@@ -1001,11 +1129,6 @@ def _parse_notify_channels(
     seen: set[str] = set()
     out: list[str] = []
     for ch in val:
-        if ch not in _VALID_NOTIFY_CHANNELS:
-            raise ConfigError(
-                f"{where}: notify_channels entry {ch!r} not in "
-                f"{sorted(_VALID_NOTIFY_CHANNELS)}"
-            )
         if ch in seen:
             raise ConfigError(
                 f"{where}: notify_channels entry {ch!r} listed twice"
@@ -1020,20 +1143,14 @@ def _parse_defaults(raw: dict[str, Any]) -> Defaults:
     where = "[defaults]"
     _reject_unknown_keys(raw, _KNOWN_DEFAULTS, where)
     channels = _parse_notify_channels(raw, where, required=True)
-    notify_email = None
-    notify_ntfy = None
+    notify_channel_defs: dict[str, NotifyChannel] = {}
     nested = raw.get("notify", {})
     if not isinstance(nested, dict):
         raise ConfigError(f"{where}.notify must be a table (dict)")
     for sub_key, sub_body in nested.items():
-        if sub_key == "email":
-            notify_email = _parse_notify_email(sub_body)
-        elif sub_key == "ntfy":
-            notify_ntfy = _parse_notify_ntfy(sub_body)
-        else:
-            raise ConfigError(
-                f"[defaults.notify.{sub_key}] is not a known channel"
-            )
+        if not isinstance(sub_body, dict):
+            raise ConfigError(f"[defaults.notify.{sub_key}]: must be a table")
+        notify_channel_defs[sub_key] = _parse_notify_channel(sub_key, sub_body)
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
@@ -1044,8 +1161,7 @@ def _parse_defaults(raw: dict[str, Any]) -> Defaults:
         ),
         timeout_sec=_positive_int(raw, "timeout_sec", where, default=1800),
         log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
-        notify_email=notify_email,
-        notify_ntfy=notify_ntfy,
+        notify_channel_defs=notify_channel_defs,
     )
 
 
@@ -1241,6 +1357,33 @@ def _validate_config(config: Config) -> None:
                 f"not referenced by any [job-group.*] (would never "
                 f"fire)"
             )
+
+    # notify_channels references must resolve to defined channels in
+    # this bundle's [defaults.notify.*] section. The reference checks
+    # run only when channels are actually selected somewhere -- an
+    # absent channels list at every layer means the bundle never
+    # dispatches, regardless of what's defined.
+    defined_channels = set(config.defaults.notify_channel_defs.keys())
+
+    def _check(layer_name: str, channels: list[str]) -> None:
+        for ch in channels:
+            if ch not in defined_channels:
+                raise ConfigError(
+                    f"{layer_name}: notify_channels entry {ch!r} "
+                    f"is not defined; expected one of "
+                    f"{sorted(defined_channels) or '[]'}"
+                )
+
+    _check("[defaults]", config.defaults.notify_channels)
+    for jname, job in config.jobs.items():
+        if job.notify_channels is not None:
+            _check(f"[job.{jname}]", job.notify_channels)
+    for tname, target in config.platform_targets.items():
+        if target.notify_channels is not None:
+            _check(f"[target.{tname}]", target.notify_channels)
+    for hname, target in config.host_targets.items():
+        if target.notify_channels is not None:
+            _check(f"[target.host.{hname}]", target.notify_channels)
 
 
 def _load_one_bundle(name: str, path: Path) -> Bundle:
@@ -1805,8 +1948,16 @@ def _build_email_message(
     cfg: NotifyEmail,
     attach_log: bool,
     attach_max_kb: int,
+    extra_headers: dict[str, str] | None = None,
 ) -> EmailMessage:
-    """Construct the RFC822 EmailMessage for a job failure."""
+    """Construct the RFC822 EmailMessage for a job failure.
+
+    `extra_headers` is the channel's user-supplied `headers` dict
+    -- arbitrary headers like `Reply-To` or `X-Priority` to attach
+    to the message. Crony-controlled headers (To / From / Subject)
+    are validated out at parse time, so anything reaching here
+    is safe to set directly.
+    """
     msg = EmailMessage()
     msg["Subject"] = (
         f"[crony/{result.host}] {result.job} {result.exit_class} "
@@ -1814,6 +1965,9 @@ def _build_email_message(
     )
     msg["From"] = cfg.from_addr or cfg.smtp_user
     msg["To"] = cfg.to
+    if extra_headers:
+        for k, v in extra_headers.items():
+            msg[k] = v
     body = _format_summary(result)
     if attach_log and log_text:
         tail, truncated = _truncate_log(log_text, attach_max_kb)
@@ -1847,17 +2001,23 @@ def _post_ntfy(
     log_text: str,
     attach_log: bool,
     attach_max_kb: int,
+    extra_headers: dict[str, str] | None = None,
 ) -> None:
     """POST to ntfy. Body is the log tail when attach_log is true,
     otherwise the human summary. urlopen raises HTTPError on >=400
     responses; the caller's broad except records that as
     notify_error.
+
+    `extra_headers` is the channel's user-supplied `headers` dict
+    -- e.g. `Email = "you@host"` to relay through ntfy's email
+    integration, or `Priority = "urgent"` to bump severity. ntfy's
+    user-facing headers are unconstrained; crony-controlled keys
+    (Authorization / Tags / Title) are filtered out at parse time.
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Title": title,
-        "Tags": f"warning,{exit_class}",
-    }
+    headers = dict(extra_headers) if extra_headers else {}
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Title"] = title
+    headers["Tags"] = f"warning,{exit_class}"
     if attach_log and log_text:
         tail, _trunc = _truncate_log(log_text, attach_max_kb)
         data = tail.encode("utf-8")
@@ -1872,53 +2032,64 @@ def _post_ntfy(
 
 
 def _send_email_for(
-    result: JobRunResult, log_text: str, defaults: Defaults
+    channel: NotifyChannel,
+    result: JobRunResult,
+    log_text: str,
+    defaults: Defaults,
 ) -> None:
-    """Send the failure email. Raises on any error."""
-    if defaults.notify_email is None:
-        raise ConfigError("[defaults.notify.email] not configured")
+    """Send the failure email through the given channel. Raises on any error."""
+    if channel.email is None:
+        raise ConfigError(
+            f"channel {channel.name!r} has no email transport config"
+        )
     password = _retrieve_secret(
-        keychain_service=defaults.notify_email.smtp_pass_keychain_service,
-        keychain_account=defaults.notify_email.smtp_pass_keychain_account,
-        file_path=defaults.notify_email.smtp_pass_file,
+        keychain_service=channel.email.smtp_pass_keychain_service,
+        keychain_account=channel.email.smtp_pass_keychain_account,
+        file_path=channel.email.smtp_pass_file,
     )
     if password is None:
         raise ConfigError(
-            "no SMTP password available (configure "
-            "smtp_pass_keychain_service or smtp_pass_file)"
+            f"channel {channel.name!r}: no SMTP password available "
+            f"(configure smtp_pass_keychain_service or smtp_pass_file)"
         )
     msg = _build_email_message(
         result,
         log_text,
-        defaults.notify_email,
+        channel.email,
         defaults.notify_attach_log,
         defaults.notify_attach_max_kb,
+        extra_headers=channel.headers,
     )
-    _send_email(msg, defaults.notify_email, password)
+    _send_email(msg, channel.email, password)
 
 
 def _send_ntfy_for(
-    result: JobRunResult, log_text: str, defaults: Defaults
+    channel: NotifyChannel,
+    result: JobRunResult,
+    log_text: str,
+    defaults: Defaults,
 ) -> None:
-    """Send the failure ntfy POST. Raises on any error."""
-    if defaults.notify_ntfy is None:
-        raise ConfigError("[defaults.notify.ntfy] not configured")
+    """Send the failure ntfy POST through the given channel. Raises on any error."""
+    if channel.ntfy is None:
+        raise ConfigError(
+            f"channel {channel.name!r} has no ntfy transport config"
+        )
     token = _retrieve_secret(
-        keychain_service=defaults.notify_ntfy.token_keychain_service,
-        keychain_account=defaults.notify_ntfy.token_keychain_account,
-        file_path=defaults.notify_ntfy.token_file,
+        keychain_service=channel.ntfy.token_keychain_service,
+        keychain_account=channel.ntfy.token_keychain_account,
+        file_path=channel.ntfy.token_file,
     )
     if token is None:
         raise ConfigError(
-            "no ntfy token available (configure "
-            "token_keychain_service or token_file)"
+            f"channel {channel.name!r}: no ntfy token available "
+            f"(configure token_keychain_service or token_file)"
         )
     title = (
         f"[crony/{result.host}] {result.job} "
         f"{result.exit_class} (exit {result.exit_code})"
     )
     _post_ntfy(
-        defaults.notify_ntfy,
+        channel.ntfy,
         token,
         title,
         result.exit_class,
@@ -1926,23 +2097,27 @@ def _send_ntfy_for(
         log_text,
         defaults.notify_attach_log,
         defaults.notify_attach_max_kb,
+        extra_headers=channel.headers,
     )
 
 
-# Per-channel sender table. Each entry takes (result, log_text,
-# defaults) and raises on failure. Adding a new channel is one new
-# function plus one entry here.
-_NOTIFY_DISPATCH: dict[str, Callable[[JobRunResult, str, Defaults], None]] = {
+# Per-transport sender table. Each entry takes (channel, result,
+# log_text, defaults) and raises on failure. Adding a new transport
+# is one new function plus one entry here plus a name in
+# _VALID_NOTIFY_TRANSPORTS.
+_NOTIFY_DISPATCH: dict[
+    str,
+    Callable[[NotifyChannel, JobRunResult, str, Defaults], None],
+] = {
     "email": _send_email_for,
     "ntfy": _send_ntfy_for,
 }
 
-# Pin parser-side and dispatcher-side enumerations together so a new
-# channel can never be accepted by the parser but unknown to dispatch
-# (or vice versa). Module-import time assertion is sufficient: both
-# sets are static.
-assert set(_NOTIFY_DISPATCH.keys()) == _VALID_NOTIFY_CHANNELS, (
-    "_NOTIFY_DISPATCH and _VALID_NOTIFY_CHANNELS have drifted"
+# Pin parser-side and dispatcher-side enumerations together so a
+# new transport can never be accepted by the parser but unknown to
+# dispatch (or vice versa).
+assert set(_NOTIFY_DISPATCH.keys()) == _VALID_NOTIFY_TRANSPORTS, (
+    "_NOTIFY_DISPATCH and _VALID_NOTIFY_TRANSPORTS have drifted"
 )
 
 
@@ -1952,25 +2127,33 @@ def _dispatch_notify(
     """Fan out to every channel in result.notifications.
 
     The runner pre-populates result.notifications with the resolved
-    channel set (one entry per channel, sent=False). This function
-    attempts each in order, catching any exception from a single
-    channel so one transport failure can't suppress the others. The
-    wrapped command's exit code remains the primary failure signal;
-    a missed notification is recorded but never propagated.
+    channel set (one entry per channel, sent=False). For each, look
+    up the bundle's channel definition (containing transport +
+    headers + transport config), then dispatch through the
+    transport's sender. Per-channel exceptions are recorded so one
+    failure doesn't suppress the others.
     """
-    for channel in list(result.notifications.keys()):
-        sender = _NOTIFY_DISPATCH.get(channel)
+    for channel_name in list(result.notifications.keys()):
         try:
+            channel = defaults.notify_channel_defs.get(channel_name)
+            if channel is None:
+                raise ConfigError(
+                    f"unknown notify channel: {channel_name!r} "
+                    f"(no [defaults.notify.{channel_name}] block)"
+                )
+            sender = _NOTIFY_DISPATCH.get(channel.transport)
             if sender is None:
-                raise ConfigError(f"unknown notify channel: {channel!r}")
-            sender(result, log_text, defaults)
-            result.notifications[channel] = NotificationResult(
+                raise ConfigError(
+                    f"unknown notify transport: {channel.transport!r}"
+                )
+            sender(channel, result, log_text, defaults)
+            result.notifications[channel_name] = NotificationResult(
                 sent=True, error=None, error_class=None
             )
         except Exception as e:
             # Notify is best-effort; record the failure on this
             # channel and continue with the next one.
-            result.notifications[channel] = NotificationResult(
+            result.notifications[channel_name] = NotificationResult(
                 sent=False,
                 error=f"{type(e).__name__}: {e}",
                 error_class=type(e).__name__,
@@ -3558,70 +3741,92 @@ def _secret_warning(
 def _validate_bundle_warnings(
     bundle: Bundle,
 ) -> list[str]:
-    """Return per-bundle warnings: notify channels listed without
-    config blocks, secret paths that don't resolve, etc."""
+    """Return per-bundle warnings: defined channels whose secrets
+    don't resolve, channels defined but never referenced, etc."""
     warnings: list[str] = []
     config = bundle.config
-    listed_channels: set[str] = set(config.defaults.notify_channels)
+
+    # Walk every layer that might select channels and confirm any
+    # we'll actually try to send through has its secrets resolvable.
+    listed: set[str] = set(config.defaults.notify_channels)
     for j in config.jobs.values():
         if j.notify_channels is not None:
-            listed_channels.update(j.notify_channels)
+            listed.update(j.notify_channels)
     for t in list(config.platform_targets.values()) + list(
         config.host_targets.values()
     ):
         if t.notify_channels is not None:
-            listed_channels.update(t.notify_channels)
+            listed.update(t.notify_channels)
 
-    if "email" in listed_channels:
-        if config.defaults.notify_email is None:
+    for ch_name in sorted(listed):
+        channel = config.defaults.notify_channel_defs.get(ch_name)
+        if channel is None:
+            # Cross-cutting validation already raises on this; be
+            # defensive in case a future caller bypasses it.
             warnings.append(
-                "email channel listed but [defaults.notify.email] "
-                "is not configured"
+                f"channel {ch_name!r} listed but not defined in "
+                f"[defaults.notify.{ch_name}]"
             )
-        else:
-            em = config.defaults.notify_email
+            continue
+        if channel.transport == "email":
+            assert channel.email is not None
+            label = f"channel {ch_name!r}: SMTP password"
             try:
                 secret = _retrieve_secret(
-                    keychain_service=em.smtp_pass_keychain_service,
-                    keychain_account=em.smtp_pass_keychain_account,
-                    file_path=em.smtp_pass_file,
+                    keychain_service=channel.email.smtp_pass_keychain_service,
+                    keychain_account=channel.email.smtp_pass_keychain_account,
+                    file_path=channel.email.smtp_pass_file,
                 )
                 if secret is None:
                     warnings.append(
                         _secret_warning(
-                            "email channel: SMTP password",
-                            keychain_service=em.smtp_pass_keychain_service,
-                            keychain_account=em.smtp_pass_keychain_account,
-                            file_path=em.smtp_pass_file,
+                            label,
+                            keychain_service=(
+                                channel.email.smtp_pass_keychain_service
+                            ),
+                            keychain_account=(
+                                channel.email.smtp_pass_keychain_account
+                            ),
+                            file_path=channel.email.smtp_pass_file,
                         )
                     )
             except PreconditionError as e:
                 warnings.append(str(e))
-    if "ntfy" in listed_channels:
-        if config.defaults.notify_ntfy is None:
-            warnings.append(
-                "ntfy channel listed but [defaults.notify.ntfy] "
-                "is not configured"
-            )
-        else:
-            nt = config.defaults.notify_ntfy
+        elif channel.transport == "ntfy":
+            assert channel.ntfy is not None
+            label = f"channel {ch_name!r}: ntfy token"
             try:
                 token = _retrieve_secret(
-                    keychain_service=nt.token_keychain_service,
-                    keychain_account=nt.token_keychain_account,
-                    file_path=nt.token_file,
+                    keychain_service=channel.ntfy.token_keychain_service,
+                    keychain_account=channel.ntfy.token_keychain_account,
+                    file_path=channel.ntfy.token_file,
                 )
                 if token is None:
                     warnings.append(
                         _secret_warning(
-                            "ntfy channel: token",
-                            keychain_service=nt.token_keychain_service,
-                            keychain_account=nt.token_keychain_account,
-                            file_path=nt.token_file,
+                            label,
+                            keychain_service=(
+                                channel.ntfy.token_keychain_service
+                            ),
+                            keychain_account=(
+                                channel.ntfy.token_keychain_account
+                            ),
+                            file_path=channel.ntfy.token_file,
                         )
                     )
             except PreconditionError as e:
                 warnings.append(str(e))
+
+    # Defined-but-unreferenced channels: not an error (may be staged
+    # for future use), but worth flagging.
+    defined = set(config.defaults.notify_channel_defs.keys())
+    unused = defined - listed
+    for ch_name in sorted(unused):
+        warnings.append(
+            f"channel {ch_name!r} is defined in "
+            f"[defaults.notify.{ch_name}] but never referenced "
+            f"by any notify_channels list"
+        )
 
     if not config.jobs and not config.job_groups:
         warnings.append(

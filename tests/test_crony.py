@@ -201,14 +201,31 @@ class TestSchedule:
 # =============================================================================
 
 
+def _email_block(**overrides: Any) -> dict[str, Any]:
+    """Minimal valid [defaults.notify.email] body, with overrides."""
+    body: dict[str, Any] = {
+        "to": "you@example.com",
+        "smtp_host": "smtp.example.com",
+        "smtp_user": "you",
+    }
+    body.update(overrides)
+    return body
+
+
+def _ntfy_block(**overrides: Any) -> dict[str, Any]:
+    """Minimal valid [defaults.notify.ntfy] body, with overrides."""
+    body: dict[str, Any] = {"url": "https://ntfy.example.com/x"}
+    body.update(overrides)
+    return body
+
+
 class TestParseDefaults:
     def test_empty_config_uses_defaults(self) -> None:
         cfg = crony.parse_config({})
         assert cfg.defaults.notify_channels == []
         assert cfg.defaults.timeout_sec == 1800
         assert cfg.defaults.notify_attach_log is True
-        assert cfg.defaults.notify_email is None
-        assert cfg.defaults.notify_ntfy is None
+        assert cfg.defaults.notify_channel_defs == {}
 
     def test_override_defaults(self) -> None:
         cfg = crony.parse_config(
@@ -219,6 +236,7 @@ class TestParseDefaults:
                     "notify_attach_max_kb": 512,
                     "timeout_sec": 3600,
                     "log_keep_runs": 50,
+                    "notify": {"ntfy": _ntfy_block()},
                 }
             }
         )
@@ -227,9 +245,13 @@ class TestParseDefaults:
         assert cfg.defaults.notify_attach_max_kb == 512
         assert cfg.defaults.timeout_sec == 3600
         assert cfg.defaults.log_keep_runs == 50
+        assert "ntfy" in cfg.defaults.notify_channel_defs
 
-    def test_invalid_notify_channel(self) -> None:
-        with pytest.raises(crony.ConfigError, match="notify_channels"):
+    def test_listed_channel_must_be_defined(self) -> None:
+        # Listing a channel that has no [defaults.notify.<name>]
+        # block is a config error -- the dispatcher would have
+        # nothing to send through.
+        with pytest.raises(crony.ConfigError, match="not defined"):
             crony.parse_config(
                 {"defaults": {"notify_channels": ["carrier-pigeon"]}}
             )
@@ -242,9 +264,18 @@ class TestParseDefaults:
 
     def test_multi_channel_defaults(self) -> None:
         cfg = crony.parse_config(
-            {"defaults": {"notify_channels": ["email", "ntfy"]}}
+            {
+                "defaults": {
+                    "notify_channels": ["email", "ntfy"],
+                    "notify": {
+                        "email": _email_block(),
+                        "ntfy": _ntfy_block(),
+                    },
+                }
+            }
         )
         assert cfg.defaults.notify_channels == ["email", "ntfy"]
+        assert set(cfg.defaults.notify_channel_defs) == {"email", "ntfy"}
 
     def test_legacy_singular_notify_channel_rejected(self) -> None:
         # The pre-multi-channel singular `notify_channel` field is
@@ -258,27 +289,26 @@ class TestParseDefaults:
             {
                 "defaults": {
                     "notify": {
-                        "email": {
-                            "to": "edp@example.com",
-                            "smtp_host": "smtp.example.com",
-                            "smtp_user": "edp",
-                            "smtp_port": 465,
-                            "smtp_starttls": False,
-                            "smtp_pass_keychain_service": "crony-smtp",
-                            "smtp_pass_keychain_account": "edp",
-                        }
+                        "email": _email_block(
+                            to="edp@example.com",
+                            smtp_user="edp",
+                            smtp_port=465,
+                            smtp_starttls=False,
+                            smtp_pass_keychain_service="crony-smtp",
+                            smtp_pass_keychain_account="edp",
+                        )
                     }
                 }
             }
         )
-        assert cfg.defaults.notify_email is not None
-        assert cfg.defaults.notify_email.to == "edp@example.com"
-        assert cfg.defaults.notify_email.smtp_port == 465
-        assert cfg.defaults.notify_email.smtp_starttls is False
-        assert (
-            cfg.defaults.notify_email.smtp_pass_keychain_service == "crony-smtp"
-        )
-        assert cfg.defaults.notify_email.smtp_pass_keychain_account == "edp"
+        ch = cfg.defaults.notify_channel_defs["email"]
+        assert ch.transport == "email"
+        assert ch.email is not None
+        assert ch.email.to == "edp@example.com"
+        assert ch.email.smtp_port == 465
+        assert ch.email.smtp_starttls is False
+        assert ch.email.smtp_pass_keychain_service == "crony-smtp"
+        assert ch.email.smtp_pass_keychain_account == "edp"
 
     def test_notify_email_missing_required(self) -> None:
         with pytest.raises(crony.ConfigError, match="required"):
@@ -291,20 +321,117 @@ class TestParseDefaults:
             {
                 "defaults": {
                     "notify": {
-                        "ntfy": {
-                            "url": "https://ntfy.example.com/x",
-                            "token_keychain_service": "ntfy-token",
-                        }
+                        "ntfy": _ntfy_block(
+                            token_keychain_service="ntfy-token",
+                        )
                     }
                 }
             }
         )
-        assert cfg.defaults.notify_ntfy is not None
-        assert cfg.defaults.notify_ntfy.url == "https://ntfy.example.com/x"
+        ch = cfg.defaults.notify_channel_defs["ntfy"]
+        assert ch.transport == "ntfy"
+        assert ch.ntfy is not None
+        assert ch.ntfy.url == "https://ntfy.example.com/x"
 
-    def test_notify_unknown_subsection(self) -> None:
-        with pytest.raises(crony.ConfigError, match="not a known channel"):
-            crony.parse_config({"defaults": {"notify": {"sms": {}}}})
+    def test_arbitrary_channel_name_requires_transport(self) -> None:
+        # `notify.foo` doesn't match a built-in transport; the user
+        # must declare `transport=`.
+        with pytest.raises(crony.ConfigError, match="transport"):
+            crony.parse_config({"defaults": {"notify": {"foo": _ntfy_block()}}})
+
+    def test_arbitrary_channel_with_transport(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify": {
+                        "ntfy-loud": dict(
+                            _ntfy_block(),
+                            transport="ntfy",
+                            headers={"Priority": "urgent"},
+                        )
+                    }
+                }
+            }
+        )
+        ch = cfg.defaults.notify_channel_defs["ntfy-loud"]
+        assert ch.transport == "ntfy"
+        assert ch.headers == {"Priority": "urgent"}
+        assert ch.ntfy is not None
+        assert ch.ntfy.url == "https://ntfy.example.com/x"
+
+    def test_unknown_transport_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="transport"):
+            crony.parse_config(
+                {
+                    "defaults": {
+                        "notify": {"carrier-pigeon": {"transport": "carrier"}}
+                    }
+                }
+            )
+
+    def test_reserved_email_header_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="cannot be overridden"):
+            crony.parse_config(
+                {
+                    "defaults": {
+                        "notify": {
+                            "email": dict(
+                                _email_block(),
+                                headers={"Subject": "override"},
+                            )
+                        }
+                    }
+                }
+            )
+
+    def test_reserved_ntfy_header_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="cannot be overridden"):
+            crony.parse_config(
+                {
+                    "defaults": {
+                        "notify": {
+                            "ntfy": dict(
+                                _ntfy_block(),
+                                headers={"Tags": "override"},
+                            )
+                        }
+                    }
+                }
+            )
+
+    def test_reserved_ntfy_filename_header_rejected(self) -> None:
+        # _post_ntfy sets Filename itself when attach_log is true;
+        # let user override only on the no-attach path would be
+        # confusing. Reserve to keep behavior consistent.
+        with pytest.raises(crony.ConfigError, match="cannot be overridden"):
+            crony.parse_config(
+                {
+                    "defaults": {
+                        "notify": {
+                            "ntfy": dict(
+                                _ntfy_block(),
+                                headers={"Filename": "custom.log"},
+                            )
+                        }
+                    }
+                }
+            )
+
+    def test_email_headers_pass_through(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify": {
+                        "email": dict(
+                            _email_block(),
+                            headers={"Reply-To": "you@example.com"},
+                        )
+                    }
+                }
+            }
+        )
+        ch = cfg.defaults.notify_channel_defs["email"]
+        assert ch.headers == {"Reply-To": "you@example.com"}
 
 
 class TestParseJob:
@@ -715,7 +842,13 @@ class TestResolution:
     def test_notify_target_wins(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"notify_channels": []},
+                "defaults": {
+                    "notify_channels": [],
+                    "notify": {
+                        "email": _email_block(),
+                        "ntfy": _ntfy_block(),
+                    },
+                },
                 "job": {"a": _job(notify_channels=["email"])},
                 "target": {
                     "darwin": {
@@ -733,7 +866,10 @@ class TestResolution:
     def test_notify_job_overrides_defaults(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"notify_channels": []},
+                "defaults": {
+                    "notify_channels": [],
+                    "notify": {"email": _email_block()},
+                },
                 "job": {"a": _job(notify_channels=["email"])},
                 "target": {"darwin": {"jobs": ["a"]}},
             }
@@ -746,7 +882,10 @@ class TestResolution:
     def test_notify_default_fallback(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"notify_channels": ["ntfy"]},
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {"ntfy": _ntfy_block()},
+                },
                 "job": {"a": _job()},
                 "target": {"darwin": {"jobs": ["a"]}},
             }
@@ -761,7 +900,13 @@ class TestResolution:
         # job-level channels (no inheritance from defaults).
         cfg = crony.parse_config(
             {
-                "defaults": {"notify_channels": ["ntfy"]},
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {
+                        "email": _email_block(),
+                        "ntfy": _ntfy_block(),
+                    },
+                },
                 "job": {"a": _job(notify_channels=["email"])},
                 "target": {
                     "darwin": {
@@ -777,7 +922,13 @@ class TestResolution:
     def test_notify_multi_channel_resolution(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"notify_channels": []},
+                "defaults": {
+                    "notify_channels": [],
+                    "notify": {
+                        "email": _email_block(),
+                        "ntfy": _ntfy_block(),
+                    },
+                },
                 "job": {
                     "a": _job(notify_channels=["email", "ntfy"]),
                 },
@@ -1353,32 +1504,24 @@ class TestRunJobNotify:
         rec = _last_run(h.state, "fail")
         assert rec["notifications"] == {}
 
-    def test_unconfigured_channel_records_error(
+    def test_listing_undefined_channel_rejected_at_parse(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # ntfy channel selected but no [defaults.notify.ntfy] section.
-        # The runner records the misconfiguration in
-        # notifications["ntfy"]["error"] rather than letting the
-        # missing config crash the run.
+        # Listing a channel without a [defaults.notify.<name>] block
+        # is a config error -- cross-cutting validation refuses to
+        # construct a config that would silently drop notifications
+        # at runtime.
         h = _RunnerHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {
-                "defaults": {"notify_channels": ["ntfy"]},
-                "job": {
-                    "fail": {
-                        "command": "exit 1",
-                        "schedule": "daily",
-                    }
+        with pytest.raises(crony.ConfigError, match="not defined"):
+            h.config(
+                {
+                    "defaults": {"notify_channels": ["ntfy"]},
+                    "job": {
+                        "fail": {"command": "exit 1", "schedule": "daily"},
+                    },
                 },
-            },
-            default_target_jobs=["fail"],
-        )
-        crony.run_job(cfg, "fail")
-        rec = _last_run(h.state, "fail")
-        assert "ntfy" in rec["notifications"]
-        n = rec["notifications"]["ntfy"]
-        assert n["sent"] is False
-        assert "not configured" in (n["error"] or "")
+                default_target_jobs=["fail"],
+            )
 
 
 class TestRunGroup:
@@ -1686,6 +1829,50 @@ class TestEmailNotify:
         assert result.notifications["email"].sent is False
         assert "no SMTP password" in (result.notifications["email"].error or "")
 
+    def test_user_headers_attached(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A `headers = { Reply-To = ... }` block on an email channel
+        # should land as headers on the rendered EmailMessage.
+        secret = tmp_path / "smtp-pw"
+        secret.write_text("hunter2")
+        secret.chmod(0o600)
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channels": ["email"],
+                    "notify": {
+                        "email": {
+                            "to": "you@example.com",
+                            "smtp_host": "smtp.example.com",
+                            "smtp_user": "u@example.com",
+                            "smtp_pass_file": str(secret),
+                            "headers": {
+                                "Reply-To": "support@example.com",
+                                "X-Crony-Source": "automation",
+                            },
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channels=["email"])},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        result = self._make_failed_result(["email"])
+        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_inst = smtp_cls.return_value
+        smtp_inst.__enter__.return_value = smtp_inst
+        smtp_inst.__exit__.return_value = None
+        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+
+        crony._dispatch_notify(result, "log", cfg.defaults)
+        assert result.notifications["email"].sent is True
+        sent = smtp_inst.send_message.call_args[0][0]
+        assert sent["Reply-To"] == "support@example.com"
+        assert sent["X-Crony-Source"] == "automation"
+        # crony-controlled headers still in place.
+        assert sent["To"] == "you@example.com"
+
 
 class TestNtfyNotify:
     """ntfy channel routing via urllib (mocked)."""
@@ -1791,6 +1978,62 @@ class TestNtfyNotify:
         assert result.notifications["ntfy"].sent is False
         assert "503" in (result.notifications["ntfy"].error or "")
 
+    def test_user_headers_attached(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A custom-named ntfy channel with `headers = { Email = ... }`
+        # should reach the HTTP POST.
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy-email"],
+                    "notify": {
+                        "ntfy-email": {
+                            "transport": "ntfy",
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                            "headers": {
+                                "Email": "you@example.com",
+                                "Priority": "urgent",
+                            },
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channels=["ntfy-email"])},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        result = self._make_failed_result(["ntfy-email"])
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: Any) -> None:
+                return None
+
+        def _fake_urlopen(req: Any, timeout: Any = None) -> Any:
+            captured["headers"] = dict(req.header_items())
+            return _Resp()
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
+        crony._dispatch_notify(result, "log", cfg.defaults)
+        assert result.notifications["ntfy-email"].sent is True
+        # User headers reached the request. urllib normalizes header
+        # keys via .capitalize().
+        h = captured["headers"]
+        email_h = h.get("Email") or h.get("email")
+        prio_h = h.get("Priority") or h.get("priority")
+        assert email_h == "you@example.com"
+        assert prio_h == "urgent"
+        # crony's controlled headers still set.
+        assert h.get("Authorization") or h.get("authorization")
+        assert h.get("Tags") or h.get("tags")
+
 
 class TestMultiChannelDispatch:
     """`_dispatch_notify` fans out across all configured channels and
@@ -1893,7 +2136,13 @@ class TestNotifyChannelOrderPreserved:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
-                "defaults": {"notify_channels": order},
+                "defaults": {
+                    "notify_channels": order,
+                    "notify": {
+                        "email": _email_block(),
+                        "ntfy": _ntfy_block(),
+                    },
+                },
                 "job": {
                     "fail": {
                         "command": "exit 1",
@@ -1919,14 +2168,21 @@ class TestNotifyTestSubcommand:
         # No channels configured: should not raise.
         crony.do_notify_test(channel=None, bundle=None)
 
-    def test_unconfigured_channel_raises_config_error(
+    def test_unresolvable_secret_raises_config_error(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Missing config bits should surface as CONFIG (3), not the
-        # generic ERROR (4) -- the user can act on config errors.
+        # email channel is fully defined but the SMTP password
+        # source can't be resolved -- this is a config-shaped
+        # failure (the user can fix it), so notify-test surfaces
+        # it as CONFIG (3) rather than ERROR (4).
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config(
-            {"defaults": {"notify_channels": ["email"]}},
+            {
+                "defaults": {
+                    "notify_channels": ["email"],
+                    "notify": {"email": _email_block()},
+                },
+            },
             default_target_jobs=[],
         )
         with pytest.raises(crony.ConfigError, match="notify-test failed"):
@@ -1998,13 +2254,13 @@ class TestNotifyTestSubcommand:
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         # borgadm has no ntfy block. Asking for borgadm.ntfy should
-        # fail because ntfy isn't set up there, which proves we
-        # routed into borgadm and not default.
+        # fail because no channel of that name is defined there,
+        # which proves we routed into borgadm and not default.
         (h.cfg_dropin / "borgadm.toml").write_text(
             "[defaults]\nnotify_channels = []\n",
             encoding="utf-8",
         )
-        with pytest.raises(crony.ConfigError, match="not configured"):
+        with pytest.raises(crony.ConfigError, match="unknown notify channel"):
             crony.do_notify_test(channel="borgadm.ntfy", bundle=None)
 
     def test_bundle_and_channel_mismatch_errors(
@@ -2717,42 +2973,20 @@ class TestValidate:
         out = capsys.readouterr().out
         assert "orphans" in out
 
-    def test_warns_on_listed_channel_without_block(
+    def test_warns_when_referenced_channel_secret_unresolvable(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # ntfy channel listed at the defaults layer but no
-        # [defaults.notify.ntfy] block -- the user has selected a
-        # channel crony has nothing to send through.
+        # The channel is fully defined, but its SMTP password has no
+        # source crony can reach. validate should surface that as a
+        # warning so the user knows the channel won't actually fire.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
             {
-                "defaults": {"notify_channels": ["ntfy"]},
-                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
-            },
-            default_target_jobs=["j"],
-        )
-        with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
-        out = capsys.readouterr().out
-        assert "ntfy channel listed" in out
-        assert "[defaults.notify.ntfy]" in out
-
-    def test_warns_when_channel_listed_only_on_target(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        # Channel is selected only via a target -- the listed_channels
-        # set in do_validate must walk targets too.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        h.config(
-            {
-                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
-                "target": {
-                    "darwin": {
-                        "jobs": ["j"],
-                        "notify_channels": ["email"],
-                    }
+                "defaults": {
+                    "notify_channels": ["email"],
+                    "notify": {"email": _email_block()},
                 },
+                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["j"],
         )
@@ -2760,7 +2994,32 @@ class TestValidate:
             crony.do_validate(bundle=None)
         assert exc.value.code == int(crony.ExitCode.WARNING)
         out = capsys.readouterr().out
-        assert "email channel listed" in out
+        assert "channel 'email'" in out
+        assert "SMTP password" in out
+
+    def test_warns_when_channel_defined_but_never_referenced(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A channel defined in [defaults.notify.<name>] that no
+        # notify_channels list ever names is dead weight. Warn so
+        # the user knows it's a no-op.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": [],
+                    "notify": {"ntfy": _ntfy_block()},
+                },
+                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_validate(bundle=None)
+        assert exc.value.code == int(crony.ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "channel 'ntfy'" in out
+        assert "never referenced" in out
 
     def test_bundle_filter_skips_orphan_check(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
