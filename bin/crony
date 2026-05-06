@@ -1839,6 +1839,32 @@ def _crony_executable() -> str:
     return str(Path(__file__).resolve())
 
 
+def _uv_executable() -> str:
+    """Absolute path to `uv`, baked into platform unit files.
+
+    Platform schedulers (launchd, systemd) start a unit's program
+    with a minimal PATH that does not include $HOME/.local/bin or
+    /opt/homebrew/bin. Crony's PEP 723 shebang `env -S uv run
+    --script` therefore can't find uv and exits 127 before the
+    script even starts. Resolving uv to an absolute path at apply
+    time and writing it directly into the unit's argv sidesteps
+    PATH entirely.
+
+    Errors clearly if uv isn't on the agent's PATH at apply time;
+    a misconfigured environment shouldn't silently render a unit
+    that will fail at run time.
+    """
+    path = shutil.which("uv")
+    if path is None:
+        raise PreconditionError(
+            "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
+            "before running `crony apply`. Platform units bake uv's "
+            "absolute path so launchd / systemd don't have to find it "
+            "on their minimal PATH."
+        )
+    return str(Path(path).resolve())
+
+
 class ExitOutcome(NamedTuple):
     """Outcome of a wrapped subprocess invocation.
 
@@ -2610,9 +2636,23 @@ def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
 
 
 def _render_plist(name: str, schedule: str | None, interval: str | None) -> str:
-    """Render the LaunchAgent plist XML for a job or group."""
+    """Render the LaunchAgent plist XML for a job or group.
+
+    ProgramArguments invokes uv with absolute paths rather than
+    relying on the script's `env -S uv run --script` shebang.
+    launchd's per-agent PATH is `/usr/bin:/bin:/usr/sbin:/sbin`,
+    which doesn't contain uv, so the shebang's `env` lookup fails
+    with exit 127 before crony can run at all.
+    """
     label = _label_for(name)
-    program_args = [_crony_executable(), "run", name]
+    program_args = [
+        _uv_executable(),
+        "run",
+        "--script",
+        _crony_executable(),
+        "run",
+        name,
+    ]
     args_xml = "".join(
         f"        <string>{xml.sax.saxutils.escape(a)}</string>\n"
         for a in program_args
@@ -2656,7 +2696,12 @@ def _render_plist(name: str, schedule: str | None, interval: str | None) -> str:
 
 
 def _render_systemd_service(name: str) -> str:
-    """Render the systemd .service unit. Independent of schedule."""
+    """Render the systemd .service unit. Independent of schedule.
+
+    ExecStart invokes uv with absolute paths -- same reason as for
+    plist (see _render_plist's docstring).
+    """
+    uv_path = _uv_executable()
     crony_path = _crony_executable()
     return (
         "[Unit]\n"
@@ -2664,7 +2709,7 @@ def _render_systemd_service(name: str) -> str:
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={crony_path} run {name}\n"
+        f"ExecStart={uv_path} run --script {crony_path} run {name}\n"
         "WorkingDirectory=%h\n"
     )
 

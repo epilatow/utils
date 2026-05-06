@@ -2417,6 +2417,23 @@ class TestPlistRendering:
         with pytest.raises(crony.ConfigError, match="step / range / list"):
             crony._render_plist("j", "Mon..Fri *-*-* 09:00", None)
 
+    def test_program_args_invoke_uv_with_absolute_path(
+        self, monkeypatch: Any
+    ) -> None:
+        # launchd's per-agent PATH is /usr/bin:/bin:/usr/sbin:/sbin
+        # which doesn't contain ~/.local/bin or homebrew's bin dir,
+        # so the script's `env -S uv run --script` shebang fails to
+        # find uv (exit 127). Render the absolute uv path into
+        # ProgramArguments so the unit doesn't depend on PATH.
+        monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
+        monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
+        plist = crony._render_plist("j", "daily", None)
+        assert "<string>/abs/uv</string>" in plist
+        assert "<string>run</string>" in plist
+        assert "<string>--script</string>" in plist
+        assert "<string>/abs/crony</string>" in plist
+        assert "<string>j</string>" in plist
+
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
@@ -2437,6 +2454,25 @@ class TestSystemdRendering:
     def test_timer_interval(self) -> None:
         timer = crony._render_systemd_timer("j", None, "1h")
         assert "OnUnitActiveSec=1h" in timer
+
+    def test_service_invokes_uv_with_absolute_path(
+        self, monkeypatch: Any
+    ) -> None:
+        # systemd user services run with a minimal default PATH;
+        # render uv's absolute path so the unit doesn't depend on
+        # whoever's PATH happens to contain it (same reason as the
+        # launchd plist case).
+        monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
+        monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
+        svc = crony._render_systemd_service("j")
+        assert "ExecStart=/abs/uv run --script /abs/crony run j" in svc
+
+    def test_uv_executable_errors_when_uv_not_on_path(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony.shutil, "which", lambda name: None)
+        with pytest.raises(crony.PreconditionError, match="uv not found"):
+            crony._uv_executable()
 
 
 class TestApplyDarwin:
