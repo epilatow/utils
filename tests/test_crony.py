@@ -2997,6 +2997,40 @@ class TestStatusReport:
         assert "ghost" in out
         assert "orphan" in out
 
+    def test_long_names_keep_columns_aligned(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Names longer than the historical 30-char JOB column width
+        # used to push later columns out of alignment. The width
+        # should now adapt to the longest name actually printed.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        long_name = "this-is-a-deliberately-long-job-name-for-alignment"
+        cfg = h.config(
+            {
+                "job": {
+                    long_name: {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=[long_name],
+        )
+        crony.apply_one(cfg, long_name)
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[])
+        rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
+        # The header's CONFIG label and every row's state token
+        # (synced / missing / orphan / etc.) should start at the
+        # same column.
+        config_col = rows[0].index("CONFIG")
+        valid_states = {"synced", "stale", "missing", "orphan"}
+        for r in rows[1:]:
+            token = r[config_col:].split(" ", 1)[0]
+            assert token in valid_states, (
+                f"row {r!r} not aligned: col {config_col} -> {token!r}"
+            )
+
 
 # =============================================================================
 # validate / audit / list / logs

@@ -3472,7 +3472,9 @@ def do_status(jobs: list[str]) -> None:
     else:
         full_names = sorted(selected | stamped)
 
-    print(f"{'JOB':30} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+    name_w = max((len(n) for n in full_names), default=0)
+    name_w = max(name_w, len("JOB"))
+    print(f"{'JOB':<{name_w}} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
     for full in full_names:
         bn, short = parse_full_name(full)
         bundle = bundles.by_name(bn)
@@ -3495,7 +3497,7 @@ def do_status(jobs: list[str]) -> None:
             else:
                 sched = _sched_state(full, platform)
         last = _last_run_state(full)
-        print(f"{full:30} {cfg_state:10} {sched:10} {last:10}")
+        print(f"{full:<{name_w}} {cfg_state:10} {sched:10} {last:10}")
 
 
 def do_logs(
@@ -3742,9 +3744,11 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
             print(f"  - {w}")
         print()
     if rows:
-        print(f"{'JOB':30} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+        name_w = max(len(r[0]) for r in rows)
+        name_w = max(name_w, len("JOB"))
+        print(f"{'JOB':<{name_w}} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
         for name, cs, ss, ls in rows:
-            print(f"{name:30} {cs:10} {ss:10} {ls:10}")
+            print(f"{name:<{name_w}} {cs:10} {ss:10} {ls:10}")
 
     raise AuditFailedError(
         f"{len(rows)} job(s) in bad state, {len(warnings)} system warning(s)"
@@ -4065,7 +4069,6 @@ def do_list(bundle: str | None) -> None:
         if bundle is not None
         else list(bundles.bundles)
     )
-    print(f"{'NAME':40} {'KIND':6} {'SCHEDULE':22} {'SELECTED':8}")
     rows: list[tuple[str, str, str, str]] = []
     for b in target_bundles:
         target = resolve_target(b.config, current_host(), platform)
@@ -4084,8 +4087,17 @@ def do_list(bundle: str | None) -> None:
             )
             is_selected = "yes" if short in selected else "no"
             rows.append((full, kind, sched_disp, is_selected))
+    name_w = max((len(r[0]) for r in rows), default=0)
+    name_w = max(name_w, len("NAME"))
+    sched_w = max((len(r[2]) for r in rows), default=0)
+    sched_w = max(sched_w, len("SCHEDULE"))
+    print(
+        f"{'NAME':<{name_w}} {'KIND':6} {'SCHEDULE':<{sched_w}} {'SELECTED':8}"
+    )
     for full, kind, sched_disp, is_selected in sorted(rows):
-        print(f"{full:40} {kind:6} {sched_disp:22} {is_selected:8}")
+        print(
+            f"{full:<{name_w}} {kind:6} {sched_disp:<{sched_w}} {is_selected:8}"
+        )
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
