@@ -247,9 +247,10 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # job sections
 # ----------------------------------------------------------------------------
 # A schedulable unit of work. Either `command` (one-line shell) or
-# `script` (path under the dotfiles repo) is required. A job with
-# no schedule/interval is valid only if some [job-group.*] references
-# it (otherwise it can never fire).
+# `script` (path under the dotfiles repo) is required. Schedule and
+# interval are optional; a job with neither fires only when a
+# scheduled group dispatches it. Validation rejects a target chain
+# that reaches a job through a path with no schedule anywhere.
 
 # [job.brew-update]
 # command   = "brew update && brew upgrade && brew cleanup"
@@ -278,12 +279,21 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # ----------------------------------------------------------------------------
 # job-group sections
 # ----------------------------------------------------------------------------
-# A scheduled sequencer that fires named jobs in order. Has its own
-# schedule but no command/script of its own.
+# A sequencer that fires named jobs (or other groups) in order.
+# Schedule / interval are optional: a group with no schedule is a
+# "transit" group that fires only when a parent group dispatches it.
+# Every chain from a target down through groups to a leaf job must
+# contain a schedule somewhere, or validation rejects it.
 
 # [job-group.daily-updates]
 # schedule = "*-*-* 03:00"
 # jobs     = ["brew-update", "uv-update", "git-pull-utils"]
+
+# Nested group: this one has no schedule of its own; it fires only
+# when the daily-updates group above (or some other scheduled
+# parent) dispatches it.
+# [job-group.uv-updates]
+# jobs = ["uv-update"]
 
 
 # ----------------------------------------------------------------------------
@@ -1231,7 +1241,13 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
 
 
 def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
-    """Parse [job-group.<name>]."""
+    """Parse [job-group.<name>].
+
+    schedule / interval are both optional: a group with neither is a
+    "transit" group that fires only when a parent group dispatches
+    it. Cross-cutting validation (per-target chain) ensures every
+    selected group is reachable from a scheduled root.
+    """
     _validate_name(name, f"[job-group.{name}]")
     where = f"[job-group.{name}]"
     _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
@@ -1243,10 +1259,6 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
     if schedule is not None and interval is not None:
         raise ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
-        )
-    if schedule is None and interval is None:
-        raise ConfigError(
-            f"{where}: must define exactly one of 'schedule' or 'interval'"
         )
     if schedule is not None:
         validate_schedule(schedule)
@@ -1296,19 +1308,15 @@ def _validate_config(config: Config) -> None:
             f"[job.*] and [job-group.*]"
         )
     all_names = set(config.jobs) | set(config.job_groups)
-    # Group children must reference defined jobs (not other groups in v1)
+    # Group children must reference a defined job or group (nested
+    # groups are supported; the chain validation below ensures every
+    # path bottoms out in a schedule).
     for gname, group in config.job_groups.items():
         for child in group.jobs:
-            if child not in config.jobs:
-                if child in config.job_groups:
-                    raise ConfigError(
-                        f"[job-group.{gname}]: 'jobs' references "
-                        f"another group {child!r} (nested groups "
-                        f"are not supported in v1)"
-                    )
+            if child not in all_names:
                 raise ConfigError(
                     f"[job-group.{gname}]: 'jobs' references "
-                    f"undefined job {child!r}"
+                    f"undefined name {child!r}"
                 )
     # Targets reference defined jobs or groups
     for tname, target in config.platform_targets.items():
@@ -1341,22 +1349,49 @@ def _validate_config(config: Config) -> None:
                         f"whose platforms={job.platforms!r} excludes "
                         f"{tname}"
                     )
-    # A job with no schedule and no interval must be referenced by some
-    # group (otherwise it can never fire).
-    referenced_by_group: set[str] = set()
-    for group in config.job_groups.values():
-        referenced_by_group.update(group.jobs)
-    for jname, job in config.jobs.items():
-        if (
-            job.schedule is None
-            and job.interval is None
-            and jname not in referenced_by_group
-        ):
-            raise ConfigError(
-                f"[job.{jname}]: has no schedule/interval and is "
-                f"not referenced by any [job-group.*] (would never "
-                f"fire)"
-            )
+
+    # Per-target chain validation: every path from a target reference
+    # down through groups to a leaf job must contain a schedule/interval
+    # somewhere. This catches both schedule-less jobs that nothing
+    # would dispatch and broken chains where the user added a layer
+    # of grouping but forgot to schedule any of it. Cycle detection
+    # piggy-backs on the same walk.
+    def _walk_chain(
+        ref: str,
+        target_label: str,
+        path: tuple[str, ...],
+        seen_schedule: bool,
+    ) -> None:
+        if ref in path:
+            cycle = " -> ".join(path[path.index(ref) :] + (ref,))
+            raise ConfigError(f"{target_label}: cycle in group chain: {cycle}")
+        path = path + (ref,)
+        if ref in config.jobs:
+            job = config.jobs[ref]
+            scheduled = job.schedule is not None or job.interval is not None
+            if not seen_schedule and not scheduled:
+                raise ConfigError(
+                    f"{target_label}: chain "
+                    f"{' -> '.join(path)} has no schedule "
+                    f"anywhere -- {ref!r} would never fire"
+                )
+            return
+        # Group: recurse with updated seen_schedule.
+        group = config.job_groups[ref]
+        scheduled = group.schedule is not None or group.interval is not None
+        new_seen = seen_schedule or scheduled
+        for child in group.jobs:
+            _walk_chain(child, target_label, path, new_seen)
+
+    targets_to_check: list[tuple[str, Target]] = [
+        (f"[target.{tname}]", t) for tname, t in config.platform_targets.items()
+    ] + [
+        (f"[target.host.{hname}]", t)
+        for hname, t in config.host_targets.items()
+    ]
+    for label, target in targets_to_check:
+        for ref in target.jobs:
+            _walk_chain(ref, label, (), seen_schedule=False)
 
     # notify_channels references must resolve to defined channels in
     # this bundle's [defaults.notify.*] section. The reference checks
@@ -1551,23 +1586,32 @@ def resolve_target(config: Config, host: str, platform: str) -> Target | None:
 def selected_jobs_and_groups(
     config: Config, target: Target | None
 ) -> tuple[set[str], set[str]]:
-    """Compute the set of job names and group names selected by target.
+    """Compute the set of job and group names selected by target.
 
-    Naming a group implicitly selects its constituent jobs, so they
-    don't appear as orphans on this host even though they have no
-    platform unit.
+    A target's `jobs` list names roots; each root's transitive
+    descendants (group children, which may themselves be groups)
+    are also selected so they get stamped on this host and don't
+    appear as orphans. Cycle protection is defensive --
+    `_validate_config` should have already rejected cycles.
     """
     jobs: set[str] = set()
     groups: set[str] = set()
     if target is None:
         return jobs, groups
-    for name in target.jobs:
+
+    def _walk(name: str, seen: set[str]) -> None:
+        if name in seen:
+            return
+        seen = seen | {name}
         if name in config.jobs:
             jobs.add(name)
         elif name in config.job_groups:
             groups.add(name)
             for child in config.job_groups[name].jobs:
-                jobs.add(child)
+                _walk(child, seen)
+
+    for name in target.jobs:
+        _walk(name, set())
     return jobs, groups
 
 
@@ -2679,16 +2723,6 @@ def _compute_unit_hash(name: str, entry: Job | JobGroup, platform: str) -> str:
         h.update(units[fname].encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()
-
-
-def _has_platform_unit(name: str) -> bool:
-    """True iff this entity has a schedulable platform unit on this host.
-
-    Group-only jobs (no schedule, no interval) intentionally do not
-    install a platform unit -- they only ever fire via a group's
-    subprocess re-invocation.
-    """
-    return True  # caller already screened group-only jobs
 
 
 def _activate_unit(

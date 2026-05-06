@@ -563,14 +563,19 @@ class TestParseJobGroup:
                 {"job-group": {"g": {"jobs": [], "schedule": "daily"}}}
             )
 
-    def test_no_schedule_no_interval(self) -> None:
-        with pytest.raises(crony.ConfigError, match="must define exactly one"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {"g": {"jobs": ["a"]}},
-                }
-            )
+    def test_schedule_optional(self) -> None:
+        # A group with no schedule / no interval is a transit group:
+        # it parses fine, but its chains are checked at validate
+        # time (a target referencing it through a path with no
+        # schedule errors).
+        cfg = crony.parse_config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"]}},
+            }
+        )
+        assert cfg.job_groups["g"].schedule is None
+        assert cfg.job_groups["g"].interval is None
 
     def test_both_schedule_and_interval(self) -> None:
         with pytest.raises(crony.ConfigError, match="mutually exclusive"):
@@ -679,21 +684,55 @@ class TestValidateConfig:
                 }
             )
 
-    def test_group_references_undefined_job(self) -> None:
-        with pytest.raises(crony.ConfigError, match="undefined job"):
+    def test_group_references_undefined_name(self) -> None:
+        with pytest.raises(crony.ConfigError, match="undefined name"):
             crony.parse_config(
                 {"job-group": {"g": {"jobs": ["nope"], "schedule": "daily"}}}
             )
 
-    def test_group_references_another_group_v1_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="another group"):
+    def test_nested_groups_supported(self) -> None:
+        # A group can reference another group; only the chain to a
+        # target needs to contain a schedule somewhere.
+        cfg = crony.parse_config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "leaf": {"jobs": ["a"]},
+                    "root": {"jobs": ["leaf"], "schedule": "daily"},
+                },
+                "target": {"darwin": {"jobs": ["root"]}},
+            }
+        )
+        assert "leaf" in cfg.job_groups
+        assert "root" in cfg.job_groups
+        assert cfg.job_groups["leaf"].schedule is None
+        assert cfg.job_groups["root"].schedule == "daily"
+
+    def test_chain_without_schedule_rejected(self) -> None:
+        # A target reaches `a` via a chain with no schedule anywhere:
+        # `a` would never fire, so reject at validate time.
+        with pytest.raises(crony.ConfigError, match="no schedule anywhere"):
             crony.parse_config(
                 {
                     "job": {"a": {"command": "true"}},
                     "job-group": {
-                        "g1": {"jobs": ["a"], "schedule": "daily"},
-                        "g2": {"jobs": ["g1"], "schedule": "daily"},
+                        "leaf": {"jobs": ["a"]},
+                        "root": {"jobs": ["leaf"]},
                     },
+                    "target": {"darwin": {"jobs": ["root"]}},
+                }
+            )
+
+    def test_chain_cycle_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="cycle"):
+            crony.parse_config(
+                {
+                    "job": {"a": {"command": "true"}},
+                    "job-group": {
+                        "g1": {"jobs": ["g2"], "schedule": "daily"},
+                        "g2": {"jobs": ["g1"]},
+                    },
+                    "target": {"darwin": {"jobs": ["g1"]}},
                 }
             )
 
@@ -711,9 +750,27 @@ class TestValidateConfig:
         )
         assert "g" in cfg.job_groups
 
-    def test_unreferenced_group_only_job_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="not referenced"):
-            crony.parse_config({"job": {"a": {"command": "true"}}})
+    def test_unreferenced_schedule_less_job_is_dead_weight(self) -> None:
+        # A schedule-less job not reachable from any target is dead
+        # weight but harmless -- the user might be staging. Validation
+        # only fires when a target reaches a chain without a schedule;
+        # this config has no target, so it parses fine.
+        cfg = crony.parse_config({"job": {"a": {"command": "true"}}})
+        assert "a" in cfg.jobs
+
+    def test_target_reaching_schedule_less_job_directly_rejected(
+        self,
+    ) -> None:
+        # A target referencing a job with no schedule and no chain
+        # to a schedule is the canonical "this would never fire"
+        # case.
+        with pytest.raises(crony.ConfigError, match="no schedule anywhere"):
+            crony.parse_config(
+                {
+                    "job": {"a": {"command": "true"}},
+                    "target": {"darwin": {"jobs": ["a"]}},
+                }
+            )
 
     def test_referenced_group_only_job_ok(self) -> None:
         cfg = crony.parse_config(
