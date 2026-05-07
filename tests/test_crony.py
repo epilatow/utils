@@ -785,16 +785,28 @@ class TestValidateConfig:
         )
         assert "a" in cfg.jobs
 
-    def test_job_platform_excluded_by_target(self) -> None:
-        with pytest.raises(crony.ConfigError, match="excludes"):
-            crony.parse_config(
-                {
-                    "job": {
-                        "a": _job(platforms=["darwin"]),
-                    },
-                    "target": {"linux": {"jobs": ["a"]}},
-                }
-            )
+    def test_platform_filter_is_silent_skip_not_validate_error(
+        self, monkeypatch: Any
+    ) -> None:
+        # Parsing a config that targets a darwin-only job from a
+        # linux target is allowed: filtering happens at selection
+        # time so a single bundle can describe entries for
+        # multiple platforms and each host picks up only its
+        # applicable subset.
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony, "current_host", lambda: "host-l")
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "a": _job(platforms=["darwin"]),
+                },
+                "target": {"linux": {"jobs": ["a"]}},
+            }
+        )
+        # Parse succeeds; selection on linux excludes `a`.
+        target = crony.resolve_target(cfg, "host-l", "linux")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" not in sel_jobs
 
 
 class TestUnknownTopLevel:
@@ -1023,6 +1035,148 @@ class TestResolution:
         )
         target = crony.resolve_target(cfg, "h", "darwin")
         assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
+
+
+class TestSelectionFilters:
+    """Per-entry `platforms` / `hosts` filters silently filter
+    entries out of the selection on incompatible (host, platform).
+    Both Job and JobGroup carry the same fields with the same
+    semantics; a filtered group does not recurse into its
+    children.
+    """
+
+    def _cfg(self, raw: dict[str, Any]) -> Any:
+        return crony.parse_config(raw)
+
+    def test_job_with_matching_platform_selected(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        cfg = self._cfg(
+            {
+                "job": {"a": _job(platforms=["darwin"])},
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "darwin")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" in sel_jobs
+
+    def test_job_with_excluding_platform_filtered_out(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {"a": _job(platforms=["darwin"])},
+                "target": {"linux": {"jobs": ["a"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" not in sel_jobs
+
+    def test_job_hosts_filter(self, monkeypatch: Any) -> None:
+        cfg = self._cfg(
+            {
+                "job": {"a": _job(hosts=["alpha", "beta"])},
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        # On a listed host: selected.
+        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        target = crony.resolve_target(cfg, "alpha", "darwin")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" in sel_jobs
+        # On a non-listed host: filtered out.
+        monkeypatch.setattr(crony, "current_host", lambda: "gamma")
+        target = crony.resolve_target(cfg, "gamma", "darwin")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" not in sel_jobs
+
+    def test_group_filter_skips_recursion(self, monkeypatch: Any) -> None:
+        # When a group's filter excludes the current host /
+        # platform, the walk does not recurse into its children
+        # via that group. A child reachable only through the
+        # filtered group is therefore not selected.
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "platforms": ["darwin"],
+                    },
+                },
+                "target": {"linux": {"jobs": ["g"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g" not in sel_groups
+        assert "a" not in sel_jobs
+
+    def test_filtered_group_child_still_selected_via_other_path(
+        self, monkeypatch: Any
+    ) -> None:
+        # A child reachable through TWO groups -- one filtered
+        # out, one not -- is still selected via the unfiltered
+        # path.
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g_only_darwin": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "platforms": ["darwin"],
+                    },
+                    "g_any": {"jobs": ["a"], "schedule": "daily"},
+                },
+                "target": {"linux": {"jobs": ["g_only_darwin", "g_any"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g_only_darwin" not in sel_groups
+        assert "g_any" in sel_groups
+        assert "a" in sel_jobs
+
+    def test_group_hosts_filter(self, monkeypatch: Any) -> None:
+        cfg = self._cfg(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "hosts": ["alpha"],
+                    },
+                },
+                "target": {"darwin": {"jobs": ["g"]}},
+            }
+        )
+        # On the listed host: group + child selected.
+        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        target = crony.resolve_target(cfg, "alpha", "darwin")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g" in sel_groups
+        assert "a" in sel_jobs
+        # On a different host: group filtered, child not reached.
+        monkeypatch.setattr(crony, "current_host", lambda: "beta")
+        target = crony.resolve_target(cfg, "beta", "darwin")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g" not in sel_groups
+        assert "a" not in sel_jobs
 
 
 # =============================================================================

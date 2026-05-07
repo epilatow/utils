@@ -272,7 +272,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 
 # [job.brew-update]
 # command   = "brew update && brew upgrade && brew cleanup"
-# platforms = ["darwin"]               # applicability filter
+# platforms = ["darwin"]               # filter: skip on non-darwin hosts
+# # hosts   = ["mymac"]                # filter: only on listed hostnames
 # schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
@@ -304,8 +305,10 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # contain a schedule somewhere, or validation rejects it.
 
 # [job-group.daily-updates]
-# schedule = "*-*-* 03:00"
-# jobs     = ["brew-update", "uv-update", "git-pull-utils"]
+# schedule  = "*-*-* 03:00"
+# jobs      = ["brew-update", "uv-update", "git-pull-utils"]
+# # platforms = ["darwin"]             # filter: as on jobs
+# # hosts     = ["mymac"]              # filter: as on jobs
 
 # Nested group: this one has no schedule of its own; it fires only
 # when the daily-updates group above (or some other scheduled
@@ -511,7 +514,13 @@ class Job:
     gate_args: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
+    # Empty list = applies to every platform / host. Non-empty
+    # list = applies only on listed platforms / hosts; otherwise
+    # the entry is silently skipped at selection time (so a
+    # bundle can describe both darwin and linux jobs and have
+    # each host pick up only its applicable subset).
     platforms: list[str] = field(default_factory=list)
+    hosts: list[str] = field(default_factory=list)
     job_timeout_sec: int | None = None
     # None = inherit from target/defaults; [] = explicit empty (this
     # job sends no external notifications even if defaults / target
@@ -536,12 +545,19 @@ class JobGroup:
     reflects the current leaf-level timeouts and gives child
     runners slack to time themselves out before the group's own
     cumulative deadline fires.
+
+    `platforms` / `hosts` work the same way as on Job: empty
+    means "applies everywhere", non-empty restricts selection.
+    A group filtered out doesn't recurse into its children; a
+    child filtered out is skipped while siblings continue.
     """
 
     name: str
     jobs: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
+    platforms: list[str] = field(default_factory=list)
+    hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -821,6 +837,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "schedule",
         "interval",
         "platforms",
+        "hosts",
         "job_timeout_sec",
         "notify_channels",
         "env",
@@ -832,6 +849,8 @@ _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
         "jobs",
         "schedule",
         "interval",
+        "platforms",
+        "hosts",
     }
 )
 
@@ -1005,6 +1024,23 @@ def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
     if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
         raise ConfigError(f"{where}: '{key}' must be a list of strings")
     return list(val)
+
+
+def _parse_platforms_field(raw: dict[str, Any], where: str) -> list[str]:
+    """Parse a `platforms = [...]` field with allowed-value check.
+
+    Both Job and JobGroup carry `platforms`; the allowed values
+    (`darwin`, `linux`) are the same. Hosts have no fixed allow-
+    list -- they're whatever the user names their machines.
+    """
+    platforms = _string_list(raw, "platforms", where)
+    for p in platforms:
+        if p not in _VALID_PLATFORMS:
+            raise ConfigError(
+                f"{where}: platforms entry {p!r} not in "
+                f"{sorted(_VALID_PLATFORMS)}"
+            )
+    return platforms
 
 
 def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
@@ -1244,13 +1280,8 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
-    platforms = _string_list(raw, "platforms", where)
-    for p in platforms:
-        if p not in _VALID_PLATFORMS:
-            raise ConfigError(
-                f"{where}: platforms entry {p!r} not in "
-                f"{sorted(_VALID_PLATFORMS)}"
-            )
+    platforms = _parse_platforms_field(raw, where)
+    hosts = _string_list(raw, "hosts", where)
     channels = _parse_notify_channels(raw, where, required=False)
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec <= 0:
@@ -1266,6 +1297,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
         schedule=schedule,
         interval=interval,
         platforms=platforms,
+        hosts=hosts,
         job_timeout_sec=job_timeout_sec,
         notify_channels=channels,
         env=_string_dict(raw, "env", where),
@@ -1296,11 +1328,15 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
+    platforms = _parse_platforms_field(raw, where)
+    hosts = _string_list(raw, "hosts", where)
     return JobGroup(
         name=name,
         jobs=jobs,
         schedule=schedule,
         interval=interval,
+        platforms=platforms,
+        hosts=hosts,
     )
 
 
@@ -1366,17 +1402,15 @@ def _validate_config(config: Config) -> None:
                     f"[target.host.{hname}]: 'jobs' references "
                     f"undefined name {ref!r}"
                 )
-    # Job platform applicability for targets that reference them
-    for tname, target in config.platform_targets.items():
-        for ref in target.jobs:
-            if ref in config.jobs:
-                job = config.jobs[ref]
-                if job.platforms and tname not in job.platforms:
-                    raise ConfigError(
-                        f"[target.{tname}] references job {ref!r} "
-                        f"whose platforms={job.platforms!r} excludes "
-                        f"{tname}"
-                    )
+    # `platforms` / `hosts` filter at selection time, not at
+    # validate time: a single bundle is allowed to describe both
+    # darwin and linux entries (or per-host overrides) and have
+    # each host pick up only its applicable subset. A
+    # configuration that's contradictory on a given host (e.g. a
+    # target.linux that references a darwin-only entry) just
+    # produces an empty selection on that host -- exactly the
+    # filter-and-skip semantics the cross-platform bundle pattern
+    # needs.
 
     # Per-target chain validation: every path from a target reference
     # down through groups to a leaf job must contain a schedule/interval
@@ -1611,6 +1645,27 @@ def resolve_target(config: Config, host: str, platform: str) -> Target | None:
     return None
 
 
+def _entry_applies_here(
+    platforms: list[str],
+    hosts: list[str],
+    *,
+    host: str,
+    platform: str,
+) -> bool:
+    """True if the entry's `platforms` / `hosts` allow this host.
+
+    Empty list = "applies everywhere" (the common case).
+    Non-empty = restricts selection to listed values. A non-match
+    on either axis filters the entry out at selection time;
+    apply / status / audit then never see it on this host.
+    """
+    if platforms and platform not in platforms:
+        return False
+    if hosts and host not in hosts:
+        return False
+    return True
+
+
 def selected_jobs_and_groups(
     config: Config, target: Target | None
 ) -> tuple[set[str], set[str]]:
@@ -1619,23 +1674,42 @@ def selected_jobs_and_groups(
     A target's `jobs` list names roots; each root's transitive
     descendants (group children, which may themselves be groups)
     are also selected so they get stamped on this host and don't
-    appear as orphans. Cycle protection is defensive --
-    `_validate_config` should have already rejected cycles.
+    appear as orphans. Per-entry `platforms` / `hosts` filters are
+    applied during the walk: a group whose filters exclude the
+    current (host, platform) is skipped without recursion (its
+    children may still appear via other paths if not similarly
+    filtered); a job whose filters exclude is skipped while
+    siblings continue.
+
+    Cycle protection is defensive -- `_validate_config` should
+    have already rejected cycles.
     """
     jobs: set[str] = set()
     groups: set[str] = set()
     if target is None:
         return jobs, groups
+    host = current_host()
+    platform = current_platform()
 
     def _walk(name: str, seen: set[str]) -> None:
         if name in seen:
             return
         seen = seen | {name}
         if name in config.jobs:
+            j = config.jobs[name]
+            if not _entry_applies_here(
+                j.platforms, j.hosts, host=host, platform=platform
+            ):
+                return
             jobs.add(name)
         elif name in config.job_groups:
+            g = config.job_groups[name]
+            if not _entry_applies_here(
+                g.platforms, g.hosts, host=host, platform=platform
+            ):
+                return
             groups.add(name)
-            for child in config.job_groups[name].jobs:
+            for child in g.jobs:
                 _walk(child, seen)
 
     for name in target.jobs:
