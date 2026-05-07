@@ -3320,9 +3320,11 @@ def _activate_unit(
     if platform == "darwin":
         plist = _plist_path_for(name)
         # Validate the plist before asking launchd to load it -- a
-        # parseable failure here is much clearer than launchd's silent
-        # error path.
-        subprocess.run(["plutil", str(plist)], check=True)
+        # parseable failure here is much clearer than launchd's
+        # silent error path. `-s` keeps stdout quiet on success
+        # (default plutil prints `<path>: OK` per file, which
+        # would clutter `apply`'s per-entry output).
+        subprocess.run(["plutil", "-s", str(plist)], check=True)
         # unload-then-load: tolerates "not loaded" (errok) so a clean
         # re-apply over a previously-installed unit just works.
         subprocess.run(
