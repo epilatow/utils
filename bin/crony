@@ -4373,13 +4373,13 @@ def do_apply(jobs: list[str], verbose: bool) -> None:
         bundle, short = by_full[full]
         result = apply_one(bundle.config, short, bundle_name=bundle.name)
         if verbose or result != "unchanged":
-            logger.info("apply %s: %s", full, result)
+            logger.info("%s: %s", full, result)
 
     if remove_orphans:
         orphans = stamped_names() - selected
         for orphan in sorted(orphans):
             destroy_one(orphan)
-            logger.info("apply %s: orphan removed", orphan)
+            logger.info("%s: orphan removed", orphan)
 
 
 def do_destroy(jobs: list[str], purge_state: bool) -> None:
@@ -4424,9 +4424,7 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
                     f"{full}: run in progress; will not destroy"
                 )
         destroy_one(full, purge_state=purge_state)
-        logger.info(
-            "destroy %s%s", full, " --purge-state" if purge_state else ""
-        )
+        logger.info("%s: %s", full, "purged" if purge_state else "destroyed")
 
 
 def _refuse_unscheduled_full(
@@ -4476,7 +4474,7 @@ def do_enable(jobs: list[str]) -> None:
     platform = current_platform()
     for full in normalized:
         _enable_unit(full, platform)
-        logger.info("enable %s", full)
+        logger.info("%s: enabled", full)
 
 
 def do_disable(jobs: list[str]) -> None:
@@ -4502,7 +4500,7 @@ def do_disable(jobs: list[str]) -> None:
     platform = current_platform()
     for full in normalized:
         _disable_unit(full, platform)
-        logger.info("disable %s", full)
+        logger.info("%s: disabled", full)
 
 
 def _trigger_exit_code(rec: dict[str, Any]) -> int:
@@ -4583,7 +4581,7 @@ def do_trigger(
     if not wait:
         for full in normalized:
             _trigger_unit(full, platform)
-            logger.info("trigger %s", full)
+            logger.info("%s: triggered", full)
         return
 
     # Synchronous waiter mode. Resolve per-name timeouts via each
@@ -4616,7 +4614,7 @@ def do_trigger(
         rec = _trigger_unit_sync(full, job_timeout=timeout, trigger_timeout=tt)
         cls = rec.get("exit_class", "ok")
         rc = _trigger_exit_code(rec)
-        logger.info("trigger %s: %s (exit %s)", full, cls, rc)
+        logger.info("%s: %s (exit %s)", full, cls, rc)
         if rc and (not worst_rc or abs(rc) > abs(worst_rc)):
             worst_rc = rc
     if worst_rc:
