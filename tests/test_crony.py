@@ -1775,6 +1775,37 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_code"] == 3
         assert rec["jobs_run"][1]["name"] == h.full("good")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
+        # Group-level rollup: any child failure → "fail" at the
+        # group level (so status / audit reflect the failure
+        # without re-deriving the rollup on every read).
+        assert rec["exit_class"] == "fail"
+
+    def test_group_rollup_is_ok_when_all_children_ok(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["a", "b"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        _stub_trigger_sync(
+            monkeypatch,
+            {
+                h.full("a"): {"exit_code": 0, "exit_class": "ok"},
+                h.full("b"): {"exit_code": 0, "exit_class": "ok"},
+            },
+        )
+        crony.run_group(h.snap(cfg, "g"))
+        rec = _last_run(h.state, "g")
+        assert rec["exit_class"] == "ok"
 
     def test_group_dry_run_skips_children(
         self, tmp_path: Path, monkeypatch: Any
@@ -4063,6 +4094,68 @@ class TestLogs:
                 path=False,
                 latest=True,
             )
+
+
+class TestGroupExitClassRollup:
+    """Direct unit tests for `_rollup_group_exit_class`. Status,
+    audit, and the LAST axis read this rolled-up value from the
+    group's last-run.json instead of re-deriving it; coverage
+    here keeps the precedence ladder honest as new exit_class
+    values get introduced.
+    """
+
+    def _children(self, *classes: str) -> list[Any]:
+        return [
+            crony.GroupChildResult(
+                name=f"default.c{i}", exit_class=cls, exit_code=0
+            )
+            for i, cls in enumerate(classes)
+        ]
+
+    def test_empty_rolls_up_to_ok(self) -> None:
+        assert crony._rollup_group_exit_class([]) == "ok"
+
+    def test_all_ok_rolls_up_to_ok(self) -> None:
+        assert (
+            crony._rollup_group_exit_class(self._children("ok", "ok")) == "ok"
+        )
+
+    def test_gated_treated_as_success(self) -> None:
+        # Gating is per-child intent ("don't run today"), not a
+        # group-level outcome.
+        assert (
+            crony._rollup_group_exit_class(self._children("ok", "gated"))
+            == "ok"
+        )
+        assert (
+            crony._rollup_group_exit_class(self._children("gated", "gated"))
+            == "ok"
+        )
+
+    def test_any_fail_rolls_up_to_fail(self) -> None:
+        assert (
+            crony._rollup_group_exit_class(self._children("ok", "fail"))
+            == "fail"
+        )
+
+    def test_signal_at_fail_grade(self) -> None:
+        # A signaled child surfaces its own exit_class so a
+        # downstream reader can distinguish abort signals from
+        # plain non-zero exits if it cares.
+        assert (
+            crony._rollup_group_exit_class(self._children("ok", "signal"))
+            == "signal"
+        )
+
+    def test_timeout_outranks_fail(self) -> None:
+        # Group with both a fail and a timeout: timeout wins so
+        # the LAST axis surfaces the more severe condition.
+        assert (
+            crony._rollup_group_exit_class(
+                self._children("fail", "timeout", "ok")
+            )
+            == "timeout"
+        )
 
 
 class TestLogHelpers:

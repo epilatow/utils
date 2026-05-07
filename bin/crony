@@ -1945,7 +1945,13 @@ class GroupChildResult:
 
 @dataclass
 class GroupRunResult:
-    """Recorded as last-run.json for each completed group run."""
+    """Recorded as last-run.json for each completed group run.
+
+    `exit_class` is a rollup from `jobs_run`: timeout > fail >
+    signal > gated > ok. The status / audit / list readers
+    consult this single field for the group's LAST axis instead
+    of re-deriving the rollup on every query.
+    """
 
     group: str
     host: str
@@ -1953,8 +1959,38 @@ class GroupRunResult:
     started_at: str
     ended_at: str
     duration_sec: float
+    exit_class: str
     log_path: str
     jobs_run: list[GroupChildResult]
+
+
+def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
+    """Worst-of children's exit_class, with a precedence ladder.
+
+    A group with no children, or one whose children are all `ok`
+    or `gated`, rolls up as `ok`: gating is a per-child concept
+    ("intentionally not run") that doesn't describe a group-level
+    outcome. Any child failure (fail / signal / timeout) surfaces
+    as the worst child's exit_class -- timeout outranks fail /
+    signal so a group with a timed-out child shows TIMEOUT in the
+    status view rather than being masked by a sibling's plain
+    fail.
+    """
+    precedence = {
+        "ok": 0,
+        "gated": 0,
+        "fail": 1,
+        "signal": 1,
+        "timeout": 2,
+    }
+    worst_score = 0
+    worst_class = "ok"
+    for c in children:
+        score = precedence.get(c.exit_class, 1)
+        if score > worst_score:
+            worst_score = score
+            worst_class = c.exit_class
+    return worst_class
 
 
 def _state_dir_for(name: str) -> Path:
@@ -3002,6 +3038,7 @@ def run_group(
                     started_at=started_iso,
                     ended_at=_now_iso(),
                     duration_sec=time.time() - started,
+                    exit_class=_rollup_group_exit_class(children),
                     log_path=str(log_path),
                     jobs_run=children,
                 )
