@@ -3930,17 +3930,23 @@ def _trigger_unit_sync(
     """Fire `full_name` via the platform and wait for completion.
 
     Returns the parsed `last-run.json` dict for the run we observed
-    completing. Raises `TriggerStartTimeout` if no fresh run
-    appears within `trigger_timeout` seconds of the trigger.
+    completing. Raises `TriggerStartTimeout` if no sign of life
+    (no pid file, no fresh last-run.json) appears within
+    `trigger_timeout` seconds of the trigger -- that's the
+    "platform never started anything" detector (broken plist,
+    stalled queue, unloaded unit). Once we've observed activity,
+    the wait is bounded by `job_timeout` (the runner's own
+    wallclock cap) rather than `trigger_timeout`, so a long-
+    running job doesn't get spuriously declared a start failure.
 
     Mechanism: a pre-trigger timestamp T is taken, the platform
     is asked to fire the unit, and the waiter watches for the
     runner's pid (published via `<state>/<full_name>/run.pid`) to
-    exit. When the pid is gone, last-run.json is read; if its
-    `ended_at` is at or after T, the run is "ours" (semantics:
-    the next completion after the trigger). Otherwise we sleep
-    briefly, re-read the pid file, and try again. The
-    pid-watch step uses kernel-level notification (no polling).
+    exit via kqueue / pidfd kernel-level notification. When the
+    pid is gone, last-run.json is read; if its `ended_at` is at
+    or after T, the run is "ours" (semantics: the next completion
+    after the trigger). Otherwise we sleep briefly, re-read the
+    pid file, and try again.
 
     Triggering an already-running unit is a no-op on both
     platforms; the waiter still attaches to the in-flight pid and
@@ -3961,13 +3967,13 @@ def _trigger_unit_sync(
 
     _trigger_unit(full_name, platform)
 
-    deadline_start = time.monotonic() + trigger_timeout
+    started_at = time.monotonic()
     while True:
+        elapsed = time.monotonic() - started_at
         pid = _read_pid_file(pid_path)
-        if pid is not None:
-            _wait_for_pid_exit(pid, timeout=job_timeout)
-            # pid is now gone; check whether the run we observed
-            # is ours (its ended_at >= our pre-trigger ts).
+        # `last-run.json` check goes first so a sub-second run
+        # whose pid file came and went between iterations is
+        # still observable via the file the runner wrote at exit.
         if last_run_path.exists():
             try:
                 rec = json.loads(last_run_path.read_text(encoding="utf-8"))
@@ -3981,7 +3987,19 @@ def _trigger_unit_sync(
                     ended_dt = None
                 if ended_dt is not None and ended_dt >= pre_trigger_dt:
                     return rec
-        if time.monotonic() > deadline_start:
+        if pid is not None:
+            # Activity confirmed; trigger_timeout no longer
+            # applies. Block on kernel-level pid-exit, capped at
+            # the runner's own wallclock budget. After the wait,
+            # loop back to re-read last-run.json (the runner
+            # writes it just before unlinking the pid).
+            remaining_job = max(1.0, job_timeout - elapsed)
+            _wait_for_pid_exit(pid, timeout=remaining_job)
+            continue
+        # No pid and no fresh result: still in the start window.
+        # Bound this state by trigger_timeout so a broken /
+        # unloaded unit fails fast instead of hanging.
+        if elapsed > trigger_timeout:
             raise TriggerStartTimeout(
                 f"trigger of {full_name!r} never produced a fresh "
                 f"run within {trigger_timeout}s"

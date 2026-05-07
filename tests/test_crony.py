@@ -4554,6 +4554,56 @@ class TestTriggerUnitSync:
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 4
 
+    def test_long_run_past_trigger_timeout_still_returns(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Regression: trigger_timeout is the "did the platform
+        # respond?" detector, not a completion deadline. A runner
+        # that takes longer than trigger_timeout to finish must
+        # still be observable -- once we've seen its pid file we
+        # switch to job_timeout-bounded waiting and let the run
+        # complete. Previously the loop's blanket trigger_timeout
+        # would fire even when the runner was actively running,
+        # causing groups to record children as `timeout` even
+        # after the children's own runners completed `ok`.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.state / full
+        sd.mkdir()
+
+        # Stub the platform trigger to write a pid file
+        # immediately. The pid points at the real test process
+        # (which won't exit during the test) -- we additionally
+        # stub `_wait_for_pid_exit` to simulate the runner
+        # finishing AFTER trigger_timeout has already elapsed.
+        (sd / "run.pid").write_text(f"{os.getpid()}\n")
+        wait_calls: list[float] = []
+
+        def _stub_wait(pid: int, timeout: float) -> str:
+            wait_calls.append(timeout)
+            # Simulate the runner completing now: write a fresh
+            # last-run.json and unlink the pid.
+            (sd / "last-run.json").write_text(
+                f'{{"ended_at": "{crony._now_iso()}",'
+                ' "exit_code": 0, "exit_class": "ok"}',
+                encoding="utf-8",
+            )
+            (sd / "run.pid").unlink(missing_ok=True)
+            return "exit"
+
+        monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
+        monkeypatch.setattr(crony, "_wait_for_pid_exit", _stub_wait)
+        rec = crony._trigger_unit_sync(
+            full, job_timeout=120.0, trigger_timeout=1.0
+        )
+        # The runner completed, even though trigger_timeout (1s)
+        # was tighter than what a real-world startup might take.
+        assert rec["exit_class"] == "ok"
+        # The wait was bounded by the larger job_timeout, not
+        # trigger_timeout: confirms the deadline switch happened
+        # once the pid was observed.
+        assert wait_calls and wait_calls[0] > 1.0
+
 
 class TestSnapshotLifecycle:
     """Apply pins runtime parameters into a per-entry snapshot JSON;
