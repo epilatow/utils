@@ -4688,12 +4688,17 @@ def do_logs(
     -l/--latest print only the most recent run's entry (from the
                 last `=== ... ===` header to EOF). Overrides -n /
                 --since; mutually exclusive with --tail.
-    -n N        print the last N lines (default 200)
+    -n N        print the last N lines (default 200). With
+                `--tail`, also controls how many lines of history
+                are shown before live-tailing begins; `-n 0`
+                skips the history.
     -s/--since X
                 parse X as a duration ('1h', '2d') or ISO timestamp
                 and skip log content older than that. Run-header
                 timestamps anchor the cut.
-    -t/--tail   follow appended output (-f semantics) until interrupted.
+    -t/--tail   show the last `-n` lines (default 200) and then
+                follow appended output (-f semantics) until
+                interrupted.
     """
     bn, short = parse_full_name(name)
     full = f"{bn}.{short}"
@@ -4706,7 +4711,7 @@ def do_logs(
     if tail and latest:
         raise UsageError("--tail and --latest are mutually exclusive")
     if tail:
-        _follow_log(log_path)
+        _follow_log(log_path, n=n)
         return
     text = log_path.read_text(encoding="utf-8", errors="replace")
     if latest:
@@ -4725,8 +4730,13 @@ def do_logs(
     sys.stdout.flush()
 
 
-def _follow_log(log_path: Path) -> None:
+def _follow_log(log_path: Path, *, n: int = 0) -> None:
     """tail -f equivalent on the log file.
+
+    Prints the last `n` lines of the file before entering the
+    follow loop (so `crony logs -t` mirrors `tail -f`'s "show
+    history then live-tail" behavior); pass `n=0` to skip the
+    history and start with new content only.
 
     Returns cleanly on Ctrl-C and on a closed downstream pipe so
     `crony logs -t | head` and an interactive interrupt both
@@ -4734,7 +4744,23 @@ def _follow_log(log_path: Path) -> None:
     """
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            f.seek(0, os.SEEK_END)
+            if n > 0:
+                # Print the last `n` lines, then continue from
+                # wherever those landed in the file. Using
+                # readlines() over f then slicing is fine at log
+                # sizes crony manages (run.log rotates per
+                # `log_keep_runs`); a streaming reverse-read
+                # would matter for multi-GB files we don't
+                # produce.
+                lines = f.readlines()
+                tail = lines[-n:] if len(lines) > n else lines
+                try:
+                    sys.stdout.writelines(tail)
+                    sys.stdout.flush()
+                except BrokenPipeError:
+                    return
+            else:
+                f.seek(0, os.SEEK_END)
             while True:
                 line = f.readline()
                 if not line:

@@ -4195,6 +4195,48 @@ class TestLogs:
         # Should return None, not propagate the exception.
         assert crony._follow_log(log) is None
 
+    def test_follow_log_prints_history_before_following(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        capsys: Any,
+    ) -> None:
+        # `tail -f` style: print the last N lines, then live-tail.
+        # The KeyboardInterrupt stub causes the follow loop to bail
+        # immediately, so what's captured is the history alone.
+        log = tmp_path / "run.log"
+        lines = [f"line-{i}\n" for i in range(20)]
+        log.write_text("".join(lines))
+
+        def _interrupt(*args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(crony.time, "sleep", _interrupt)
+        crony._follow_log(log, n=5)
+        out = capsys.readouterr().out
+        # Last 5 lines (15..19) present, earlier lines suppressed.
+        assert "line-19" in out
+        assert "line-15" in out
+        assert "line-14" not in out
+        assert "line-0" not in out
+
+    def test_follow_log_skips_history_when_n_zero(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        capsys: Any,
+    ) -> None:
+        log = tmp_path / "run.log"
+        log.write_text("existing line\n")
+
+        def _interrupt(*args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(crony.time, "sleep", _interrupt)
+        crony._follow_log(log, n=0)
+        out = capsys.readouterr().out
+        assert out == ""
+
     def test_latest_prints_only_the_last_run_entry(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
