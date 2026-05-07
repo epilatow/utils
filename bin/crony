@@ -85,10 +85,11 @@ child through the same mechanism, with a cumulative deadline
 pinned at apply time as 1.05 * sum-of-children's-timeouts.
 
 Apply pins each entry's runtime parameters into a JSON snapshot
-next to the platform unit (`STATE_DIR/installed/<full>.snapshot
-.json`). The runner reads the snapshot, never the live config:
-editing the toml without `apply` therefore has no effect on
-running units, and audit catches any drift via the hash.
+in the entry's state dir (`STATE_DIR/<full>/snapshot.json`,
+alongside `hash`, `run.log`, `last-run.json`, etc.). The runner
+reads the snapshot, never the live config: editing the toml
+without `apply` therefore has no effect on running units, and
+audit catches any drift via the hash.
 
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -958,11 +959,6 @@ _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # themselves contain dots.
 _BUNDLE_NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
-# Names that collide with crony's own state-dir layout. A job named
-# "installed" would be wiped by `destroy --purge-state` (which removes
-# STATE_DIR/<name>/), taking the hash registry with it.
-_RESERVED_NAMES: frozenset[str] = frozenset({"installed"})
-
 
 def _validate_name(name: str, where: str) -> None:
     """Reject names that would break filesystem paths or unit labels."""
@@ -972,8 +968,6 @@ def _validate_name(name: str, where: str) -> None:
             f"[A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, "
             f"empty, or leading punctuation)"
         )
-    if name in _RESERVED_NAMES:
-        raise ConfigError(f"{where}: name {name!r} is reserved by crony")
 
 
 def _validate_bundle_name(name: str, where: str) -> None:
@@ -1771,7 +1765,7 @@ class GroupSnapshot:
 
 
 def _snapshot_path_for(full_name: str) -> Path:
-    return STATE_DIR / "installed" / f"{full_name}.snapshot.json"
+    return STATE_DIR / full_name / "snapshot.json"
 
 
 def _resolve_job_snapshot(
@@ -3092,7 +3086,7 @@ def _timer_path_for(name: str) -> Path:
 
 
 def _hash_path_for(name: str) -> Path:
-    return STATE_DIR / "installed" / f"{name}.hash"
+    return STATE_DIR / name / "hash"
 
 
 def _systemd_unit_name(name: str) -> str:
@@ -3540,8 +3534,13 @@ def apply_one(
 
 
 def destroy_one(name: str, *, purge_state: bool = False) -> None:
-    """Remove a single name's platform unit, hash stamp, and (if
-    --purge-state) state directory. Errok throughout so a partially-
+    """Remove a single name's platform unit and apply-time state.
+
+    Default removes the platform unit files plus `hash` and
+    `snapshot.json` inside the entry's state dir, but preserves
+    the run-time artifacts (run.log, last-run.json, etc.) so a
+    later post-mortem stays possible. `--purge-state` additionally
+    wipes the entire entry dir. Errok throughout so a partially-
     installed unit can still be cleaned up.
     """
     platform = current_platform()
@@ -3551,20 +3550,25 @@ def destroy_one(name: str, *, purge_state: bool = False) -> None:
     else:
         _service_path_for(name).unlink(missing_ok=True)
         _timer_path_for(name).unlink(missing_ok=True)
-    _hash_path_for(name).unlink(missing_ok=True)
-    _snapshot_path_for(name).unlink(missing_ok=True)
     if purge_state:
         sd = STATE_DIR / name
         if sd.exists():
             shutil.rmtree(sd)
+    else:
+        _hash_path_for(name).unlink(missing_ok=True)
+        _snapshot_path_for(name).unlink(missing_ok=True)
 
 
 def stamped_names() -> set[str]:
-    """Names with a hash stamp on this host (i.e., crony installed them)."""
-    inst = STATE_DIR / "installed"
-    if not inst.exists():
+    """Names with a hash stamp on this host (i.e., crony installed them).
+
+    A stamp lives at `STATE_DIR/<full_name>/hash`; per-entry state
+    (logs, last-run.json, snapshot.json, run.lock, run.pid) shares
+    the same directory.
+    """
+    if not STATE_DIR.exists():
         return set()
-    return {p.stem for p in inst.glob("*.hash")}
+    return {d.name for d in STATE_DIR.iterdir() if (d / "hash").is_file()}
 
 
 # =============================================================================

@@ -1205,7 +1205,7 @@ class _RunnerHarness:
         their own snapshot files (not from the parent's config)."""
         snap = self.snap(cfg, short)
         full = self.full(short)
-        p = self.state / "installed" / f"{full}.snapshot.json"
+        p = self.state / full / "snapshot.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         import dataclasses as _dc
         import json as _json
@@ -2893,7 +2893,7 @@ class TestApplyDarwin:
         assert "plutil" in commands
         assert "launchctl" in commands
         # Hash stamp written
-        assert (h.state / "installed" / f"{h.full('j')}.hash").exists()
+        assert (h.state / h.full("j") / "hash").exists()
 
     def test_idempotent_when_unchanged(
         self, tmp_path: Path, monkeypatch: Any
@@ -2951,31 +2951,33 @@ class TestApplyFullSync:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        # Pre-stamp an orphan
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "old.hash").write_text("legacy\n")
+        # Pre-stamp an orphan: an entry's state dir with a `hash`
+        # file but no corresponding config entry. `crony apply`
+        # with no args treats it as an orphan and destroys it.
+        orphan_dir = h.state / "old"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "hash").write_text("legacy\n")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=[])
-        assert (h.state / "installed" / f"{h.full('j')}.hash").exists()
-        assert not (h.state / "installed" / "old.hash").exists()
+        assert (h.state / h.full("j") / "hash").exists()
+        assert not (orphan_dir / "hash").exists()
 
     def test_surgical_apply_leaves_orphans(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "old.hash").write_text("legacy\n")
+        orphan_dir = h.state / "old"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "hash").write_text("legacy\n")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=["j"])
-        assert (h.state / "installed" / "old.hash").exists()  # left alone
+        assert (orphan_dir / "hash").exists()  # left alone
 
 
 class TestDestroy:
@@ -2987,10 +2989,10 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert (h.state / "installed" / f"{h.full('j')}.hash").exists()
+        assert (h.state / h.full("j") / "hash").exists()
         crony.do_destroy(jobs=[], purge_state=False)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert not (h.state / "installed" / f"{h.full('j')}.hash").exists()
+        assert not (h.state / h.full("j") / "hash").exists()
 
     def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -3006,8 +3008,8 @@ class TestDestroy:
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
         crony.do_destroy(jobs=["a"], purge_state=False)
-        assert not (h.state / "installed" / f"{h.full('a')}.hash").exists()
-        assert (h.state / "installed" / f"{h.full('b')}.hash").exists()
+        assert not (h.state / h.full("a") / "hash").exists()
+        assert (h.state / h.full("b") / "hash").exists()
 
     def test_purge_state_removes_state_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -3302,10 +3304,10 @@ class TestConfigState:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        inst = h.state / "installed"
-        inst.mkdir()
-        # Stamp file follows the namespaced shape on disk.
-        (inst / f"{h.full('old')}.hash").write_text("legacy\n")
+        # Stamp the entry on disk: per-entry dir with a `hash` file.
+        orphan_dir = h.state / h.full("old")
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "hash").write_text("legacy\n")
         cfg = h.config({}, default_target_jobs=[])
         assert crony._config_state(cfg, "old", "darwin") == "orphan"
 
@@ -3568,9 +3570,9 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "ghost.hash").write_text("legacy\n")
+        ghost_dir = h.state / "ghost"
+        ghost_dir.mkdir(parents=True)
+        (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
         crony.do_status(jobs=[])
@@ -3635,9 +3637,9 @@ class TestValidate:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "ghost.hash").write_text("legacy\n")
+        ghost_dir = h.state / "ghost"
+        ghost_dir.mkdir(parents=True)
+        (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         with pytest.raises(SystemExit) as exc:
             crony.do_validate(bundle=None)
@@ -3700,9 +3702,9 @@ class TestValidate:
         # ignores them. The orphan stamp here would normally
         # trigger a WARNING; --bundle borgadm should exit clean.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "ghost.hash").write_text("legacy\n")
+        ghost_dir = h.state / "ghost"
+        ghost_dir.mkdir(parents=True)
+        (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
             '[job.foo]\ncommand = "true"\nschedule = "daily"\n',
@@ -3833,9 +3835,9 @@ class TestAudit:
             '[target.darwin]\njobs = ["foo"]\n',
             encoding="utf-8",
         )
-        inst = h.state / "installed"
-        inst.mkdir()
-        (inst / "borgadm.gone.hash").write_text("legacy\n", encoding="utf-8")
+        gone_dir = h.state / "borgadm.gone"
+        gone_dir.mkdir(parents=True)
+        (gone_dir / "hash").write_text("legacy\n", encoding="utf-8")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
         with pytest.raises(crony.AuditFailedError):
             crony.do_audit(exclude_disabled=False, bundle="borgadm")
@@ -4578,7 +4580,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        snap_path = h.state / h.full("j") / "snapshot.json"
         assert snap_path.exists()
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "job"
@@ -4586,6 +4588,24 @@ class TestSnapshotLifecycle:
         assert snap["command"] == "true"
         assert snap["job_timeout_sec"] == 600
         assert snap["schema"] == crony._SNAPSHOT_SCHEMA
+
+    def test_apply_state_is_co_located_in_entry_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The hash and snapshot live alongside per-run artifacts in
+        # the entry's state dir, not in a separate `installed/`
+        # registry. Verify the layout so a refactor doesn't quietly
+        # split them again.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        entry_dir = h.state / h.full("j")
+        assert (entry_dir / "hash").is_file()
+        assert (entry_dir / "snapshot.json").is_file()
+        assert not (h.state / "installed").exists()
 
     def test_apply_writes_group_snapshot_with_pinned_budget(
         self, tmp_path: Path, monkeypatch: Any
@@ -4610,7 +4630,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
         crony.apply_one(cfg, "g")
-        snap_path = h.state / "installed" / f"{h.full('g')}.snapshot.json"
+        snap_path = h.state / h.full("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "group"
         assert snap["children"] == [h.full("a"), h.full("b")]
@@ -4690,7 +4710,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        snap_path = h.state / h.full("j") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # Literal $PATH preserved -- expansion happens at fire time.
         assert snap["env"] == {"PATH": "/extra:$PATH"}
@@ -4762,7 +4782,7 @@ class TestSnapshotLifecycle:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("j")
-        p = h.state / "installed" / f"{full}.snapshot.json"
+        p = h.state / full / "snapshot.json"
         p.parent.mkdir(parents=True)
         # schema=999 simulates a future version we don't support.
         p.write_text(
@@ -4802,7 +4822,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["g"],
         )
         crony.do_apply(jobs=[])
-        snap_path = h.state / "installed" / f"{h.full('g')}.snapshot.json"
+        snap_path = h.state / h.full("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
         assert snap["group_budget_sec"] == 105
@@ -4836,7 +4856,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        snap_path = h.state / h.full("j") / "snapshot.json"
         assert snap_path.exists()
         crony.destroy_one(h.full("j"))
         assert not snap_path.exists()
