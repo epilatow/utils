@@ -1270,6 +1270,65 @@ def _cast_dict(text: str) -> dict[str, Any]:
     return out
 
 
+class TestPathFieldExpansion:
+    """`script`, `args`, `gate_script`, and `gate_args` accept `~` and
+    `$VAR` / `${VAR}`, mirroring how shell-string `command` fields are
+    expanded by `/bin/sh`. Without this, configs that use `$HOME` in
+    a script path fail with a misleading "script not found" error
+    (the literal `$HOME` gets concatenated under CONFIG_DIR).
+    """
+
+    def test_resolve_script_expands_tilde(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/home/user")
+        p = crony._resolve_script("~/bin/foo.sh")
+        assert str(p) == "/home/user/bin/foo.sh"
+
+    def test_resolve_script_expands_dollar_var(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/home/user")
+        p = crony._resolve_script("$HOME/bin/foo.sh")
+        assert str(p) == "/home/user/bin/foo.sh"
+
+    def test_resolve_script_expands_braced_var(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/home/user")
+        p = crony._resolve_script("${HOME}/bin/foo.sh")
+        assert str(p) == "/home/user/bin/foo.sh"
+
+    def test_resolve_script_unresolved_var_stays_literal(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("CRONY_NO_SUCH_VAR", raising=False)
+        # When no expansion applies, the value falls under CONFIG_DIR
+        # as a relative path. The literal `$VAR` is preserved.
+        p = crony._resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
+        assert "$CRONY_NO_SUCH_VAR" in str(p)
+
+    def test_command_argv_expands_args(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/home/user")
+        job = crony.Job(
+            name="j",
+            script="/abs/path.sh",
+            args=["~/data", "$HOME/cache", "--flag"],
+        )
+        argv = crony._command_argv(job)
+        assert argv == [
+            "/abs/path.sh",
+            "/home/user/data",
+            "/home/user/cache",
+            "--flag",
+        ]
+
+    def test_gate_argv_expands_args(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("HOME", "/home/user")
+        job = crony.Job(
+            name="j",
+            command="true",
+            gate_script="/abs/gate.sh",
+            gate_args=["$HOME/state"],
+        )
+        argv = crony._gate_argv(job)
+        assert argv == ["/abs/gate.sh", "/home/user/state"]
+
+
 class TestRuntimeEnvExpansion:
     """`_runtime_env` carries forward shell-essential vars from the
     invoking process (so wrapped commands reach the user's ssh-agent

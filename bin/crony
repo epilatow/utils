@@ -277,7 +277,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 
 # [job.git-pull-utils]
 # script   = "scripts/git-pull.sh"     # path under the dotfiles repo
-# args     = ["~/utils"]               # ~ expanded
+# args     = ["~/utils"]               # `~` and `$VAR` expanded
 # interval = "30min"                   # 30 min after each completion
 
 # Group-only job: no schedule, only fires via [job-group.*].
@@ -1850,9 +1850,22 @@ def _runtime_env(job: Job) -> dict[str, str]:
     return env
 
 
+def _expand_path_field(value: str) -> str:
+    """Expand `~` and `$VAR` / `${VAR}` against os.environ.
+
+    Mirrors the `env` value expansion so script paths and argv
+    elements can refer to `$HOME` / `$XDG_CONFIG_HOME` / etc. the
+    same way a shell-string `command` would. Unresolved variables
+    stay literal (matches `_expand_env_value`'s shell-style
+    behavior). Path-resolution timing means we expand against
+    os.environ, not the per-job runtime env.
+    """
+    return os.path.expandvars(os.path.expanduser(value))
+
+
 def _resolve_script(script: str) -> Path:
     """Resolve a `script` field to an absolute path."""
-    p = Path(os.path.expanduser(script))
+    p = Path(_expand_path_field(script))
     if not p.is_absolute():
         p = (CONFIG_DIR / p).resolve()
     return p
@@ -1865,7 +1878,7 @@ def _command_argv(job: Job) -> list[str]:
     assert job.script is not None
     return [
         str(_resolve_script(job.script)),
-        *(os.path.expanduser(a) for a in job.args),
+        *(_expand_path_field(a) for a in job.args),
     ]
 
 
@@ -1876,7 +1889,7 @@ def _gate_argv(job: Job) -> list[str] | None:
     if job.gate_script is not None:
         return [
             str(_resolve_script(job.gate_script)),
-            *(os.path.expanduser(a) for a in job.gate_args),
+            *(_expand_path_field(a) for a in job.gate_args),
         ]
     return None
 
