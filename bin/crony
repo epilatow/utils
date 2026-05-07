@@ -71,17 +71,24 @@ state via a 3-tuple status:
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
-Plus operational subcommands: status, logs, run, trigger, audit,
+Plus operational subcommands: status, logs, trigger, audit,
 validate, notify-test, list, init, self-test.
 
-`run` invokes the wrapped command directly in the calling process
-(skipping the platform scheduler entirely); `trigger` asks the
-platform (launchd / systemd) to fire the unit immediately, the
-same path a scheduled fire would take. `trigger --wait` blocks
-until the next completion via kernel-level pid-exit notification
-(kqueue on darwin, pidfd_open on linux) -- no polling. Groups
-dispatch each child through the same mechanism, with a
-cumulative deadline of 1.05 * sum-of-children's-timeouts.
+`trigger` asks the platform (launchd / systemd) to fire the unit
+immediately, the same path a scheduled fire would take. To run a
+job ad-hoc, use `crony trigger <name>` -- this guarantees the run
+uses the same execution context (env, gate, timeout, working dir)
+as a scheduled fire. `trigger --wait` blocks until the next
+completion via kernel-level pid-exit notification (kqueue on
+darwin, pidfd_open on linux) -- no polling. Groups dispatch each
+child through the same mechanism, with a cumulative deadline
+pinned at apply time as 1.05 * sum-of-children's-timeouts.
+
+Apply pins each entry's runtime parameters into a JSON snapshot
+next to the platform unit (`STATE_DIR/installed/<full>.snapshot
+.json`). The runner reads the snapshot, never the live config:
+editing the toml without `apply` therefore has no effect on
+running units, and audit catches any drift via the hash.
 
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -90,7 +97,7 @@ Config bundles:
 Bundles are independent: each has its own [defaults], targets, and
 notify config; jobs/groups defined in one bundle don't see another's.
 Job and group names are namespaced as <bundle>.<short>; bare CLI
-input (`crony run foo`) is shorthand for `default.foo` and only
+input (`crony trigger foo`) is shorthand for `default.foo` and only
 ever resolves to the default bundle.
 
 State (logs, locks, last-run records, install hashes) lives at
@@ -184,7 +191,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # Each bundle is independent: its [defaults], targets, groups, and
 # notify config apply only to the jobs defined in the same file.
 # Job and group names are namespaced as <bundle>.<short>; on the
-# CLI, a bare name (`crony run foo`) is shorthand for
+# CLI, a bare name (`crony trigger foo`) is shorthand for
 # `default.foo` and never falls through to other bundles.
 #
 # Schedules use systemd OnCalendar syntax; intervals use systemd
@@ -1701,19 +1708,198 @@ def resolved_group_timeout_sec(
 
 
 # =============================================================================
+# APPLIED SNAPSHOT
+# =============================================================================
+# Apply pins each entry's runtime parameters into a JSON snapshot
+# next to the platform unit. The runner reads the snapshot, never
+# the live config: editing the toml without `apply` therefore has
+# no effect on running units. The hash includes the snapshot so
+# any drift forces a re-apply (and audit catches the mismatch).
+#
+# notify_channels are deliberately NOT pinned -- routing is
+# separable from "what runs", and notify edits should take effect
+# without a re-apply.
+
+
+_SNAPSHOT_SCHEMA: int = 2
+
+
+@dataclass
+class JobSnapshot:
+    """Resolved runtime parameters for a single job. Most fields are
+    final values: paths are pre-expanded (`~` and `$VAR`), timeouts
+    are post-cascade. `env` is the deliberate exception -- it stores
+    the user's literal toml `env` dict (no parent-process overlay,
+    no $VAR expansion). The runner merges it with the inherited
+    process env at fire time. Pinning the inherited env would (a)
+    make the hash unstable across shell sessions, (b) hand the
+    runner whatever SSH_AUTH_SOCK / PATH was in scope when `crony
+    apply` happened to run.
+    """
+
+    schema: int
+    kind: str  # "job"
+    name: str  # full namespaced name
+    command: str | None
+    script: str | None
+    args: list[str]
+    gate: str | None
+    gate_script: str | None
+    gate_args: list[str]
+    env: dict[str, str]
+    job_timeout_sec: int
+
+
+@dataclass
+class GroupSnapshot:
+    """Resolved runtime parameters for a job-group. `children` are
+    full namespaced names; `group_budget_sec` is the pre-padded
+    cumulative deadline computed once at apply time.
+    """
+
+    schema: int
+    kind: str  # "group"
+    name: str  # full namespaced name
+    children: list[str]
+    group_budget_sec: int
+    trigger_timeout_sec: int
+
+
+def _snapshot_path_for(full_name: str) -> Path:
+    return STATE_DIR / "installed" / f"{full_name}.snapshot.json"
+
+
+def _resolve_job_snapshot(
+    config: Config, target: Target | None, job: Job, full_name: str
+) -> JobSnapshot:
+    """Build a JobSnapshot by applying every cascade once."""
+    args = [_expand_path_field(a) for a in job.args]
+    gate_args = [_expand_path_field(a) for a in job.gate_args]
+    script = (
+        str(_resolve_script(job.script)) if job.script is not None else None
+    )
+    gate_script = (
+        str(_resolve_script(job.gate_script))
+        if job.gate_script is not None
+        else None
+    )
+    return JobSnapshot(
+        schema=_SNAPSHOT_SCHEMA,
+        kind="job",
+        name=full_name,
+        command=job.command,
+        script=script,
+        args=args,
+        gate=job.gate,
+        gate_script=gate_script,
+        gate_args=gate_args,
+        env=dict(job.env),
+        job_timeout_sec=resolved_job_timeout_sec(config, target, job),
+    )
+
+
+def _resolve_group_snapshot(
+    config: Config,
+    target: Target | None,
+    group: JobGroup,
+    bundle_name: str,
+    full_name: str,
+) -> GroupSnapshot:
+    """Build a GroupSnapshot. `group_budget_sec` is recomputed from
+    the live config (not from children's pinned snapshots), so an
+    apply pass that walks topologically still produces the right
+    parent budget regardless of children's prior applied state.
+    """
+    children = [f"{bundle_name}.{c}" for c in group.jobs]
+    return GroupSnapshot(
+        schema=_SNAPSHOT_SCHEMA,
+        kind="group",
+        name=full_name,
+        children=children,
+        group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
+        trigger_timeout_sec=config.defaults.trigger_timeout_sec,
+    )
+
+
+def _resolve_snapshot_for(
+    config: Config,
+    short: str,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
+) -> JobSnapshot | GroupSnapshot:
+    """Resolve a snapshot for a single config entry by short name.
+
+    Convenience for callers that have a Config + short name and
+    want the resolved snapshot in one step (apply pipeline + tests
+    that exercise the runner without going through full apply).
+    """
+    full_name = f"{bundle_name}.{short}"
+    target = resolve_target(config, current_host(), current_platform())
+    if short in config.jobs:
+        return _resolve_job_snapshot(
+            config, target, config.jobs[short], full_name
+        )
+    if short in config.job_groups:
+        return _resolve_group_snapshot(
+            config, target, config.job_groups[short], bundle_name, full_name
+        )
+    raise PreconditionError(f"unknown job/group: {short!r}")
+
+
+def _serialize_snapshot(snap: JobSnapshot | GroupSnapshot) -> str:
+    """Stable JSON for hash inclusion: sorted keys, no whitespace
+    variance. Hash stability matters more than human readability
+    -- audit and apply use this same serialization."""
+    return json.dumps(
+        dataclasses.asdict(snap), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _load_snapshot(full_name: str) -> JobSnapshot | GroupSnapshot:
+    """Load and validate a snapshot file. Raises PreconditionError
+    if missing (entry not applied) or schema mismatch (re-apply
+    required)."""
+    p = _snapshot_path_for(full_name)
+    if not p.exists():
+        raise PreconditionError(
+            f"no snapshot for {full_name!r} (run `crony apply` first)"
+        )
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise PreconditionError(
+            f"snapshot for {full_name!r} is unreadable: {e}"
+        ) from e
+    schema = raw.get("schema")
+    if schema != _SNAPSHOT_SCHEMA:
+        raise PreconditionError(
+            f"snapshot for {full_name!r} has schema {schema!r}, "
+            f"expected {_SNAPSHOT_SCHEMA} (re-apply required)"
+        )
+    kind = raw.get("kind")
+    if kind == "job":
+        return JobSnapshot(**raw)
+    if kind == "group":
+        return GroupSnapshot(**raw)
+    raise PreconditionError(
+        f"snapshot for {full_name!r} has unknown kind {kind!r}"
+    )
+
+
+# =============================================================================
 # RUNNER
 # =============================================================================
-# `crony run <name>` dispatches to the per-job pipeline or the group
-# pipeline depending on whether <name> is a job or a job-group. The
-# per-job pipeline acquires a per-job flock, runs the optional gate,
-# execs the main command with a wallclock cap, writes a structured
-# last-run.json record, and dispatches a notification on non-ok exits
-# via the configured channel (log-only, email, or ntfy). The group
-# pipeline acquires a group-level lock and triggers each named child
-# through its own platform unit (launchctl kickstart / systemctl
-# start), waiting synchronously for each to exit via a kqueue or
-# pidfd watcher; per-job notifications happen inside each child's own
-# run.
+# `crony run <name>` is the platform unit's entry point -- launchd /
+# systemd invoke it; it is not a user-facing subcommand. It loads the
+# pinned applied snapshot and dispatches to the per-job pipeline or
+# the group pipeline. The per-job pipeline acquires a per-job flock,
+# runs the optional gate, execs the main command with a wallclock
+# cap, writes a structured last-run.json record, and dispatches a
+# notification on non-ok exits via the configured channel (log-only,
+# email, or ntfy). The group pipeline acquires a group-level lock
+# and triggers each named child through its own platform unit
+# (launchctl kickstart / systemctl start), waiting synchronously for
+# each to exit via a kqueue or pidfd watcher; per-job notifications
+# happen inside each child's own run.
 
 
 @dataclass
@@ -1817,19 +2003,27 @@ def _expand_env_value(raw: str, env: dict[str, str]) -> str:
     return string.Template(raw).safe_substitute(env)
 
 
-def _runtime_env(job: Job) -> dict[str, str]:
+def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
     Carries forward the small set of shell-essential vars from the
-    invoking process and overlays the job's `env` dict so users can
-    inject custom settings without leaking the full parent env.
-    SSH_AUTH_SOCK is included so jobs that need to ssh out (e.g.
-    a remote backup or a git pull from a private repo) can talk to
-    the user's running ssh-agent without the user having to wire it
-    up per-job. Each `env` value is expanded against the running
-    merged env, so a job can write `PATH = "/extra:$PATH"` and have
-    $PATH resolve to the inherited PATH (or to a value an earlier
-    job-env key set).
+    invoking process and overlays `user_env` (the literal dict the
+    user wrote in the toml) on top, so users can inject custom
+    settings without leaking the full parent env. SSH_AUTH_SOCK is
+    included so jobs that need to ssh out (e.g. a remote backup or
+    a git pull from a private repo) can talk to the user's running
+    ssh-agent without the user having to wire it up per-job. Each
+    user_env value is expanded against the running merged env, so a
+    job can write `PATH = "/extra:$PATH"` and have $PATH resolve to
+    the inherited PATH (or to a value an earlier user_env key set).
+
+    Called at runtime, not apply time: the inherited env is process-
+    contextual (SSH_AUTH_SOCK in particular is per-shell-session)
+    and pinning it would (a) make the hash unstable across shells,
+    (b) hand the runner a stale agent socket from whatever shell
+    happened to run `crony apply`. The snapshot stores `user_env`
+    only; this helper produces the merged + expanded env at fire
+    time.
     """
     env: dict[str, str] = {}
     for k in (
@@ -1845,7 +2039,7 @@ def _runtime_env(job: Job) -> dict[str, str]:
         v = os.environ.get(k)
         if v is not None:
             env[k] = v
-    for k, raw in job.env.items():
+    for k, raw in user_env.items():
         env[k] = _expand_env_value(raw, env)
     return env
 
@@ -1871,26 +2065,25 @@ def _resolve_script(script: str) -> Path:
     return p
 
 
-def _command_argv(job: Job) -> list[str]:
-    """argv for the job's main command."""
-    if job.command is not None:
-        return ["/bin/sh", "-c", job.command]
-    assert job.script is not None
-    return [
-        str(_resolve_script(job.script)),
-        *(_expand_path_field(a) for a in job.args),
-    ]
+def _command_argv(snap: JobSnapshot) -> list[str]:
+    """argv for the job's main command, drawn from the snapshot.
+
+    Snapshot fields are pre-resolved at apply time (script paths
+    absolute, `~` and `$VAR` expanded), so this is just argv
+    assembly with no further substitution.
+    """
+    if snap.command is not None:
+        return ["/bin/sh", "-c", snap.command]
+    assert snap.script is not None
+    return [snap.script, *snap.args]
 
 
-def _gate_argv(job: Job) -> list[str] | None:
-    """argv for the job's gate, or None if no gate is configured."""
-    if job.gate is not None:
-        return ["/bin/sh", "-c", job.gate]
-    if job.gate_script is not None:
-        return [
-            str(_resolve_script(job.gate_script)),
-            *(_expand_path_field(a) for a in job.gate_args),
-        ]
+def _gate_argv(snap: JobSnapshot) -> list[str] | None:
+    """argv for the gate, or None if the snapshot has no gate."""
+    if snap.gate is not None:
+        return ["/bin/sh", "-c", snap.gate]
+    if snap.gate_script is not None:
+        return [snap.gate_script, *snap.gate_args]
     return None
 
 
@@ -2360,43 +2553,57 @@ def _dispatch_notify(
             )
 
 
+def _resolve_notify_at_runtime(
+    full_name: str,
+) -> tuple[list[str], Defaults]:
+    """Look up notify channels + bundle defaults from the live config.
+
+    Notify routing is intentionally NOT pinned in the snapshot:
+    edits to notify channels / defaults take effect on the next
+    fire without requiring a re-apply. Falls back gracefully when
+    the toml entry has been removed -- audit will already be
+    flagging the orphan, so log-only here is a coherent degraded
+    behavior.
+    """
+    bn, short = parse_full_name(full_name)
+    try:
+        bundles = load_all_bundles()
+    except (OSError, ConfigError, UsageError):
+        return [], Defaults()
+    bundle = bundles.by_name(bn)
+    if bundle is None:
+        return [], Defaults()
+    config = bundle.config
+    target = resolve_target(config, current_host(), current_platform())
+    job = config.jobs.get(short)
+    if job is None:
+        return list(config.defaults.notify_channels), config.defaults
+    return (
+        resolved_notify_channels(config, target, job),
+        config.defaults,
+    )
+
+
 def run_job(
-    config: Config,
-    name: str,
+    snap: JobSnapshot,
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> int:
-    """Run a single job through the per-job pipeline.
-
-    `name` is the short name (as written in the bundle's TOML).
-    `bundle_name` defaults to "default" so single-bundle callers
-    work unchanged; the full namespaced name `<bundle_name>.<name>`
-    is what lands on disk (state dir, last-run.json, log path).
+    """Run a single job from its applied snapshot.
 
     Returns an exit code suitable for the platform scheduler: the
     wrapped command's exit code on completion (0 on success or any
     nonzero code from the command), ExitCode.LOCK_BUSY on lock
     contention, ExitCode.TIMEOUT on wallclock cap, or 0 for a
-    gated/dry-run skip. Precondition failures (missing script,
-    unselected job, unknown name) are signalled by raising
-    PreconditionError -- cli() maps that to ExitCode.PRECONDITION.
+    gated/dry-run skip. Precondition failures (missing script) are
+    signalled by raising PreconditionError -- cli() maps that to
+    ExitCode.PRECONDITION.
     """
-    if name not in config.jobs:
-        raise PreconditionError(f"unknown job: {name!r}")
-    job = config.jobs[name]
-    full_name = f"{bundle_name}.{name}"
+    full_name = snap.name
 
-    target = resolve_target(config, current_host(), current_platform())
-    selected, _ = selected_jobs_and_groups(config, target)
-    if name not in selected:
-        raise PreconditionError(
-            f"job {full_name!r} is not selected on this host"
-        )
-
-    if job.script is not None:
-        sp = _resolve_script(job.script)
+    if snap.script is not None:
+        sp = Path(snap.script)
         if not sp.exists():
             raise PreconditionError(f"script not found: {sp}")
         if not os.access(sp, os.X_OK):
@@ -2408,9 +2615,12 @@ def run_job(
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
-    notify_channels = resolved_notify_channels(config, target, job)
-    job_timeout_sec = resolved_job_timeout_sec(config, target, job)
-    env = _runtime_env(job)
+    notify_channels, notify_defaults = _resolve_notify_at_runtime(full_name)
+    job_timeout_sec = snap.job_timeout_sec
+    # snap.env stores the user-written env literally; merge with
+    # the inherited (process-contextual) env at fire time so
+    # SSH_AUTH_SOCK and friends reach the wrapped command.
+    env = _runtime_env(snap.env)
     started = time.time()
     started_iso = _now_iso()
     host = current_host()
@@ -2437,7 +2647,7 @@ def run_job(
                 log_file.write(header)
 
                 gate: str = "none"
-                gate_argv = _gate_argv(job)
+                gate_argv = _gate_argv(snap)
                 if gate_argv is not None and not skip_gate:
                     log_file.write(f"gate: {shlex.join(gate_argv)}\n".encode())
                     gate_rc: int
@@ -2480,7 +2690,7 @@ def run_job(
                         )
                         return 0
 
-                argv = _command_argv(job)
+                argv = _command_argv(snap)
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
                 try:
                     rc, sig = _exec_with_timeout(
@@ -2538,7 +2748,7 @@ def run_job(
                         )[-200_000:]
                     except OSError:
                         pass
-                    _dispatch_notify(result, log_text, config.defaults)
+                    _dispatch_notify(result, log_text, notify_defaults)
 
                 _write_last_run(last_run_path, dataclasses.asdict(result))
                 return surfaced_rc
@@ -2553,41 +2763,52 @@ def run_job(
         return int(ExitCode.LOCK_BUSY)
 
 
+def _child_timeout_from_snapshot(child_full_name: str) -> float:
+    """Per-child wait cap for the group runner. Reads the child's
+    pinned snapshot rather than the live config, so the cap is
+    consistent with what the child's own runner will enforce.
+    Falls back to a generous default if the child snapshot is
+    missing -- that's an audit-flagged condition, but the trigger
+    itself will fail fast and the group's group_budget_sec still
+    bounds the wait.
+    """
+    try:
+        cs = _load_snapshot(child_full_name)
+    except PreconditionError:
+        return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
+    if isinstance(cs, JobSnapshot):
+        return float(cs.job_timeout_sec)
+    return float(cs.group_budget_sec)
+
+
+_DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
+
+
 def run_group(
-    config: Config,
-    name: str,
+    snap: GroupSnapshot,
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> int:
-    """Run a job-group: fire each child through the platform
-    scheduler in order, waiting for completion via kernel-level
-    pid-exit notification.
+    """Run a job-group from its applied snapshot.
 
-    Children fire sequentially via `_trigger_unit_sync`, which
-    asks the platform (launchd / systemd) to start the child's
-    unit and watches its `run.pid` for exit. The group's runner
-    enforces a cumulative deadline (the group's auto-computed
-    effective timeout); when the budget is exhausted, the loop
-    stops dispatching new children -- already-running children
-    keep running independently in their own runner processes.
+    Fires each child through the platform scheduler in order,
+    waiting for completion via kernel-level pid-exit notification
+    (`_trigger_unit_sync`). The group's `run.log` becomes a
+    sequencer trace (fired/finished lines per child); child
+    stdout/stderr stays in each child's own log. The group never
+    sends notifications; each child's own runner handles notify
+    per the cascade.
 
-    The group's `run.log` becomes a sequencer trace
-    (fired/finished lines per child); child stdout/stderr stays
-    in the child's own log. The group never sends notifications;
-    each child's own runner handles notify per the cascade.
-
-    `skip_gate` is intentionally unused for the platform-mediated
-    dispatch path -- the child's runner reads the toml at fire
-    time and applies the cascade itself.
+    The cumulative deadline (`snap.group_budget_sec`) was pinned
+    at apply time. Per-child wait cap pulls the child's pinned
+    timeout from its own snapshot so cap and child enforcement
+    agree. `skip_gate` is intentionally unused -- the child's
+    runner reads its own snapshot and applies the gate itself.
     """
-    if name not in config.job_groups:
-        raise PreconditionError(f"unknown group: {name!r}")
-    group = config.job_groups[name]
-    full_name = f"{bundle_name}.{name}"
-    target = resolve_target(config, current_host(), current_platform())
-    group_budget = resolved_group_timeout_sec(config, target, name)
+    full_name = snap.name
+    group_budget = snap.group_budget_sec
+    trigger_timeout = snap.trigger_timeout_sec
 
     sd = _state_dir_for(full_name)
     lock_path = sd / "run.lock"
@@ -2599,7 +2820,6 @@ def run_group(
     started_iso = _now_iso()
     host = current_host()
     platform = current_platform()
-    trigger_timeout = config.defaults.trigger_timeout_sec
 
     try:
         with _acquire_lock(lock_path):
@@ -2610,7 +2830,7 @@ def run_group(
             log_file = open(log_path, "ab", buffering=0)
             children: list[GroupChildResult] = []
             try:
-                child_full = [f"{bundle_name}.{c}" for c in group.jobs]
+                child_full = list(snap.children)
                 header = (
                     f"\n=== {started_iso} group {full_name} "
                     f"budget={group_budget}s "
@@ -2619,7 +2839,7 @@ def run_group(
                 log_file.write(header)
 
                 deadline = time.monotonic() + group_budget
-                for child_short, child_full_name in zip(group.jobs, child_full):
+                for child_full_name in child_full:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         log_file.write(
@@ -2637,20 +2857,9 @@ def run_group(
                         )
                         continue
 
-                    # Compute the child's own effective timeout so we
-                    # cap the wait at min(child timeout, remaining
-                    # group budget). This is what gives child
-                    # runners a chance to time themselves out and
-                    # write their own last-run.json before the
-                    # group's deadline fires.
-                    if child_short in config.jobs:
-                        child_timeout: float = resolved_job_timeout_sec(
-                            config, target, config.jobs[child_short]
-                        )
-                    else:
-                        child_timeout = resolved_group_timeout_sec(
-                            config, target, child_short
-                        )
+                    child_timeout = _child_timeout_from_snapshot(
+                        child_full_name
+                    )
                     child_wait = min(child_timeout, remaining)
 
                     log_file.write(
@@ -2960,8 +3169,19 @@ def _entity_schedule(
     return entry.schedule, entry.interval
 
 
-def _compute_unit_hash(name: str, entry: Job | JobGroup, platform: str) -> str:
-    """SHA-256 of rendered unit content; the drift-detection signal."""
+def _compute_unit_hash(
+    name: str,
+    entry: Job | JobGroup,
+    platform: str,
+    snapshot: JobSnapshot | GroupSnapshot,
+) -> str:
+    """SHA-256 of rendered unit content + serialized snapshot.
+
+    The snapshot covers everything the runner consumes (command,
+    gate, env, timeouts, group children + budget); including it
+    in the hash means an edit to any of those fields flips the
+    hash, so apply reports updated and audit catches drift.
+    """
     schedule, interval = _entity_schedule(entry)
     units = _render_units(name, schedule, interval, platform)
     h = hashlib.sha256()
@@ -2970,6 +3190,8 @@ def _compute_unit_hash(name: str, entry: Job | JobGroup, platform: str) -> str:
         h.update(b"\0")
         h.update(units[fname].encode("utf-8"))
         h.update(b"\0")
+    h.update(b"snapshot\0")
+    h.update(_serialize_snapshot(snapshot).encode("utf-8"))
     return h.hexdigest()
 
 
@@ -3104,7 +3326,17 @@ def apply_one(
     schedule, interval = _entity_schedule(entry)
     platform = current_platform()
     hash_path = _hash_path_for(full_name)
-    new_hash = _compute_unit_hash(full_name, entry, platform)
+    snapshot_path = _snapshot_path_for(full_name)
+    target = resolve_target(config, current_host(), platform)
+    if isinstance(entry, Job):
+        snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
+            config, target, entry, full_name
+        )
+    else:
+        snapshot = _resolve_group_snapshot(
+            config, target, entry, bundle_name, full_name
+        )
+    new_hash = _compute_unit_hash(full_name, entry, platform, snapshot)
     old_hash = hash_path.read_text().strip() if hash_path.exists() else None
 
     if old_hash == new_hash:
@@ -3152,6 +3384,17 @@ def apply_one(
         scheduled=schedule is not None or interval is not None,
     )
 
+    # Snapshot first, hash second: a stale snapshot without a
+    # matching hash is detectable by audit (hash mismatch); the
+    # reverse (hash present, snapshot missing) would let the
+    # runner fail to load the snapshot on a fire it should have
+    # been able to handle.
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(dataclasses.asdict(snapshot), indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
     hash_path.parent.mkdir(parents=True, exist_ok=True)
     hash_path.write_text(new_hash + "\n", encoding="utf-8")
     return "added" if old_hash is None else "updated"
@@ -3170,6 +3413,7 @@ def destroy_one(name: str, *, purge_state: bool = False) -> None:
         _service_path_for(name).unlink(missing_ok=True)
         _timer_path_for(name).unlink(missing_ok=True)
     _hash_path_for(name).unlink(missing_ok=True)
+    _snapshot_path_for(name).unlink(missing_ok=True)
     if purge_state:
         sd = STATE_DIR / name
         if sd.exists():
@@ -3411,7 +3655,15 @@ def _config_state_for(
     if not in_config and not has_stamp:
         return "missing"
     entry: Job | JobGroup = config.jobs.get(short) or config.job_groups[short]
-    new_hash = _compute_unit_hash(full_name, entry, platform)
+    bn, _ = parse_full_name(full_name)
+    target = resolve_target(config, current_host(), platform)
+    if isinstance(entry, Job):
+        snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
+            config, target, entry, full_name
+        )
+    else:
+        snapshot = _resolve_group_snapshot(config, target, entry, bn, full_name)
+    new_hash = _compute_unit_hash(full_name, entry, platform, snapshot)
     old_hash = _hash_path_for(full_name).read_text(encoding="utf-8").strip()
     return "synced" if old_hash == new_hash else "stale"
 
@@ -3654,6 +3906,76 @@ def _selected_full_names_per_bundle(
     return by_full, set(by_full.keys())
 
 
+def _expand_apply_subtree(
+    by_full: dict[str, tuple[Bundle, str]], full_names: list[str]
+) -> list[str]:
+    """Expand each name to include its transitive group children.
+
+    `crony apply <group>` cascades to the group's children so the
+    group's snapshot reflects each child's freshly-applied state.
+    Children outside the current host's selection are silently
+    skipped (they shouldn't have units installed here).
+    """
+    seen: set[str] = set()
+
+    def walk(full: str) -> None:
+        if full in seen or full not in by_full:
+            return
+        seen.add(full)
+        bundle, short = by_full[full]
+        group = bundle.config.job_groups.get(short)
+        if group is None:
+            return
+        for child_short in group.jobs:
+            walk(bundle.full_name(child_short))
+
+    for f in full_names:
+        walk(f)
+    return sorted(seen)
+
+
+def _topo_apply_order(
+    by_full: dict[str, tuple[Bundle, str]], full_names: list[str]
+) -> list[str]:
+    """Order names so each group's children are applied first.
+
+    Groups depend on their children (the group's snapshot pulls
+    `group_budget_sec` from the children's resolved timeouts via
+    the live config; ordering leaves-first keeps both pinned and
+    in-progress state consistent within the same apply pass).
+
+    `_validate_config` rejects cycles, so a real cycle here is
+    defensive: if the in-degree never drops to zero, fall back to
+    input order (the apply itself will fail loudly on whatever
+    inconsistency the cycle implies).
+    """
+    pool = set(full_names)
+    indeg: dict[str, int] = {n: 0 for n in pool}
+    parents: dict[str, list[str]] = {n: [] for n in pool}
+    for full in pool:
+        bundle, short = by_full[full]
+        group = bundle.config.job_groups.get(short)
+        if group is None:
+            continue
+        for child_short in group.jobs:
+            child_full = bundle.full_name(child_short)
+            if child_full in pool:
+                indeg[full] += 1
+                parents[child_full].append(full)
+    queue = sorted(n for n, d in indeg.items() if d == 0)
+    out: list[str] = []
+    while queue:
+        n = queue.pop(0)
+        out.append(n)
+        for parent in sorted(parents[n]):
+            indeg[parent] -= 1
+            if indeg[parent] == 0:
+                queue.append(parent)
+    if len(out) != len(pool):
+        return list(full_names)
+    return out
+
+
 def do_apply(jobs: list[str]) -> None:
     """Render and activate platform units to match config.
 
@@ -3680,11 +4002,19 @@ def do_apply(jobs: list[str]) -> None:
             raise UsageError(
                 f"unknown or unselected on this host: {sorted(unknown)}"
             )
-        full_names_to_apply = normalized
+        # Cascade `crony apply <group>` to the group's transitive
+        # children so the group's snapshot reflects each child's
+        # freshly-applied state.
+        full_names_to_apply = _expand_apply_subtree(by_full, normalized)
         remove_orphans = False
     else:
         full_names_to_apply = sorted(selected)
         remove_orphans = True
+
+    # Topological sort: leaves first, so each group's snapshot is
+    # computed against children whose own snapshots have already
+    # landed in this apply pass.
+    full_names_to_apply = _topo_apply_order(by_full, full_names_to_apply)
 
     # Pre-pass: render every selected entry so a darwin-specific
     # OnCalendar limitation (step / range / list) surfaces before we
@@ -3869,15 +4199,15 @@ def do_trigger(
 ) -> None:
     """Ask the platform scheduler to fire the named jobs.
 
-    Distinct from `crony run`, which executes the job's wrapped
-    command directly in the calling process tree (skipping the
-    platform scheduler entirely). `trigger` exercises the same
-    launchd / systemd path the schedule would, useful for testing
-    that the platform unit is wired up correctly without waiting
-    for the next scheduled fire. Works on every stamped entry,
-    including transit groups and group-only jobs (every entry
-    installs a platform unit; schedule-less entries' units just sit
-    dormant until kickstarted).
+    `trigger` exercises the same launchd / systemd path a
+    scheduled fire would, so the run uses the exact execution
+    context (env, working dir, signal handling) the next
+    scheduled invocation would use. This is the user-facing way
+    to do an immediate run; the underlying `run` subcommand is
+    the platform unit's entry point and not user-facing. Works
+    on every stamped entry, including transit groups and group-
+    only jobs (every entry installs a platform unit; schedule-
+    less entries' units just sit dormant until kickstarted).
 
     Default mode is async (matches `launchctl kickstart` /
     `systemctl start`): the trigger returns as soon as the
@@ -4132,42 +4462,22 @@ def _filter_since(text: str, since: str) -> str:
 
 
 def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
-    """Runner shim. Platform schedulers invoke this.
+    """Runner shim. Platform schedulers invoke this; not user-facing.
 
     `name` is the full namespaced name (`<bundle>.<short>`); bare
-    input is shorthand for `default.<short>`. Resolves whether the
-    short name is a job or a job-group within the named bundle and
-    dispatches to the appropriate pipeline. The wrapped command's
-    exit code is surfaced via SystemExit so it propagates to
-    launchd/systemd; cli() converts that into the process exit.
+    input is shorthand for `default.<short>`. Loads the pinned
+    snapshot written by the most recent apply and dispatches to
+    the per-job or per-group pipeline. The wrapped command's exit
+    code is surfaced via SystemExit so it propagates to launchd /
+    systemd; cli() converts that into the process exit.
     """
     bn, short = parse_full_name(name)
-    bundles = load_all_bundles()
-    bundle = bundles.by_name(bn)
-    if bundle is None:
-        raise UsageError(f"unknown bundle: {bn!r} (in {name!r})")
-    config = bundle.config
-    if short in config.jobs and short in config.job_groups:
-        # Validate already rejects collisions, but be defensive.
-        raise ConfigError(f"name {short!r} is both a job and a group")
-    if short in config.jobs:
-        rc = run_job(
-            config,
-            short,
-            dry_run=dry_run,
-            skip_gate=skip_gate,
-            bundle_name=bundle.name,
-        )
-    elif short in config.job_groups:
-        rc = run_group(
-            config,
-            short,
-            dry_run=dry_run,
-            skip_gate=skip_gate,
-            bundle_name=bundle.name,
-        )
+    full_name = f"{bn}.{short}"
+    snap = _load_snapshot(full_name)
+    if isinstance(snap, JobSnapshot):
+        rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
-        raise UsageError(f"unknown job or group: {name!r}")
+        rc = run_group(snap, dry_run=dry_run, skip_gate=skip_gate)
     raise SystemExit(rc)
 
 
@@ -4640,7 +4950,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=f"{ExitCode.epilog()}\n\n{_CRONY_DESIGN}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+    # `metavar=` overrides argparse's auto-generated `{a,b,c,...}`
+    # choices summary so internal subcommands like `run` (the
+    # platform unit's entry point, not user-facing) don't leak
+    # into the top-level help.
+    subparsers = parser.add_subparsers(
+        dest="command",
+        metavar="<command>",
+        help="Subcommands",
+    )
 
     # init
     p_init = subparsers.add_parser(
@@ -4790,14 +5108,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the log file path and exit (no content)",
     )
 
-    # run
-    p_run = subparsers.add_parser(
-        "run",
-        help="Runner shim (invoked by platform schedulers)",
-    )
+    # run -- internal entry point for platform units; hidden from
+    # `crony --help` since end users should never invoke it directly
+    # (use `crony trigger` instead, which goes through the platform
+    # scheduler so the run uses the same execution context as a
+    # scheduled fire).
+    # No `help=` here -- argparse omits subparsers without a help
+    # string from the top-level subcommand listing. Passing
+    # argparse.SUPPRESS surfaces the literal "==SUPPRESS==" string
+    # instead of hiding the entry.
+    p_run = subparsers.add_parser("run")
     p_run.add_argument(
         "name",
-        help="Job or group name",
+        help="Full namespaced name (`<bundle>.<short>`)",
     )
     p_run.add_argument(
         "--dry-run",

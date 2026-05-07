@@ -1191,6 +1191,29 @@ class _RunnerHarness:
         """
         return f"{crony.DEFAULT_BUNDLE_NAME}.{short}"
 
+    def snap(self, cfg: Any, short: str) -> Any:
+        """Resolve a snapshot for a default-bundle entry. Convenience
+        for runner tests that build a Config and call run_job /
+        run_group directly without going through full apply.
+        """
+        return crony._resolve_snapshot_for(cfg, short)
+
+    def write_snap(self, cfg: Any, short: str) -> None:
+        """Write a snapshot to disk so `_load_snapshot` finds it.
+        Used by group runner tests where children are loaded from
+        their own snapshot files (not from the parent's config)."""
+        snap = self.snap(cfg, short)
+        full = self.full(short)
+        p = self.state / "installed" / f"{full}.snapshot.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import dataclasses as _dc
+        import json as _json
+
+        p.write_text(
+            _json.dumps(_dc.asdict(snap), sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+
     def config(
         self, raw: dict[str, Any], *, default_target_jobs: list[str]
     ) -> Any:
@@ -1302,22 +1325,35 @@ class TestPathFieldExpansion:
         p = crony._resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
         assert "$CRONY_NO_SUCH_VAR" in str(p)
 
-    def test_command_argv_expands_args(self, monkeypatch: Any) -> None:
+    def test_snapshot_resolves_expanded_args(self, monkeypatch: Any) -> None:
+        # Path-field expansion is applied at snapshot-resolve time
+        # (apply); the runner then pulls already-expanded argv from
+        # the snapshot.
         monkeypatch.setenv("HOME", "/home/user")
         job = crony.Job(
             name="j",
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
-        argv = crony._command_argv(job)
-        assert argv == [
+        snap = crony._resolve_job_snapshot(
+            crony.Config(), None, job, "default.j"
+        )
+        assert snap.script == "/abs/path.sh"
+        assert snap.args == [
+            "/home/user/data",
+            "/home/user/cache",
+            "--flag",
+        ]
+        assert crony._command_argv(snap) == [
             "/abs/path.sh",
             "/home/user/data",
             "/home/user/cache",
             "--flag",
         ]
 
-    def test_gate_argv_expands_args(self, monkeypatch: Any) -> None:
+    def test_snapshot_resolves_expanded_gate_args(
+        self, monkeypatch: Any
+    ) -> None:
         monkeypatch.setenv("HOME", "/home/user")
         job = crony.Job(
             name="j",
@@ -1325,56 +1361,59 @@ class TestPathFieldExpansion:
             gate_script="/abs/gate.sh",
             gate_args=["$HOME/state"],
         )
-        argv = crony._gate_argv(job)
-        assert argv == ["/abs/gate.sh", "/home/user/state"]
+        snap = crony._resolve_job_snapshot(
+            crony.Config(), None, job, "default.j"
+        )
+        assert snap.gate_script == "/abs/gate.sh"
+        assert snap.gate_args == ["/home/user/state"]
+        assert crony._gate_argv(snap) == ["/abs/gate.sh", "/home/user/state"]
 
 
 class TestRuntimeEnvExpansion:
-    """`_runtime_env` carries forward shell-essential vars from the
+    """`_runtime_env` is called at fire time with the snapshot's
+    user_env dict. It carries forward shell-essential vars from the
     invoking process (so wrapped commands reach the user's ssh-agent
-    via SSH_AUTH_SOCK) and expands `$VAR` / `${VAR}` in job.env
-    values.
+    via SSH_AUTH_SOCK) and expands `$VAR` / `${VAR}` references in
+    user_env values against the merged env. Called at runtime, not
+    apply time, so the inherited env stays current per fire.
     """
-
-    def _job(self, env_dict: dict[str, str] | None = None) -> Any:
-        return crony.Job(name="j", command="true", env=env_dict or {})
 
     def test_inherits_path_when_no_env_override(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        env = crony._runtime_env(self._job({}))
+        env = crony._runtime_env({})
         assert env["PATH"] == "/usr/bin:/bin"
 
     def test_ssh_auth_sock_forwarded_when_present(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
-        env = crony._runtime_env(self._job())
+        env = crony._runtime_env({})
         assert env.get("SSH_AUTH_SOCK") == "/tmp/agent.sock"
 
     def test_ssh_auth_sock_absent_when_unset(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
-        env = crony._runtime_env(self._job())
+        env = crony._runtime_env({})
         assert "SSH_AUTH_SOCK" not in env
 
     def test_dollar_var_resolves_against_inherited(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        env = crony._runtime_env(self._job({"PATH": "/extra:$PATH"}))
+        env = crony._runtime_env({"PATH": "/extra:$PATH"})
         assert env["PATH"] == "/extra:/usr/bin:/bin"
 
     def test_brace_form_resolves(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/Users/edp")
-        env = crony._runtime_env(self._job({"TMPDIR": "${HOME}/.local/tmp"}))
+        env = crony._runtime_env({"TMPDIR": "${HOME}/.local/tmp"})
         assert env["TMPDIR"] == "/Users/edp/.local/tmp"
 
     def test_unknown_var_stays_literal(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_NOPE", raising=False)
-        env = crony._runtime_env(self._job({"FOO": "$CRONY_NOPE"}))
+        env = crony._runtime_env({"FOO": "$CRONY_NOPE"})
         assert env["FOO"] == "$CRONY_NOPE"
 
     def test_double_dollar_escapes_to_literal(self, monkeypatch: Any) -> None:
-        env = crony._runtime_env(self._job({"MSG": "cost: $$5"}))
+        env = crony._runtime_env({"MSG": "cost: $$5"})
         assert env["MSG"] == "cost: $5"
 
     def test_iteration_order_lets_later_keys_see_earlier(
@@ -1384,12 +1423,10 @@ class TestRuntimeEnvExpansion:
         # An earlier job.env key should be visible to a later one.
         monkeypatch.setenv("PATH", "/usr/bin")
         env = crony._runtime_env(
-            self._job(
-                {
-                    "PATH": "/extra:$PATH",
-                    "LD_LIBRARY_PATH": "$PATH/../lib",
-                }
-            )
+            {
+                "PATH": "/extra:$PATH",
+                "LD_LIBRARY_PATH": "$PATH/../lib",
+            }
         )
         assert env["PATH"] == "/extra:/usr/bin"
         assert env["LD_LIBRARY_PATH"] == "/extra:/usr/bin/../lib"
@@ -1400,7 +1437,7 @@ class TestRuntimeEnvExpansion:
         # Job env is overlay; absent keys inherit unchanged.
         monkeypatch.setenv("HOME", "/Users/edp")
         monkeypatch.setenv("LANG", "en_US.UTF-8")
-        env = crony._runtime_env(self._job({"FOO": "bar"}))
+        env = crony._runtime_env({"FOO": "bar"})
         assert env["HOME"] == "/Users/edp"
         assert env["LANG"] == "en_US.UTF-8"
         assert env["FOO"] == "bar"
@@ -1411,13 +1448,11 @@ class TestRuntimeEnvExpansion:
         # trailing bare $ has nothing to consume; ${UNCLOSED has
         # no closing brace.
         env = crony._runtime_env(
-            self._job(
-                {
-                    "DIGIT": "$1 is not an identifier",
-                    "TRAILING": "ends with $",
-                    "BRACE_NO_CLOSE": "starts ${UNCLOSED",
-                }
-            )
+            {
+                "DIGIT": "$1 is not an identifier",
+                "TRAILING": "ends with $",
+                "BRACE_NO_CLOSE": "starts ${UNCLOSED",
+            }
         )
         assert env["DIGIT"] == "$1 is not an identifier"
         assert env["TRAILING"] == "ends with $"
@@ -1433,7 +1468,7 @@ class TestRunJobBasics:
             {"job": {"ok": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["ok"],
         )
-        rc = crony.run_job(cfg, "ok")
+        rc = crony.run_job(h.snap(cfg, "ok"))
         assert rc == 0
         rec = _last_run(h.state, "ok")
         assert rec["exit_class"] == "ok"
@@ -1455,31 +1490,29 @@ class TestRunJobBasics:
             },
             default_target_jobs=["fail"],
         )
-        rc = crony.run_job(cfg, "fail")
+        rc = crony.run_job(h.snap(cfg, "fail"))
         assert rc == 17
         rec = _last_run(h.state, "fail")
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 17
 
-    def test_unknown_job_raises_precondition(
+    def test_unknown_name_raises_precondition_at_resolve(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config({}, default_target_jobs=[])
         with pytest.raises(crony.PreconditionError, match="unknown"):
-            crony.run_job(cfg, "ghost")
+            crony._resolve_snapshot_for(cfg, "ghost")
 
-    def test_unselected_job_raises_precondition(
+    def test_run_without_snapshot_raises_precondition(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
-        # Job exists but the target's `jobs` list is empty.
-        cfg = h.config(
-            {"job": {"ok": {"command": "true", "schedule": "daily"}}},
-            default_target_jobs=[],
-        )
-        with pytest.raises(crony.PreconditionError, match="not selected"):
-            crony.run_job(cfg, "ok")
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.PreconditionError, match="no snapshot"):
+            crony.do_run(
+                name="default.never-applied", dry_run=False, skip_gate=False
+            )
 
     def test_dry_run_does_not_exec(
         self, tmp_path: Path, monkeypatch: Any
@@ -1496,7 +1529,7 @@ class TestRunJobBasics:
             },
             default_target_jobs=["ok"],
         )
-        rc = crony.run_job(cfg, "ok", dry_run=True)
+        rc = crony.run_job(h.snap(cfg, "ok"), dry_run=True)
         assert rc == 0
         # No last-run.json written on dry-run
         assert not (h.state / h.full("ok") / "last-run.json").exists()
@@ -1519,7 +1552,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony.run_job(cfg, "g")
+        rc = crony.run_job(h.snap(cfg, "g"))
         assert rc == 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "ok"
@@ -1541,7 +1574,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony.run_job(cfg, "g")
+        rc = crony.run_job(h.snap(cfg, "g"))
         assert rc == 0  # gated exits 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "gated"
@@ -1567,7 +1600,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony.run_job(cfg, "g", skip_gate=True)
+        rc = crony.run_job(h.snap(cfg, "g"), skip_gate=True)
         assert rc == 0
         rec = _last_run(h.state, "g")
         assert rec["exit_class"] == "ok"
@@ -1592,7 +1625,7 @@ class TestRunJobLockContention:
         held = open(lock, "w")
         _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         try:
-            rc = crony.run_job(cfg, "j")
+            rc = crony.run_job(h.snap(cfg, "j"))
         finally:
             _fcntl.flock(held, _fcntl.LOCK_UN)
             held.close()
@@ -1618,7 +1651,7 @@ class TestRunJobNotify:
             },
             default_target_jobs=["fail"],
         )
-        crony.run_job(cfg, "fail")
+        crony.run_job(h.snap(cfg, "fail"))
         rec = _last_run(h.state, "fail")
         assert rec["notifications"] == {}
 
@@ -1697,7 +1730,7 @@ class TestRunGroup:
                 h.full("b"): {"exit_code": 0, "exit_class": "ok"},
             },
         )
-        rc = crony.run_group(cfg, "g")
+        rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = _last_run(h.state, "g")
         names = [c["name"] for c in rec["jobs_run"]]
@@ -1732,7 +1765,7 @@ class TestRunGroup:
                 h.full("good"): {"exit_code": 0, "exit_class": "ok"},
             },
         )
-        rc = crony.run_group(cfg, "g")
+        rc = crony.run_group(h.snap(cfg, "g"))
         # Group orchestration succeeds even if a child failed.
         assert rc == 0
         rec = _last_run(h.state, "g")
@@ -1754,7 +1787,7 @@ class TestRunGroup:
             default_target_jobs=["g"],
         )
         _stub_trigger_sync(monkeypatch, {})
-        rc = crony.run_group(cfg, "g", dry_run=True)
+        rc = crony.run_group(h.snap(cfg, "g"), dry_run=True)
         assert rc == 0
         # No last-run.json for either group or child on dry-run.
         # The stub was never called.
@@ -1821,7 +1854,7 @@ class TestRunGroup:
 
         monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_advance)
 
-        rc = crony.run_group(cfg, "g")
+        rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = _last_run(h.state, "g")
         # Only `a` actually fired; `b` was budget-skipped.
@@ -2383,7 +2416,7 @@ class TestNotifyChannelOrderPreserved:
             },
             default_target_jobs=["fail"],
         )
-        crony.run_job(cfg, "fail")
+        crony.run_job(h.snap(cfg, "fail"))
         rec = _last_run(h.state, "fail")
         assert list(rec["notifications"].keys()) == order
 
@@ -4129,6 +4162,318 @@ class TestTriggerUnitSync:
         )
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 4
+
+
+class TestSnapshotLifecycle:
+    """Apply pins runtime parameters into a per-entry snapshot JSON;
+    the runner reads from the snapshot, not the live config. These
+    tests exercise the snapshot file lifecycle (write, read, refuse
+    on schema mismatch) and the drift-detection invariant (an edit
+    to any snapshot-covered field flips the hash).
+    """
+
+    def test_apply_writes_snapshot(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job_timeout_sec": 600,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        assert snap_path.exists()
+        snap = _cast_dict(snap_path.read_text())
+        assert snap["kind"] == "job"
+        assert snap["name"] == h.full("j")
+        assert snap["command"] == "true"
+        assert snap["job_timeout_sec"] == 600
+        assert snap["schema"] == crony._SNAPSHOT_SCHEMA
+
+    def test_apply_writes_group_snapshot_with_pinned_budget(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "job_timeout_sec": 100},
+                    "b": {"command": "true", "job_timeout_sec": 200},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        # Apply children first so the group's resolution sees them.
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "b")
+        crony.apply_one(cfg, "g")
+        snap_path = h.state / "installed" / f"{h.full('g')}.snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        assert snap["kind"] == "group"
+        assert snap["children"] == [h.full("a"), h.full("b")]
+        # 1.05 * (100 + 200) = 315
+        assert snap["group_budget_sec"] == 315
+
+    def test_command_edit_flips_hash(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        # Same schedule -- only the command changed; pre-snapshot
+        # this would not flip the hash (apply would say "unchanged").
+        cfg2 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true; echo updated",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        result = crony.apply_one(cfg2, "j")
+        assert result == "updated"
+
+    def test_hash_stable_across_os_environ_changes(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Regression: previously the snapshot pinned `_runtime_env`
+        # output, which mixed in os.environ values like SSH_AUTH_SOCK
+        # and PATH. A second apply (or a status check) from a shell
+        # with a different SSH_AUTH_SOCK would compute a different
+        # hash and report the entry as stale. Now snapshot.env stores
+        # only the user-written dict, and the runner does the env
+        # merge at fire time -- changing the inherited env between
+        # apply and status doesn't perturb the hash.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-A.sock")
+        first = crony.apply_one(cfg, "j")
+        assert first == "added"
+        # Same config, different SSH_AUTH_SOCK: should be a no-op.
+        # PATH is intentionally NOT mutated -- apply needs to find
+        # uv on PATH at apply time -- but SSH_AUTH_SOCK is the
+        # realistic per-session-volatile case the regression
+        # protects against.
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-B.sock")
+        second = crony.apply_one(cfg, "j")
+        assert second == "unchanged"
+
+    def test_snapshot_env_stores_user_literal(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # snap.env carries the literal toml `env` dict, not the
+        # merged + expanded runtime env. The runner expands at fire
+        # time (see TestRuntimeEnvExpansion).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "env": {"PATH": "/extra:$PATH"},
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        # Literal $PATH preserved -- expansion happens at fire time.
+        assert snap["env"] == {"PATH": "/extra:$PATH"}
+
+    def test_env_edit_flips_hash(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "env": {"FOO": "1"},
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        cfg2 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "env": {"FOO": "2"},
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony.apply_one(cfg2, "j") == "updated"
+
+    def test_timeout_edit_flips_hash(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job_timeout_sec": 60,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg1, "j")
+        cfg2 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job_timeout_sec": 120,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony.apply_one(cfg2, "j") == "updated"
+
+    def test_load_snapshot_refuses_schema_mismatch(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("j")
+        p = h.state / "installed" / f"{full}.snapshot.json"
+        p.parent.mkdir(parents=True)
+        # schema=999 simulates a future version we don't support.
+        p.write_text(
+            '{"schema": 999, "kind": "job", "name": "default.j"}',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.PreconditionError, match="schema 999"):
+            crony._load_snapshot(full)
+
+    def test_load_snapshot_refuses_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        with pytest.raises(crony.PreconditionError, match="no snapshot"):
+            crony._load_snapshot(h.full("never-applied"))
+
+    def test_topological_apply_propagates_leaf_edit_to_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # When a leaf's job_timeout_sec changes and the user runs
+        # `crony apply <group>`, the group's snapshot must reflect
+        # the new leaf budget. Topological apply walks leaves first
+        # within the same pass.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "leaf": {"command": "true", "job_timeout_sec": 100},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["leaf"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.do_apply(jobs=[])
+        snap_path = h.state / "installed" / f"{h.full('g')}.snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        # 1.05 * 100 = 105
+        assert snap["group_budget_sec"] == 105
+
+        # Bump leaf to 200; apply the group only and confirm the
+        # group's pinned budget tracks the new leaf.
+        h.config(
+            {
+                "job": {
+                    "leaf": {"command": "true", "job_timeout_sec": 200},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["leaf"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.do_apply(jobs=[h.full("g")])
+        snap_after = _cast_dict(snap_path.read_text())
+        assert snap_after["group_budget_sec"] == 210
+
+    def test_destroy_removes_snapshot(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        snap_path = h.state / "installed" / f"{h.full('j')}.snapshot.json"
+        assert snap_path.exists()
+        crony.destroy_one(h.full("j"))
+        assert not snap_path.exists()
+
+    def test_run_subcommand_hidden_from_top_level_help(self) -> None:
+        # `run` is the platform unit's entry point, not user-facing.
+        # It must not appear in the usage line's choices summary
+        # nor in the subcommand description block. Free-form prose
+        # in the epilog can still mention "run" as a verb -- this
+        # test scopes to the structural surfaces only.
+        parser = crony.build_parser()
+        usage_line = parser.format_usage()
+        assert "trigger" not in usage_line  # uses metavar, not choices
+        assert "run" not in usage_line, (
+            f"`run` leaked into usage line: {usage_line!r}"
+        )
+        # In the subcommand description block, each entry appears
+        # as `    <name>          <help>`. `run` shouldn't.
+        help_text = parser.format_help()
+        assert not re.search(r"^    run\b", help_text, flags=re.MULTILINE), (
+            f"`run` leaked into subcommand description block:\n{help_text}"
+        )
+        # Sanity: `trigger` IS user-facing and must show up.
+        assert re.search(r"^    trigger\b", help_text, flags=re.MULTILINE), (
+            "`trigger` missing from subcommand description block"
+        )
 
 
 class TestLifecycleSmoke:
