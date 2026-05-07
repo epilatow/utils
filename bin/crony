@@ -4526,10 +4526,11 @@ def do_logs(
                 last `=== ... ===` header to EOF). Overrides -n /
                 --since; mutually exclusive with --tail.
     -n N        print the last N lines (default 200)
-    --since X   parse X as a duration ('1h', '2d') or ISO timestamp
+    -s/--since X
+                parse X as a duration ('1h', '2d') or ISO timestamp
                 and skip log content older than that. Run-header
                 timestamps anchor the cut.
-    --tail      follow appended output (-f semantics) until interrupted.
+    -t/--tail   follow appended output (-f semantics) until interrupted.
     """
     bn, short = parse_full_name(name)
     full = f"{bn}.{short}"
@@ -5265,11 +5266,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the last N lines (default 200)",
     )
     p_logs.add_argument(
+        "-s",
         "--since",
         default=None,
         help='"1h", "2d", or ISO timestamp',
     )
     p_logs.add_argument(
+        "-t",
         "--tail",
         action="store_true",
         help="Follow appended output",
