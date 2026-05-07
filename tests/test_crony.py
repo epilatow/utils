@@ -3540,6 +3540,7 @@ class TestEnableDisable:
         assert cmd == [
             "systemctl",
             "--user",
+            "--quiet",
             "enable",
             "--now",
             f"crony-{h.full('j')}.timer",
@@ -3753,7 +3754,13 @@ class TestEnableDisable:
         )
         h.calls.clear()
         crony.apply_one(cfg2, "j")
-        verbs = [c[2] if len(c) > 2 else "" for c in h.calls]
+        # Strip leading flags (`--user`, `--quiet`, etc.) and pull
+        # the systemctl subcommand verb so the test isn't tied to
+        # flag ordering.
+        verbs = [
+            next((a for a in c[1:] if not a.startswith("-")), "")
+            for c in h.calls
+        ]
         assert "daemon-reload" in verbs
         assert "enable" not in verbs
 

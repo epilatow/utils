@@ -3457,12 +3457,20 @@ def _activate_unit(
     # entries; for schedule-less entries the .service alone is
     # enough (it sits in the unit catalog, ready for `systemctl
     # start` to fire it).
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    # `--quiet` suppresses systemctl's "Created symlink ..."
+    # informational chatter on enable/disable so `crony apply`
+    # output stays focused on the apply-level summary lines.
+    # Real errors still print to stderr; --quiet only suppresses
+    # the success-path notices.
+    subprocess.run(
+        ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
+    )
     if scheduled and not prior_disabled:
         subprocess.run(
             [
                 "systemctl",
                 "--user",
+                "--quiet",
                 "enable",
                 "--now",
                 _systemd_unit_name(name),
@@ -3487,6 +3495,7 @@ def _deactivate_unit(name: str, platform: str) -> None:
             [
                 "systemctl",
                 "--user",
+                "--quiet",
                 "disable",
                 "--now",
                 _systemd_unit_name(name),
@@ -3494,7 +3503,7 @@ def _deactivate_unit(name: str, platform: str) -> None:
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "--quiet", "daemon-reload"],
             stderr=subprocess.DEVNULL,
         )
 
@@ -3575,6 +3584,7 @@ def apply_one(
                 [
                     "systemctl",
                     "--user",
+                    "--quiet",
                     "disable",
                     "--now",
                     timer_path.name,
@@ -3980,6 +3990,7 @@ def _enable_unit(name: str, platform: str) -> None:
             [
                 "systemctl",
                 "--user",
+                "--quiet",
                 "enable",
                 "--now",
                 _systemd_unit_name(name),
@@ -4009,6 +4020,7 @@ def _disable_unit(name: str, platform: str) -> None:
             [
                 "systemctl",
                 "--user",
+                "--quiet",
                 "disable",
                 "--now",
                 _systemd_unit_name(name),
