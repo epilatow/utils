@@ -14,6 +14,7 @@ import importlib.util
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -3036,6 +3037,28 @@ class TestDestroy:
         with pytest.raises(crony.UsageError, match="unknown"):
             crony.do_destroy(jobs=["ghost"], purge_state=False)
 
+    def test_destroy_finds_units_with_no_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # If state was wiped (rm -rf ~/.local/state/crony) but
+        # platform unit files linger, `crony destroy` (no args =
+        # factory reset) must still find and clean them up via
+        # the platform-unit discovery pass.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert plist.exists()
+        # Wipe state but leave the plist behind.
+        shutil.rmtree(h.state)
+        assert plist.exists()
+        # Factory reset still finds and removes the orphan plist.
+        crony.do_destroy(jobs=[], purge_state=False)
+        assert not plist.exists()
+
 
 # =============================================================================
 # Platform/host detection
@@ -3578,6 +3601,29 @@ class TestStatusReport:
         crony.do_status(jobs=[], cols=None)
         out = capsys.readouterr().out
         assert "ghost" in out
+        assert "orphan" in out
+
+    def test_orphan_appears_when_only_unit_file_remains(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # State wiped but the platform unit lingers: status
+        # discovers it via the platform-unit scan and reports
+        # it as orphan so the user can `crony destroy` it.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        # Drop the entry from the config and wipe state, leaving
+        # only the plist behind.
+        h.config({}, default_target_jobs=[])
+        shutil.rmtree(h.state)
+        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols=None)
+        out = capsys.readouterr().out
+        assert h.full("j") in out
         assert "orphan" in out
 
     def test_cols_replaces_default_column_set(
@@ -4695,6 +4741,47 @@ class TestTriggerUnitSync:
         # trigger_timeout: confirms the deadline switch happened
         # once the pid was observed.
         assert wait_calls and wait_calls[0] > 1.0
+
+
+class TestPlatformUnitDiscovery:
+    """`_platform_unit_names` walks the platform unit directory
+    and returns crony-managed entries by parsing their filenames.
+    Used so units lingering after a state wipe still surface as
+    orphans for status / audit / destroy.
+    """
+
+    def test_finds_plist_on_darwin(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.agents.mkdir(parents=True, exist_ok=True)
+        (h.agents / "org.crony.default.foo.plist").write_text("")
+        (h.agents / "org.crony.bundle.bar.plist").write_text("")
+        # Non-crony plist must be ignored.
+        (h.agents / "com.other.app.plist").write_text("")
+        names = crony._platform_unit_names()
+        assert names == {"default.foo", "bundle.bar"}
+
+    def test_finds_service_and_timer_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        (h.sysd / "crony-default.foo.service").write_text("")
+        (h.sysd / "crony-default.foo.timer").write_text("")
+        (h.sysd / "crony-bundle.bar.service").write_text("")
+        # Foreign unit must be ignored.
+        (h.sysd / "myapp.service").write_text("")
+        names = crony._platform_unit_names()
+        assert names == {"default.foo", "bundle.bar"}
+
+    def test_missing_unit_dir_returns_empty(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Fresh install or otherwise no unit dir: no crash, just empty.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        if h.agents.exists():
+            shutil.rmtree(h.agents)
+        assert crony._platform_unit_names() == set()
 
 
 class TestSnapshotLifecycle:

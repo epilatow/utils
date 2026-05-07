@@ -3559,16 +3559,52 @@ def destroy_one(name: str, *, purge_state: bool = False) -> None:
         _snapshot_path_for(name).unlink(missing_ok=True)
 
 
-def stamped_names() -> set[str]:
-    """Names with a hash stamp on this host (i.e., crony installed them).
-
-    A stamp lives at `STATE_DIR/<full_name>/hash`; per-entry state
-    (logs, last-run.json, snapshot.json, run.lock, run.pid) shares
-    the same directory.
-    """
+def _state_dir_stamps() -> set[str]:
+    """Names whose state dir contains a `hash` stamp."""
     if not STATE_DIR.exists():
         return set()
     return {d.name for d in STATE_DIR.iterdir() if (d / "hash").is_file()}
+
+
+def _platform_unit_names() -> set[str]:
+    """Names with a crony-managed platform unit file on this host.
+
+    Walks the platform's user-unit directory and returns every
+    full-namespaced name encoded in a crony-shaped filename. Used
+    to discover entries whose unit landed on disk but whose state
+    dir is missing -- e.g. a state wipe (rm -rf
+    ~/.local/state/crony/) without `crony destroy` first. Without
+    this, those units would be invisible to status / audit /
+    destroy and the user would have to track them down manually.
+    """
+    names: set[str] = set()
+    if LAUNCHAGENTS_DIR.exists():
+        prefix = f"org.{BASENAME}."
+        suffix = ".plist"
+        for p in LAUNCHAGENTS_DIR.iterdir():
+            if p.name.startswith(prefix) and p.name.endswith(suffix):
+                names.add(p.name[len(prefix) : -len(suffix)])
+    if SYSTEMD_USER_DIR.exists():
+        prefix = f"{BASENAME}-"
+        for suffix in (".service", ".timer"):
+            for p in SYSTEMD_USER_DIR.iterdir():
+                if p.name.startswith(prefix) and p.name.endswith(suffix):
+                    names.add(p.name[len(prefix) : -len(suffix)])
+    return names
+
+
+def stamped_names() -> set[str]:
+    """Names crony has installed on this host.
+
+    Union of `_state_dir_stamps()` (the normal "applied via crony"
+    case) and `_platform_unit_names()` (units lingering on disk
+    after a state wipe). Either signal alone is enough to surface
+    the entry to status / audit / destroy: with state-only, we
+    have the hash to detect drift; with units-only, we can still
+    report the entry as `orphan` and let `crony destroy` clean
+    up the unit files.
+    """
+    return _state_dir_stamps() | _platform_unit_names()
 
 
 # =============================================================================
@@ -3826,15 +3862,29 @@ def _config_state_for(
     `short` is the bundle-local name (used to look up the entry in
     `config`); `full_name` is the namespaced name used for the
     on-disk hash stamp and unit identifier.
+
+    A "stamp" here is any signal that crony installed this entry
+    on this host: either the state-dir hash, or a leftover
+    platform unit file (the latter covers the "state wiped, units
+    lingering" case so those entries surface as orphans for
+    destroy).
     """
     in_config = short in config.jobs or short in config.job_groups
-    has_stamp = _hash_path_for(full_name).exists()
+    hash_path = _hash_path_for(full_name)
+    has_hash = hash_path.exists()
+    has_unit = full_name in _platform_unit_names()
+    has_stamp = has_hash or has_unit
     if not in_config and has_stamp:
         return "orphan"
     if in_config and not has_stamp:
         return "missing"
     if not in_config and not has_stamp:
         return "missing"
+    if not has_hash:
+        # Unit on disk but no hash to compare against (state was
+        # wiped). Treat as drift so the user gets a clear "re-
+        # apply" signal.
+        return "stale"
     entry: Job | JobGroup = config.jobs.get(short) or config.job_groups[short]
     bn, _ = parse_full_name(full_name)
     target = resolve_target(config, current_host(), platform)
@@ -3845,7 +3895,7 @@ def _config_state_for(
     else:
         snapshot = _resolve_group_snapshot(config, target, entry, bn, full_name)
     new_hash = _compute_unit_hash(full_name, entry, platform, snapshot)
-    old_hash = _hash_path_for(full_name).read_text(encoding="utf-8").strip()
+    old_hash = hash_path.read_text(encoding="utf-8").strip()
     return "synced" if old_hash == new_hash else "stale"
 
 
