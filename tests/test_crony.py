@@ -3557,7 +3557,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[])
+        crony.do_status(jobs=[], cols=None)
         out = capsys.readouterr().out
         assert "JOB" in out
         assert "CONFIG" in out
@@ -3575,10 +3575,86 @@ class TestStatusReport:
         (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[])
+        crony.do_status(jobs=[], cols=None)
         out = capsys.readouterr().out
         assert "ghost" in out
         assert "orphan" in out
+
+    def test_cols_replaces_default_column_set(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols="job,last,last-ran")
+        out = capsys.readouterr().out
+        header = out.splitlines()[0]
+        assert "JOB" in header
+        assert "LAST" in header
+        assert "LAST RAN" in header
+        # Columns omitted from --cols are absent.
+        assert "CONFIG" not in header
+        assert "SCHED" not in header
+
+    def test_cols_unknown_name_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown status column"):
+            crony.do_status(jobs=[], cols="job,bogus")
+
+    def test_last_ran_column_shows_relative_time(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Write a last-run.json with a timestamp ~5 minutes back
+        # and confirm the LAST RAN column renders "5m ago".
+        import datetime as _dt
+
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        sd = h.state / h.full("j")
+        sd.mkdir(parents=True, exist_ok=True)
+        five_min_ago = (
+            _dt.datetime.now(_dt.timezone.utc).astimezone()
+            - _dt.timedelta(minutes=5)
+        ).isoformat(timespec="seconds")
+        (sd / "last-run.json").write_text(
+            f'{{"started_at": "{five_min_ago}",'
+            f' "ended_at": "{five_min_ago}",'
+            ' "exit_code": 0, "exit_class": "ok"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols="job,last-ran")
+        out = capsys.readouterr().out
+        # Allow a small wallclock drift between writing the file and
+        # the status read -- it should still land in the 4-6m range.
+        assert any(f"{m}m ago" in out for m in (4, 5, 6)), (
+            f"expected ~5m ago in:\n{out}"
+        )
+
+    def test_last_ran_column_shows_never_when_no_run(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols="job,last-ran")
+        out = capsys.readouterr().out
+        assert "never" in out
 
     def test_long_names_keep_columns_aligned(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3601,7 +3677,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, long_name)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[])
+        crony.do_status(jobs=[], cols=None)
         rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
         # The header's CONFIG label and every row's state token
         # (synced / missing / orphan / etc.) should start at the
@@ -4021,6 +4097,22 @@ class TestLogs:
         # run-header timestamps; surface at parse time instead.
         with pytest.raises(crony.UsageError, match="timezone offset"):
             crony._parse_since("2026-04-01T12:00:00")
+
+    def test_follow_log_returns_cleanly_on_keyboard_interrupt(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Ctrl-C during `crony logs -t` should exit without a stack
+        # trace. The follow loop sleeps on time.sleep(); raising
+        # KeyboardInterrupt from there mimics the live signal.
+        log = tmp_path / "run.log"
+        log.write_text("existing line\n")
+
+        def _interrupt(*args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(crony.time, "sleep", _interrupt)
+        # Should return None, not propagate the exception.
+        assert crony._follow_log(log) is None
 
     def test_latest_prints_only_the_last_run_entry(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -4963,7 +5055,7 @@ class TestLifecycleSmoke:
         # status -> prints the synced/enabled tuple (sched stub)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
         capsys.readouterr()  # drop earlier output
-        crony.do_status(jobs=[])
+        crony.do_status(jobs=[], cols=None)
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset

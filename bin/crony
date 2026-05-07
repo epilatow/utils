@@ -3765,6 +3765,44 @@ def _last_run_state(name: str) -> str:
     return "unknown"
 
 
+def _last_ran_at(name: str) -> str:
+    """Return a compact "when did this last run" string for status.
+
+    Reads the entity's `last-run.json` and formats `started_at` as
+    a relative-time string (e.g. "5m ago", "3h ago", "2d ago").
+    Returns "never" when there's no last-run record and "unknown"
+    when the file exists but its timestamp is unreadable.
+    """
+    sd = STATE_DIR / name
+    last_run = sd / "last-run.json"
+    if not last_run.exists():
+        return "never"
+    try:
+        raw = json.loads(last_run.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+    started = raw.get("started_at")
+    if not started:
+        return "unknown"
+    try:
+        dt = datetime.datetime.fromisoformat(started)
+    except ValueError:
+        return "unknown"
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+    secs = int((now - dt).total_seconds())
+    if secs < 0:
+        # Clock skew or a future-dated record; surface explicitly
+        # rather than rendering "0s ago" which would mislead.
+        return "future"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
 def _config_state(
     config: Config,
     name: str,
@@ -4444,15 +4482,59 @@ def do_trigger(
         raise SystemExit(worst_rc)
 
 
-def do_status(jobs: list[str]) -> None:
-    """Print the resolved (CONFIG, SCHED, LAST) tuple per job.
+_STATUS_COL_HEADERS: dict[str, str] = {
+    "job": "JOB",
+    "config": "CONFIG",
+    "sched": "SCHED",
+    "last": "LAST",
+    "last-ran": "LAST RAN",
+}
+_DEFAULT_STATUS_COLS: tuple[str, ...] = (
+    "job",
+    "config",
+    "sched",
+    "last",
+    "last-ran",
+)
+
+
+def _parse_status_cols(spec: str | None) -> list[str]:
+    """Parse the `--cols` argument into an ordered column list.
+
+    Comma-separated; whitespace around names is ignored. `job` is
+    always included (and forced to the first column) because
+    everything else is meaningless without the entity name.
+    Unknown column names raise UsageError so a typo is loud, not a
+    silent missing column.
+    """
+    if not spec:
+        return list(_DEFAULT_STATUS_COLS)
+    cols = [c.strip() for c in spec.split(",") if c.strip()]
+    unknown = [c for c in cols if c not in _STATUS_COL_HEADERS]
+    if unknown:
+        raise UsageError(
+            f"unknown status column(s): {sorted(unknown)} "
+            f"(valid: {sorted(_STATUS_COL_HEADERS)})"
+        )
+    if "job" in cols:
+        cols.remove("job")
+    return ["job"] + cols
+
+
+def do_status(jobs: list[str], cols: str | None) -> None:
+    """Print the resolved state per job in a tabular view.
 
     With no args, the report covers selected jobs/groups plus any
     orphans across all bundles. Names are full namespaced
     (`<bundle>.<short>`); bare CLI input is shorthand for
     `default.<short>`. Linger status on linux surfaces above the
     table.
+
+    `--cols` is a comma-separated list selecting which columns to
+    show, in order. Valid: job, config, sched, last, last-ran.
+    Default: all five. `job` is always included.
     """
+    selected_cols = _parse_status_cols(cols)
     bundles = load_all_bundles()
     platform = current_platform()
     _by_full, selected = _selected_full_names_per_bundle(bundles)
@@ -4476,9 +4558,7 @@ def do_status(jobs: list[str]) -> None:
     else:
         full_names = sorted(selected | stamped)
 
-    name_w = max((len(n) for n in full_names), default=0)
-    name_w = max(name_w, len("JOB"))
-    print(f"{'JOB':<{name_w}} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+    rows: list[dict[str, str]] = []
     for full in full_names:
         bn, short = parse_full_name(full)
         bundle = bundles.by_name(bn)
@@ -4500,8 +4580,36 @@ def do_status(jobs: list[str]) -> None:
                 sched = "grouped"
             else:
                 sched = _sched_state(full, platform)
-        last = _last_run_state(full)
-        print(f"{full:<{name_w}} {cfg_state:10} {sched:10} {last:10}")
+        rows.append(
+            {
+                "job": full,
+                "config": cfg_state,
+                "sched": sched,
+                "last": _last_run_state(full),
+                "last-ran": _last_ran_at(full),
+            }
+        )
+
+    # Per-column width: max of the header label and the longest
+    # cell, so a long "last-ran" value (`12d ago`) doesn't get
+    # squeezed by the 8-char header.
+    widths: dict[str, int] = {}
+    for col in selected_cols:
+        header = _STATUS_COL_HEADERS[col]
+        cell_max = max((len(r[col]) for r in rows), default=0)
+        widths[col] = max(len(header), cell_max)
+
+    # Two-space separator: a single space ran headers and cells
+    # together at narrow column widths (e.g. CONFIG=6 vs SCHED=7
+    # produced columns visually flush against each other).
+    sep = "  "
+    header_line = sep.join(
+        f"{_STATUS_COL_HEADERS[c]:<{widths[c]}}" for c in selected_cols
+    )
+    print(header_line.rstrip())
+    for row in rows:
+        line = sep.join(f"{row[c]:<{widths[c]}}" for c in selected_cols)
+        print(line.rstrip())
 
 
 def do_logs(
@@ -4563,19 +4671,27 @@ def do_logs(
 
 
 def _follow_log(log_path: Path) -> None:
-    """tail -f equivalent on the log file."""
-    with open(log_path, encoding="utf-8", errors="replace") as f:
-        f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.5)
-                continue
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except BrokenPipeError:
-                return
+    """tail -f equivalent on the log file.
+
+    Returns cleanly on Ctrl-C and on a closed downstream pipe so
+    `crony logs -t | head` and an interactive interrupt both
+    terminate without a stack trace.
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except BrokenPipeError:
+                    return
+    except KeyboardInterrupt:
+        return
 
 
 _DURATION_RE = re.compile(r"^(\d+)([smhd])$")
@@ -5248,6 +5364,15 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help="Restrict to these jobs (default: all)",
+    )
+    p_status.add_argument(
+        "--cols",
+        default=None,
+        help=(
+            "Comma-separated columns to display "
+            "(valid: job,config,sched,last,last-ran; "
+            "default: all)"
+        ),
     )
 
     # logs
