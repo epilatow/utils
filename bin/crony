@@ -4225,7 +4225,7 @@ def _topo_apply_order(
     return out
 
 
-def do_apply(jobs: list[str]) -> None:
+def do_apply(jobs: list[str], verbose: bool) -> None:
     """Render and activate platform units to match config.
 
     No args: full sync across every bundle. Install missing, fix
@@ -4236,6 +4236,10 @@ def do_apply(jobs: list[str]) -> None:
     Names on the CLI are full namespaced names
     (`<bundle>.<short>`). Bare input is shorthand for
     `default.<short>` and only ever resolves to the default bundle.
+
+    `unchanged` results are suppressed by default so the output
+    only shows the entries the apply actually touched. `-v` /
+    `--verbose` prints them too.
     """
     bundles = load_all_bundles()
     by_full, selected = _selected_full_names_per_bundle(bundles)
@@ -4282,7 +4286,8 @@ def do_apply(jobs: list[str]) -> None:
     for full in full_names_to_apply:
         bundle, short = by_full[full]
         result = apply_one(bundle.config, short, bundle_name=bundle.name)
-        logger.info("apply %s: %s", full, result)
+        if verbose or result != "unchanged":
+            logger.info("apply %s: %s", full, result)
 
     if remove_orphans:
         orphans = stamped_names() - selected
@@ -5331,6 +5336,12 @@ def build_parser() -> argparse.ArgumentParser:
             "missing, fix drift, remove orphans). With names: "
             "surgical update of those entries only."
         ),
+    )
+    p_apply.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Also print 'unchanged' lines (default: suppressed)",
     )
 
     # destroy

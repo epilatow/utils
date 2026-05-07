@@ -2962,7 +2962,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=[])
+        crony.do_apply(jobs=[], verbose=False)
         assert (h.state / h.full("j") / "hash").exists()
         assert not (orphan_dir / "hash").exists()
 
@@ -2977,8 +2977,43 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=["j"])
+        crony.do_apply(jobs=["j"], verbose=False)
         assert (orphan_dir / "hash").exists()  # left alone
+
+    def test_unchanged_suppressed_by_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        caplog: Any,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=[], verbose=False)
+        # Re-apply with no changes: nothing to print.
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_apply(jobs=[], verbose=False)
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("unchanged" in m for m in messages), messages
+
+    def test_unchanged_shown_with_verbose(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        caplog: Any,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=[], verbose=False)
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_apply(jobs=[], verbose=True)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("unchanged" in m for m in messages), messages
 
 
 class TestDestroy:
@@ -5050,7 +5085,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.do_apply(jobs=[])
+        crony.do_apply(jobs=[], verbose=False)
         snap_path = h.state / h.full("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
@@ -5072,7 +5107,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.do_apply(jobs=[h.full("g")])
+        crony.do_apply(jobs=[h.full("g")], verbose=False)
         snap_after = _cast_dict(snap_path.read_text())
         assert snap_after["group_budget_sec"] == 210
 
@@ -5137,7 +5172,7 @@ class TestLifecycleSmoke:
         )
         crony.do_validate(bundle=None)
         # apply -> renders + activates
-        crony.do_apply(jobs=[])
+        crony.do_apply(jobs=[], verbose=False)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # status -> prints the synced/enabled tuple (sched stub)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
