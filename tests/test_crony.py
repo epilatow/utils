@@ -402,9 +402,10 @@ class TestParseDefaults:
             )
 
     def test_reserved_ntfy_filename_header_rejected(self) -> None:
-        # _post_ntfy sets Filename itself when attach_log is true;
-        # let user override only on the no-attach path would be
-        # confusing. Reserve to keep behavior consistent.
+        # `Filename` would make ntfy render the body as a downloadable
+        # file (publicly addressable by URL guessing). Reserved so a
+        # config can't accidentally turn the inline-body design into
+        # the very attachment behavior it was designed to avoid.
         with pytest.raises(crony.ConfigError, match="cannot be overridden"):
             crony.parse_config(
                 {
@@ -2051,7 +2052,35 @@ class TestEmailNotify:
         body = sent.get_content()
         assert "Job:        j" in body
         assert "fail" in body
+        assert "--- log (latest run) ---" in body
         assert "log content here" in body
+
+    def test_email_body_is_latest_run_entry_only(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Multi-run log: email and ntfy both include only the most
+        # recent run's entry. Earlier history would be noise the
+        # recipient already saw in prior notifications.
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result(["email"])
+
+        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_inst = smtp_cls.return_value
+        smtp_inst.__enter__.return_value = smtp_inst
+        smtp_inst.__exit__.return_value = None
+        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+
+        log_text = (
+            "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
+            "older-run-detail\n"
+            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            "newest-run-detail\n"
+        )
+        crony._dispatch_notify(result, log_text, cfg.defaults)
+        sent = smtp_inst.send_message.call_args[0][0]
+        body = sent.get_content()
+        assert "newest-run-detail" in body
+        assert "older-run-detail" not in body
 
     def test_records_smtp_failure_no_propagate(
         self, tmp_path: Path, monkeypatch: Any
@@ -2221,8 +2250,142 @@ class TestNtfyNotify:
             "tags"
         )
         assert tags == "warning,fail"
-        # attach_log=True -> body is the log content tail
-        assert b"log content here" in captured["data"]
+        # Body mirrors the email layout: human summary block,
+        # separator, then the latest log entry. (No run-header in
+        # this fixture, so latest-entry extraction passes the
+        # text through unchanged.)
+        body = captured["data"].decode("utf-8")
+        assert "Job:" in body
+        assert "Exit class:" in body
+        assert "--- log (latest run) ---" in body
+        assert "log content here" in body
+        # No Filename header: the body is inline content, not an
+        # ntfy attachment (which would be publicly addressable).
+        for k in captured["headers"]:
+            assert k.lower() != "filename", (
+                f"Filename header leaked: {captured['headers']!r}"
+            )
+
+    def test_ntfy_body_is_latest_run_entry_only(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Multi-run log: the body should contain only the most
+        # recent run's entry, not earlier history. ntfy's 4 KB
+        # message ceiling means we can't ship the whole log.
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result(["ntfy"])
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: Any) -> None:
+                return None
+
+        def _fake(req: Any, timeout: Any = None) -> Any:
+            captured["data"] = req.data
+            return _Resp()
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
+        log_text = (
+            "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
+            "older-run-detail\n"
+            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            "newest-run-detail\n"
+        )
+        crony._dispatch_notify(result, log_text, cfg.defaults)
+        body = captured["data"].decode("utf-8")
+        assert "newest-run-detail" in body
+        assert "older-run-detail" not in body
+
+    def test_ntfy_body_head_truncated_to_3kb(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Body must fit ntfy's per-message limit. The summary stays
+        # intact at the top (its structured fields are more useful
+        # than a truncated stub); the log section is head-truncated
+        # so the most recent failure output stays visible at the
+        # bottom.
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result(["ntfy"])
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: Any) -> None:
+                return None
+
+        def _fake(req: Any, timeout: Any = None) -> Any:
+            captured["data"] = req.data
+            return _Resp()
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
+        log_text = (
+            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            + ("X" * 5000)
+            + "MARKER-AT-TAIL\n"
+        )
+        crony._dispatch_notify(result, log_text, cfg.defaults)
+        body_bytes = captured["data"]
+        assert len(body_bytes) <= 3 * 1024
+        body = body_bytes.decode("utf-8", errors="replace")
+        # Summary block intact at the top.
+        assert body.startswith("Job:")
+        assert "Exit class:" in body
+        # Log section follows the separator and shows the tail.
+        assert "--- log (latest run) ---" in body
+        assert "MARKER-AT-TAIL" in body
+        # Truncation marker appears within the log section.
+        assert "bytes truncated" in body
+
+    def test_ntfy_body_is_summary_only_when_attach_log_disabled(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `notify_attach_log = false` means "no log content in
+        # notifications"; the body is the structured summary
+        # without the trailing log section.
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        cfg = crony.parse_config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify_attach_log": False,
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                },
+                "job": {"j": _job(notify_channels=["ntfy"])},
+            }
+        )
+        result = self._make_failed_result(["ntfy"])
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: Any) -> None:
+                return None
+
+        def _fake(req: Any, timeout: Any = None) -> Any:
+            captured["data"] = req.data
+            return _Resp()
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
+        crony._dispatch_notify(result, "log content not in body", cfg.defaults)
+        body = captured["data"].decode("utf-8")
+        # Human summary keys are present; log content is not.
+        assert "Job:" in body
+        assert "Exit class:" in body
+        assert "log content not in body" not in body
 
     def test_http_error_recorded(
         self, tmp_path: Path, monkeypatch: Any
@@ -3728,7 +3891,9 @@ class TestLogs:
             "\n".join(f"line {i}" for i in range(20)) + "\n",
             encoding="utf-8",
         )
-        crony.do_logs(name="j", n=5, since=None, tail=False, path=False)
+        crony.do_logs(
+            name="j", n=5, since=None, tail=False, path=False, latest=False
+        )
         out = capsys.readouterr().out
         assert "line 19" in out
         assert "line 15" in out
@@ -3739,7 +3904,12 @@ class TestLogs:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="no log"):
             crony.do_logs(
-                name="ghost", n=10, since=None, tail=False, path=False
+                name="ghost",
+                n=10,
+                since=None,
+                tail=False,
+                path=False,
+                latest=False,
             )
 
     def test_path_prints_file_path(
@@ -3753,7 +3923,9 @@ class TestLogs:
         log = h.state / h.full("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("hello\n", encoding="utf-8")
-        crony.do_logs(name="j", n=0, since=None, tail=False, path=True)
+        crony.do_logs(
+            name="j", n=0, since=None, tail=False, path=True, latest=False
+        )
         out = capsys.readouterr().out.strip()
         assert out == str(log)
 
@@ -3770,7 +3942,9 @@ class TestLogs:
             default_target_jobs=["j"],
         )
         # No log file written; --path should still succeed.
-        crony.do_logs(name="j", n=0, since=None, tail=False, path=True)
+        crony.do_logs(
+            name="j", n=0, since=None, tail=False, path=True, latest=False
+        )
         out = capsys.readouterr().out.strip()
         expected = h.state / h.full("j") / "run.log"
         assert out == str(expected)
@@ -3798,7 +3972,9 @@ class TestLogs:
             f"=== {now_iso} j pid=2 ===\nnew-line\n",
             encoding="utf-8",
         )
-        crony.do_logs(name="j", n=0, since="1h", tail=False, path=False)
+        crony.do_logs(
+            name="j", n=0, since="1h", tail=False, path=False, latest=False
+        )
         out = capsys.readouterr().out
         assert "new-line" in out
         assert "old-line" not in out
@@ -3812,6 +3988,126 @@ class TestLogs:
         # run-header timestamps; surface at parse time instead.
         with pytest.raises(crony.UsageError, match="timezone offset"):
             crony._parse_since("2026-04-01T12:00:00")
+
+    def test_latest_prints_only_the_last_run_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / h.full("j") / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
+            "first-run-output\n"
+            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            "second-run-output\n",
+            encoding="utf-8",
+        )
+        crony.do_logs(
+            name="j",
+            n=0,
+            since=None,
+            tail=False,
+            path=False,
+            latest=True,
+        )
+        out = capsys.readouterr().out
+        assert "second-run-output" in out
+        assert "first-run-output" not in out
+
+    def test_latest_falls_back_when_no_headers(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Pre-header content (e.g. a hand-edited or partially-
+        # truncated log) returns whole-file unchanged rather than
+        # an empty stream.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / h.full("j") / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("orphan content with no === header\n", encoding="utf-8")
+        crony.do_logs(
+            name="j",
+            n=0,
+            since=None,
+            tail=False,
+            path=False,
+            latest=True,
+        )
+        out = capsys.readouterr().out
+        assert "orphan content" in out
+
+    def test_latest_and_tail_mutually_exclusive(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / h.full("j") / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n")
+        with pytest.raises(crony.UsageError, match="mutually exclusive"):
+            crony.do_logs(
+                name="j",
+                n=0,
+                since=None,
+                tail=True,
+                path=False,
+                latest=True,
+            )
+
+
+class TestLogHelpers:
+    """Direct unit tests for `_extract_latest_log_entry` and
+    `_head_truncate_to_kb`. Exercised end-to-end via TestLogs and
+    TestNtfyNotify; this class isolates the boundary conditions
+    so a regression in either helper surfaces here first.
+    """
+
+    def test_extract_returns_from_last_header(self) -> None:
+        text = (
+            "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
+            "older\n"
+            "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
+            "newest\n"
+        )
+        out = crony._extract_latest_log_entry(text)
+        assert out.startswith("=== 2026-05-02T03:00:00-08:00")
+        assert "newest" in out
+        assert "older" not in out
+
+    def test_extract_returns_full_text_when_no_header(self) -> None:
+        text = "no header here, just content\n"
+        assert crony._extract_latest_log_entry(text) == text
+
+    def test_extract_returns_empty_for_empty_input(self) -> None:
+        assert crony._extract_latest_log_entry("") == ""
+
+    def test_head_truncate_under_cap_passes_through(self) -> None:
+        text = "small body\n"
+        out, truncated = crony._head_truncate_to_kb(text, 1)
+        assert out == text
+        assert truncated is False
+
+    def test_head_truncate_over_cap_keeps_tail_with_marker(self) -> None:
+        # 1 KB cap; build a text that's ~3KB so head-truncation drops
+        # the start. The output must be <= 1024 bytes and start with
+        # the truncation marker.
+        text = "X" * 3000 + "TAIL"
+        out, truncated = crony._head_truncate_to_kb(text, 1)
+        assert truncated is True
+        assert len(out.encode("utf-8")) <= 1024
+        assert out.startswith("[... ")
+        assert "bytes truncated" in out
+        assert out.endswith("TAIL")
 
 
 # =============================================================================

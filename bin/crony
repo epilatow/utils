@@ -209,8 +209,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 
 # [defaults]
 # notify_channels      = []           # any names defined below
-# notify_attach_log    = true
-# notify_attach_max_kb = 256
+# notify_attach_log    = true         # include log content in notifications
+# notify_attach_max_kb = 256          # email-only cap (ntfy uses a 3 KB inline cap)
 # job_timeout_sec      = 1800         # 30 min default per-job wallclock cap
 # trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
@@ -481,6 +481,10 @@ class Defaults:
     # entry must name a key in `notify_channel_defs` below.
     notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
+    # Cap on log content included in EMAIL notifications. ntfy
+    # bodies use a fixed 3 KB inline cap (ntfy's per-message limit
+    # is 4 KB) and ignore this setting -- adjusting it here will
+    # not affect ntfy.
     notify_attach_max_kb: int = 256
     job_timeout_sec: int = 1800
     # How long `crony trigger --wait` waits for a runner to come
@@ -888,10 +892,11 @@ _VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
 # entries that match (case-insensitively) are rejected at parse
 # time so a config can never silently overwrite them.
 _RESERVED_HEADERS_EMAIL: frozenset[str] = frozenset({"to", "from", "subject"})
-# `filename` is set automatically by _post_ntfy when attach_log is
-# true, so a user `headers = { Filename = ... }` would only take
-# effect on the no-attach path -- reserve it to keep behavior
-# predictable.
+# `filename` is reserved even though _post_ntfy never sets it: a
+# user-supplied `Filename` would make ntfy render the body as a
+# downloadable file (publicly addressable by URL guessing), which
+# is exactly what the inline-body design avoids. Reserve it to
+# keep that behavior consistent across configs.
 _RESERVED_HEADERS_NTFY: frozenset[str] = frozenset(
     {"authorization", "tags", "title", "filename"}
 )
@@ -2327,12 +2332,56 @@ def _format_summary(result: JobRunResult) -> str:
     )
 
 
-def _truncate_log(log_text: str, max_kb: int) -> tuple[str, bool]:
-    """Tail a log to at most max_kb KB, returning (text, truncated)."""
+# Each `crony run` invocation writes a header line to run.log of
+# the form:
+#   === <ISO ts> <full.name> pid=<N> ===
+# `_extract_latest_log_entry` finds the last such header and
+# returns everything from there to EOF (the most recent run's
+# trace). Used by `crony logs --latest` (single-run readout) and
+# the ntfy notify path (3KB inline body instead of a full-log
+# attachment).
+_RUN_HEADER_RE = re.compile(r"^=== ", re.MULTILINE)
+
+
+def _extract_latest_log_entry(text: str) -> str:
+    """Return the slice from the last `=== ... ===` header to EOF.
+
+    If there is no header (log empty or pre-header content), the
+    full text is returned as-is so callers degrade gracefully.
+    """
+    matches = list(_RUN_HEADER_RE.finditer(text))
+    if not matches:
+        return text
+    return text[matches[-1].start() :]
+
+
+def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
+    """Tail a string to at most max_kb KB, head-truncating.
+
+    When truncation occurs, the returned text is prepended with a
+    one-line marker noting how many bytes were dropped, so
+    recipients know the head is missing. The marker counts toward
+    the byte cap so the result still fits within max_kb.
+
+    Used by ntfy notifications (where the goal is "show the most
+    recent few KB of failure output") and reusable by any other
+    transport with a similar size constraint.
+    """
     max_bytes = max_kb * 1024
-    if len(log_text) <= max_bytes:
-        return log_text, False
-    return log_text[-max_bytes:], True
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    dropped = len(encoded) - max_bytes
+    marker = f"[... {dropped} bytes truncated ...]\n"
+    marker_bytes = marker.encode("utf-8")
+    keep = max_bytes - len(marker_bytes)
+    if keep <= 0:
+        # Cap is smaller than the marker itself; degrade to marker
+        # alone so the result still indicates truncation rather
+        # than silently returning a marker-less stub.
+        return marker[:max_bytes], True
+    tail = encoded[-keep:].decode("utf-8", errors="replace")
+    return marker + tail, True
 
 
 def _build_email_message(
@@ -2363,13 +2412,9 @@ def _build_email_message(
             msg[k] = v
     body = _format_summary(result)
     if attach_log and log_text:
-        tail, truncated = _truncate_log(log_text, attach_max_kb)
-        marker = (
-            f"\n--- log (last {len(tail)} of {len(log_text)} bytes) ---\n"
-            if truncated
-            else "\n--- log ---\n"
+        body += _LOG_SEPARATOR + _format_log_for_notification(
+            log_text, attach_max_kb
         )
-        body += marker + tail
     msg.set_content(body)
     return msg
 
@@ -2385,6 +2430,61 @@ def _send_email(msg: EmailMessage, cfg: NotifyEmail, password: str) -> None:
         smtp.send_message(msg)
 
 
+_NTFY_MAX_BODY_KB: int = 3
+_LOG_SEPARATOR: str = "\n--- log (latest run) ---\n"
+
+
+def _format_log_for_notification(log_text: str, max_kb: int) -> str:
+    """Most recent run's log entry, head-truncated to max_kb.
+
+    Both notify transports show only the latest run's slice of
+    `run.log`: the structured summary already has the metadata
+    for the failing run, and the log content older than the
+    most recent header would just be noise (and on ntfy would
+    bump out the actual diagnostic detail under the 3 KB cap).
+    """
+    latest = _extract_latest_log_entry(log_text)
+    truncated, _trunc = _head_truncate_to_kb(latest, max_kb)
+    return truncated
+
+
+def _build_ntfy_body(summary: str, log_text: str, attach_log: bool) -> bytes:
+    """Construct the ntfy POST body.
+
+    Mirrors the email layout (human summary block followed by the
+    log) so a recipient subscribed to both transports sees the same
+    structured information. The whole body fits inside ntfy's per-
+    message budget by sizing the log section to whatever remains
+    after the summary; if the log is bigger than that, head-
+    truncate it (keeping the tail) so the most recent failure
+    output stays visible.
+
+    `attach_log = false` returns the summary alone (matches the
+    email path's "summary only when the user opted out of log
+    content").
+    """
+    summary_bytes = summary.encode("utf-8")
+    if not (attach_log and log_text):
+        return summary_bytes
+    sep_bytes = _LOG_SEPARATOR.encode("utf-8")
+    max_bytes = _NTFY_MAX_BODY_KB * 1024
+    log_budget_bytes = max_bytes - len(summary_bytes) - len(sep_bytes)
+    if log_budget_bytes <= 0:
+        # Pathological: summary alone exceeds the budget. Keep the
+        # summary intact (its structured fields are more useful to
+        # the recipient than a truncated stub) and skip the log.
+        return summary_bytes
+    log_budget_kb = max(1, log_budget_bytes // 1024)
+    tail = _format_log_for_notification(log_text, log_budget_kb)
+    # Tighten to the byte budget if the kb-rounded helper produced
+    # a slightly oversized result (happens when log_budget_bytes
+    # isn't a clean multiple of 1024).
+    tail_bytes = tail.encode("utf-8")
+    if len(tail_bytes) > log_budget_bytes:
+        tail_bytes = tail_bytes[-log_budget_bytes:]
+    return summary_bytes + sep_bytes + tail_bytes
+
+
 def _post_ntfy(
     cfg: NotifyNtfy,
     token: str,
@@ -2393,30 +2493,31 @@ def _post_ntfy(
     body: str,
     log_text: str,
     attach_log: bool,
-    attach_max_kb: int,
     extra_headers: dict[str, str] | None = None,
 ) -> None:
-    """POST to ntfy. Body is the log tail when attach_log is true,
-    otherwise the human summary. urlopen raises HTTPError on >=400
-    responses; the caller's broad except records that as
-    notify_error.
+    """POST to ntfy. Body mirrors the email layout (human summary +
+    latest log entry), capped at _NTFY_MAX_BODY_KB. urlopen raises
+    HTTPError on >=400 responses; the caller's broad except records
+    that as notify_error.
+
+    Inline body, not an attachment: ntfy attachments are publicly
+    addressable by URL guessing, so log content goes in the body
+    where it's auth-gated by ntfy's regular delivery channel.
+    ntfy's per-message limit is 4KB; we cap at 3KB to leave room
+    for headers and to keep notifications scannable.
 
     `extra_headers` is the channel's user-supplied `headers` dict
     -- e.g. `Email = "you@host"` to relay through ntfy's email
     integration, or `Priority = "urgent"` to bump severity. ntfy's
     user-facing headers are unconstrained; crony-controlled keys
-    (Authorization / Tags / Title) are filtered out at parse time.
+    (Authorization / Tags / Title / Filename) are filtered out at
+    parse time.
     """
     headers = dict(extra_headers) if extra_headers else {}
     headers["Authorization"] = f"Bearer {token}"
     headers["Title"] = title
     headers["Tags"] = f"warning,{exit_class}"
-    if attach_log and log_text:
-        tail, _trunc = _truncate_log(log_text, attach_max_kb)
-        data = tail.encode("utf-8")
-        headers["Filename"] = "run.log"
-    else:
-        data = body.encode("utf-8")
+    data = _build_ntfy_body(body, log_text, attach_log)
     req = urllib.request.Request(
         cfg.url, data=data, headers=headers, method="POST"
     )
@@ -2489,7 +2590,6 @@ def _send_ntfy_for(
         _format_summary(result),
         log_text,
         defaults.notify_attach_log,
-        defaults.notify_attach_max_kb,
         extra_headers=channel.headers,
     )
 
@@ -4349,22 +4449,26 @@ def do_logs(
     since: str | None,
     tail: bool,
     path: bool,
+    latest: bool,
 ) -> None:
     """Print a job's recent log output.
 
     `name` is the full namespaced name (`<bundle>.<short>`); bare
     input is shorthand for `default.<short>`.
 
-    -p/--path print the log file's path and exit (no content read).
-              Path resolution is purely structural -- prints even
-              when the file doesn't exist yet (e.g. for a job
-              that's been applied but never run), so it composes
-              with other tools: `$EDITOR "$(crony logs j -p)"`.
-    -n N      print the last N lines (default 200)
-    --since X parse X as a duration ('1h', '2d') or ISO timestamp
-              and skip log content older than that. Run-header
-              timestamps anchor the cut.
-    --tail    follow appended output (-f semantics) until interrupted.
+    -p/--path   print the log file's path and exit (no content read).
+                Path resolution is purely structural -- prints even
+                when the file doesn't exist yet (e.g. for a job
+                that's been applied but never run), so it composes
+                with other tools: `$EDITOR "$(crony logs j -p)"`.
+    -l/--latest print only the most recent run's entry (from the
+                last `=== ... ===` header to EOF). Overrides -n /
+                --since; mutually exclusive with --tail.
+    -n N        print the last N lines (default 200)
+    --since X   parse X as a duration ('1h', '2d') or ISO timestamp
+                and skip log content older than that. Run-header
+                timestamps anchor the cut.
+    --tail      follow appended output (-f semantics) until interrupted.
     """
     bn, short = parse_full_name(name)
     full = f"{bn}.{short}"
@@ -4374,16 +4478,24 @@ def do_logs(
         return
     if not log_path.exists():
         raise UsageError(f"no log for {full!r} (state dir: {STATE_DIR / full})")
+    if tail and latest:
+        raise UsageError("--tail and --latest are mutually exclusive")
     if tail:
         _follow_log(log_path)
         return
     text = log_path.read_text(encoding="utf-8", errors="replace")
-    if since is not None:
-        text = _filter_since(text, since)
-    if n > 0:
-        lines = text.splitlines()
-        if len(lines) > n:
-            text = "\n".join(lines[-n:]) + "\n"
+    if latest:
+        # `--latest` is a single-run readout; it overrides -n /
+        # --since since the entry is bounded by run-header
+        # markers, not line count or wallclock.
+        text = _extract_latest_log_entry(text)
+    else:
+        if since is not None:
+            text = _filter_since(text, since)
+        if n > 0:
+            lines = text.splitlines()
+            if len(lines) > n:
+                text = "\n".join(lines[-n:]) + "\n"
     sys.stdout.write(text)
     sys.stdout.flush()
 
@@ -5106,6 +5218,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--path",
         action="store_true",
         help="Print the log file path and exit (no content)",
+    )
+    p_logs.add_argument(
+        "-l",
+        "--latest",
+        action="store_true",
+        help="Print only the latest run's entry",
     )
 
     # run -- internal entry point for platform units; hidden from
