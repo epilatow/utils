@@ -77,7 +77,11 @@ validate, notify-test, list, init, self-test.
 `run` invokes the wrapped command directly in the calling process
 (skipping the platform scheduler entirely); `trigger` asks the
 platform (launchd / systemd) to fire the unit immediately, the
-same path a scheduled fire would take.
+same path a scheduled fire would take. `trigger --wait` blocks
+until the next completion via kernel-level pid-exit notification
+(kqueue on darwin, pidfd_open on linux) -- no polling. Groups
+dispatch each child through the same mechanism, with a
+cumulative deadline of 1.05 * sum-of-children's-timeouts.
 
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -101,10 +105,10 @@ State (logs, locks, last-run records, install hashes) lives at
 BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
 LOGFILE: Path = Path(tempfile.gettempdir()) / f"{BASENAME}.log"
 
-# Path overrides via env so the runner shim's subprocess re-invocation
-# (groups dispatching `crony run <child>`) and tests can redirect
-# config and state without filesystem games. Names follow the
-# convention CRONY_<KEY>.
+# Path overrides via env so platform-mediated invocations (launchd /
+# systemd starting `crony run <name>`) and tests can redirect config
+# and state without filesystem games. Names follow the convention
+# CRONY_<KEY>.
 _ENV_PREFIX: str = BASENAME.upper()
 
 
@@ -200,7 +204,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # notify_channels      = []           # any names defined below
 # notify_attach_log    = true
 # notify_attach_max_kb = 256
-# timeout_sec          = 1800         # 30 min default per-job wallclock cap
+# job_timeout_sec      = 1800         # 30 min default per-job wallclock cap
+# trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
 
 # Each notify channel is a [defaults.notify.<name>] block. The name
@@ -264,7 +269,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
 # # notify_channels = ["email"]
-# # timeout_sec     = 7200
+# # job_timeout_sec = 7200
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
 # # Unresolved vars stay literal; `$$` is a literal `$`.
@@ -470,7 +475,12 @@ class Defaults:
     notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
     notify_attach_max_kb: int = 256
-    timeout_sec: int = 1800
+    job_timeout_sec: int = 1800
+    # How long `crony trigger --wait` waits for a runner to come
+    # online after asking the platform scheduler to fire the unit.
+    # Catches "trigger seemed to succeed but nothing happened"
+    # cases (broken plist, queue stalled, etc.).
+    trigger_timeout_sec: int = 15
     log_keep_runs: int = 30
     # Per-bundle channel definitions: { name -> NotifyChannel }.
     notify_channel_defs: dict[str, NotifyChannel] = field(default_factory=dict)
@@ -490,7 +500,7 @@ class Job:
     schedule: str | None = None
     interval: str | None = None
     platforms: list[str] = field(default_factory=list)
-    timeout_sec: int | None = None
+    job_timeout_sec: int | None = None
     # None = inherit from target/defaults; [] = explicit empty (this
     # job sends no external notifications even if defaults / target
     # would).
@@ -502,18 +512,24 @@ class Job:
 class JobGroup:
     """A scheduled sequencer that fires named jobs in order.
 
-    Groups don't carry notify settings: children run as fresh
-    subprocesses via `crony run <child>` and resolve their own
-    notify_channels through the target / job / defaults cascade. To
-    apply a notify channel to all members of a group, set it at the
-    target level (typical case) or per-job.
+    Groups don't carry notify settings: children run independently
+    (via the platform scheduler dispatch that crony orchestrates)
+    and resolve their own notify_channels through the target / job
+    / defaults cascade. To apply a notify channel to all members of
+    a group, set it at the target level (typical case) or per-job.
+
+    Groups also don't carry `job_timeout_sec` -- their effective
+    timeout is auto-computed from `resolved_group_timeout_sec`
+    (1.05 * sum of children's effective timeouts), which always
+    reflects the current leaf-level timeouts and gives child
+    runners slack to time themselves out before the group's own
+    cumulative deadline fires.
     """
 
     name: str
     jobs: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
-    timeout_sec: int | None = None
 
 
 @dataclass
@@ -528,7 +544,7 @@ class Target:
     jobs: list[str] = field(default_factory=list)
     # None = inherit from job/defaults; [] = explicit empty.
     notify_channels: list[str] | None = None
-    timeout_sec: int | None = None
+    job_timeout_sec: int | None = None
 
 
 @dataclass
@@ -775,7 +791,8 @@ _KNOWN_DEFAULTS: frozenset[str] = frozenset(
         "notify_channels",
         "notify_attach_log",
         "notify_attach_max_kb",
-        "timeout_sec",
+        "job_timeout_sec",
+        "trigger_timeout_sec",
         "log_keep_runs",
         "notify",
     }
@@ -792,7 +809,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "schedule",
         "interval",
         "platforms",
-        "timeout_sec",
+        "job_timeout_sec",
         "notify_channels",
         "env",
     }
@@ -803,7 +820,6 @@ _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
         "jobs",
         "schedule",
         "interval",
-        "timeout_sec",
     }
 )
 
@@ -811,7 +827,7 @@ _KNOWN_TARGET: frozenset[str] = frozenset(
     {
         "jobs",
         "notify_channels",
-        "timeout_sec",
+        "job_timeout_sec",
     }
 )
 
@@ -897,7 +913,7 @@ def _typed_field(
 
     `bool` and `int` are distinct here, even though `isinstance(True, int)`
     is True in Python -- we explicitly reject booleans for int-typed fields
-    so `timeout_sec = true` raises clearly rather than silently meaning 1.
+    so `job_timeout_sec = true` raises clearly rather than silently meaning 1.
     """
     if key not in raw:
         return default
@@ -1174,7 +1190,12 @@ def _parse_defaults(raw: dict[str, Any]) -> Defaults:
         notify_attach_max_kb=_positive_int(
             raw, "notify_attach_max_kb", where, default=256
         ),
-        timeout_sec=_positive_int(raw, "timeout_sec", where, default=1800),
+        job_timeout_sec=_positive_int(
+            raw, "job_timeout_sec", where, default=1800
+        ),
+        trigger_timeout_sec=_positive_int(
+            raw, "trigger_timeout_sec", where, default=15
+        ),
         log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
         notify_channel_defs=notify_channel_defs,
     )
@@ -1225,9 +1246,9 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
                 f"{sorted(_VALID_PLATFORMS)}"
             )
     channels = _parse_notify_channels(raw, where, required=False)
-    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
-    if timeout_sec is not None and timeout_sec <= 0:
-        raise ConfigError(f"{where}: timeout_sec must be positive")
+    job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
+    if job_timeout_sec is not None and job_timeout_sec <= 0:
+        raise ConfigError(f"{where}: job_timeout_sec must be positive")
     return Job(
         name=name,
         command=command,
@@ -1239,7 +1260,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
         schedule=schedule,
         interval=interval,
         platforms=platforms,
-        timeout_sec=timeout_sec,
+        job_timeout_sec=job_timeout_sec,
         notify_channels=channels,
         env=_string_dict(raw, "env", where),
     )
@@ -1269,15 +1290,11 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
-    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
-    if timeout_sec is not None and timeout_sec <= 0:
-        raise ConfigError(f"{where}: timeout_sec must be positive")
     return JobGroup(
         name=name,
         jobs=jobs,
         schedule=schedule,
         interval=interval,
-        timeout_sec=timeout_sec,
     )
 
 
@@ -1291,15 +1308,15 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
     _reject_unknown_keys(raw, _KNOWN_TARGET, where)
     jobs = _string_list(raw, "jobs", where)
     channels = _parse_notify_channels(raw, where, required=False)
-    timeout_sec = _typed_field(raw, "timeout_sec", int, where)
-    if timeout_sec is not None and timeout_sec <= 0:
-        raise ConfigError(f"{where}: timeout_sec must be positive")
+    job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
+    if job_timeout_sec is not None and job_timeout_sec <= 0:
+        raise ConfigError(f"{where}: job_timeout_sec must be positive")
     return Target(
         name=name,
         kind=kind,
         jobs=jobs,
         notify_channels=channels,
-        timeout_sec=timeout_sec,
+        job_timeout_sec=job_timeout_sec,
     )
 
 
@@ -1638,15 +1655,49 @@ def resolved_notify_channels(
     return list(config.defaults.notify_channels)
 
 
-def resolved_timeout_sec(
+def resolved_job_timeout_sec(
     config: Config, target: Target | None, job: Job
 ) -> int:
-    """Cascade timeout_sec: target > job > defaults."""
-    if target is not None and target.timeout_sec is not None:
-        return target.timeout_sec
-    if job.timeout_sec is not None:
-        return job.timeout_sec
-    return config.defaults.timeout_sec
+    """Cascade job_timeout_sec: target > job > defaults."""
+    if target is not None and target.job_timeout_sec is not None:
+        return target.job_timeout_sec
+    if job.job_timeout_sec is not None:
+        return job.job_timeout_sec
+    return config.defaults.job_timeout_sec
+
+
+# Padding factor applied to a group's effective timeout. The 5%
+# slack lets a leaf job hit its own timeout (and propagate the
+# error up through last-run.json) before the parent group's own
+# cumulative deadline fires. Compounds with nesting depth, by
+# design.
+_GROUP_TIMEOUT_PADDING: float = 1.05
+
+
+def resolved_group_timeout_sec(
+    config: Config, target: Target | None, group_name: str
+) -> int:
+    """Auto-computed effective timeout for a group.
+
+    Returns 1.05 * sum of children's effective timeouts (jobs use
+    `resolved_job_timeout_sec`; sub-groups recurse into this same
+    helper). Floor at 1 second. Used by:
+    - `run_group` to bound its cumulative dispatch loop.
+    - The waiter in `_trigger_unit_sync` to bound its pid-watch
+      when waiting for a group.
+    Cycle-safety: `_validate_config` rejects cycles in group
+    references, so the recursion always terminates.
+    """
+    group = config.job_groups[group_name]
+    total = 0.0
+    for child in group.jobs:
+        if child in config.jobs:
+            total += resolved_job_timeout_sec(
+                config, target, config.jobs[child]
+            )
+        else:
+            total += resolved_group_timeout_sec(config, target, child)
+    return max(1, int(total * _GROUP_TIMEOUT_PADDING))
 
 
 # =============================================================================
@@ -1657,10 +1708,12 @@ def resolved_timeout_sec(
 # per-job pipeline acquires a per-job flock, runs the optional gate,
 # execs the main command with a wallclock cap, writes a structured
 # last-run.json record, and dispatches a notification on non-ok exits
-# exits via the configured channel (log-only, email, or ntfy). The
-# group pipeline acquires a group-level lock and re-invokes
-# `crony run <child>` for each named child in order; per-job
-# notifications happen inside each child's own run.
+# via the configured channel (log-only, email, or ntfy). The group
+# pipeline acquires a group-level lock and triggers each named child
+# through its own platform unit (launchctl kickstart / systemctl
+# start), waiting synchronously for each to exit via a kqueue or
+# pidfd watcher; per-job notifications happen inside each child's own
+# run.
 
 
 @dataclass
@@ -1881,7 +1934,7 @@ def _exec_with_timeout(
     argv: list[str],
     *,
     env: dict[str, str],
-    timeout_sec: int,
+    job_timeout_sec: int,
     log_file: IO[bytes],
 ) -> ExitOutcome:
     """Exec argv, piping stdout+stderr into log_file.
@@ -1896,7 +1949,7 @@ def _exec_with_timeout(
         env=env,
     )
     try:
-        rc = proc.wait(timeout=timeout_sec)
+        rc = proc.wait(timeout=job_timeout_sec)
     except subprocess.TimeoutExpired:
         proc.terminate()
         try:
@@ -1908,6 +1961,65 @@ def _exec_with_timeout(
     if rc < 0:
         return ExitOutcome(rc=0, signal=-rc)
     return ExitOutcome(rc=rc, signal=None)
+
+
+def _wait_for_pid_exit(pid: int, timeout: float | None) -> str:
+    """Block until `pid` exits, using kernel-level notification.
+
+    Returns "exit" if the pid is gone (exited, never existed, or
+    raced into reuse); "timeout" if `timeout` seconds elapsed
+    without an exit notification. No polling: darwin uses
+    kqueue + EVFILT_PROC + NOTE_EXIT; linux uses
+    `os.pidfd_open` + `select.poll`.
+
+    `timeout=None` waits indefinitely. The race-safe path -- pid
+    already gone before we register -- is the same on both
+    platforms: kqueue.control raises ProcessLookupError, pidfd_open
+    raises ProcessLookupError; both translate to "exit".
+    """
+    if sys.platform == "darwin":
+        return _wait_for_pid_exit_kqueue(pid, timeout)
+    if sys.platform.startswith("linux"):
+        return _wait_for_pid_exit_pidfd(pid, timeout)
+    raise CronyError(f"unsupported platform: {sys.platform}")
+
+
+def _wait_for_pid_exit_kqueue(pid: int, timeout: float | None) -> str:
+    import select as _select
+
+    kq = _select.kqueue()
+    try:
+        ev = _select.kevent(
+            pid,
+            filter=_select.KQ_FILTER_PROC,
+            flags=_select.KQ_EV_ADD | _select.KQ_EV_ENABLE,
+            fflags=_select.KQ_NOTE_EXIT,
+        )
+        try:
+            kq.control([ev], 0, 0)
+        except ProcessLookupError:
+            return "exit"
+        events = kq.control([], 1, timeout)
+        return "exit" if events else "timeout"
+    finally:
+        kq.close()
+
+
+def _wait_for_pid_exit_pidfd(pid: int, timeout: float | None) -> str:
+    import select as _select
+
+    try:
+        fd = os.pidfd_open(pid)  # type: ignore[attr-defined]
+    except ProcessLookupError:
+        return "exit"
+    try:
+        poll = _select.poll()
+        poll.register(fd, _select.POLLIN)
+        ms = -1 if timeout is None else int(timeout * 1000)
+        events = poll.poll(ms)
+        return "exit" if events else "timeout"
+    finally:
+        os.close(fd)
 
 
 def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
@@ -2281,9 +2393,10 @@ def run_job(
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
+    pid_path = sd / "run.pid"
 
     notify_channels = resolved_notify_channels(config, target, job)
-    timeout_sec = resolved_timeout_sec(config, target, job)
+    job_timeout_sec = resolved_job_timeout_sec(config, target, job)
     env = _runtime_env(job)
     started = time.time()
     started_iso = _now_iso()
@@ -2294,6 +2407,11 @@ def run_job(
         with _acquire_lock(lock_path):
             if dry_run:
                 return 0
+            # Publish our pid for waiters (parent groups, `crony
+            # trigger --wait`) to watch via kqueue / pidfd. The
+            # pid file lives only for the duration of the lock-
+            # holding run; cleaned up in `finally`.
+            pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_size_before = (
                 log_path.stat().st_size if log_path.exists() else 0
@@ -2355,7 +2473,7 @@ def run_job(
                     rc, sig = _exec_with_timeout(
                         argv,
                         env=env,
-                        timeout_sec=timeout_sec,
+                        job_timeout_sec=job_timeout_sec,
                         log_file=log_file,
                     )
                     if sig is not None:
@@ -2413,6 +2531,7 @@ def run_job(
                 return surfaced_rc
             finally:
                 log_file.close()
+                pid_path.unlink(missing_ok=True)
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
@@ -2429,38 +2548,51 @@ def run_group(
     skip_gate: bool = False,
     bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> int:
-    """Run a job-group: dispatch each child via `crony run <child>`.
+    """Run a job-group: fire each child through the platform
+    scheduler in order, waiting for completion via kernel-level
+    pid-exit notification.
 
-    `name` is the short group name; `bundle_name` defaults to
-    "default". Children dispatch via subprocess as
-    `crony run <bundle_name>.<child-short>` so the child's runner
-    resolves into the same bundle's defaults / target / job
-    cascade.
+    Children fire sequentially via `_trigger_unit_sync`, which
+    asks the platform (launchd / systemd) to start the child's
+    unit and watches its `run.pid` for exit. The group's runner
+    enforces a cumulative deadline (the group's auto-computed
+    effective timeout); when the budget is exhausted, the loop
+    stops dispatching new children -- already-running children
+    keep running independently in their own runner processes.
 
-    Children fire sequentially; one child failing does not stop the
-    next. The group writes its own aggregate last-run.json with a
-    per-child summary. The group itself never sends a notification;
-    each child's own runner handles notify.
+    The group's `run.log` becomes a sequencer trace
+    (fired/finished lines per child); child stdout/stderr stays
+    in the child's own log. The group never sends notifications;
+    each child's own runner handles notify per the cascade.
+
+    `skip_gate` is intentionally unused for the platform-mediated
+    dispatch path -- the child's runner reads the toml at fire
+    time and applies the cascade itself.
     """
     if name not in config.job_groups:
         raise PreconditionError(f"unknown group: {name!r}")
     group = config.job_groups[name]
     full_name = f"{bundle_name}.{name}"
+    target = resolve_target(config, current_host(), current_platform())
+    group_budget = resolved_group_timeout_sec(config, target, name)
 
     sd = _state_dir_for(full_name)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
+    pid_path = sd / "run.pid"
 
     started = time.time()
     started_iso = _now_iso()
     host = current_host()
     platform = current_platform()
+    trigger_timeout = config.defaults.trigger_timeout_sec
 
     try:
         with _acquire_lock(lock_path):
             if dry_run:
                 return 0
+            pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_file = open(log_path, "ab", buffering=0)
             children: list[GroupChildResult] = []
@@ -2468,33 +2600,71 @@ def run_group(
                 child_full = [f"{bundle_name}.{c}" for c in group.jobs]
                 header = (
                     f"\n=== {started_iso} group {full_name} "
+                    f"budget={group_budget}s "
                     f"children={child_full} ===\n"
                 ).encode()
                 log_file.write(header)
 
+                deadline = time.monotonic() + group_budget
                 for child_short, child_full_name in zip(group.jobs, child_full):
-                    log_file.write(f"-> {child_full_name}\n".encode())
-                    cmd = [
-                        _crony_executable(),
-                        "run",
-                        child_full_name,
-                    ]
-                    if skip_gate:
-                        cmd.append("--skip-gate")
-                    proc = subprocess.run(
-                        cmd, stdout=log_file, stderr=subprocess.STDOUT
-                    )
-                    rc = proc.returncode
-                    if rc == 0:
-                        cls = "ok"
-                    elif rc == int(ExitCode.LOCK_BUSY):
-                        cls = "lock_busy"
-                    elif rc == int(ExitCode.TIMEOUT):
-                        cls = "timeout"
-                    elif rc == int(ExitCode.PRECONDITION):
-                        cls = "precondition"
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        log_file.write(
+                            (
+                                f"-> {child_full_name}: TIMEOUT "
+                                f"(group budget exhausted)\n"
+                            ).encode()
+                        )
+                        children.append(
+                            GroupChildResult(
+                                name=child_full_name,
+                                exit_class="timeout",
+                                exit_code=int(ExitCode.TIMEOUT),
+                            )
+                        )
+                        continue
+
+                    # Compute the child's own effective timeout so we
+                    # cap the wait at min(child timeout, remaining
+                    # group budget). This is what gives child
+                    # runners a chance to time themselves out and
+                    # write their own last-run.json before the
+                    # group's deadline fires.
+                    if child_short in config.jobs:
+                        child_timeout: float = resolved_job_timeout_sec(
+                            config, target, config.jobs[child_short]
+                        )
                     else:
-                        cls = "fail"
+                        child_timeout = resolved_group_timeout_sec(
+                            config, target, child_short
+                        )
+                    child_wait = min(child_timeout, remaining)
+
+                    log_file.write(
+                        (
+                            f"-> {child_full_name} "
+                            f"(timeout={child_wait:.0f}s)\n"
+                        ).encode()
+                    )
+                    try:
+                        rec = _trigger_unit_sync(
+                            child_full_name,
+                            job_timeout=child_wait,
+                            trigger_timeout=trigger_timeout,
+                        )
+                    except TriggerStartTimeout as e:
+                        log_file.write(f"   {e}\n".encode())
+                        children.append(
+                            GroupChildResult(
+                                name=child_full_name,
+                                exit_class="timeout",
+                                exit_code=int(ExitCode.TIMEOUT),
+                            )
+                        )
+                        continue
+                    cls = rec.get("exit_class", "fail")
+                    rc = _trigger_exit_code(rec)
+                    log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
                     children.append(
                         GroupChildResult(
                             name=child_full_name,
@@ -2517,6 +2687,7 @@ def run_group(
                 return 0
             finally:
                 log_file.close()
+                pid_path.unlink(missing_ok=True)
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
@@ -2742,17 +2913,31 @@ def _render_units(
     interval: str | None,
     platform: str,
 ) -> dict[str, str]:
-    """Return {filename: content} for the platform units of (name, schedule)."""
+    """Return {filename: content} for the platform units of (name, schedule).
+
+    Every job and group gets a unit so it's individually triggerable
+    via the platform scheduler, regardless of whether it has its own
+    schedule. Schedule-less entries (transit groups, group-only jobs)
+    install a unit that just sits dormant until something fires it
+    -- either `crony trigger` or a parent group dispatching it.
+
+    On darwin, that's a plist with no Start* keys (RunAtLoad=false,
+    so loading doesn't auto-fire). On linux, only the .service file
+    is rendered for schedule-less entries; the .timer is omitted
+    because a timer with no triggering condition is dead weight.
+    """
     if platform == "darwin":
         return {
             f"{_label_for(name)}.plist": _render_plist(name, schedule, interval)
         }
-    return {
+    units = {
         f"{BASENAME}-{name}.service": _render_systemd_service(name),
-        f"{BASENAME}-{name}.timer": _render_systemd_timer(
-            name, schedule, interval
-        ),
     }
+    if schedule is not None or interval is not None:
+        units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(
+            name, schedule, interval
+        )
+    return units
 
 
 def _entity_schedule(
@@ -2776,7 +2961,11 @@ def _compute_unit_hash(name: str, entry: Job | JobGroup, platform: str) -> str:
 
 
 def _activate_unit(
-    name: str, platform: str, *, prior_disabled: bool = False
+    name: str,
+    platform: str,
+    *,
+    prior_disabled: bool = False,
+    scheduled: bool = True,
 ) -> None:
     """Load the unit into the platform scheduler.
 
@@ -2786,6 +2975,12 @@ def _activate_unit(
     so the scheduler doesn't fire it. Without this, a `crony disable
     foo` followed by an unrelated config edit would silently re-arm
     foo.
+
+    `scheduled=False` means the entry has no schedule / interval.
+    On linux that means there's no .timer to enable; only the
+    .service is registered (oneshot, sits dormant until something
+    starts it). The plist analog is the same -- a plist with no
+    Start* keys loads fine and just doesn't auto-fire.
     """
     if platform == "darwin":
         plist = _plist_path_for(name)
@@ -2815,10 +3010,13 @@ def _activate_unit(
                 check=True,
             )
         return
-    # linux: daemon-reload picks up the new content. Only enable +
-    # start when the unit was NOT already deliberately disabled.
+    # linux: daemon-reload picks up the new content. `enable --now`
+    # only applies to the .timer, which we only render for scheduled
+    # entries; for schedule-less entries the .service alone is
+    # enough (it sits in the unit catalog, ready for `systemctl
+    # start` to fire it).
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    if not prior_disabled:
+    if scheduled and not prior_disabled:
         subprocess.run(
             [
                 "systemctl",
@@ -2874,9 +3072,13 @@ def apply_one(
     `<bundle_name>.<name>` is what lands on disk (hash stamp,
     plist / systemd unit identifier).
 
-    Group-only jobs (no schedule, no interval) install no platform
-    unit but still get a hash stamp so orphan-detection has a record.
-    The same return values apply -- only the platform-unit IO differs.
+    Every entry installs a platform unit, even schedule-less ones:
+    a transit group's plist sits dormant until a parent dispatches
+    it (or `crony trigger` fires it explicitly). On linux, only the
+    .service file is installed for schedule-less entries; the
+    .timer (which would have nothing to trigger on) is omitted, and
+    apply cleans up a stale .timer if an entry transitions
+    scheduled -> unscheduled.
     """
     if name in config.jobs:
         entry: Job | JobGroup = config.jobs[name]
@@ -2887,14 +3089,9 @@ def apply_one(
     full_name = f"{bundle_name}.{name}"
 
     schedule, interval = _entity_schedule(entry)
-    has_unit = schedule is not None or interval is not None
     platform = current_platform()
     hash_path = _hash_path_for(full_name)
-    new_hash = (
-        _compute_unit_hash(full_name, entry, platform)
-        if has_unit
-        else "stamp-only"
-    )
+    new_hash = _compute_unit_hash(full_name, entry, platform)
     old_hash = hash_path.read_text().strip() if hash_path.exists() else None
 
     if old_hash == new_hash:
@@ -2903,24 +3100,44 @@ def apply_one(
     if dry_run:
         return "added" if old_hash is None else "updated"
 
-    if has_unit:
-        # Capture runtime state BEFORE we re-render so a hand-disabled
-        # unit stays disabled across the re-load. _sched_state returns
-        # "unknown" for a not-yet-installed unit (no platform record
-        # to query); we treat unknown as "not previously disabled" so
-        # a fresh install lands enabled.
-        prior_disabled = (
-            old_hash is not None
-            and _sched_state(full_name, platform) == "disabled"
-        )
-        units = _render_units(full_name, schedule, interval, platform)
-        target_dir = (
-            LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for fname, content in units.items():
-            (target_dir / fname).write_text(content, encoding="utf-8")
-        _activate_unit(full_name, platform, prior_disabled=prior_disabled)
+    # Capture runtime state BEFORE we re-render so a hand-disabled
+    # unit stays disabled across the re-load. _sched_state returns
+    # "unknown" for a not-yet-installed unit (no platform record
+    # to query); we treat unknown as "not previously disabled" so
+    # a fresh install lands enabled.
+    prior_disabled = (
+        old_hash is not None and _sched_state(full_name, platform) == "disabled"
+    )
+    units = _render_units(full_name, schedule, interval, platform)
+    target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # Clean up any previously-installed unit files for this name
+    # that aren't in the current render set (handles a scheduled
+    # -> unscheduled transition where the .timer should be removed).
+    if platform == "linux":
+        timer_path = _timer_path_for(full_name)
+        if timer_path.name not in units and timer_path.exists():
+            # Disable the orphaned timer in the scheduler's view
+            # before unlinking the file.
+            subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                    timer_path.name,
+                ],
+                stderr=subprocess.DEVNULL,
+            )
+            timer_path.unlink()
+    for fname, content in units.items():
+        (target_dir / fname).write_text(content, encoding="utf-8")
+    _activate_unit(
+        full_name,
+        platform,
+        prior_disabled=prior_disabled,
+        scheduled=schedule is not None or interval is not None,
+    )
 
     hash_path.parent.mkdir(parents=True, exist_ok=True)
     hash_path.write_text(new_hash + "\n", encoding="utf-8")
@@ -3181,13 +3398,7 @@ def _config_state_for(
     if not in_config and not has_stamp:
         return "missing"
     entry: Job | JobGroup = config.jobs.get(short) or config.job_groups[short]
-    schedule, interval = _entity_schedule(entry)
-    has_unit = schedule is not None or interval is not None
-    new_hash = (
-        _compute_unit_hash(full_name, entry, platform)
-        if has_unit
-        else "stamp-only"
-    )
+    new_hash = _compute_unit_hash(full_name, entry, platform)
     old_hash = _hash_path_for(full_name).read_text(encoding="utf-8").strip()
     return "synced" if old_hash == new_hash else "stale"
 
@@ -3257,6 +3468,11 @@ def _trigger_unit(name: str, platform: str) -> None:
     than `launchctl start` which only queues the next scheduled
     fire). On linux, `systemctl --user start <unit>.service` runs
     the timer's underlying service directly.
+
+    Both platforms treat "trigger an already-running unit" as a
+    no-op -- the in-flight run continues and there is no fresh
+    fire. Waiters that need to know the next completion's outcome
+    use `_trigger_unit_sync` instead.
     """
     if platform == "linux":
         # The timer's job is to fire the .service; trigger by
@@ -3272,6 +3488,97 @@ def _trigger_unit(name: str, platform: str) -> None:
         ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
         check=True,
     )
+
+
+class TriggerStartTimeout(JobTimeoutError):
+    """The platform never produced a runner within
+    `trigger_timeout_sec` after we asked it to fire the unit.
+    Suggests a broken plist / unit, a stalled scheduler queue, or
+    the unit not being loaded (run `crony apply` first).
+
+    Subclass of `JobTimeoutError` so it shares the TIMEOUT exit
+    code; the specialization conveys 'the trigger never started'
+    rather than 'the runner exceeded its timeout'.
+    """
+
+
+def _read_pid_file(pid_path: Path) -> int | None:
+    try:
+        text = pid_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _trigger_unit_sync(
+    full_name: str,
+    *,
+    job_timeout: float,
+    trigger_timeout: float,
+) -> dict[str, Any]:
+    """Fire `full_name` via the platform and wait for completion.
+
+    Returns the parsed `last-run.json` dict for the run we observed
+    completing. Raises `TriggerStartTimeout` if no fresh run
+    appears within `trigger_timeout` seconds of the trigger.
+
+    Mechanism: a pre-trigger timestamp T is taken, the platform
+    is asked to fire the unit, and the waiter watches for the
+    runner's pid (published via `<state>/<full_name>/run.pid`) to
+    exit. When the pid is gone, last-run.json is read; if its
+    `ended_at` is at or after T, the run is "ours" (semantics:
+    the next completion after the trigger). Otherwise we sleep
+    briefly, re-read the pid file, and try again. The
+    pid-watch step uses kernel-level notification (no polling).
+
+    Triggering an already-running unit is a no-op on both
+    platforms; the waiter still attaches to the in-flight pid and
+    returns its result. That's what we want -- "the next
+    completion" is well-defined and serves the group-dispatch use
+    case (we wanted the child's run; an in-flight run satisfies).
+    """
+    # Match the runner's `_now_iso()` precision (whole seconds): if
+    # pre_trigger captured microseconds and the runner's ended_at
+    # truncated them, a sub-second run could compare ended_at <
+    # pre_trigger and the loop would conclude "no fresh run yet"
+    # for the entire trigger_timeout window.
+    pre_trigger_dt = datetime.datetime.fromisoformat(_now_iso())
+    sd = _state_dir_for(full_name)
+    pid_path = sd / "run.pid"
+    last_run_path = sd / "last-run.json"
+    platform = current_platform()
+
+    _trigger_unit(full_name, platform)
+
+    deadline_start = time.monotonic() + trigger_timeout
+    while True:
+        pid = _read_pid_file(pid_path)
+        if pid is not None:
+            _wait_for_pid_exit(pid, timeout=job_timeout)
+            # pid is now gone; check whether the run we observed
+            # is ours (its ended_at >= our pre-trigger ts).
+        if last_run_path.exists():
+            try:
+                rec = json.loads(last_run_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                rec = None
+            ended_at = rec.get("ended_at") if rec is not None else None
+            if ended_at:
+                try:
+                    ended_dt = datetime.datetime.fromisoformat(ended_at)
+                except ValueError:
+                    ended_dt = None
+                if ended_dt is not None and ended_dt >= pre_trigger_dt:
+                    return rec
+        if time.monotonic() > deadline_start:
+            raise TriggerStartTimeout(
+                f"trigger of {full_name!r} never produced a fresh "
+                f"run within {trigger_timeout}s"
+            )
+        time.sleep(1.0)
 
 
 # =============================================================================
@@ -3439,11 +3746,11 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
         )
 
 
-def _refuse_stamp_only_full(
+def _refuse_unscheduled_full(
     bundles: Bundles, full_names: list[str], verb: str
 ) -> None:
-    """Reject group-only entries that have a stamp but no platform unit."""
-    stamp_only: list[str] = []
+    """Reject entries with no schedule (nothing to enable/disable)."""
+    unscheduled: list[str] = []
     for full in full_names:
         bn, short = parse_full_name(full)
         bundle = bundles.by_name(bn)
@@ -3456,11 +3763,10 @@ def _refuse_stamp_only_full(
             continue
         sched, interval = _entity_schedule(entry)
         if sched is None and interval is None:
-            stamp_only.append(full)
-    if stamp_only:
+            unscheduled.append(full)
+    if unscheduled:
         raise UsageError(
-            f"cannot {verb} group-only entries (no platform unit): "
-            f"{sorted(stamp_only)}"
+            f"cannot {verb} entries with no schedule: {sorted(unscheduled)}"
         )
 
 
@@ -3469,7 +3775,8 @@ def do_enable(jobs: list[str]) -> None:
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first) and group-only entries.
+    this host (run apply first) and entries with no schedule (no
+    platform timer to enable / disable).
     """
     bundles = load_all_bundles()
     stamped = stamped_names()
@@ -3482,7 +3789,7 @@ def do_enable(jobs: list[str]) -> None:
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_stamp_only_full(bundles, normalized, "enable")
+    _refuse_unscheduled_full(bundles, normalized, "enable")
     platform = current_platform()
     for full in normalized:
         _enable_unit(full, platform)
@@ -3494,7 +3801,8 @@ def do_disable(jobs: list[str]) -> None:
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first) and group-only entries.
+    this host (run apply first) and entries with no schedule (no
+    platform timer to enable / disable).
     """
     bundles = load_all_bundles()
     stamped = stamped_names()
@@ -3507,28 +3815,75 @@ def do_disable(jobs: list[str]) -> None:
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_stamp_only_full(bundles, normalized, "disable")
+    _refuse_unscheduled_full(bundles, normalized, "disable")
     platform = current_platform()
     for full in normalized:
         _disable_unit(full, platform)
         logger.info("disable %s", full)
 
 
-def do_trigger(jobs: list[str]) -> None:
-    """Ask the platform scheduler to fire the named jobs immediately.
+def _trigger_exit_code(rec: dict[str, Any]) -> int:
+    """Map a last-run.json record to a process exit code.
+
+    `exit_code` is None whenever the job didn't reach a normal exit
+    (timeout, signal, gate refusal, precondition fail, lock contention).
+    `... or 0` would mask all of those as success; instead, derive the
+    code from the exit_class so a `crony trigger --wait` against a
+    timed-out job exits non-zero.
+    """
+    rc = rec.get("exit_code")
+    if rc is not None:
+        return int(rc)
+    cls = rec.get("exit_class", "ok")
+    if cls == "timeout":
+        return int(ExitCode.TIMEOUT)
+    if cls == "signal":
+        sig = rec.get("signal")
+        return 128 + int(sig) if sig else int(ExitCode.ERROR)
+    if cls == "lock_busy":
+        return int(ExitCode.LOCK_BUSY)
+    if cls == "precondition":
+        return int(ExitCode.PRECONDITION)
+    if cls == "gated":
+        return 0
+    return 0
+
+
+def do_trigger(
+    jobs: list[str],
+    wait: bool,
+    trigger_timeout: int | None,
+) -> None:
+    """Ask the platform scheduler to fire the named jobs.
 
     Distinct from `crony run`, which executes the job's wrapped
     command directly in the calling process tree (skipping the
     platform scheduler entirely). `trigger` exercises the same
     launchd / systemd path the schedule would, useful for testing
     that the platform unit is wired up correctly without waiting
-    for the next scheduled fire.
+    for the next scheduled fire. Works on every stamped entry,
+    including transit groups and group-only jobs (every entry
+    installs a platform unit; schedule-less entries' units just sit
+    dormant until kickstarted).
+
+    Default mode is async (matches `launchctl kickstart` /
+    `systemctl start`): the trigger returns as soon as the
+    platform has accepted it. With `--wait`, blocks until each
+    named entry's next completion and exits with that exit code
+    (the worst exit code across multiple names if more than one).
+
+    `--trigger-timeout <sec>` (only with `--wait`) overrides the
+    default 15s "trigger never produced a run" deadline.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first) and group-only / transit entries
-    that have no platform unit.
+    this host (run apply first).
     """
+    if trigger_timeout is not None and not wait:
+        raise UsageError(
+            "--trigger-timeout requires --wait (only meaningful in "
+            "synchronous mode)"
+        )
     bundles = load_all_bundles()
     stamped = stamped_names()
     normalized = [
@@ -3540,11 +3895,49 @@ def do_trigger(jobs: list[str]) -> None:
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_stamp_only_full(bundles, normalized, "trigger")
     platform = current_platform()
+
+    if not wait:
+        for full in normalized:
+            _trigger_unit(full, platform)
+            logger.info("trigger %s", full)
+        return
+
+    # Synchronous waiter mode. Resolve per-name timeouts via each
+    # name's bundle; bundles can disagree about defaults so we look
+    # up trigger_timeout_sec per-bundle too.
+    worst_rc = 0
     for full in normalized:
-        _trigger_unit(full, platform)
-        logger.info("trigger %s", full)
+        bn, short = parse_full_name(full)
+        bundle = bundles.by_name(bn)
+        if bundle is None:
+            raise UsageError(
+                f"unknown bundle for {full!r} (apply may be stale)"
+            )
+        b_target = resolve_target(bundle.config, current_host(), platform)
+        if short in bundle.config.jobs:
+            timeout = float(
+                resolved_job_timeout_sec(
+                    bundle.config, b_target, bundle.config.jobs[short]
+                )
+            )
+        else:
+            timeout = float(
+                resolved_group_timeout_sec(bundle.config, b_target, short)
+            )
+        tt = (
+            float(trigger_timeout)
+            if trigger_timeout is not None
+            else float(bundle.config.defaults.trigger_timeout_sec)
+        )
+        rec = _trigger_unit_sync(full, job_timeout=timeout, trigger_timeout=tt)
+        cls = rec.get("exit_class", "ok")
+        rc = _trigger_exit_code(rec)
+        logger.info("trigger %s: %s (exit %s)", full, cls, rc)
+        if rc and (not worst_rc or abs(rc) > abs(worst_rc)):
+            worst_rc = rc
+    if worst_rc:
+        raise SystemExit(worst_rc)
 
 
 def do_status(jobs: list[str]) -> None:
@@ -4319,6 +4712,26 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="+",
         help="Job names to trigger via launchd / systemctl",
+    )
+    p_trigger.add_argument(
+        "-w",
+        "--wait",
+        action="store_true",
+        help=(
+            "Block until each named entry's next completion and "
+            "exit with that exit code (worst across multiple names)"
+        ),
+    )
+    p_trigger.add_argument(
+        "--trigger-timeout",
+        type=int,
+        default=None,
+        dest="trigger_timeout",
+        help=(
+            "Override [defaults].trigger_timeout_sec (seconds to "
+            "wait for a runner to come online after kickstart). "
+            "Only meaningful with --wait."
+        ),
     )
 
     # status

@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -224,7 +225,7 @@ class TestParseDefaults:
     def test_empty_config_uses_defaults(self) -> None:
         cfg = crony.parse_config({})
         assert cfg.defaults.notify_channels == []
-        assert cfg.defaults.timeout_sec == 1800
+        assert cfg.defaults.job_timeout_sec == 1800
         assert cfg.defaults.notify_attach_log is True
         assert cfg.defaults.notify_channel_defs == {}
 
@@ -235,7 +236,7 @@ class TestParseDefaults:
                     "notify_channels": ["ntfy"],
                     "notify_attach_log": False,
                     "notify_attach_max_kb": 512,
-                    "timeout_sec": 3600,
+                    "job_timeout_sec": 3600,
                     "log_keep_runs": 50,
                     "notify": {"ntfy": _ntfy_block()},
                 }
@@ -244,7 +245,7 @@ class TestParseDefaults:
         assert cfg.defaults.notify_channels == ["ntfy"]
         assert cfg.defaults.notify_attach_log is False
         assert cfg.defaults.notify_attach_max_kb == 512
-        assert cfg.defaults.timeout_sec == 3600
+        assert cfg.defaults.job_timeout_sec == 3600
         assert cfg.defaults.log_keep_runs == 50
         assert "ntfy" in cfg.defaults.notify_channel_defs
 
@@ -521,11 +522,11 @@ class TestParseJob:
 
     def test_negative_timeout(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config(self._cfg(_job(timeout_sec=-1)))
+            crony.parse_config(self._cfg(_job(job_timeout_sec=-1)))
 
     def test_zero_timeout(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config(self._cfg(_job(timeout_sec=0)))
+            crony.parse_config(self._cfg(_job(job_timeout_sec=0)))
 
     def test_env_must_be_string_dict(self) -> None:
         with pytest.raises(crony.ConfigError, match="string -> string"):
@@ -1002,24 +1003,24 @@ class TestResolution:
     def test_timeout_cascade(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"timeout_sec": 100},
-                "job": {"a": _job(timeout_sec=200)},
-                "target": {"darwin": {"jobs": ["a"], "timeout_sec": 300}},
+                "defaults": {"job_timeout_sec": 100},
+                "job": {"a": _job(job_timeout_sec=200)},
+                "target": {"darwin": {"jobs": ["a"], "job_timeout_sec": 300}},
             }
         )
         target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_timeout_sec(cfg, target, cfg.jobs["a"]) == 300
+        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 300
 
     def test_timeout_default_fallback(self) -> None:
         cfg = crony.parse_config(
             {
-                "defaults": {"timeout_sec": 100},
+                "defaults": {"job_timeout_sec": 100},
                 "job": {"a": _job()},
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
         target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
+        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
 
 
 # =============================================================================
@@ -1582,8 +1583,36 @@ class TestRunJobNotify:
             )
 
 
+def _stub_trigger_sync(
+    monkeypatch: Any, results: dict[str, dict[str, Any]]
+) -> None:
+    """Replace `_trigger_unit_sync` with a deterministic stub.
+
+    `results` maps full child names -> the dict each call should
+    return (mimicking last-run.json). The stub records each call's
+    args (job_timeout, trigger_timeout) on a ledger we can assert
+    against.
+    """
+    ledger: list[dict[str, Any]] = []
+
+    def _stub(
+        full_name: str, *, job_timeout: float, trigger_timeout: float
+    ) -> dict[str, Any]:
+        ledger.append(
+            {
+                "full_name": full_name,
+                "job_timeout": job_timeout,
+                "trigger_timeout": trigger_timeout,
+            }
+        )
+        return results.get(full_name, {"exit_code": 0, "exit_class": "ok"})
+
+    monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+    monkeypatch.setattr(crony, "_ledger", ledger, raising=False)
+
+
 class TestRunGroup:
-    def test_group_runs_each_child(
+    def test_group_dispatches_each_child_via_platform(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -1602,15 +1631,21 @@ class TestRunGroup:
             },
             default_target_jobs=["g"],
         )
+        _stub_trigger_sync(
+            monkeypatch,
+            {
+                h.full("a"): {"exit_code": 0, "exit_class": "ok"},
+                h.full("b"): {"exit_code": 0, "exit_class": "ok"},
+            },
+        )
         rc = crony.run_group(cfg, "g")
         assert rc == 0
         rec = _last_run(h.state, "g")
         names = [c["name"] for c in rec["jobs_run"]]
         assert names == [h.full("a"), h.full("b")]
-        # Each child ran via subprocess invocation of `crony run`,
-        # so they each wrote their own last-run.json.
-        for child in ("a", "b"):
-            assert (h.state / h.full(child) / "last-run.json").exists()
+        # Children fire in declared order through the platform stub.
+        led = crony._ledger
+        assert [e["full_name"] for e in led] == [h.full("a"), h.full("b")]
 
     def test_group_continues_on_child_failure(
         self, tmp_path: Path, monkeypatch: Any
@@ -1630,6 +1665,13 @@ class TestRunGroup:
                 },
             },
             default_target_jobs=["g"],
+        )
+        _stub_trigger_sync(
+            monkeypatch,
+            {
+                h.full("bad"): {"exit_code": 3, "exit_class": "fail"},
+                h.full("good"): {"exit_code": 0, "exit_class": "ok"},
+            },
         )
         rc = crony.run_group(cfg, "g")
         # Group orchestration succeeds even if a child failed.
@@ -1652,11 +1694,83 @@ class TestRunGroup:
             },
             default_target_jobs=["g"],
         )
+        _stub_trigger_sync(monkeypatch, {})
         rc = crony.run_group(cfg, "g", dry_run=True)
         assert rc == 0
-        # No last-run.json for either group or child on dry-run
+        # No last-run.json for either group or child on dry-run.
+        # The stub was never called.
         assert not (h.state / h.full("g") / "last-run.json").exists()
         assert not (h.state / h.full("a") / "last-run.json").exists()
+        assert crony._ledger == []
+
+    def test_group_budget_exhausted_skips_remaining(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Group budget = 1.05 * (5 + 5) = ~10s. First child
+        # consumes nearly all of it; second child sees no budget
+        # remaining and is recorded as timed-out without dispatch.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 5,
+                    },
+                    "b": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 5,
+                    },
+                },
+                "job-group": {"g": {"jobs": ["a", "b"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+
+        def _slow(
+            full_name: str, *, job_timeout: float, trigger_timeout: float
+        ) -> dict[str, Any]:
+            # Burn 11 seconds of monotonic time using a fake clock;
+            # we monkeypatch time.monotonic to make this fast.
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        # Simulate elapsed time by returning a moving monotonic value.
+        clock = {"now": 0.0}
+        real_monotonic = crony.time.monotonic
+
+        def fake_monotonic() -> float:
+            return real_monotonic() + clock["now"]
+
+        monkeypatch.setattr(crony.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _slow)
+
+        # Advance the fake clock forward in the stub so the second
+        # iteration sees no remaining budget.
+        called: list[str] = []
+
+        def _stub_advance(
+            full_name: str,
+            *,
+            job_timeout: float,
+            trigger_timeout: float,
+        ) -> dict[str, Any]:
+            called.append(full_name)
+            clock["now"] += 11.0  # past 1.05*(5+5) budget
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_advance)
+
+        rc = crony.run_group(cfg, "g")
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        # Only `a` actually fired; `b` was budget-skipped.
+        assert called == [h.full("a")]
+        assert rec["jobs_run"][0]["name"] == h.full("a")
+        assert rec["jobs_run"][0]["exit_class"] == "ok"
+        assert rec["jobs_run"][1]["name"] == h.full("b")
+        assert rec["jobs_run"][1]["exit_class"] == "timeout"
 
 
 # =============================================================================
@@ -2664,15 +2778,15 @@ class TestTypeStrictness:
 
     def test_bool_rejected_for_int_field(self) -> None:
         with pytest.raises(crony.ConfigError, match="bool"):
-            crony.parse_config({"defaults": {"timeout_sec": True}})
+            crony.parse_config({"defaults": {"job_timeout_sec": True}})
 
     def test_negative_default_timeout_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"timeout_sec": -5}})
+            crony.parse_config({"defaults": {"job_timeout_sec": -5}})
 
     def test_zero_default_timeout_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"timeout_sec": 0}})
+            crony.parse_config({"defaults": {"job_timeout_sec": 0}})
 
     def test_negative_default_attach_max_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
@@ -2962,7 +3076,7 @@ class TestEnableDisable:
         with pytest.raises(crony.UsageError, match="not stamped"):
             crony.do_disable(jobs=["ghost"])
 
-    def test_stamp_only_entry_rejected(
+    def test_unscheduled_entry_rejected(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2974,9 +3088,9 @@ class TestEnableDisable:
             default_target_jobs=["g"],
         )
         crony.apply_one(cfg, "a")
-        with pytest.raises(crony.UsageError, match="group-only entries"):
+        with pytest.raises(crony.UsageError, match="no schedule"):
             crony.do_enable(jobs=["a"])
-        with pytest.raises(crony.UsageError, match="group-only entries"):
+        with pytest.raises(crony.UsageError, match="no schedule"):
             crony.do_disable(jobs=["a"])
 
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
@@ -2989,7 +3103,7 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_trigger(jobs=["j"])
+        crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=None)
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd == [
             "launchctl",
@@ -3007,7 +3121,7 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_trigger(jobs=["j"])
+        crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=None)
         cmd = next(c for c in h.calls if c[0] == "systemctl")
         assert cmd == [
             "systemctl",
@@ -3022,14 +3136,92 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="not stamped"):
-            crony.do_trigger(jobs=["ghost"])
+            crony.do_trigger(jobs=["ghost"], wait=False, trigger_timeout=None)
 
-    def test_trigger_stamp_only_entry_rejected(
+    def test_trigger_wait_maps_timeout_to_nonzero_exit(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A schedule-less job has a stamp but no platform unit; the
-        # platform has nothing to fire, so refuse rather than letting
-        # launchctl/systemctl error with a less-clear message.
+        # `crony trigger --wait` must surface a non-zero exit code
+        # when the job times out (exit_code is None for that class).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(
+            crony,
+            "_trigger_unit_sync",
+            lambda *a, **kw: {
+                "exit_class": "timeout",
+                "exit_code": None,
+                "signal": None,
+            },
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+        assert exc.value.code == int(crony.ExitCode.TIMEOUT)
+
+    def test_trigger_wait_maps_signal_to_128_plus_n(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(
+            crony,
+            "_trigger_unit_sync",
+            lambda *a, **kw: {
+                "exit_class": "signal",
+                "exit_code": None,
+                "signal": 9,
+            },
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+        assert exc.value.code == 137
+
+    def test_trigger_wait_passes_through_command_exit_code(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "false", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(
+            crony,
+            "_trigger_unit_sync",
+            lambda *a, **kw: {
+                "exit_class": "fail",
+                "exit_code": 7,
+                "signal": None,
+            },
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+        assert exc.value.code == 7
+
+    def test_trigger_timeout_requires_wait(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(crony.UsageError, match="--trigger-timeout"):
+            crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=10)
+
+    def test_trigger_works_on_schedule_less_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Every entry installs a platform unit, including schedule-
+        # less group-only jobs. trigger fires that unit directly.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -3039,8 +3231,11 @@ class TestEnableDisable:
             default_target_jobs=["g"],
         )
         crony.apply_one(cfg, "a")
-        with pytest.raises(crony.UsageError, match="group-only entries"):
-            crony.do_trigger(jobs=["a"])
+        h.calls.clear()
+        crony.do_trigger(jobs=["a"], wait=False, trigger_timeout=None)
+        cmd = next(c for c in h.calls if c[0] == "launchctl")
+        assert cmd[1] == "kickstart"
+        assert cmd[2].endswith(f"org.crony.{h.full('a')}")
 
     def test_apply_preserves_disabled_state_on_linux(
         self, tmp_path: Path, monkeypatch: Any
@@ -3742,6 +3937,139 @@ class TestBundleNamespacing:
         full_names = bundles.all_full_names()
         assert "default.daily-update" in full_names
         assert "borgadm.daily-update" in full_names
+
+
+class TestWaitForPidExit:
+    """Kernel-level pid-exit wait primitive (kqueue / pidfd).
+
+    These are the building block for `_trigger_unit_sync`; they
+    must be reliable on both darwin and linux without polling.
+    """
+
+    def test_live_pid_exits_during_wait(self) -> None:
+        proc = subprocess.Popen(["sleep", "0.3"])
+        try:
+            t0 = time.monotonic()
+            reason = crony._wait_for_pid_exit(proc.pid, timeout=5.0)
+            dt = time.monotonic() - t0
+            assert reason == "exit"
+            assert 0.2 < dt < 2.0, f"unexpected wait duration: {dt}"
+        finally:
+            proc.wait()
+
+    def test_already_dead_pid_returns_exit(self) -> None:
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        # Either the kernel still has zombie info (kqueue/pidfd
+        # returns immediately) or the pid has been recycled
+        # (we wait for a new process to exit, possibly hitting
+        # timeout). Both are acceptable; the call must not hang
+        # past the timeout.
+        reason = crony._wait_for_pid_exit(proc.pid, timeout=2.0)
+        assert reason in {"exit", "timeout"}
+
+    def test_long_running_pid_hits_timeout(self) -> None:
+        proc = subprocess.Popen(["sleep", "5"])
+        try:
+            t0 = time.monotonic()
+            reason = crony._wait_for_pid_exit(proc.pid, timeout=0.2)
+            dt = time.monotonic() - t0
+            assert reason == "timeout"
+            assert 0.15 < dt < 0.6, f"unexpected wait duration: {dt}"
+        finally:
+            proc.terminate()
+            proc.wait()
+
+
+class TestTriggerUnitSync:
+    """`_trigger_unit_sync` wraps the kickstart + pid-watch +
+    last-run.json cross-check. Stub the platform trigger and
+    write a synthetic last-run.json to exercise the waiter loop
+    without requiring real launchd / systemd."""
+
+    def test_returns_recent_completion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.state / full
+        sd.mkdir()
+
+        def _stub_trigger(name: str, platform: str) -> None:
+            # Pretend the runner ran and wrote a fresh result.
+            (sd / "last-run.json").write_text(
+                '{"ended_at": "2099-01-01T00:00:00-08:00",'
+                ' "exit_code": 0, "exit_class": "ok"}',
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
+        rec = crony._trigger_unit_sync(
+            full, job_timeout=5.0, trigger_timeout=5.0
+        )
+        assert rec["exit_code"] == 0
+        assert rec["exit_class"] == "ok"
+
+    def test_trigger_start_timeout_raises(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        (h.state / full).mkdir()
+        monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
+        with pytest.raises(crony.TriggerStartTimeout, match="never produced"):
+            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=1.0)
+
+    def test_stale_last_run_json_loops_until_fresh_arrives(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Pre-existing last-run.json from a prior run (ended_at
+        # before the trigger). The waiter should NOT accept it as
+        # the answer; it should keep waiting until either a fresh
+        # one appears or the trigger_timeout fires.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.state / full
+        sd.mkdir()
+        (sd / "last-run.json").write_text(
+            '{"ended_at": "1970-01-01T00:00:00-00:00",'
+            ' "exit_code": 0, "exit_class": "ok"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
+        with pytest.raises(crony.TriggerStartTimeout):
+            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=1.0)
+
+    def test_subsecond_run_is_recognized_as_fresh(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Regression: pre_trigger captured at microsecond precision
+        # but the runner's `_now_iso()` truncates to whole seconds.
+        # A run that completes within the same second as the trigger
+        # would have ended_at < pre_trigger after parse, and the
+        # waiter would loop until trigger_timeout. The fix: capture
+        # pre_trigger at the same precision as ended_at.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.state / full
+        sd.mkdir()
+
+        def _stub_trigger(name: str, platform: str) -> None:
+            # Write a last-run.json whose ended_at is the same
+            # whole-second timestamp `_now_iso()` would produce
+            # right now -- modeling a sub-second run.
+            (sd / "last-run.json").write_text(
+                '{"ended_at": "%s", "exit_code": 4, "exit_class": "fail"}'
+                % crony._now_iso(),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
+        rec = crony._trigger_unit_sync(
+            full, job_timeout=5.0, trigger_timeout=2.0
+        )
+        assert rec["exit_class"] == "fail"
+        assert rec["exit_code"] == 4
 
 
 class TestLifecycleSmoke:
