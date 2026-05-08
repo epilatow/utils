@@ -15,45 +15,44 @@ import fnmatch
 import logging
 import os
 import subprocess
+import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional, Set
+from typing import Callable, Iterator, List, Optional, Set
 
 # =============================================================================
-# DOTFILES DESIGN
+# DESIGN
 # =============================================================================
 #
-# This tool manages dotfiles by creating symlinks from $HOME to files in
-# "dotfile directories". Each file in a dotfile directory gets a
-# corresponding dotfile symlink in $HOME with a "." prefix.
+# This tool creates symlinks from a target root (e.g. $HOME) to files in a
+# "source directory". Two profiles are supported, picked from the program
+# name in argv[0]:
 #
-# SYMLINK STRUCTURE:
-#   Given a dotfile directory containing:
-#     dotfile1
-#     dir1/dir2/dotfile2
-#     dotfile_symlink -> dotfile1
+#   dotfiles  - target root is $HOME, top-level entries get a "." prefix,
+#               entries are discovered recursively.
+#   binfiles  - target root is ~/.local/bin, names are linked verbatim,
+#               only top-level entries are considered (flat), and only
+#               files with the executable bit set are linked.
 #
-#   Installing creates:
-#     $HOME/.dotfile1 -> $RELATIVE_DOTFILE_DIR/dotfile1
-#     $HOME/.dir1/dir2/dotfile2 -> $RELATIVE_DOTFILE_DIR/dir1/dir2/dotfile2
-#     $HOME/.dotfile_symlink -> $RELATIVE_DOTFILE_DIR/dotfile_symlink
+# Tracking:
+#   Installed source directories are recorded in ~/.dotfiles.installed
+#   (dotfiles) or ~/.binfiles.installed (binfiles), one absolute path
+#   per line.
 #
-#   All symlinks are relative paths for portability.
-#
-# TRACKING:
-#   Installed directories are tracked in ~/.dotfiles.installed, one
-#   absolute path per line.
-#
-# CONFLICTS:
+# Conflicts:
 #   A conflict occurs when a target path exists but doesn't point to the
-#   expected location. With --force, conflicting symlinks are replaced.
+#   expected source. With --force, conflicting symlinks are replaced.
 #   Regular files/directories are never removed by --force.
 #
+# Cleanup:
+#   The cleanup subcommand removes ALL dangling symlinks from the
+#   directories the active profile manages: ~/.local/bin for binfiles;
+#   $HOME plus parent directories of currently-discovered targets across
+#   all installed source dirs for dotfiles.
+#
 # =============================================================================
-
-INSTALLED_FILE = Path.home() / ".dotfiles.installed"
 
 # Configure logging
 logging.basicConfig(
@@ -61,6 +60,76 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# PROFILE
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Discriminator for the dotfiles vs binfiles invocations.
+
+    target_root, transform_segment, and installed_file are callables so
+    that test monkeypatches of Path.home propagate through.
+    """
+
+    name: str
+    description: str
+    target_root: Callable[[], Path]
+    transform_segment: Callable[[str], str]
+    installed_file: Callable[[], Path]
+    flat: bool
+    executable_only: bool
+
+
+def _dot_prefix(segment: str) -> str:
+    return "." + segment
+
+
+def _identity(segment: str) -> str:
+    return segment
+
+
+DOTFILES_PROFILE = Profile(
+    name="dotfiles",
+    description="Manage dotfiles by creating symlinks from $HOME",
+    target_root=lambda: Path.home(),
+    transform_segment=_dot_prefix,
+    installed_file=lambda: Path.home() / ".dotfiles.installed",
+    flat=False,
+    executable_only=False,
+)
+
+
+BINFILES_PROFILE = Profile(
+    name="binfiles",
+    description=("Manage executables by creating symlinks in ~/.local/bin"),
+    target_root=lambda: Path.home() / ".local" / "bin",
+    transform_segment=_identity,
+    installed_file=lambda: Path.home() / ".binfiles.installed",
+    flat=True,
+    executable_only=True,
+)
+
+
+def select_profile(argv0: str) -> Profile:
+    """Pick a Profile from the program name in argv[0]."""
+    name = Path(argv0).name
+    if name == "binfiles":
+        return BINFILES_PROFILE
+    return DOTFILES_PROFILE
+
+
+# Active profile, set by cli() based on argv[0]. Default is dotfiles so
+# that direct function calls (e.g. from tests) get the dotfiles
+# behavior unless they pass an explicit profile.
+ACTIVE_PROFILE: Profile = DOTFILES_PROFILE
+
+# Active tracking file, kept in sync with ACTIVE_PROFILE by cli(). Tests
+# monkeypatch this directly to point at a tmpdir.
+INSTALLED_FILE: Path = DOTFILES_PROFILE.installed_file()
 
 
 # =============================================================================
@@ -75,8 +144,8 @@ class ExitCode(enum.IntEnum):
     CONFIG = 3, "Configuration error"
     ERROR = 4, "General error"
     SUBPROCESS = 5, "Subprocess error"
-    CONFLICTS = 6, "Conflicts or missing dotfiles"
-    MISSING_DIR = 7, "Missing dotfiles directory"
+    CONFLICTS = 6, "Conflicts or missing entries"
+    MISSING_DIR = 7, "Missing source directory"
 
     def __new__(cls, value: int, description: str = "") -> ExitCode:
         obj = int.__new__(cls, value)
@@ -118,7 +187,7 @@ class UsageError(DotfilesError):
 
 
 class MissingDotfilesDirectory(DotfilesError):
-    """Raised when a dotfile directory does not exist or is invalid."""
+    """Raised when a source directory does not exist or is invalid."""
 
     exit_code = ExitCode.MISSING_DIR
 
@@ -146,23 +215,23 @@ class DotfileStatus(Enum):
 
 @dataclass
 class DotfileEntry:
-    """Represents a single dotfile entry."""
+    """Represents a single source-to-target link."""
 
-    relative_path: Path  # Path relative to dotfile directory
-    dotfile_dir: Path  # Absolute path to dotfile directory
+    relative_path: Path  # Path relative to source directory
+    dotfile_dir: Path  # Absolute path to source directory
+    profile: Profile = field(default_factory=lambda: ACTIVE_PROFILE)
 
     @property
     def source_path(self) -> Path:
-        """Absolute path to the source file in dotfile directory."""
+        """Absolute path to the source file."""
         return self.dotfile_dir / self.relative_path
 
     @property
     def target_path(self) -> Path:
-        """Absolute path to the target symlink in $HOME."""
-        # Add "." prefix to top-level entry
+        """Absolute path to the target symlink under target_root."""
         parts = self.relative_path.parts
-        dotted_parts = ("." + parts[0],) + parts[1:]
-        return Path.home() / Path(*dotted_parts)
+        transformed = (self.profile.transform_segment(parts[0]),) + parts[1:]
+        return self.profile.target_root() / Path(*transformed)
 
     def compute_relative_symlink(self) -> Path:
         """Compute relative path from target to source."""
@@ -302,24 +371,44 @@ def matches_ignore_pattern(path: Path, patterns: Set[str]) -> bool:
     return False
 
 
-def discover_dotfiles(dotfile_dir: Path) -> List[DotfileEntry]:
+def _is_executable(path: Path) -> bool:
+    """Return True if path resolves to a file with the executable bit set.
+
+    Follows symlinks. Returns False if the symlink is broken or stat fails.
     """
-    Discover all dotfiles in a dotfile directory.
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return bool(st.st_mode & 0o111)
 
-    This finds all files and symlinks (but not directories) recursively,
-    skipping:
-    - Version control directories (.git, .hg)
-    - Root-level dotfiles (files starting with '.' in the repo root)
-    - Files matching patterns in .gitignore or .hgignore
 
-    Returns DotfileEntry objects for each discovered item.
+def discover_dotfiles(
+    dotfile_dir: Path, *, profile: Optional[Profile] = None
+) -> List[DotfileEntry]:
+    """
+    Discover entries in a source directory.
+
+    Common rules:
+    - Skip version control directories (.git, .hg).
+    - Skip root-level dotfiles (files starting with '.' in the source root).
+    - Skip files matching patterns in .gitignore or .hgignore.
+
+    With profile.flat=True, only top-level entries are considered;
+    subdirectories are not descended into.
+
+    With profile.executable_only=True, non-executable files are skipped
+    with a warning.
 
     Raises:
         MissingDotfilesDirectory: If the directory doesn't exist or isn't valid.
     """
+    if profile is None:
+        profile = ACTIVE_PROFILE
+
     if not dotfile_dir.exists():
         raise MissingDotfilesDirectory(
-            f"Dotfile directory does not exist: {dotfile_dir}"
+            f"Source directory does not exist: {dotfile_dir}"
         )
     if not dotfile_dir.is_dir():
         raise MissingDotfilesDirectory(f"Not a directory: {dotfile_dir}")
@@ -327,30 +416,37 @@ def discover_dotfiles(dotfile_dir: Path) -> List[DotfileEntry]:
     abs_dotfile_dir = dotfile_dir.resolve()
     entries: List[DotfileEntry] = []
 
-    # Load ignore patterns from .gitignore and .hgignore
     ignore_patterns = load_ignore_patterns(abs_dotfile_dir)
 
-    for item in abs_dotfile_dir.rglob("*"):
-        # Include files and symlinks, but not directories
-        # (symlinks are included even if they point to directories)
-        if item.is_file() or item.is_symlink():
-            relative = item.relative_to(abs_dotfile_dir)
-            # Skip files inside version control directories
-            if relative.parts[0] in VCS_DIRS:
-                continue
-            # Skip root-level dotfiles (files starting with '.')
-            if len(relative.parts) == 1 and relative.name.startswith("."):
-                continue
-            # Skip files matching ignore patterns
-            if matches_ignore_pattern(relative, ignore_patterns):
-                continue
-            entries.append(
-                DotfileEntry(
-                    relative_path=relative, dotfile_dir=abs_dotfile_dir
-                )
-            )
+    candidates: Iterator[Path]
+    if profile.flat:
+        candidates = abs_dotfile_dir.iterdir()
+    else:
+        candidates = abs_dotfile_dir.rglob("*")
 
-    # Sort for consistent output
+    for item in candidates:
+        # Include files and symlinks, but not directories
+        # (symlinks are included even if they point to directories).
+        if not (item.is_file() or item.is_symlink()):
+            continue
+        relative = item.relative_to(abs_dotfile_dir)
+        if relative.parts[0] in VCS_DIRS:
+            continue
+        if len(relative.parts) == 1 and relative.name.startswith("."):
+            continue
+        if matches_ignore_pattern(relative, ignore_patterns):
+            continue
+        if profile.executable_only and not _is_executable(item):
+            logger.warning("skipping non-executable file: %s", relative)
+            continue
+        entries.append(
+            DotfileEntry(
+                relative_path=relative,
+                dotfile_dir=abs_dotfile_dir,
+                profile=profile,
+            )
+        )
+
     entries.sort(key=lambda e: str(e.relative_path))
     return entries
 
@@ -470,19 +566,18 @@ def remove_dotfile(
         # Correctly linked, safe to remove
         if not dry_run:
             entry.target_path.unlink()
-            # Remove empty parent directories up to $HOME
-            _cleanup_empty_parents(entry.target_path.parent)
+            _cleanup_empty_parents(entry.target_path.parent, entry.profile)
         return OperationResult(entry=entry, status=DotfileStatus.REMOVED)
 
     # FILE_CONFLICT or LINK_CONFLICT - leave alone
     return OperationResult(entry=entry, status=status)
 
 
-def _cleanup_empty_parents(directory: Path) -> None:
-    """Remove empty parent directories up to but not including $HOME."""
-    home = Path.home()
+def _cleanup_empty_parents(directory: Path, profile: Profile) -> None:
+    """Remove empty parent directories up to but not including target_root."""
+    target_root = profile.target_root()
     current = directory
-    while current != home and current.exists():
+    while current != target_root and current.exists():
         try:
             current.rmdir()  # Only succeeds if empty
             current = current.parent
@@ -511,20 +606,22 @@ def process_directory(
     *,
     dry_run: bool = False,
     force: bool = False,
+    profile: Optional[Profile] = None,
 ) -> List[OperationResult]:
     """
-    Process all dotfiles in a directory.
+    Process all entries in a source directory.
 
     Args:
-        dotfile_dir: Path to dotfile directory
+        dotfile_dir: Path to source directory
         operation: One of "install", "remove", "audit"
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks (install only)
+        profile: Profile to use for discovery; defaults to ACTIVE_PROFILE
 
     Returns:
         List of OperationResult objects
     """
-    entries = discover_dotfiles(dotfile_dir)
+    entries = discover_dotfiles(dotfile_dir, profile=profile)
     results: List[OperationResult] = []
 
     for entry in entries:
@@ -562,7 +659,7 @@ def has_conflicts(results: List[OperationResult]) -> bool:
 
 
 def has_missing(results: List[OperationResult]) -> bool:
-    """Check if any results indicate missing dotfiles."""
+    """Check if any results indicate missing entries."""
     return any(r.status == DotfileStatus.MISSING for r in results)
 
 
@@ -577,7 +674,7 @@ def do_install(
     dry_run: bool,
     force: bool,
 ) -> None:
-    """Install dotfiles.
+    """Install entries from one or all source directories.
 
     Args:
         directory: Specific directory to install, or None for all
@@ -589,23 +686,20 @@ def do_install(
         MissingDotfilesDirectory: If a directory does not exist.
     """
     if directory is not None:
-        # Install from specific directory
         directories = [directory.resolve()]
-        # Record it (unless dry-run)
         if not dry_run:
             add_installed_directory(directory)
     else:
-        # Install from all recorded directories
         directories = load_installed_directories()
         if not directories:
-            logger.info("No dotfile directories installed.")
+            logger.info("No %s directories installed.", ACTIVE_PROFILE.name)
             return
 
     had_conflicts = False
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
             raise MissingDotfilesDirectory(
-                f"Dotfile directory does not exist: {dotfile_dir}"
+                f"Source directory does not exist: {dotfile_dir}"
             )
 
         results = process_directory(
@@ -624,7 +718,7 @@ def do_remove(
     *,
     dry_run: bool,
 ) -> None:
-    """Remove dotfiles.
+    """Remove entries for one or all source directories.
 
     Args:
         directory: Specific directory to remove, or None for all
@@ -638,31 +732,30 @@ def do_remove(
     else:
         directories = load_installed_directories()
         if not directories:
-            logger.info("No dotfile directories installed.")
+            logger.info("No %s directories installed.", ACTIVE_PROFILE.name)
             return
 
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
             raise MissingDotfilesDirectory(
-                f"Dotfile directory does not exist: {dotfile_dir}"
+                f"Source directory does not exist: {dotfile_dir}"
             )
 
         results = process_directory(dotfile_dir, "remove", dry_run=dry_run)
         log_results(dotfile_dir, results)
 
-        # Remove from installed list (unless dry-run)
         if not dry_run:
             remove_installed_directory(dotfile_dir)
 
 
 def do_audit(directory: Optional[Path]) -> None:
-    """Audit dotfiles.
+    """Audit entries for one or all source directories.
 
     Args:
         directory: Specific directory to audit, or None for all
 
     Raises:
-        ConflictsFound: If conflicts or missing dotfiles found.
+        ConflictsFound: If conflicts or missing entries found.
     """
     if directory is not None:
         directories = [directory.resolve()]
@@ -674,7 +767,6 @@ def do_audit(directory: Optional[Path]) -> None:
     had_issues = False
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
-            # Skip non-existent directories silently
             continue
 
         results = process_directory(dotfile_dir, "audit")
@@ -683,13 +775,47 @@ def do_audit(directory: Optional[Path]) -> None:
             had_issues = True
 
     if had_issues:
-        raise ConflictsFound("Conflicts or missing dotfiles found during audit")
+        raise ConflictsFound("Conflicts or missing entries found during audit")
+
+
+def do_cleanup(*, dry_run: bool) -> None:
+    """Remove all dangling symlinks from directories the profile manages.
+
+    The scan set is target_root plus the parent directory of every entry
+    currently discovered across all installed source directories. For
+    binfiles (flat) this collapses to {target_root}; for dotfiles it
+    typically includes $HOME plus any subdirs where dotfiles delivers
+    nested files.
+
+    Args:
+        dry_run: If True, log what would be removed without removing it.
+    """
+    profile = ACTIVE_PROFILE
+    scan_dirs: Set[Path] = {profile.target_root()}
+
+    for src_dir in load_installed_directories():
+        if not src_dir.exists():
+            continue
+        for entry in discover_dotfiles(src_dir, profile=profile):
+            scan_dirs.add(entry.target_path.parent)
+
+    for scan_dir in sorted(scan_dirs):
+        if not scan_dir.is_dir():
+            continue
+        for item in sorted(scan_dir.iterdir()):
+            if not item.is_symlink():
+                continue
+            if item.exists():
+                continue
+            logger.info("removing dangling symlink: %s", item)
+            if not dry_run:
+                item.unlink()
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
-    """Run tests by invoking the test file directly."""
-    repo_root = Path(__file__).parent.parent
-    test_file = repo_root / "tests" / "test_dotfiles.py"
+    """Run tests by invoking the active profile's test file directly."""
+    repo_root = Path(__file__).resolve().parent.parent
+    test_file = repo_root / "tests" / f"test_{ACTIVE_PROFILE.name}.py"
 
     cmd = [str(test_file)]
     if verbose:
@@ -707,13 +833,14 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """
-    Build and return the argument parser.
+    Build and return the argument parser for the active profile.
 
     Returns:
         Configured ArgumentParser instance
     """
     parser = argparse.ArgumentParser(
-        description=("Manage dotfiles by creating symlinks from $HOME"),
+        prog=ACTIVE_PROFILE.name,
+        description=ACTIVE_PROFILE.description,
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -721,7 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Install subcommand
     install_parser = subparsers.add_parser(
-        "install", help="Install dotfiles from a directory"
+        "install", help="Install entries from a source directory"
     )
     install_parser.add_argument(
         "--dry-run",
@@ -738,12 +865,12 @@ def build_parser() -> argparse.ArgumentParser:
         "directory",
         type=Path,
         nargs="?",
-        help="Directory containing dotfiles to install",
+        help="Source directory to install entries from",
     )
 
     # Remove subcommand
     remove_parser = subparsers.add_parser(
-        "remove", help="Remove installed dotfiles"
+        "remove", help="Remove installed entries"
     )
     remove_parser.add_argument(
         "--dry-run",
@@ -754,18 +881,29 @@ def build_parser() -> argparse.ArgumentParser:
         "directory",
         type=Path,
         nargs="?",
-        help="Directory whose dotfiles should be removed",
+        help="Source directory whose entries should be removed",
     )
 
     # Audit subcommand
     audit_parser = subparsers.add_parser(
-        "audit", help="Audit installed dotfiles"
+        "audit", help="Audit installed entries"
     )
     audit_parser.add_argument(
         "directory",
         type=Path,
         nargs="?",
-        help="Directory to audit",
+        help="Source directory to audit",
+    )
+
+    # Cleanup subcommand
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="Remove dangling symlinks from managed directories",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be removed without removing it",
     )
 
     # Self-test subcommand
@@ -793,11 +931,21 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "install": do_install,
     "remove": do_remove,
     "audit": do_audit,
+    "cleanup": do_cleanup,
 }
+
+
+def _activate_profile(profile: Profile) -> None:
+    """Set the module-level ACTIVE_PROFILE and INSTALLED_FILE."""
+    global ACTIVE_PROFILE, INSTALLED_FILE
+    ACTIVE_PROFILE = profile
+    INSTALLED_FILE = profile.installed_file()
 
 
 def cli() -> int:
     """CLI entry point with exception handling."""
+    _activate_profile(select_profile(sys.argv[0]))
+
     parser = build_parser()
     args = parser.parse_args()
 

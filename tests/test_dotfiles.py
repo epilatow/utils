@@ -79,6 +79,13 @@ class TestArgumentParser:
         assert args.command == "audit"
         assert args.directory == Path("/path/to/dotfiles")
 
+    def test_cleanup_parses(self) -> None:
+        """Test cleanup subcommand parses --dry-run."""
+        parser = df.build_parser()
+        args = parser.parse_args(["cleanup", "--dry-run"])
+        assert args.command == "cleanup"
+        assert args.dry_run is True
+
 
 class TestDotfileEntry:
     """Test DotfileEntry dataclass."""
@@ -1310,6 +1317,135 @@ class TestDoAudit:
                 os.path.relpath(existing_dir / "vimrc", home)
             )
             df.do_audit(None)
+
+
+class TestDoCleanup:
+    """Test do_cleanup function for the dotfiles profile."""
+
+    def test_cleanup_removes_dangling_link_at_target_root(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Dangling symlinks directly under $HOME are removed."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".broken").symlink_to(tmp_path / "nonexistent")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+        assert not (home / ".broken").is_symlink()
+
+    def test_cleanup_removes_dangling_link_in_nested_target_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Dangling links in dirs the source currently delivers into."""
+        home = tmp_path / "home"
+        home.mkdir()
+        nested = home / ".config" / "app"
+        nested.mkdir(parents=True)
+        # Source delivers config/app/settings, so .config/app is a scan dir
+        src = tmp_path / "dotfiles"
+        src.mkdir()
+        (src / "config" / "app").mkdir(parents=True)
+        (src / "config" / "app" / "settings").write_text("content")
+        (nested / "old_setting").symlink_to(src / "deleted")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        installed_file.write_text(f"{src.resolve()}\n")
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+        assert not (nested / "old_setting").is_symlink()
+
+    def test_cleanup_leaves_valid_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Non-dangling symlinks are not touched."""
+        home = tmp_path / "home"
+        home.mkdir()
+        target = tmp_path / "real"
+        target.write_text("content")
+        (home / ".vimrc").symlink_to(target)
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+        assert (home / ".vimrc").is_symlink()
+        assert (home / ".vimrc").resolve() == target.resolve()
+
+    def test_cleanup_leaves_regular_files(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Regular files are not touched."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".bashrc").write_text("content")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+        assert (home / ".bashrc").exists()
+        assert not (home / ".bashrc").is_symlink()
+
+    def test_cleanup_dry_run_keeps_dangling_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Dry-run reports but does not remove."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".broken").symlink_to(tmp_path / "nonexistent")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=True)
+
+        assert (home / ".broken").is_symlink()
+
+    def test_cleanup_skips_nonexistent_source_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Cleanup does not raise when an installed source dir is gone."""
+        home = tmp_path / "home"
+        home.mkdir()
+        nonexistent = tmp_path / "nonexistent"
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        installed_file.write_text(f"{nonexistent}\n")
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+    def test_cleanup_removes_dangling_link_unrelated_to_dotfiles(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Any dangling symlink in a scan dir is removed, even if it
+        was not created by dotfiles."""
+        home = tmp_path / "home"
+        home.mkdir()
+        # Dangling, points outside the source dir entirely
+        (home / ".unrelated").symlink_to("/some/random/missing/path")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+
+        assert not (home / ".unrelated").is_symlink()
 
 
 class TestDoSelfTest:
