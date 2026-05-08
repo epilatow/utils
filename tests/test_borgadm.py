@@ -2252,7 +2252,7 @@ class TestTimestampPruning:
         mock_cfg.PRUNE_KEEP_MONTHLY = 0
         mock_cfg.PRUNE_KEEP_YEARLY = 0
 
-        # Two hourly timestamps — only 1 hourly kept, nothing
+        # Two hourly timestamps -- only 1 hourly kept, nothing
         # from other intervals since they're all 0
         ts_all = {"20250101_010000", "20250101_020000"}
         ts_keep = ba.ts_to_keep(ts_all)
@@ -2618,7 +2618,7 @@ class TestWrapperRebuild:
     ) -> None:
         """Raises BorgadmError when source is missing."""
         _src, _binary, _hash_file = wrapper_env
-        # src not created → doesn't exist
+        # src not created -> doesn't exist
         with pytest.raises(ba.BorgadmError, match="source missing"):
             ba._wrapper_needs_rebuild()
 
@@ -2739,7 +2739,7 @@ class TestWrapperBinary:
         )
         mock_borgadm.chmod(0o755)
 
-        # Fake HOME (no TCC dir → FDA check sees ENOENT → proceeds)
+        # Fake HOME (no TCC dir -> FDA check sees ENOENT -> proceeds)
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
 
@@ -2807,7 +2807,7 @@ class TestWrapperBinary:
         )
         assert result.returncode == 0
         assert args_file.exists()
-        # No args → empty line
+        # No args -> empty line
         assert args_file.read_text().strip() == ""
 
     def test_fda_check_denied_exits(

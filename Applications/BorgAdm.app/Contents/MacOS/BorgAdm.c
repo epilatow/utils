@@ -1,5 +1,5 @@
 /*
- * BorgAdm.app wrapper — compiled Mach-O binary for FDA propagation.
+ * BorgAdm.app wrapper -- compiled Mach-O binary for FDA propagation.
  *
  * macOS TCC only grants Full Disk Access to app bundles whose
  * executable is a native Mach-O binary (not an interpreted script).
@@ -47,13 +47,13 @@ static int check_fda(void)
     }
     if (errno == EACCES || errno == EPERM)
         return 0;
-    /* ENOENT or other — can't determine, proceed. */
+    /* ENOENT or other -- can't determine, proceed. */
     return 1;
 }
 
 /*
  * Walk up count directory levels from path, in place.
- * E.g. dirname_n("/a/b/c/d", 2) → "/a/b"
+ * E.g. dirname_n("/a/b/c/d", 2) -> "/a/b"
  */
 static void dirname_n(char *path, int count)
 {

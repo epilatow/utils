@@ -837,7 +837,7 @@ ARCHIVE_README_TEMPLATE = """\
   7z x -oOUTPUT_DIR YOUR_ARCHIVE.7z
   ```
 
-### Option D: App Store (GUI) — Keka (Purchase required)
+### Option D: App Store (GUI) -- Keka (Purchase required)
 * Install **[Keka](https://apps.apple.com/us/app/keka/id470158793)**
   from the Mac App Store.
 * Open the `.7z` file with Keka and enter the password.
@@ -846,7 +846,7 @@ ARCHIVE_README_TEMPLATE = """\
 ---
 ## Windows
 * Download [official 7-Zip installer](https://www.7-zip.org/download.html).
-* Right-click the `.7z` file → **7-Zip** → **Extract Here** or **Extract to…**
+* Right-click the `.7z` file -> **7-Zip** -> **Extract Here** or **Extract to...**
 * Enter the password when prompted.
 """
 

@@ -173,7 +173,7 @@ _PRUNE_KEEP_YEARLY: int = 2
 
 # macOS paths auto-excluded on Darwin to prevent backup failures.
 _MACOS_EXCLUDES: list[str] = [
-    # iCloud — causes deadlocks when borg reads during active sync
+    # iCloud -- causes deadlocks when borg reads during active sync
     "Library/Mobile Documents",
     # Contains root-owned files (not a TCC/FDA issue)
     "Library/Google/GoogleSoftwareUpdate",
@@ -1121,7 +1121,7 @@ def _direct_script_path() -> str:
 
 def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
     wrapper_path = automation_script_path()
-    # Check tasks don't read user files — run borgadm directly
+    # Check tasks don't read user files -- run borgadm directly
     # (least privilege: no FDA wrapper needed).
     direct_path = _direct_script_path()
     tasks: dict[str, dict[str, Any]] = {

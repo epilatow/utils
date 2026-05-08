@@ -1944,7 +1944,7 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_code"] == 3
         assert rec["jobs_run"][1]["name"] == h.full("good")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
-        # Group-level rollup: any child failure → "fail" at the
+        # Group-level rollup: any child failure -> "fail" at the
         # group level (so status / audit reflect the failure
         # without re-deriving the rollup on every read).
         assert rec["exit_class"] == "fail"

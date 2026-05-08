@@ -543,7 +543,7 @@ def dedup_container_conflicts(
         ctx_ids = {get_user_context_id(c.origin_attributes) for c in group}
         if len(ctx_ids) == 1:
             # Same container, different partition keys
-            # or other sub-attributes — keep all.
+            # or other sub-attributes -- keep all.
             deduped.extend(group)
             continue
 
