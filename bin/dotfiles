@@ -5,6 +5,7 @@
 # This is AI generated code
 #
 # IMPORTANT: This script has tests in tests/test_dotfiles.py
+# (and tests/test_binfiles.py when invoked as binfiles).
 # Always run the `self-test` subcommand after making modifications.
 
 from __future__ import annotations
