@@ -324,6 +324,42 @@ class TestBinfilesSubcommands:
 
         assert (target_root / "tool").is_symlink()
 
+    def test_audit_flags_stale_managed_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Stale-link detection works under the binfiles profile."""
+        home, _ = self._setup(tmp_path, monkeypatch)
+        src = tmp_path / "binfiles"
+        src.mkdir()
+        _make_executable(src / "tool")
+        _make_executable(src / "old_tool")
+        with patch.object(Path, "home", return_value=home):
+            bf.do_install(src, dry_run=False, force=False)
+            (src / "old_tool").unlink()
+            with pytest.raises(bf.ConflictsFound):
+                bf.do_audit(src)
+
+    def test_install_prunes_stale_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Re-install of a binfiles repo removes stale links for
+        files that have left the repo."""
+        home, _ = self._setup(tmp_path, monkeypatch)
+        src = tmp_path / "binfiles"
+        src.mkdir()
+        _make_executable(src / "tool")
+        _make_executable(src / "old_tool")
+        target_root = home / ".local" / "bin"
+
+        with patch.object(Path, "home", return_value=home):
+            bf.do_install(src, dry_run=False, force=False)
+            assert (target_root / "old_tool").is_symlink()
+            (src / "old_tool").unlink()
+            bf.do_install(src, dry_run=False, force=False)
+
+        assert (target_root / "tool").is_symlink()
+        assert not (target_root / "old_tool").is_symlink()
+
 
 class TestBinfilesCli:
     """cli() activates BINFILES_PROFILE when invoked as 'binfiles'."""

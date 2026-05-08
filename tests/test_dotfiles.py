@@ -1608,6 +1608,209 @@ class TestDoCleanup:
         assert not (home / ".unrelated").is_symlink()
 
 
+class TestStaleLinkDetection:
+    """audit / cleanup / install identify and (where appropriate)
+    remove managed symlinks whose source path is no longer in the
+    discovered set -- e.g. the file was removed from the repo or now
+    matches .gitignore / .hgignore / .dotfilesignore."""
+
+    @staticmethod
+    def _setup_repo_with_stale_link(
+        tmp_path: Path, monkeypatch: Any, ignore_via: str = "delete"
+    ) -> tuple[Path, Path]:
+        """Install a repo with two files, then either delete one or
+        add it to .dotfilesignore. Returns (home, dotfile_dir)."""
+        home = tmp_path / "home"
+        home.mkdir()
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / "vimrc").write_text("content")
+        (dotfile_dir / "bashrc").write_text("content")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=False, force=False)
+
+        assert (home / ".vimrc").is_symlink()
+        assert (home / ".bashrc").is_symlink()
+
+        if ignore_via == "delete":
+            (dotfile_dir / "bashrc").unlink()
+        elif ignore_via == "dotfilesignore":
+            (dotfile_dir / ".dotfilesignore").write_text("bashrc\n")
+        elif ignore_via == "gitignore":
+            (dotfile_dir / ".gitignore").write_text("bashrc\n")
+        else:
+            raise ValueError(ignore_via)
+        return home, dotfile_dir
+
+    def test_audit_flags_stale_when_source_deleted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """audit reports STALE for a managed symlink whose source
+        file was removed from the repo."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="delete"
+        )
+        with patch.object(Path, "home", return_value=home):
+            with pytest.raises(df.ConflictsFound):
+                df.do_audit(dotfile_dir)
+        # Audit reports but does not act -- the stale link is still there.
+        assert (home / ".bashrc").is_symlink()
+
+    def test_audit_flags_stale_via_dotfilesignore(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """audit reports STALE when the source file is now matched by
+        .dotfilesignore."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="dotfilesignore"
+        )
+        with patch.object(Path, "home", return_value=home):
+            with pytest.raises(df.ConflictsFound):
+                df.do_audit(dotfile_dir)
+
+    def test_audit_flags_stale_via_gitignore(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """audit reports STALE when the source file is now matched by
+        .gitignore (managed link semantics also apply to .gitignore
+        adds)."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="gitignore"
+        )
+        with patch.object(Path, "home", return_value=home):
+            with pytest.raises(df.ConflictsFound):
+                df.do_audit(dotfile_dir)
+
+    def test_audit_does_not_flag_unmanaged_links(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """A symlink under target_root pointing outside every
+        installed source dir is not flagged."""
+        home = tmp_path / "home"
+        home.mkdir()
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / "vimrc").write_text("content")
+        # Pre-existing user link, not managed.
+        unrelated = tmp_path / "elsewhere"
+        unrelated.write_text("user data")
+        (home / ".user_link").symlink_to(unrelated)
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_audit(dotfile_dir)
+        # The unmanaged link survives.
+        assert (home / ".user_link").is_symlink()
+
+    def test_cleanup_removes_stale_managed_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """cleanup removes a managed link whose source was removed."""
+        home, _ = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="delete"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+        assert not (home / ".bashrc").is_symlink()
+        # Still-valid managed link is left alone.
+        assert (home / ".vimrc").is_symlink()
+
+    def test_cleanup_removes_stale_via_dotfilesignore(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """cleanup removes a managed link when source is ignored."""
+        home, _ = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="dotfilesignore"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=False)
+        assert not (home / ".bashrc").is_symlink()
+        assert (home / ".vimrc").is_symlink()
+
+    def test_cleanup_dry_run_keeps_stale_link(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """dry-run cleanup does not remove stale managed links."""
+        home, _ = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="delete"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_cleanup(dry_run=True)
+        assert (home / ".bashrc").is_symlink()
+
+    def test_install_prunes_stale_link_when_source_deleted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """A second install call after the source file is deleted
+        prunes the now-stale managed link."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="delete"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=False, force=False)
+        assert not (home / ".bashrc").is_symlink()
+        assert (home / ".vimrc").is_symlink()
+
+    def test_install_prunes_stale_via_dotfilesignore(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """install prunes a managed link newly matched by
+        .dotfilesignore."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="dotfilesignore"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=False, force=False)
+        assert not (home / ".bashrc").is_symlink()
+
+    def test_install_dry_run_does_not_prune(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """dry-run install does not unlink stale managed links."""
+        home, dotfile_dir = self._setup_repo_with_stale_link(
+            tmp_path, monkeypatch, ignore_via="delete"
+        )
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=True, force=False)
+        assert (home / ".bashrc").is_symlink()
+
+    def test_install_does_not_touch_other_repos_links(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """install of repo A does not prune stale links owned by
+        repo B."""
+        home = tmp_path / "home"
+        home.mkdir()
+        repo_a = tmp_path / "repo_a"
+        repo_a.mkdir()
+        (repo_a / "vimrc").write_text("a")
+        repo_b = tmp_path / "repo_b"
+        repo_b.mkdir()
+        (repo_b / "bashrc").write_text("b")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(repo_a, dry_run=False, force=False)
+            df.do_install(repo_b, dry_run=False, force=False)
+            # Make repo_b's bashrc stale.
+            (repo_b / "bashrc").unlink()
+            # Re-install repo_a only -- repo_b's stale link should
+            # survive because it's not in repo_a's blast radius.
+            df.do_install(repo_a, dry_run=False, force=False)
+
+        assert (home / ".vimrc").is_symlink()
+        assert (home / ".bashrc").is_symlink()
+
+
 class TestDoSelfTest:
     """Test do_self_test function."""
 

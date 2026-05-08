@@ -21,7 +21,16 @@ import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Set
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 # =============================================================================
 # DESIGN
@@ -47,11 +56,25 @@ from typing import Callable, Iterator, List, Optional, Set
 #   expected source. With --force, conflicting symlinks are replaced.
 #   Regular files/directories are never removed by --force.
 #
-# Cleanup:
-#   The cleanup subcommand removes ALL dangling symlinks from the
-#   directories the active profile manages: ~/.local/bin for binfiles;
-#   $HOME plus parent directories of currently-discovered targets across
-#   all installed source dirs for dotfiles.
+# Stale managed links:
+#   A symlink is "managed" when its resolved target lies inside an
+#   installed source directory. It becomes "stale" when the relative
+#   path within that source is no longer in the source's discovered
+#   set -- because the file was removed from the repo or now matches
+#   .gitignore / .hgignore / .dotfilesignore. The three subcommands
+#   handle stale managed links as follows:
+#     - audit   reports them as STALE and fails (ConflictsFound).
+#     - cleanup removes them (alongside the existing dangling-symlink
+#               removal). Foreign symlinks are left alone.
+#     - install removes them, scoped to the source dir being installed.
+#               This makes install a sync: after it runs, the target
+#               tree matches the repo's current discovered set as if
+#               from a fresh clone.
+#
+#   The scan set for stale-link detection is target_root plus the
+#   parent directory of every currently-discovered entry, the same
+#   convention dangling-symlink cleanup uses. Stale links inside
+#   subdirectories that hold no current entries are not reached.
 #
 # =============================================================================
 
@@ -207,6 +230,7 @@ class DotfileStatus(Enum):
     MISSING = "missing"
     INSTALLED = "installed"
     REMOVED = "removed"
+    STALE = "stale"
 
 
 # =============================================================================
@@ -559,6 +583,88 @@ def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
     return DotfileStatus.FILE_CONFLICT
 
 
+def _resolve_link_target(symlink: Path) -> Optional[Path]:
+    """Resolve a symlink's literal target relative to its parent.
+
+    Returns None if the symlink can't be read. resolve(strict=False)
+    is used so a dangling target still produces a comparable path.
+    """
+    try:
+        link_value = Path(os.readlink(symlink))
+    except OSError:
+        return None
+    try:
+        return (symlink.parent / link_value).resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _link_source_dir(
+    symlink: Path, source_dirs: List[Path]
+) -> Optional[Tuple[Path, Path]]:
+    """If symlink resolves into one of source_dirs, return
+    (matching_source_dir, relative_path_within_it).
+
+    source_dirs must already be resolved (no further .resolve() done
+    here). Returns None when the symlink points outside every
+    candidate or can't be read.
+    """
+    target = _resolve_link_target(symlink)
+    if target is None:
+        return None
+    for src in source_dirs:
+        try:
+            rel = target.relative_to(src)
+        except ValueError:
+            continue
+        return (src, rel)
+    return None
+
+
+def _stale_managed_links(
+    sources: Dict[Path, Set[Path]],
+    scan_dirs: Iterable[Path],
+) -> List[Tuple[Path, Path, Path]]:
+    """Find managed-but-stale symlinks under scan_dirs.
+
+    A managed link is one whose resolved target lies inside a key of
+    `sources` (which maps a resolved source dir to the set of relative
+    paths currently delivered by that source). A managed link is stale
+    when its relative path is not in that set -- either because the
+    file was removed from the source repo or now matches an ignore
+    pattern (.gitignore / .hgignore / .dotfilesignore).
+
+    Returns a list of (symlink, source_dir, relative_path) tuples.
+    """
+    src_list = list(sources.keys())
+    found: List[Tuple[Path, Path, Path]] = []
+    for scan_dir in sorted(set(scan_dirs)):
+        if not scan_dir.is_dir():
+            continue
+        for item in sorted(scan_dir.iterdir()):
+            if not item.is_symlink():
+                continue
+            link = _link_source_dir(item, src_list)
+            if link is None:
+                continue
+            src, rel = link
+            if rel not in sources[src]:
+                found.append((item, src, rel))
+    return found
+
+
+def _scan_dirs_for_entries(
+    entries: List[DotfileEntry], profile: Profile
+) -> Set[Path]:
+    """Return the directory set to scan for symlinks managed by the
+    given entries: target_root plus the parent directory of each
+    entry's target_path."""
+    scan_dirs: Set[Path] = {profile.target_root()}
+    for entry in entries:
+        scan_dirs.add(entry.target_path.parent)
+    return scan_dirs
+
+
 def install_dotfile(
     entry: DotfileEntry,
     *,
@@ -667,6 +773,28 @@ def audit_dotfile(entry: DotfileEntry) -> OperationResult:
 # =============================================================================
 
 
+def _process_entries(
+    entries: List[DotfileEntry],
+    operation: str,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+) -> List[OperationResult]:
+    """Apply operation to each entry and return the results."""
+    results: List[OperationResult] = []
+    for entry in entries:
+        if operation == "install":
+            result = install_dotfile(entry, dry_run=dry_run, force=force)
+        elif operation == "remove":
+            result = remove_dotfile(entry, dry_run=dry_run)
+        elif operation == "audit":
+            result = audit_dotfile(entry)
+        else:
+            raise ValueError(f"Unknown operation: {operation}")
+        results.append(result)
+    return results
+
+
 def process_directory(
     dotfile_dir: Path,
     operation: str,
@@ -689,20 +817,7 @@ def process_directory(
         List of OperationResult objects
     """
     entries = discover_dotfiles(dotfile_dir, profile=profile)
-    results: List[OperationResult] = []
-
-    for entry in entries:
-        if operation == "install":
-            result = install_dotfile(entry, dry_run=dry_run, force=force)
-        elif operation == "remove":
-            result = remove_dotfile(entry, dry_run=dry_run)
-        elif operation == "audit":
-            result = audit_dotfile(entry)
-        else:
-            raise ValueError(f"Unknown operation: {operation}")
-        results.append(result)
-
-    return results
+    return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
 def log_results(dotfile_dir: Path, results: List[OperationResult]) -> None:
@@ -730,6 +845,39 @@ def has_missing(results: List[OperationResult]) -> bool:
     return any(r.status == DotfileStatus.MISSING for r in results)
 
 
+def has_stale(results: List[OperationResult]) -> bool:
+    """Check if any results indicate a stale managed symlink."""
+    return any(r.status == DotfileStatus.STALE for r in results)
+
+
+def _find_stale_for_dir(
+    dotfile_dir: Path,
+    entries: List[DotfileEntry],
+    profile: Profile,
+) -> List[Tuple[Path, DotfileEntry]]:
+    """Find managed-but-stale symlinks for one source dir.
+
+    Returns (symlink, synthesized DotfileEntry) tuples. The
+    synthesized entry has its relative_path set to the path inside
+    dotfile_dir that the stale link points to, so callers can
+    package it as an OperationResult or unlink the symlink.
+    """
+    src_resolved = dotfile_dir.resolve()
+    discovered_rels = {e.relative_path for e in entries}
+    sources = {src_resolved: discovered_rels}
+    scan_dirs = _scan_dirs_for_entries(entries, profile)
+
+    stale: List[Tuple[Path, DotfileEntry]] = []
+    for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
+        synth_entry = DotfileEntry(
+            relative_path=rel,
+            dotfile_dir=src_resolved,
+            profile=profile,
+        )
+        stale.append((symlink, synth_entry))
+    return stale
+
+
 # =============================================================================
 # SUBCOMMAND IMPLEMENTATIONS
 # =============================================================================
@@ -742,6 +890,14 @@ def do_install(
     force: bool,
 ) -> None:
     """Install entries from one or all source directories.
+
+    install is a sync operation: after it runs, the target tree
+    reflects the source repo's current discovered set. Files added
+    to the repo are linked (subject to conflict / -f rules); files
+    removed from the repo or newly matched by .gitignore /
+    .hgignore / .dotfilesignore have their managed symlinks pruned.
+    Stale-link pruning is per-repo and only touches symlinks that
+    point into the source dir being installed.
 
     Args:
         directory: Specific directory to install, or None for all
@@ -762,6 +918,7 @@ def do_install(
             logger.info("No %s directories installed.", ACTIVE_PROFILE.name)
             return
 
+    profile = ACTIVE_PROFILE
     had_conflicts = False
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
@@ -769,9 +926,17 @@ def do_install(
                 f"Source directory does not exist: {dotfile_dir}"
             )
 
-        results = process_directory(
-            dotfile_dir, "install", dry_run=dry_run, force=force
+        entries = discover_dotfiles(dotfile_dir, profile=profile)
+        results = _process_entries(
+            entries, "install", dry_run=dry_run, force=force
         )
+        for symlink, synth_entry in _find_stale_for_dir(
+            dotfile_dir, entries, profile
+        ):
+            if not dry_run:
+                symlink.unlink()
+                _cleanup_empty_parents(symlink.parent, profile)
+            results.append(OperationResult(synth_entry, DotfileStatus.STALE))
         log_results(dotfile_dir, results)
         if has_conflicts(results):
             had_conflicts = True
@@ -818,11 +983,18 @@ def do_remove(
 def do_audit(directory: Optional[Path]) -> None:
     """Audit entries for one or all source directories.
 
+    Reports the status of each discovered entry plus any STALE
+    managed symlinks -- symlinks under target_root that point into
+    the audited dotfile_dir but whose relative path is no longer in
+    the discovered set (file removed from the repo, or matched by
+    .gitignore / .hgignore / .dotfilesignore).
+
     Args:
         directory: Specific directory to audit, or None for all
 
     Raises:
-        ConflictsFound: If conflicts or missing entries found.
+        ConflictsFound: If conflicts, missing entries, or stale
+            managed links are found.
     """
     if directory is not None:
         directories = [directory.resolve()]
@@ -831,52 +1003,84 @@ def do_audit(directory: Optional[Path]) -> None:
         if not directories:
             return
 
+    profile = ACTIVE_PROFILE
     had_issues = False
     for dotfile_dir in directories:
         if not dotfile_dir.exists():
             continue
 
-        results = process_directory(dotfile_dir, "audit")
+        entries = discover_dotfiles(dotfile_dir, profile=profile)
+        results = _process_entries(entries, "audit")
+        for _symlink, synth_entry in _find_stale_for_dir(
+            dotfile_dir, entries, profile
+        ):
+            results.append(OperationResult(synth_entry, DotfileStatus.STALE))
         log_results(dotfile_dir, results)
-        if has_conflicts(results) or has_missing(results):
+        if has_conflicts(results) or has_missing(results) or has_stale(results):
             had_issues = True
 
     if had_issues:
-        raise ConflictsFound("Conflicts or missing entries found during audit")
+        raise ConflictsFound(
+            "Conflicts, missing entries, or stale links found during audit"
+        )
 
 
 def do_cleanup(*, dry_run: bool) -> None:
-    """Remove all dangling symlinks from directories the profile manages.
+    """Remove dangling and stale managed symlinks from the
+    directories the profile manages.
 
-    The scan set is target_root plus the parent directory of every entry
-    currently discovered across all installed source directories. For
-    binfiles (flat) this collapses to {target_root}; for dotfiles it
-    typically includes $HOME plus any subdirs where dotfiles delivers
-    nested files.
+    A *dangling* symlink points to a target that no longer exists on
+    disk and is removed regardless of where it points. A *stale
+    managed* symlink resolves into one of the installed source
+    directories but to a path that is no longer in that source's
+    discovered set -- because the file was removed from the repo or
+    now matches .gitignore / .hgignore / .dotfilesignore. Symlinks
+    that point outside every installed source directory and resolve
+    to an existing file are foreign and left alone.
+
+    The scan set is target_root plus the parent directory of every
+    entry currently discovered across all installed source
+    directories. For binfiles (flat) this collapses to {target_root};
+    for dotfiles it typically includes $HOME plus any subdirs where
+    dotfiles delivers nested files.
 
     Args:
         dry_run: If True, log what would be removed without removing it.
     """
     profile = ACTIVE_PROFILE
     scan_dirs: Set[Path] = {profile.target_root()}
+    sources: Dict[Path, Set[Path]] = {}
 
     for src_dir in load_installed_directories():
         if not src_dir.exists():
             continue
+        rels: Set[Path] = set()
         for entry in discover_dotfiles(src_dir, profile=profile):
+            rels.add(entry.relative_path)
             scan_dirs.add(entry.target_path.parent)
+        sources[src_dir.resolve()] = rels
 
+    src_list = list(sources.keys())
     for scan_dir in sorted(scan_dirs):
         if not scan_dir.is_dir():
             continue
         for item in sorted(scan_dir.iterdir()):
             if not item.is_symlink():
                 continue
-            if item.exists():
+            link = _link_source_dir(item, src_list)
+            if link is not None:
+                src, rel = link
+                if rel in sources[src]:
+                    continue
+                logger.info("removing stale managed symlink: %s", item)
+                if not dry_run:
+                    item.unlink()
+                    _cleanup_empty_parents(item.parent, profile)
                 continue
-            logger.info("removing dangling symlink: %s", item)
-            if not dry_run:
-                item.unlink()
+            if not item.exists():
+                logger.info("removing dangling symlink: %s", item)
+                if not dry_run:
+                    item.unlink()
 
 
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
@@ -915,7 +1119,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Install subcommand
     install_parser = subparsers.add_parser(
-        "install", help="Install entries from a source directory"
+        "install",
+        help=(
+            "Sync entries from a source directory: link new ones, "
+            "prune stale managed links"
+        ),
     )
     install_parser.add_argument(
         "--dry-run",
@@ -953,7 +1161,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Audit subcommand
     audit_parser = subparsers.add_parser(
-        "audit", help="Audit installed entries"
+        "audit",
+        help=(
+            "Report status of installed entries; fails on conflicts, "
+            "missing entries, or stale managed links"
+        ),
     )
     audit_parser.add_argument(
         "directory",
@@ -965,7 +1177,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Cleanup subcommand
     cleanup_parser = subparsers.add_parser(
         "cleanup",
-        help="Remove dangling symlinks from managed directories",
+        help="Remove dangling and stale managed symlinks",
     )
     cleanup_parser.add_argument(
         "--dry-run",
