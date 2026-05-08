@@ -221,6 +221,21 @@ class TestBinfilesDiscovery:
         assert Path("tool") in names
         assert Path("old.bak") not in names
 
+    def test_respects_dotfilesignore(self, tmp_path: Path) -> None:
+        """A binfiles repo can keep tests/ tracked but unlinked via
+        .dotfilesignore (same file the dotfiles profile reads)."""
+        src = tmp_path / "binfiles"
+        src.mkdir()
+        (src / ".dotfilesignore").write_text("tests/\n")
+        _make_executable(src / "tool")
+        (src / "tests").mkdir()
+        _make_executable(src / "tests" / "test_format")
+
+        entries = bf.discover_dotfiles(src, profile=bf.BINFILES_PROFILE)
+        names = {e.relative_path for e in entries}
+        assert Path("tool") in names
+        assert Path("tests/test_format") not in names
+
 
 class TestBinfilesSubcommands:
     """Smoke-test install/remove/audit/cleanup under BINFILES_PROFILE."""

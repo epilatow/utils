@@ -387,17 +387,63 @@ class TestLoadIgnorePatterns:
         assert "*.tmp" in patterns
         assert "*.swp" in patterns
 
-    def test_load_both_ignore_files(self, tmp_path: Path) -> None:
-        """Test loading patterns from both .gitignore and .hgignore."""
+    def test_load_dotfilesignore(self, tmp_path: Path) -> None:
+        """Test loading patterns from .dotfilesignore. Trailing
+        directory slashes are stripped at load time so fnmatch's
+        path-component check works."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".dotfilesignore").write_text("tests/\nREADME.md\n")
+
+        patterns = df.load_ignore_patterns(dotfile_dir)
+
+        assert "tests" in patterns
+        assert "README.md" in patterns
+
+    def test_load_all_ignore_files(self, tmp_path: Path) -> None:
+        """Patterns are merged from .gitignore, .hgignore, and
+        .dotfilesignore."""
         dotfile_dir = tmp_path / "dotfiles"
         dotfile_dir.mkdir()
         (dotfile_dir / ".gitignore").write_text("*~\n")
         (dotfile_dir / ".hgignore").write_text("*.tmp\n")
+        (dotfile_dir / ".dotfilesignore").write_text("tests/\n")
 
         patterns = df.load_ignore_patterns(dotfile_dir)
 
         assert "*~" in patterns
         assert "*.tmp" in patterns
+        assert "tests" in patterns
+
+    def test_strips_trailing_slash_from_directory_patterns(
+        self, tmp_path: Path
+    ) -> None:
+        """gitignore-style 'foo/' is loaded as 'foo' so the
+        path-component matcher works."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".gitignore").write_text("__pycache__/\nbuild/\n")
+
+        patterns = df.load_ignore_patterns(dotfile_dir)
+
+        assert "__pycache__" in patterns
+        assert "build" in patterns
+        assert "__pycache__/" not in patterns
+
+    def test_lone_slash_pattern_not_collapsed_to_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """A line containing only '/' is not stripped to the empty
+        string (which would fnmatch-match nothing useful and pollute
+        the pattern set)."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".gitignore").write_text("/\n")
+
+        patterns = df.load_ignore_patterns(dotfile_dir)
+
+        assert "" not in patterns
+        assert "/" in patterns
 
     def test_skip_comments_and_empty_lines(self, tmp_path: Path) -> None:
         """Test that comments and empty lines are skipped."""
@@ -602,6 +648,29 @@ class TestDiscoverDotfilesIgnoreFeatures:
         assert Path("vimrc") in paths
         assert Path("vimrc~") not in paths
         assert Path("config.bak") not in paths
+
+    def test_respects_dotfilesignore_patterns(self, tmp_path: Path) -> None:
+        """A repo can keep tests/ tracked in git but excluded from
+        linking by listing it in .dotfilesignore."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".dotfilesignore").write_text(
+            "tests/\nREADME.md\n.github\n"
+        )
+        (dotfile_dir / "vimrc").write_text("content")
+        (dotfile_dir / "README.md").write_text("docs")
+        (dotfile_dir / "tests").mkdir()
+        (dotfile_dir / "tests" / "test_format.py").write_text("test")
+        (dotfile_dir / ".github").mkdir()
+        (dotfile_dir / ".github" / "workflow.yml").write_text("ci")
+
+        entries = df.discover_dotfiles(dotfile_dir)
+
+        paths = {e.relative_path for e in entries}
+        assert Path("vimrc") in paths
+        assert Path("README.md") not in paths
+        assert Path("tests/test_format.py") not in paths
+        assert Path(".github/workflow.yml") not in paths
 
     def test_respects_hgignore_patterns(self, tmp_path: Path) -> None:
         """Test that .hgignore patterns are respected."""
