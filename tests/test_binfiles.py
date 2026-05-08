@@ -26,10 +26,13 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest  # type: ignore[import-not-found]
 from conftest import (
     CmdCallbacksBase,
     CodeQualityBase,
     ExceptionHierarchyBase,
+    IsolateHomeFixtureBase,
+    isolate_home,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -46,10 +49,25 @@ sys.modules["binfiles"] = bf
 _spec.loader.exec_module(bf)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
+    isolate_home(bf, ".binfiles.installed", tmp_path, monkeypatch)
+
+
 def _make_executable(path: Path) -> None:
     """Write a minimal executable script to path."""
     path.write_text("#!/bin/sh\nexit 0\n")
     path.chmod(0o755)
+
+
+class TestIsolateHomeFixture(IsolateHomeFixtureBase):
+    MODULE = bf
+    SOURCE_NAME = "tool"
+    PROFILE_ATTR = "BINFILES_PROFILE"
+
+    @staticmethod
+    def _make_source(path: Path) -> None:
+        _make_executable(path)
 
 
 class TestSelectProfile:

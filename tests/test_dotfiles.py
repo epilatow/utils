@@ -24,6 +24,8 @@ from conftest import (
     CmdCallbacksBase,
     CodeQualityBase,
     ExceptionHierarchyBase,
+    IsolateHomeFixtureBase,
+    isolate_home,
 )
 
 # Repository root directory (parent of tests/)
@@ -39,6 +41,21 @@ assert _spec and _spec.loader
 df = importlib.util.module_from_spec(_spec)
 sys.modules["dotfiles"] = df
 _spec.loader.exec_module(df)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
+    isolate_home(df, ".dotfiles.installed", tmp_path, monkeypatch)
+
+
+class TestIsolateHomeFixture(IsolateHomeFixtureBase):
+    MODULE = df
+    SOURCE_NAME = "vimrc"
+    PROFILE_ATTR = "DOTFILES_PROFILE"
+
+    @staticmethod
+    def _make_source(path: Path) -> None:
+        path.write_text("content")
 
 
 class TestArgumentParser:

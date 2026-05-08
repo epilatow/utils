@@ -204,6 +204,77 @@ class ExceptionHierarchyBase:
         assert len(codes) == len(set(codes))
 
 
+def isolate_home(
+    module: Any,
+    installed_basename: str,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Default Path.home() and a module's INSTALLED_FILE to a
+    nonexistent path under tmp_path so a test that forgets to patch
+    them cannot touch the real $HOME or installed-tracking file.
+
+    Tests that explicitly set their own home via patch.object /
+    monkeypatch.setattr override this. Lives in conftest so the
+    dotfiles and binfiles autouse fixtures share one definition.
+    """
+    sentinel = tmp_path / "_home_sentinel_unwritten"
+    monkeypatch.setattr(Path, "home", lambda: sentinel)
+    monkeypatch.setattr(module, "INSTALLED_FILE", sentinel / installed_basename)
+
+
+class IsolateHomeFixtureBase:
+    """Meta-tests pinning the autouse _isolate_home fixture in
+    test_dotfiles.py and test_binfiles.py.
+
+    Subclasses declare:
+      MODULE: the loaded dotfiles / binfiles module.
+      SOURCE_NAME: name of the source file under dotfile_dir.
+      PROFILE_ATTR: attribute on MODULE for the profile to use.
+
+    Subclasses also override _make_source(path) to create the file
+    in the form their profile accepts (text vs executable).
+    """
+
+    MODULE: ClassVar[Any]
+    SOURCE_NAME: ClassVar[str]
+    PROFILE_ATTR: ClassVar[str]
+
+    @staticmethod
+    def _make_source(path: Path) -> None:
+        raise NotImplementedError
+
+    def test_home_diverted_to_sentinel(self, tmp_path: Path) -> None:
+        """Path.home() returns a per-test sentinel, not the real home."""
+        assert Path.home() == tmp_path / "_home_sentinel_unwritten"
+
+    def test_sentinel_does_not_exist(self) -> None:
+        """The sentinel intentionally does not exist on disk."""
+        assert not Path.home().exists()
+
+    def test_install_lands_under_sentinel_not_real_home(
+        self, tmp_path: Path
+    ) -> None:
+        """install_dotfile without an explicit home-patch writes
+        inside the sentinel tree under tmp_path, never to the real
+        $HOME / ~/.local/bin."""
+        mod = type(self).MODULE
+        src = tmp_path / "src"
+        src.mkdir()
+        type(self)._make_source(src / type(self).SOURCE_NAME)
+        profile = getattr(mod, type(self).PROFILE_ATTR)
+        entry = mod.DotfileEntry(
+            relative_path=Path(type(self).SOURCE_NAME),
+            dotfile_dir=src,
+            profile=profile,
+        )
+        assert str(entry.target_path).startswith(str(tmp_path))
+        result = mod.install_dotfile(entry)
+        assert result.status == mod.DotfileStatus.INSTALLED
+        assert entry.target_path.is_symlink()
+        assert str(entry.target_path).startswith(str(tmp_path))
+
+
 class CmdCallbacksBase:
     """Base class for command callback table tests.
 
