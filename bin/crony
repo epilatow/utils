@@ -38,7 +38,7 @@ import xml.sax.saxutils
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
-from typing import IO, Any, Callable, Iterator, NamedTuple
+from typing import IO, Any, Callable, Iterable, Iterator, NamedTuple
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -103,7 +103,11 @@ Bundles are independent: each has its own [defaults], targets, and
 notify config; jobs/groups defined in one bundle don't see another's.
 Job and group names are namespaced as <bundle>.<short>; bare CLI
 input (`crony trigger foo`) is shorthand for `default.foo` and only
-ever resolves to the default bundle.
+ever resolves to the default bundle. The `-b/--bundle <name>` flag
+on multi-job subcommands (apply, destroy, status, enable, disable,
+trigger) reshapes that resolution: bare names resolve in `<name>`,
+qualified names must match it, and a bare invocation scopes the
+operation to that bundle's selection.
 
 State (logs, locks, last-run records, install hashes) lives at
 ~/.local/state/crony/.\
@@ -197,7 +201,10 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # notify config apply only to the jobs defined in the same file.
 # Job and group names are namespaced as <bundle>.<short>; on the
 # CLI, a bare name (`crony trigger foo`) is shorthand for
-# `default.foo` and never falls through to other bundles.
+# `default.foo` and never falls through to other bundles. The
+# `-b/--bundle <name>` flag on multi-job subcommands (apply,
+# destroy, status, enable, disable, trigger) scopes the operation
+# to <name>, so a bare arg resolves there instead of `default`.
 #
 # Schedules use systemd OnCalendar syntax; intervals use systemd
 # time-span syntax. See:
@@ -1039,6 +1046,41 @@ def normalize_full_name(arg: str) -> str:
     """
     bundle, short = parse_full_name(arg)
     return f"{bundle}.{short}"
+
+
+def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
+    """CLI input -> canonical `<bundle>.<short>` honoring `-b`.
+
+    With `scope_bundle` None this is `normalize_full_name`. With
+    `scope_bundle` set, bare `arg` resolves in that bundle (so
+    `-b foo bar` -> `foo.bar`), already-qualified `<scope>.<short>`
+    round-trips, and `<other>.<short>` is rejected -- under `-b`
+    every name on the command line must belong to that bundle so
+    a bulk operation can't sneak in a cross-bundle reference.
+    """
+    if scope_bundle is None:
+        return normalize_full_name(arg)
+    bundle, short = parse_full_name(arg)
+    if "." not in arg:
+        return f"{scope_bundle}.{short}"
+    if bundle != scope_bundle:
+        raise UsageError(
+            f"{arg!r} is in bundle {bundle!r} but --bundle "
+            f"{scope_bundle!r} is set"
+        )
+    return f"{bundle}.{short}"
+
+
+def require_known_bundle(bundles: Bundles, bundle: str | None) -> None:
+    """Reject `--bundle <name>` if `<name>` isn't a loaded bundle."""
+    if bundle is not None and bundles.by_name(bundle) is None:
+        raise UsageError(f"unknown bundle: {bundle!r}")
+
+
+def bundle_prefix_filter(names: Iterable[str], bundle: str) -> set[str]:
+    """Subset of `names` whose `<bundle>.` prefix matches."""
+    prefix = f"{bundle}."
+    return {n for n in names if n.startswith(prefix)}
 
 
 def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
@@ -4442,7 +4484,7 @@ def _topo_apply_order(
     return out
 
 
-def do_apply(jobs: list[str], verbose: bool) -> None:
+def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """Render and activate platform units to match config.
 
     No args: full sync across every bundle. Install missing, fix
@@ -4454,17 +4496,35 @@ def do_apply(jobs: list[str], verbose: bool) -> None:
     (`<bundle>.<short>`). Bare input is shorthand for
     `default.<short>` and only ever resolves to the default bundle.
 
+    With `--bundle <name>`, scopes the apply to that bundle: bare
+    CLI input resolves there instead of `default`, qualified names
+    must match `<name>`, and a no-args sync only touches that
+    bundle's selected jobs and its own orphan stamps -- other
+    bundles' state is untouched.
+
     `unchanged` results are suppressed by default so the output
     only shows the entries the apply actually touched. `-v` /
     `--verbose` prints them too.
     """
     bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     by_full, selected = _selected_full_names_per_bundle(bundles)
+    if bundle is not None:
+        selected = bundle_prefix_filter(selected, bundle)
 
     if jobs:
-        # Normalize each CLI input to its full namespaced form.
-        normalized = [normalize_full_name(arg) for arg in jobs]
+        normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
         unknown = [n for n in normalized if n not in by_full]
+        if bundle is not None:
+            # Under `-b`, a name that exists in `by_full` but is
+            # outside the scoped `selected` set means the entry
+            # belongs to that bundle but isn't selected on this
+            # host; surface it the same as unknown.
+            unknown.extend(
+                n
+                for n in normalized
+                if n in by_full and n not in selected and n not in unknown
+            )
         if unknown:
             raise UsageError(
                 f"unknown or unselected on this host: {sorted(unknown)}"
@@ -4489,52 +4549,67 @@ def do_apply(jobs: list[str], verbose: bool) -> None:
     # partial install and the user has to chase what landed.
     if current_platform() == "darwin":
         for full in full_names_to_apply:
-            bundle, short = by_full[full]
+            b, short = by_full[full]
             entry: Job | JobGroup = (
-                bundle.config.jobs.get(short) or bundle.config.job_groups[short]
+                b.config.jobs.get(short) or b.config.job_groups[short]
             )
             schedule, _interval = _entity_schedule(entry)
             if schedule is not None:
                 _oncalendar_to_plist_calendar(schedule)
 
     for full in full_names_to_apply:
-        bundle, short = by_full[full]
-        result = apply_one(bundle.config, short, bundle_name=bundle.name)
+        b, short = by_full[full]
+        result = apply_one(b.config, short, bundle_name=b.name)
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
 
     if remove_orphans:
-        orphans = stamped_names() - selected
+        stamps = stamped_names()
+        if bundle is not None:
+            stamps = bundle_prefix_filter(stamps, bundle)
+        orphans = stamps - selected
         for orphan in sorted(orphans):
             destroy_one(orphan)
             logger.info("%s: orphan removed", orphan)
 
 
-def do_destroy(jobs: list[str], purge_state: bool) -> None:
+def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
     """Remove platform units.
 
     No args: factory reset -- every crony-managed unit on this host
     (every stamped name across all bundles).
 
+    With `--bundle <name>` and no positional args: scope the reset
+    to that bundle's stamped names. Other bundles' units stay
+    intact.
+
     With names: surgical removal by full namespaced name. Refuses
     if a name is in neither any bundle's config nor the stamped set;
-    refuses if a name's run.lock is currently held.
+    refuses if a name's run.lock is currently held. Under
+    `--bundle`, bare names resolve in that bundle and qualified
+    names must match it.
     """
+    bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     if jobs:
-        bundles = load_all_bundles()
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
         # currently-stamped name (so an old stamp can still be
         # destroyed even after the bundle is gone).
         defined = set(by_full.keys()) | bundles.all_full_names()
         known = defined | stamped_names()
-        normalized = [normalize_full_name(arg) for arg in jobs]
+        if bundle is not None:
+            known = bundle_prefix_filter(known, bundle)
+        normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
         unknown = [n for n in normalized if n not in known]
         if unknown:
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
     else:
-        full_names_to_destroy = sorted(stamped_names())
+        stamps = stamped_names()
+        if bundle is not None:
+            stamps = bundle_prefix_filter(stamps, bundle)
+        full_names_to_destroy = sorted(stamps)
 
     for full in full_names_to_destroy:
         # Refuse if a run is in progress; a partial destroy would
@@ -4552,41 +4627,94 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
         logger.info("%s: %s", full, "purged" if purge_state else "destroyed")
 
 
+def _entry_schedule_state(bundles: Bundles, full: str) -> str:
+    """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`.
+
+    `unresolved` covers a name whose bundle or short doesn't
+    currently exist (a stale stamp, say). `unscheduled` is a
+    defined entry with neither schedule nor interval. `scheduled`
+    is anything with a schedule or interval.
+    """
+    bn, short = parse_full_name(full)
+    b = bundles.by_name(bn)
+    if b is None:
+        return "unresolved"
+    entry: Job | JobGroup | None = b.config.jobs.get(
+        short
+    ) or b.config.job_groups.get(short)
+    if entry is None:
+        return "unresolved"
+    sched, interval = _entity_schedule(entry)
+    if sched is None and interval is None:
+        return "unscheduled"
+    return "scheduled"
+
+
+def _resolve_bulk_names(
+    jobs: list[str],
+    bundle: str | None,
+    stamped: set[str],
+    bundles: Bundles,
+    scheduled_only: bool,
+) -> list[str]:
+    """Derive the operate-on name set for enable / disable / trigger.
+
+    With positional `jobs`, normalize each via `resolve_cli_name`
+    (which honors `-b`'s bundle-scoping rules). With no positionals,
+    `bundle` is required and the set expands to that bundle's
+    stamped names; `scheduled_only` drops unscheduled entries so a
+    bulk `enable -b foo` skips schedule-less group containers
+    rather than rejecting the whole call.
+    """
+    if jobs:
+        return [resolve_cli_name(arg, bundle) for arg in jobs]
+    if bundle is None:
+        raise UsageError("specify job names or --bundle")
+    expanded = sorted(bundle_prefix_filter(stamped, bundle))
+    if scheduled_only:
+        expanded = [
+            n
+            for n in expanded
+            if _entry_schedule_state(bundles, n) == "scheduled"
+        ]
+    return expanded
+
+
 def _refuse_unscheduled_full(
     bundles: Bundles, full_names: list[str], verb: str
 ) -> None:
     """Reject entries with no schedule (nothing to enable/disable)."""
-    unscheduled: list[str] = []
-    for full in full_names:
-        bn, short = parse_full_name(full)
-        bundle = bundles.by_name(bn)
-        if bundle is None:
-            continue
-        entry: Job | JobGroup | None = bundle.config.jobs.get(
-            short
-        ) or bundle.config.job_groups.get(short)
-        if entry is None:
-            continue
-        sched, interval = _entity_schedule(entry)
-        if sched is None and interval is None:
-            unscheduled.append(full)
+    unscheduled = [
+        full
+        for full in full_names
+        if _entry_schedule_state(bundles, full) == "unscheduled"
+    ]
     if unscheduled:
         raise UsageError(
             f"cannot {verb} entries with no schedule: {sorted(unscheduled)}"
         )
 
 
-def do_enable(jobs: list[str]) -> None:
+def do_enable(jobs: list[str], bundle: str | None) -> None:
     """Move the platform scheduler into `enabled` for the named jobs.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
     this host (run apply first) and entries with no schedule (no
     platform timer to enable / disable).
+
+    With `--bundle <name>` and no positional args, enables every
+    scheduled stamped entry in `<name>` (unscheduled entries in
+    that bundle are skipped, not rejected). With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified
+    names must match it.
     """
     bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     stamped = stamped_names()
-    normalized = [normalize_full_name(n) for n in jobs]
+    normalized = _resolve_bulk_names(
+        jobs, bundle, stamped, bundles, scheduled_only=True
+    )
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4600,17 +4728,26 @@ def do_enable(jobs: list[str]) -> None:
         logger.info("%s: enabled", full)
 
 
-def do_disable(jobs: list[str]) -> None:
+def do_disable(jobs: list[str], bundle: str | None) -> None:
     """Move the platform scheduler into `disabled` for the named jobs.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
     this host (run apply first) and entries with no schedule (no
     platform timer to enable / disable).
+
+    With `--bundle <name>` and no positional args, disables every
+    scheduled stamped entry in `<name>` (unscheduled entries in
+    that bundle are skipped, not rejected). With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified
+    names must match it.
     """
     bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     stamped = stamped_names()
-    normalized = [normalize_full_name(n) for n in jobs]
+    normalized = _resolve_bulk_names(
+        jobs, bundle, stamped, bundles, scheduled_only=True
+    )
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4655,6 +4792,7 @@ def do_trigger(
     jobs: list[str],
     wait: bool,
     trigger_timeout: int | None,
+    bundle: str | None,
 ) -> None:
     """Ask the platform scheduler to fire the named jobs.
 
@@ -4680,6 +4818,12 @@ def do_trigger(
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. Refuses names not stamped on
     this host (run apply first).
+
+    With `--bundle <name>` and no positional args, triggers every
+    stamped entry in `<name>` (including schedule-less ones, since
+    trigger is meaningful for them too). With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified
+    names must match it.
     """
     if trigger_timeout is not None and not wait:
         raise UsageError(
@@ -4687,8 +4831,11 @@ def do_trigger(
             "synchronous mode)"
         )
     bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     stamped = stamped_names()
-    normalized = [normalize_full_name(n) for n in jobs]
+    normalized = _resolve_bulk_names(
+        jobs, bundle, stamped, bundles, scheduled_only=False
+    )
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4709,26 +4856,26 @@ def do_trigger(
     worst_rc = 0
     for full in normalized:
         bn, short = parse_full_name(full)
-        bundle = bundles.by_name(bn)
-        if bundle is None:
+        b = bundles.by_name(bn)
+        if b is None:
             raise UsageError(
                 f"unknown bundle for {full!r} (apply may be stale)"
             )
-        b_target = resolve_target(bundle.config, current_host(), platform)
-        if short in bundle.config.jobs:
+        b_target = resolve_target(b.config, current_host(), platform)
+        if short in b.config.jobs:
             timeout = float(
                 resolved_job_timeout_sec(
-                    bundle.config, b_target, bundle.config.jobs[short]
+                    b.config, b_target, b.config.jobs[short]
                 )
             )
         else:
             timeout = float(
-                resolved_group_timeout_sec(bundle.config, b_target, short)
+                resolved_group_timeout_sec(b.config, b_target, short)
             )
         tt = (
             float(trigger_timeout)
             if trigger_timeout is not None
-            else float(bundle.config.defaults.trigger_timeout_sec)
+            else float(b.config.defaults.trigger_timeout_sec)
         )
         rec = _trigger_unit_sync(full, job_timeout=timeout, trigger_timeout=tt)
         cls = rec.get("exit_class", "ok")
@@ -4839,7 +4986,12 @@ def _resolve_state_axes(
     return cfg_state, sched_state, last_state
 
 
-def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
+def do_status(
+    jobs: list[str],
+    cols: str | None,
+    show_masked: bool,
+    bundle: str | None,
+) -> None:
     """Print the resolved state per job in a tabular view.
 
     With no args, the report covers selected jobs/groups plus any
@@ -4847,6 +4999,10 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
     (`<bundle>.<short>`); bare CLI input is shorthand for
     `default.<short>`. Linger status on linux surfaces above the
     table.
+
+    With `--bundle <name>`, restricts the table (and the masked-
+    entries set surfaced by `-a`) to that bundle. Bare CLI input
+    resolves in `<name>` and qualified names must match it.
 
     `--cols` is a comma-separated list selecting which columns to
     show, in order. Valid: job, config, sched, last, last-ran,
@@ -4863,11 +5019,20 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
     """
     selected_cols = _parse_status_cols(cols)
     bundles = load_all_bundles()
+    require_known_bundle(bundles, bundle)
     platform = current_platform()
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
     stamped = stamped_names()
+    if bundle is not None:
+        selected = bundle_prefix_filter(selected, bundle)
+        stamped = bundle_prefix_filter(stamped, bundle)
+        masked_by_full = {
+            n: r
+            for n, r in masked_by_full.items()
+            if n.startswith(f"{bundle}.")
+        }
 
     if platform == "linux":
         ling = linger_enabled()
@@ -4881,7 +5046,7 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
 
     full_names: list[str]
     if jobs:
-        full_names = [normalize_full_name(n) for n in jobs]
+        full_names = [resolve_cli_name(n, bundle) for n in jobs]
     else:
         active = selected | stamped
         if show_masked:
@@ -5143,16 +5308,13 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     namespaced (`<bundle>.<short>`).
     """
     bundles = load_all_bundles()
-    if bundle is not None and bundles.by_name(bundle) is None:
-        raise UsageError(f"unknown bundle: {bundle!r}")
+    require_known_bundle(bundles, bundle)
     platform = current_platform()
     _by_full, selected = _selected_full_names_per_bundle(bundles)
     stamped = stamped_names()
     if bundle is not None:
-        prefix = f"{bundle}."
-        selected = {n for n in selected if n.startswith(prefix)}
-        scoped_stamped = {n for n in stamped if n.startswith(prefix)}
-        candidates = sorted(selected | scoped_stamped)
+        selected = bundle_prefix_filter(selected, bundle)
+        candidates = sorted(selected | bundle_prefix_filter(stamped, bundle))
     else:
         candidates = sorted(selected | stamped)
 
@@ -5348,8 +5510,7 @@ def do_validate(bundle: str | None) -> None:
     the whole-host picture, not any one bundle.
     """
     bundles = load_all_bundles()
-    if bundle is not None and bundles.by_name(bundle) is None:
-        raise UsageError(f"unknown bundle: {bundle!r}")
+    require_known_bundle(bundles, bundle)
     platform = current_platform()
 
     warnings: list[str] = []
@@ -5477,9 +5638,9 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
                 f"{channel!r} (bundle {channel_bundle!r}); pick one"
             )
     bundle_name = channel_bundle or bundle or DEFAULT_BUNDLE_NAME
+    require_known_bundle(bundles, bundle_name)
     target_bundle = bundles.by_name(bundle_name)
-    if target_bundle is None:
-        raise UsageError(f"unknown bundle: {bundle_name!r}")
+    assert target_bundle is not None  # require_known_bundle guarantees
 
     successes, failures = _notify_test_one_bundle(target_bundle, channel_short)
     for ch in successes:
@@ -5513,8 +5674,7 @@ def do_list(bundle: str | None) -> None:
     namespaced (`<bundle>.<short>`).
     """
     bundles = load_all_bundles()
-    if bundle is not None and bundles.by_name(bundle) is None:
-        raise UsageError(f"unknown bundle: {bundle!r}")
+    require_known_bundle(bundles, bundle)
     platform = current_platform()
     target_bundles = (
         [b for b in bundles.bundles if b.name == bundle]
@@ -5599,6 +5759,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing config file",
     )
     p_init.add_argument(
+        "-b",
         "--bundle",
         default=None,
         help=(
@@ -5627,6 +5788,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also print 'unchanged' lines (default: suppressed)",
     )
+    p_apply.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the apply to one bundle. Bare names resolve in "
+            "<bundle>; qualified names must match it. With no "
+            "positional args, only that bundle's selection and "
+            "orphans are touched."
+        ),
+    )
 
     # destroy
     p_destroy = subparsers.add_parser(
@@ -5646,6 +5818,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also delete log/state dirs for affected jobs",
     )
+    p_destroy.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the destroy to one bundle. Bare names resolve in "
+            "<bundle>; qualified names must match it. With no "
+            "positional args, only that bundle's stamps are removed."
+        ),
+    )
 
     # enable
     p_enable = subparsers.add_parser(
@@ -5654,8 +5836,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_enable.add_argument(
         "jobs",
-        nargs="+",
-        help="Job names to enable",
+        nargs="*",
+        help=(
+            "Job names to enable. Omit when --bundle is given to "
+            "enable every scheduled stamped entry in that bundle."
+        ),
+    )
+    p_enable.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the enable to one bundle. With no positional "
+            "args, enables every scheduled stamped entry in "
+            "<bundle>; with positional args, bare names resolve in "
+            "<bundle> and qualified names must match it."
+        ),
     )
 
     # disable
@@ -5665,8 +5861,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_disable.add_argument(
         "jobs",
-        nargs="+",
-        help="Job names to disable",
+        nargs="*",
+        help=(
+            "Job names to disable. Omit when --bundle is given to "
+            "disable every scheduled stamped entry in that bundle."
+        ),
+    )
+    p_disable.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the disable to one bundle. With no positional "
+            "args, disables every scheduled stamped entry in "
+            "<bundle>; with positional args, bare names resolve in "
+            "<bundle> and qualified names must match it."
+        ),
     )
 
     # trigger
@@ -5676,8 +5886,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_trigger.add_argument(
         "jobs",
-        nargs="+",
-        help="Job names to trigger via launchd / systemctl",
+        nargs="*",
+        help=(
+            "Job names to trigger via launchd / systemctl. Omit "
+            "when --bundle is given to trigger every stamped entry "
+            "in that bundle."
+        ),
+    )
+    p_trigger.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the trigger to one bundle. With no positional "
+            "args, fires every stamped entry in <bundle>; with "
+            "positional args, bare names resolve in <bundle> and "
+            "qualified names must match it."
+        ),
     )
     p_trigger.add_argument(
         "-w",
@@ -5727,6 +5952,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated columns to display "
             "(valid: job,config,sched,last,last-ran,masked-by; "
             "aliases: default, all; default: default)"
+        ),
+    )
+    p_status.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Restrict the table to one bundle. Bare names resolve "
+            "in <bundle>; qualified names must match it."
         ),
     )
 
@@ -5806,6 +6040,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not flag intentionally-disabled jobs as bad",
     )
     p_audit.add_argument(
+        "-b",
         "--bundle",
         default=None,
         help="Restrict audit to jobs from one bundle",
@@ -5817,6 +6052,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lint config; report orphans, linger, etc",
     )
     p_validate.add_argument(
+        "-b",
         "--bundle",
         default=None,
         help=(
@@ -5841,6 +6077,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_nt.add_argument(
+        "-b",
         "--bundle",
         default=None,
         help=(
@@ -5855,6 +6092,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="One-line summary per job",
     )
     p_list.add_argument(
+        "-b",
         "--bundle",
         default=None,
         help="Restrict listing to one bundle",

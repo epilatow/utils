@@ -3130,7 +3130,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=[], verbose=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert (h.state / h.full("j") / "hash").exists()
         assert not (orphan_dir / "hash").exists()
 
@@ -3145,7 +3145,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=["j"], verbose=False)
+        crony.do_apply(jobs=["j"], verbose=False, bundle=None)
         assert (orphan_dir / "hash").exists()  # left alone
 
     def test_unchanged_suppressed_by_default(
@@ -3159,10 +3159,10 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=[], verbose=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         # Re-apply with no changes: nothing to print.
         with caplog.at_level(logging.INFO, logger="crony"):
-            crony.do_apply(jobs=[], verbose=False)
+            crony.do_apply(jobs=[], verbose=False, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert not any("unchanged" in m for m in messages), messages
 
@@ -3191,7 +3191,7 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         with pytest.raises(crony.UsageError, match="unselected on this host"):
-            crony.do_apply(jobs=["j"], verbose=False)
+            crony.do_apply(jobs=["j"], verbose=False, bundle=None)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
     def test_unchanged_shown_with_verbose(
@@ -3205,11 +3205,57 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_apply(jobs=[], verbose=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         with caplog.at_level(logging.INFO, logger="crony"):
-            crony.do_apply(jobs=[], verbose=True)
+            crony.do_apply(jobs=[], verbose=True, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert any("unchanged" in m for m in messages), messages
+
+    def test_bundle_unknown_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_apply(jobs=[], verbose=False, bundle="ghost")
+
+    def test_bundle_scopes_orphan_removal(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Pre-stamp orphans in two namespaces. `apply -b borgadm`
+        # must only prune orphans inside the borgadm namespace;
+        # default's orphan stays put.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        for ns in ("default.gone", "borgadm.gone"):
+            d = h.state / ns
+            d.mkdir(parents=True)
+            (d / "hash").write_text("legacy\n")
+        h.config({}, default_target_jobs=[])
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle="borgadm")
+        assert (h.state / "default.gone" / "hash").exists()
+        assert not (h.state / "borgadm.gone" / "hash").exists()
+
+    def test_bundle_resolves_bare_name_in_scope(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `crony apply -b borgadm k` must resolve to `borgadm.k`,
+        # not `default.k` (which doesn't exist on this host).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        crony.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
+        assert (h.state / "borgadm.k" / "hash").exists()
 
 
 class TestDestroy:
@@ -3222,7 +3268,7 @@ class TestDestroy:
         crony.apply_one(cfg, "j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert (h.state / h.full("j") / "hash").exists()
-        crony.do_destroy(jobs=[], purge_state=False)
+        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert not (h.state / h.full("j") / "hash").exists()
 
@@ -3239,7 +3285,7 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
-        crony.do_destroy(jobs=["a"], purge_state=False)
+        crony.do_destroy(jobs=["a"], purge_state=False, bundle=None)
         assert not (h.state / h.full("a") / "hash").exists()
         assert (h.state / h.full("b") / "hash").exists()
 
@@ -3257,7 +3303,7 @@ class TestDestroy:
             parents=True, exist_ok=True
         )
         (h.state / h.full("j") / "run.log").write_text("...")
-        crony.do_destroy(jobs=["j"], purge_state=True)
+        crony.do_destroy(jobs=["j"], purge_state=True, bundle=None)
         assert not (h.state / h.full("j")).exists()
 
     def test_unknown_name_rejected(
@@ -3266,7 +3312,7 @@ class TestDestroy:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown"):
-            crony.do_destroy(jobs=["ghost"], purge_state=False)
+            crony.do_destroy(jobs=["ghost"], purge_state=False, bundle=None)
 
     def test_destroy_refuses_with_run_in_progress_message(
         self, tmp_path: Path, monkeypatch: Any
@@ -3291,7 +3337,7 @@ class TestDestroy:
         _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         try:
             with pytest.raises(crony.LockBusyError) as exc:
-                crony.do_destroy(jobs=["j"], purge_state=False)
+                crony.do_destroy(jobs=["j"], purge_state=False, bundle=None)
             assert "run in progress; will not destroy" in str(exc.value)
             assert exc.value.exit_code == crony.ExitCode.LOCK_BUSY
         finally:
@@ -3317,8 +3363,61 @@ class TestDestroy:
         shutil.rmtree(h.state)
         assert plist.exists()
         # Factory reset still finds and removes the orphan plist.
-        crony.do_destroy(jobs=[], purge_state=False)
+        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
         assert not plist.exists()
+
+    def test_bundle_unknown_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_destroy(jobs=[], purge_state=False, bundle="ghost")
+
+    def test_bundle_scoped_destroy_leaves_other_bundles(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Two bundles, both stamped. `destroy -b borgadm` removes
+        # only borgadm's stamps; default's survive.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        crony.do_destroy(jobs=[], purge_state=False, bundle="borgadm")
+        assert (h.state / "default.j" / "hash").exists()
+        assert not (h.state / "borgadm.k" / "hash").exists()
+
+    def test_bundle_qualified_other_bundle_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.UsageError, match="bundle 'default'"):
+            crony.do_destroy(
+                jobs=["default.j"], purge_state=False, bundle="borgadm"
+            )
 
 
 # =============================================================================
@@ -3421,6 +3520,33 @@ class TestNameShape:
                     "target": {"host": {"bad name": {"jobs": ["a"]}}},
                 }
             )
+
+
+class TestResolveCliName:
+    """`-b/--bundle` reshapes how bare and qualified CLI args resolve.
+
+    Without `-b`, bare 'foo' resolves to 'default.foo' (legacy
+    behavior covered elsewhere). Under `-b <name>`, bare resolves
+    in `<name>`, qualified `<name>.short` round-trips, and any
+    other qualified prefix is rejected so a bulk operation can't
+    sneak in a cross-bundle name.
+    """
+
+    def test_bare_resolves_to_default_without_scope(self) -> None:
+        assert crony.resolve_cli_name("foo", None) == "default.foo"
+
+    def test_qualified_round_trips_without_scope(self) -> None:
+        assert crony.resolve_cli_name("borgadm.k", None) == "borgadm.k"
+
+    def test_bare_resolves_in_scope_bundle(self) -> None:
+        assert crony.resolve_cli_name("foo", "borgadm") == "borgadm.foo"
+
+    def test_qualified_in_scope_round_trips(self) -> None:
+        assert crony.resolve_cli_name("borgadm.k", "borgadm") == "borgadm.k"
+
+    def test_qualified_other_bundle_rejected(self) -> None:
+        with pytest.raises(crony.UsageError, match="default"):
+            crony.resolve_cli_name("default.k", "borgadm")
 
 
 # =============================================================================
@@ -3607,7 +3733,7 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_enable(jobs=["j"])
+        crony.do_enable(jobs=["j"], bundle=None)
         cmd = next(c for c in h.calls if c[0] == "systemctl")
         assert cmd == [
             "systemctl",
@@ -3628,7 +3754,7 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_disable(jobs=["j"])
+        crony.do_disable(jobs=["j"], bundle=None)
         verbs = [c[1] if len(c) > 1 else "" for c in h.calls]
         assert "unload" in verbs
         assert "disable" in verbs
@@ -3639,7 +3765,7 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="not stamped"):
-            crony.do_enable(jobs=["ghost"])
+            crony.do_enable(jobs=["ghost"], bundle=None)
 
     def test_unknown_name_rejected_for_disable(
         self, tmp_path: Path, monkeypatch: Any
@@ -3647,7 +3773,7 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="not stamped"):
-            crony.do_disable(jobs=["ghost"])
+            crony.do_disable(jobs=["ghost"], bundle=None)
 
     def test_unscheduled_entry_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -3662,9 +3788,9 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "a")
         with pytest.raises(crony.UsageError, match="no schedule"):
-            crony.do_enable(jobs=["a"])
+            crony.do_enable(jobs=["a"], bundle=None)
         with pytest.raises(crony.UsageError, match="no schedule"):
-            crony.do_disable(jobs=["a"])
+            crony.do_disable(jobs=["a"], bundle=None)
 
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
@@ -3676,7 +3802,9 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=None)
+        crony.do_trigger(
+            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd == [
             "launchctl",
@@ -3694,7 +3822,9 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "j")
         h.calls.clear()
-        crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=None)
+        crony.do_trigger(
+            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        )
         cmd = next(c for c in h.calls if c[0] == "systemctl")
         assert cmd == [
             "systemctl",
@@ -3709,7 +3839,9 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="not stamped"):
-            crony.do_trigger(jobs=["ghost"], wait=False, trigger_timeout=None)
+            crony.do_trigger(
+                jobs=["ghost"], wait=False, trigger_timeout=None, bundle=None
+            )
 
     def test_trigger_wait_maps_timeout_to_nonzero_exit(
         self, tmp_path: Path, monkeypatch: Any
@@ -3732,7 +3864,9 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+            crony.do_trigger(
+                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            )
         assert exc.value.code == int(crony.ExitCode.TIMEOUT)
 
     def test_trigger_wait_maps_signal_to_128_plus_n(
@@ -3754,7 +3888,9 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+            crony.do_trigger(
+                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            )
         assert exc.value.code == 137
 
     def test_trigger_wait_passes_through_command_exit_code(
@@ -3776,7 +3912,9 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_trigger(jobs=["j"], wait=True, trigger_timeout=None)
+            crony.do_trigger(
+                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            )
         assert exc.value.code == 7
 
     def test_trigger_timeout_requires_wait(
@@ -3788,7 +3926,9 @@ class TestEnableDisable:
             default_target_jobs=["j"],
         )
         with pytest.raises(crony.UsageError, match="--trigger-timeout"):
-            crony.do_trigger(jobs=["j"], wait=False, trigger_timeout=10)
+            crony.do_trigger(
+                jobs=["j"], wait=False, trigger_timeout=10, bundle=None
+            )
 
     def test_trigger_works_on_schedule_less_job(
         self, tmp_path: Path, monkeypatch: Any
@@ -3805,7 +3945,9 @@ class TestEnableDisable:
         )
         crony.apply_one(cfg, "a")
         h.calls.clear()
-        crony.do_trigger(jobs=["a"], wait=False, trigger_timeout=None)
+        crony.do_trigger(
+            jobs=["a"], wait=False, trigger_timeout=None, bundle=None
+        )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd[1] == "kickstart"
         assert cmd[2].endswith(f"org.crony.{h.full('a')}")
@@ -3865,6 +4007,93 @@ class TestEnableDisable:
         ]
         assert "enable" not in verbs
 
+    def test_bundle_unknown_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_enable(jobs=[], bundle="ghost")
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_disable(jobs=[], bundle="ghost")
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_trigger(
+                jobs=[], wait=False, trigger_timeout=None, bundle="ghost"
+            )
+
+    def test_bundle_or_jobs_required(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="specify job names"):
+            crony.do_enable(jobs=[], bundle=None)
+        with pytest.raises(crony.UsageError, match="specify job names"):
+            crony.do_disable(jobs=[], bundle=None)
+        with pytest.raises(crony.UsageError, match="specify job names"):
+            crony.do_trigger(
+                jobs=[], wait=False, trigger_timeout=None, bundle=None
+            )
+
+    def test_enable_bulk_skips_unscheduled_in_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Bundle has one scheduled job and one schedule-less group
+        # member. `enable -b foo` enables the scheduled one and
+        # silently skips the unscheduled one rather than aborting.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true", "schedule": "*-*-* 03:00"},
+                },
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 04:00"}},
+            },
+            default_target_jobs=["b", "g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "b")
+        crony.apply_one(cfg, "g")
+        h.calls.clear()
+        crony.do_enable(jobs=[], bundle="default")
+        # Only b and g (scheduled) get enable invocations.
+        timers = [
+            c[-1]
+            for c in h.calls
+            if c and c[0] == "systemctl" and "enable" in c
+        ]
+        assert f"crony-{h.full('b')}.timer" in timers
+        assert f"crony-{h.full('g')}.timer" in timers
+        assert f"crony-{h.full('a')}.timer" not in timers
+
+    def test_trigger_bulk_includes_unscheduled_in_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Trigger fires every stamped entry, including schedule-less
+        # ones (their dormant units kickstart fine).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 04:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        h.calls.clear()
+        crony.do_trigger(
+            jobs=[], wait=False, trigger_timeout=None, bundle="default"
+        )
+        labels = [
+            c[-1]
+            for c in h.calls
+            if c and c[0] == "launchctl" and c[1] == "kickstart"
+        ]
+        assert any(h.full("a") in lbl for lbl in labels)
+        assert any(h.full("g") in lbl for lbl in labels)
+
 
 class TestStatusReport:
     def test_prints_table(
@@ -3877,7 +4106,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         out = capsys.readouterr().out
         assert "JOB" in out
         assert "CONFIG" in out
@@ -3895,7 +4124,7 @@ class TestStatusReport:
         (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         out = capsys.readouterr().out
         assert "ghost" in out
         assert "orphan" in out
@@ -3918,7 +4147,7 @@ class TestStatusReport:
         shutil.rmtree(h.state)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "orphan" in out
@@ -3933,7 +4162,9 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last,last-ran", show_masked=False)
+        crony.do_status(
+            jobs=[], cols="job,last,last-ran", show_masked=False, bundle=None
+        )
         out = capsys.readouterr().out
         header = out.splitlines()[0]
         assert "JOB" in header
@@ -3949,7 +4180,9 @@ class TestStatusReport:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown status column"):
-            crony.do_status(jobs=[], cols="job,bogus", show_masked=False)
+            crony.do_status(
+                jobs=[], cols="job,bogus", show_masked=False, bundle=None
+            )
 
     def test_last_ran_column_shows_relative_time(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3977,7 +4210,9 @@ class TestStatusReport:
             encoding="utf-8",
         )
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last-ran", show_masked=False)
+        crony.do_status(
+            jobs=[], cols="job,last-ran", show_masked=False, bundle=None
+        )
         out = capsys.readouterr().out
         # Allow a small wallclock drift between writing the file and
         # the status read -- it should still land in the 4-6m range.
@@ -3995,7 +4230,9 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last-ran", show_masked=False)
+        crony.do_status(
+            jobs=[], cols="job,last-ran", show_masked=False, bundle=None
+        )
         out = capsys.readouterr().out
         assert "never" in out
 
@@ -4020,7 +4257,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, long_name)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
         # The header's CONFIG label and every row's state token
         # (synced / missing / orphan / etc.) should start at the
@@ -4053,10 +4290,10 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         out = capsys.readouterr().out
         assert h.full("j") not in out
-        crony.do_status(jobs=[], cols=None, show_masked=True)
+        crony.do_status(jobs=[], cols=None, show_masked=True, bundle=None)
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "masked" in out
@@ -4091,7 +4328,9 @@ class TestStatusReport:
             },
             default_target_jobs=["host_only", "plat_only", "both"],
         )
-        crony.do_status(jobs=[], cols="default,masked-by", show_masked=True)
+        crony.do_status(
+            jobs=[], cols="default,masked-by", show_masked=True, bundle=None
+        )
         out = capsys.readouterr().out
         assert "MASKED BY" in out
         lines = out.splitlines()
@@ -4122,7 +4361,7 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        crony.do_status(jobs=[], cols=None, show_masked=True)
+        crony.do_status(jobs=[], cols=None, show_masked=True, bundle=None)
         out = capsys.readouterr().out
         assert "MASKED BY" not in out
         # The masked row still surfaces -- only the reason column
@@ -4139,7 +4378,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="all", show_masked=False)
+        crony.do_status(jobs=[], cols="all", show_masked=False, bundle=None)
         header = capsys.readouterr().out.splitlines()[0]
         assert "JOB" in header
         assert "CONFIG" in header
@@ -4158,9 +4397,9 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         baseline = capsys.readouterr().out
-        crony.do_status(jobs=[], cols="default", show_masked=False)
+        crony.do_status(jobs=[], cols="default", show_masked=False, bundle=None)
         aliased = capsys.readouterr().out
         assert baseline == aliased
 
@@ -4176,13 +4415,52 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="default,masked-by", show_masked=False)
+        crony.do_status(
+            jobs=[], cols="default,masked-by", show_masked=False, bundle=None
+        )
         header = capsys.readouterr().out.splitlines()[0]
         # JOB first, MASKED BY last; default columns preserved in
         # between.
         labels = ["JOB", "CONFIG", "SCHED", "LAST", "LAST RAN", "MASKED BY"]
         positions = [header.index(label) for label in labels]
         assert positions == sorted(positions)
+
+    def test_bundle_unknown_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="unknown bundle"):
+            crony.do_status(
+                jobs=[], cols=None, show_masked=False, bundle="ghost"
+            )
+
+    def test_bundle_scopes_table(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Two bundles, both selected. `status -b borgadm` prints
+        # only borgadm.k -- default.j is out of scope.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle="borgadm")
+        out = capsys.readouterr().out
+        assert "borgadm.k" in out
+        assert "default.j" not in out
 
 
 # =============================================================================
@@ -5653,7 +5931,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.do_apply(jobs=[], verbose=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         snap_path = h.state / h.full("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
@@ -5675,7 +5953,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.do_apply(jobs=[h.full("g")], verbose=False)
+        crony.do_apply(jobs=[h.full("g")], verbose=False, bundle=None)
         snap_after = _cast_dict(snap_path.read_text())
         assert snap_after["group_budget_sec"] == 210
 
@@ -5740,16 +6018,16 @@ class TestLifecycleSmoke:
         )
         crony.do_validate(bundle=None)
         # apply -> renders + activates
-        crony.do_apply(jobs=[], verbose=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # status -> prints the synced/enabled tuple (sched stub)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
         capsys.readouterr()  # drop earlier output
-        crony.do_status(jobs=[], cols=None, show_masked=False)
+        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset
-        crony.do_destroy(jobs=[], purge_state=False)
+        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
