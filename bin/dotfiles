@@ -304,10 +304,50 @@ VCS_DIRS = {".git", ".hg"}
 # Ignore file names to load patterns from
 IGNORE_FILES = {".gitignore", ".hgignore"}
 
+# Editor / swap / autosave patterns always excluded, even when no
+# .gitignore is reachable. Matched as fnmatch globs against filename
+# and path components.
+HARDCODED_IGNORE_PATTERNS: frozenset[str] = frozenset(
+    {
+        "*~",
+        "*.swp",
+        "*.swo",
+        ".*.swp",
+        "#*#",
+    }
+)
+
+
+def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
+    """Return dotfile_dir plus ancestors up to (and including) $HOME.
+
+    If dotfile_dir is not inside $HOME, only dotfile_dir itself is
+    returned -- the walk only makes sense within the user's home tree.
+    """
+    abs_dir = dotfile_dir.resolve()
+    dirs = [abs_dir]
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return dirs
+    if abs_dir == home:
+        return dirs
+    if home not in abs_dir.parents:
+        return dirs
+    for parent in abs_dir.parents:
+        dirs.append(parent)
+        if parent == home:
+            break
+    return dirs
+
 
 def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     """
     Load ignore patterns from .gitignore and .hgignore files.
+
+    Patterns are collected from dotfile_dir and each ancestor directory
+    up to and including $HOME, plus a hardcoded set of editor / swap /
+    autosave file patterns that always apply.
 
     Patterns are simple glob patterns (supports *, ?, []).
     Lines starting with # are comments.
@@ -317,25 +357,31 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     Returns:
         Set of glob patterns to ignore.
     """
-    patterns: Set[str] = set()
+    patterns: Set[str] = set(HARDCODED_IGNORE_PATTERNS)
 
-    for ignore_file in IGNORE_FILES:
-        ignore_path = dotfile_dir / ignore_file
-        if ignore_path.exists() and ignore_path.is_file():
+    for directory in _ignore_search_dirs(dotfile_dir):
+        for ignore_file in IGNORE_FILES:
+            ignore_path = directory / ignore_file
+            if not (ignore_path.exists() and ignore_path.is_file()):
+                continue
             try:
                 content = ignore_path.read_text(encoding="utf-8")
-                for line in content.splitlines():
-                    line = line.strip()
-                    # Skip empty lines and comments
-                    if not line or line.startswith("#"):
-                        continue
-                    # Skip negation patterns (not supported)
-                    if line.startswith("!"):
-                        continue
-                    patterns.add(line)
             except OSError:
-                # If we can't read the file, skip it
-                pass
+                continue
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("!"):
+                    continue
+                # gitignore patterns use '\X' to escape a literal X
+                # anywhere in the pattern (git's wildmatch). fnmatch
+                # treats '\' as a literal character with no escape
+                # semantics, so unescape '\#' and '\!' before adding --
+                # otherwise a real-world pattern like '\#*\#' (matching
+                # emacs autosave files) would never fire.
+                pattern = line.replace(r"\#", "#").replace(r"\!", "!")
+                patterns.add(pattern)
 
     return patterns
 
@@ -393,7 +439,9 @@ def discover_dotfiles(
     Common rules:
     - Skip version control directories (.git, .hg).
     - Skip root-level dotfiles (files starting with '.' in the source root).
-    - Skip files matching patterns in .gitignore or .hgignore.
+    - Skip files matching patterns in .gitignore / .hgignore from
+      dotfile_dir and each ancestor up to $HOME, plus a hardcoded set
+      of editor / swap / autosave patterns.
 
     With profile.flat=True, only top-level entries are considered;
     subdirectories are not descended into.

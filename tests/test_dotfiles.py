@@ -393,7 +393,6 @@ class TestLoadIgnorePatterns:
         assert "*~" in patterns
         assert "# Comment" not in patterns
         assert "" not in patterns
-        assert len(patterns) == 1
 
     def test_skip_negation_patterns(self, tmp_path: Path) -> None:
         """Test that negation patterns are skipped."""
@@ -406,14 +405,89 @@ class TestLoadIgnorePatterns:
         assert "*~" in patterns
         assert "!important~" not in patterns
 
-    def test_no_ignore_files(self, tmp_path: Path) -> None:
-        """Test returns empty set when no ignore files exist."""
+    def test_no_ignore_files_returns_hardcoded(self, tmp_path: Path) -> None:
+        """With no ignore files, only the hardcoded fallback applies."""
         dotfile_dir = tmp_path / "dotfiles"
         dotfile_dir.mkdir()
 
         patterns = df.load_ignore_patterns(dotfile_dir)
 
-        assert patterns == set()
+        assert patterns == df.HARDCODED_IGNORE_PATTERNS
+
+    def test_hardcoded_patterns_always_present(self, tmp_path: Path) -> None:
+        """Hardcoded editor / swap patterns are always included."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".gitignore").write_text("custom.bak\n")
+
+        patterns = df.load_ignore_patterns(dotfile_dir)
+
+        for hardcoded in {"*~", "*.swp", "*.swo", ".*.swp", "#*#"}:
+            assert hardcoded in patterns
+        assert "custom.bak" in patterns
+
+    def test_walks_ancestors_up_to_home(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Patterns are collected from ancestors up to and including $HOME."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "utils"
+        bin_dir = repo / "bin"
+        bin_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (fake_home / ".gitignore").write_text("home_pattern\n")
+        (repo / ".gitignore").write_text("repo_pattern\n")
+
+        patterns = df.load_ignore_patterns(bin_dir)
+
+        assert "home_pattern" in patterns
+        assert "repo_pattern" in patterns
+
+    def test_does_not_walk_above_home(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Patterns above $HOME are not collected."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "utils"
+        repo.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (tmp_path / ".gitignore").write_text("above_home\n")
+
+        patterns = df.load_ignore_patterns(repo)
+
+        assert "above_home" not in patterns
+
+    def test_unescapes_gitignore_hash_escape(self, tmp_path: Path) -> None:
+        """Gitignore '\\#' / '\\!' escapes are translated for fnmatch."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".gitignore").write_text("\\#*\\#\n\\!literal\n")
+
+        patterns = df.load_ignore_patterns(dotfile_dir)
+
+        assert "#*#" in patterns
+        assert "!literal" in patterns
+        assert df.matches_ignore_pattern(Path("#main.c#"), patterns) is True
+
+    def test_outside_home_does_not_walk(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """When dotfile_dir is outside $HOME, only dotfile_dir is checked."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (tmp_path / ".gitignore").write_text("ancestor_pattern\n")
+        (outside / ".gitignore").write_text("local_pattern\n")
+
+        patterns = df.load_ignore_patterns(outside)
+
+        assert "local_pattern" in patterns
+        assert "ancestor_pattern" not in patterns
 
 
 class TestMatchesIgnorePattern:
