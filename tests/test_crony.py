@@ -1014,16 +1014,30 @@ class TestResolution:
             "ntfy",
         ]
 
-    def test_timeout_cascade(self) -> None:
+    def test_timeout_cascade_job_overrides_defaults(self) -> None:
         cfg = crony.parse_config(
             {
                 "defaults": {"job_timeout_sec": 100},
                 "job": {"a": _job(job_timeout_sec=200)},
-                "target": {"darwin": {"jobs": ["a"], "job_timeout_sec": 300}},
+                "target": {"darwin": {"jobs": ["a"]}},
             }
         )
         target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 300
+        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 200
+
+    def test_target_rejects_job_timeout_sec(self) -> None:
+        # Targets deliberately have no timeout knob: timeouts are a
+        # per-leaf-job concern. An attempt to set one in the target
+        # block must surface as a config error, not silently no-op.
+        with pytest.raises(crony.ConfigError, match="unknown key"):
+            crony.parse_config(
+                {
+                    "job": {"a": _job()},
+                    "target": {
+                        "darwin": {"jobs": ["a"], "job_timeout_sec": 300}
+                    },
+                }
+            )
 
     def test_timeout_default_fallback(self) -> None:
         cfg = crony.parse_config(
@@ -3156,11 +3170,12 @@ class TestApplyFullSync:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A masked entry is "reached via target" but excluded by
-        # the host's filters; apply must reject it (refusing to
-        # install a unit the host's selection would have skipped),
-        # not silently install it.  Regression guard for
-        # `_selected_full_names_per_bundle`'s `by_full` key set
-        # being narrower than the masked-aware variant.
+        # the host's filters; apply must reject it rather than
+        # install a unit the host's selection would have skipped.
+        # `_selected_full_names_per_bundle`'s `by_full` keyset is
+        # the gate `do_apply` consults to distinguish "known to
+        # this host" from "elsewhere"; the test pins that the
+        # gate honors the masked-vs-selected distinction.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         monkeypatch.setattr(crony, "current_host", lambda: "h")
         h.config(
@@ -3252,6 +3267,36 @@ class TestDestroy:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown"):
             crony.do_destroy(jobs=["ghost"], purge_state=False)
+
+    def test_destroy_refuses_with_run_in_progress_message(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A run-lock that's held when destroy runs must surface the
+        # "run in progress; will not destroy" message and the
+        # LOCK_BUSY exit class -- not a generic SubprocessError
+        # whose user-visible string is "Command 'destroy X' returned
+        # non-zero exit status 1."
+        import fcntl as _fcntl
+
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        sd = h.state / h.full("j")
+        sd.mkdir(parents=True, exist_ok=True)
+        lock_path = sd / "run.lock"
+        held = open(lock_path, "w")
+        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            with pytest.raises(crony.LockBusyError) as exc:
+                crony.do_destroy(jobs=["j"], purge_state=False)
+            assert "run in progress; will not destroy" in str(exc.value)
+            assert exc.value.exit_code == crony.ExitCode.LOCK_BUSY
+        finally:
+            _fcntl.flock(held, _fcntl.LOCK_UN)
+            held.close()
 
     def test_destroy_finds_units_with_no_state(
         self, tmp_path: Path, monkeypatch: Any
@@ -3791,6 +3836,35 @@ class TestEnableDisable:
         assert "daemon-reload" in verbs
         assert "enable" not in verbs
 
+    def test_apply_after_state_wipe_preserves_disabled_unit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # State-dir wipe + surviving platform unit + scheduler
+        # reporting `disabled`: re-apply must consult the live
+        # scheduler state, not the absent hash, to decide whether
+        # to preserve the disable. The unit can outlive its hash,
+        # so the disable signal lives only in the scheduler view.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        # Wipe state; the timer file under sysd survives.
+        shutil.rmtree(h.state)
+        timer = h.sysd / f"crony-{h.full('j')}.timer"
+        assert timer.exists()
+        # Scheduler reports the unit as disabled (user disabled it
+        # by hand before the state wipe).
+        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
+        h.calls.clear()
+        crony.apply_one(cfg, "j")
+        verbs = [
+            next((a for a in c[1:] if not a.startswith("-")), "")
+            for c in h.calls
+        ]
+        assert "enable" not in verbs
+
 
 class TestStatusReport:
     def test_prints_table(
@@ -4218,6 +4292,97 @@ class TestValidate:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown bundle"):
             crony.do_validate(bundle="ghost")
+
+
+class TestResolveStateAxes:
+    """Direct unit tests for `_resolve_state_axes`. `do_status` and
+    `do_audit` consume the same triple from this helper; pinning
+    each branch keeps the two views from drifting on a future edit.
+    """
+
+    def test_orphan_when_stamp_present_without_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        # Stamped on disk but not in any bundle -> orphan; no
+        # entry to consult so sched falls through to _sched_state
+        # (stubbed to "enabled" to surface the branch).
+        ghost = h.full("ghost")
+        (h.state / ghost).mkdir(parents=True)
+        (h.state / ghost / "hash").write_text("legacy\n")
+        h.config({}, default_target_jobs=[])
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        bundles = crony.load_all_bundles()
+        cfg, sched, last = crony._resolve_state_axes(
+            bundles, ghost, "darwin", crony.stamped_names()
+        )
+        assert cfg == "orphan"
+        assert sched == "enabled"
+        assert last == "never"
+
+    def test_missing_short_circuits_sched_to_unknown(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # No stamp, no bundle entry -> missing; sched short-
+        # circuits to "unknown" without consulting _sched_state.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        called: list[str] = []
+
+        def _stub_sched(n: str, p: str) -> str:
+            called.append(n)
+            return "enabled"
+
+        monkeypatch.setattr(crony, "_sched_state", _stub_sched)
+        bundles = crony.load_all_bundles()
+        cfg, sched, last = crony._resolve_state_axes(
+            bundles, h.full("ghost"), "darwin", set()
+        )
+        assert cfg == "missing"
+        assert sched == "unknown"
+        assert last == "never"
+        assert not called  # short-circuit honored
+
+    def test_grouped_when_entry_has_no_schedule_or_interval(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Group-only job (no schedule / interval, fires only via
+        # parent group) -> sched = "grouped" without consulting
+        # _sched_state.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        bundles = crony.load_all_bundles()
+        _, sched, _ = crony._resolve_state_axes(
+            bundles, h.full("a"), "darwin", crony.stamped_names()
+        )
+        assert sched == "grouped"
+
+    def test_leaf_with_schedule_consults_sched_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Scheduled leaf -> sched read from _sched_state.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "disabled")
+        bundles = crony.load_all_bundles()
+        cfg_state, sched, _ = crony._resolve_state_axes(
+            bundles, h.full("j"), "darwin", crony.stamped_names()
+        )
+        assert cfg_state == "synced"
+        assert sched == "disabled"
 
 
 class TestAudit:
@@ -4713,6 +4878,32 @@ class TestGroupExitClassRollup:
             == "timeout"
         )
 
+    def test_gated_does_not_mask_fail(self) -> None:
+        # gated ties with ok at the bottom; a fail child must
+        # still surface, not be masked by sibling gating.
+        assert (
+            crony._rollup_group_exit_class(self._children("gated", "fail"))
+            == "fail"
+        )
+        assert (
+            crony._rollup_group_exit_class(self._children("fail", "gated"))
+            == "fail"
+        )
+
+    def test_signal_and_fail_are_equally_severe(self) -> None:
+        # signal and fail share severity 1; the first child of
+        # that tier wins, so the readout reflects the
+        # encountered-order outcome rather than swapping based on
+        # iteration. This pins the tie-break for either case.
+        assert (
+            crony._rollup_group_exit_class(self._children("signal", "fail"))
+            == "signal"
+        )
+        assert (
+            crony._rollup_group_exit_class(self._children("fail", "signal"))
+            == "fail"
+        )
+
 
 class TestLogHelpers:
     """Direct unit tests for `_extract_latest_log_entry` and
@@ -5080,12 +5271,12 @@ class TestTriggerUnitSync:
     def test_subsecond_run_is_recognized_as_fresh(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Regression: pre_trigger captured at microsecond precision
-        # but the runner's `_now_iso()` truncates to whole seconds.
-        # A run that completes within the same second as the trigger
-        # would have ended_at < pre_trigger after parse, and the
-        # waiter would loop until trigger_timeout. The fix: capture
-        # pre_trigger at the same precision as ended_at.
+        # `pre_trigger` and `ended_at` must compare at the same
+        # precision: the runner's `_now_iso()` truncates to whole
+        # seconds, so a run that completes within the same second
+        # as the trigger needs `pre_trigger` truncated too --
+        # otherwise the waiter sees `ended_at < pre_trigger` and
+        # spins until `trigger_timeout`.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.state / full
@@ -5111,15 +5302,13 @@ class TestTriggerUnitSync:
     def test_long_run_past_trigger_timeout_still_returns(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Regression: trigger_timeout is the "did the platform
-        # respond?" detector, not a completion deadline. A runner
-        # that takes longer than trigger_timeout to finish must
-        # still be observable -- once we've seen its pid file we
-        # switch to job_timeout-bounded waiting and let the run
-        # complete. Previously the loop's blanket trigger_timeout
-        # would fire even when the runner was actively running,
-        # causing groups to record children as `timeout` even
-        # after the children's own runners completed `ok`.
+        # `trigger_timeout` is the "did the platform respond?"
+        # detector, not a completion deadline. Once the runner's
+        # pid file appears, the waiter must switch to
+        # `job_timeout`-bounded watching so a long but
+        # well-behaved run completes normally; otherwise a job
+        # whose execution exceeds `trigger_timeout` would record
+        # as `timeout` even after a clean `ok` exit.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.state / full
@@ -5310,14 +5499,12 @@ class TestSnapshotLifecycle:
     def test_hash_stable_across_os_environ_changes(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Regression: previously the snapshot pinned `_runtime_env`
-        # output, which mixed in os.environ values like SSH_AUTH_SOCK
-        # and PATH. A second apply (or a status check) from a shell
-        # with a different SSH_AUTH_SOCK would compute a different
-        # hash and report the entry as stale. Now snapshot.env stores
-        # only the user-written dict, and the runner does the env
-        # merge at fire time -- changing the inherited env between
-        # apply and status doesn't perturb the hash.
+        # The snapshot must pin only the user-written `env` dict,
+        # not the merged runtime env: variables inherited from
+        # the apply shell (SSH_AUTH_SOCK, transient session
+        # state, etc.) would otherwise enter the hash, and a
+        # subsequent apply / status from a different shell would
+        # report the entry as stale despite no config change.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},

@@ -66,7 +66,7 @@ and notifications behave the same on both platforms), and reports
 state via a 3-tuple status:
   CONFIG  synced  | stale    | missing | orphan  | masked
   SCHED   enabled | disabled | grouped | unknown
-  LAST    ok      | fail     | timeout | gated   | running | never
+  LAST    ok      | fail     | timeout | gated   | running | never | unknown
 
 `masked` only appears with `crony status -a/--all`; it marks an
 entry the target reaches but whose `platforms` / `hosts` filters
@@ -543,11 +543,12 @@ class JobGroup:
     / defaults cascade. To apply a notify channel to all members of
     a group, set it at the target level (typical case) or per-job.
 
-    Groups also don't carry `job_timeout_sec` -- their effective
-    timeout is auto-computed from `resolved_group_timeout_sec`
-    (1.05 * sum of children's effective timeouts), which always
-    reflects the current leaf-level timeouts and gives child
-    runners slack to time themselves out before the group's own
+    Groups also don't carry `job_timeout_sec` -- timeouts are a
+    per-leaf-job concern. A group's effective deadline is
+    auto-computed from its children (`resolved_group_timeout_sec`,
+    1.05 * sum of children's effective timeouts) and is not a
+    user-facing knob: it acts as defense-in-depth so each child
+    can hit its own per-job timeout before the parent's
     cumulative deadline fires.
 
     `platforms` / `hosts` work the same way as on Job: empty
@@ -569,6 +570,14 @@ class Target:
     """Per-platform or per-host selection of jobs/groups + cascading settings.
 
     `kind` is "platform" (e.g. darwin/linux) or "host" (a specific host).
+
+    A target deliberately carries no timeout knob: timeouts are a
+    per-leaf-job concern (`Job.job_timeout_sec` cascading to
+    `Defaults.job_timeout_sec`) because a target / group is a
+    selection-or-sequencing concept, not an executor. Effective
+    deadlines for groups are auto-computed from their children
+    (`resolved_group_timeout_sec`) as defense-in-depth, not as a
+    user-tunable surface.
     """
 
     name: str
@@ -576,7 +585,6 @@ class Target:
     jobs: list[str] = field(default_factory=list)
     # None = inherit from job/defaults; [] = explicit empty.
     notify_channels: list[str] | None = None
-    job_timeout_sec: int | None = None
 
 
 @dataclass
@@ -862,7 +870,6 @@ _KNOWN_TARGET: frozenset[str] = frozenset(
     {
         "jobs",
         "notify_channels",
-        "job_timeout_sec",
     }
 )
 
@@ -900,11 +907,12 @@ _KNOWN_TRANSPORT_NTFY: frozenset[str] = frozenset(
     }
 )
 
-# Built-in transport names. Channel names that match these are
-# treated as their own transport when `transport=` is omitted (the
-# pre-arbitrary-naming shortcut: [defaults.notify.email] -> ntfy
-# transport with channel name "email"). Channels named anything
-# else must declare `transport=` explicitly.
+# Built-in transport names. A channel whose name matches one of
+# these may omit `transport=` -- the shorthand
+# `[defaults.notify.email]` is equivalent to
+# `[defaults.notify.email] transport = "email"`. A channel named
+# anything else must declare `transport=` explicitly so the
+# parser knows which schema to validate the block against.
 _VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
     {
         "email",
@@ -1018,6 +1026,19 @@ def parse_full_name(arg: str) -> tuple[str, str]:
     if not bundle or not short:
         raise UsageError(f"invalid job reference: {arg!r}")
     return (bundle, short)
+
+
+def normalize_full_name(arg: str) -> str:
+    """CLI input -> canonical `<bundle>.<short>` form.
+
+    Convenience wrapper over `parse_full_name`: bare 'foo'
+    becomes 'default.foo', already-namespaced inputs round-trip.
+    Used at the entry point of every CLI handler that takes
+    user-supplied job references so downstream code can rely on
+    one normalized form.
+    """
+    bundle, short = parse_full_name(arg)
+    return f"{bundle}.{short}"
 
 
 def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
@@ -1354,15 +1375,11 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
     _reject_unknown_keys(raw, _KNOWN_TARGET, where)
     jobs = _string_list(raw, "jobs", where)
     channels = _parse_notify_channels(raw, where, required=False)
-    job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
-    if job_timeout_sec is not None and job_timeout_sec <= 0:
-        raise ConfigError(f"{where}: job_timeout_sec must be positive")
     return Target(
         name=name,
         kind=kind,
         jobs=jobs,
         notify_channels=channels,
-        job_timeout_sec=job_timeout_sec,
     )
 
 
@@ -1560,10 +1577,12 @@ def load_all_bundles() -> Bundles:
 
 
 def load_config(path: Path | None = None) -> Config:
-    """Load a single config file as a `Config`. Used by tests and
-    callers that want the legacy single-bundle shape.
+    """Load a single config file as a `Config` (single-bundle view).
 
-    Most production code should use `load_all_bundles()` instead.
+    Suited to tests and any caller that has one specific config
+    path in hand and wants the parsed `Config` for that file
+    alone. Production code paths walk every bundle and should use
+    `load_all_bundles()` instead.
     """
     if path is None:
         path = CONFIG_FILE
@@ -1794,9 +1813,15 @@ def resolved_notify_channels(
 def resolved_job_timeout_sec(
     config: Config, target: Target | None, job: Job
 ) -> int:
-    """Cascade job_timeout_sec: target > job > defaults."""
-    if target is not None and target.job_timeout_sec is not None:
-        return target.job_timeout_sec
+    """Cascade job_timeout_sec: job > defaults.
+
+    `target` is accepted for signature symmetry with
+    `resolved_notify_channels` (and to keep callers unaware of the
+    cascade shape) but does not contribute -- targets and groups
+    intentionally have no user-tunable timeout knob; see the
+    `Target` and `JobGroup` docstrings for the rationale.
+    """
+    del target
     if job.job_timeout_sec is not None:
         return job.job_timeout_sec
     return config.defaults.job_timeout_sec
@@ -2071,8 +2096,10 @@ class GroupChildResult:
 class GroupRunResult:
     """Recorded as last-run.json for each completed group run.
 
-    `exit_class` is a rollup from `jobs_run`: timeout > fail >
-    signal > gated > ok. The status / audit / list readers
+    `exit_class` is a rollup from `jobs_run`: timeout outranks
+    fail / signal (which are equally severe), and ok / gated tie
+    at the bottom (gating is "intentionally not run", not a
+    group-level outcome). The status / audit / list readers
     consult this single field for the group's LAST axis instead
     of re-deriving the rollup on every query.
     """
@@ -3618,13 +3645,12 @@ def apply_one(
         return "added" if old_hash is None else "updated"
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
-    # unit stays disabled across the re-load. _sched_state returns
-    # "unknown" for a not-yet-installed unit (no platform record
-    # to query); we treat unknown as "not previously disabled" so
-    # a fresh install lands enabled.
-    prior_disabled = (
-        old_hash is not None and _sched_state(full_name, platform) == "disabled"
-    )
+    # unit stays disabled across the re-load. The scheduler view
+    # is the source of truth here (the platform unit can outlive
+    # the state-dir hash); _sched_state returns "unknown" for a
+    # not-yet-installed unit, so only an explicit "disabled"
+    # answer counts and a fresh install still lands enabled.
+    prior_disabled = _sched_state(full_name, platform) == "disabled"
     units = _render_units(full_name, schedule, interval, platform)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -4081,7 +4107,7 @@ def _disable_unit(name: str, platform: str) -> None:
                 "--now",
                 _systemd_unit_name(name),
             ],
-            stderr=subprocess.DEVNULL,
+            check=True,
         )
         return
     label = _label_for(name)
@@ -4429,10 +4455,7 @@ def do_apply(jobs: list[str], verbose: bool) -> None:
 
     if jobs:
         # Normalize each CLI input to its full namespaced form.
-        normalized: list[str] = []
-        for arg in jobs:
-            bn, short = parse_full_name(arg)
-            normalized.append(f"{bn}.{short}")
+        normalized = [normalize_full_name(arg) for arg in jobs]
         unknown = [n for n in normalized if n not in by_full]
         if unknown:
             raise UsageError(
@@ -4497,10 +4520,7 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
         # destroyed even after the bundle is gone).
         defined = set(by_full.keys()) | bundles.all_full_names()
         known = defined | stamped_names()
-        normalized: list[str] = []
-        for arg in jobs:
-            bn, short = parse_full_name(arg)
-            normalized.append(f"{bn}.{short}")
+        normalized = [normalize_full_name(arg) for arg in jobs]
         unknown = [n for n in normalized if n not in known]
         if unknown:
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
@@ -4517,7 +4537,7 @@ def do_destroy(jobs: list[str], purge_state: bool) -> None:
                 with _acquire_lock(lock_path):
                     pass
             except LockBusyError:
-                raise SubprocessError(1, ["destroy", full]) from LockBusyError(
+                raise LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 )
         destroy_one(full, purge_state=purge_state)
@@ -4558,9 +4578,7 @@ def do_enable(jobs: list[str]) -> None:
     """
     bundles = load_all_bundles()
     stamped = stamped_names()
-    normalized = [
-        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
-    ]
+    normalized = [normalize_full_name(n) for n in jobs]
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4584,9 +4602,7 @@ def do_disable(jobs: list[str]) -> None:
     """
     bundles = load_all_bundles()
     stamped = stamped_names()
-    normalized = [
-        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
-    ]
+    normalized = [normalize_full_name(n) for n in jobs]
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4664,9 +4680,7 @@ def do_trigger(
         )
     bundles = load_all_bundles()
     stamped = stamped_names()
-    normalized = [
-        f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
-    ]
+    normalized = [normalize_full_name(n) for n in jobs]
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
         raise UsageError(
@@ -4781,6 +4795,42 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     return ["job"] + cols
 
 
+def _resolve_state_axes(
+    bundles: Bundles, full: str, platform: str, stamped: set[str]
+) -> tuple[str, str, str]:
+    """Compute the (cfg, sched, last) status axes for one full name.
+
+    `do_status` and `do_audit` share this pipeline so a future
+    change to any axis stays consistent across the two views.
+    Returns the values straight from the underlying state readers
+    -- no opinion about whether a given combination is "bad" --
+    so each caller applies its own filtering / display logic on
+    top.
+    """
+    bn, short = parse_full_name(full)
+    bundle = bundles.by_name(bn)
+    if bundle is None:
+        cfg_state = "orphan" if full in stamped else "missing"
+        entry: Job | JobGroup | None = None
+    else:
+        cfg_state = _config_state_for(bundle.config, short, full, platform)
+        entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
+            short
+        )
+    if cfg_state == "missing":
+        sched_state = "unknown"
+    else:
+        schedule, interval = (
+            _entity_schedule(entry) if entry is not None else (None, None)
+        )
+        if entry is not None and schedule is None and interval is None:
+            sched_state = "grouped"
+        else:
+            sched_state = _sched_state(full, platform)
+    last_state = _last_run_state(full)
+    return cfg_state, sched_state, last_state
+
+
 def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
     """Print the resolved state per job in a tabular view.
 
@@ -4823,9 +4873,7 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
 
     full_names: list[str]
     if jobs:
-        full_names = [
-            f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
-        ]
+        full_names = [normalize_full_name(n) for n in jobs]
     else:
         active = selected | stamped
         if show_masked:
@@ -4834,8 +4882,6 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
 
     rows: list[dict[str, str]] = []
     for full in full_names:
-        bn, short = parse_full_name(full)
-        bundle = bundles.by_name(bn)
         mask_reason = masked_by_full.get(full, "")
         if mask_reason and full not in selected and full not in stamped:
             # A masked entry that has nothing on disk: there is no
@@ -4854,30 +4900,15 @@ def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
                 }
             )
             continue
-        if bundle is None:
-            cfg_state = "orphan" if full in stamped else "missing"
-            entry = None
-        else:
-            cfg_state = _config_state_for(bundle.config, short, full, platform)
-            entry = bundle.config.jobs.get(
-                short
-            ) or bundle.config.job_groups.get(short)
-        if cfg_state == "missing":
-            sched = "unknown"
-        else:
-            schedule, interval = (
-                _entity_schedule(entry) if entry is not None else (None, None)
-            )
-            if entry is not None and schedule is None and interval is None:
-                sched = "grouped"
-            else:
-                sched = _sched_state(full, platform)
+        cfg_state, sched, last = _resolve_state_axes(
+            bundles, full, platform, stamped
+        )
         rows.append(
             {
                 "job": full,
                 "config": cfg_state,
                 "sched": sched,
-                "last": _last_run_state(full),
+                "last": last,
                 "last-ran": _last_ran_at(full),
                 "masked-by": mask_reason,
             }
@@ -4938,8 +4969,7 @@ def do_logs(
                 follow appended output (-f semantics) until
                 interrupted.
     """
-    bn, short = parse_full_name(name)
-    full = f"{bn}.{short}"
+    full = normalize_full_name(name)
     log_path = STATE_DIR / full / "run.log"
     if path:
         print(log_path)
@@ -5080,8 +5110,7 @@ def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
     code is surfaced via SystemExit so it propagates to launchd /
     systemd; cli() converts that into the process exit.
     """
-    bn, short = parse_full_name(name)
-    full_name = f"{bn}.{short}"
+    full_name = normalize_full_name(name)
     snap = _load_snapshot(full_name)
     if isinstance(snap, JobSnapshot):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
@@ -5101,8 +5130,8 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     they're about the whole-host picture, not any one bundle.
 
     Bad means CONFIG drift (stale/missing/orphan), the scheduler
-    being unable to fire (failed/unknown, plus disabled by default),
-    or a recent failed/timeout run. Names in output are full
+    being unable to fire (unknown, plus disabled by default), or
+    a recent failed/timeout run. Names in output are full
     namespaced (`<bundle>.<short>`).
     """
     bundles = load_all_bundles()
@@ -5120,33 +5149,16 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
         candidates = sorted(selected | stamped)
 
     bad_config = {"stale", "missing", "orphan"}
-    bad_sched = {"failed", "unknown"}
+    bad_sched = {"unknown"}
     if not exclude_disabled:
         bad_sched = bad_sched | {"disabled"}
     bad_last = {"fail", "timeout"}
 
     rows: list[tuple[str, str, str, str]] = []
     for full in candidates:
-        bn, short = parse_full_name(full)
-        b = bundles.by_name(bn)
-        if b is None:
-            cfg_state = "orphan" if full in stamped else "missing"
-            entry: Job | JobGroup | None = None
-        else:
-            cfg_state = _config_state_for(b.config, short, full, platform)
-            entry = b.config.jobs.get(short) or b.config.job_groups.get(short)
-        if cfg_state == "missing":
-            sched_state = "unknown"
-        else:
-            if entry is None:
-                sched_state = _sched_state(full, platform)
-            else:
-                schedule, interval = _entity_schedule(entry)
-                if schedule is None and interval is None:
-                    sched_state = "grouped"
-                else:
-                    sched_state = _sched_state(full, platform)
-        last_state = _last_run_state(full)
+        cfg_state, sched_state, last_state = _resolve_state_axes(
+            bundles, full, platform, stamped
+        )
         is_bad = (
             cfg_state in bad_config
             or sched_state in bad_sched
@@ -5909,8 +5921,6 @@ def cli() -> int:
         if isinstance(e.code, int):
             return e.code
         return ExitCode.SUCCESS if e.code is None else ExitCode.ERROR
-    except KeyError:
-        raise UsageError(f"Unknown command '{command}'")
     except CronyError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
