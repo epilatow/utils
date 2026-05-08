@@ -3152,6 +3152,33 @@ class TestApplyFullSync:
         messages = [r.getMessage() for r in caplog.records]
         assert not any("unchanged" in m for m in messages), messages
 
+    def test_masked_name_rejected_by_apply(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A masked entry is "reached via target" but excluded by
+        # the host's filters; apply must reject it (refusing to
+        # install a unit the host's selection would have skipped),
+        # not silently install it.  Regression guard for
+        # `_selected_full_names_per_bundle`'s `by_full` key set
+        # being narrower than the masked-aware variant.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "platforms": ["linux"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(crony.UsageError, match="unselected on this host"):
+            crony.do_apply(jobs=["j"], verbose=False)
+        assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+
     def test_unchanged_shown_with_verbose(
         self,
         tmp_path: Path,
@@ -3776,7 +3803,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None)
+        crony.do_status(jobs=[], cols=None, show_masked=False)
         out = capsys.readouterr().out
         assert "JOB" in out
         assert "CONFIG" in out
@@ -3794,7 +3821,7 @@ class TestStatusReport:
         (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None)
+        crony.do_status(jobs=[], cols=None, show_masked=False)
         out = capsys.readouterr().out
         assert "ghost" in out
         assert "orphan" in out
@@ -3817,7 +3844,7 @@ class TestStatusReport:
         shutil.rmtree(h.state)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None)
+        crony.do_status(jobs=[], cols=None, show_masked=False)
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "orphan" in out
@@ -3832,7 +3859,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last,last-ran")
+        crony.do_status(jobs=[], cols="job,last,last-ran", show_masked=False)
         out = capsys.readouterr().out
         header = out.splitlines()[0]
         assert "JOB" in header
@@ -3848,7 +3875,7 @@ class TestStatusReport:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown status column"):
-            crony.do_status(jobs=[], cols="job,bogus")
+            crony.do_status(jobs=[], cols="job,bogus", show_masked=False)
 
     def test_last_ran_column_shows_relative_time(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3876,7 +3903,7 @@ class TestStatusReport:
             encoding="utf-8",
         )
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last-ran")
+        crony.do_status(jobs=[], cols="job,last-ran", show_masked=False)
         out = capsys.readouterr().out
         # Allow a small wallclock drift between writing the file and
         # the status read -- it should still land in the 4-6m range.
@@ -3894,7 +3921,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="job,last-ran")
+        crony.do_status(jobs=[], cols="job,last-ran", show_masked=False)
         out = capsys.readouterr().out
         assert "never" in out
 
@@ -3919,7 +3946,7 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, long_name)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None)
+        crony.do_status(jobs=[], cols=None, show_masked=False)
         rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
         # The header's CONFIG label and every row's state token
         # (synced / missing / orphan / etc.) should start at the
@@ -3931,6 +3958,157 @@ class TestStatusReport:
             assert token in valid_states, (
                 f"row {r!r} not aligned: col {config_col} -> {token!r}"
             )
+
+    def test_all_flag_lists_platform_masked_jobs(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A linux-only job under a darwin target is reachable via
+        # the target but excluded by its own platforms filter; with
+        # --all it should surface as config=masked.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "platforms": ["linux"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_status(jobs=[], cols=None, show_masked=False)
+        out = capsys.readouterr().out
+        assert h.full("j") not in out
+        crony.do_status(jobs=[], cols=None, show_masked=True)
+        out = capsys.readouterr().out
+        assert h.full("j") in out
+        assert "masked" in out
+
+    def test_all_flag_with_masked_by_column_shows_reason(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Three jobs: host-only-other, platform-other, both-other.
+        # Each should report its masking axis in MASKED BY.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    "host_only": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    },
+                    "plat_only": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "platforms": ["linux"],
+                    },
+                    "both": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                        "platforms": ["linux"],
+                    },
+                }
+            },
+            default_target_jobs=["host_only", "plat_only", "both"],
+        )
+        crony.do_status(jobs=[], cols="default,masked-by", show_masked=True)
+        out = capsys.readouterr().out
+        assert "MASKED BY" in out
+        lines = out.splitlines()
+        by_name = {
+            line.split()[0]: line for line in lines if line and " " in line
+        }
+        host_row = by_name[h.full("host_only")]
+        plat_row = by_name[h.full("plat_only")]
+        both_row = by_name[h.full("both")]
+        assert host_row.split()[-1] == "host"
+        assert plat_row.split()[-1] == "platform"
+        assert both_row.split()[-1] == "host,platform"
+
+    def test_masked_by_column_hidden_by_default(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "platforms": ["linux"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_status(jobs=[], cols=None, show_masked=True)
+        out = capsys.readouterr().out
+        assert "MASKED BY" not in out
+        # The masked row still surfaces -- only the reason column
+        # is hidden in the default column set.
+        assert "masked" in out
+
+    def test_cols_all_alias_expands_to_every_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols="all", show_masked=False)
+        header = capsys.readouterr().out.splitlines()[0]
+        assert "JOB" in header
+        assert "CONFIG" in header
+        assert "SCHED" in header
+        assert "LAST" in header
+        assert "LAST RAN" in header
+        assert "MASKED BY" in header
+
+    def test_cols_default_alias_matches_no_cols(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols=None, show_masked=False)
+        baseline = capsys.readouterr().out
+        crony.do_status(jobs=[], cols="default", show_masked=False)
+        aliased = capsys.readouterr().out
+        assert baseline == aliased
+
+    def test_cols_default_combined_with_extra_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `default,masked-by` keeps the default columns and appends
+        # the extra one (deduped, with `job` first).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        crony.do_status(jobs=[], cols="default,masked-by", show_masked=False)
+        header = capsys.readouterr().out.splitlines()[0]
+        # JOB first, MASKED BY last; default columns preserved in
+        # between.
+        labels = ["JOB", "CONFIG", "SCHED", "LAST", "LAST RAN", "MASKED BY"]
+        positions = [header.index(label) for label in labels]
+        assert positions == sorted(positions)
 
 
 # =============================================================================
@@ -5380,7 +5558,7 @@ class TestLifecycleSmoke:
         # status -> prints the synced/enabled tuple (sched stub)
         monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
         capsys.readouterr()  # drop earlier output
-        crony.do_status(jobs=[], cols=None)
+        crony.do_status(jobs=[], cols=None, show_masked=False)
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset

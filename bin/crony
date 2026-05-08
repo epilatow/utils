@@ -64,9 +64,13 @@ more TOML config bundles and applies the corresponding platform
 units, runs jobs through a uniform shim (so logs, locks, gates,
 and notifications behave the same on both platforms), and reports
 state via a 3-tuple status:
-  CONFIG  synced  | stale    | missing | orphan
+  CONFIG  synced  | stale    | missing | orphan  | masked
   SCHED   enabled | disabled | grouped | unknown
   LAST    ok      | fail     | timeout | gated   | running | never
+
+`masked` only appears with `crony status -a/--all`; it marks an
+entry the target reaches but whose `platforms` / `hosts` filters
+exclude it on this host.
 
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
@@ -1645,6 +1649,32 @@ def resolve_target(config: Config, host: str, platform: str) -> Target | None:
     return None
 
 
+def _mask_reason(
+    platforms: list[str],
+    hosts: list[str],
+    *,
+    host: str,
+    platform: str,
+) -> str | None:
+    """Return the axis (or axes) that mask this entry, or None.
+
+    Empty list = "applies everywhere" (the common case). A
+    non-empty list with no match on its axis contributes that
+    axis name to the reason. Both axes can mask simultaneously
+    (`"host,platform"`); a single-axis mask returns
+    `"platform"` or `"host"`. None means the entry applies on
+    this (host, platform).
+    """
+    parts: list[str] = []
+    if hosts and host not in hosts:
+        parts.append("host")
+    if platforms and platform not in platforms:
+        parts.append("platform")
+    if not parts:
+        return None
+    return ",".join(parts)
+
+
 def _entry_applies_here(
     platforms: list[str],
     hosts: list[str],
@@ -1659,11 +1689,7 @@ def _entry_applies_here(
     on either axis filters the entry out at selection time;
     apply / status / audit then never see it on this host.
     """
-    if platforms and platform not in platforms:
-        return False
-    if hosts and host not in hosts:
-        return False
-    return True
+    return _mask_reason(platforms, hosts, host=host, platform=platform) is None
 
 
 def selected_jobs_and_groups(
@@ -1674,47 +1700,77 @@ def selected_jobs_and_groups(
     A target's `jobs` list names roots; each root's transitive
     descendants (group children, which may themselves be groups)
     are also selected so they get stamped on this host and don't
-    appear as orphans. Per-entry `platforms` / `hosts` filters are
-    applied during the walk: a group whose filters exclude the
-    current (host, platform) is skipped without recursion (its
-    children may still appear via other paths if not similarly
-    filtered); a job whose filters exclude is skipped while
-    siblings continue.
+    appear as orphans. Per-entry `platforms` / `hosts` filters
+    exclude entries from the selected sets; a child reachable
+    only through a filtered group is excluded as well, while a
+    child reachable via at least one unfiltered path remains
+    selected.
 
     Cycle protection is defensive -- `_validate_config` should
     have already rejected cycles.
     """
+    jobs, groups, _ = selected_and_masked_jobs_and_groups(config, target)
+    return jobs, groups
+
+
+def selected_and_masked_jobs_and_groups(
+    config: Config, target: Target | None
+) -> tuple[set[str], set[str], dict[str, str]]:
+    """Walk the target's selection, distinguishing selected from masked.
+
+    Mirrors `selected_jobs_and_groups` for the selected sets; in
+    addition, returns a `masked` mapping of name -> reason (axis
+    string from `_mask_reason`) for entries reached through the
+    target whose own filters exclude them, plus children of a
+    masked group (which inherit the parent's reason -- they're
+    inactive on this host even if their own filters would pass).
+    The selected sets are identical to what `selected_jobs_and_groups`
+    returns; `masked` is the strictly-additional set that `--all`
+    exposes.
+    """
     jobs: set[str] = set()
     groups: set[str] = set()
+    masked: dict[str, str] = {}
     if target is None:
-        return jobs, groups
+        return jobs, groups, masked
     host = current_host()
     platform = current_platform()
 
-    def _walk(name: str, seen: set[str]) -> None:
+    def _walk(name: str, parent_mask: str | None, seen: set[str]) -> None:
         if name in seen:
             return
         seen = seen | {name}
         if name in config.jobs:
             j = config.jobs[name]
-            if not _entry_applies_here(
+            own_reason = _mask_reason(
                 j.platforms, j.hosts, host=host, platform=platform
-            ):
-                return
-            jobs.add(name)
+            )
+            effective = own_reason or parent_mask
+            if effective is None:
+                jobs.add(name)
+            else:
+                masked[name] = effective
         elif name in config.job_groups:
             g = config.job_groups[name]
-            if not _entry_applies_here(
+            own_reason = _mask_reason(
                 g.platforms, g.hosts, host=host, platform=platform
-            ):
-                return
-            groups.add(name)
+            )
+            effective = own_reason or parent_mask
+            if effective is None:
+                groups.add(name)
+            else:
+                masked[name] = effective
             for child in g.jobs:
-                _walk(child, seen)
+                _walk(child, effective, seen)
 
     for name in target.jobs:
-        _walk(name, set())
-    return jobs, groups
+        _walk(name, None, set())
+    # A name reachable through both a masked and an unmasked path
+    # should appear as selected, not masked. Drop any masked entry
+    # that also made it into the selected sets.
+    for n in jobs | groups:
+        masked.pop(n, None)
+    return jobs, groups, masked
 
 
 def resolved_notify_channels(
@@ -4229,7 +4285,14 @@ def _selected_full_names_per_bundle(
     bundles: Bundles,
 ) -> tuple[dict[str, tuple[Bundle, str]], set[str]]:
     """Return (full_name -> (bundle, short)) and full_names set,
-    spanning every bundle's selection on the current host."""
+    spanning every bundle's selection on the current host.
+
+    `by_full`'s key set is the same set as `selected`; this is the
+    contract `do_apply` / `_expand_apply_subtree` rely on to
+    distinguish "names known to this host's selection" from
+    "everything else".  Callers that also need to inspect masked
+    entries use `_selected_and_masked_full_names_per_bundle`.
+    """
     host = current_host()
     platform = current_platform()
     by_full: dict[str, tuple[Bundle, str]] = {}
@@ -4239,6 +4302,40 @@ def _selected_full_names_per_bundle(
         for short in sel_jobs | sel_groups:
             by_full[b.full_name(short)] = (b, short)
     return by_full, set(by_full.keys())
+
+
+def _selected_and_masked_full_names_per_bundle(
+    bundles: Bundles,
+) -> tuple[dict[str, tuple[Bundle, str]], set[str], dict[str, str]]:
+    """Spans every bundle, returning selected and masked names.
+
+    `by_full` maps full_name -> (bundle, short) for every entry
+    that is selected OR masked on this host -- the wider set is
+    needed only by status callers that surface masked rows.
+    `selected` is the set of full_names that pass the host's
+    `platforms` / `hosts` filters; `masked_by_full` maps the
+    rest (reached via target but excluded by filters) to the
+    axis reason from `_mask_reason`.
+    """
+    host = current_host()
+    platform = current_platform()
+    by_full: dict[str, tuple[Bundle, str]] = {}
+    selected: set[str] = set()
+    masked_by_full: dict[str, str] = {}
+    for b in bundles.bundles:
+        target = resolve_target(b.config, host, platform)
+        sel_jobs, sel_groups, masked = selected_and_masked_jobs_and_groups(
+            b.config, target
+        )
+        for short in sel_jobs | sel_groups:
+            full = b.full_name(short)
+            by_full[full] = (b, short)
+            selected.add(full)
+        for short, reason in masked.items():
+            full = b.full_name(short)
+            by_full[full] = (b, short)
+            masked_by_full[full] = reason
+    return by_full, selected, masked_by_full
 
 
 def _expand_apply_subtree(
@@ -4627,6 +4724,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "sched": "SCHED",
     "last": "LAST",
     "last-ran": "LAST RAN",
+    "masked-by": "MASKED BY",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job",
@@ -4635,6 +4733,10 @@ _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "last",
     "last-ran",
 )
+_STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
+    "default": _DEFAULT_STATUS_COLS,
+    "all": tuple(_STATUS_COL_HEADERS.keys()),
+}
 
 
 def _parse_status_cols(spec: str | None) -> list[str]:
@@ -4643,24 +4745,43 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     Comma-separated; whitespace around names is ignored. `job` is
     always included (and forced to the first column) because
     everything else is meaningless without the entity name.
-    Unknown column names raise UsageError so a typo is loud, not a
-    silent missing column.
+    `default` and `all` are aliases that expand to the default
+    column set and every column respectively; mixing aliases with
+    explicit names is allowed (`default,masked-by`). Order is
+    preserved across the resolved list with duplicates dropped.
+    Unknown names raise UsageError so a typo is loud, not a silent
+    missing column.
     """
     if not spec:
         return list(_DEFAULT_STATUS_COLS)
-    cols = [c.strip() for c in spec.split(",") if c.strip()]
-    unknown = [c for c in cols if c not in _STATUS_COL_HEADERS]
+    raw = [c.strip() for c in spec.split(",") if c.strip()]
+    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIASES)
+    unknown = [c for c in raw if c not in valid]
     if unknown:
         raise UsageError(
             f"unknown status column(s): {sorted(unknown)} "
-            f"(valid: {sorted(_STATUS_COL_HEADERS)})"
+            f"(valid: {sorted(_STATUS_COL_HEADERS)}; "
+            f"aliases: {sorted(_STATUS_COL_ALIASES)})"
         )
+    expanded: list[str] = []
+    for c in raw:
+        if c in _STATUS_COL_ALIASES:
+            expanded.extend(_STATUS_COL_ALIASES[c])
+        else:
+            expanded.append(c)
+    seen: set[str] = set()
+    cols: list[str] = []
+    for c in expanded:
+        if c in seen:
+            continue
+        seen.add(c)
+        cols.append(c)
     if "job" in cols:
         cols.remove("job")
     return ["job"] + cols
 
 
-def do_status(jobs: list[str], cols: str | None) -> None:
+def do_status(jobs: list[str], cols: str | None, show_masked: bool) -> None:
     """Print the resolved state per job in a tabular view.
 
     With no args, the report covers selected jobs/groups plus any
@@ -4670,13 +4791,24 @@ def do_status(jobs: list[str], cols: str | None) -> None:
     table.
 
     `--cols` is a comma-separated list selecting which columns to
-    show, in order. Valid: job, config, sched, last, last-ran.
-    Default: all five. `job` is always included.
+    show, in order. Valid: job, config, sched, last, last-ran,
+    masked-by. The aliases `default` and `all` expand to the
+    default column set and every column respectively, and may be
+    mixed with explicit names (`default,masked-by`). `job` is
+    always included.
+
+    `-a` / `--all` extends the default selection with entries the
+    target reaches but the host's `platforms` / `hosts` filters
+    exclude. Those rows render with `config = masked` and the
+    masking axis in the `masked-by` column (which is hidden by
+    default; combine with `--cols default,masked-by` to surface it).
     """
     selected_cols = _parse_status_cols(cols)
     bundles = load_all_bundles()
     platform = current_platform()
-    _by_full, selected = _selected_full_names_per_bundle(bundles)
+    _by_full, selected, masked_by_full = (
+        _selected_and_masked_full_names_per_bundle(bundles)
+    )
     stamped = stamped_names()
 
     if platform == "linux":
@@ -4695,12 +4827,33 @@ def do_status(jobs: list[str], cols: str | None) -> None:
             f"{parse_full_name(n)[0]}.{parse_full_name(n)[1]}" for n in jobs
         ]
     else:
-        full_names = sorted(selected | stamped)
+        active = selected | stamped
+        if show_masked:
+            active = active | set(masked_by_full)
+        full_names = sorted(active)
 
     rows: list[dict[str, str]] = []
     for full in full_names:
         bn, short = parse_full_name(full)
         bundle = bundles.by_name(bn)
+        mask_reason = masked_by_full.get(full, "")
+        if mask_reason and full not in selected and full not in stamped:
+            # A masked entry that has nothing on disk: there is no
+            # unit / hash / last-run to read from, so the non-config
+            # axes have no signal. Fix the row to "masked / unknown
+            # / never / never" so the table reflects "this entry is
+            # defined but the host's filters excluded it".
+            rows.append(
+                {
+                    "job": full,
+                    "config": "masked",
+                    "sched": "unknown",
+                    "last": "never",
+                    "last-ran": "never",
+                    "masked-by": mask_reason,
+                }
+            )
+            continue
         if bundle is None:
             cfg_state = "orphan" if full in stamped else "missing"
             entry = None
@@ -4726,6 +4879,7 @@ def do_status(jobs: list[str], cols: str | None) -> None:
                 "sched": sched,
                 "last": _last_run_state(full),
                 "last-ran": _last_ran_at(full),
+                "masked-by": mask_reason,
             }
         )
 
@@ -5537,12 +5691,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict to these jobs (default: all)",
     )
     p_status.add_argument(
+        "-a",
+        "--all",
+        dest="show_masked",
+        action="store_true",
+        help=(
+            "Also list jobs the target reaches but this host's "
+            "platforms/hosts filters mask out (config=masked)"
+        ),
+    )
+    p_status.add_argument(
         "--cols",
         default=None,
         help=(
             "Comma-separated columns to display "
-            "(valid: job,config,sched,last,last-ran; "
-            "default: all)"
+            "(valid: job,config,sched,last,last-ran,masked-by; "
+            "aliases: default, all; default: default)"
         ),
     )
 
