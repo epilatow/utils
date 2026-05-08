@@ -2383,15 +2383,23 @@ def _wait_for_pid_exit(pid: int, timeout: float | None) -> str:
 
 
 def _wait_for_pid_exit_kqueue(pid: int, timeout: float | None) -> str:
+    # mypy's stubs for `select` are platform-specific: kqueue,
+    # kevent, and the KQ_* constants are absent from the Linux
+    # stubs. wait_for_pid_exit only dispatches here when
+    # sys.platform == "darwin", so the runtime contract is fine;
+    # silence the static-checker on each macOS-only attribute.
     import select as _select
 
-    kq = _select.kqueue()
+    kq = _select.kqueue()  # type: ignore[attr-defined]
     try:
-        ev = _select.kevent(
+        ev = _select.kevent(  # type: ignore[attr-defined]
             pid,
-            filter=_select.KQ_FILTER_PROC,
-            flags=_select.KQ_EV_ADD | _select.KQ_EV_ENABLE,
-            fflags=_select.KQ_NOTE_EXIT,
+            filter=_select.KQ_FILTER_PROC,  # type: ignore[attr-defined]
+            flags=(
+                _select.KQ_EV_ADD  # type: ignore[attr-defined]
+                | _select.KQ_EV_ENABLE  # type: ignore[attr-defined]
+            ),
+            fflags=_select.KQ_NOTE_EXIT,  # type: ignore[attr-defined]
         )
         try:
             kq.control([ev], 0, 0)
