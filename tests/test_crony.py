@@ -13,6 +13,8 @@ import importlib.machinery
 import importlib.util
 import logging
 import os
+import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -69,16 +71,16 @@ class TestHelpOutput:
     def test_help_includes_design_block(self) -> None:
         parser = crony.build_parser()
         text = parser.format_help()
-        # Design block: 3-tuple status legend.
-        assert "CONFIG  synced" in text
-        assert "SCHED   enabled" in text
-        assert "LAST    ok" in text
+        # Design block documents the default status columns.
+        assert "CONFIG    synced" in text
+        assert "SCHEDULE  the cron" in text
+        assert "LAST      ok" in text
         # Exit codes still rendered.
         assert "exit codes:" in text
         # Design block is appended *after* the exit codes -- the
         # short tagline lives in description, design lives in
         # epilog after the exit-code list.
-        assert text.index("exit codes:") < text.index("CONFIG  synced")
+        assert text.index("exit codes:") < text.index("CONFIG    synced")
 
 
 class TestCmdCallbacks(CmdCallbacksBase):
@@ -3634,13 +3636,13 @@ class TestLingerDetection:
         assert crony.linger_enabled(user="edp") is True
 
 
-class TestSchedStateDarwin:
+class TestUnitStateDarwin:
     def test_loaded_label_is_enabled(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
         monkeypatch.setattr(
             crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
         )
-        assert crony._sched_state("j", "darwin") == "enabled"
+        assert crony._unit_state("j", "darwin") == "enabled"
 
     def test_disabled_record_takes_precedence(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(
@@ -3651,28 +3653,28 @@ class TestSchedStateDarwin:
         monkeypatch.setattr(
             crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
         )
-        assert crony._sched_state("j", "darwin") == "disabled"
+        assert crony._unit_state("j", "darwin") == "disabled"
 
-    def test_unknown_when_neither_loaded_nor_disabled(
+    def test_none_when_neither_loaded_nor_disabled(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
         monkeypatch.setattr(crony, "_launchctl_list", lambda: "")
-        assert crony._sched_state("j", "darwin") == "unknown"
+        assert crony._unit_state("j", "darwin") == "none"
 
 
-class TestSchedStateLinux:
+class TestUnitStateLinux:
     def test_enabled(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "enabled")
-        assert crony._sched_state("j", "linux") == "enabled"
+        assert crony._unit_state("j", "linux") == "enabled"
 
     def test_disabled(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
-        assert crony._sched_state("j", "linux") == "disabled"
+        assert crony._unit_state("j", "linux") == "disabled"
 
-    def test_unknown_on_empty(self, monkeypatch: Any) -> None:
+    def test_none_on_empty(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "")
-        assert crony._sched_state("j", "linux") == "unknown"
+        assert crony._unit_state("j", "linux") == "none"
 
 
 class TestConfigState:
@@ -3787,9 +3789,9 @@ class TestEnableDisable:
             default_target_jobs=["g"],
         )
         crony.apply_one(cfg, "a")
-        with pytest.raises(crony.UsageError, match="no schedule"):
+        with pytest.raises(crony.UsageError, match="grouped entries"):
             crony.do_enable(jobs=["a"], bundle=None)
-        with pytest.raises(crony.UsageError, match="no schedule"):
+        with pytest.raises(crony.UsageError, match="grouped entries"):
             crony.do_disable(jobs=["a"], bundle=None)
 
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
@@ -4105,12 +4107,19 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         out = capsys.readouterr().out
         assert "JOB" in out
         assert "CONFIG" in out
-        assert "SCHED" in out
+        assert "SCHEDULE" in out
         assert "LAST" in out
         assert "j" in out
         assert "synced" in out
@@ -4123,8 +4132,15 @@ class TestStatusReport:
         ghost_dir.mkdir(parents=True)
         (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         out = capsys.readouterr().out
         assert "ghost" in out
         assert "orphan" in out
@@ -4146,8 +4162,15 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         shutil.rmtree(h.state)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "orphan" in out
@@ -4161,9 +4184,14 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
-            jobs=[], cols="job,last,last-ran", show_masked=False, bundle=None
+            jobs=[],
+            cols="job,last,last-ran",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
         )
         out = capsys.readouterr().out
         header = out.splitlines()[0]
@@ -4172,7 +4200,8 @@ class TestStatusReport:
         assert "LAST RAN" in header
         # Columns omitted from --cols are absent.
         assert "CONFIG" not in header
-        assert "SCHED" not in header
+        assert "SCHEDULE" not in header
+        assert "UNIT" not in header
 
     def test_cols_unknown_name_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -4181,7 +4210,12 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown status column"):
             crony.do_status(
-                jobs=[], cols="job,bogus", show_masked=False, bundle=None
+                jobs=[],
+                cols="job,bogus",
+                show_masked=False,
+                bundle=None,
+                config_current=False,
+                config_pending=False,
             )
 
     def test_last_ran_column_shows_relative_time(
@@ -4209,9 +4243,14 @@ class TestStatusReport:
             ' "exit_code": 0, "exit_class": "ok"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
-            jobs=[], cols="job,last-ran", show_masked=False, bundle=None
+            jobs=[],
+            cols="job,last-ran",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
         )
         out = capsys.readouterr().out
         # Allow a small wallclock drift between writing the file and
@@ -4229,9 +4268,14 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
-            jobs=[], cols="job,last-ran", show_masked=False, bundle=None
+            jobs=[],
+            cols="job,last-ran",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
         )
         out = capsys.readouterr().out
         assert "never" in out
@@ -4256,8 +4300,15 @@ class TestStatusReport:
             default_target_jobs=[long_name],
         )
         crony.apply_one(cfg, long_name)
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
         # The header's CONFIG label and every row's state token
         # (synced / missing / orphan / etc.) should start at the
@@ -4290,10 +4341,24 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
         out = capsys.readouterr().out
         assert h.full("j") not in out
-        crony.do_status(jobs=[], cols=None, show_masked=True, bundle=None)
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "masked" in out
@@ -4329,7 +4394,12 @@ class TestStatusReport:
             default_target_jobs=["host_only", "plat_only", "both"],
         )
         crony.do_status(
-            jobs=[], cols="default,masked-by", show_masked=True, bundle=None
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
         )
         out = capsys.readouterr().out
         assert "MASKED BY" in out
@@ -4361,7 +4431,14 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        crony.do_status(jobs=[], cols=None, show_masked=True, bundle=None)
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
         out = capsys.readouterr().out
         assert "MASKED BY" not in out
         # The masked row still surfaces -- only the reason column
@@ -4377,12 +4454,21 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols="all", show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="all",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         header = capsys.readouterr().out.splitlines()[0]
         assert "JOB" in header
+        assert "KIND" in header
         assert "CONFIG" in header
-        assert "SCHED" in header
+        assert "SCHEDULE" in header
+        assert "UNIT" in header
         assert "LAST" in header
         assert "LAST RAN" in header
         assert "MASKED BY" in header
@@ -4396,10 +4482,24 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
         baseline = capsys.readouterr().out
-        crony.do_status(jobs=[], cols="default", show_masked=False, bundle=None)
+        crony.do_status(
+            jobs=[],
+            cols="default",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
         aliased = capsys.readouterr().out
         assert baseline == aliased
 
@@ -4414,14 +4514,27 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
-            jobs=[], cols="default,masked-by", show_masked=False, bundle=None
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
         )
         header = capsys.readouterr().out.splitlines()[0]
         # JOB first, MASKED BY last; default columns preserved in
-        # between.
-        labels = ["JOB", "CONFIG", "SCHED", "LAST", "LAST RAN", "MASKED BY"]
+        # between. The default set covers config, schedule, runtime,
+        # and last-run signals.
+        labels = [
+            "JOB",
+            "CONFIG",
+            "SCHEDULE",
+            "LAST",
+            "LAST RAN",
+            "MASKED BY",
+        ]
         positions = [header.index(label) for label in labels]
         assert positions == sorted(positions)
 
@@ -4432,7 +4545,12 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown bundle"):
             crony.do_status(
-                jobs=[], cols=None, show_masked=False, bundle="ghost"
+                jobs=[],
+                cols=None,
+                show_masked=False,
+                bundle="ghost",
+                config_current=False,
+                config_pending=False,
             )
 
     def test_bundle_scopes_table(
@@ -4456,15 +4574,747 @@ class TestStatusReport:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle="borgadm")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle="borgadm",
+            config_current=False,
+            config_pending=False,
+        )
         out = capsys.readouterr().out
         assert "borgadm.k" in out
         assert "default.j" not in out
 
+    def test_kind_column_shows_job_or_group(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
+                "job-group": {"g": {"jobs": ["j"], "schedule": "*-*-* 04:00"}},
+            },
+            default_target_jobs=["j", "g"],
+        )
+        crony.apply_one(cfg, "j")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,kind",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        # default.j is a job; default.g is a group
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "job" in line
+            if "default.g " in line:
+                assert "group" in line
+
+    def test_kind_column_uses_snapshot_for_orphan(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply, then drop the entry from config so the row turns
+        # orphan. KIND falls back to the snapshot's recorded kind.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config({}, default_target_jobs=[])
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,kind,config",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "job" in line
+                assert "orphan" in line
+
+    def test_unit_name_column_darwin_uses_launchd_label(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-name",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "UNIT NAME" in out
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert f"org.crony.{h.full('j')}" in line
+
+    def test_unit_name_column_linux_picks_timer_or_service(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Scheduled job -> .timer; grouped job -> .service.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = h.config(
+            {
+                "job": {
+                    "sched": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "gm": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["gm"], "schedule": "*-*-* 04:00"}},
+            },
+            default_target_jobs=["sched", "g"],
+        )
+        crony.apply_one(cfg, "sched")
+        crony.apply_one(cfg, "gm")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-name",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.sched " in line:
+                assert f"crony-{h.full('sched')}.timer" in line
+            if "default.gm " in line:
+                assert f"crony-{h.full('gm')}.service" in line
+
+    def test_unit_schedule_and_pending_schedule_columns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply, then mutate config. unit-schedule reflects the
+        # snapshot (old value); pending-schedule reflects the live
+        # config (new value); neither carries the stale asterisk.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-schedule,pending-schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "*-*-* 03:00" in line
+                assert "*-*-* 09:00" in line
+        # Neither column carries the stale-marker asterisk.
+        assert "*-*-* 03:00 *" not in out
+        assert "*-*-* 09:00 *" not in out
+
+    def test_unit_schedule_empty_when_no_snapshot(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Defined in config, never applied -- unit-schedule blank.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "none")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-schedule,pending-schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        # pending-schedule populated; unit-schedule blank for this row.
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "*-*-* 03:00" in line  # pending
+                # The row should not contain the cron expression twice.
+                assert line.count("*-*-* 03:00") == 1
+
+    def test_unit_schedule_renders_grouped_for_unscheduled_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # An applied grouped entry (no own schedule) should render
+        # `grouped` in unit-schedule, matching pending-schedule
+        # and the default schedule column.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-schedule,pending-schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.a " in line:
+                # Both columns show `grouped` for the unscheduled
+                # group member.
+                assert line.count("grouped") == 2
+
+    def test_groups_column_shows_membership(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Job `a` belongs to group `g`. The groups column lists `g`.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,groups",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.a " in line:
+                assert "default.g" in line
+
+    def test_groups_column_lists_multiple_groups_comma_separated(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Job `a` is a child of two groups.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g1": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                    "g2": {"jobs": ["a"], "schedule": "*-*-* 04:00"},
+                },
+            },
+            default_target_jobs=["g1", "g2"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g1")
+        crony.apply_one(cfg, "g2")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,groups",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.a " in line:
+                assert "default.g1,default.g2" in line
+
+    def test_groups_default_marks_stale_when_membership_changes(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply with a in g; rewrite config so a is no longer in g
+        # (without re-applying). Default mode shows the applied
+        # membership with `*` and the shared stale-value footer.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "b")
+        crony.apply_one(cfg, "g")
+        # Drop `a` from the group's children in pending config.
+        h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,groups",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        # `a`'s row carries the stale-marked applied membership.
+        for line in out.splitlines():
+            if "default.a " in line:
+                assert "default.g *" in line
+        assert "stale" in out
+        assert "crony apply" in out
+
+    def test_groups_config_pending_overrides_applied(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        # Pending: swap `a` out for `b`. `a` is no longer in any group.
+        h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,groups",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=True,
+        )
+        out = capsys.readouterr().out
+        # Pending says `a` is in no group; cell is empty (no
+        # asterisk, since the user picked the source).
+        for line in out.splitlines():
+            if "default.a " in line:
+                assert "default.g" not in line
+                assert " *" not in line
+
+    def test_opt_in_columns_not_in_default_set(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        header = capsys.readouterr().out.splitlines()[0]
+        assert "UNIT NAME" not in header
+        assert "UNIT SCHEDULE" not in header
+        assert "PENDING SCHEDULE" not in header
+        # KIND and UNIT moved to opt-in -- the schedule column
+        # surfaces "disabled" inline when the unit is off, so
+        # the standalone runtime axis isn't load-bearing for
+        # day-to-day reading.
+        assert "KIND" not in header
+        # `UNIT` is a substring of `UNIT NAME`/`UNIT SCHEDULE`;
+        # check the bare header label with surrounding whitespace.
+        assert " UNIT " not in header
+        assert not header.rstrip().endswith("UNIT")
+
+    def test_status_help_epilog_lists_columns(self) -> None:
+        parser = crony.build_parser()
+        # Locate the status subparser and pull its epilog text.
+        subparsers_action = next(
+            a
+            for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        )
+        status_parser = subparsers_action.choices["status"]
+        text = status_parser.format_help()
+        # Two sections: every column documented in Columns; aliases
+        # documented as their expansions in Aliases.
+        assert "Columns\n-------" in text
+        assert "Aliases\n-------" in text
+        for col in [
+            "job",
+            "kind",
+            "config",
+            "schedule",
+            "unit",
+            "last",
+            "last-ran",
+            "masked-by",
+            "unit-name",
+            "unit-schedule",
+            "pending-schedule",
+        ]:
+            assert col in text
+        # `default` alias enumerates its expansion verbatim so the
+        # block doubles as the documentation of the default set.
+        for col in crony._DEFAULT_STATUS_COLS:
+            assert col in text
+        # `all` is rendered as a label rather than the full list.
+        assert "  all       all" in text
+
+    def test_schedule_column_renders_cron_interval_and_grouped(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "cron-job": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "iv-job": {"command": "true", "interval": "1h"},
+                    "child": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["child"], "schedule": "*-*-* 04:00"}
+                },
+            },
+            default_target_jobs=["cron-job", "iv-job", "g"],
+        )
+        crony.apply_one(cfg, "cron-job")
+        crony.apply_one(cfg, "iv-job")
+        crony.apply_one(cfg, "child")
+        crony.apply_one(cfg, "g")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.cron-job" in line:
+                assert "*-*-* 03:00" in line
+            if "default.iv-job" in line:
+                assert "interval=1h" in line
+            if "default.child" in line:
+                assert "grouped" in line
+
+    def test_schedule_renders_disabled_when_unit_disabled(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Default mode: a disabled platform unit replaces the cron
+        # cell with `disabled`. --config-pending suppresses the
+        # override (the pending value is a config fact).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "disabled" in line
+                assert "*-*-* 03:00" not in line
+        # --config-pending still shows the cron expression.
+        capsys.readouterr()
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=True,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.j " in line:
+                assert "*-*-* 03:00" in line
+                assert "disabled" not in line
+
+    def test_schedule_disabled_override_drops_stale_marker(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply with one schedule, mutate the config (so schedule
+        # would normally be stale), and disable the unit. The
+        # cell renders `disabled` with no asterisk and no footer
+        # since the cell is no longer the schedule that would
+        # have been compared against pending.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "disabled" in out
+        assert "*" not in out.replace("*-*-*", "")
+        assert "stale" not in out
+
+    def test_schedule_default_marks_stale_with_asterisk_and_footer(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply with one schedule, then mutate config to a new
+        # schedule. Default schedule cell shows the applied
+        # (current) value with `*`; footer prints.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        # Rewrite config with a new schedule (no re-apply).
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "*-*-* 03:00 *" in out
+        assert "stale" in out
+        assert "crony apply" in out
+
+    def test_config_current_shows_applied_no_asterisk(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=True,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "*-*-* 03:00" in out
+        assert "*-*-* 09:00" not in out
+        assert "*-*-* 03:00 *" not in out
+        assert "*-*-* 09:00 *" not in out
+        assert "stale" not in out
+
+    def test_config_pending_shows_config_no_asterisk(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=True,
+        )
+        out = capsys.readouterr().out
+        assert "*-*-* 09:00" in out
+        assert "*-*-* 03:00" not in out
+        assert "*-*-* 03:00 *" not in out
+        assert "*-*-* 09:00 *" not in out
+        assert "stale" not in out
+
+    def test_config_current_and_pending_mutually_exclusive(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="mutually exclusive"):
+            crony.do_status(
+                jobs=[],
+                cols=None,
+                show_masked=False,
+                bundle=None,
+                config_current=True,
+                config_pending=True,
+            )
+
+    def test_unused_mask_reason_surfaces_under_all(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `extra` is defined in config but not in target.jobs.
+        # Default `crony status` hides it; `-a` surfaces it as
+        # config=masked, masked-by=unused.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "extra": {
+                        "command": "true",
+                        "schedule": "*-*-* 04:00",
+                    },
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,config,masked-by",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "default.extra" not in out
+        capsys.readouterr()
+        crony.do_status(
+            jobs=[],
+            cols="job,config,masked-by",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        for line in out.splitlines():
+            if "default.extra" in line:
+                assert "masked" in line
+                assert "unused" in line
+
+    def test_unit_state_axis_uses_none_for_uninstantiated(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Stub _unit_state to "none" -- simulating a unit the
+        # platform scheduler doesn't see. The cell renders `none`.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "none")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert "UNIT" in out
+        for line in out.splitlines():
+            if "default.j" in line:
+                assert "none" in line
+
 
 # =============================================================================
-# validate / audit / list / logs
+# validate / audit / logs
 # =============================================================================
 
 
@@ -4583,13 +5433,13 @@ class TestResolveStateAxes:
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         # Stamped on disk but not in any bundle -> orphan; no
-        # entry to consult so sched falls through to _sched_state
+        # entry to consult so sched falls through to _unit_state
         # (stubbed to "enabled" to surface the branch).
         ghost = h.full("ghost")
         (h.state / ghost).mkdir(parents=True)
         (h.state / ghost / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         bundles = crony.load_all_bundles()
         cfg, sched, last = crony._resolve_state_axes(
             bundles, ghost, "darwin", crony.stamped_names()
@@ -4598,11 +5448,11 @@ class TestResolveStateAxes:
         assert sched == "enabled"
         assert last == "never"
 
-    def test_missing_short_circuits_sched_to_unknown(
+    def test_missing_short_circuits_unit_state_to_none(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # No stamp, no bundle entry -> missing; sched short-
-        # circuits to "unknown" without consulting _sched_state.
+        # No stamp, no bundle entry -> missing; unit short-
+        # circuits to "none" without consulting _unit_state.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         called: list[str] = []
@@ -4611,13 +5461,13 @@ class TestResolveStateAxes:
             called.append(n)
             return "enabled"
 
-        monkeypatch.setattr(crony, "_sched_state", _stub_sched)
+        monkeypatch.setattr(crony, "_unit_state", _stub_sched)
         bundles = crony.load_all_bundles()
-        cfg, sched, last = crony._resolve_state_axes(
+        cfg, unit_state, last = crony._resolve_state_axes(
             bundles, h.full("ghost"), "darwin", set()
         )
         assert cfg == "missing"
-        assert sched == "unknown"
+        assert unit_state == "none"
         assert last == "never"
         assert not called  # short-circuit honored
 
@@ -4626,7 +5476,7 @@ class TestResolveStateAxes:
     ) -> None:
         # Group-only job (no schedule / interval, fires only via
         # parent group) -> sched = "grouped" without consulting
-        # _sched_state.
+        # _unit_state.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -4637,24 +5487,24 @@ class TestResolveStateAxes:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "g")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         bundles = crony.load_all_bundles()
         _, sched, _ = crony._resolve_state_axes(
             bundles, h.full("a"), "darwin", crony.stamped_names()
         )
         assert sched == "grouped"
 
-    def test_leaf_with_schedule_consults_sched_state(
+    def test_leaf_with_schedule_consults_unit_state(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Scheduled leaf -> sched read from _sched_state.
+        # Scheduled leaf -> sched read from _unit_state.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         bundles = crony.load_all_bundles()
         cfg_state, sched, _ = crony._resolve_state_axes(
             bundles, h.full("j"), "darwin", crony.stamped_names()
@@ -4673,7 +5523,7 @@ class TestAudit:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         last_run = h.state / h.full("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
@@ -4690,7 +5540,7 @@ class TestAudit:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         last_run = h.state / h.full("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "fail"}', encoding="utf-8")
@@ -4708,7 +5558,7 @@ class TestAudit:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         last_run = h.state / h.full("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
@@ -4746,7 +5596,7 @@ class TestAudit:
         clean_last = h.state / "borgadm.k" / "last-run.json"
         clean_last.parent.mkdir(parents=True, exist_ok=True)
         clean_last.write_text('{"exit_class": "ok"}', encoding="utf-8")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_audit(exclude_disabled=False, bundle="borgadm")
         out = capsys.readouterr().out
         assert "all jobs nominal" in out
@@ -4777,7 +5627,7 @@ class TestAudit:
         gone_dir = h.state / "borgadm.gone"
         gone_dir.mkdir(parents=True)
         (gone_dir / "hash").write_text("legacy\n", encoding="utf-8")
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         with pytest.raises(crony.AuditFailedError):
             crony.do_audit(exclude_disabled=False, bundle="borgadm")
         out = capsys.readouterr().out
@@ -4797,55 +5647,6 @@ class TestAudit:
         out = capsys.readouterr().out
         assert "linger" not in out
         assert "all jobs nominal" in out
-
-
-class TestListSubcommand:
-    def test_prints_each_entry(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        h.config(
-            {
-                "job": {
-                    "a": {"command": "true", "schedule": "*-*-* 03:00"},
-                    "b": {"command": "true"},
-                },
-                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 04:00"}},
-            },
-            default_target_jobs=["a", "g"],
-        )
-        crony.do_list(bundle=None)
-        out = capsys.readouterr().out
-        assert "a" in out
-        assert "b" in out
-        assert "g" in out
-        assert "group" in out
-        assert "job" in out
-
-    def test_bundle_filter_restricts_output(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        h.config(
-            {"job": {"alpha": {"command": "true", "schedule": "daily"}}},
-            default_target_jobs=["alpha"],
-        )
-        (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.bravo]\ncommand = "true"\nschedule = "daily"\n',
-            encoding="utf-8",
-        )
-        crony.do_list(bundle="borgadm")
-        out = capsys.readouterr().out
-        assert "borgadm.bravo" in out
-        assert "alpha" not in out
-
-    def test_bundle_unknown_rejected(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(crony.UsageError, match="unknown bundle"):
-            crony.do_list(bundle="ghost")
 
 
 class TestLogs:
@@ -5995,6 +6796,41 @@ class TestSnapshotLifecycle:
         )
 
 
+class TestSnapshotBackwardLoad:
+    """A snapshot.json written before `schedule` / `interval` were
+    snapshot fields must still load without raising. Treats the
+    fields as None and lets status's schedule column fall back to
+    the pending config value.
+    """
+
+    def test_legacy_job_snapshot_loads_with_none_schedule(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        full = h.full("j")
+        snap_dir = h.state / full
+        snap_dir.mkdir(parents=True)
+        # Pre-existing snapshot lacking schedule / interval keys.
+        legacy = {
+            "schema": crony._SNAPSHOT_SCHEMA,
+            "kind": "job",
+            "name": full,
+            "command": "true",
+            "script": None,
+            "args": [],
+            "gate": None,
+            "gate_script": None,
+            "gate_args": [],
+            "env": {},
+            "job_timeout_sec": 600,
+        }
+        (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
+        snap = crony._load_snapshot(full)
+        assert isinstance(snap, crony.JobSnapshot)
+        assert snap.schedule is None
+        assert snap.interval is None
+
+
 class TestLifecycleSmoke:
     """End-to-end smoke covering init -> edit -> validate -> apply ->
     status -> destroy via the public function entry points. Catches
@@ -6021,9 +6857,16 @@ class TestLifecycleSmoke:
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # status -> prints the synced/enabled tuple (sched stub)
-        monkeypatch.setattr(crony, "_sched_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         capsys.readouterr()  # drop earlier output
-        crony.do_status(jobs=[], cols=None, show_masked=False, bundle=None)
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset

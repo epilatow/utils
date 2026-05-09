@@ -63,20 +63,27 @@ LaunchAgents) and Linux (systemd user timers). It reads one or
 more TOML config bundles and applies the corresponding platform
 units, runs jobs through a uniform shim (so logs, locks, gates,
 and notifications behave the same on both platforms), and reports
-state via a 3-tuple status:
-  CONFIG  synced  | stale    | missing | orphan  | masked
-  SCHED   enabled | disabled | grouped | unknown
-  LAST    ok      | fail     | timeout | gated   | running | never | unknown
+state via `crony status`. The default columns are:
+  JOB       the full namespaced name `<bundle>.<short>`
+  CONFIG    synced  | stale    | missing | orphan  | masked
+  SCHEDULE  the cron / interval / `grouped` value for the entry,
+            or `disabled` when the unit is off at the scheduler
+  LAST      ok      | fail     | timeout | gated   | running | never | unknown
+  LAST RAN  compact relative time of the last run (e.g. `5m ago`)
 
-`masked` only appears with `crony status -a/--all`; it marks an
-entry the target reaches but whose `platforms` / `hosts` filters
-exclude it on this host.
+`config=masked` only appears with `crony status -a/--all`. Several
+opt-in columns are available via `--cols`, including `unit`
+(scheduler-side state: enabled / disabled / grouped / none),
+`groups` (group memberships), `kind` (job vs group), `masked-by`
+(why CONFIG is `masked`: platform / host / unused, or a combination
+joined with `,`), and applied-vs-pending splits of the schedule
+column. See `crony status --help` for the full column reference.
 
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
 Plus operational subcommands: status, logs, trigger, audit,
-validate, notify-test, list, init, self-test.
+validate, notify-test, init, self-test.
 
 `trigger` asks the platform (launchd / systemd) to fire the unit
 immediately, the same path a scheduled fire would take. To run a
@@ -1944,6 +1951,14 @@ class JobSnapshot:
     gate_args: list[str]
     env: dict[str, str]
     job_timeout_sec: int
+    # `schedule` and `interval` capture the per-entry config that
+    # drove the rendered platform unit, so `crony status` can show
+    # the currently-active (applied) schedule independently of any
+    # later edit to the live config. Default-None for back-compat
+    # with snapshots written before these fields existed; loaders
+    # rely on the dataclass default rather than a schema bump.
+    schedule: str | None = None
+    interval: str | None = None
 
 
 @dataclass
@@ -1959,6 +1974,8 @@ class GroupSnapshot:
     children: list[str]
     group_budget_sec: int
     trigger_timeout_sec: int
+    schedule: str | None = None
+    interval: str | None = None
 
 
 def _snapshot_path_for(full_name: str) -> Path:
@@ -1991,6 +2008,8 @@ def _resolve_job_snapshot(
         gate_args=gate_args,
         env=dict(job.env),
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
+        schedule=job.schedule,
+        interval=job.interval,
     )
 
 
@@ -2014,6 +2033,8 @@ def _resolve_group_snapshot(
         children=children,
         group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
         trigger_timeout_sec=config.defaults.trigger_timeout_sec,
+        schedule=group.schedule,
+        interval=group.interval,
     )
 
 
@@ -3507,6 +3528,21 @@ def _entity_schedule(
     return entry.schedule, entry.interval
 
 
+def _schedule_display(schedule: str | None, interval: str | None) -> str:
+    """Render a (schedule, interval) pair into one cell value.
+
+    Schedule wins over interval when both are set (matching apply's
+    rendering precedence). An entry with neither -- a transit group
+    or a group-only job -- displays as `grouped` to mirror the
+    UNIT axis value for the same condition.
+    """
+    if schedule is not None:
+        return schedule
+    if interval is not None:
+        return f"interval={interval}"
+    return "grouped"
+
+
 def _compute_unit_hash(
     name: str,
     entry: Job | JobGroup,
@@ -3697,10 +3733,10 @@ def apply_one(
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
     # is the source of truth here (the platform unit can outlive
-    # the state-dir hash); _sched_state returns "unknown" for a
+    # the state-dir hash); _unit_state returns "none" for a
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
-    prior_disabled = _sched_state(full_name, platform) == "disabled"
+    prior_disabled = _unit_state(full_name, platform) == "disabled"
     units = _render_units(full_name, schedule, interval, platform)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -3936,13 +3972,15 @@ def _launchctl_list() -> str:
     return r.stdout
 
 
-def _sched_state(name: str, platform: str) -> str:
-    """Return SCHED axis value for a stamped entity.
+def _unit_state(name: str, platform: str) -> str:
+    """Return UNIT axis value for a stamped entity.
 
     Distinct from CONFIG: a unit can be configured-and-stamped while
-    being disabled at the platform scheduler. Group-only jobs (no
-    schedule, no interval) report `grouped`; their callers fire them
-    via subprocess invocation rather than the scheduler.
+    being disabled at the platform scheduler. Group-only entries
+    (no schedule, no interval) report `grouped`; their callers fire
+    them via subprocess invocation rather than the scheduler.
+    `none` means the platform scheduler doesn't know about a unit
+    by this name -- nothing instantiated to flip on or off.
     """
     if platform == "linux":
         unit = _systemd_unit_name(name)
@@ -3953,16 +3991,14 @@ def _sched_state(name: str, platform: str) -> str:
             return "disabled"
         if state == "static":
             return "enabled"
-        if state == "":
-            return "unknown"
-        return "unknown"
+        return "none"
     # darwin
     label = _label_for(name)
     if _is_launchd_disabled(label):
         return "disabled"
     if _is_launchd_loaded(label):
         return "enabled"
-    return "unknown"
+    return "none"
 
 
 def _is_launchd_disabled(label: str) -> bool:
@@ -4386,12 +4422,15 @@ def _selected_and_masked_full_names_per_bundle(
     """Spans every bundle, returning selected and masked names.
 
     `by_full` maps full_name -> (bundle, short) for every entry
-    that is selected OR masked on this host -- the wider set is
-    needed only by status callers that surface masked rows.
-    `selected` is the set of full_names that pass the host's
-    `platforms` / `hosts` filters; `masked_by_full` maps the
-    rest (reached via target but excluded by filters) to the
-    axis reason from `_mask_reason`.
+    that is selected OR masked OR defined-but-unused on this host
+    -- the wider set is needed only by status callers that surface
+    masked rows. `selected` is the set of full_names that pass the
+    host's `platforms` / `hosts` filters. `masked_by_full` maps
+    everything else: entries reached through `target.jobs` but
+    excluded by per-entry filters get the axis reason from
+    `_mask_reason` (`host`, `platform`, ...); entries defined in
+    a bundle's config but not reached by the host's resolved
+    target get the literal reason `unused`.
     """
     host = current_host()
     platform = current_platform()
@@ -4411,6 +4450,12 @@ def _selected_and_masked_full_names_per_bundle(
             full = b.full_name(short)
             by_full[full] = (b, short)
             masked_by_full[full] = reason
+        defined = set(b.config.jobs) | set(b.config.job_groups)
+        accounted = sel_jobs | sel_groups | set(masked.keys())
+        for short in defined - accounted:
+            full = b.full_name(short)
+            by_full[full] = (b, short)
+            masked_by_full[full] = "unused"
     return by_full, selected, masked_by_full
 
 
@@ -4691,7 +4736,9 @@ def _refuse_unscheduled_full(
     ]
     if unscheduled:
         raise UsageError(
-            f"cannot {verb} entries with no schedule: {sorted(unscheduled)}"
+            f"cannot {verb} grouped entries: {sorted(unscheduled)}. "
+            f"Grouped entries are triggered by parent jobs with their "
+            f"own schedule."
         )
 
 
@@ -4889,16 +4936,22 @@ def do_trigger(
 
 _STATUS_COL_HEADERS: dict[str, str] = {
     "job": "JOB",
+    "kind": "KIND",
     "config": "CONFIG",
-    "sched": "SCHED",
+    "schedule": "SCHEDULE",
+    "groups": "GROUPS",
+    "unit": "UNIT",
     "last": "LAST",
     "last-ran": "LAST RAN",
     "masked-by": "MASKED BY",
+    "unit-name": "UNIT NAME",
+    "unit-schedule": "UNIT SCHEDULE",
+    "pending-schedule": "PENDING SCHEDULE",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job",
     "config",
-    "sched",
+    "schedule",
     "last",
     "last-ran",
 )
@@ -4906,6 +4959,83 @@ _STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
     "default": _DEFAULT_STATUS_COLS,
     "all": tuple(_STATUS_COL_HEADERS.keys()),
 }
+
+
+_STATUS_HELP_EPILOG_TEMPLATE: str = """\
+Columns
+-------
+  config            synced | stale | missing | orphan | masked.
+  groups            Comma-separated full names of groups containing this
+                    entry. Same default-vs-pending rules as `schedule`:
+                    starred when the applied membership differs from the
+                    pending config; --config-current / --config-pending
+                    force a single source. Empty when the entry isn't a
+                    member of any group.
+  job               Full namespaced name `<bundle>.<short>`. Always shown.
+  kind              "job" or "group". Falls back to the snapshot's recorded
+                    kind for orphan rows whose live config is gone.
+  last              Last-run outcome: ok | fail | timeout | gated | running
+                    | never | unknown.
+  last-ran          Compact relative time of the last run, e.g. "5m ago".
+  masked-by         platform | host | unused, or a combination of
+                    those joined with `,` (e.g. `host,platform` when
+                    both axes exclude the entry). Set when
+                    config=masked. `unused` means defined in config
+                    but not listed in the host's resolved target.jobs.
+  pending-schedule  The schedule from the live config, with no asterisk
+                    and no fallback to applied. Empty when the entry is
+                    not in any bundle.
+  schedule          Default mode shows the applied (current) schedule. When
+                    the pending schedule differs, the cell carries a
+                    trailing "*" and a footer prints below the table
+                    pointing at `crony apply`. --config-current and
+                    --config-pending force a single source. When the
+                    unit is disabled at the platform scheduler the cell
+                    renders as `disabled` -- the cron expression is
+                    misleading there since the unit won't fire. Add the
+                    opt-in `unit` column to see the platform-scheduler
+                    state for the rest of the rows. --config-pending
+                    suppresses this override (the pending schedule is
+                    a config fact, independent of runtime state).
+  unit              Platform scheduler view: enabled | disabled | grouped
+                    | none. `grouped` means the entry has no schedule
+                    (parent group dispatches it); `none` means the
+                    scheduler doesn't see a unit by this name.
+  unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
+                    `crony-<name>.timer` (scheduled) or
+                    `crony-<name>.service` (grouped) on Linux. Empty when
+                    neither config nor snapshot describes the entry.
+  unit-schedule     The applied schedule from the on-disk snapshot, with
+                    no asterisk and no fallback to pending. Empty when
+                    no snapshot exists or it predates the schedule field.
+
+Aliases
+-------
+{aliases_block}
+"""
+
+
+def _build_status_aliases_block() -> str:
+    """Render the Aliases help block from `_STATUS_COL_ALIASES`.
+
+    Each alias becomes one line: `  <name>  <expansion>`. `all`
+    is rendered with a descriptive label instead of the full
+    column list (which would just enumerate everything in the
+    Columns section above) so the block stays scannable.
+    """
+    lines: list[str] = []
+    for alias, expansion in _STATUS_COL_ALIASES.items():
+        if alias == "all":
+            label = "all"
+        else:
+            label = ", ".join(expansion)
+        lines.append(f"  {alias:<8}  {label}")
+    return "\n".join(lines)
+
+
+_STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
+    aliases_block=_build_status_aliases_block(),
+)
 
 
 def _parse_status_cols(spec: str | None) -> list[str]:
@@ -4953,7 +5083,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 def _resolve_state_axes(
     bundles: Bundles, full: str, platform: str, stamped: set[str]
 ) -> tuple[str, str, str]:
-    """Compute the (cfg, sched, last) status axes for one full name.
+    """Compute the (cfg, unit, last) status axes for one full name.
 
     `do_status` and `do_audit` share this pipeline so a future
     change to any axis stays consistent across the two views.
@@ -4973,17 +5103,222 @@ def _resolve_state_axes(
             short
         )
     if cfg_state == "missing":
-        sched_state = "unknown"
+        unit_state = "none"
     else:
         schedule, interval = (
             _entity_schedule(entry) if entry is not None else (None, None)
         )
         if entry is not None and schedule is None and interval is None:
-            sched_state = "grouped"
+            unit_state = "grouped"
         else:
-            sched_state = _sched_state(full, platform)
+            unit_state = _unit_state(full, platform)
     last_state = _last_run_state(full)
-    return cfg_state, sched_state, last_state
+    return cfg_state, unit_state, last_state
+
+
+def _entry_is_scheduled(entry: Job | JobGroup | None) -> bool:
+    if entry is None:
+        return False
+    sched, interval = _entity_schedule(entry)
+    return sched is not None or interval is not None
+
+
+def _snapshot_says_scheduled(full: str) -> bool | None:
+    """`True` / `False` if a snapshot is present and records its
+    schedule fields; `None` otherwise (legacy snapshots and missing
+    snapshots both fall through). Used to guess UNIT NAME for
+    entries whose live config no longer exists.
+    """
+    snap_path = _snapshot_path_for(full)
+    if not snap_path.exists():
+        return None
+    try:
+        raw = json.loads(snap_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    sched, interval = raw.get("schedule"), raw.get("interval")
+    if sched is None and interval is None and "schedule" not in raw:
+        # Legacy snapshot pre-dating these fields: can't decide.
+        return None
+    return sched is not None or interval is not None
+
+
+def _unit_name_for(
+    full: str, entry: Job | JobGroup | None, platform: str
+) -> str:
+    """Platform unit identifier for the UNIT NAME column.
+
+    On macOS, every entry is a launchd plist with the same label
+    shape regardless of schedule. On Linux, scheduled entries are
+    driven by a `<name>.timer`; grouped (no-schedule) entries
+    install only `<name>.service`. Falls back to the snapshot's
+    schedule fields when the live config no longer describes the
+    entry; returns "" when nothing on disk or in config can decide.
+    """
+    if platform == "darwin":
+        return _label_for(full)
+    if entry is not None:
+        scheduled = _entry_is_scheduled(entry)
+    else:
+        snap_says = _snapshot_says_scheduled(full)
+        if snap_says is None:
+            return ""
+        scheduled = snap_says
+    return (
+        _timer_path_for(full).name
+        if scheduled
+        else _service_path_for(full).name
+    )
+
+
+def _kind_from_snapshot(full: str) -> str:
+    """Best-effort `job` / `group` for entries no longer in config.
+
+    Orphan rows have lost their bundle entry but still carry an
+    on-disk snapshot from the last apply. The snapshot records
+    its `kind`, so KIND can fill in even though the config-side
+    lookup turns up nothing. Returns "" if no snapshot is present
+    or the file is unreadable.
+    """
+    snap_path = _snapshot_path_for(full)
+    if not snap_path.exists():
+        return ""
+    try:
+        raw = json.loads(snap_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if isinstance(raw, dict):
+        kind = raw.get("kind")
+        if kind in ("job", "group"):
+            return kind
+    return ""
+
+
+_STALE_VALUE_FOOTER: str = (
+    "* -- One or more starred cells are stale: the currently "
+    "active value differs from the pending config. Use "
+    "--config-pending to see the pending value, or run "
+    "`crony apply` to bring the active value in sync."
+)
+
+
+def _build_group_membership(
+    bundles: Bundles,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Reverse-index group membership across all bundles.
+
+    Returns `(pending, current)`. `pending[<full>]` lists the group
+    full names that include `<full>` as a child in the live config.
+    `current[<full>]` lists the group full names whose on-disk
+    snapshot's `children` list still records `<full>` as a member.
+    The two diverge when a group has been edited but not re-applied.
+    Each value list is sorted for stable display order.
+    """
+    pending: dict[str, list[str]] = {}
+    for b in bundles.bundles:
+        for g_short, g in b.config.job_groups.items():
+            g_full = b.full_name(g_short)
+            for child_short in g.jobs:
+                pending.setdefault(b.full_name(child_short), []).append(g_full)
+    current: dict[str, list[str]] = {}
+    if STATE_DIR.exists():
+        for entry_dir in STATE_DIR.iterdir():
+            if not entry_dir.is_dir():
+                continue
+            snap = entry_dir / "snapshot.json"
+            if not snap.exists():
+                continue
+            try:
+                raw = json.loads(snap.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict) or raw.get("kind") != "group":
+                continue
+            children = raw.get("children")
+            if not isinstance(children, list):
+                continue
+            g_full = raw.get("name") or entry_dir.name
+            for child in children:
+                if isinstance(child, str):
+                    current.setdefault(child, []).append(g_full)
+    for table in (pending, current):
+        for v in table.values():
+            v.sort()
+    return pending, current
+
+
+def _groups_cells(
+    pending: list[str], current: list[str], config_source: str
+) -> tuple[str, bool]:
+    """Return `(cell, is_stale)` for the GROUPS column.
+
+    Mirrors `_schedule_cells`: default mode shows current with
+    `is_stale=True` when pending differs (so the renderer can
+    annotate the cell and print the shared stale-value footer);
+    `current` and `pending` force a single source. Empty groups
+    list -> empty cell.
+    """
+    p_str = ",".join(pending)
+    c_str = ",".join(current)
+    if config_source == "current":
+        return (c_str, False)
+    if config_source == "pending":
+        return (p_str, False)
+    if not c_str:
+        return (p_str, False)
+    return (c_str, p_str != c_str)
+
+
+def _schedule_cells(
+    bundles: Bundles,
+    full: str,
+    config_source: str,
+) -> tuple[str, bool]:
+    """Return (cell, is_stale) for the SCHEDULE column.
+
+    `config_source` is "default", "current", or "pending". The
+    default source shows the applied (current) schedule when one
+    exists, with `is_stale` true if the pending schedule differs;
+    falls back to pending for entries that have never been
+    applied. `current` and `pending` force a single source and
+    never set is_stale (the user picked the source explicitly).
+    Cells with no value at all return an empty string.
+    """
+    bn, short = parse_full_name(full)
+    bundle = bundles.by_name(bn)
+    pending: str | None = None
+    if bundle is not None:
+        entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
+            short
+        )
+        if entry is not None:
+            sched, interval = _entity_schedule(entry)
+            pending = _schedule_display(sched, interval)
+    current: str | None = None
+    snap_path = _snapshot_path_for(full)
+    if snap_path.exists():
+        try:
+            raw = json.loads(snap_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict) and ("schedule" in raw or "interval" in raw):
+            # Both keys present-but-None means the entry was grouped
+            # at apply time; render as `grouped` to match the
+            # pending-schedule and schedule columns. Legacy
+            # snapshots written before these fields existed have
+            # neither key and fall through with current=None so
+            # status doesn't fabricate a schedule it doesn't know.
+            cs, ci = raw.get("schedule"), raw.get("interval")
+            current = _schedule_display(cs, ci)
+    if config_source == "current":
+        return (current or "", False)
+    if config_source == "pending":
+        return (pending or "", False)
+    if current is None:
+        return (pending or "", False)
+    return (current, pending is not None and pending != current)
 
 
 def do_status(
@@ -4991,6 +5326,8 @@ def do_status(
     cols: str | None,
     show_masked: bool,
     bundle: str | None,
+    config_current: bool,
+    config_pending: bool,
 ) -> None:
     """Print the resolved state per job in a tabular view.
 
@@ -5004,19 +5341,26 @@ def do_status(
     entries set surfaced by `-a`) to that bundle. Bare CLI input
     resolves in `<name>` and qualified names must match it.
 
-    `--cols` is a comma-separated list selecting which columns to
-    show, in order. Valid: job, config, sched, last, last-ran,
-    masked-by. The aliases `default` and `all` expand to the
-    default column set and every column respectively, and may be
-    mixed with explicit names (`default,masked-by`). `job` is
-    always included.
-
-    `-a` / `--all` extends the default selection with entries the
-    target reaches but the host's `platforms` / `hosts` filters
-    exclude. Those rows render with `config = masked` and the
-    masking axis in the `masked-by` column (which is hidden by
-    default; combine with `--cols default,masked-by` to surface it).
+    Column selection is via `--cols`; valid names, aliases, and
+    descriptions live in `crony status --help`'s epilog. `-a` /
+    `--all` lists every defined entry, including ones masked on
+    the current host (target-unused or excluded by the entry's
+    `platforms` / `hosts` filters). `--config-current` and
+    `--config-pending` force the SCHEDULE and GROUPS columns to a
+    single source and suppress the stale-marker asterisk; the two
+    flags are mutually exclusive.
     """
+    if config_current and config_pending:
+        raise UsageError(
+            "--config-current and --config-pending are mutually exclusive"
+        )
+    config_source = (
+        "current"
+        if config_current
+        else "pending"
+        if config_pending
+        else "default"
+    )
     selected_cols = _parse_status_cols(cols)
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
@@ -5053,37 +5397,82 @@ def do_status(
             active = active | set(masked_by_full)
         full_names = sorted(active)
 
+    pending_groups, current_groups = _build_group_membership(bundles)
     rows: list[dict[str, str]] = []
+    any_stale = False
     for full in full_names:
         mask_reason = masked_by_full.get(full, "")
-        if mask_reason and full not in selected and full not in stamped:
-            # A masked entry that has nothing on disk: there is no
-            # unit / hash / last-run to read from, so the non-config
-            # axes have no signal. Fix the row to "masked / unknown
-            # / never / never" so the table reflects "this entry is
-            # defined but the host's filters excluded it".
-            rows.append(
-                {
-                    "job": full,
-                    "config": "masked",
-                    "sched": "unknown",
-                    "last": "never",
-                    "last-ran": "never",
-                    "masked-by": mask_reason,
-                }
-            )
-            continue
-        cfg_state, sched, last = _resolve_state_axes(
-            bundles, full, platform, stamped
+        bn, short = parse_full_name(full)
+        bdl = bundles.by_name(bn)
+        entry = (
+            bdl.config.jobs.get(short) or bdl.config.job_groups.get(short)
+            if bdl is not None
+            else None
         )
+        if isinstance(entry, JobGroup):
+            kind = "group"
+        elif entry is not None:
+            kind = "job"
+        else:
+            kind = _kind_from_snapshot(full)
+        # Resolve the runtime axes up-front. The schedule cell
+        # below uses unit_state to decide whether to surface
+        # "disabled" instead of the cron expression. The mask-no-
+        # state branch substitutes placeholder values for entries
+        # the host doesn't act on AND that have no on-disk signal.
+        if mask_reason and full not in selected and full not in stamped:
+            cfg_state = "masked"
+            unit_state = "none"
+            last = "never"
+            last_ran = "never"
+        else:
+            cfg_state, unit_state, last = _resolve_state_axes(
+                bundles, full, platform, stamped
+            )
+            last_ran = _last_ran_at(full)
+            # Filter-mask or `unused` wins over a derived
+            # config state -- otherwise the row would claim
+            # `synced` and `masked-by=...` simultaneously.
+            if mask_reason:
+                cfg_state = "masked"
+        sched_cell, sched_stale = _schedule_cells(bundles, full, config_source)
+        if config_source != "pending" and unit_state == "disabled":
+            # The default and --config-current views describe
+            # what the host will actually run. A disabled timer
+            # doesn't fire on its schedule, so the cron expression
+            # is misleading -- show the runtime fact instead.
+            # Drop the stale-marker too: the cell is no longer
+            # the schedule it would have been compared against.
+            sched_cell = "disabled"
+            sched_stale = False
+        if sched_stale:
+            any_stale = True
+            sched_cell = f"{sched_cell} *"
+        unit_sched_cell, _ = _schedule_cells(bundles, full, "current")
+        pending_sched_cell, _ = _schedule_cells(bundles, full, "pending")
+        groups_cell, groups_stale = _groups_cells(
+            pending_groups.get(full, []),
+            current_groups.get(full, []),
+            config_source,
+        )
+        if groups_stale:
+            any_stale = True
+            groups_cell = f"{groups_cell} *"
+        unit_name = _unit_name_for(full, entry, platform)
         rows.append(
             {
                 "job": full,
+                "kind": kind,
                 "config": cfg_state,
-                "sched": sched,
+                "schedule": sched_cell,
+                "groups": groups_cell,
+                "unit": unit_state,
                 "last": last,
-                "last-ran": _last_ran_at(full),
+                "last-ran": last_ran,
                 "masked-by": mask_reason,
+                "unit-name": unit_name,
+                "unit-schedule": unit_sched_cell,
+                "pending-schedule": pending_sched_cell,
             }
         )
 
@@ -5097,7 +5486,7 @@ def do_status(
         widths[col] = max(len(header), cell_max)
 
     # Two-space separator: a single space ran headers and cells
-    # together at narrow column widths (e.g. CONFIG=6 vs SCHED=7
+    # together at narrow column widths (e.g. CONFIG=6 vs UNIT=8
     # produced columns visually flush against each other).
     sep = "  "
     header_line = sep.join(
@@ -5107,6 +5496,13 @@ def do_status(
     for row in rows:
         line = sep.join(f"{row[c]:<{widths[c]}}" for c in selected_cols)
         print(line.rstrip())
+    # The footer applies to any starred cell. Suppress when the
+    # user picked a column set that hides the columns that can
+    # carry the marker.
+    starred_cols = {"schedule", "groups"}
+    if any_stale and any(c in selected_cols for c in starred_cols):
+        print()
+        print(_STALE_VALUE_FOOTER)
 
 
 def do_logs(
@@ -5319,23 +5715,23 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
         candidates = sorted(selected | stamped)
 
     bad_config = {"stale", "missing", "orphan"}
-    bad_sched = {"unknown"}
+    bad_unit_state = {"none"}
     if not exclude_disabled:
-        bad_sched = bad_sched | {"disabled"}
+        bad_unit_state = bad_unit_state | {"disabled"}
     bad_last = {"fail", "timeout"}
 
     rows: list[tuple[str, str, str, str]] = []
     for full in candidates:
-        cfg_state, sched_state, last_state = _resolve_state_axes(
+        cfg_state, unit_state, last_state = _resolve_state_axes(
             bundles, full, platform, stamped
         )
         is_bad = (
             cfg_state in bad_config
-            or sched_state in bad_sched
+            or unit_state in bad_unit_state
             or last_state in bad_last
         )
         if is_bad:
-            rows.append((full, cfg_state, sched_state, last_state))
+            rows.append((full, cfg_state, unit_state, last_state))
 
     warnings: list[str] = []
     # Linger is host-wide -- skip it under --bundle scoping; the
@@ -5360,7 +5756,7 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     if rows:
         name_w = max(len(r[0]) for r in rows)
         name_w = max(name_w, len("JOB"))
-        print(f"{'JOB':<{name_w}} {'CONFIG':10} {'SCHED':10} {'LAST':10}")
+        print(f"{'JOB':<{name_w}} {'CONFIG':10} {'UNIT':10} {'LAST':10}")
         for name, cs, ss, ls in rows:
             print(f"{name:<{name_w}} {cs:10} {ss:10} {ls:10}")
 
@@ -5666,52 +6062,6 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     raise CronyError(f"notify-test failed: {detail}")
 
 
-def do_list(bundle: str | None) -> None:
-    """One-line summary per defined job/group.
-
-    With no --bundle, lists every bundle's contents. With --bundle
-    <name>, restricts the table to that one bundle. Names are full
-    namespaced (`<bundle>.<short>`).
-    """
-    bundles = load_all_bundles()
-    require_known_bundle(bundles, bundle)
-    platform = current_platform()
-    target_bundles = (
-        [b for b in bundles.bundles if b.name == bundle]
-        if bundle is not None
-        else list(bundles.bundles)
-    )
-    rows: list[tuple[str, str, str, str]] = []
-    for b in target_bundles:
-        target = resolve_target(b.config, current_host(), platform)
-        sel_jobs, sel_groups = selected_jobs_and_groups(b.config, target)
-        selected = sel_jobs | sel_groups
-        for short in sorted(set(b.config.jobs) | set(b.config.job_groups)):
-            full = b.full_name(short)
-            kind = "group" if short in b.config.job_groups else "job"
-            entry: Job | JobGroup = (
-                b.config.jobs.get(short) or b.config.job_groups[short]
-            )
-            sched_disp = entry.schedule or (
-                f"interval={entry.interval}"
-                if entry.interval
-                else "(group-only)"
-            )
-            is_selected = "yes" if short in selected else "no"
-            rows.append((full, kind, sched_disp, is_selected))
-    name_w = max((len(r[0]) for r in rows), default=0)
-    name_w = max(name_w, len("NAME"))
-    sched_w = max((len(r[2]) for r in rows), default=0)
-    sched_w = max(sched_w, len("SCHEDULE"))
-    print(
-        f"{'NAME':<{name_w}} {'KIND':6} {'SCHEDULE':<{sched_w}} {'SELECTED':8}"
-    )
-    for full, kind, sched_disp, is_selected in sorted(rows):
-        print(
-            f"{full:<{name_w}} {kind:6} {sched_disp:<{sched_w}} {is_selected:8}"
-        )
-
-
 def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
     """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
@@ -5929,6 +6279,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = subparsers.add_parser(
         "status",
         help="Print resolved state per job",
+        epilog=_STATUS_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_status.add_argument(
         "jobs",
@@ -5941,17 +6293,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="show_masked",
         action="store_true",
         help=(
-            "Also list jobs the target reaches but this host's "
-            "platforms/hosts filters mask out (config=masked)"
+            "List all defined entries, including ones masked on the "
+            "current host. Entries can be masked because they are "
+            "unused or associated with a different platform and/or "
+            "host."
         ),
     )
     p_status.add_argument(
         "--cols",
         default=None,
         help=(
-            "Comma-separated columns to display "
-            "(valid: job,config,sched,last,last-ran,masked-by; "
-            "aliases: default, all; default: default)"
+            "Comma-separated columns to display. See the Columns "
+            "sections in the help epilog for valid names, aliases, "
+            "and descriptions."
         ),
     )
     p_status.add_argument(
@@ -5961,6 +6315,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Restrict the table to one bundle. Bare names resolve "
             "in <bundle>; qualified names must match it."
+        ),
+    )
+    p_status.add_argument(
+        "--config-current",
+        action="store_true",
+        help=(
+            "SCHEDULE and GROUPS columns show only currently-"
+            "active (applied) values (no asterisk on divergence)"
+        ),
+    )
+    p_status.add_argument(
+        "--config-pending",
+        action="store_true",
+        help=(
+            "SCHEDULE and GROUPS columns show only pending values "
+            "from the live config (no asterisk on divergence)"
         ),
     )
 
@@ -6086,18 +6456,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # list
-    p_list = subparsers.add_parser(
-        "list",
-        help="One-line summary per job",
-    )
-    p_list.add_argument(
-        "-b",
-        "--bundle",
-        default=None,
-        help="Restrict listing to one bundle",
-    )
-
     # self-test
     p_st = subparsers.add_parser(
         "self-test",
@@ -6135,7 +6493,6 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "audit": do_audit,
     "validate": do_validate,
     "notify-test": do_notify_test,
-    "list": do_list,
 }
 
 
