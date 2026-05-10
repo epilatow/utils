@@ -75,9 +75,10 @@ state via `crony status`. The default columns are:
 opt-in columns are available via `--cols`, including `unit`
 (scheduler-side state: enabled / disabled / grouped / none),
 `groups` (group memberships), `kind` (job vs group), `masked-by`
-(why CONFIG is `masked`: platform / host / unused, or a combination
-joined with `,`), and applied-vs-pending splits of the schedule
-column. See `crony status --help` for the full column reference.
+(why CONFIG is `masked`: `host` and / or `platform` joined with
+`,`, or one of `unused` / `empty`), and applied-vs-pending splits
+of the schedule column. See `crony status --help` for the full
+column reference.
 
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
@@ -1792,9 +1793,13 @@ def selected_and_masked_jobs_and_groups(
     target whose own filters exclude them, plus children of a
     masked group (which inherit the parent's reason -- they're
     inactive on this host even if their own filters would pass).
-    The selected sets are identical to what `selected_jobs_and_groups`
-    returns; `masked` is the strictly-additional set that `--all`
-    exposes.
+    A group whose every direct child is itself masked on this
+    host has nothing to dispatch and joins the masked set with
+    reason `"empty"`; the cascade iterates to a fixed point so a
+    parent whose only effective child was a now-empty group is
+    demoted as well. The selected sets are identical to what
+    `selected_jobs_and_groups` returns; `masked` is the strictly-
+    additional set that `--all` exposes.
     """
     jobs: set[str] = set()
     groups: set[str] = set()
@@ -1838,6 +1843,26 @@ def selected_and_masked_jobs_and_groups(
     # that also made it into the selected sets.
     for n in jobs | groups:
         masked.pop(n, None)
+    # Empty-group cascade: a selected group with no unmasked
+    # direct child has nothing to dispatch on this host, so the
+    # reference is treated as a no-op and the group joins the
+    # masked set with reason "empty". Iterate to a fixed point so
+    # a parent whose only remaining child was itself a now-empty
+    # group cascades too. Cycles are rejected by `_validate_config`,
+    # so the loop terminates in O(group_count) iterations.
+    while True:
+        empties: list[str] = []
+        for gname in groups:
+            g = config.job_groups[gname]
+            if not g.jobs or not any(
+                (c in jobs) or (c in groups) for c in g.jobs
+            ):
+                empties.append(gname)
+        if not empties:
+            break
+        for gname in empties:
+            groups.discard(gname)
+            masked[gname] = "empty"
     return jobs, groups, masked
 
 
@@ -1897,10 +1922,18 @@ def resolved_group_timeout_sec(
       when waiting for a group.
     Cycle-safety: `_validate_config` rejects cycles in group
     references, so the recursion always terminates.
+
+    Children not selected on this host contribute zero (own
+    filter excludes them or empty-group cascade demoted them) --
+    the parent won't trigger them here, so the budget shouldn't
+    reserve their time either.
     """
     group = config.job_groups[group_name]
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
     total = 0.0
     for child in group.jobs:
+        if child not in sel_jobs and child not in sel_groups:
+            continue
         if child in config.jobs:
             total += resolved_job_timeout_sec(
                 config, target, config.jobs[child]
@@ -2024,8 +2057,22 @@ def _resolve_group_snapshot(
     the live config (not from children's pinned snapshots), so an
     apply pass that walks topologically still produces the right
     parent budget regardless of children's prior applied state.
+
+    Children that aren't selected on this host are dropped from
+    `children`. That covers both own-filter masks (the child's
+    own `platforms` / `hosts` exclude this host) and the
+    empty-group cascade (a child group whose own children are all
+    masked here). The reference becomes a no-op on this host, so
+    a shared bundle can list a host-restricted child from a
+    parent group that runs everywhere without the parent
+    dispatcher trying to trigger a unit that wasn't installed.
     """
-    children = [f"{bundle_name}.{c}" for c in group.jobs]
+    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    children = [
+        f"{bundle_name}.{c}"
+        for c in group.jobs
+        if c in sel_jobs or c in sel_groups
+    ]
     return GroupSnapshot(
         schema=_SNAPSHOT_SCHEMA,
         kind="group",
@@ -5043,11 +5090,15 @@ Columns
   last              Last-run outcome: ok | fail | timeout | gated | running
                     | never | unknown.
   last-ran          Compact relative time of the last run, e.g. "5m ago".
-  masked-by         platform | host | unused, or a combination of
-                    those joined with `,` (e.g. `host,platform` when
-                    both axes exclude the entry). Set when
-                    config=masked. `unused` means defined in config
-                    but not listed in the host's resolved target.jobs.
+  masked-by         `host` and / or `platform` joined with `,`
+                    (e.g. `host,platform` when both axes exclude
+                    the entry), or one of `unused` / `empty`. Set
+                    when config=masked. `unused` means defined in
+                    config but not listed in the host's resolved
+                    target.jobs. `empty` means a group whose every
+                    direct child is itself masked on this host --
+                    the reference is a no-op here, so the group
+                    is masked too.
   pending-schedule  The schedule from the live config, with no asterisk
                     and no fallback to applied. Empty when the entry is
                     not in any bundle.

@@ -1194,6 +1194,91 @@ class TestSelectionFilters:
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
 
+    def test_group_with_all_masked_children_is_masked_empty(
+        self, monkeypatch: Any
+    ) -> None:
+        # A group whose every direct child is itself masked on
+        # this host has nothing to dispatch -- the reference is a
+        # no-op and the group joins masked with reason "empty".
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {
+                    "a": _job(hosts=["other"]),
+                    "b": _job(platforms=["darwin"]),
+                },
+                "job-group": {
+                    "g": {"jobs": ["a", "b"], "schedule": "daily"},
+                },
+                "target": {"linux": {"jobs": ["g"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        _sel_jobs, sel_groups, masked = (
+            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        )
+        assert "g" not in sel_groups
+        assert masked.get("g") == "empty"
+        assert masked.get("a") == "host"
+        assert masked.get("b") == "platform"
+
+    def test_empty_group_cascade_propagates_to_parents(
+        self, monkeypatch: Any
+    ) -> None:
+        # P references only G, and G's only child is masked.
+        # G becomes "empty"; the cascade then demotes P, whose
+        # only remaining child is now masked.
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {"a": _job(hosts=["other"])},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "daily"},
+                    "p": {"jobs": ["g"], "schedule": "daily"},
+                },
+                "target": {"linux": {"jobs": ["p"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        _sel_jobs, sel_groups, masked = (
+            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        )
+        assert "g" not in sel_groups
+        assert "p" not in sel_groups
+        assert masked.get("g") == "empty"
+        assert masked.get("p") == "empty"
+
+    def test_group_with_partial_unmasked_child_stays_selected(
+        self, monkeypatch: Any
+    ) -> None:
+        # If at least one direct child is unmasked, the group is
+        # NOT empty -- it remains selected and its snapshot will
+        # reference that one child.
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        cfg = self._cfg(
+            {
+                "job": {
+                    "a": _job(),
+                    "b": _job(hosts=["other"]),
+                },
+                "job-group": {
+                    "g": {"jobs": ["a", "b"], "schedule": "daily"},
+                },
+                "target": {"linux": {"jobs": ["g"]}},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "linux")
+        sel_jobs, sel_groups, masked = (
+            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        )
+        assert "g" in sel_groups
+        assert "a" in sel_jobs
+        assert masked.get("b") == "host"
+        assert "g" not in masked
+
 
 # =============================================================================
 # crony init
@@ -6821,6 +6906,109 @@ class TestSnapshotLifecycle:
         assert snap["children"] == [h.full("a"), h.full("b")]
         # 1.05 * (100 + 200) = 315
         assert snap["group_budget_sec"] == 315
+
+    def test_group_snapshot_drops_host_masked_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A parent group can reference a child whose own `hosts`
+        # filter excludes the current host. The reference is a
+        # no-op here: the child isn't installed (its own filter
+        # masks it from selection), so the parent's snapshot must
+        # not list it -- otherwise group dispatch would call
+        # `systemctl --user start` on a unit that doesn't exist.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "job_timeout_sec": 100},
+                    "b": {
+                        "command": "true",
+                        "job_timeout_sec": 200,
+                        "hosts": ["some-other-host"],
+                    },
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        # `b` is masked on test-host; apply skips it via target
+        # selection. The group snapshot must do the same.
+        crony.apply_one(cfg, "g")
+        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        assert snap["children"] == [h.full("a")]
+        # Budget reflects only `a`: 1.05 * 100 = 105.
+        assert snap["group_budget_sec"] == 105
+
+    def test_group_snapshot_drops_platform_masked_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Mirror of the host-mask case for the platform axis.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "job_timeout_sec": 100},
+                    "b": {
+                        "command": "true",
+                        "job_timeout_sec": 200,
+                        "platforms": ["linux"],
+                    },
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "*-*-* 03:00",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        assert snap["children"] == [h.full("a")]
+        assert snap["group_budget_sec"] == 105
+
+    def test_group_snapshot_drops_masked_child_subgroup(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Same rule applies when the masked direct child is itself
+        # a sub-group. The parent's snapshot drops the reference;
+        # the sub-group never gets installed on this host.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "job_timeout_sec": 100},
+                    "x": {"command": "true", "job_timeout_sec": 50},
+                },
+                "job-group": {
+                    "sub": {
+                        "jobs": ["x"],
+                        "hosts": ["some-other-host"],
+                    },
+                    "g": {
+                        "jobs": ["a", "sub"],
+                        "schedule": "*-*-* 03:00",
+                    },
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap = _cast_dict(snap_path.read_text())
+        assert snap["children"] == [h.full("a")]
+        assert snap["group_budget_sec"] == 105
 
     def test_command_edit_flips_hash(
         self, tmp_path: Path, monkeypatch: Any
