@@ -2152,6 +2152,107 @@ class TestRunGroup:
         assert rec["jobs_run"][1]["name"] == h.full("b")
         assert rec["jobs_run"][1]["exit_class"] == "timeout"
 
+    def test_group_soft_fails_missing_child_unit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # If a parent group's snapshot references a child whose
+        # platform unit isn't installed (snapshot pre-dates a
+        # destroy, or the host was never apply'd post-refilter),
+        # the dispatcher raises `UnitNotInstalledError`. The
+        # group must catch it, record the child as a precondition
+        # fail, and continue with siblings -- otherwise a single
+        # stale reference takes the whole nightly run down and
+        # the notification path is bypassed.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "missing": {"command": "true"},
+                    "ok": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["missing", "ok"],
+                        "schedule": "daily",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+
+        def _stub(
+            full_name: str, *, job_timeout: float, trigger_timeout: float
+        ) -> dict[str, Any]:
+            if full_name == h.full("missing"):
+                raise crony.UnitNotInstalledError(
+                    f"unit for {full_name!r} is not installed on this host"
+                )
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+        rc = crony.run_group(h.snap(cfg, "g"))
+        # Group orchestration succeeds (rc 0); the child failure
+        # surfaces in the rolled-up exit_class and per-child
+        # records so the runner's notification path fires.
+        assert rc == 0
+        rec = _last_run(h.state, "g")
+        missing_rec = rec["jobs_run"][0]
+        assert missing_rec["name"] == h.full("missing")
+        assert missing_rec["exit_class"] == "fail"
+        assert missing_rec["exit_code"] == int(crony.ExitCode.PRECONDITION)
+        # Sibling still ran.
+        assert rec["jobs_run"][1]["name"] == h.full("ok")
+        assert rec["jobs_run"][1]["exit_class"] == "ok"
+        # Group rollup: a fail child surfaces at the group level.
+        assert rec["exit_class"] == "fail"
+
+
+class TestTriggerUnitNotInstalled:
+    """`_trigger_unit` refuses early when the platform unit file
+    doesn't exist, and `_trigger_unit_sync` doesn't side-effect a
+    state dir for a never-installed name.
+    """
+
+    def _isolate_unit_dirs(self, tmp_path: Path, monkeypatch: Any) -> None:
+        """Redirect LAUNCHAGENTS_DIR / SYSTEMD_USER_DIR at empty
+        tmp dirs so a missing `org.crony.<name>.plist` /
+        `crony-<name>.service` lookup gives a deterministic answer
+        regardless of what's in the test host's real ~/Library or
+        ~/.config/systemd/user.
+        """
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        sysd = tmp_path / "systemd-user"
+        sysd.mkdir()
+        monkeypatch.setattr(crony, "LAUNCHAGENTS_DIR", agents)
+        monkeypatch.setattr(crony, "SYSTEMD_USER_DIR", sysd)
+
+    def test_trigger_unit_raises_when_unit_file_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        self._isolate_unit_dirs(tmp_path, monkeypatch)
+        full = h.full("ghost")
+        platform = crony.current_platform()
+        with pytest.raises(crony.UnitNotInstalledError, match="not installed"):
+            crony._trigger_unit(full, platform)
+        # No state dir leaked.
+        assert not (h.state / full).exists()
+
+    def test_trigger_unit_sync_does_not_create_state_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The waiter takes a read-only stance on the state dir
+        # until the runner actually starts. Refusing a missing
+        # unit must not leave a phantom state-dir-only remnant
+        # behind (which `crony status` would then surface).
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        self._isolate_unit_dirs(tmp_path, monkeypatch)
+        full = h.full("ghost")
+        with pytest.raises(crony.UnitNotInstalledError):
+            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=5.0)
+        assert not (h.state / full).exists()
+
 
 # =============================================================================
 # Notify channels

@@ -446,6 +446,24 @@ class JobTimeoutError(CronyError):
     exit_code = ExitCode.TIMEOUT
 
 
+class UnitNotInstalledError(PreconditionError):
+    """A dispatcher was asked to fire a unit that isn't installed
+    on this host.
+
+    Surfaces from `_trigger_unit` when the platform unit file the
+    dispatcher would reach for doesn't exist. The typical cause
+    is a parent group whose snapshot still references a child
+    that was destroyed (or never applied here): `crony apply`
+    re-pins the parent's snapshot to drop the stale reference.
+    Caught and soft-failed by `run_group` so a single missing
+    child doesn't take down a whole group run. Inherits
+    `PreconditionError`'s `PRECONDITION` exit code so the
+    "precondition failed before exec" framing is consistent at
+    the exit-code level even though the specialization carries
+    the more specific message.
+    """
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -3292,6 +3310,16 @@ def run_group(
                             )
                         )
                         continue
+                    except UnitNotInstalledError as e:
+                        log_file.write(f"   {e}\n".encode())
+                        children.append(
+                            GroupChildResult(
+                                name=child_full_name,
+                                exit_class="fail",
+                                exit_code=int(ExitCode.PRECONDITION),
+                            )
+                        )
+                        continue
                     cls = rec.get("exit_class", "fail")
                     rc = _trigger_exit_code(rec)
                     log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
@@ -3369,6 +3397,21 @@ def _hash_path_for(name: str) -> Path:
 
 def _systemd_unit_name(name: str) -> str:
     return f"{BASENAME}-{name}.timer"
+
+
+def _dispatch_unit_path(name: str, platform: str) -> Path:
+    """File the dispatcher reaches for when firing `name`.
+
+    On linux, `systemctl --user start crony-<name>.service` -- so
+    the .service file, not the .timer (which is the scheduler-arm
+    side, not the dispatch side). On darwin, `launchctl kickstart`
+    targets the loaded plist by label. Used by `_trigger_unit` to
+    refuse early when the unit was never installed (or was
+    destroyed since the parent group's snapshot was pinned).
+    """
+    if platform == "linux":
+        return _service_path_for(name)
+    return _plist_path_for(name)
 
 
 def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
@@ -4309,7 +4352,20 @@ def _trigger_unit(name: str, platform: str) -> None:
     no-op -- the in-flight run continues and there is no fresh
     fire. Waiters that need to know the next completion's outcome
     use `_trigger_unit_sync` instead.
+
+    Raises `UnitNotInstalledError` if the platform unit file
+    doesn't exist. Refusing early matters for the group-dispatch
+    path: a parent's snapshot can name a child whose unit was
+    destroyed (or never applied here), and we don't want
+    `systemctl start` to either traceback at the CLI or leave
+    side-effects (a created state dir, a hung waiter) before the
+    caller can decide to soft-fail.
     """
+    if not _dispatch_unit_path(name, platform).exists():
+        raise UnitNotInstalledError(
+            f"unit for {name!r} is not installed on this host "
+            f"(run `crony apply` to re-pin the parent's snapshot)"
+        )
     if platform == "linux":
         # The timer's job is to fire the .service; trigger by
         # starting the service directly.
@@ -4388,7 +4444,12 @@ def _trigger_unit_sync(
     # pre_trigger and the loop would conclude "no fresh run yet"
     # for the entire trigger_timeout window.
     pre_trigger_dt = datetime.datetime.fromisoformat(_now_iso())
-    sd = _state_dir_for(full_name)
+    # Read-only paths -- do NOT mkdir the state dir here. If the
+    # unit isn't installed, `_trigger_unit` raises and the caller
+    # (typically `run_group`) soft-fails the child; creating the
+    # state dir just for the waiter's reads would leave a phantom
+    # remnant behind for a unit that never existed.
+    sd = STATE_DIR / full_name
     pid_path = sd / "run.pid"
     last_run_path = sd / "last-run.json"
     platform = current_platform()
