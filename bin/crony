@@ -3818,6 +3818,21 @@ def _state_dir_stamps() -> set[str]:
     return {d.name for d in STATE_DIR.iterdir() if (d / "hash").is_file()}
 
 
+def _state_dir_names() -> set[str]:
+    """Names with a state dir on this host, with or without a hash.
+
+    Broader than `_state_dir_stamps()`: a state dir whose `hash`
+    was stripped by a non-purge `crony destroy` still counts.
+    These are the leftover-runtime cases (`run.log`,
+    `last-run.json`, `run.lock`) that `crony destroy` deliberately
+    preserves for post-mortem and that `--purge-state` exists to
+    clean up.
+    """
+    if not STATE_DIR.exists():
+        return set()
+    return {d.name for d in STATE_DIR.iterdir() if d.is_dir()}
+
+
 def _platform_unit_names() -> set[str]:
     """Names with a crony-managed platform unit file on this host.
 
@@ -3846,17 +3861,36 @@ def _platform_unit_names() -> set[str]:
 
 
 def stamped_names() -> set[str]:
-    """Names crony has installed on this host.
+    """Names crony has actively installed on this host.
 
-    Union of `_state_dir_stamps()` (the normal "applied via crony"
-    case) and `_platform_unit_names()` (units lingering on disk
-    after a state wipe). Either signal alone is enough to surface
-    the entry to status / audit / destroy: with state-only, we
-    have the hash to detect drift; with units-only, we can still
-    report the entry as `orphan` and let `crony destroy` clean
-    up the unit files.
+    Union of `_state_dir_stamps()` (hash present, the normal
+    "applied via crony" case) and `_platform_unit_names()` (units
+    lingering on disk after a state wipe). Either signal is enough
+    to treat the entry as actionable: with hash-only, we have the
+    hash to detect drift; with unit-only, we can still report
+    the entry as `orphan` and let `crony destroy` clean up the
+    unit files.
+
+    Used by callers that need an entry actually wired up on the
+    host: `apply` (orphan removal), `enable`, `disable`,
+    `trigger`. For the broader "any leftover" set that includes
+    state-dir-only remnants from prior non-purge destroys, see
+    `discovered_names()`.
     """
     return _state_dir_stamps() | _platform_unit_names()
+
+
+def discovered_names() -> set[str]:
+    """Every name crony has any on-disk remnant of on this host.
+
+    Superset of `stamped_names()` that also includes state dirs
+    surviving from a non-purge `crony destroy` -- the dir lingers
+    with `run.log` / `last-run.json` / `run.lock` but no hash and
+    no unit. Without this set those names would be invisible to
+    status / audit / destroy, and `destroy --purge-state` could
+    not find them to clean up.
+    """
+    return _state_dir_names() | _platform_unit_names()
 
 
 # =============================================================================
@@ -4115,22 +4149,24 @@ def _config_state_for(
     `config`); `full_name` is the namespaced name used for the
     on-disk hash stamp and unit identifier.
 
-    A "stamp" here is any signal that crony installed this entry
-    on this host: either the state-dir hash, or a leftover
-    platform unit file (the latter covers the "state wiped, units
-    lingering" case so those entries surface as orphans for
-    destroy).
+    A "remnant" here is any signal that crony has on-disk state
+    for this entry: the state-dir hash, a leftover platform unit
+    file, or a state dir surviving a non-purge destroy. All three
+    surface as orphans for destroy when the entry isn't in config.
+    A "stamp" is the narrower hash-or-unit set -- the entry is
+    actively installed and apply / enable / disable / trigger can
+    operate on it.
     """
     in_config = short in config.jobs or short in config.job_groups
     hash_path = _hash_path_for(full_name)
     has_hash = hash_path.exists()
     has_unit = full_name in _platform_unit_names()
+    has_state_dir = (STATE_DIR / full_name).is_dir()
     has_stamp = has_hash or has_unit
-    if not in_config and has_stamp:
-        return "orphan"
-    if in_config and not has_stamp:
-        return "missing"
-    if not in_config and not has_stamp:
+    has_remnant = has_stamp or has_state_dir
+    if not in_config:
+        return "orphan" if has_remnant else "missing"
+    if not has_stamp:
         return "missing"
     if not has_hash:
         # Unit on disk but no hash to compare against (state was
@@ -4621,28 +4657,33 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
     """Remove platform units.
 
-    No args: factory reset -- every crony-managed unit on this host
-    (every stamped name across all bundles).
+    No args: factory reset -- every crony-managed remnant on this
+    host. Discovery is broader than just "actively stamped":
+    `--purge-state` also picks up state dirs left behind by an
+    earlier non-purge destroy (whose hash and unit were removed
+    but whose runtime artifacts were preserved for post-mortem),
+    so the user can reach those leftovers without tracking
+    paths down by hand.
 
     With `--bundle <name>` and no positional args: scope the reset
-    to that bundle's stamped names. Other bundles' units stay
-    intact.
+    to that bundle's discovered names. Other bundles' remnants
+    stay intact.
 
     With names: surgical removal by full namespaced name. Refuses
-    if a name is in neither any bundle's config nor the stamped set;
-    refuses if a name's run.lock is currently held. Under
-    `--bundle`, bare names resolve in that bundle and qualified
-    names must match it.
+    if a name is in neither any bundle's config nor the
+    discovered set; refuses if a name's run.lock is currently
+    held. Under `--bundle`, bare names resolve in that bundle and
+    qualified names must match it.
     """
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
-        # currently-stamped name (so an old stamp can still be
-        # destroyed even after the bundle is gone).
+        # name with an on-disk remnant (so a leftover state dir or
+        # unit can still be destroyed after the bundle is gone).
         defined = set(by_full.keys()) | bundles.all_full_names()
-        known = defined | stamped_names()
+        known = defined | discovered_names()
         if bundle is not None:
             known = bundle_prefix_filter(known, bundle)
         normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
@@ -4651,10 +4692,10 @@ def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
     else:
-        stamps = stamped_names()
+        names = discovered_names()
         if bundle is not None:
-            stamps = bundle_prefix_filter(stamps, bundle)
-        full_names_to_destroy = sorted(stamps)
+            names = bundle_prefix_filter(names, bundle)
+        full_names_to_destroy = sorted(names)
 
     for full in full_names_to_destroy:
         # Refuse if a run is in progress; a partial destroy would
@@ -5081,7 +5122,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 
 
 def _resolve_state_axes(
-    bundles: Bundles, full: str, platform: str, stamped: set[str]
+    bundles: Bundles, full: str, platform: str, remnants: set[str]
 ) -> tuple[str, str, str]:
     """Compute the (cfg, unit, last) status axes for one full name.
 
@@ -5095,7 +5136,7 @@ def _resolve_state_axes(
     bn, short = parse_full_name(full)
     bundle = bundles.by_name(bn)
     if bundle is None:
-        cfg_state = "orphan" if full in stamped else "missing"
+        cfg_state = "orphan" if full in remnants else "missing"
         entry: Job | JobGroup | None = None
     else:
         cfg_state = _config_state_for(bundle.config, short, full, platform)
@@ -5368,10 +5409,10 @@ def do_status(
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
-    stamped = stamped_names()
+    remnants = discovered_names()
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
-        stamped = bundle_prefix_filter(stamped, bundle)
+        remnants = bundle_prefix_filter(remnants, bundle)
         masked_by_full = {
             n: r
             for n, r in masked_by_full.items()
@@ -5392,7 +5433,7 @@ def do_status(
     if jobs:
         full_names = [resolve_cli_name(n, bundle) for n in jobs]
     else:
-        active = selected | stamped
+        active = selected | remnants
         if show_masked:
             active = active | set(masked_by_full)
         full_names = sorted(active)
@@ -5420,14 +5461,14 @@ def do_status(
         # "disabled" instead of the cron expression. The mask-no-
         # state branch substitutes placeholder values for entries
         # the host doesn't act on AND that have no on-disk signal.
-        if mask_reason and full not in selected and full not in stamped:
+        if mask_reason and full not in selected and full not in remnants:
             cfg_state = "masked"
             unit_state = "none"
             last = "never"
             last_ran = "never"
         else:
             cfg_state, unit_state, last = _resolve_state_axes(
-                bundles, full, platform, stamped
+                bundles, full, platform, remnants
             )
             last_ran = _last_ran_at(full)
             # Filter-mask or `unused` wins over a derived
@@ -5692,11 +5733,12 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     """Walk every job; print bad rows; exit AUDIT_FAILED on hits.
 
     With no --bundle, iterates every bundle's selection plus every
-    orphan stamp on disk, and reports linger status. With --bundle
-    <name>, scopes to that bundle's selected jobs and orphan stamps
-    in that bundle's namespace (so a leftover `<name>.gone.hash` is
-    still surfaced); cross-host checks like linger are skipped --
-    they're about the whole-host picture, not any one bundle.
+    on-disk remnant (hash, unit file, or leftover state dir from a
+    prior non-purge destroy), and reports linger status. With
+    --bundle <name>, scopes to that bundle's selected jobs and
+    remnants in that bundle's namespace; cross-host checks like
+    linger are skipped -- they're about the whole-host picture,
+    not any one bundle.
 
     Bad means CONFIG drift (stale/missing/orphan), the scheduler
     being unable to fire (unknown, plus disabled by default), or
@@ -5707,12 +5749,12 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     require_known_bundle(bundles, bundle)
     platform = current_platform()
     _by_full, selected = _selected_full_names_per_bundle(bundles)
-    stamped = stamped_names()
+    remnants = discovered_names()
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
-        candidates = sorted(selected | bundle_prefix_filter(stamped, bundle))
+        candidates = sorted(selected | bundle_prefix_filter(remnants, bundle))
     else:
-        candidates = sorted(selected | stamped)
+        candidates = sorted(selected | remnants)
 
     bad_config = {"stale", "missing", "orphan"}
     bad_unit_state = {"none"}
@@ -5723,7 +5765,7 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     rows: list[tuple[str, str, str, str]] = []
     for full in candidates:
         cfg_state, unit_state, last_state = _resolve_state_axes(
-            bundles, full, platform, stamped
+            bundles, full, platform, remnants
         )
         is_bad = (
             cfg_state in bad_config
@@ -5912,8 +5954,8 @@ def do_validate(bundle: str | None) -> None:
     warnings: list[str] = []
     if bundle is None:
         _by_full, selected = _selected_full_names_per_bundle(bundles)
-        stamped = stamped_names()
-        orphans = sorted(stamped - selected)
+        remnants = discovered_names()
+        orphans = sorted(remnants - selected)
         if orphans:
             warnings.append(f"orphans on this host: {orphans}")
         if platform == "linux":
@@ -6175,7 +6217,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Scope the destroy to one bundle. Bare names resolve in "
             "<bundle>; qualified names must match it. With no "
-            "positional args, only that bundle's stamps are removed."
+            "positional args, only that bundle's on-disk remnants "
+            "are removed."
         ),
     )
 
