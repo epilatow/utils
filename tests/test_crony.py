@@ -4802,6 +4802,174 @@ class TestStatusReport:
         # is hidden in the default column set.
         assert "masked" in out
 
+    def test_filter_masked_entry_with_remnants_reports_orphan(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Install a job, then tighten the config so the same entry
+        # is masked here (hosts=["other"]). The on-disk unit / hash
+        # / state-dir become orphaned: `crony destroy --orphans`
+        # is the cleanup, and status must surface it as `orphan`
+        # in the default view so the cleanup is discoverable. The
+        # masked-by column still carries the reason (`host`).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "orphan" in row
+        assert "masked" not in row
+        assert row.split()[-1] == "host"
+
+    def test_filter_masked_entry_without_remnants_stays_masked(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Counterpart to the orphan case: never applied here, so
+        # no remnants. The row stays `masked` and is hidden from
+        # the default view; --all surfaces it.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_status(
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        assert h.full("j") not in out
+        crony.do_status(
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "masked" in row
+        assert "orphan" not in row
+
+    def test_empty_cascade_group_with_remnant_reports_orphan(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A group whose only child is host-only on `other`: under
+        # the empty-mask cascade the group itself is masked with
+        # reason `empty`. If the group was previously applied
+        # here (when the child wasn't yet restricted), the unit
+        # remnant should now report as `orphan` -- same axis as
+        # direct host-mask + remnant, just via the cascade.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        crony.apply_one(cfg, "g")
+        h.config(
+            {
+                "job": {"a": {"command": "true", "hosts": ["other"]}},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("g"))
+        )
+        assert "orphan" in row
+        assert row.split()[-1] == "empty"
+
+    def test_unused_entry_with_remnants_reports_orphan(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `unused` is the other axis that puts a name into masked-by
+        # without an own filter: it's defined in the bundle but no
+        # target lists it. If a prior config listed it and apply
+        # installed it, removing the target reference leaves an
+        # orphan -- same as the host-mask case.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=[],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="default,masked-by",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out = capsys.readouterr().out
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "orphan" in row
+        assert row.split()[-1] == "unused"
+
     def test_cols_all_alias_expands_to_every_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
@@ -5905,6 +6073,38 @@ class TestAudit:
             crony.do_audit(exclude_disabled=False, bundle=None)
         out = capsys.readouterr().out
         assert h.full("j") in out and "fail" in out
+
+    def test_filter_masked_remnant_flagged_as_orphan(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply a job, then tighten the filter so it's masked on
+        # this host. The on-disk remnant must surface in audit as
+        # an `orphan` -- status reports the same thing, and audit
+        # should agree so a CI gate catches the leftover.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        with pytest.raises(crony.AuditFailedError):
+            crony.do_audit(exclude_disabled=False, bundle=None)
+        out = capsys.readouterr().out
+        assert h.full("j") in out
+        assert "orphan" in out
 
     def test_disabled_excluded_when_flag_set(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
