@@ -3785,15 +3785,16 @@ def apply_one(
     return "added" if old_hash is None else "updated"
 
 
-def destroy_one(name: str, *, purge_state: bool = False) -> None:
+def destroy_one(name: str, *, preserve_runtime: bool = False) -> None:
     """Remove a single name's platform unit and apply-time state.
 
-    Default removes the platform unit files plus `hash` and
-    `snapshot.json` inside the entry's state dir, but preserves
-    the run-time artifacts (run.log, last-run.json, etc.) so a
-    later post-mortem stays possible. `--purge-state` additionally
-    wipes the entire entry dir. Errok throughout so a partially-
-    installed unit can still be cleaned up.
+    Default wipes the entire entry dir along with the platform
+    unit files, leaving no on-disk trace of the entry on this
+    host. `preserve_runtime=True` keeps the run-time artifacts
+    (run.log, last-run.json, run.lock) so a later post-mortem is
+    still possible -- only the unit, hash, and snapshot are
+    removed. Errok throughout so a partially-installed unit can
+    still be cleaned up.
     """
     platform = current_platform()
     _deactivate_unit(name, platform)
@@ -3802,13 +3803,13 @@ def destroy_one(name: str, *, purge_state: bool = False) -> None:
     else:
         _service_path_for(name).unlink(missing_ok=True)
         _timer_path_for(name).unlink(missing_ok=True)
-    if purge_state:
+    if preserve_runtime:
+        _hash_path_for(name).unlink(missing_ok=True)
+        _snapshot_path_for(name).unlink(missing_ok=True)
+    else:
         sd = STATE_DIR / name
         if sd.exists():
             shutil.rmtree(sd)
-    else:
-        _hash_path_for(name).unlink(missing_ok=True)
-        _snapshot_path_for(name).unlink(missing_ok=True)
 
 
 def _state_dir_stamps() -> set[str]:
@@ -3822,11 +3823,10 @@ def _state_dir_names() -> set[str]:
     """Names with a state dir on this host, with or without a hash.
 
     Broader than `_state_dir_stamps()`: a state dir whose `hash`
-    was stripped by a non-purge `crony destroy` still counts.
+    was stripped by a `--preserve-runtime` destroy still counts.
     These are the leftover-runtime cases (`run.log`,
-    `last-run.json`, `run.lock`) that `crony destroy` deliberately
-    preserves for post-mortem and that `--purge-state` exists to
-    clean up.
+    `last-run.json`, `run.lock`) that the opt-in
+    `--preserve-runtime` flag deliberately keeps for post-mortem.
     """
     if not STATE_DIR.exists():
         return set()
@@ -3884,11 +3884,11 @@ def discovered_names() -> set[str]:
     """Every name crony has any on-disk remnant of on this host.
 
     Superset of `stamped_names()` that also includes state dirs
-    surviving from a non-purge `crony destroy` -- the dir lingers
-    with `run.log` / `last-run.json` / `run.lock` but no hash and
-    no unit. Without this set those names would be invisible to
-    status / audit / destroy, and `destroy --purge-state` could
-    not find them to clean up.
+    surviving from a `--preserve-runtime` destroy -- the dir
+    lingers with `run.log` / `last-run.json` / `run.lock` but no
+    hash and no unit. Without this set those names would be
+    invisible to status / audit / destroy, and a follow-up
+    destroy could not find them to clean up.
     """
     return _state_dir_names() | _platform_unit_names()
 
@@ -4654,27 +4654,45 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
             logger.info("%s: orphan removed", orphan)
 
 
-def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
+def do_destroy(
+    jobs: list[str],
+    preserve_runtime: bool,
+    bundle: str | None,
+    orphans: bool,
+) -> None:
     """Remove platform units.
 
     No args: factory reset -- every crony-managed remnant on this
-    host. Discovery is broader than just "actively stamped":
-    `--purge-state` also picks up state dirs left behind by an
-    earlier non-purge destroy (whose hash and unit were removed
-    but whose runtime artifacts were preserved for post-mortem),
-    so the user can reach those leftovers without tracking
+    host. Discovery covers state dirs (with or without hash) plus
+    platform unit files, so leftovers from an earlier
+    `--preserve-runtime` destroy are reachable without tracking
     paths down by hand.
 
     With `--bundle <name>` and no positional args: scope the reset
     to that bundle's discovered names. Other bundles' remnants
     stay intact.
 
+    With `--orphans`: limit removal to entries with on-disk
+    remnants that no bundle's live config selects to install on
+    this host. Combinable with `--bundle` (orphans within that
+    bundle namespace). Mutually exclusive with positional names.
+
     With names: surgical removal by full namespaced name. Refuses
     if a name is in neither any bundle's config nor the
     discovered set; refuses if a name's run.lock is currently
     held. Under `--bundle`, bare names resolve in that bundle and
     qualified names must match it.
+
+    `preserve_runtime=True` (CLI: `--preserve-runtime`) keeps
+    `run.log`, `last-run.json`, and `run.lock` for post-mortem
+    review; the unit, hash, and snapshot are still removed. The
+    default fully wipes the entry's state dir so destroy leaves
+    no on-disk trace.
     """
+    if orphans and jobs:
+        raise UsageError(
+            "--orphans and positional names are mutually exclusive"
+        )
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
     if jobs:
@@ -4693,6 +4711,9 @@ def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
         full_names_to_destroy = normalized
     else:
         names = discovered_names()
+        if orphans:
+            _by_full, selected = _selected_full_names_per_bundle(bundles)
+            names = names - selected
         if bundle is not None:
             names = bundle_prefix_filter(names, bundle)
         full_names_to_destroy = sorted(names)
@@ -4709,8 +4730,12 @@ def do_destroy(jobs: list[str], purge_state: bool, bundle: str | None) -> None:
                 raise LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 )
-        destroy_one(full, purge_state=purge_state)
-        logger.info("%s: %s", full, "purged" if purge_state else "destroyed")
+        destroy_one(full, preserve_runtime=preserve_runtime)
+        logger.info(
+            "%s: %s",
+            full,
+            "destroyed (runtime kept)" if preserve_runtime else "destroyed",
+        )
 
 
 def _entry_schedule_state(bundles: Bundles, full: str) -> str:
@@ -6206,9 +6231,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_destroy.add_argument(
-        "--purge-state",
+        "--preserve-runtime",
         action="store_true",
-        help="Also delete log/state dirs for affected jobs",
+        help=(
+            "Keep run.log, last-run.json, and run.lock for "
+            "post-mortem; only the unit, hash, and snapshot "
+            "are removed. Default: full wipe."
+        ),
+    )
+    p_destroy.add_argument(
+        "--orphans",
+        action="store_true",
+        help=(
+            "Limit removal to entries with on-disk remnants "
+            "that no live config selects on this host. "
+            "Combinable with -b/--bundle; mutually exclusive "
+            "with positional names."
+        ),
     )
     p_destroy.add_argument(
         "-b",

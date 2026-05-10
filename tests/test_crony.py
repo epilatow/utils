@@ -3150,6 +3150,28 @@ class TestApplyFullSync:
         crony.do_apply(jobs=["j"], verbose=False, bundle=None)
         assert (orphan_dir / "hash").exists()  # left alone
 
+    def test_no_arg_apply_fully_wipes_orphan_state_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Apply's orphan removal goes through destroy_one with
+        # default semantics, which fully wipes the entry's state
+        # dir -- runtime artifacts included. This matches the
+        # default destroy behavior so a renamed entry's residue
+        # doesn't keep surfacing in status / audit after the
+        # next apply.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        orphan_dir = h.state / "old"
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "hash").write_text("legacy\n")
+        (orphan_dir / "run.log").write_text("old run\n")
+        (orphan_dir / "last-run.json").write_text("{}")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        assert not orphan_dir.exists()
+
     def test_unchanged_suppressed_by_default(
         self,
         tmp_path: Path,
@@ -3270,7 +3292,9 @@ class TestDestroy:
         crony.apply_one(cfg, "j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert (h.state / h.full("j") / "hash").exists()
-        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=False
+        )
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert not (h.state / h.full("j") / "hash").exists()
 
@@ -3287,38 +3311,38 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
-        crony.do_destroy(jobs=["a"], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=["a"], preserve_runtime=False, bundle=None, orphans=False
+        )
         assert not (h.state / h.full("a") / "hash").exists()
         assert (h.state / h.full("b") / "hash").exists()
 
-    def test_purge_state_removes_state_dir(
+    def test_default_destroy_wipes_state_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # Default destroy fully wipes the state dir, including run-
+        # time artifacts. `--preserve-runtime` is the opt-in to keep
+        # them.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        # Pretend a run created state
-        (h.state / h.full("j") / "run.log").parent.mkdir(
-            parents=True, exist_ok=True
+        sd = h.state / h.full("j")
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "run.log").write_text("...")
+        crony.do_destroy(
+            jobs=["j"], preserve_runtime=False, bundle=None, orphans=False
         )
-        (h.state / h.full("j") / "run.log").write_text("...")
-        crony.do_destroy(jobs=["j"], purge_state=True, bundle=None)
-        assert not (h.state / h.full("j")).exists()
+        assert not sd.exists()
 
-    def test_purge_state_cleans_post_destroy_orphan_state_dir(
+    def test_preserve_runtime_keeps_runtime_artifacts(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A non-purge `crony destroy` deliberately preserves runtime
-        # artifacts (run.log, last-run.json, run.lock) for post-
-        # mortem, but it removes the hash and the unit. The leftover
-        # state dir has no hash and no unit, so it's invisible to
-        # the narrower stamped-names discovery. The follow-up
-        # `destroy --purge-state` must still find it via the broader
-        # discovery set and clean it up -- otherwise --purge-state
-        # is a no-op against the very state it exists to handle.
+        # `--preserve-runtime` removes the unit, hash, and snapshot
+        # but keeps run.log / last-run.json / run.lock for post-
+        # mortem. The state dir survives without a hash.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -3328,20 +3352,48 @@ class TestDestroy:
         sd = h.state / h.full("j")
         (sd / "run.log").write_text("...", encoding="utf-8")
         (sd / "last-run.json").write_text("{}", encoding="utf-8")
-        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=["j"], preserve_runtime=True, bundle=None, orphans=False
+        )
         assert sd.exists()
         assert not (sd / "hash").exists()
-        crony.do_destroy(jobs=[], purge_state=True, bundle=None)
-        assert not sd.exists()
+        assert not (sd / "snapshot.json").exists()
+        assert (sd / "run.log").read_text() == "..."
+        assert (sd / "last-run.json").read_text() == "{}"
 
-    def test_purge_state_cleans_post_destroy_orphan_under_bundle(
+    def test_destroy_cleans_residue_from_preserve_runtime_destroy(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Bundle-scoped variant: a `--bundle X --purge-state`
-        # destroy must reach state-dir-only orphans inside that
-        # bundle's namespace, not just hash-stamped or unit-stamped
-        # ones. The bundle filter is applied to the broader
-        # discovered-names set.
+        # The state dir left behind by a `--preserve-runtime`
+        # destroy has no hash and no unit. A follow-up default
+        # destroy must still find it via the broader discovery
+        # (state-dir presence) and wipe it -- otherwise the
+        # leftover would be invisible to crony forever.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        sd = h.state / h.full("j")
+        (sd / "run.log").write_text("...", encoding="utf-8")
+        crony.do_destroy(
+            jobs=[], preserve_runtime=True, bundle=None, orphans=False
+        )
+        assert sd.exists()
+        assert not (sd / "hash").exists()
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=False
+        )
+        assert not sd.exists()
+
+    def test_destroy_cleans_residue_under_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Bundle-scoped variant: a default `--bundle X` destroy
+        # must reach state-dir-only residue from a prior
+        # `--preserve-runtime --bundle X` destroy in that
+        # bundle's namespace.
         h = _ApplyHarness(tmp_path, monkeypatch)
         (h.cfg_dropin / "private.toml").write_text(
             '[job.j]\ncommand = "true"\nschedule = "*-*-* 03:00"\n'
@@ -3355,9 +3407,13 @@ class TestDestroy:
         crony.apply_one(priv.config, "j", bundle_name="private")
         sd = h.state / "private.j"
         (sd / "run.log").write_text("...", encoding="utf-8")
-        crony.do_destroy(jobs=[], purge_state=False, bundle="private")
+        crony.do_destroy(
+            jobs=[], preserve_runtime=True, bundle="private", orphans=False
+        )
         assert sd.exists()
-        crony.do_destroy(jobs=[], purge_state=True, bundle="private")
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle="private", orphans=False
+        )
         assert not sd.exists()
 
     def test_unknown_name_rejected(
@@ -3366,7 +3422,12 @@ class TestDestroy:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown"):
-            crony.do_destroy(jobs=["ghost"], purge_state=False, bundle=None)
+            crony.do_destroy(
+                jobs=["ghost"],
+                preserve_runtime=False,
+                bundle=None,
+                orphans=False,
+            )
 
     def test_destroy_refuses_with_run_in_progress_message(
         self, tmp_path: Path, monkeypatch: Any
@@ -3391,7 +3452,12 @@ class TestDestroy:
         _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         try:
             with pytest.raises(crony.LockBusyError) as exc:
-                crony.do_destroy(jobs=["j"], purge_state=False, bundle=None)
+                crony.do_destroy(
+                    jobs=["j"],
+                    preserve_runtime=False,
+                    bundle=None,
+                    orphans=False,
+                )
             assert "run in progress; will not destroy" in str(exc.value)
             assert exc.value.exit_code == crony.ExitCode.LOCK_BUSY
         finally:
@@ -3417,7 +3483,9 @@ class TestDestroy:
         shutil.rmtree(h.state)
         assert plist.exists()
         # Factory reset still finds and removes the orphan plist.
-        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=False
+        )
         assert not plist.exists()
 
     def test_bundle_unknown_rejected(
@@ -3426,13 +3494,18 @@ class TestDestroy:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown bundle"):
-            crony.do_destroy(jobs=[], purge_state=False, bundle="ghost")
+            crony.do_destroy(
+                jobs=[],
+                preserve_runtime=False,
+                bundle="ghost",
+                orphans=False,
+            )
 
     def test_bundle_scoped_destroy_leaves_other_bundles(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Two bundles, both stamped. `destroy -b borgadm` removes
-        # only borgadm's stamps; default's survive.
+        # only borgadm's remnants; default's survive.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -3449,9 +3522,14 @@ class TestDestroy:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
-        crony.do_destroy(jobs=[], purge_state=False, bundle="borgadm")
+        crony.do_destroy(
+            jobs=[],
+            preserve_runtime=False,
+            bundle="borgadm",
+            orphans=False,
+        )
         assert (h.state / "default.j" / "hash").exists()
-        assert not (h.state / "borgadm.k" / "hash").exists()
+        assert not (h.state / "borgadm.k").exists()
 
     def test_bundle_qualified_other_bundle_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -3470,8 +3548,114 @@ class TestDestroy:
         )
         with pytest.raises(crony.UsageError, match="bundle 'default'"):
             crony.do_destroy(
-                jobs=["default.j"], purge_state=False, bundle="borgadm"
+                jobs=["default.j"],
+                preserve_runtime=False,
+                bundle="borgadm",
+                orphans=False,
             )
+
+    def test_orphans_flag_destroys_unselected_remnants(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Apply a config, drop the entry from config (a rename
+        # leaves the old name's remnants behind), then run
+        # `destroy --orphans`. Only the orphaned remnants are
+        # removed; entries that remain selected stay put.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "live": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "renamed": {"command": "true", "schedule": "*-*-* 04:00"},
+                }
+            },
+            default_target_jobs=["live", "renamed"],
+        )
+        crony.apply_one(cfg, "live")
+        crony.apply_one(cfg, "renamed")
+        # Drop `renamed` from config without applying -- now
+        # selected={live} but discovered={live,renamed}.
+        h.config(
+            {
+                "job": {
+                    "live": {"command": "true", "schedule": "*-*-* 03:00"},
+                }
+            },
+            default_target_jobs=["live"],
+        )
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=True
+        )
+        assert (h.state / h.full("live") / "hash").exists()
+        assert not (h.state / h.full("renamed")).exists()
+        assert not (h.agents / f"org.crony.{h.full('renamed')}.plist").exists()
+
+    def test_orphans_flag_under_bundle_scopes_to_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Two bundles each have one orphan. `--orphans -b borgadm`
+        # touches only borgadm's orphan; default's orphan stays.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"old_d": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["old_d"],
+        )
+        crony.apply_one(cfg, "old_d")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.old_b]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["old_b"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        crony.apply_one(borgadm.config, "old_b", bundle_name="borgadm")
+        # Strip both entries from their configs, leaving them
+        # as orphan remnants on disk.
+        h.config({}, default_target_jobs=[])
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            "[target.darwin]\njobs = []\n",
+            encoding="utf-8",
+        )
+        crony.do_destroy(
+            jobs=[],
+            preserve_runtime=False,
+            bundle="borgadm",
+            orphans=True,
+        )
+        assert (h.state / "default.old_d" / "hash").exists()
+        assert not (h.state / "borgadm.old_b").exists()
+
+    def test_orphans_flag_with_positional_names_rejected(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="mutually exclusive"):
+            crony.do_destroy(
+                jobs=["foo"],
+                preserve_runtime=False,
+                bundle=None,
+                orphans=True,
+            )
+
+    def test_orphans_flag_leaves_active_entries_alone(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # No orphans on disk: `--orphans` is a no-op and active
+        # entries are untouched.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=True
+        )
+        assert (h.state / h.full("j") / "hash").exists()
+        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
 # =============================================================================
@@ -4230,10 +4414,11 @@ class TestStatusReport:
     def test_orphan_appears_when_only_state_dir_remains(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # A non-purge `crony destroy` removes the unit and the hash
-        # but preserves runtime artifacts (run.log, last-run.json).
-        # Status must still surface that residual state dir as
-        # orphan so the user can clean it up with --purge-state.
+        # A `--preserve-runtime` destroy removes the unit and the
+        # hash but keeps run.log / last-run.json. Status must
+        # still surface that residual state dir as orphan so the
+        # user can clean it up with a follow-up default destroy
+        # (or `destroy --orphans`).
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -4243,7 +4428,9 @@ class TestStatusReport:
         sd = h.state / h.full("j")
         (sd / "run.log").write_text("...", encoding="utf-8")
         h.config({}, default_target_jobs=[])
-        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=[], preserve_runtime=True, bundle=None, orphans=False
+        )
         assert sd.exists()
         assert not (sd / "hash").exists()
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
@@ -6955,7 +7142,9 @@ class TestLifecycleSmoke:
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset
-        crony.do_destroy(jobs=[], purge_state=False, bundle=None)
+        crony.do_destroy(
+            jobs=[], preserve_runtime=False, bundle=None, orphans=False
+        )
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
