@@ -16,12 +16,15 @@ import collections
 import importlib.machinery
 import io
 import importlib.util
+import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -124,6 +127,189 @@ def mock_cfg() -> Any:
     setattr(ba, "CFG", cfg)
     yield cfg
     setattr(ba, "CFG", original_cfg)
+
+
+# -----------------------------------------------------------------------------
+# E2E fixture: real borg repo + real subprocess invocations of borgadm.
+# -----------------------------------------------------------------------------
+
+# Backup-set layout used by borg_e2e. Two sets, each rooted at a single
+# source directory under BACKUP_ROOT. Trailing slash marks the path as a
+# directory (vs. a file) for borgadm's dir-vs-file classification in
+# backup_set_paths().
+_E2E_SETS: dict[str, list[str]] = {
+    "set-a": ["set-a/"],
+    "set-b": ["set-b/"],
+}
+
+
+@dataclass
+class BorgE2EFixture:
+    """Context object yielded by the borg_e2e fixture."""
+
+    repo_path: Path
+    backup_root: Path
+    home: Path
+    config_path: Path
+    sets: dict[str, list[Path]] = field(default_factory=dict)
+
+    @property
+    def borgadm_bin(self) -> Path:
+        return REPO_ROOT / "bin" / "borgadm"
+
+    def _subprocess_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        # Unencrypted repos prompt interactively on first access. The
+        # opt-in env var silences the prompt for our local test repo.
+        env["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
+        env.setdefault("BORG_PASSPHRASE", "")
+        return env
+
+    def run(
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke borgadm as a subprocess with HOME pointing at the fake
+        home so the subprocess picks up our test config."""
+        return subprocess.run(
+            [str(self.borgadm_bin), *args],
+            env=self._subprocess_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    def borg(
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        """Invoke borg directly. Used by tests to set up state without
+        going through borgadm, or to assert on raw repo state."""
+        return subprocess.run(
+            ["borg", *args],
+            env=self._subprocess_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    def archives(self) -> list[str]:
+        """Return the list of archive short-names currently in the repo."""
+        result = self.borg("list", "--short", str(self.repo_path))
+        return [line for line in result.stdout.splitlines() if line]
+
+
+def _have_borg() -> bool:
+    return shutil.which("borg") is not None
+
+
+# Skip the E2E suite when borg or ssh-keygen aren't installed. Both are
+# required for the fixture itself, not just individual tests.
+e2e_requires_borg = pytest.mark.skipif(
+    not _have_borg() or shutil.which("ssh-keygen") is None,
+    reason="borg and ssh-keygen must be installed for E2E tests",
+)
+
+
+@pytest.fixture
+def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
+    """Spin up a real local borg repo with a minimal borgadm config so
+    tests can drive `borgadm` via subprocess against actual archives.
+
+    Layout:
+      <short-home>/                # HOME for the subprocess; created
+                                   # under /tmp because macOS
+                                   # /usr/bin/ssh-agent puts its unix
+                                   # socket at $HOME/.ssh/agent/... and
+                                   # pytest's tmp_path under
+                                   # /private/var/folders/... brushes
+                                   # the sockaddr_un.sun_path limit
+                                   # (104 bytes).
+        .borgadm                   # config pointing at the local repo
+        .borg_passphrase           # dummy, repo uses --encryption=none
+        .ssh/id_borg.net           # passphrase-less ed25519 key
+      <tmp_path>/repo/             # the borg repo (encryption=none)
+      <tmp_path>/src/<set>/...     # source dirs, one per backup set
+    """
+    home = Path(tempfile.mkdtemp(prefix="be2e_home_", dir="/tmp"))
+    try:
+        repo_path = tmp_path / "repo"
+        backup_root = tmp_path / "src"
+        backup_root.mkdir()
+
+        sets: dict[str, list[Path]] = {}
+        for set_name, paths in _E2E_SETS.items():
+            absolute_paths: list[Path] = []
+            for rel in paths:
+                full = backup_root / rel.rstrip("/")
+                full.mkdir(parents=True)
+                (full / f"{set_name}-file.txt").write_text(
+                    f"{set_name} content\n"
+                )
+                absolute_paths.append(full)
+            sets[set_name] = absolute_paths
+
+        ssh_dir = home / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        sshkey_file = ssh_dir / "id_borg.net"
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(sshkey_file),
+                "-q",
+                "-C",
+                "borgadm-e2e-test",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        sshkey_file.chmod(0o600)
+
+        passphrase_file = home / ".borg_passphrase"
+        passphrase_file.write_text("e2e-test-passphrase\n")
+        passphrase_file.chmod(0o600)
+
+        subprocess.run(
+            ["borg", "init", "--encryption=none", str(repo_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        backup_sets_cfg = {
+            name: {"paths": _E2E_SETS[name]} for name in _E2E_SETS
+        }
+        config_path = home / ".borgadm"
+        config_path.write_text(
+            f"BORG_REPO = {repo_path}\n"
+            f"BACKUP_NAME = test\n"
+            f"BACKUP_ROOT = {backup_root}\n"
+            f"BORG_PASSPHRASE_FILE = {passphrase_file}\n"
+            f"BORG_SSHKEY_FILE = {sshkey_file}\n"
+            f"BACKUP_SETS = {json.dumps(backup_sets_cfg)}\n"
+        )
+
+        yield BorgE2EFixture(
+            repo_path=repo_path,
+            backup_root=backup_root,
+            home=home,
+            config_path=config_path,
+            sets=sets,
+        )
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
 
 
 class TestArgumentParser:
@@ -2883,6 +3069,50 @@ class TestWrapperBinary:
             assert "writable" in result.stderr.lower()
         finally:
             mock_borgadm.chmod(0o755)
+
+
+@e2e_requires_borg
+class TestE2EFixture:
+    """Smoke tests pinning the borg_e2e fixture itself.
+
+    These do not exercise borgadm subcommand semantics in depth -- that
+    is the job of the per-subcommand E2E test classes added in subsequent
+    commits. The goal here is to detect fixture-setup regressions early.
+    """
+
+    def test_fixture_lays_out_repo_and_config(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """The fixture creates a usable repo, config, auth files, and
+        source dirs."""
+        assert borg_e2e.repo_path.is_dir()
+        assert (borg_e2e.repo_path / "README").is_file()
+        assert borg_e2e.config_path.is_file()
+        assert (borg_e2e.home / ".borg_passphrase").is_file()
+        assert (borg_e2e.home / ".ssh" / "id_borg.net").is_file()
+        # Each declared set has at least one populated source path.
+        for set_name, paths in borg_e2e.sets.items():
+            assert paths, f"set {set_name!r} has no source paths"
+            for path in paths:
+                assert path.is_dir(), f"missing source dir: {path}"
+                assert any(path.iterdir()), f"empty source dir: {path}"
+
+    def test_borg_list_returns_empty_on_fresh_repo(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A freshly-initialized repo has no archives."""
+        assert borg_e2e.archives() == []
+
+    def test_borgadm_list_runs_against_empty_repo(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm list` succeeds on an empty repo (smoke test that the
+        subprocess invocation path -- config parsing, ssh-agent startup,
+        env init -- all work end-to-end)."""
+        result = borg_e2e.run("list")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
