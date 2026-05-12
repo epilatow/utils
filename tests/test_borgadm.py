@@ -3618,6 +3618,122 @@ class TestE2EExtract:
         assert "no full backups found" in result.stderr.lower()
 
 
+@e2e_requires_borg
+class TestE2EDelete:
+    """E2E coverage for `borgadm delete` archive-resolution behavior.
+
+    do_delete resolves the positional argument as either a full archive
+    name or a YYYYMMDD_HHMMSS timestamp string. The timestamp form
+    matches every archive at that timestamp, full set or partial. The
+    --latest form resolves to the newest full timestamp. These tests
+    pin those resolution paths so the upcoming completeness rework does
+    not silently change which archives `borgadm delete` removes for a
+    given input.
+    """
+
+    def test_delete_by_timestamp_removes_all_archives_at_ts(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm delete TIMESTAMP` deletes every archive whose name
+        carries that timestamp, leaving other timestamps untouched."""
+        keep_ts = "20260102_120000"
+        delete_ts = "20260101_120000"
+        for ts in (keep_ts, delete_ts):
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        result = borg_e2e.run("delete", delete_ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            f"test-set-a-{keep_ts}",
+            f"test-set-b-{keep_ts}",
+        ]
+
+    def test_delete_by_timestamp_includes_partial_archives(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A timestamp with only some configured sets present is still
+        addressable by `borgadm delete TIMESTAMP` -- include_partial is
+        on for the timestamp resolution path."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")  # partial
+        result = borg_e2e.run("delete", ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert borg_e2e.archives() == []
+
+    def test_delete_by_archive_name_removes_single_archive(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm delete ARCHIVE_NAME` removes only the named archive,
+        even when sibling archives at the same timestamp exist."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        result = borg_e2e.run("delete", f"test-set-a-{ts}")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert borg_e2e.archives() == [f"test-set-b-{ts}"]
+
+    def test_delete_latest_removes_newest_full_set(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm delete --latest` resolves to the newest full
+        timestamp and removes every archive at that timestamp.
+        Partials at later timestamps are not eligible for --latest."""
+        older_ts = "20260101_120000"
+        newer_ts = "20260102_120000"
+        for ts in (older_ts, newer_ts):
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        # Partial at a still-newer timestamp must not become "latest".
+        borg_e2e.make_archive("test-set-a-20260103_120000")
+        result = borg_e2e.run("delete", "--latest")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            "test-set-a-20260101_120000",
+            "test-set-a-20260103_120000",
+            "test-set-b-20260101_120000",
+        ]
+
+    def test_delete_dry_run_is_nondestructive(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--dry-run` lists what would be deleted without removing
+        any archive."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        before = set(borg_e2e.archives())
+        result = borg_e2e.run("delete", "--dry-run", ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert set(borg_e2e.archives()) == before
+
+    def test_delete_unknown_archive_fails(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Requesting a non-existent archive name surfaces a clear
+        error rather than silently succeeding."""
+        result = borg_e2e.run("delete", "does-not-exist", check=False)
+        assert result.returncode != 0
+        assert "archive not found" in result.stderr.lower()
+
+    def test_delete_unknown_timestamp_fails(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Requesting an unknown well-formed timestamp also fails."""
+        result = borg_e2e.run("delete", "19990101_000000", check=False)
+        assert result.returncode != 0
+        assert "no archives found for timestamp" in result.stderr.lower()
+
+
 class TestExceptionHierarchy(ExceptionHierarchyBase):
     """Test BorgadmError exception hierarchy."""
 
