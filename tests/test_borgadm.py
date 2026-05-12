@@ -117,7 +117,7 @@ def mock_cfg() -> Any:
     """Create a mock config for testing."""
     config_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
     config_file.write("""
-    BORG_REPO = "foobar"
+    BORG_REPO = foobar
     BACKUP_SETS = { "set1": {"paths": ["foo"]} }
     """)
     config_file.flush()
@@ -2449,7 +2449,7 @@ class TestTimestampPruning:
         """Test that all keep=0 is rejected as a config error."""
         config_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
         config_file.write(
-            'BORG_REPO = "foobar"\n'
+            "BORG_REPO = foobar\n"
             'BACKUP_SETS = { "set1": {"paths": ["foo"]} }\n'
             "PRUNE_KEEP_HOURLY = 0\n"
             "PRUNE_KEEP_DAILY = 0\n"
