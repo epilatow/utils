@@ -220,6 +220,31 @@ class BorgE2EFixture:
         self.borg("create", f"{self.repo_path}::{name}", str(path))
 
 
+def _archive_name(
+    set_name: str,
+    ts: str,
+    n: int | None = None,
+    m: int | None = None,
+    backup_name: str = "test",
+) -> str:
+    """Build an archive name string for the test fixture's BACKUP_NAME.
+
+    Delegates to the real ba._ArchiveName so the tests exercise the
+    production renderer rather than a parallel copy of the format.
+    With both n and m provided the NofM suffix is applied; without
+    them a legacy (pre-NofM) name is produced.
+    """
+    return str(
+        ba._ArchiveName(
+            backup_name=backup_name,
+            set_name=set_name,
+            timestamp=ts,
+            n=n,
+            m=m,
+        )
+    )
+
+
 def _have_borg() -> bool:
     return shutil.which("borg") is not None
 
@@ -2493,6 +2518,10 @@ script_path = {script!r}
 loader = importlib.machinery.SourceFileLoader("borgadm", script_path)
 spec = importlib.util.spec_from_loader("borgadm", loader)
 borgadm = importlib.util.module_from_spec(spec)
+# Register before exec_module: @dataclass resolves field annotations
+# against sys.modules[cls.__module__], so the module must be findable
+# there by the time the class body runs.
+sys.modules["borgadm"] = borgadm
 spec.loader.exec_module(borgadm)
 
 logger = logging.getLogger("test_pipe")
@@ -3129,6 +3158,173 @@ class TestE2EFixture:
         )
 
 
+class TestArchiveCompleteness:
+    """Unit-level coverage of _archive_entries_are_complete and the
+    _ArchiveName struct. The E2E classes above exercise the
+    integration path; these tests cover edge cases that are hard to
+    reach from real archives (M=0, duplicate Ns, mixed suffixed +
+    legacy at one timestamp, and the parse / round-trip path)."""
+
+    _TS = "20260101_120000"
+
+    def _entry(
+        self,
+        set_name: str,
+        n: int | None,
+        m: int | None,
+        timestamp: str | None = None,
+    ) -> Any:
+        return ba._ArchiveName(
+            backup_name="test",
+            set_name=set_name,
+            timestamp=timestamp or self._TS,
+            n=n,
+            m=m,
+        )
+
+    def test_legacy_only_is_complete(self) -> None:
+        """Any timestamp containing a legacy archive is complete."""
+        assert ba._archive_entries_are_complete(
+            [self._entry("set-a", None, None)]
+        )
+
+    def test_mixed_legacy_and_suffixed_is_complete(self) -> None:
+        """A legacy archive anywhere in the entry list short-circuits
+        to complete -- the no-suffix archive's membership cannot be
+        evaluated, so the safe answer is "do not prune"."""
+        assert ba._archive_entries_are_complete(
+            [
+                self._entry("set-a", None, None),
+                self._entry("set-b", 1, 2),
+            ]
+        )
+
+    def test_full_nofm_coverage_is_complete(self) -> None:
+        assert ba._archive_entries_are_complete(
+            [self._entry("set-a", 1, 2), self._entry("set-b", 2, 2)]
+        )
+
+    def test_missing_n_is_incomplete(self) -> None:
+        assert not ba._archive_entries_are_complete(
+            [self._entry("set-a", 1, 3), self._entry("set-b", 2, 3)]
+        )
+
+    def test_inconsistent_m_is_incomplete(self) -> None:
+        assert not ba._archive_entries_are_complete(
+            [self._entry("set-a", 1, 2), self._entry("set-b", 1, 3)]
+        )
+
+    def test_duplicate_n_is_incomplete(self) -> None:
+        """Two archives at the same N produce a set with fewer than M
+        elements, so coverage does not reach {1..M} and the timestamp
+        is partial. This is the corner case where set_name and N would
+        otherwise have been treated as 1:1."""
+        assert not ba._archive_entries_are_complete(
+            [self._entry("set-a", 1, 2), self._entry("set-b", 1, 2)]
+        )
+
+    def test_m_zero_is_incomplete(self) -> None:
+        """M=0 would emerge from a corrupted suffix; treat as
+        partial rather than vacuously complete."""
+        assert not ba._archive_entries_are_complete(
+            [self._entry("set-a", 0, 0)]
+        )
+
+    def test_mixed_timestamps_violates_caller_contract(self) -> None:
+        """The function's contract is "members of one set", which share
+        a timestamp. It asserts on a mismatch rather than silently
+        returning a misleading result, so a caller bug surfaces
+        immediately."""
+        e1 = self._entry("set-a", 1, 2, timestamp="20260101_120000")
+        e2 = self._entry("set-b", 2, 2, timestamp="20260101_130000")
+        with pytest.raises(AssertionError):
+            ba._archive_entries_are_complete([e1, e2])
+
+    def test_mixed_backup_names_violates_caller_contract(self) -> None:
+        """Members of one set share a backup_name. A mix means the
+        caller pulled in archives from a different borgadm config."""
+        e1 = ba._ArchiveName("test", "set-a", self._TS, 1, 2)
+        e2 = ba._ArchiveName("other", "set-b", self._TS, 2, 2)
+        with pytest.raises(AssertionError):
+            ba._archive_entries_are_complete([e1, e2])
+
+    def test_duplicate_set_name_violates_caller_contract(self) -> None:
+        """A set has one archive per member, so set names are distinct.
+        Two entries with the same set_name means the caller grouped
+        unrelated archives -- assert rather than guess which is the
+        real member."""
+        e1 = self._entry("set-a", 1, 2)
+        e2 = self._entry("set-a", 2, 2)
+        with pytest.raises(AssertionError):
+            ba._archive_entries_are_complete([e1, e2])
+
+    def test_str_round_trips_through_from_str(self) -> None:
+        """Building an _ArchiveName, rendering it with str(), then
+        parsing the result back yields an equal value. This pins the
+        single-source-of-truth contract between do_create's emission
+        path and list_backups' parse path."""
+        name = self._entry("home-fuse", 1, 2)
+        assert ba._ArchiveName.from_str("test", str(name)) == name
+
+    def test_str_pads_when_m_two_digits(self) -> None:
+        """N is zero-padded to M's width so archive names sort
+        correctly when M >= 10."""
+        name = self._entry("home-fuse", 3, 11)
+        assert str(name) == "test-home-fuse-20260101_120000_03of11"
+
+    def test_str_no_suffix_for_legacy(self) -> None:
+        """Legacy names (n or m is None) render without a suffix."""
+        name = self._entry("home-fuse", None, None)
+        assert str(name) == "test-home-fuse-20260101_120000"
+
+    def test_from_str_returns_none_for_unrecognized_shape(
+        self,
+    ) -> None:
+        """A string that doesn't match the expected shape returns
+        None rather than raising. list_backups uses this to silently
+        skip non-borgadm archives in the same repo."""
+        assert ba._ArchiveName.from_str("test", "manual-archive") is None
+        assert ba._ArchiveName.from_str("test", "other-set-a-no-stamp") is None
+
+    def test_from_str_returns_none_for_other_backup_name(self) -> None:
+        """An archive whose backup_name prefix doesn't match the
+        configured BACKUP_NAME is rejected so two borgadm-managed
+        repositories sharing a borg target stay isolated."""
+        name = "other-set-a-20260101_120000_1of2"
+        assert ba._ArchiveName.from_str("test", name) is None
+
+    def test_from_str_parses_legacy_archive(self) -> None:
+        """Suffix-less names parse with n=m=None."""
+        name = ba._ArchiveName.from_str("test", "test-set-a-20260101_120000")
+        assert name == ba._ArchiveName(
+            backup_name="test",
+            set_name="set-a",
+            timestamp="20260101_120000",
+            n=None,
+            m=None,
+        )
+
+    def test_from_str_parses_set_name_with_dashes(self) -> None:
+        """The set-name token may contain dashes; the parser anchors
+        on the trailing timestamp and NofM, not on a dash count."""
+        name = ba._ArchiveName.from_str(
+            "test", "test-home-fuse-mount-20260101_120000_1of2"
+        )
+        assert name is not None
+        assert name.set_name == "home-fuse-mount"
+        assert name.n == 1 and name.m == 2
+
+    def test_lt_gives_total_order_across_timestamps(self) -> None:
+        """_ArchiveName is fully sortable: timestamp first, then
+        NofM-suffixed names ahead of legacy ones (suffixed ascending
+        by N), then set_name. sorted() needs no key function."""
+        a = self._entry("set-a", 1, 2, timestamp="20260101_120000")
+        b = self._entry("set-b", 2, 2, timestamp="20260101_120000")
+        c = self._entry("z-legacy", None, None, timestamp="20260101_120000")
+        d = self._entry("set-a", 1, 1, timestamp="20260102_120000")
+        assert sorted([d, c, b, a]) == [a, b, c, d]
+
+
 def _list_borgadm(fixture: BorgE2EFixture, *flags: str) -> list[str]:
     """Run `borgadm list` and return non-empty stdout lines.
 
@@ -3160,21 +3356,22 @@ class TestE2EList:
     def test_full_set_at_one_ts_shows_as_single_line(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
-        """A timestamp with every configured set present collapses to
-        one timestamp line in the default output."""
+        """A timestamp whose NofM-suffixed archives cover 1..M is a
+        full backup and collapses to one timestamp line in the
+        default output."""
         ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{ts}")
-        borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
         assert _list_borgadm(borg_e2e) == [ts]
 
     def test_partial_set_included_by_default(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
-        """`borgadm list` defaults to --include-partial, so a timestamp
-        with only some configured sets present still appears in the
-        default output."""
+        """`borgadm list` defaults to --include-partial, so a
+        partial timestamp (NofM coverage of 1..M is incomplete)
+        still appears in the default output."""
         ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
         assert _list_borgadm(borg_e2e) == [ts]
 
     def test_no_include_partial_excludes_partial_sets(
@@ -3183,9 +3380,9 @@ class TestE2EList:
         """`--no-include-partial` filters out incomplete timestamps."""
         full_ts = "20260102_120000"
         partial_ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{full_ts}")
-        borg_e2e.make_archive(f"test-set-b-{full_ts}")
-        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        borg_e2e.make_archive(_archive_name("set-a", full_ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", full_ts, 2, 2))
+        borg_e2e.make_archive(_archive_name("set-a", partial_ts, 1, 2))
         assert _list_borgadm(borg_e2e, "--no-include-partial") == [full_ts]
 
     def test_only_partial_returns_only_partial(
@@ -3194,23 +3391,23 @@ class TestE2EList:
         """`--only-partial` filters out full backups."""
         full_ts = "20260102_120000"
         partial_ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{full_ts}")
-        borg_e2e.make_archive(f"test-set-b-{full_ts}")
-        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        borg_e2e.make_archive(_archive_name("set-a", full_ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", full_ts, 2, 2))
+        borg_e2e.make_archive(_archive_name("set-a", partial_ts, 1, 2))
         assert _list_borgadm(borg_e2e, "--only-partial") == [partial_ts]
 
     def test_full_names_emits_archive_names(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
         """`--full-names` switches the output to one line per archive.
-        Within a timestamp, archives appear in sorted set-name order
-        (matching do_create's NofM emission order)."""
+        Within a timestamp, suffixed archives sort by ascending N
+        (mirroring do_create's emission order)."""
         ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{ts}")
-        borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
         assert _list_borgadm(borg_e2e, "--full-names") == [
-            f"{borg_e2e.repo_path}::test-set-a-{ts}",
-            f"{borg_e2e.repo_path}::test-set-b-{ts}",
+            f"{borg_e2e.repo_path}::test-set-a-{ts}_1of2",
+            f"{borg_e2e.repo_path}::test-set-b-{ts}_2of2",
         ]
 
     def test_latest_no_partial_returns_only_newest_full(
@@ -3219,9 +3416,9 @@ class TestE2EList:
         """`--latest --no-include-partial` ignores later partial archives
         and returns just the newest *full* timestamp."""
         for ts in ("20260101_120000", "20260102_120000"):
-            borg_e2e.make_archive(f"test-set-a-{ts}")
-            borg_e2e.make_archive(f"test-set-b-{ts}")
-        borg_e2e.make_archive("test-set-a-20260103_120000")
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        borg_e2e.make_archive(_archive_name("set-a", "20260103_120000", 1, 2))
         assert _list_borgadm(borg_e2e, "--latest", "--no-include-partial") == [
             "20260102_120000"
         ]
@@ -3234,9 +3431,9 @@ class TestE2EList:
         twice, once per completeness, and `latest` caps each call
         independently. do_list emits full timestamps first, then partial."""
         for ts in ("20260101_120000", "20260102_120000"):
-            borg_e2e.make_archive(f"test-set-a-{ts}")
-            borg_e2e.make_archive(f"test-set-b-{ts}")
-        borg_e2e.make_archive("test-set-a-20260103_120000")
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        borg_e2e.make_archive(_archive_name("set-a", "20260103_120000", 1, 2))
         assert _list_borgadm(borg_e2e, "--latest") == [
             "20260102_120000",
             "20260103_120000",
@@ -3268,6 +3465,41 @@ class TestE2EList:
         assert _list_borgadm(borg_e2e) == [ts]
         assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
         assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_legacy_archives_classified_as_full(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Pre-NofM archives (no _NofM suffix on the name) are always
+        classified as full so the upgrade does not retroactively mark
+        any pre-existing archive as partial and eligible for pruning."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
+        assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_partial_requires_missing_nofm_member(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """An NofM-suffixed timestamp counts as full only when every N
+        in 1..M is present at that timestamp. A timestamp with just one
+        of a two-archive set is partial."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == []
+        assert _list_borgadm(borg_e2e, "--only-partial") == [ts]
+
+    def test_inconsistent_m_at_one_ts_is_partial(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """If two archives at the same timestamp report different M
+        values (e.g. 1of2 and 1of3) the timestamp is treated as
+        partial -- the completeness rule cannot pick which M is
+        authoritative, so the safe answer is "incomplete"."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 1, 3))
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == []
+        assert _list_borgadm(borg_e2e, "--only-partial") == [ts]
 
 
 # Matches archive names produced by do_create:
@@ -3416,6 +3648,19 @@ class TestE2ECreate:
         )
         assert borg_e2e.archives() == []
 
+    def test_create_requires_backup_sets(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm create` is the one subcommand that needs
+        BACKUP_SETS to be non-empty -- it has nothing to back up
+        otherwise. The validation now lives in do_create itself
+        (rather than Config.__init__) so other subcommands can run
+        against a repo with an empty BACKUP_SETS config."""
+        _set_backup_sets(borg_e2e, {})
+        result = borg_e2e.run("create", "--no-prune", check=False)
+        assert result.returncode != 0
+        assert "backup_sets not defined" in result.stderr.lower()
+
     def test_two_creates_use_distinct_timestamps(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
@@ -3499,37 +3744,39 @@ class TestE2EPrune:
         only the partial archive."""
         full_ts = "20260102_120000"
         partial_ts = "20260101_120000"
-        borg_e2e.make_archive(f"test-set-a-{full_ts}")
-        borg_e2e.make_archive(f"test-set-b-{full_ts}")
-        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        full_a = _archive_name("set-a", full_ts, 1, 2)
+        full_b = _archive_name("set-b", full_ts, 2, 2)
+        partial_a = _archive_name("set-a", partial_ts, 1, 2)
+        borg_e2e.make_archive(full_a)
+        borg_e2e.make_archive(full_b)
+        borg_e2e.make_archive(partial_a)
         result = borg_e2e.run("prune")
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        assert sorted(borg_e2e.archives()) == [
-            f"test-set-a-{full_ts}",
-            f"test-set-b-{full_ts}",
-        ]
+        assert sorted(borg_e2e.archives()) == [full_a, full_b]
 
     def test_prune_keeps_full_backups_within_retention(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
-        """Three full backups at distinct hours all fall within the
-        default 24-hourly retention window and survive prune."""
+        """Three NofM-full backups at distinct hours all fall within
+        the default 24-hourly retention window and survive prune."""
         timestamps = [
             "20260101_120000",
             "20260101_130000",
             "20260101_140000",
         ]
         for ts in timestamps:
-            borg_e2e.make_archive(f"test-set-a-{ts}")
-            borg_e2e.make_archive(f"test-set-b-{ts}")
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
         result = borg_e2e.run("prune")
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         expected = sorted(
-            f"test-{s}-{ts}" for ts in timestamps for s in ("set-a", "set-b")
+            _archive_name(s, ts, n, 2)
+            for ts in timestamps
+            for s, n in (("set-a", 1), ("set-b", 2))
         )
         assert sorted(borg_e2e.archives()) == expected
 
@@ -3537,7 +3784,7 @@ class TestE2EPrune:
         self, borg_e2e: BorgE2EFixture
     ) -> None:
         """With --keep-hourly=1 (and other retention buckets set to 0),
-        only the newest of three hourly full backups survives.
+        only the newest of three hourly NofM-full backups survives.
 
         ts_to_keep fills the hourly bucket from oldest to newest, then
         keeps the last N (newest) entries -- so 14:00 wins over 12:00
@@ -3548,8 +3795,8 @@ class TestE2EPrune:
             "20260101_140000",
         ]
         for ts in timestamps:
-            borg_e2e.make_archive(f"test-set-a-{ts}")
-            borg_e2e.make_archive(f"test-set-b-{ts}")
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
         result = borg_e2e.run(
             "prune",
             "--keep-hourly",
@@ -3567,8 +3814,59 @@ class TestE2EPrune:
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         assert sorted(borg_e2e.archives()) == [
-            "test-set-a-20260101_140000",
-            "test-set-b-20260101_140000",
+            _archive_name("set-a", "20260101_140000", 1, 2),
+            _archive_name("set-b", "20260101_140000", 2, 2),
+        ]
+
+    def test_prune_partial_sweep_spares_legacy_archives(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A lone pre-NofM archive looks like an incomplete set under
+        naive set-membership, but the legacy bypass classifies it as
+        full -- so the prune partial sweep does not touch it. With
+        default retention it is the only backup and survives."""
+        legacy_ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{legacy_ts}")
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert borg_e2e.archives() == [f"test-set-a-{legacy_ts}"]
+
+    def test_prune_subjects_legacy_archives_to_retention(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Legacy archives are complete, not exempt: they age out
+        through the same GFS retention as NofM archives. A legacy
+        archive plus two newer NofM full backups, under --keep-hourly=1,
+        leaves only the newest hourly bucket entry -- the legacy
+        archive is pruned along with the older NofM timestamp."""
+        legacy_ts = "20260101_120000"
+        older_full_ts = "20260101_130000"
+        newer_full_ts = "20260101_140000"
+        borg_e2e.make_archive(f"test-set-a-{legacy_ts}")
+        for ts in (older_full_ts, newer_full_ts):
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        result = borg_e2e.run(
+            "prune",
+            "--keep-hourly",
+            "1",
+            "--keep-daily",
+            "0",
+            "--keep-weekly",
+            "0",
+            "--keep-monthly",
+            "0",
+            "--keep-yearly",
+            "0",
+        )
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            _archive_name("set-a", newer_full_ts, 1, 2),
+            _archive_name("set-b", newer_full_ts, 2, 2),
         ]
 
 
@@ -3757,19 +4055,20 @@ class TestE2EDelete:
         Partials at later timestamps are not eligible for --latest."""
         older_ts = "20260101_120000"
         newer_ts = "20260102_120000"
+        partial_ts = "20260103_120000"
         for ts in (older_ts, newer_ts):
-            borg_e2e.make_archive(f"test-set-a-{ts}")
-            borg_e2e.make_archive(f"test-set-b-{ts}")
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
         # Partial at a still-newer timestamp must not become "latest".
-        borg_e2e.make_archive("test-set-a-20260103_120000")
+        borg_e2e.make_archive(_archive_name("set-a", partial_ts, 1, 2))
         result = borg_e2e.run("delete", "--latest")
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         assert sorted(borg_e2e.archives()) == [
-            "test-set-a-20260101_120000",
-            "test-set-a-20260103_120000",
-            "test-set-b-20260101_120000",
+            _archive_name("set-a", older_ts, 1, 2),
+            _archive_name("set-a", partial_ts, 1, 2),
+            _archive_name("set-b", older_ts, 2, 2),
         ]
 
     def test_delete_dry_run_is_nondestructive(
@@ -3803,6 +4102,207 @@ class TestE2EDelete:
         result = borg_e2e.run("delete", "19990101_000000", check=False)
         assert result.returncode != 0
         assert "no archives found for timestamp" in result.stderr.lower()
+
+
+@e2e_requires_borg
+class TestE2ECfgDrift:
+    """E2E coverage for cfg.BACKUP_SETS drift against existing archives.
+
+    The NofM rework's contract is that set-name choice is informational
+    once an archive is written: completeness derives from the NofM
+    suffix, not from cfg.BACKUP_SETS membership. These tests pin that
+    contract end-to-end by mutating the config after archives exist
+    and asserting that the archives stay visible, stay classified, and
+    are not deleted by a subsequent prune.
+    """
+
+    def test_renamed_set_keeps_archives_classified(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Renaming a set in cfg.BACKUP_SETS does not hide archives
+        that used the old set name. list_backups recognizes them by
+        the {BACKUP_NAME}-...-{ts}_NofM shape; the literal set-name
+        token in the middle is captured but not validated against
+        cfg."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "renamed-a": {"paths": ["set-a/"]},
+                "renamed-b": {"paths": ["set-b/"]},
+            },
+        )
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
+        assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_added_set_does_not_reclassify_existing_archives(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Adding a new set to cfg.BACKUP_SETS does not retroactively
+        mark NofM-full archives as partial. M was current at the time
+        the archive was created; the suffix records that, and an
+        increase in the configured count does not invalidate prior
+        coverage."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "set-a": {"paths": ["set-a/"]},
+                "set-b": {"paths": ["set-b/"]},
+                "set-c": {"paths": ["set-c/"]},
+            },
+        )
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
+        assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_removed_set_keeps_archives_visible(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Removing a set from cfg.BACKUP_SETS does not make archives
+        for the removed set invisible. The archives stay in the repo
+        and stay classified by their original NofM coverage."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        _set_backup_sets(borg_e2e, {"set-a": {"paths": ["set-a/"]}})
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
+        assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_renamed_set_archives_survive_prune(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A prune run after a set rename does not delete the
+        old-named archives. The classifier still sees them as full
+        (NofM coverage holds) and retention preserves them as well."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "renamed-a": {"paths": ["set-a/"]},
+                "renamed-b": {"paths": ["set-b/"]},
+            },
+        )
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            _archive_name("set-a", ts, 1, 2),
+            _archive_name("set-b", ts, 2, 2),
+        ]
+
+    def test_list_works_with_empty_backup_sets(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm list` reads only cfg.BACKUP_NAME (for the archive-
+        name prefix gate) and the per-archive NofM suffix. With
+        BACKUP_SETS = {} -- a user who hasn't configured any sets
+        yet, or who emptied the config -- the existing archives in
+        the repo still appear, classified by their NofM coverage."""
+        ts_full = "20260102_120000"
+        ts_partial = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts_full, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts_full, 2, 2))
+        borg_e2e.make_archive(_archive_name("set-a", ts_partial, 1, 2))
+        _set_backup_sets(borg_e2e, {})
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts_full]
+        assert _list_borgadm(borg_e2e, "--only-partial") == [ts_partial]
+
+    def test_extract_works_with_empty_backup_sets(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """`borgadm extract` succeeds on the latest full backup even
+        when BACKUP_SETS has been emptied. The managed-paths logic
+        reads only the archives being extracted, so a config-drifted
+        user can still restore."""
+        borg_e2e.run("create", "--no-prune")
+        _set_backup_sets(borg_e2e, {})
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        result = borg_e2e.run("extract", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (target / "set-a" / "set-a-file.txt").is_file()
+        assert (target / "set-b" / "set-b-file.txt").is_file()
+
+    def test_extract_works_on_legacy_archive_with_empty_backup_sets(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """Pre-NofM archives in a repo with BACKUP_SETS = {}: the
+        legacy bypass classifies them as complete, list_backups
+        returns them, and extract restores their content. This is
+        the upgrade-from-old-borgadm scenario."""
+        # Use borgadm create (so the archive carries cwd-relative
+        # paths, matching what an older borgadm would have produced)
+        # then rename the result to a suffix-less legacy form. Limit
+        # the config to a single set so create produces just one
+        # archive; that lets the rename target be unambiguous.
+        _set_backup_sets(borg_e2e, {"set-a": {"paths": ["set-a/"]}})
+        borg_e2e.run("create", "--no-prune")
+        suffixed = borg_e2e.archives()
+        assert len(suffixed) == 1
+        legacy_short = suffixed[0].rsplit("_", 1)[0]  # drop _1of1
+        borg_e2e.borg(
+            "rename", f"{borg_e2e.repo_path}::{suffixed[0]}", legacy_short
+        )
+        _set_backup_sets(borg_e2e, {})
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        result = borg_e2e.run("extract", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (target / "set-a" / "set-a-file.txt").is_file()
+
+    def test_prune_works_with_empty_backup_sets(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm prune` with empty BACKUP_SETS still sweeps partial
+        archives and retention-prunes full ones. Classification is
+        archive-driven, so config drift does not interfere."""
+        full_ts = "20260102_120000"
+        partial_ts = "20260101_120000"
+        full_a = _archive_name("set-a", full_ts, 1, 2)
+        full_b = _archive_name("set-b", full_ts, 2, 2)
+        partial_a = _archive_name("set-a", partial_ts, 1, 2)
+        borg_e2e.make_archive(full_a)
+        borg_e2e.make_archive(full_b)
+        borg_e2e.make_archive(partial_a)
+        _set_backup_sets(borg_e2e, {})
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Partial archive swept; full set kept.
+        assert sorted(borg_e2e.archives()) == [full_a, full_b]
+
+    def test_delete_works_with_empty_backup_sets(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm delete TIMESTAMP` resolves archives via
+        list_backups, which is archive-driven, so empty BACKUP_SETS
+        does not block deletion of legacy archives in the repo."""
+        keep_ts = "20260102_120000"
+        delete_ts = "20260101_120000"
+        for ts in (keep_ts, delete_ts):
+            borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+            borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        _set_backup_sets(borg_e2e, {})
+        result = borg_e2e.run("delete", delete_ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            _archive_name("set-a", keep_ts, 1, 2),
+            _archive_name("set-b", keep_ts, 2, 2),
+        ]
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):

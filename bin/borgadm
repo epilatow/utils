@@ -13,6 +13,7 @@ import argparse
 import atexit
 import collections
 import configparser
+import dataclasses
 import enum
 import fcntl
 import functools
@@ -47,7 +48,15 @@ if hasattr(signal, "SIGPIPE"):
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional, OrderedDict, Tuple, TextIO, cast
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    OrderedDict,
+    Tuple,
+    TextIO,
+    cast,
+)
 
 from xml.dom import minidom
 from xml.etree import ElementTree
@@ -202,6 +211,21 @@ _BORG_REPO_HOSTKEY: str = ""
 # two or more digits, N is zero-padded to match (e.g. 01of11,
 # ..., 11of11) so archive names sort correctly in alphabetical
 # listings.
+#
+# The NofM suffix is the source of truth for set completeness: a
+# timestamp is "full" when every N in 1..M is present and "partial"
+# otherwise. Adding, removing, or renaming a set changes which N
+# future archives get but does NOT retroactively reclassify existing
+# archives -- old archives keep their original NofM.
+#
+# Archives without a `_NofM` suffix are treated as legacy/complete:
+# the prune partial-sweep never touches them, so an upgrade through
+# this change cannot mistake an old archive for an incomplete set.
+# They remain subject to GFS retention like any other full backup,
+# so suffix-less archives still age out normally. Running
+# `borgadm prune` on the previous release immediately before
+# upgrading is the way to clear genuine pre-upgrade partials:
+# afterward they are indistinguishable from complete sets.
 _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 
 
@@ -322,8 +346,6 @@ class Config:
         errors: list[str] = []
         if not self.BORG_REPO:
             errors.append(f"BORG_REPO not defined in config: {path}")
-        if not self.BACKUP_SETS:
-            errors.append(f"BACKUP_SETS not defined in config: {path}")
         if not any(
             [
                 self.PRUNE_KEEP_HOURLY,
@@ -734,6 +756,126 @@ def list_backups_raw() -> subprocess.CompletedProcess[Any]:
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _ArchiveName:
+    """A borg archive name, parsed into its components.
+
+    The string form is `{backup_name}-{set_name}-YYYYMMDD_HHMMSS[_NofM]`
+    -- the part after `::` in a full `repo::archive` reference. `n` and
+    `m` are None for legacy (pre-NofM) archives that don't carry a
+    suffix. `str()` renders the name and `from_str()` parses one back,
+    so do_create (emitting names) and list_backups (reading them) share
+    exactly one definition of the shape.
+    """
+
+    backup_name: str
+    set_name: str
+    timestamp: str
+    n: Optional[int]
+    m: Optional[int]
+
+    def __str__(self) -> str:
+        """Render the archive name. Zero-pads N to M's digit count
+        when both are present so archive names sort correctly when
+        M >= 10 (e.g. 01of11 rather than 1of11)."""
+        base = f"{self.backup_name}-{self.set_name}-{self.timestamp}"
+        if self.n is None or self.m is None:
+            return base
+        width = len(str(self.m))
+        return f"{base}_{self.n:0{width}d}of{self.m}"
+
+    def __lt__(self, other: _ArchiveName) -> bool:
+        """Total order over archive names: by backup_name, then
+        timestamp, then NofM-suffixed names ahead of legacy ones
+        (suffixed ascending by N, mirroring do_create's emission
+        order), then set_name, then M. None values for n/m collapse
+        into an explicit lower-priority bucket so a legacy name never
+        has to be compared against an int."""
+        if not isinstance(other, _ArchiveName):
+            return NotImplemented
+        return self._order_key() < other._order_key()
+
+    def _order_key(self) -> Tuple[str, str, int, int, str, int]:
+        return (
+            self.backup_name,
+            self.timestamp,
+            0 if self.n is not None else 1,
+            self.n if self.n is not None else 0,
+            self.set_name,
+            self.m if self.m is not None else 0,
+        )
+
+    @classmethod
+    def from_str(cls, backup_name: str, name: str) -> Optional[_ArchiveName]:
+        """Parse a borg archive name into an _ArchiveName.
+
+        Returns None when `name` does not match the expected
+        `{backup_name}-{set_name}-YYYYMMDD_HHMMSS[_NofM]` shape -- the
+        normal outcome for non-borgadm archives a user may have in
+        the repo. Set-name is captured as the literal token between
+        backup_name and the timestamp; it carries no semantic weight
+        beyond display ordering.
+        """
+        pattern = (
+            re.escape(backup_name) + r"-(.+)-(\d{8}_\d{6})(?:_(\d+)of(\d+))?$"
+        )
+        match = re.match(pattern, name)
+        if match is None:
+            return None
+        set_name, ts, n_str, m_str = match.groups()
+        return cls(
+            backup_name=backup_name,
+            set_name=set_name,
+            timestamp=ts,
+            n=int(n_str) if n_str is not None else None,
+            m=int(m_str) if m_str is not None else None,
+        )
+
+
+def _archive_entries_are_complete(entries: list[_ArchiveName]) -> bool:
+    """Decide whether `entries` form a complete backup set.
+
+    Caller contract: `entries` are the members of a single set --
+    they share one backup_name and one timestamp, and every set_name
+    is distinct. The function asserts all three rather than
+    soft-failing; a violation means the caller failed to group
+    archives correctly, and surfacing the bug beats returning a
+    misleading classification.
+
+    Two completeness cases:
+      - Any archive lacks a suffix: the set is legacy/complete.
+        Pre-NofM archives don't carry the N-of-M membership signal,
+        so the safe rule is to never flag them partial. They are
+        still subject to GFS retention like any other complete set
+        -- "complete" only exempts a set from the prune partial
+        sweep, not from age-based retention.
+      - All archives are suffixed: completeness requires a single
+        consistent M and N values covering 1..M exactly. Inconsistent
+        Ms or a missing N is incomplete.
+    """
+    backup_names = {e.backup_name for e in entries}
+    assert len(backup_names) == 1, (
+        f"entries must share a backup_name; got {sorted(backup_names)}"
+    )
+    timestamps = {e.timestamp for e in entries}
+    assert len(timestamps) == 1, (
+        f"entries must share a timestamp; got {sorted(timestamps)}"
+    )
+    set_names = [e.set_name for e in entries]
+    assert len(set_names) == len(set(set_names)), (
+        f"entries must have distinct set names; got {sorted(set_names)}"
+    )
+    if any(e.n is None or e.m is None for e in entries):
+        return True
+    m_values = {e.m for e in entries}
+    if len(m_values) != 1:
+        return False
+    (m,) = m_values
+    assert m is not None
+    n_values = {e.n for e in entries}
+    return n_values == set(range(1, m + 1))
+
+
 def list_backups(
     latest: bool = False, partial: bool = False
 ) -> dict[str, list[str]]:
@@ -741,52 +883,21 @@ def list_backups(
 
     result = list_backups_raw()
 
-    # set_name -> timestamp -> short archive name as observed in the
-    # repo. Storing the actual short name (rather than just remembering
-    # which timestamps a set has) is what lets the reconstructed
-    # archive reference round-trip the NofM suffix, including its
-    # absence on legacy archives.
-    archives_by_set: dict[str, dict[str, str]] = {
-        key: {} for key in cfg.BACKUP_SETS
-    }
-    backup_set_names = "|".join(cfg.BACKUP_SETS)
-    ts_pattern = re.compile(
-        f"{cfg.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
-    )
+    archives_by_ts: dict[str, list[_ArchiveName]] = {}
     for line in result.stdout.strip().splitlines():
-        short = line.strip()
-        match = ts_pattern.match(short)
-        if match:
-            set_name, timestamp = match.groups()
-            if set_name in archives_by_set:
-                archives_by_set[set_name][timestamp] = short
+        entry = _ArchiveName.from_str(cfg.BACKUP_NAME, line.strip())
+        if entry is None:
+            continue
+        archives_by_ts.setdefault(entry.timestamp, []).append(entry)
 
-    all_ts: set[str] = set().union(
-        *(set(per_ts) for per_ts in archives_by_set.values())
-    )
-    # Iterate sets in sorted() order -- the same ordering do_create
-    # uses to assign N -- so archives within a timestamp emerge in a
-    # stable order matching do_create's NofM assignment.
-    sorted_set_names = sorted(cfg.BACKUP_SETS.keys())
     rv: dict[str, list[str]] = {}
-
-    for ts in sorted(all_ts, reverse=True):
-
-        def include() -> None:
-            rv[ts] = [
-                f"{cfg.BORG_REPO}::{archives_by_set[set_name][ts]}"
-                for set_name in sorted_set_names
-                if ts in archives_by_set[set_name]
-            ]
-
-        is_full = all(
-            ts in archives_by_set[set_name] for set_name in sorted_set_names
-        )
-        if not partial and is_full:
-            include()
-        if partial and not is_full:
-            include()
-        if rv and latest:
+    for ts in sorted(archives_by_ts.keys(), reverse=True):
+        entries = archives_by_ts[ts]
+        is_full = _archive_entries_are_complete(entries)
+        if not ((not partial and is_full) or (partial and not is_full)):
+            continue
+        rv[ts] = [f"{cfg.BORG_REPO}::{name}" for name in sorted(entries)]
+        if latest:
             break
 
     return rv
@@ -1517,6 +1628,11 @@ def do_compact(progress: bool) -> None:
 
 def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
     cfg = get_cfg()
+    # do_create is the one subcommand that requires BACKUP_SETS to be
+    # non-empty -- the others read whatever the repo already contains
+    # via list_backups, which is config-set-name-agnostic.
+    if not cfg.BACKUP_SETS:
+        raise ConfigError(f"BACKUP_SETS not defined in config: {CONFIG}")
 
     def backup_set_tests(set_name: str) -> None:
         error: bool = False
@@ -1557,14 +1673,12 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # NofM suffix: M is the count of configured sets; N is the 1-based
-    # position of the current set among the sorted dict keys. The
-    # width-padded format keeps archive names sorting correctly when
-    # M >= 10 (e.g. 01of11, ..., 11of11). Sorting the keys means two
-    # configs with the same set names produce identical archive names
-    # regardless of how the user edits the dict.
+    # position of the current set among the sorted dict keys. Sorting
+    # the keys means two configs with the same set names produce
+    # identical archive names regardless of how the user edits the
+    # dict; reordering the dict literally cannot change archive names.
     sorted_set_names = sorted(cfg.BACKUP_SETS.keys())
     suffix_count = len(sorted_set_names)
-    suffix_width = len(str(suffix_count))
     for suffix_pos, set_name in enumerate(sorted_set_names, start=1):
         set_cfg = cfg.BACKUP_SETS[set_name]
         # Backups can take a while, so re-run tests before each backup
@@ -1597,8 +1711,13 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 excludes.extend(auto_excludes)
         for e in excludes:
             create_args += ["--exclude", e]
-        suffix = f"_{suffix_pos:0{suffix_width}d}of{suffix_count}"
-        archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}{suffix}"
+        archive_name = _ArchiveName(
+            backup_name=cfg.BACKUP_NAME,
+            set_name=set_name,
+            timestamp=timestamp,
+            n=suffix_pos,
+            m=suffix_count,
+        )
         archive = f"{cfg.BORG_REPO}::{archive_name}"
         dry = " (dry-run)" if dry_run else ""
         logger.info(f"Create archive, start: {archive}{dry})")
@@ -1822,6 +1941,12 @@ def do_prune(dry_run: bool, progress: bool) -> None:
         cmd += partial_archives
         run_cmd(cmd, allow_output=progress)
 
+    # Retention runs over every complete backup, legacy archives
+    # included. list_backups() (partial=False) already excludes
+    # incomplete sets, and legacy archives classify as complete, so
+    # they age out through the same GFS retention as NofM archives --
+    # "complete" exempts a set from the partial sweep above, not from
+    # retention.
     archives = list_backups()
     ts_keep = ts_to_keep(set(archives.keys()))
     ts_prune = archives.keys() - ts_keep.keys()
