@@ -3501,6 +3501,123 @@ class TestE2EPrune:
         ]
 
 
+@e2e_requires_borg
+class TestE2EExtract:
+    """E2E coverage for `borgadm extract --delete` path filtering.
+
+    do_extract reads cfg.BACKUP_SETS today to decide which paths under
+    target_dir are "managed" -- only managed extras get cleaned up; any
+    file outside a configured set-path is preserved. The upcoming
+    refactor switches the managed-path derivation to read top-level
+    paths from the archives being extracted instead, so the relevant
+    test surface is "what gets deleted vs. preserved", not the
+    implementation strategy. These tests pin that user-visible split.
+    """
+
+    @staticmethod
+    def _populate_target(target_dir: Path) -> None:
+        """Create the target-dir layout used by extract --delete tests:
+        one managed extra under set-a/ (the file path do_extract's
+        delete pass should clean up) and one unmanaged file under other/
+        (which sits outside every backup-set path and must be
+        preserved). Only one managed extra is used: do_extract's current
+        cleanup-path dedup loop calls Path.relative_to (which raises
+        ValueError for unrelated paths) instead of is_relative_to, so
+        multiple unrelated managed extras crash do_extract. That defect
+        is independent of the NofM-suffix rework these tests are
+        baselining."""
+        (target_dir / "set-a").mkdir()
+        (target_dir / "set-a" / "extra-managed.txt").write_text(
+            "managed-extra-a"
+        )
+        (target_dir / "other").mkdir()
+        (target_dir / "other" / "preserve.txt").write_text("unmanaged")
+
+    def test_extract_without_delete_preserves_extras(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """Without --delete, extract overlays archive contents on
+        target_dir but does not remove any pre-existing files."""
+        borg_e2e.run("create", "--no-prune")
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        self._populate_target(target)
+        result = borg_e2e.run("extract", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Archive contents extracted on top.
+        assert (target / "set-a" / "set-a-file.txt").is_file()
+        assert (target / "set-b" / "set-b-file.txt").is_file()
+        # Pre-existing extras (managed and unmanaged) all preserved.
+        assert (target / "set-a" / "extra-managed.txt").is_file()
+        assert (target / "other" / "preserve.txt").is_file()
+
+    def test_extract_with_delete_removes_managed_extra(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """With --delete, extract deletes a pre-existing file that is
+        under a configured backup-set path AND not in any archive.
+        Files outside every backup-set path are preserved. Files that
+        ARE in the archive are spared by the delete pass and
+        overwritten by the extract pass."""
+        borg_e2e.run("create", "--no-prune")
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        self._populate_target(target)
+        # Pre-populate an archive-resident path with a known marker so
+        # we can prove the delete pass spared it (rather than just
+        # observing the extract pass writing it).
+        (target / "set-a" / "set-a-file.txt").write_text("ORIGINAL")
+        result = borg_e2e.run("extract", "--delete", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Managed extra: gone.
+        assert not (target / "set-a" / "extra-managed.txt").exists()
+        # Archive-resident path: present, and replaced by archive
+        # content (proving the delete pass spared it and the extract
+        # pass overwrote).
+        assert (target / "set-a" / "set-a-file.txt").read_text() == (
+            "set-a content\n"
+        )
+        assert (target / "set-b" / "set-b-file.txt").is_file()
+        # Unmanaged tree: untouched.
+        assert (target / "other" / "preserve.txt").is_file()
+
+    def test_extract_delete_dry_run_preserves_everything(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """`--dry-run --delete` neither extracts archive contents nor
+        deletes managed extras."""
+        borg_e2e.run("create", "--no-prune")
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        self._populate_target(target)
+        result = borg_e2e.run("extract", "--delete", "--dry-run", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # No new files written.
+        assert not (target / "set-a" / "set-a-file.txt").exists()
+        assert not (target / "set-b" / "set-b-file.txt").exists()
+        # Nothing deleted.
+        assert (target / "set-a" / "extra-managed.txt").is_file()
+        assert (target / "other" / "preserve.txt").is_file()
+
+    def test_extract_on_empty_repo_fails(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """do_extract operates on the latest full backup; an empty repo
+        has no full backups and surfaces as a BorgadmError with a
+        message naming the missing-backup condition."""
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        result = borg_e2e.run("extract", str(target), check=False)
+        assert result.returncode != 0
+        assert "no full backups found" in result.stderr.lower()
+
+
 class TestExceptionHierarchy(ExceptionHierarchyBase):
     """Test BorgadmError exception hierarchy."""
 
