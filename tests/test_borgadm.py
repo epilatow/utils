@@ -137,6 +137,10 @@ def mock_cfg() -> Any:
 # source directory under BACKUP_ROOT. Trailing slash marks the path as a
 # directory (vs. a file) for borgadm's dir-vs-file classification in
 # backup_set_paths().
+#
+# Iteration order is load-bearing: borgadm's list_backups() emits archives
+# in cfg.BACKUP_SETS order within a timestamp, and several E2E tests below
+# assert on that exact ordering. Keep insertion order stable when editing.
 _E2E_SETS: dict[str, list[str]] = {
     "set-a": ["set-a/"],
     "set-b": ["set-b/"],
@@ -204,6 +208,14 @@ class BorgE2EFixture:
         """Return the list of archive short-names currently in the repo."""
         result = self.borg("list", "--short", str(self.repo_path))
         return [line for line in result.stdout.splitlines() if line]
+
+    def make_archive(self, name: str, content_path: Path | None = None) -> None:
+        """Create a borg archive at `name`. Defaults to archiving the
+        whole backup_root, since archive *contents* don't matter for
+        name-based classification tests -- callers care about the
+        archive name being present in the repo, not what's inside."""
+        path = content_path if content_path is not None else self.backup_root
+        self.borg("create", f"{self.repo_path}::{name}", str(path))
 
 
 def _have_borg() -> bool:
@@ -3113,6 +3125,146 @@ class TestE2EFixture:
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+
+
+def _list_borgadm(fixture: BorgE2EFixture, *flags: str) -> list[str]:
+    """Run `borgadm list` and return non-empty stdout lines.
+
+    `do_list` writes timestamp or archive-name lines via the INFO logger
+    which the stdout handler emits without a level prefix, so simply
+    stripping blank lines yields the user-visible list.
+
+    `--keep-tags` defaults to True in production and appends labels like
+    ` (hour-0)` whose values depend on wall time. Tests want a stable
+    output to assert against, so the helper passes `--no-keep-tags`
+    unless the caller specifically supplies its own keep-tags flag.
+    """
+    if not any(f in flags for f in ("--keep-tags", "--no-keep-tags")):
+        flags = ("--no-keep-tags", *flags)
+    result = fixture.run("list", *flags)
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+@e2e_requires_borg
+class TestE2EList:
+    """E2E coverage for borgadm's list_backups full/partial classification.
+
+    Pins the user-observable output of `borgadm list` against archives
+    manufactured at known timestamps. Future commits rework how set
+    completeness is determined; these tests catch silent regressions in
+    what the existing classification produces today.
+    """
+
+    def test_full_set_at_one_ts_shows_as_single_line(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A timestamp with every configured set present collapses to
+        one timestamp line in the default output."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        assert _list_borgadm(borg_e2e) == [ts]
+
+    def test_partial_set_included_by_default(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm list` defaults to --include-partial, so a timestamp
+        with only some configured sets present still appears in the
+        default output."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        assert _list_borgadm(borg_e2e) == [ts]
+
+    def test_no_include_partial_excludes_partial_sets(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--no-include-partial` filters out incomplete timestamps."""
+        full_ts = "20260102_120000"
+        partial_ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{full_ts}")
+        borg_e2e.make_archive(f"test-set-b-{full_ts}")
+        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [full_ts]
+
+    def test_only_partial_returns_only_partial(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--only-partial` filters out full backups."""
+        full_ts = "20260102_120000"
+        partial_ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{full_ts}")
+        borg_e2e.make_archive(f"test-set-b-{full_ts}")
+        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        assert _list_borgadm(borg_e2e, "--only-partial") == [partial_ts]
+
+    def test_full_names_emits_archive_names(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--full-names` switches the output to one line per archive.
+        Within a timestamp, archives appear in cfg.BACKUP_SETS order."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        assert _list_borgadm(borg_e2e, "--full-names") == [
+            f"{borg_e2e.repo_path}::test-set-a-{ts}",
+            f"{borg_e2e.repo_path}::test-set-b-{ts}",
+        ]
+
+    def test_latest_no_partial_returns_only_newest_full(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--latest --no-include-partial` ignores later partial archives
+        and returns just the newest *full* timestamp."""
+        for ts in ("20260101_120000", "20260102_120000"):
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("test-set-a-20260103_120000")
+        assert _list_borgadm(borg_e2e, "--latest", "--no-include-partial") == [
+            "20260102_120000"
+        ]
+
+    def test_latest_default_returns_newest_of_each_completeness(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """With `--include-partial` (the default), `--latest` returns the
+        newest full *and* the newest partial -- list_backups is called
+        twice, once per completeness, and `latest` caps each call
+        independently. do_list emits full timestamps first, then partial."""
+        for ts in ("20260101_120000", "20260102_120000"):
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("test-set-a-20260103_120000")
+        assert _list_borgadm(borg_e2e, "--latest") == [
+            "20260102_120000",
+            "20260103_120000",
+        ]
+
+    def test_default_order_is_reverse_chronological(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Multiple full backups list newest-first."""
+        timestamps = [
+            "20260101_120000",
+            "20260102_120000",
+            "20260103_120000",
+        ]
+        for ts in timestamps:
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        assert _list_borgadm(borg_e2e) == list(reversed(timestamps))
+
+    def test_archive_names_outside_pattern_are_ignored(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Archives whose names don't match the BACKUP_NAME-set-TS
+        pattern are ignored entirely (neither full nor partial)."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("manual-backup-keep-this")
+        assert _list_borgadm(borg_e2e) == [ts]
+        assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
+        assert _list_borgadm(borg_e2e, "--only-partial") == []
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
