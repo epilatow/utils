@@ -3874,30 +3874,26 @@ class TestE2EPrune:
 class TestE2EExtract:
     """E2E coverage for `borgadm extract --delete` path filtering.
 
-    do_extract reads cfg.BACKUP_SETS today to decide which paths under
-    target_dir are "managed" -- only managed extras get cleaned up; any
-    file outside a configured set-path is preserved. The upcoming
-    refactor switches the managed-path derivation to read top-level
-    paths from the archives being extracted instead, so the relevant
-    test surface is "what gets deleted vs. preserved", not the
-    implementation strategy. These tests pin that user-visible split.
+    do_extract decides which paths under target_dir are "managed" by
+    reading top-level entries from the archives being extracted. Only
+    managed extras get cleaned up by --delete; any file outside every
+    archive-managed root is preserved. Files that ARE in the archive
+    are spared by the delete pass and overwritten by the extract pass.
     """
 
     @staticmethod
     def _populate_target(target_dir: Path) -> None:
         """Create the target-dir layout used by extract --delete tests:
-        one managed extra under set-a/ (the file path do_extract's
-        delete pass should clean up) and one unmanaged file under other/
-        (which sits outside every backup-set path and must be
-        preserved). Only one managed extra is used: do_extract's current
-        cleanup-path dedup loop calls Path.relative_to (which raises
-        ValueError for unrelated paths) instead of is_relative_to, so
-        multiple unrelated managed extras crash do_extract. That defect
-        is independent of the NofM-suffix rework these tests are
-        baselining."""
+        a managed extra under set-a/, a managed extra under set-b/, and
+        an unmanaged file under other/ that sits outside every
+        archive-managed path."""
         (target_dir / "set-a").mkdir()
         (target_dir / "set-a" / "extra-managed.txt").write_text(
             "managed-extra-a"
+        )
+        (target_dir / "set-b").mkdir()
+        (target_dir / "set-b" / "extra-managed.txt").write_text(
+            "managed-extra-b"
         )
         (target_dir / "other").mkdir()
         (target_dir / "other" / "preserve.txt").write_text("unmanaged")
@@ -3920,14 +3916,15 @@ class TestE2EExtract:
         assert (target / "set-b" / "set-b-file.txt").is_file()
         # Pre-existing extras (managed and unmanaged) all preserved.
         assert (target / "set-a" / "extra-managed.txt").is_file()
+        assert (target / "set-b" / "extra-managed.txt").is_file()
         assert (target / "other" / "preserve.txt").is_file()
 
-    def test_extract_with_delete_removes_managed_extra(
+    def test_extract_with_delete_removes_managed_extras(
         self, borg_e2e: BorgE2EFixture, tmp_path: Path
     ) -> None:
-        """With --delete, extract deletes a pre-existing file that is
-        under a configured backup-set path AND not in any archive.
-        Files outside every backup-set path are preserved. Files that
+        """With --delete, extract deletes pre-existing files that are
+        under an archive-managed path AND not in any archive. Files
+        outside every archive-managed path are preserved. Files that
         ARE in the archive are spared by the delete pass and
         overwritten by the extract pass."""
         borg_e2e.run("create", "--no-prune")
@@ -3942,8 +3939,9 @@ class TestE2EExtract:
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        # Managed extra: gone.
+        # Managed extras: gone.
         assert not (target / "set-a" / "extra-managed.txt").exists()
+        assert not (target / "set-b" / "extra-managed.txt").exists()
         # Archive-resident path: present, and replaced by archive
         # content (proving the delete pass spared it and the extract
         # pass overwrote).
@@ -3972,7 +3970,183 @@ class TestE2EExtract:
         assert not (target / "set-b" / "set-b-file.txt").exists()
         # Nothing deleted.
         assert (target / "set-a" / "extra-managed.txt").is_file()
+        assert (target / "set-b" / "extra-managed.txt").is_file()
         assert (target / "other" / "preserve.txt").is_file()
+
+    def test_extract_delete_handles_multi_component_archive_roots(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """Backup-set paths can be multi-component relatives like
+        Pictures/Family/. borg create archives just the explicit
+        directory, not its parents -- the archive entries start at
+        Pictures/Family with no Pictures or "" entry. archive_managed
+        must still discover Pictures/Family as a managed root."""
+        # Reconfigure with a multi-component backup-set path.
+        nested = borg_e2e.backup_root / "Pictures" / "Family"
+        nested.mkdir(parents=True)
+        (nested / "photo.txt").write_text("family photo")
+        _set_backup_sets(borg_e2e, {"family": {"paths": ["Pictures/Family/"]}})
+        borg_e2e.run("create", "--no-prune")
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        (target / "Pictures" / "Family").mkdir(parents=True)
+        (target / "Pictures" / "Family" / "extra-managed.txt").write_text(
+            "managed-extra"
+        )
+        (target / "Pictures" / "preserve-sibling.txt").write_text(
+            "unmanaged sibling under Pictures"
+        )
+        (target / "other").mkdir()
+        (target / "other" / "preserve.txt").write_text("unmanaged")
+
+        result = borg_e2e.run("extract", "--delete", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Inside the multi-component managed root: deleted.
+        assert not (
+            target / "Pictures" / "Family" / "extra-managed.txt"
+        ).exists()
+        # Archive-resident file: present.
+        assert (target / "Pictures" / "Family" / "photo.txt").is_file()
+        # Sibling under Pictures/ but outside Pictures/Family/: preserved.
+        assert (target / "Pictures" / "preserve-sibling.txt").is_file()
+        # Unrelated tree: preserved.
+        assert (target / "other" / "preserve.txt").is_file()
+
+    def test_extract_delete_uses_archive_managed_paths_not_config(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """managed-path classification reads top-level entries from the
+        archives being extracted, not cfg.BACKUP_SETS. A backup set
+        added to the config after the archives were created therefore
+        does NOT become eligible for --delete cleanup: there is no
+        archive to validate the local paths against, so the safe rule
+        is to leave them alone."""
+        borg_e2e.run("create", "--no-prune")
+        # Add a new set-c entry to the config without creating any
+        # archive for it. The fixture's source dir needs the directory
+        # to exist for config validation reachable from later commands,
+        # though no extract subcommand path triggers that validation.
+        (borg_e2e.backup_root / "set-c").mkdir()
+        (borg_e2e.backup_root / "set-c" / "f.txt").write_text("c")
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "set-a": {"paths": ["set-a/"]},
+                "set-b": {"paths": ["set-b/"]},
+                "set-c": {"paths": ["set-c/"]},
+            },
+        )
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        (target / "set-a").mkdir()
+        (target / "set-a" / "extra-managed.txt").write_text("managed-a")
+        (target / "set-c").mkdir()
+        (target / "set-c" / "extra-unmanaged.txt").write_text(
+            "no archive covers me"
+        )
+
+        result = borg_e2e.run("extract", "--delete", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # set-a extra: managed by the archive being extracted, deleted.
+        assert not (target / "set-a" / "extra-managed.txt").exists()
+        # set-c extra: no archive covers set-c, so the new code treats
+        # it as outside every archive-managed root and preserves it,
+        # even though cfg.BACKUP_SETS lists set-c.
+        assert (target / "set-c" / "extra-unmanaged.txt").is_file()
+
+    def test_extract_delete_reconciles_root_level_file(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """A backup set that is a bare file lands at the archive root.
+        Its managed root is the file's parent -- target_dir itself --
+        so `--delete` reconciles the whole target: a pre-existing
+        root-level extra is removed, leaving only the archive's file."""
+        (borg_e2e.backup_root / "new").write_text("new content")
+        _set_backup_sets(borg_e2e, {"loose": {"paths": ["new"]}})
+        borg_e2e.run("create", "--no-prune")
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        (target / "old").write_text("stale root-level file")
+
+        result = borg_e2e.run("extract", "--delete", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (target / "new").read_text() == "new content"
+        assert not (target / "old").exists()
+
+    def test_extract_without_delete_keeps_root_level_sibling(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """Without --delete, a bare-file backup set extracts its file
+        but leaves a pre-existing root-level sibling untouched."""
+        (borg_e2e.backup_root / "new").write_text("new content")
+        _set_backup_sets(borg_e2e, {"loose": {"paths": ["new"]}})
+        borg_e2e.run("create", "--no-prune")
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        (target / "old").write_text("stale root-level file")
+
+        result = borg_e2e.run("extract", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (target / "new").read_text() == "new content"
+        assert (target / "old").read_text() == "stale root-level file"
+
+    def test_extract_delete_root_file_preserves_archive_ancestor_dirs(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """A root-level file in the backup makes target_dir a managed
+        root, but --delete must still spare directories that hold
+        archive content. With a bare-file set plus a Pictures/Family/
+        tree: the root-level extra is deleted and a stale leaf inside
+        Family/ is deleted, but Pictures/ and Pictures/Family/ survive
+        (borg writes no Pictures entry, yet it is an ancestor of
+        archive content -- deleting it would only force a re-extract)."""
+        (borg_e2e.backup_root / "new").write_text("new content")
+        family = borg_e2e.backup_root / "Pictures" / "Family"
+        family.mkdir(parents=True)
+        (family / "photo.txt").write_text("family photo")
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "loose": {"paths": ["new"]},
+                "family": {"paths": ["Pictures/Family/"]},
+            },
+        )
+        borg_e2e.run("create", "--no-prune")
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        (target / "old").write_text("stale root-level file")
+        target_family = target / "Pictures" / "Family"
+        target_family.mkdir(parents=True)
+        (target_family / "photo.txt").write_text("stale photo")
+        (target_family / "stale.txt").write_text("stale leaf inside Family")
+
+        result = borg_e2e.run("extract", "--delete", str(target))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Root-level extra: deleted.
+        assert not (target / "old").exists()
+        # Ancestor dirs of archive content: preserved.
+        assert (target / "Pictures").is_dir()
+        assert target_family.is_dir()
+        # Archive content: extracted (stale photo overwritten).
+        assert (target / "new").read_text() == "new content"
+        assert (target_family / "photo.txt").read_text() == "family photo"
+        # Stale leaf inside a backed-up dir: deleted.
+        assert not (target_family / "stale.txt").exists()
 
     def test_extract_on_empty_repo_fails(
         self, borg_e2e: BorgE2EFixture, tmp_path: Path

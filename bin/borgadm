@@ -1812,15 +1812,26 @@ def do_extract(
 
     cleanup_paths: set[Path] = set()
     if delete:
+        # archive_paths is every entry in the archives; archive_dirs is
+        # the subset that are directories. The "{type} {path}" format
+        # puts a single type char ('d' for a directory) then a space
+        # then the path, so the path starts at index 2 and may itself
+        # contain spaces.
         archive_paths: set[Path] = set()
+        archive_dirs: set[Path] = set()
         for archive in archives:
             logger.info(f"Getting archive contents: {archive}")
-            cmd = borg_cmd() + ["list", "--format", "{path}{NL}"]
+            cmd = borg_cmd() + ["list", "--format", "{type} {path}{NL}"]
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
             cmd.append(archive)
-            for i in run_cmd(cmd).stdout.splitlines():
-                archive_paths.add(Path(i))
+            for line in run_cmd(cmd).stdout.splitlines():
+                if not line:
+                    continue
+                entry_path = Path(line[2:])
+                archive_paths.add(entry_path)
+                if line[0] == "d":
+                    archive_dirs.add(entry_path)
 
         logger.info(f"Getting target-path contents: {target_dir}")
         local_paths: set[Path] = set()
@@ -1834,24 +1845,53 @@ def do_extract(
         logger.info(
             "Filtering local contents against backup paths and archive contents"
         )
-        bs_dirs, bs_files = backup_set_paths()
+        # Derive "managed" path roots from the archives being extracted
+        # rather than from cfg.BACKUP_SETS. If the config has drifted
+        # since these archives were created (a backup set was added,
+        # removed, or renamed), reading cfg would over-delete or
+        # under-delete in target_dir. The archives are the
+        # authoritative statement of what this restore covers.
+        #
+        # The root of a backed-up tree is the topmost archive entry
+        # (no proper ancestor in archive_paths). This handles
+        # multi-component cfg-relative backup paths like
+        # "Pictures/Family/" -- borg create writes a directory entry
+        # for the explicitly-specified path but no entries for its
+        # parents, so the root may live at any depth. A directory
+        # topmost entry IS its own managed root; a file topmost entry
+        # (a bare-file backup set) contributes its parent directory,
+        # so --delete still reconciles the file's siblings. A
+        # root-level file therefore makes target_dir itself a managed
+        # root.
+        managed_roots: set[Path] = set()
+        # Sort by depth then lexicographically by path string so the
+        # outcome is deterministic even when two entries share a
+        # depth (e.g. a root-level file and a root-level directory).
+        for p in sorted(archive_paths, key=lambda x: (len(x.parts), str(x))):
+            if any(p.is_relative_to(r) and p != r for r in managed_roots):
+                continue
+            managed_roots.add(p if p in archive_dirs else p.parent)
 
-        def backup_set_filter(
-            path: Path, set_name: Optional[str] = None
-        ) -> bool:
-            if path in bs_files:
-                return True
-            for d in bs_dirs:
-                if path.is_relative_to(d):
-                    return True
-            return False
+        def archive_managed(path: Path) -> bool:
+            # Path.is_relative_to(self) is True, so a single
+            # is_relative_to check covers the exact-match case too.
+            return any(path.is_relative_to(r) for r in managed_roots)
 
-        local_paths = set(filter(backup_set_filter, local_paths))
+        # An archive entry's ancestor directories must survive the
+        # delete pass even when they aren't archive entries themselves
+        # -- borg omits the parents above a backed-up path, so a
+        # "Pictures/Family/" set leaves Pictures/ with no entry.
+        # Deleting it would only force a re-extract.
+        archive_ancestors = {
+            parent for p in archive_paths for parent in p.parents
+        }
+        local_paths = set(filter(archive_managed, local_paths))
         extras = sorted(
-            local_paths - archive_paths, key=lambda x: len(x.parts)
+            local_paths - archive_paths - archive_ancestors,
+            key=lambda x: len(x.parts),
         )  # shallowest first
         for path in extras:
-            if not any(path.relative_to(p) for p in cleanup_paths):
+            if not any(path.is_relative_to(p) for p in cleanup_paths):
                 cleanup_paths.add(path)
 
         logger.info(
