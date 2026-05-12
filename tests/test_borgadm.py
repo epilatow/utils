@@ -3367,6 +3367,140 @@ class TestE2ECreate:
         assert len(timestamps) == 2
 
 
+@e2e_requires_borg
+class TestE2EPrune:
+    """E2E coverage for `borgadm prune` retention + partial handling.
+
+    Pins do_prune's two-stage behavior end-to-end: stage one deletes
+    every partial archive unconditionally; stage two keeps full
+    timestamps that satisfy the GFS retention buckets in ts_to_keep and
+    deletes the rest. ts_to_keep itself is exhaustively unit-tested
+    elsewhere -- the goal here is to confirm the wiring between
+    list_backups, ts_to_keep, and the actual borg-delete invocations
+    survives the upcoming completeness rework.
+    """
+
+    def test_prune_on_empty_repo_succeeds(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm prune` on a repo with no archives is a no-op."""
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert borg_e2e.archives() == []
+
+    def test_prune_dry_run_is_nondestructive(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`--dry-run` reports what would happen without touching the
+        repo. Exercises both prune stages: a partial archive that stage
+        one would delete and a stale full archive that stage two would
+        prune under --keep-hourly=1."""
+        for ts in ("20260101_120000", "20260101_130000"):
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("test-set-a-20260101_140000")
+        before = set(borg_e2e.archives())
+        result = borg_e2e.run(
+            "prune",
+            "--dry-run",
+            "--keep-hourly",
+            "1",
+            "--keep-daily",
+            "0",
+            "--keep-weekly",
+            "0",
+            "--keep-monthly",
+            "0",
+            "--keep-yearly",
+            "0",
+        )
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert set(borg_e2e.archives()) == before
+
+    def test_prune_deletes_partials_keeps_full(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A repo with one full set and one partial set: prune deletes
+        only the partial archive."""
+        full_ts = "20260102_120000"
+        partial_ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{full_ts}")
+        borg_e2e.make_archive(f"test-set-b-{full_ts}")
+        borg_e2e.make_archive(f"test-set-a-{partial_ts}")
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            f"test-set-a-{full_ts}",
+            f"test-set-b-{full_ts}",
+        ]
+
+    def test_prune_keeps_full_backups_within_retention(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Three full backups at distinct hours all fall within the
+        default 24-hourly retention window and survive prune."""
+        timestamps = [
+            "20260101_120000",
+            "20260101_130000",
+            "20260101_140000",
+        ]
+        for ts in timestamps:
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        expected = sorted(
+            f"test-{s}-{ts}" for ts in timestamps for s in ("set-a", "set-b")
+        )
+        assert sorted(borg_e2e.archives()) == expected
+
+    def test_prune_drops_full_backups_outside_retention(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """With --keep-hourly=1 (and other retention buckets set to 0),
+        only the newest of three hourly full backups survives.
+
+        ts_to_keep fills the hourly bucket from oldest to newest, then
+        keeps the last N (newest) entries -- so 14:00 wins over 12:00
+        and 13:00."""
+        timestamps = [
+            "20260101_120000",
+            "20260101_130000",
+            "20260101_140000",
+        ]
+        for ts in timestamps:
+            borg_e2e.make_archive(f"test-set-a-{ts}")
+            borg_e2e.make_archive(f"test-set-b-{ts}")
+        result = borg_e2e.run(
+            "prune",
+            "--keep-hourly",
+            "1",
+            "--keep-daily",
+            "0",
+            "--keep-weekly",
+            "0",
+            "--keep-monthly",
+            "0",
+            "--keep-yearly",
+            "0",
+        )
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [
+            "test-set-a-20260101_140000",
+            "test-set-b-20260101_140000",
+        ]
+
+
 class TestExceptionHierarchy(ExceptionHierarchyBase):
     """Test BorgadmError exception hierarchy."""
 
