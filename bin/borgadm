@@ -194,6 +194,14 @@ _BORG_REPO_HOSTKEY: str = ""
 #       "paths": ["path1", ...]
 #   }
 # }
+#
+# Archive names emitted by `borgadm create` follow
+#   {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM
+# where M is the count of configured sets and N is the 1-based
+# position of the set's name in sorted set-name order. When M has
+# two or more digits, N is zero-padded to match (e.g. 01of11,
+# ..., 11of11) so archive names sort correctly in alphabetical
+# listings.
 _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 
 
@@ -733,34 +741,46 @@ def list_backups(
 
     result = list_backups_raw()
 
-    timestamps_by_type: dict[str, set[str]] = {
-        key: set() for key in cfg.BACKUP_SETS
+    # set_name -> timestamp -> short archive name as observed in the
+    # repo. Storing the actual short name (rather than just remembering
+    # which timestamps a set has) is what lets the reconstructed
+    # archive reference round-trip the NofM suffix, including its
+    # absence on legacy archives.
+    archives_by_set: dict[str, dict[str, str]] = {
+        key: {} for key in cfg.BACKUP_SETS
     }
     backup_set_names = "|".join(cfg.BACKUP_SETS)
     ts_pattern = re.compile(
         f"{cfg.BACKUP_NAME}-({backup_set_names})-" + r"(\d{8}_\d{6})"
     )
     for line in result.stdout.strip().splitlines():
-        match = ts_pattern.match(line.strip())
+        short = line.strip()
+        match = ts_pattern.match(short)
         if match:
             set_name, timestamp = match.groups()
-            if set_name in timestamps_by_type:
-                timestamps_by_type[set_name].add(timestamp)
+            if set_name in archives_by_set:
+                archives_by_set[set_name][timestamp] = short
 
-    all_ts: set[str] = set().union(*timestamps_by_type.values())
+    all_ts: set[str] = set().union(
+        *(set(per_ts) for per_ts in archives_by_set.values())
+    )
+    # Iterate sets in sorted() order -- the same ordering do_create
+    # uses to assign N -- so archives within a timestamp emerge in a
+    # stable order matching do_create's NofM assignment.
+    sorted_set_names = sorted(cfg.BACKUP_SETS.keys())
     rv: dict[str, list[str]] = {}
 
     for ts in sorted(all_ts, reverse=True):
 
         def include() -> None:
             rv[ts] = [
-                f"{cfg.BORG_REPO}::{cfg.BACKUP_NAME}-{set_name}-{ts}"
-                for set_name in cfg.BACKUP_SETS
-                if ts in timestamps_by_type[set_name]
+                f"{cfg.BORG_REPO}::{archives_by_set[set_name][ts]}"
+                for set_name in sorted_set_names
+                if ts in archives_by_set[set_name]
             ]
 
         is_full = all(
-            ts in timestamps_by_type[set_name] for set_name in cfg.BACKUP_SETS
+            ts in archives_by_set[set_name] for set_name in sorted_set_names
         )
         if not partial and is_full:
             include()
@@ -1536,7 +1556,17 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         backup_set_tests(set_name)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for set_name, set_cfg in cfg.BACKUP_SETS.items():
+    # NofM suffix: M is the count of configured sets; N is the 1-based
+    # position of the current set among the sorted dict keys. The
+    # width-padded format keeps archive names sorting correctly when
+    # M >= 10 (e.g. 01of11, ..., 11of11). Sorting the keys means two
+    # configs with the same set names produce identical archive names
+    # regardless of how the user edits the dict.
+    sorted_set_names = sorted(cfg.BACKUP_SETS.keys())
+    suffix_count = len(sorted_set_names)
+    suffix_width = len(str(suffix_count))
+    for suffix_pos, set_name in enumerate(sorted_set_names, start=1):
+        set_cfg = cfg.BACKUP_SETS[set_name]
         # Backups can take a while, so re-run tests before each backup
         backup_set_tests(set_name)
         for path in cfg.BACKUP_MOUNTS:
@@ -1567,7 +1597,8 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 excludes.extend(auto_excludes)
         for e in excludes:
             create_args += ["--exclude", e]
-        archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}"
+        suffix = f"_{suffix_pos:0{suffix_width}d}of{suffix_count}"
+        archive_name = f"{cfg.BACKUP_NAME}-{set_name}-{timestamp}{suffix}"
         archive = f"{cfg.BORG_REPO}::{archive_name}"
         dry = " (dry-run)" if dry_run else ""
         logger.info(f"Create archive, start: {archive}{dry})")

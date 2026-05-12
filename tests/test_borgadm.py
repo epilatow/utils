@@ -3203,7 +3203,8 @@ class TestE2EList:
         self, borg_e2e: BorgE2EFixture
     ) -> None:
         """`--full-names` switches the output to one line per archive.
-        Within a timestamp, archives appear in cfg.BACKUP_SETS order."""
+        Within a timestamp, archives appear in sorted set-name order
+        (matching do_create's NofM emission order)."""
         ts = "20260101_120000"
         borg_e2e.make_archive(f"test-set-a-{ts}")
         borg_e2e.make_archive(f"test-set-b-{ts}")
@@ -3269,11 +3270,18 @@ class TestE2EList:
         assert _list_borgadm(borg_e2e, "--only-partial") == []
 
 
-# Matches archive names produced by do_create today:
-# `{BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS`. Captures the set name and
-# the timestamp so callers can assert on cross-archive timestamp equality.
+# Matches archive names produced by do_create:
+# `{BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM`. Captures set name,
+# timestamp, N, and M so callers can assert on the NofM suffix in
+# addition to cross-archive timestamp equality. The suffix is padded
+# to the width of M when M >= 10 (e.g. 01of11) so archive names sort
+# correctly; N and M are captured as raw strings to let the caller
+# inspect the padding rather than implicitly normalizing. The set
+# token is `.+?` so tests can use arbitrary set names; the trailing
+# `_\d+of\d+$` anchor pins the parse against the timestamp + suffix
+# rather than against any specific set name.
 _CREATE_ARCHIVE_RE = re.compile(
-    r"^test-(?P<set>set-a|set-b)-(?P<ts>\d{8}_\d{6})$"
+    r"^test-(?P<set>.+?)-(?P<ts>\d{8}_\d{6})_(?P<n>\d+)of(?P<m>\d+)$"
 )
 
 
@@ -3286,21 +3294,34 @@ def _parse_archive_name(name: str) -> re.Match[str]:
     return m
 
 
+def _set_backup_sets(
+    fixture: BorgE2EFixture, sets: dict[str, dict[str, list[str]]]
+) -> None:
+    """Rewrite the BACKUP_SETS line in the fixture's config without
+    disturbing the rest of the file. Tests use this when they need to
+    exercise a config different from the fixture's default two-set
+    layout (different set count, set names, or path shapes)."""
+    lines = fixture.config_path.read_text().splitlines()
+    rewritten = [line for line in lines if not line.startswith("BACKUP_SETS")]
+    rewritten.append(f"BACKUP_SETS = {json.dumps(sets)}")
+    fixture.config_path.write_text("\n".join(rewritten) + "\n")
+
+
 @e2e_requires_borg
 class TestE2ECreate:
     """E2E coverage for `borgadm create` archive naming.
 
-    Pins the current naming scheme so the upcoming NofM-suffix rework
-    surfaces as an explicit test diff rather than a silent behavior
-    change. _CREATE_ARCHIVE_RE and this docstring move in lockstep with
-    that rework.
+    Pins the NofM-suffix scheme: each archive name carries a
+    `_NofM` tail where M is the configured-set count and N is the
+    1-based position of the set's name in sorted set-name order.
     """
 
     def test_create_produces_one_archive_per_set(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
         """A successful `borgadm create --no-prune` writes one archive
-        per configured set, all sharing a single timestamp."""
+        per configured set, all sharing a single timestamp and tagged
+        with a complete NofM = 1..M run."""
         result = borg_e2e.run("create", "--no-prune")
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -3309,31 +3330,81 @@ class TestE2ECreate:
         assert len(archives) == 2
         timestamps: set[str] = set()
         sets_seen: list[str] = []
+        n_values: list[int] = []
+        m_values: set[str] = set()
         for name in archives:
             m = _parse_archive_name(name)
             timestamps.add(m.group("ts"))
             sets_seen.append(m.group("set"))
+            n_values.append(int(m.group("n")))
+            m_values.add(m.group("m"))
         assert len(timestamps) == 1, (
             f"archives at different timestamps: {timestamps}"
         )
         assert sorted(sets_seen) == ["set-a", "set-b"]
+        # Every archive in a run shares the same M, and N values cover
+        # 1..M exactly once.
+        assert m_values == {"2"}, f"mixed M values: {m_values}"
+        assert sorted(n_values) == [1, 2]
 
-    def test_create_emits_in_backup_sets_order(
+    def test_create_assigns_n_by_sorted_set_name(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
-        """do_create iterates cfg.BACKUP_SETS in order, writing the
-        `set-a` archive first and the `set-b` archive second. `borg list`
-        defaults to --sort-by=timestamp, and the two archives carry the
-        same wall-clock string from datetime.now() (granular to seconds);
-        sub-second creation order is what disambiguates them. This test
-        pins the resulting ordering because that order is what determines
-        NofM assignment once the suffix rework lands."""
+        """N is assigned in sorted order of the BACKUP_SETS keys, not
+        in cfg-dict insertion order. Uses a config whose insertion
+        order is the REVERSE of sorted order (zebra before alpha) so
+        a regression to dict-iteration would visibly flip the N
+        assignment."""
+        (borg_e2e.backup_root / "zebra").mkdir()
+        (borg_e2e.backup_root / "zebra" / "f.txt").write_text("z")
+        (borg_e2e.backup_root / "alpha").mkdir()
+        (borg_e2e.backup_root / "alpha" / "f.txt").write_text("a")
+        # Insertion order zebra-then-alpha; sorted order alpha-then-zebra.
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "zebra": {"paths": ["zebra/"]},
+                "alpha": {"paths": ["alpha/"]},
+            },
+        )
         borg_e2e.run("create", "--no-prune")
+        n_by_set = {
+            _parse_archive_name(name).group("set"): _parse_archive_name(
+                name
+            ).group("n")
+            for name in borg_e2e.archives()
+        }
+        # alpha sorts first -> N=1; zebra second -> N=2.
+        assert n_by_set == {"alpha": "1", "zebra": "2"}
+
+    def test_create_pads_n_when_m_has_two_digits(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """When M >= 10 the suffix pads N to match M's width so archive
+        names sort correctly in alphabetical listings (01of11 rather
+        than 1of11, which would sort after 10of11). Rewrites the
+        config to declare 11 sets and re-runs create against a fresh
+        archive timestamp."""
+        # Override the fixture config with 11 sets to exercise the
+        # padding branch end-to-end.
+        for i in range(1, 12):
+            d = borg_e2e.backup_root / f"s{i:02d}"
+            d.mkdir(exist_ok=True)
+            (d / "f.txt").write_text("x")
+        _set_backup_sets(
+            borg_e2e,
+            {f"s{i:02d}": {"paths": [f"s{i:02d}/"]} for i in range(1, 12)},
+        )
+        result = borg_e2e.run("create", "--no-prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
         archives = borg_e2e.archives()
-        assert len(archives) == 2
-        first, second = archives
-        assert _parse_archive_name(first).group("set") == "set-a"
-        assert _parse_archive_name(second).group("set") == "set-b"
+        assert len(archives) == 11
+        # The NofM tail is the substring after the last underscore.
+        suffixes = sorted(name.rsplit("_", 1)[-1] for name in archives)
+        # All zero-padded to width 2; values cover 01..11.
+        assert suffixes == [f"{i:02d}of11" for i in range(1, 12)]
 
     def test_create_dry_run_does_not_persist_archives(
         self, borg_e2e: BorgE2EFixture
