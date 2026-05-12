@@ -20,10 +20,12 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -3265,6 +3267,104 @@ class TestE2EList:
         assert _list_borgadm(borg_e2e) == [ts]
         assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
         assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+
+# Matches archive names produced by do_create today:
+# `{BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS`. Captures the set name and
+# the timestamp so callers can assert on cross-archive timestamp equality.
+_CREATE_ARCHIVE_RE = re.compile(
+    r"^test-(?P<set>set-a|set-b)-(?P<ts>\d{8}_\d{6})$"
+)
+
+
+def _parse_archive_name(name: str) -> re.Match[str]:
+    """Match an archive name against the do_create scheme, asserting on
+    failure. Centralizes the parse so tests don't carry # type: ignore
+    comments or silently drop unmatched archives via walrus filters."""
+    m = _CREATE_ARCHIVE_RE.match(name)
+    assert m is not None, f"archive name does not match: {name!r}"
+    return m
+
+
+@e2e_requires_borg
+class TestE2ECreate:
+    """E2E coverage for `borgadm create` archive naming.
+
+    Pins the current naming scheme so the upcoming NofM-suffix rework
+    surfaces as an explicit test diff rather than a silent behavior
+    change. _CREATE_ARCHIVE_RE and this docstring move in lockstep with
+    that rework.
+    """
+
+    def test_create_produces_one_archive_per_set(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A successful `borgadm create --no-prune` writes one archive
+        per configured set, all sharing a single timestamp."""
+        result = borg_e2e.run("create", "--no-prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        archives = borg_e2e.archives()
+        assert len(archives) == 2
+        timestamps: set[str] = set()
+        sets_seen: list[str] = []
+        for name in archives:
+            m = _parse_archive_name(name)
+            timestamps.add(m.group("ts"))
+            sets_seen.append(m.group("set"))
+        assert len(timestamps) == 1, (
+            f"archives at different timestamps: {timestamps}"
+        )
+        assert sorted(sets_seen) == ["set-a", "set-b"]
+
+    def test_create_emits_in_backup_sets_order(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """do_create iterates cfg.BACKUP_SETS in order, writing the
+        `set-a` archive first and the `set-b` archive second. `borg list`
+        defaults to --sort-by=timestamp, and the two archives carry the
+        same wall-clock string from datetime.now() (granular to seconds);
+        sub-second creation order is what disambiguates them. This test
+        pins the resulting ordering because that order is what determines
+        NofM assignment once the suffix rework lands."""
+        borg_e2e.run("create", "--no-prune")
+        archives = borg_e2e.archives()
+        assert len(archives) == 2
+        first, second = archives
+        assert _parse_archive_name(first).group("set") == "set-a"
+        assert _parse_archive_name(second).group("set") == "set-b"
+
+    def test_create_dry_run_does_not_persist_archives(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm create --dry-run` exits 0 without writing archives."""
+        result = borg_e2e.run("create", "--dry-run", "--no-prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert borg_e2e.archives() == []
+
+    def test_two_creates_use_distinct_timestamps(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Sequential `borgadm create` invocations produce archives at
+        different timestamps. do_create stamps once at the top of the
+        run and shares that stamp across the set, so successive runs
+        must diverge -- otherwise the second run would collide with the
+        first on archive name."""
+        borg_e2e.run("create", "--no-prune")
+        # Sleep 1s to guarantee a distinct YYYYMMDD_HHMMSS stamp; the
+        # second create would otherwise hit `borg create` with an
+        # already-existing archive name and fail.
+        time.sleep(1.1)
+        borg_e2e.run("create", "--no-prune")
+        archives = borg_e2e.archives()
+        assert len(archives) == 4
+        timestamps = {
+            _parse_archive_name(name).group("ts") for name in archives
+        }
+        assert len(timestamps) == 2
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
