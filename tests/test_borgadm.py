@@ -33,10 +33,9 @@ from typing import Any, Iterator
 from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
-import pytest  # type: ignore[import-not-found]
+import pytest
 from conftest import (
     CmdCallbacksBase,
-    CodeQualityBase,
     ExceptionHierarchyBase,
 )
 
@@ -4489,13 +4488,6 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         ba.ExitCode.WARNING,
         ba.ExitCode.USAGE,
     }
-
-
-class TestCodeQuality(CodeQualityBase):
-    """Test code quality with black, flake8, and mypy."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_borgadm.py"
 
 
 if __name__ == "__main__":

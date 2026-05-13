@@ -381,14 +381,17 @@ def decompress_mozlz4(data: bytes) -> bytes:
     Raises:
         ValueError: If the magic header is invalid.
     """
-    import lz4.block  # type: ignore[import-untyped,import-not-found]
+    import lz4.block  # type: ignore[import-untyped]
 
     MOZLZ4_MAGIC = b"mozLz40\0"
     if not data.startswith(MOZLZ4_MAGIC):
         raise ValueError("Invalid mozlz4 file: wrong magic header")
     (uncompressed_size,) = struct.unpack_from("<I", data, len(MOZLZ4_MAGIC))
     compressed = data[len(MOZLZ4_MAGIC) + 4 :]
-    return lz4.block.decompress(compressed, uncompressed_size=uncompressed_size)
+    decompressed: bytes = lz4.block.decompress(
+        compressed, uncompressed_size=uncompressed_size
+    )
+    return decompressed
 
 
 def load_session_cookies(

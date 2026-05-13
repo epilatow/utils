@@ -722,7 +722,10 @@ def extract_manifest_from_archive(
         manifest_file = td_path / "manifest.json"
         if not manifest_file.exists():
             return None
-        return json.loads(manifest_file.read_text("utf-8"))
+        loaded = json.loads(manifest_file.read_text("utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+        return None
 
 
 def make_archive_with_7zz(

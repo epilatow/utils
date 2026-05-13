@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
-import pytest  # type: ignore[import-not-found]
-from conftest import CmdCallbacksBase, CodeQualityBase, ExceptionHierarchyBase
+import pytest
+from conftest import CmdCallbacksBase, ExceptionHierarchyBase
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -2191,13 +2191,6 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         sa.ExitCode.SUCCESS,
         sa.ExitCode.WARNING,
     }
-
-
-class TestCodeQuality(CodeQualityBase):
-    """Test code quality with black, flake8, and mypy."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_secure_archiver.py"
 
 
 if __name__ == "__main__":

@@ -25,10 +25,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
-import pytest  # type: ignore[import-not-found]
+import pytest
 from conftest import (
     CmdCallbacksBase,
-    CodeQualityBase,
     ExceptionHierarchyBase,
 )
 
@@ -56,13 +55,6 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         crony.ExitCode.SUCCESS,
         crony.ExitCode.WARNING,
     }
-
-
-class TestCodeQuality(CodeQualityBase):
-    """Test code quality with ruff and mypy."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_crony.py"
 
 
 class TestHelpOutput:
@@ -2121,7 +2113,7 @@ class TestRunGroup:
         real_monotonic = crony.time.monotonic
 
         def fake_monotonic() -> float:
-            return real_monotonic() + clock["now"]
+            return float(real_monotonic()) + clock["now"]
 
         monkeypatch.setattr(crony.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(crony, "_trigger_unit_sync", _slow)
@@ -4052,7 +4044,7 @@ class TestLingerDetection:
         def fake_path(p: Any) -> Path:
             if str(p) == "/var/lib/systemd/linger/edp":
                 return sentinel
-            return real_path(p)
+            return Path(real_path(p))
 
         monkeypatch.setattr(crony, "Path", fake_path)
         assert crony.linger_enabled(user="edp") is True

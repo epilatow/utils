@@ -8,11 +8,10 @@ import atexit
 import inspect
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 
-import pytest  # type: ignore[import-not-found]
+import pytest
 from pathlib import Path
 from typing import Any, ClassVar, Iterator
 from unittest.mock import MagicMock, create_autospec, patch
@@ -48,118 +47,11 @@ atexit.register(_cleanup_all_caches)
 
 
 def pytest_sessionfinish(
-    session,  # type: ignore[no-untyped-def]
-    exitstatus,  # type: ignore[no-untyped-def]
+    session: pytest.Session,
+    exitstatus: int,
 ) -> None:
     """Clean up pycache directories after test session."""
     _cleanup_all_caches()
-
-
-class CodeQualityBase:
-    """Base class for code quality tests.
-
-    Subclasses must define SCRIPT_PATH and TEST_PATH.
-    """
-
-    SCRIPT_PATH: ClassVar[Path]
-    TEST_PATH: ClassVar[Path]
-
-    def test_ruff_check_compliance(self) -> None:
-        """Test that code passes ruff linting."""
-        result = subprocess.run(
-            ["uvx", "ruff", "check", str(self.SCRIPT_PATH)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f"ruff check failed:\n{result.stdout}"
-        )
-
-    def test_ruff_check_compliance_tests(self) -> None:
-        """Test that tests pass ruff linting."""
-        result = subprocess.run(
-            ["uvx", "ruff", "check", str(self.TEST_PATH)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f"ruff check failed:\n{result.stdout}"
-        )
-
-    def test_ruff_format_compliance(self) -> None:
-        """Test that code is formatted with ruff."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "ruff",
-                "format",
-                "--check",
-                str(self.SCRIPT_PATH),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f"ruff format check failed:\n{result.stderr}"
-        )
-
-    def test_ruff_format_compliance_tests(self) -> None:
-        """Test that tests are formatted with ruff."""
-        result = subprocess.run(
-            [
-                "uvx",
-                "ruff",
-                "format",
-                "--check",
-                str(self.TEST_PATH),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f"ruff format check failed:\n{result.stderr}"
-        )
-
-    def test_mypy_compliance(self, tmp_path: Path) -> None:
-        """Test that code passes mypy."""
-        cache_dir = tmp_path / "mypy_cache"
-        result = subprocess.run(
-            [
-                "uvx",
-                "mypy",
-                "--cache-dir",
-                str(cache_dir),
-                str(self.SCRIPT_PATH),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f"mypy check failed:\n{result.stdout}"
-        )
-
-    def test_mypy_compliance_tests(self, tmp_path: Path) -> None:
-        """Test that tests pass mypy."""
-        cache_dir = tmp_path / "mypy_cache"
-        env = os.environ.copy()
-        env["MYPYPATH"] = str(_REPO_ROOT / "bin")
-        result = subprocess.run(
-            [
-                "uvx",
-                "--with",
-                "pytest",
-                "mypy",
-                "--cache-dir",
-                str(cache_dir),
-                str(self.TEST_PATH),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        assert result.returncode == 0, (
-            f"mypy check failed:\n{result.stdout}"
-        )
 
 
 class ExceptionHierarchyBase:
@@ -175,14 +67,9 @@ class ExceptionHierarchyBase:
 
     def test_all_exit_codes_have_exception(self) -> None:
         """Every non-excluded ExitCode has an exception."""
-        all_classes = (
-            [self.BASE_ERROR]
-            + self.BASE_ERROR.__subclasses__()
-        )
+        all_classes = [self.BASE_ERROR] + self.BASE_ERROR.__subclasses__()
         covered = {
-            cls.exit_code
-            for cls in all_classes
-            if "exit_code" in cls.__dict__
+            cls.exit_code for cls in all_classes if "exit_code" in cls.__dict__
         }
         expected = set(self.EXIT_CODE) - self.EXCLUDED_CODES
         assert covered == expected
@@ -291,9 +178,7 @@ class CmdCallbacksBase:
     SELF_TEST_CMD: ClassVar[str] = "self-test"
     POPPED_ARGS: ClassVar[set[str]] = set()
     TEST_SUBCOMMAND: ClassVar[str] = ""
-    EXCEPTION_EXIT_CODE_MAP: ClassVar[
-        list[tuple[Exception, int]]
-    ] = []
+    EXCEPTION_EXIT_CODE_MAP: ClassVar[list[tuple[Exception, int]]] = []
 
     @staticmethod
     def _leaf_subparsers(
@@ -306,17 +191,11 @@ class CmdCallbacksBase:
         compound keys like ``"check age"`` for nested ones.
         """
         for action in parser._actions:
-            if not isinstance(
-                action, argparse._SubParsersAction
-            ):
+            if not isinstance(action, argparse._SubParsersAction):
                 continue
             for cmd, sub in action.choices.items():
                 label = f"{prefix} {cmd}".strip()
-                nested = list(
-                    CmdCallbacksBase._leaf_subparsers(
-                        sub, label
-                    )
-                )
+                nested = list(CmdCallbacksBase._leaf_subparsers(sub, label))
                 if nested:
                     yield from nested
                 else:
@@ -325,10 +204,7 @@ class CmdCallbacksBase:
     def test_dispatch_covers_all_commands(self) -> None:
         """COMMAND_CALLBACKS matches parser commands."""
         parser = type(self).PARSER_FUNC()
-        parser_cmds = {
-            cmd
-            for cmd, _ in self._leaf_subparsers(parser)
-        }
+        parser_cmds = {cmd for cmd, _ in self._leaf_subparsers(parser)}
         parser_cmds.discard(self.SELF_TEST_CMD)
         assert set(self.CALLBACKS.keys()) == parser_cmds
 
@@ -339,9 +215,7 @@ class CmdCallbacksBase:
         for cmd, fn in self.CALLBACKS.items():
             sig = inspect.signature(fn)
             for name, param in sig.parameters.items():
-                assert (
-                    param.default is inspect.Parameter.empty
-                ), (
+                assert param.default is inspect.Parameter.empty, (
                     f"{fn.__name__}({name}=...) has a "
                     f"default; defaults belong in the "
                     f"argument parser"
@@ -370,9 +244,7 @@ class CmdCallbacksBase:
                     continue
                 arg_names.add(action.dest)
             arg_names -= skip
-            arg_names = {
-                n for n in arg_names if not n.startswith("_")
-            }
+            arg_names = {n for n in arg_names if not n.startswith("_")}
 
             # autospec enforces the real signature
             mock_fn = create_autospec(fn)
@@ -381,26 +253,19 @@ class CmdCallbacksBase:
                 mock_fn(**kwargs)
             except TypeError as e:
                 raise AssertionError(
-                    f"Signature mismatch for '{cmd}' "
-                    f"({fn.__name__}): {e}"
+                    f"Signature mismatch for '{cmd}' ({fn.__name__}): {e}"
                 ) from e
 
     def test_all_subcommands_have_help(self) -> None:
         """All subcommands and arguments have help text."""
         parser = type(self).PARSER_FUNC()
 
-        def check_parser(
-            p: argparse.ArgumentParser, path: str
-        ) -> None:
+        def check_parser(p: argparse.ArgumentParser, path: str) -> None:
             for action in p._actions:
                 if isinstance(action, argparse._HelpAction):
                     continue
-                if isinstance(
-                    action, argparse._SubParsersAction
-                ):
-                    assert action.choices, (
-                        f"Empty subparsers in '{path}'"
-                    )
+                if isinstance(action, argparse._SubParsersAction):
+                    assert action.choices, f"Empty subparsers in '{path}'"
                     for name, sub in action.choices.items():
                         check_parser(sub, f"{path} {name}")
                     continue
@@ -421,9 +286,7 @@ class CmdCallbacksBase:
         """self-test subcommand parses -v/--coverage."""
         parser = type(self).PARSER_FUNC()
         cmd = type(self).SELF_TEST_CMD
-        args = parser.parse_args(
-            [cmd, "-v", "--coverage"]
-        )
+        args = parser.parse_args([cmd, "-v", "--coverage"])
         assert args.command == cmd
         assert args.verbose is True
         assert args.coverage is True
@@ -434,9 +297,7 @@ class CmdCallbacksBase:
         args = parser.parse_args([])
         assert args.command is None
 
-    def test_no_args_shows_help(
-        self, capsys: Any
-    ) -> None:
+    def test_no_args_shows_help(self, capsys: Any) -> None:
         """No arguments prints help and returns USAGE."""
         with patch("sys.argv", ["prog"]):
             result = type(self).CLI_FUNC()
@@ -514,9 +375,7 @@ class CmdCallbacksBase:
         ):
             result = type(self).CLI_FUNC()
         assert result == 0
-        mock.assert_called_once_with(
-            verbose=False, coverage=False
-        )
+        mock.assert_called_once_with(verbose=False, coverage=False)
 
     def test_cli_self_test_returns_test_results(
         self,
@@ -558,7 +417,7 @@ def run_tests(
     """
     import argparse
 
-    import pytest  # type: ignore[import-not-found]
+    import pytest
 
     parser = argparse.ArgumentParser()
     parser.add_argument(

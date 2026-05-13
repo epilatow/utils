@@ -98,6 +98,34 @@ def run_test_file(
     return TestResult(name=name, returncode=cp.returncode)
 
 
+def run_repo_shared_phase(
+    repo_shared_dir: Path,
+    *,
+    verbose: bool = False,
+) -> TestResult:
+    """Run the delivered shared tests under ``_repo_shared/tests/``.
+
+    The shared tests import ``epilatow_repo_shared`` from this repo's
+    ``pyproject.toml`` + ``uv.lock``, so they run as a single ``uv run
+    pytest`` invocation rather than as individual ``uv run --script``
+    files. ``_repo_shared/tests/`` is a sibling of this ``tests/``
+    tree rather than a descendant, so the ``tests/conftest.py`` walk
+    chain never reaches them -- no ``--confcutdir`` needed.
+    """
+    print_banner("Test: repo-shared (shared)")
+
+    cmd: list[str] = [
+        "uv",
+        "run",
+        "pytest",
+        str(repo_shared_dir),
+    ]
+    if verbose:
+        cmd.append("-v")
+    cp = subprocess.run(cmd, cwd=REPO_ROOT)
+    return TestResult(name="repo-shared", returncode=cp.returncode)
+
+
 # =============================================================
 # Reporting
 # =============================================================
@@ -187,6 +215,14 @@ def main() -> int:
             test_file,
             verbose=args.verbose,
             coverage=args.coverage,
+        )
+        results.append(result)
+
+    repo_shared_dir = REPO_ROOT / "_repo_shared" / "tests"
+    if repo_shared_dir.is_dir() and any(repo_shared_dir.glob("test_*.py")):
+        result = run_repo_shared_phase(
+            repo_shared_dir,
+            verbose=args.verbose,
         )
         results.append(result)
 

@@ -16,8 +16,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest  # type: ignore[import-not-found]
-from conftest import CodeQualityBase
+import pytest
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -155,6 +154,61 @@ class TestRunTestFile:
 
 
 # =============================================================
+# Tests: run_repo_shared_phase
+# =============================================================
+
+
+class TestRunRepoSharedPhase:
+    """Tests for the delivered-shared-tests phase.
+
+    The phase shells out to ``uv run pytest <dir>``; the interesting
+    shape is the argv it builds and the returncode mapping, not the
+    pytest run itself, so ``subprocess.run`` is patched.
+    """
+
+    def _stub_run(self, returncode: int) -> tuple[list[list[str]], object]:
+        captured: list[list[str]] = []
+
+        def fake(cmd: list[str], **_kwargs: object) -> object:
+            captured.append(list(cmd))
+            return type("CP", (), {"returncode": returncode})()
+
+        return captured, fake
+
+    def test_invokes_uv_run_pytest_against_dir(self) -> None:
+        captured, fake = self._stub_run(0)
+        shared_dir = Path("/some/_repo_shared/tests")
+        with patch.object(ra.subprocess, "run", fake):
+            result = ra.run_repo_shared_phase(shared_dir)
+        assert result.name == "repo-shared"
+        assert result.returncode == 0
+        assert result.success is True
+        assert len(captured) == 1
+        argv = captured[0]
+        assert argv[:3] == ["uv", "run", "pytest"]
+        assert argv[-1] == str(shared_dir)
+        # No --confcutdir: the shared tests are a sibling of tests/,
+        # not a descendant, so the conftest walk never reaches them.
+        assert not any(a.startswith("--confcutdir") for a in argv)
+        assert "-v" not in argv
+
+    def test_verbose_flag_appends_dash_v(self) -> None:
+        captured, fake = self._stub_run(0)
+        with patch.object(ra.subprocess, "run", fake):
+            ra.run_repo_shared_phase(
+                Path("/some/_repo_shared/tests"), verbose=True
+            )
+        assert "-v" in captured[0]
+
+    def test_nonzero_returncode_maps_to_failure(self) -> None:
+        _captured, fake = self._stub_run(1)
+        with patch.object(ra.subprocess, "run", fake):
+            result = ra.run_repo_shared_phase(Path("/some/_repo_shared/tests"))
+        assert result.returncode == 1
+        assert result.success is False
+
+
+# =============================================================
 # Tests: print_summary
 # =============================================================
 
@@ -265,18 +319,6 @@ class TestMain:
         ):
             rc = ra.main()
         assert rc == ra.EXIT_INFRA_ERROR
-
-
-# =============================================================
-# Tests: Code Quality
-# =============================================================
-
-
-class TestCodeQuality(CodeQualityBase):
-    """Code quality checks for run_all.py."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_run_all.py"
 
 
 if __name__ == "__main__":

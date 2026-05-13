@@ -430,29 +430,29 @@ def osascript_notify() -> None:
 
 
 class InfoFilter(logging.Filter):
-    def filter(self, record) -> bool:
+    def filter(self, record: logging.LogRecord) -> bool:
         return record.levelno == logging.INFO
 
 
 class WarnOrWorseFilter(logging.Filter):
-    def __init__(self, verbose) -> None:
+    def __init__(self, verbose: bool) -> None:
         self.verbose = verbose
 
-    def filter(self, record) -> bool:
+    def filter(self, record: logging.LogRecord) -> bool:
         if self.verbose:
             # skip INFO messages
             return record.levelno != logging.INFO
         return record.levelno >= logging.WARNING
 
 
-class BrokenPipeAwareStreamHandler(logging.StreamHandler):
+class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
     """StreamHandler that silently disables itself once its underlying
     stream is closed by a downstream pipe consumer (e.g., piping to
     `head`). The first BrokenPipeError swaps the stream for /dev/null,
     so subsequent records are absorbed without spamming "Logging error"
     tracebacks for every remaining log call."""
 
-    def handleError(self, record) -> None:
+    def handleError(self, record: logging.LogRecord) -> None:
         # logging.StreamHandler.emit catches every non-RecursionError
         # exception and routes it here. If the underlying cause is a
         # closed pipe, swap to /dev/null so future emits no-op silently
@@ -470,10 +470,10 @@ class BrokenPipeAwareStreamHandler(logging.StreamHandler):
 
 
 def initialize_logger(
-    logfile_path,
-    verbose=False,
-    timestamp_messages=False,
-    enable_notifications=False,
+    logfile_path: str | Path,
+    verbose: bool = False,
+    timestamp_messages: bool = False,
+    enable_notifications: bool = False,
 ) -> None:
     logger.setLevel(logging.DEBUG)  # Capture all logs for the file
 
@@ -520,7 +520,11 @@ def initialize_logger(
     stderr_handler.setFormatter(logging.Formatter(stderr_fmt))
     logger.addHandler(stderr_handler)
 
-    def log_exceptions(exc_type, exc_value, exc_traceback) -> None:
+    def log_exceptions(
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_traceback: Any,
+    ) -> None:
         logger.critical(
             "Uncaught exception",
             exc_info=(exc_type, exc_value, exc_traceback),
@@ -613,7 +617,7 @@ def run_cmd(
     sudo: bool = False,
     errok: bool = False,
     allow_output: bool = False,
-    **kwargs,
+    **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
     slow_cmds = borg_cmd() + ["rsync"]
     timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
@@ -1052,19 +1056,19 @@ def create_plist_element(
     plist = ElementTree.Element("plist", version="1.0")
     dict_elem = ElementTree.SubElement(plist, "dict")
 
-    def add_kv(key, value):
+    def add_kv(key: str, value: str) -> None:
         ElementTree.SubElement(dict_elem, "key").text = key
         ElementTree.SubElement(dict_elem, "string").text = value
 
-    def add_bool(key, val: bool):
+    def add_bool(key: str, val: bool) -> None:
         ElementTree.SubElement(dict_elem, "key").text = key
         ElementTree.SubElement(dict_elem, "true" if val else "false")
 
-    def add_int(key, val: int):
+    def add_int(key: str, val: int) -> None:
         ElementTree.SubElement(dict_elem, "key").text = key
         ElementTree.SubElement(dict_elem, "integer").text = str(val)
 
-    def add_env(env_vars: dict[str, str]):
+    def add_env(env_vars: dict[str, str]) -> None:
         ElementTree.SubElement(dict_elem, "key").text = "EnvironmentVariables"
         env_dict = ElementTree.SubElement(dict_elem, "dict")
         for k, v in env_vars.items():
@@ -1944,7 +1948,7 @@ def do_list(
     if keep_tags:
         ts_keep = ts_to_keep(set(full_backups.keys()))
 
-    def get_keep_tag(ts) -> str:
+    def get_keep_tag(ts: str) -> str:
         if not keep_tags:
             return ""
         if ts not in ts_keep:
@@ -2215,7 +2219,7 @@ def args_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     # Always set formatter_class so that we display default values.
-    def add_parser(name: str, **kwargs) -> argparse.ArgumentParser:
+    def add_parser(name: str, **kwargs: Any) -> argparse.ArgumentParser:
         kwargs["formatter_class"] = HelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
@@ -2247,7 +2251,9 @@ def args_parser() -> argparse.ArgumentParser:
             "--keep-weekly", type=int, help="Number of weekly backups to keep"
         )
         parser.add_argument(
-            "--keep-monthly", type=int, help="Number of monthly backups to keep"
+            "--keep-monthly",
+            type=int,
+            help="Number of monthly backups to keep",
         )
         parser.add_argument(
             "--keep-yearly", type=int, help="Number of yearly backups to keep"
@@ -2263,7 +2269,9 @@ def args_parser() -> argparse.ArgumentParser:
 
     def add_target_dir(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
-            "target_dir", type=Path, help="Target directly for extracted backup"
+            "target_dir",
+            type=Path,
+            help="Target directly for extracted backup",
         )
 
     automate = add_parser(

@@ -23,12 +23,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import lz4.block  # type: ignore[import-untyped,import-not-found]
+import lz4.block  # type: ignore[import-untyped]
 
-import pytest  # type: ignore[import-not-found]
+import pytest
 from conftest import (
     CmdCallbacksBase,
-    CodeQualityBase,
     ExceptionHierarchyBase,
 )
 
@@ -250,7 +249,7 @@ def cookies_db(profile_dir: Path) -> Path:
 def _make_mozlz4(data: dict[str, Any]) -> bytes:
     """Compress a dict as mozlz4 (for test fixtures)."""
     json_bytes = json.dumps(data).encode("utf-8")
-    compressed = lz4.block.compress(json_bytes, store_size=False)
+    compressed: bytes = lz4.block.compress(json_bytes, store_size=False)
     magic = b"mozLz40\0"
     size_bytes = struct.pack("<I", len(json_bytes))
     return magic + size_bytes + compressed
@@ -2118,13 +2117,6 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         fc.ExitCode.WARNING,
         fc.ExitCode.SUBPROCESS,
     }
-
-
-class TestCodeQuality(CodeQualityBase):
-    """Test code quality with ruff and mypy."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_firefox_cookies.py"
 
 
 if __name__ == "__main__":

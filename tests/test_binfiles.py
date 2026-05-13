@@ -26,10 +26,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest  # type: ignore[import-not-found]
+import pytest
 from conftest import (
     CmdCallbacksBase,
-    CodeQualityBase,
     ExceptionHierarchyBase,
     IsolateHomeFixtureBase,
     isolate_home,
@@ -437,13 +436,6 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         bf.ExitCode.CONFIG,
         bf.ExitCode.SUBPROCESS,
     }
-
-
-class TestCodeQuality(CodeQualityBase):
-    """ruff/mypy compliance for the binfiles symlink and test file."""
-
-    SCRIPT_PATH = _script_path
-    TEST_PATH = REPO_ROOT / "tests" / "test_binfiles.py"
 
 
 if __name__ == "__main__":

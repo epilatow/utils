@@ -33,8 +33,3 @@ Thumbs.db
 # misc
 tmp/
 nohup.out
-
-# BorgAdm.app build artifacts (binary compiled at automate-enable time)
-Applications/BorgAdm.app/Contents/MacOS/BorgAdm
-Applications/BorgAdm.app/Contents/MacOS/.BorgAdm.source-sha256
-Applications/BorgAdm.app/Contents/_CodeSignature/
