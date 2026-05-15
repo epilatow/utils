@@ -488,10 +488,12 @@ class TestLoadIgnorePatterns:
             assert hardcoded in patterns
         assert "custom.bak" in patterns
 
-    def test_walks_ancestors_up_to_home(
+    def test_walk_falls_back_to_home_when_no_repo_root(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        """Patterns are collected from ancestors up to and including $HOME."""
+        """When no enclosing repo root exists below $HOME, the walk
+        falls back to stopping at $HOME inclusive so ancestor patterns
+        like the user's editor-backup globs still apply."""
         fake_home = tmp_path / "home"
         repo = fake_home / "utils"
         bin_dir = repo / "bin"
@@ -505,6 +507,88 @@ class TestLoadIgnorePatterns:
 
         assert "home_pattern" in patterns
         assert "repo_pattern" in patterns
+
+    def test_walk_stops_at_enclosing_repo_root(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """The walk stops at (and includes) the enclosing repo root,
+        so ~/.gitignore-equivalent files above the repo are not
+        consulted -- avoiding the gitignore-anchoring confusion that
+        would come from flat-merging $HOME-level patterns into a
+        dotfile_dir-relative matcher."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "utils"
+        bin_dir = repo / "bin"
+        bin_dir.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (fake_home / ".gitignore").write_text("home_pattern\n")
+        (repo / ".gitignore").write_text("repo_pattern\n")
+
+        patterns = df.load_ignore_patterns(bin_dir)
+
+        assert "repo_pattern" in patterns
+        assert "home_pattern" not in patterns
+
+    def test_walk_stops_at_dotfile_dir_when_it_is_repo_root(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """If dotfile_dir is itself the repo root, no ancestor is
+        consulted -- the typical `dotfiles install <repo>` shape."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "dotfiles"
+        repo.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (fake_home / ".gitignore").write_text("home_pattern\n")
+        (repo / ".gitignore").write_text("repo_pattern\n")
+
+        patterns = df.load_ignore_patterns(repo)
+
+        assert "repo_pattern" in patterns
+        assert "home_pattern" not in patterns
+
+    def test_walk_recognizes_hg_repo_root(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """An '.hg' marker bounds the walk the same way '.git' does."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "hg-utils"
+        bin_dir = repo / "bin"
+        bin_dir.mkdir(parents=True)
+        (repo / ".hg").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (fake_home / ".hgignore").write_text("home_pattern\n")
+        (repo / ".hgignore").write_text("repo_pattern\n")
+
+        patterns = df.load_ignore_patterns(bin_dir)
+
+        assert "repo_pattern" in patterns
+        assert "home_pattern" not in patterns
+
+    def test_walk_recognizes_git_file_marker(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """In a git worktree or submodule, '.git' is a regular file
+        containing a 'gitdir:' pointer rather than a directory. The
+        walk treats it as a repo-root marker the same way."""
+        fake_home = tmp_path / "home"
+        repo = fake_home / "worktree"
+        bin_dir = repo / "bin"
+        bin_dir.mkdir(parents=True)
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/x\n")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        (fake_home / ".gitignore").write_text("home_pattern\n")
+        (repo / ".gitignore").write_text("repo_pattern\n")
+
+        patterns = df.load_ignore_patterns(bin_dir)
+
+        assert "repo_pattern" in patterns
+        assert "home_pattern" not in patterns
 
     def test_does_not_walk_above_home(
         self, tmp_path: Path, monkeypatch: Any

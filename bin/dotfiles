@@ -347,11 +347,31 @@ HARDCODED_IGNORE_PATTERNS: frozenset[str] = frozenset(
 )
 
 
-def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
-    """Return dotfile_dir plus ancestors up to (and including) $HOME.
+def _is_repo_root(path: Path) -> bool:
+    """Return True if path looks like a git or hg repo root.
 
-    If dotfile_dir is not inside $HOME, only dotfile_dir itself is
-    returned -- the walk only makes sense within the user's home tree.
+    Both '.git' and '.hg' may be a directory or, for git worktrees /
+    submodules, a regular file containing a 'gitdir:' pointer --
+    Path.exists() catches both shapes.
+    """
+    return (path / ".git").exists() or (path / ".hg").exists()
+
+
+def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
+    """Return dotfile_dir plus ancestors up to the enclosing repo root.
+
+    The walk consumes dotfile_dir and continues upward until it hits
+    (and includes) the first ancestor that contains a '.git' or '.hg'
+    entry -- the enclosing git/hg repo root. This covers the
+    motivating case ('binfiles install ~/utils/bin' needs to see
+    '~/utils/.gitignore', which lives one level above bin) without
+    pulling in the user's $HOME-level ignore files, where flat-merged
+    patterns -- especially leading-/ anchored ones -- would be
+    re-interpreted relative to dotfile_dir and silently mismatch.
+
+    If no enclosing repo root exists between dotfile_dir and $HOME,
+    the walk falls back to stopping at $HOME inclusive. A dotfile_dir
+    outside $HOME consults only dotfile_dir itself.
     """
     abs_dir = dotfile_dir.resolve()
     dirs = [abs_dir]
@@ -363,8 +383,12 @@ def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
         return dirs
     if home not in abs_dir.parents:
         return dirs
+    if _is_repo_root(abs_dir):
+        return dirs
     for parent in abs_dir.parents:
         dirs.append(parent)
+        if _is_repo_root(parent):
+            break
         if parent == home:
             break
     return dirs
@@ -376,8 +400,9 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     .dotfilesignore files.
 
     Patterns are collected from dotfile_dir and each ancestor directory
-    up to and including $HOME, plus a hardcoded set of editor / swap /
-    autosave file patterns that always apply.
+    up to and including the enclosing repo root (see
+    _ignore_search_dirs for the exact walk bound), plus a hardcoded
+    set of editor / swap / autosave file patterns that always apply.
 
     .dotfilesignore is the preferred way to exclude something that is
     tracked in git but should not be linked into the target tree
@@ -396,14 +421,14 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     for linking. The leading slash is preserved in the returned set
     and interpreted by matches_ignore_pattern.
 
-    Note: anchored patterns collected from ancestor ignore files
-    (e.g. '/foo' written in '~/.gitignore' while dotfile_dir is
-    deeper inside $HOME) anchor to dotfile_dir, not to the ancestor
-    directory the pattern was written in. This diverges from gitignore
-    proper, which anchors each pattern at its own .gitignore's
-    directory. The flat-merge collection here is the underlying cause;
-    practical impact is small because '/' anchors in '~/.gitignore'
-    are unusual.
+    Note: anchored patterns collected from an ancestor ignore file
+    (e.g. '/foo' in the repo root's '.gitignore' while dotfile_dir
+    is a subdir of the repo) anchor to dotfile_dir, not to the
+    ancestor directory the pattern was written in. This diverges
+    from gitignore proper, which anchors each pattern at its own
+    .gitignore's directory. The flat-merge collection here is the
+    underlying cause; practical impact is bounded because the walk
+    stops at the enclosing repo root (see _ignore_search_dirs).
 
     Returns:
         Set of glob patterns to ignore.
@@ -522,8 +547,9 @@ def discover_dotfiles(
     - Skip version control directories (.git, .hg).
     - Skip root-level dotfiles (files starting with '.' in the source root).
     - Skip files matching patterns in .gitignore / .hgignore /
-      .dotfilesignore from dotfile_dir and each ancestor up to $HOME,
-      plus a hardcoded set of editor / swap / autosave patterns.
+      .dotfilesignore from dotfile_dir and each ancestor up to the
+      enclosing repo root, plus a hardcoded set of editor / swap /
+      autosave patterns.
 
     With profile.flat=True, only top-level entries are considered;
     subdirectories are not descended into.
