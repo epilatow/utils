@@ -1438,6 +1438,40 @@ class TestDoInstall:
 
         df.do_install(None, dry_run=False, force=False)
 
+    def test_do_install_missing_directory_does_not_record(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """A failed install must not leave the bogus path in
+        ~/.dotfiles.installed."""
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with pytest.raises(df.MissingDotfilesDirectory):
+            df.do_install(
+                tmp_path / "does-not-exist",
+                dry_run=False,
+                force=False,
+            )
+
+        assert df.load_installed_directories() == []
+
+    def test_do_install_file_as_directory_does_not_record(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """A path that exists but is a regular file (not a directory)
+        is also rejected before being recorded -- discover_dotfiles
+        would raise the same exception, and recording it would
+        poison every subsequent 'install' run-without-args."""
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+        regular_file = tmp_path / "not-a-dir"
+        regular_file.write_text("oops")
+
+        with pytest.raises(df.MissingDotfilesDirectory):
+            df.do_install(regular_file, dry_run=False, force=False)
+
+        assert df.load_installed_directories() == []
+
     def test_do_install_with_conflicts(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

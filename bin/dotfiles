@@ -992,7 +992,12 @@ def do_install(
         MissingDotfilesDirectory: If a directory does not exist.
     """
     if directory is not None:
-        directories = [directory.resolve()]
+        resolved = directory.resolve()
+        if not resolved.is_dir():
+            raise MissingDotfilesDirectory(
+                f"Source directory does not exist: {resolved}"
+            )
+        directories = [resolved]
         if not dry_run:
             add_installed_directory(directory)
     else:
@@ -1004,7 +1009,7 @@ def do_install(
     profile = ACTIVE_PROFILE
     had_conflicts = False
     for dotfile_dir in directories:
-        if not dotfile_dir.exists():
+        if not dotfile_dir.is_dir():
             raise MissingDotfilesDirectory(
                 f"Source directory does not exist: {dotfile_dir}"
             )
