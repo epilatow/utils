@@ -257,7 +257,7 @@ class TestBinfilesSubcommands:
         _make_executable(src / "tool")
 
         with patch.object(Path, "home", return_value=home):
-            bf.do_install(src, dry_run=False, force=False)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
 
         target = home / ".local" / "bin" / "tool"
         assert target.is_symlink()
@@ -270,8 +270,8 @@ class TestBinfilesSubcommands:
         _make_executable(src / "tool")
 
         with patch.object(Path, "home", return_value=home):
-            bf.do_install(src, dry_run=False, force=False)
-            bf.do_remove(src, dry_run=False)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
+            bf.do_remove(src, dry_run=False, verbose=False)
 
         assert not (home / ".local" / "bin" / "tool").exists()
 
@@ -282,8 +282,8 @@ class TestBinfilesSubcommands:
         _make_executable(src / "tool")
 
         with patch.object(Path, "home", return_value=home):
-            bf.do_install(src, dry_run=False, force=False)
-            bf.do_audit(src)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
+            bf.do_audit(src, verbose=False)
 
     def test_cleanup_removes_dangling_link(
         self, tmp_path: Path, monkeypatch: Any
@@ -333,10 +333,10 @@ class TestBinfilesSubcommands:
         _make_executable(src / "tool")
         _make_executable(src / "old_tool")
         with patch.object(Path, "home", return_value=home):
-            bf.do_install(src, dry_run=False, force=False)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
             (src / "old_tool").unlink()
             with pytest.raises(bf.ConflictsFound):
-                bf.do_audit(src)
+                bf.do_audit(src, verbose=False)
 
     def test_install_prunes_stale_link(
         self, tmp_path: Path, monkeypatch: Any
@@ -351,10 +351,10 @@ class TestBinfilesSubcommands:
         target_root = home / ".local" / "bin"
 
         with patch.object(Path, "home", return_value=home):
-            bf.do_install(src, dry_run=False, force=False)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
             assert (target_root / "old_tool").is_symlink()
             (src / "old_tool").unlink()
-            bf.do_install(src, dry_run=False, force=False)
+            bf.do_install(src, dry_run=False, force=False, verbose=False)
 
         assert (target_root / "tool").is_symlink()
         assert not (target_root / "old_tool").is_symlink()

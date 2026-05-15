@@ -106,6 +106,35 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# OUTPUT FORMATTING
+# =============================================================================
+
+# ANSI color escape sequences for status output. Applied only when
+# stdout is a TTY and NO_COLOR is unset (https://no-color.org/).
+_ANSI_GREEN = "\033[32m"
+_ANSI_RED = "\033[31m"
+_ANSI_RESET = "\033[0m"
+
+
+def _color_supported() -> bool:
+    """Return True if ANSI color escape sequences should be emitted.
+
+    Color is suppressed when NO_COLOR is set in the environment or
+    when the result stream (stdout) isn't a TTY -- redirecting to a
+    file or piping into another process should produce plain text.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _colorize(text: str, code: str) -> str:
+    if not _color_supported():
+        return text
+    return f"{code}{text}{_ANSI_RESET}"
+
+
+# =============================================================================
 # PROFILE
 # =============================================================================
 
@@ -922,14 +951,58 @@ def process_directory(
     return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
-def log_results(dotfile_dir: Path, results: List[OperationResult]) -> None:
-    """Log the results of processing a directory."""
-    logger.info("%s", dotfile_dir)
+def _format_status(status: DotfileStatus) -> str:
+    code = _ANSI_GREEN if status == DotfileStatus.OK else _ANSI_RED
+    return _colorize(status.value, code)
+
+
+def log_results(
+    dotfile_dir: Path,
+    results: List[OperationResult],
+    *,
+    verbose: bool = False,
+) -> None:
+    """Log the results of processing a directory.
+
+    Default mode prints only entries whose status isn't ok, so the
+    output stays focused on what needs attention. When every entry
+    is ok the directory line gets an ': ok' suffix and no per-entry
+    lines are emitted; otherwise the directory line gets an
+    ': error' suffix and the non-ok entries are listed beneath it.
+    Verbose mode restores the per-entry view for every result, ok
+    included, and the directory header carries the same suffix.
+
+    On a color-capable TTY the suffix and per-entry status text are
+    colored: ok green, anything else red.
+    """
+    has_error = any(r.status != DotfileStatus.OK for r in results)
+    if has_error:
+        header_suffix = _colorize("error", _ANSI_RED)
+    else:
+        header_suffix = _colorize("ok", _ANSI_GREEN)
+
+    if verbose:
+        logger.info("%s: %s", dotfile_dir, header_suffix)
+        for result in results:
+            logger.info(
+                "    %s: %s",
+                result.entry.relative_path,
+                _format_status(result.status),
+            )
+        return
+
+    if not has_error:
+        logger.info("%s: %s", dotfile_dir, header_suffix)
+        return
+
+    logger.info("%s: %s", dotfile_dir, header_suffix)
     for result in results:
+        if result.status == DotfileStatus.OK:
+            continue
         logger.info(
-            "  %s: %s",
+            "    %s: %s",
             result.entry.relative_path,
-            result.status.value,
+            _format_status(result.status),
         )
 
 
@@ -990,6 +1063,7 @@ def do_install(
     *,
     dry_run: bool,
     force: bool,
+    verbose: bool,
 ) -> None:
     """Install entries from one or all source directories.
 
@@ -1044,7 +1118,7 @@ def do_install(
                 symlink.unlink()
                 _cleanup_empty_parents(symlink.parent, profile)
             results.append(OperationResult(synth_entry, DotfileStatus.STALE))
-        log_results(dotfile_dir, results)
+        log_results(dotfile_dir, results, verbose=verbose)
         if has_conflicts(results):
             had_conflicts = True
 
@@ -1056,6 +1130,7 @@ def do_remove(
     directory: Optional[Path],
     *,
     dry_run: bool,
+    verbose: bool,
 ) -> None:
     """Remove entries for one or all source directories.
 
@@ -1081,13 +1156,13 @@ def do_remove(
             )
 
         results = process_directory(dotfile_dir, "remove", dry_run=dry_run)
-        log_results(dotfile_dir, results)
+        log_results(dotfile_dir, results, verbose=verbose)
 
         if not dry_run:
             remove_installed_directory(dotfile_dir)
 
 
-def do_audit(directory: Optional[Path]) -> None:
+def do_audit(directory: Optional[Path], *, verbose: bool) -> None:
     """Audit entries for one or all source directories.
 
     Reports the status of each discovered entry plus any STALE
@@ -1122,7 +1197,7 @@ def do_audit(directory: Optional[Path]) -> None:
             dotfile_dir, entries, profile
         ):
             results.append(OperationResult(synth_entry, DotfileStatus.STALE))
-        log_results(dotfile_dir, results)
+        log_results(dotfile_dir, results, verbose=verbose)
         if has_conflicts(results) or has_missing(results) or has_stale(results):
             had_issues = True
 
@@ -1244,6 +1319,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replace conflicting symlinks (not files)",
     )
     install_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every entry; default suppresses ok lines",
+    )
+    install_parser.add_argument(
         "directory",
         type=Path,
         nargs="?",
@@ -1260,6 +1341,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show what would be done without making changes",
     )
     remove_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every entry; default suppresses ok lines",
+    )
+    remove_parser.add_argument(
         "directory",
         type=Path,
         nargs="?",
@@ -1273,6 +1360,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Report status of installed entries; fails on conflicts, "
             "missing entries, or stale managed links"
         ),
+    )
+    audit_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every entry; default suppresses ok lines",
     )
     audit_parser.add_argument(
         "directory",

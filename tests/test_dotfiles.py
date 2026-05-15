@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -1325,6 +1326,133 @@ class TestProcessDirectory:
             df.process_directory(dotfile_dir, "invalid")
 
 
+class TestLogResults:
+    """Test log_results output formatting (suppress-ok summary,
+    verbose mode, color toggling)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_color(self, monkeypatch: Any) -> None:
+        """Force color off in this test class so assertions can
+        compare against plain status text."""
+        monkeypatch.setenv("NO_COLOR", "1")
+
+    def test_default_all_ok_collapses_to_summary(self, caplog: Any) -> None:
+        """When every entry is ok the dir gets a single ': ok' line
+        and per-entry rows are suppressed."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("vimrc"), dotfile_dir),
+                df.DotfileStatus.OK,
+            ),
+            df.OperationResult(
+                df.DotfileEntry(Path("zshrc"), dotfile_dir),
+                df.DotfileStatus.OK,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(dotfile_dir, results, verbose=False)
+        assert [r.getMessage() for r in caplog.records] == ["/dotfiles: ok"]
+
+    def test_default_suppresses_ok_lines_keeps_problems(
+        self, caplog: Any
+    ) -> None:
+        """With some non-ok entries, only those entries are printed
+        under the dir header -- ok lines are suppressed."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("vimrc"), dotfile_dir),
+                df.DotfileStatus.OK,
+            ),
+            df.OperationResult(
+                df.DotfileEntry(Path("zshrc"), dotfile_dir),
+                df.DotfileStatus.LINK_CONFLICT,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(dotfile_dir, results, verbose=False)
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: error",
+            "    zshrc: link-conflict",
+        ]
+
+    def test_verbose_prints_every_entry(self, caplog: Any) -> None:
+        """verbose=True restores the per-entry view for every
+        result, ok included."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("vimrc"), dotfile_dir),
+                df.DotfileStatus.OK,
+            ),
+            df.OperationResult(
+                df.DotfileEntry(Path("zshrc"), dotfile_dir),
+                df.DotfileStatus.LINK_CONFLICT,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(dotfile_dir, results, verbose=True)
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: error",
+            "    vimrc: ok",
+            "    zshrc: link-conflict",
+        ]
+
+    def test_default_empty_results_collapses_to_summary(
+        self, caplog: Any
+    ) -> None:
+        """A dir with no discovered entries also collapses to ': ok'."""
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(Path("/dotfiles"), [], verbose=False)
+        assert [r.getMessage() for r in caplog.records] == ["/dotfiles: ok"]
+
+
+class TestStatusColor:
+    """Test the ANSI-color helpers used by log_results."""
+
+    def test_color_off_when_not_tty(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+        assert df._color_supported() is False
+
+    def test_color_off_when_no_color_env_set(self, monkeypatch: Any) -> None:
+        """NO_COLOR (https://no-color.org/) wins even on a TTY."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        assert df._color_supported() is False
+
+    def test_color_on_when_tty_and_no_color_unset(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        assert df._color_supported() is True
+
+    def test_format_status_ok_green_when_supported(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        text = df._format_status(df.DotfileStatus.OK)
+        assert text == "\033[32mok\033[0m"
+
+    def test_format_status_non_ok_red_when_supported(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        text = df._format_status(df.DotfileStatus.LINK_CONFLICT)
+        assert text == "\033[31mlink-conflict\033[0m"
+
+    def test_format_status_plain_when_color_off(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert df._format_status(df.DotfileStatus.OK) == "ok"
+        assert (
+            df._format_status(df.DotfileStatus.LINK_CONFLICT) == "link-conflict"
+        )
+
+
 class TestHasConflicts:
     """Test has_conflicts helper function."""
 
@@ -1398,7 +1526,9 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
 
         assert (home / ".vimrc").is_symlink()
         # Should have recorded the directory
@@ -1424,7 +1554,7 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(None, dry_run=False, force=False)
+            df.do_install(None, dry_run=False, force=False, verbose=False)
 
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
@@ -1436,7 +1566,7 @@ class TestDoInstall:
         installed_file = tmp_path / ".dotfiles.installed"
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
-        df.do_install(None, dry_run=False, force=False)
+        df.do_install(None, dry_run=False, force=False, verbose=False)
 
     def test_do_install_missing_directory_does_not_record(
         self, tmp_path: Path, monkeypatch: Any
@@ -1451,6 +1581,7 @@ class TestDoInstall:
                 tmp_path / "does-not-exist",
                 dry_run=False,
                 force=False,
+                verbose=False,
             )
 
         assert df.load_installed_directories() == []
@@ -1468,7 +1599,9 @@ class TestDoInstall:
         regular_file.write_text("oops")
 
         with pytest.raises(df.MissingDotfilesDirectory):
-            df.do_install(regular_file, dry_run=False, force=False)
+            df.do_install(
+                regular_file, dry_run=False, force=False, verbose=False
+            )
 
         assert df.load_installed_directories() == []
 
@@ -1493,6 +1626,7 @@ class TestDoInstall:
                     dotfile_dir,
                     dry_run=False,
                     force=False,
+                    verbose=False,
                 )
 
     def test_do_install_dry_run(self, tmp_path: Path, monkeypatch: Any) -> None:
@@ -1507,7 +1641,7 @@ class TestDoInstall:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=True, force=False)
+            df.do_install(dotfile_dir, dry_run=True, force=False, verbose=False)
 
         assert not (home / ".vimrc").exists()
         # Should NOT have recorded the directory
@@ -1532,11 +1666,13 @@ class TestDoRemove:
 
         with patch.object(Path, "home", return_value=home):
             # First install
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
             assert (home / ".vimrc").is_symlink()
 
             # Then remove
-            df.do_remove(dotfile_dir, dry_run=False)
+            df.do_remove(dotfile_dir, dry_run=False, verbose=False)
 
         assert not (home / ".vimrc").exists()
         # Should have removed from installed list
@@ -1557,10 +1693,12 @@ class TestDoRemove:
 
         with patch.object(Path, "home", return_value=home):
             # First install
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
 
             # Then remove all
-            df.do_remove(None, dry_run=False)
+            df.do_remove(None, dry_run=False, verbose=False)
 
         assert not (home / ".vimrc").exists()
         assert df.load_installed_directories() == []
@@ -1575,7 +1713,7 @@ class TestDoRemove:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with pytest.raises(df.MissingDotfilesDirectory, match="does not exist"):
-            df.do_remove(None, dry_run=False)
+            df.do_remove(None, dry_run=False, verbose=False)
 
 
 class TestDoAudit:
@@ -1593,8 +1731,10 @@ class TestDoAudit:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
-            df.do_audit(dotfile_dir)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
+            df.do_audit(dotfile_dir, verbose=False)
 
     def test_do_audit_missing(self, tmp_path: Path, monkeypatch: Any) -> None:
         """Test audit when dotfiles are missing raises ConflictsFound."""
@@ -1610,7 +1750,7 @@ class TestDoAudit:
 
         with patch.object(Path, "home", return_value=home):
             with pytest.raises(df.ConflictsFound):
-                df.do_audit(None)
+                df.do_audit(None, verbose=False)
 
     def test_do_audit_conflicts(self, tmp_path: Path, monkeypatch: Any) -> None:
         """Test audit when there are conflicts raises ConflictsFound."""
@@ -1628,7 +1768,7 @@ class TestDoAudit:
 
         with patch.object(Path, "home", return_value=home):
             with pytest.raises(df.ConflictsFound):
-                df.do_audit(None)
+                df.do_audit(None, verbose=False)
 
     def test_do_audit_no_installed_file(
         self, tmp_path: Path, monkeypatch: Any
@@ -1638,7 +1778,7 @@ class TestDoAudit:
         # Don't create the file - it should not exist
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
-        df.do_audit(None)
+        df.do_audit(None, verbose=False)
 
     def test_do_audit_skips_nonexistent_directories(
         self, tmp_path: Path, monkeypatch: Any
@@ -1654,7 +1794,7 @@ class TestDoAudit:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_audit(None)
+            df.do_audit(None, verbose=False)
 
     def test_do_audit_mixed_existing_nonexistent(
         self, tmp_path: Path, monkeypatch: Any
@@ -1677,7 +1817,7 @@ class TestDoAudit:
             (home / ".vimrc").symlink_to(
                 os.path.relpath(existing_dir / "vimrc", home)
             )
-            df.do_audit(None)
+            df.do_audit(None, verbose=False)
 
 
 class TestDoCleanup:
@@ -1832,7 +1972,9 @@ class TestStaleLinkDetection:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
 
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
@@ -1857,7 +1999,7 @@ class TestStaleLinkDetection:
         )
         with patch.object(Path, "home", return_value=home):
             with pytest.raises(df.ConflictsFound):
-                df.do_audit(dotfile_dir)
+                df.do_audit(dotfile_dir, verbose=False)
         # Audit reports but does not act -- the stale link is still there.
         assert (home / ".bashrc").is_symlink()
 
@@ -1871,7 +2013,7 @@ class TestStaleLinkDetection:
         )
         with patch.object(Path, "home", return_value=home):
             with pytest.raises(df.ConflictsFound):
-                df.do_audit(dotfile_dir)
+                df.do_audit(dotfile_dir, verbose=False)
 
     def test_audit_flags_stale_via_gitignore(
         self, tmp_path: Path, monkeypatch: Any
@@ -1884,7 +2026,7 @@ class TestStaleLinkDetection:
         )
         with patch.object(Path, "home", return_value=home):
             with pytest.raises(df.ConflictsFound):
-                df.do_audit(dotfile_dir)
+                df.do_audit(dotfile_dir, verbose=False)
 
     def test_audit_does_not_flag_unmanaged_links(
         self, tmp_path: Path, monkeypatch: Any
@@ -1905,8 +2047,10 @@ class TestStaleLinkDetection:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
-            df.do_audit(dotfile_dir)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
+            df.do_audit(dotfile_dir, verbose=False)
         # The unmanaged link survives.
         assert (home / ".user_link").is_symlink()
 
@@ -1955,7 +2099,9 @@ class TestStaleLinkDetection:
             tmp_path, monkeypatch, ignore_via="delete"
         )
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
         assert not (home / ".bashrc").is_symlink()
         assert (home / ".vimrc").is_symlink()
 
@@ -1968,7 +2114,9 @@ class TestStaleLinkDetection:
             tmp_path, monkeypatch, ignore_via="dotfilesignore"
         )
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
         assert not (home / ".bashrc").is_symlink()
 
     def test_install_dry_run_does_not_prune(
@@ -1979,7 +2127,7 @@ class TestStaleLinkDetection:
             tmp_path, monkeypatch, ignore_via="delete"
         )
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=True, force=False)
+            df.do_install(dotfile_dir, dry_run=True, force=False, verbose=False)
         assert (home / ".bashrc").is_symlink()
 
     def test_install_does_not_touch_other_repos_links(
@@ -2000,13 +2148,13 @@ class TestStaleLinkDetection:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(repo_a, dry_run=False, force=False)
-            df.do_install(repo_b, dry_run=False, force=False)
+            df.do_install(repo_a, dry_run=False, force=False, verbose=False)
+            df.do_install(repo_b, dry_run=False, force=False, verbose=False)
             # Make repo_b's bashrc stale.
             (repo_b / "bashrc").unlink()
             # Re-install repo_a only -- repo_b's stale link should
             # survive because it's not in repo_a's blast radius.
-            df.do_install(repo_a, dry_run=False, force=False)
+            df.do_install(repo_a, dry_run=False, force=False, verbose=False)
 
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
@@ -2040,7 +2188,9 @@ class TestStaleLinkDetection:
         monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
 
         with patch.object(Path, "home", return_value=home):
-            df.do_install(dotfile_dir, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir, dry_run=False, force=False, verbose=False
+            )
 
         installed_link = home / ".claude" / "SHARED.md"
         assert installed_link.is_symlink()
@@ -2132,11 +2282,15 @@ class TestMultipleDirectories:
 
         with patch.object(Path, "home", return_value=home):
             # Install first directory
-            df.do_install(dotfile_dir1, dry_run=False, force=False)
+            df.do_install(
+                dotfile_dir1, dry_run=False, force=False, verbose=False
+            )
 
             # Install second directory - should conflict
             with pytest.raises(df.ConflictsFound):
-                df.do_install(dotfile_dir2, dry_run=False, force=False)
+                df.do_install(
+                    dotfile_dir2, dry_run=False, force=False, verbose=False
+                )
 
             # Original symlink should still point to first directory
             assert (home / ".vimrc").resolve() == (
