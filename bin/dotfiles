@@ -951,8 +951,33 @@ def process_directory(
     return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
-def _format_status(status: DotfileStatus) -> str:
-    code = _ANSI_GREEN if status == DotfileStatus.OK else _ANSI_RED
+# Per-operation classification of which DotfileStatus values count
+# as *problems* (anything else is either OK or a successful action).
+# install / remove that complete cleanly may yield INSTALLED, REMOVED,
+# or (for install) STALE-pruned entries -- those are state changes,
+# not errors. audit, by contrast, doesn't fix anything, so any
+# status that says the target tree diverges from the discovered set
+# is a problem the user needs to see.
+_INSTALL_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
+    {DotfileStatus.FILE_CONFLICT, DotfileStatus.LINK_CONFLICT}
+)
+_REMOVE_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
+    {DotfileStatus.FILE_CONFLICT, DotfileStatus.LINK_CONFLICT}
+)
+_AUDIT_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
+    {
+        DotfileStatus.MISSING,
+        DotfileStatus.FILE_CONFLICT,
+        DotfileStatus.LINK_CONFLICT,
+        DotfileStatus.STALE,
+    }
+)
+
+
+def _format_status(
+    status: DotfileStatus, problem_statuses: frozenset[DotfileStatus]
+) -> str:
+    code = _ANSI_RED if status in problem_statuses else _ANSI_GREEN
     return _colorize(status.value, code)
 
 
@@ -961,22 +986,28 @@ def log_results(
     results: List[OperationResult],
     *,
     verbose: bool = False,
+    problem_statuses: frozenset[DotfileStatus] = frozenset(),
 ) -> None:
     """Log the results of processing a directory.
 
-    Default mode prints only entries whose status isn't ok, so the
-    output stays focused on what needs attention. When every entry
-    is ok the directory line gets an ': ok' suffix and no per-entry
-    lines are emitted; otherwise the directory line gets an
-    ': error' suffix and the non-ok entries are listed beneath it.
-    Verbose mode restores the per-entry view for every result, ok
-    included, and the directory header carries the same suffix.
+    Default mode collapses an all-ok run to a single '<dir>: ok'
+    line. When some entries are non-ok (state changes like INSTALLED
+    or actual problems like LINK_CONFLICT), those entries print
+    under the dir header. The header itself reads ': error' only
+    when at least one entry's status is in problem_statuses --
+    successful state changes don't flip the header. Verbose mode
+    prints every entry, ok included.
 
-    On a color-capable TTY the suffix and per-entry status text are
-    colored: ok green, anything else red.
+    problem_statuses is the per-operation classifier: install /
+    remove flag only file/link conflicts (so INSTALLED, REMOVED,
+    STALE-pruned all count as success), while audit flags anything
+    that says the target tree diverges from the discovered set.
+
+    On a color-capable TTY the header suffix and per-entry status
+    text are colored: green for non-problem, red for problem.
     """
-    has_error = any(r.status != DotfileStatus.OK for r in results)
-    if has_error:
+    has_problem = any(r.status in problem_statuses for r in results)
+    if has_problem:
         header_suffix = _colorize("error", _ANSI_RED)
     else:
         header_suffix = _colorize("ok", _ANSI_GREEN)
@@ -987,22 +1018,21 @@ def log_results(
             logger.info(
                 "    %s: %s",
                 result.entry.relative_path,
-                _format_status(result.status),
+                _format_status(result.status, problem_statuses),
             )
         return
 
-    if not has_error:
+    non_ok = [r for r in results if r.status != DotfileStatus.OK]
+    if not non_ok:
         logger.info("%s: %s", dotfile_dir, header_suffix)
         return
 
     logger.info("%s: %s", dotfile_dir, header_suffix)
-    for result in results:
-        if result.status == DotfileStatus.OK:
-            continue
+    for result in non_ok:
         logger.info(
             "    %s: %s",
             result.entry.relative_path,
-            _format_status(result.status),
+            _format_status(result.status, problem_statuses),
         )
 
 
@@ -1118,7 +1148,12 @@ def do_install(
                 symlink.unlink()
                 _cleanup_empty_parents(symlink.parent, profile)
             results.append(OperationResult(synth_entry, DotfileStatus.STALE))
-        log_results(dotfile_dir, results, verbose=verbose)
+        log_results(
+            dotfile_dir,
+            results,
+            verbose=verbose,
+            problem_statuses=_INSTALL_PROBLEM_STATUSES,
+        )
         if has_conflicts(results):
             had_conflicts = True
 
@@ -1156,7 +1191,12 @@ def do_remove(
             )
 
         results = process_directory(dotfile_dir, "remove", dry_run=dry_run)
-        log_results(dotfile_dir, results, verbose=verbose)
+        log_results(
+            dotfile_dir,
+            results,
+            verbose=verbose,
+            problem_statuses=_REMOVE_PROBLEM_STATUSES,
+        )
 
         if not dry_run:
             remove_installed_directory(dotfile_dir)
@@ -1197,7 +1237,12 @@ def do_audit(directory: Optional[Path], *, verbose: bool) -> None:
             dotfile_dir, entries, profile
         ):
             results.append(OperationResult(synth_entry, DotfileStatus.STALE))
-        log_results(dotfile_dir, results, verbose=verbose)
+        log_results(
+            dotfile_dir,
+            results,
+            verbose=verbose,
+            problem_statuses=_AUDIT_PROBLEM_STATUSES,
+        )
         if has_conflicts(results) or has_missing(results) or has_stale(results):
             had_issues = True
 

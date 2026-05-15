@@ -1351,7 +1351,12 @@ class TestLogResults:
             ),
         ]
         with caplog.at_level(logging.INFO, logger="dotfiles"):
-            df.log_results(dotfile_dir, results, verbose=False)
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._AUDIT_PROBLEM_STATUSES,
+            )
         assert [r.getMessage() for r in caplog.records] == ["/dotfiles: ok"]
 
     def test_default_suppresses_ok_lines_keeps_problems(
@@ -1371,10 +1376,116 @@ class TestLogResults:
             ),
         ]
         with caplog.at_level(logging.INFO, logger="dotfiles"):
-            df.log_results(dotfile_dir, results, verbose=False)
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._AUDIT_PROBLEM_STATUSES,
+            )
         assert [r.getMessage() for r in caplog.records] == [
             "/dotfiles: error",
             "    zshrc: link-conflict",
+        ]
+
+    def test_install_action_lines_print_with_ok_header(
+        self, caplog: Any
+    ) -> None:
+        """A successful install with newly-linked entries reports the
+        actions per-line but the dir header stays 'ok' -- INSTALLED
+        is a state change, not a problem the user needs to fix."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("vimrc"), dotfile_dir),
+                df.DotfileStatus.OK,
+            ),
+            df.OperationResult(
+                df.DotfileEntry(Path("claude/X.md"), dotfile_dir),
+                df.DotfileStatus.INSTALLED,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._INSTALL_PROBLEM_STATUSES,
+            )
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: ok",
+            "    claude/X.md: installed",
+        ]
+
+    def test_install_problem_flips_header_to_error(self, caplog: Any) -> None:
+        """A LINK_CONFLICT during install flips the header to error
+        and lists both the conflict and any state-change actions."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("a"), dotfile_dir),
+                df.DotfileStatus.INSTALLED,
+            ),
+            df.OperationResult(
+                df.DotfileEntry(Path("b"), dotfile_dir),
+                df.DotfileStatus.LINK_CONFLICT,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._INSTALL_PROBLEM_STATUSES,
+            )
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: error",
+            "    a: installed",
+            "    b: link-conflict",
+        ]
+
+    def test_remove_missing_does_not_flip_header(self, caplog: Any) -> None:
+        """remove of a target that's already gone reports MISSING
+        but stays 'ok' at the header -- there's nothing to fix."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("a"), dotfile_dir),
+                df.DotfileStatus.MISSING,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._REMOVE_PROBLEM_STATUSES,
+            )
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: ok",
+            "    a: missing",
+        ]
+
+    def test_audit_missing_flips_header_to_error(self, caplog: Any) -> None:
+        """audit, by contrast, treats MISSING as a problem -- the
+        target tree diverges from the discovered set and audit can't
+        fix it."""
+        dotfile_dir = Path("/dotfiles")
+        results = [
+            df.OperationResult(
+                df.DotfileEntry(Path("a"), dotfile_dir),
+                df.DotfileStatus.MISSING,
+            ),
+        ]
+        with caplog.at_level(logging.INFO, logger="dotfiles"):
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=False,
+                problem_statuses=df._AUDIT_PROBLEM_STATUSES,
+            )
+        assert [r.getMessage() for r in caplog.records] == [
+            "/dotfiles: error",
+            "    a: missing",
         ]
 
     def test_verbose_prints_every_entry(self, caplog: Any) -> None:
@@ -1392,7 +1503,12 @@ class TestLogResults:
             ),
         ]
         with caplog.at_level(logging.INFO, logger="dotfiles"):
-            df.log_results(dotfile_dir, results, verbose=True)
+            df.log_results(
+                dotfile_dir,
+                results,
+                verbose=True,
+                problem_statuses=df._AUDIT_PROBLEM_STATUSES,
+            )
         assert [r.getMessage() for r in caplog.records] == [
             "/dotfiles: error",
             "    vimrc: ok",
@@ -1404,7 +1520,12 @@ class TestLogResults:
     ) -> None:
         """A dir with no discovered entries also collapses to ': ok'."""
         with caplog.at_level(logging.INFO, logger="dotfiles"):
-            df.log_results(Path("/dotfiles"), [], verbose=False)
+            df.log_results(
+                Path("/dotfiles"),
+                [],
+                verbose=False,
+                problem_statuses=df._AUDIT_PROBLEM_STATUSES,
+            )
         assert [r.getMessage() for r in caplog.records] == ["/dotfiles: ok"]
 
 
@@ -1429,27 +1550,43 @@ class TestStatusColor:
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
         assert df._color_supported() is True
 
-    def test_format_status_ok_green_when_supported(
+    def test_format_status_non_problem_green_when_supported(
         self, monkeypatch: Any
     ) -> None:
+        """A status outside problem_statuses prints green even if it
+        isn't OK -- INSTALLED in the install context, for example."""
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-        text = df._format_status(df.DotfileStatus.OK)
-        assert text == "\033[32mok\033[0m"
+        ok = df._format_status(
+            df.DotfileStatus.OK, df._INSTALL_PROBLEM_STATUSES
+        )
+        installed = df._format_status(
+            df.DotfileStatus.INSTALLED, df._INSTALL_PROBLEM_STATUSES
+        )
+        assert ok == "\033[32mok\033[0m"
+        assert installed == "\033[32minstalled\033[0m"
 
-    def test_format_status_non_ok_red_when_supported(
+    def test_format_status_problem_red_when_supported(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-        text = df._format_status(df.DotfileStatus.LINK_CONFLICT)
+        text = df._format_status(
+            df.DotfileStatus.LINK_CONFLICT, df._INSTALL_PROBLEM_STATUSES
+        )
         assert text == "\033[31mlink-conflict\033[0m"
 
     def test_format_status_plain_when_color_off(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("NO_COLOR", "1")
-        assert df._format_status(df.DotfileStatus.OK) == "ok"
         assert (
-            df._format_status(df.DotfileStatus.LINK_CONFLICT) == "link-conflict"
+            df._format_status(df.DotfileStatus.OK, df._INSTALL_PROBLEM_STATUSES)
+            == "ok"
+        )
+        assert (
+            df._format_status(
+                df.DotfileStatus.LINK_CONFLICT, df._INSTALL_PROBLEM_STATUSES
+            )
+            == "link-conflict"
         )
 
 
