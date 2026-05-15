@@ -650,19 +650,36 @@ def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
 
 
 def _resolve_link_target(symlink: Path) -> Optional[Path]:
-    """Resolve a symlink's literal target relative to its parent.
+    """Compute the symlink's immediate target as an absolute path.
 
-    Returns None if the symlink can't be read. resolve(strict=False)
-    is used so a dangling target still produces a comparable path.
+    The symlink's parent directory is resolved (so paths like
+    /tmp/... canonicalize to /private/tmp/... on macOS, matching the
+    resolved source dirs the result is compared against). The
+    readlink value is appended literally and any '.'/'..' segments
+    in the joined path are normalized -- but symlinks within the
+    target are NOT followed.
+
+    The non-following matters when the source dir contains internal
+    symlinks: e.g. claude/DEVELOPMENT_SHARED.md -> ../_repo_shared/
+    files/DEVELOPMENT_SHARED.md. A managed link
+    ~/.claude/DEVELOPMENT_SHARED.md -> .../dotfiles/claude/
+    DEVELOPMENT_SHARED.md should resolve to the immediate
+    claude/DEVELOPMENT_SHARED.md (which is in the discovered set,
+    so not stale), not to the chain end at _repo_shared/files/...
+    (which would otherwise be classified stale and unlinked,
+    destroying the install).
+
+    Returns None if the symlink can't be read.
     """
     try:
         link_value = Path(os.readlink(symlink))
     except OSError:
         return None
     try:
-        return (symlink.parent / link_value).resolve(strict=False)
+        parent_resolved = symlink.parent.resolve(strict=False)
     except OSError:
         return None
+    return Path(os.path.normpath(str(parent_resolved / link_value)))
 
 
 def _link_source_dir(

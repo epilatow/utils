@@ -1977,6 +1977,41 @@ class TestStaleLinkDetection:
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
 
+    def test_install_keeps_link_when_source_is_internal_symlink_to_excluded_path(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """A discovered entry that is itself a symlink within the
+        repo (e.g. claude/SHARED.md -> ../_repo_shared/files/SHARED.md
+        when _repo_shared/ is excluded by .dotfilesignore) installs
+        normally and is NOT then removed by stale-link cleanup.
+
+        Without resolving the immediate link target only, stale
+        detection followed the chain into the excluded path and
+        unlinked the just-installed file -- so 'install' would
+        report 'installed' and leave nothing on disk."""
+        home = tmp_path / "home"
+        home.mkdir()
+        dotfile_dir = tmp_path / "dotfiles"
+        (dotfile_dir / "claude").mkdir(parents=True)
+        (dotfile_dir / "_repo_shared" / "files").mkdir(parents=True)
+        (dotfile_dir / "_repo_shared" / "files" / "SHARED.md").write_text(
+            "shared"
+        )
+        (dotfile_dir / "claude" / "SHARED.md").symlink_to(
+            Path("..") / "_repo_shared" / "files" / "SHARED.md"
+        )
+        (dotfile_dir / ".dotfilesignore").write_text("/_repo_shared/\n")
+
+        installed_file = tmp_path / ".dotfiles.installed"
+        monkeypatch.setattr(df, "INSTALLED_FILE", installed_file)
+
+        with patch.object(Path, "home", return_value=home):
+            df.do_install(dotfile_dir, dry_run=False, force=False)
+
+        installed_link = home / ".claude" / "SHARED.md"
+        assert installed_link.is_symlink()
+        assert installed_link.exists()
+
 
 class TestDoSelfTest:
     """Test do_self_test function."""
