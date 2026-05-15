@@ -390,6 +390,21 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     Empty lines are skipped.
     Negation patterns (!) are not supported.
 
+    A leading '/' anchors the pattern to dotfile_dir's root, matching
+    gitignore semantics: '/CLAUDE.md' excludes only the root-level
+    CLAUDE.md, leaving nested files like 'claude/CLAUDE.md' eligible
+    for linking. The leading slash is preserved in the returned set
+    and interpreted by matches_ignore_pattern.
+
+    Note: anchored patterns collected from ancestor ignore files
+    (e.g. '/foo' written in '~/.gitignore' while dotfile_dir is
+    deeper inside $HOME) anchor to dotfile_dir, not to the ancestor
+    directory the pattern was written in. This diverges from gitignore
+    proper, which anchors each pattern at its own .gitignore's
+    directory. The flat-merge collection here is the underlying cause;
+    practical impact is small because '/' anchors in '~/.gitignore'
+    are unusual.
+
     Returns:
         Set of glob patterns to ignore.
     """
@@ -420,7 +435,9 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
                 # gitignore convention suffixes directory patterns with
                 # '/' (e.g. 'tests/'). fnmatch has no concept of
                 # trailing slash; strip it so the path-component check
-                # in matches_ignore_pattern does the right thing.
+                # in matches_ignore_pattern does the right thing. A
+                # leading '/' is kept as the anchored-pattern marker
+                # consumed by matches_ignore_pattern.
                 if pattern.endswith("/") and len(pattern) > 1:
                     pattern = pattern[:-1]
                 patterns.add(pattern)
@@ -432,8 +449,19 @@ def matches_ignore_pattern(path: Path, patterns: Set[str]) -> bool:
     """
     Check if a path matches any of the ignore patterns.
 
-    The path is checked against patterns using fnmatch.
-    Both the full path and the filename are checked.
+    Unanchored patterns are checked via fnmatch against the basename,
+    the full relative path, and each path component -- so a bare
+    'CLAUDE.md' excludes that file at any depth.
+
+    Patterns with a leading '/' are anchored to the dotfile_dir root,
+    matching gitignore semantics. An anchored bare name like
+    '/CLAUDE.md' matches only the first path component (root-level
+    file or root-level directory by that name), leaving nested
+    'claude/CLAUDE.md' eligible for linking. An anchored multi-segment
+    pattern like '/foo/bar' matches the full relative path AND any
+    descendant of it ('/foo/bar' excludes 'foo/bar' itself plus
+    'foo/bar/baz') so it works as a directory exclusion the same way
+    the bare-name branch does.
 
     Args:
         path: Relative path to check
@@ -444,8 +472,20 @@ def matches_ignore_pattern(path: Path, patterns: Set[str]) -> bool:
     """
     path_str = str(path)
     filename = path.name
+    first_part = path.parts[0] if path.parts else ""
 
     for pattern in patterns:
+        if pattern.startswith("/") and len(pattern) > 1:
+            anchored = pattern[1:]
+            if "/" in anchored:
+                if fnmatch.fnmatch(path_str, anchored) or fnmatch.fnmatch(
+                    path_str, anchored + "/*"
+                ):
+                    return True
+            else:
+                if fnmatch.fnmatch(first_part, anchored):
+                    return True
+            continue
         # Check if pattern matches the filename
         if fnmatch.fnmatch(filename, pattern):
             return True

@@ -601,6 +601,70 @@ class TestMatchesIgnorePattern:
 
         assert df.matches_ignore_pattern(Path("file~"), patterns) is False
 
+    def test_anchored_bare_name_matches_only_root(self) -> None:
+        """A leading '/' anchors the pattern to dotfile_dir root, so
+        '/CLAUDE.md' excludes the top-level file but not a nested
+        'claude/CLAUDE.md'."""
+        patterns = {"/CLAUDE.md"}
+
+        assert df.matches_ignore_pattern(Path("CLAUDE.md"), patterns) is True
+        assert (
+            df.matches_ignore_pattern(Path("claude/CLAUDE.md"), patterns)
+            is False
+        )
+
+    def test_anchored_directory_matches_only_root(self) -> None:
+        """An anchored bare-name pattern also matches when the root
+        entry is a directory: '/_repo_shared' excludes everything
+        under the root-level _repo_shared/ but leaves a nested
+        'sub/_repo_shared/...' alone."""
+        patterns = {"/_repo_shared"}
+
+        assert (
+            df.matches_ignore_pattern(
+                Path("_repo_shared/tests/foo.py"), patterns
+            )
+            is True
+        )
+        assert (
+            df.matches_ignore_pattern(Path("sub/_repo_shared/foo.py"), patterns)
+            is False
+        )
+
+    def test_anchored_multi_segment_matches_full_path(self) -> None:
+        """An anchored multi-segment pattern matches the full
+        relative path, not a same-named tail elsewhere."""
+        patterns = {"/foo/bar"}
+
+        assert df.matches_ignore_pattern(Path("foo/bar"), patterns) is True
+        assert df.matches_ignore_pattern(Path("baz/foo/bar"), patterns) is False
+
+    def test_anchored_multi_segment_excludes_directory_contents(
+        self,
+    ) -> None:
+        """An anchored multi-segment pattern also excludes everything
+        under the named path -- '/foo/bar' must skip 'foo/bar/baz' the
+        same way the bare-name branch '/foo' would, otherwise a
+        directory pattern like '/some/subdir/' silently leaves its
+        contents linkable."""
+        patterns = {"/foo/bar"}
+
+        assert df.matches_ignore_pattern(Path("foo/bar/baz"), patterns) is True
+        assert (
+            df.matches_ignore_pattern(Path("foo/bar/baz/qux"), patterns) is True
+        )
+
+    def test_unanchored_still_matches_at_any_depth(self) -> None:
+        """A bare 'CLAUDE.md' (no leading slash) keeps the gitignore
+        default of matching at any depth."""
+        patterns = {"CLAUDE.md"}
+
+        assert df.matches_ignore_pattern(Path("CLAUDE.md"), patterns) is True
+        assert (
+            df.matches_ignore_pattern(Path("claude/CLAUDE.md"), patterns)
+            is True
+        )
+
 
 class TestDiscoverDotfilesIgnoreFeatures:
     """Test discover_dotfiles ignore features."""
@@ -670,6 +734,26 @@ class TestDiscoverDotfilesIgnoreFeatures:
         assert Path("README.md") not in paths
         assert Path("tests/test_format.py") not in paths
         assert Path(".github/workflow.yml") not in paths
+
+    def test_anchored_dotfilesignore_excludes_root_only(
+        self, tmp_path: Path
+    ) -> None:
+        """A leading '/' in .dotfilesignore anchors the pattern: the
+        root CLAUDE.md is skipped but claude/CLAUDE.md is linked,
+        which is how the dotfiles repo's own dev docs coexist with
+        per-tool config under claude/."""
+        dotfile_dir = tmp_path / "dotfiles"
+        dotfile_dir.mkdir()
+        (dotfile_dir / ".dotfilesignore").write_text("/CLAUDE.md\n")
+        (dotfile_dir / "CLAUDE.md").write_text("repo dev doc")
+        (dotfile_dir / "claude").mkdir()
+        (dotfile_dir / "claude" / "CLAUDE.md").write_text("tool config")
+
+        entries = df.discover_dotfiles(dotfile_dir)
+
+        paths = {e.relative_path for e in entries}
+        assert Path("CLAUDE.md") not in paths
+        assert Path("claude/CLAUDE.md") in paths
 
     def test_respects_hgignore_patterns(self, tmp_path: Path) -> None:
         """Test that .hgignore patterns are respected."""
