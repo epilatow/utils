@@ -734,6 +734,84 @@ class TestValidateConfig:
                 }
             )
 
+    def test_multi_parent_target_and_group_rejected(self) -> None:
+        # Target lists both group G and job A directly; G also lists
+        # A. Within this target's subtree A has two parents, so the
+        # platform schedulers would dispatch A twice per fire.
+        with pytest.raises(crony.ConfigError, match="multiple parents"):
+            crony.parse_config(
+                {
+                    "job": {
+                        "a": {
+                            "command": "true",
+                            "schedule": "*-*-* 03:00",
+                        },
+                    },
+                    "job-group": {
+                        "g": {"jobs": ["a"], "schedule": "daily"},
+                    },
+                    "target": {"darwin": {"jobs": ["g", "a"]}},
+                }
+            )
+
+    def test_multi_parent_two_groups_rejected(self) -> None:
+        # Two groups under the same scheduled root both list job A.
+        # Walked from the target, A has two parent groups.
+        with pytest.raises(crony.ConfigError, match="multiple parents"):
+            crony.parse_config(
+                {
+                    "job": {
+                        "a": {
+                            "command": "true",
+                            "schedule": "*-*-* 03:00",
+                        },
+                    },
+                    "job-group": {
+                        "g1": {"jobs": ["a"]},
+                        "g2": {"jobs": ["a"]},
+                        "root": {
+                            "jobs": ["g1", "g2"],
+                            "schedule": "daily",
+                        },
+                    },
+                    "target": {"darwin": {"jobs": ["root"]}},
+                }
+            )
+
+    def test_multi_parent_duplicate_in_list_rejected(self) -> None:
+        # Same parent referencing the same child twice in its `jobs`
+        # list still doubles the dispatch on every fire, so it's
+        # also flagged.
+        with pytest.raises(crony.ConfigError, match="multiple parents"):
+            crony.parse_config(
+                {
+                    "job": {
+                        "a": {
+                            "command": "true",
+                            "schedule": "*-*-* 03:00",
+                        },
+                    },
+                    "target": {"darwin": {"jobs": ["a", "a"]}},
+                }
+            )
+
+    def test_multi_parent_cross_target_allowed(self) -> None:
+        # Two targets each listing the same group is fine: only one
+        # target activates on a given host, so the dispatch graphs
+        # are disjoint at runtime.
+        cfg = crony.parse_config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+                "target": {
+                    "darwin": {"jobs": ["g"]},
+                    "linux": {"jobs": ["g"]},
+                    "host": {"squee": {"jobs": ["g"]}},
+                },
+            }
+        )
+        assert "g" in cfg.job_groups
+
     def test_target_references_undefined_name(self) -> None:
         with pytest.raises(crony.ConfigError, match="undefined name"):
             crony.parse_config({"target": {"darwin": {"jobs": ["nope"]}}})
@@ -1129,34 +1207,6 @@ class TestSelectionFilters:
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
-
-    def test_filtered_group_child_still_selected_via_other_path(
-        self, monkeypatch: Any
-    ) -> None:
-        # A child reachable through TWO groups -- one filtered
-        # out, one not -- is still selected via the unfiltered
-        # path.
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
-        cfg = self._cfg(
-            {
-                "job": {"a": _job()},
-                "job-group": {
-                    "g_only_darwin": {
-                        "jobs": ["a"],
-                        "schedule": "daily",
-                        "platforms": ["darwin"],
-                    },
-                    "g_any": {"jobs": ["a"], "schedule": "daily"},
-                },
-                "target": {"linux": {"jobs": ["g_only_darwin", "g_any"]}},
-            }
-        )
-        target = crony.resolve_target(cfg, "h", "linux")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
-        assert "g_only_darwin" not in sel_groups
-        assert "g_any" in sel_groups
-        assert "a" in sel_jobs
 
     def test_group_hosts_filter(self, monkeypatch: Any) -> None:
         cfg = self._cfg(
@@ -5214,7 +5264,7 @@ class TestStatusReport:
                 "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
                 "job-group": {"g": {"jobs": ["j"], "schedule": "*-*-* 04:00"}},
             },
-            default_target_jobs=["j", "g"],
+            default_target_jobs=["g"],
         )
         crony.apply_one(cfg, "j")
         crony.apply_one(cfg, "g")
@@ -5446,7 +5496,11 @@ class TestStatusReport:
     def test_groups_column_lists_multiple_groups_comma_separated(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # Job `a` is a child of two groups.
+        # Job `a` is a child of two groups. The single-parent
+        # invariant rejects a target reaching the same name twice,
+        # so only `g1` is in the target; `g2` is defined but dead.
+        # The GROUPS column reports every membership in the bundle
+        # regardless of which path the target activates.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -5456,7 +5510,7 @@ class TestStatusReport:
                     "g2": {"jobs": ["a"], "schedule": "*-*-* 04:00"},
                 },
             },
-            default_target_jobs=["g1", "g2"],
+            default_target_jobs=["g1"],
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "g1")

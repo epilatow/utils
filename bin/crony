@@ -345,9 +345,14 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # Selects which jobs and groups install on which hosts. A host
 # target replaces the platform target when both apply; the explicit
 # `jobs` list IS the selection (no inherits / exclude / add).
+#
+# Single-parent rule: within one target's subtree, each name has
+# at most one parent. Listing both a group and one of its children
+# from the same target -- or two groups that share a child -- is
+# rejected at parse time.
 
 # [target.darwin]
-# jobs            = ["brew-update", "git-pull-utils", "daily-updates"]
+# jobs            = ["daily-updates"]
 # notify_channels = ["email"]
 
 # [target.linux]
@@ -1454,6 +1459,47 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
     )
 
 
+def _collect_target_parents(
+    config: Config, target: Target
+) -> dict[str, list[str]]:
+    """Map each name reachable from `target` to its parent reference(s).
+
+    A direct entry in `target.jobs` records `"target"` as the
+    parent. A child of a group records `"group <gname>"`. The list
+    preserves visit order: target-direct entries first, then group
+    children in the order their parent groups were walked. Each
+    group is walked at most once per call (so a name that appears
+    as a child of two distinct groups records two parent entries,
+    but a group reachable through two paths still only contributes
+    its children once).
+
+    Used by `_validate_config` to enforce the single-parent
+    invariant within a target's dispatch graph. The per-walk
+    visited-groups set both deduplicates work for diamond shapes
+    and bounds the walk if a cycle ever sneaks in -- so the result
+    is well-defined regardless of whether the chain walk that
+    rejects cycles ran first.
+    """
+    parents: dict[str, list[str]] = {}
+    seen_groups: set[str] = set()
+
+    def _walk(group_name: str) -> None:
+        if group_name in seen_groups:
+            return
+        seen_groups.add(group_name)
+        g = config.job_groups.get(group_name)
+        if g is None:
+            return
+        for child in g.jobs:
+            parents.setdefault(child, []).append(f"group {group_name!r}")
+            _walk(child)
+
+    for ref in target.jobs:
+        parents.setdefault(ref, []).append("target")
+        _walk(ref)
+    return parents
+
+
 def _validate_config(config: Config) -> None:
     """Cross-cutting validation: name collisions, references, applicability."""
     # Job/group name collision
@@ -1546,6 +1592,27 @@ def _validate_config(config: Config) -> None:
     for label, target in targets_to_check:
         for ref in target.jobs:
             _walk_chain(ref, label, (), seen_schedule=False)
+
+    # Single-parent invariant: within a single target's subtree
+    # (the dispatch graph that any one host activates), each name
+    # appears as a child of at most one parent. A target lists its
+    # roots, groups list their children -- if A is reachable from
+    # the target both directly and through a group, or from two
+    # different groups, the platform schedulers would dispatch it
+    # twice on every fire. Duplicate references inside a single
+    # parent's `jobs` list count as multiple parents for the same
+    # reason. Cross-target overlap is fine: only one target ever
+    # activates on a given host, so two targets that both reference
+    # the same root produce independent dispatch graphs on the
+    # hosts they apply to.
+    for label, target in targets_to_check:
+        parents = _collect_target_parents(config, target)
+        for child, parent_list in parents.items():
+            if len(parent_list) > 1:
+                raise ConfigError(
+                    f"{label}: {child!r} has multiple parents in this "
+                    f"target's subtree: {', '.join(parent_list)}"
+                )
 
     # notify_channels references must resolve to defined channels in
     # this bundle's [defaults.notify.*] section. The reference checks
@@ -1791,10 +1858,10 @@ def selected_jobs_and_groups(
     descendants (group children, which may themselves be groups)
     are also selected so they get stamped on this host and don't
     appear as orphans. Per-entry `platforms` / `hosts` filters
-    exclude entries from the selected sets; a child reachable
-    only through a filtered group is excluded as well, while a
-    child reachable via at least one unfiltered path remains
-    selected.
+    exclude entries from the selected sets; a child whose only
+    reachable parent is filtered out gets excluded along with it.
+    Validation enforces single-parent within a target's subtree,
+    so there is at most one path to any name on this host.
 
     Cycle protection is defensive -- `_validate_config` should
     have already rejected cycles.
@@ -1859,11 +1926,6 @@ def selected_and_masked_jobs_and_groups(
 
     for name in target.jobs:
         _walk(name, None, set())
-    # A name reachable through both a masked and an unmasked path
-    # should appear as selected, not masked. Drop any masked entry
-    # that also made it into the selected sets.
-    for n in jobs | groups:
-        masked.pop(n, None)
     # Empty-group cascade: a selected group with no unmasked
     # direct child has nothing to dispatch on this host, so the
     # reference is treated as a no-op and the group joins the
