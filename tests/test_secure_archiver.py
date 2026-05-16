@@ -20,7 +20,11 @@ from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import CmdCallbacksBase, ExceptionHierarchyBase
+from conftest import (
+    CmdCallbacksBase,
+    ExceptionHierarchyBase,
+    UnknownArgRoutedToSubparserBase,
+)
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
@@ -1544,6 +1548,17 @@ class TestRunTests:
         mock_run.return_value = MagicMock(returncode=1)
 
         assert sa.do_self_test(verbose=False, coverage=False) == 1
+
+
+class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
+    """Unknown args print the subcommand's usage line."""
+
+    PARSER_FUNC = staticmethod(sa.build_parser)
+    CASES = [
+        (["create", "--bogus"], "create"),
+        (["check-config", "--bogus"], "check-config"),
+        (["write-example-config", "--bogus"], "write-example-config"),
+    ]
 
 
 class TestCmdCallbacks(CmdCallbacksBase):
