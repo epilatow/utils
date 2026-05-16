@@ -1128,22 +1128,30 @@ def create_plist_file(element: ElementTree.Element, path: Path) -> None:
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
+def _repo_root() -> Path:
+    """Return the borgadm repo root.
+
+    Resolves symlinks so paths derived from this work when borgadm
+    is invoked via a symlinked launcher (e.g. ~/.local/bin/borgadm
+    -> repo/bin/borgadm); without the resolve, the launcher's
+    parent dir would be returned instead of the repo checkout.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
 def _wrapper_source_path() -> Path:
     """Return path to the BorgAdm.app C wrapper source."""
-    repo = Path(__file__).parent.parent
-    return repo / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
+    return _repo_root() / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
 
 
 def _wrapper_binary_path() -> Path:
     """Return path to the compiled BorgAdm.app wrapper binary."""
-    repo = Path(__file__).parent.parent
-    return repo / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    return _repo_root() / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
 
 
 def _wrapper_app_path() -> Path:
     """Return path to the BorgAdm.app bundle."""
-    repo = Path(__file__).parent.parent
-    return repo / "Applications/BorgAdm.app"
+    return _repo_root() / "Applications/BorgAdm.app"
 
 
 def _wrapper_hash_path() -> Path:
@@ -1250,8 +1258,13 @@ _TASK_NAME_TEMPLATE = "local.borgadm.{task}"
 
 
 def _direct_script_path() -> str:
-    """Return the path to borgadm itself (no FDA wrapper)."""
-    return os.path.abspath(__file__)
+    """Return the path to borgadm itself (no FDA wrapper).
+
+    Resolves symlinks so a launchd plist points at the real
+    script in the repo rather than a launcher symlink that
+    could later move.
+    """
+    return str(Path(__file__).resolve())
 
 
 def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
@@ -2188,7 +2201,7 @@ def do_environment() -> None:
 
 def do_self_test(verbose: bool = False, coverage: bool = False) -> int:
     """Run tests by invoking the test file directly."""
-    repo_root = Path(__file__).parent.parent
+    repo_root = _repo_root()
     test_file = repo_root / "tests" / "test_borgadm.py"
 
     cmd = [str(test_file)]

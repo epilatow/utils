@@ -2765,6 +2765,33 @@ class TestCli:
             setattr(ba, "_warning_occurred", original)
 
 
+class TestRepoRoot:
+    """Test _repo_root() symlink resolution."""
+
+    def test_repo_root_resolves_symlinked_launcher(
+        self, tmp_path: Path
+    ) -> None:
+        """_repo_root() follows a symlinked launcher to the real repo.
+
+        Mirrors the common install where ~/.local/bin/borgadm is a
+        symlink to repo/bin/borgadm: without resolve(), repo_root
+        would return ~/.local/ and the Applications/ tree wouldn't
+        be found.
+        """
+        real_repo = tmp_path / "repo"
+        (real_repo / "bin").mkdir(parents=True)
+        real_script = real_repo / "bin" / "borgadm"
+        real_script.write_text("#!/usr/bin/env python\n")
+
+        launcher_root = tmp_path / "launcher"
+        (launcher_root / "bin").mkdir(parents=True)
+        launcher_script = launcher_root / "bin" / "borgadm"
+        launcher_script.symlink_to(real_script)
+
+        with patch.object(ba, "__file__", str(launcher_script)):
+            assert ba._repo_root() == real_repo.resolve()
+
+
 class TestWrapperRebuild:
     """Test _wrapper_needs_rebuild() and _build_wrapper()."""
 
