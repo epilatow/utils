@@ -574,6 +574,24 @@ def borg_cmd() -> list[str]:
     raise BorgadmError("Can't find borg or uvx executables.")
 
 
+def _is_remote_repo(repo: str) -> bool:
+    """True if `repo` is an ssh-accessed borg repo URL.
+
+    Borg accepts `ssh://user@host[:port]/path` and the abbreviated
+    `user@host:path` form for remote repos; everything else is a local
+    filesystem path. We follow borg's own heuristic for the abbreviated
+    form -- a colon in the first path segment marks it as remote.
+    Absolute local paths are immune (the segment before the first `/`
+    is empty); a relative local path whose first directory contains a
+    colon (e.g. `dir:name/repo`) would be misclassified as remote, but
+    borg itself would reject the same input in the same way.
+    """
+    if repo.startswith("ssh://"):
+        return True
+    head, _, _ = repo.partition("/")
+    return ":" in head
+
+
 def initialize_borg_environment() -> None:
     cfg = get_cfg()
 
@@ -585,17 +603,19 @@ def initialize_borg_environment() -> None:
         os.environ["BORG_REMOTE_PATH"] = cfg.BORG_REMOTE_PATH
         logger.debug(f"BORG_REMOTE_PATH={os.environ['BORG_REMOTE_PATH']}")
     os.environ["BORG_PASSPHRASE"] = load_passphrase()
-    _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
-    _hostkey_file.flush()
-    # Use -F /dev/null to ignore user's ~/.ssh/config which may contain
-    # settings (like IdentityAgent) that conflict with our ssh-agent setup.
-    os.environ["BORG_RSH"] = (
-        f"ssh -F /dev/null "
-        f"-o StrictHostKeyChecking=yes "
-        f"-o UserKnownHostsFile={_hostkey_file.name}"
-    )
-    logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
-    start_ssh_agent()
+    if _is_remote_repo(cfg.BORG_REPO):
+        _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
+        _hostkey_file.flush()
+        # Use -F /dev/null to ignore user's ~/.ssh/config which may
+        # contain settings (like IdentityAgent) that conflict with our
+        # ssh-agent setup.
+        os.environ["BORG_RSH"] = (
+            f"ssh -F /dev/null "
+            f"-o StrictHostKeyChecking=yes "
+            f"-o UserKnownHostsFile={_hostkey_file.name}"
+        )
+        logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
+        start_ssh_agent()
     _borg_env_initialized = True
 
 
@@ -2210,7 +2230,8 @@ def do_repair_repo(progress: bool, yes: bool) -> None:
 
 def do_environment() -> None:
     cfg = get_cfg()
-    logger.info(f"ssh-add -q {cfg.BORG_SSHKEY_FILE}")
+    if _is_remote_repo(cfg.BORG_REPO):
+        logger.info(f"ssh-add -q {cfg.BORG_SSHKEY_FILE}")
     logger.info(f"export BORG_PASSPHRASE=$(cat {cfg.BORG_PASSPHRASE_FILE})")
     logger.info(f"export BORG_REPO={cfg.BORG_REPO}")
     if cfg.BORG_REMOTE_PATH:

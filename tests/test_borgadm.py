@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import importlib.machinery
 import io
 import importlib.util
@@ -2165,6 +2166,99 @@ class TestNotifyTitle:
             assert getattr(ba, "_notify_title") == "borgadm check repo"
         finally:
             setattr(ba, "_notify_title", original_title)
+
+
+class TestIsRemoteRepo:
+    """Test the BORG_REPO local-vs-remote classifier."""
+
+    def test_ssh_scheme(self) -> None:
+        assert ba._is_remote_repo("ssh://user@host/srv/borg") is True
+        assert ba._is_remote_repo("ssh://user@host:2222/srv/borg") is True
+
+    def test_user_at_host_colon_path(self) -> None:
+        assert ba._is_remote_repo("user@host:/srv/borg") is True
+        assert ba._is_remote_repo("host:/srv/borg") is True
+        assert ba._is_remote_repo("backup-host:repos/main") is True
+
+    def test_local_absolute_path(self) -> None:
+        assert ba._is_remote_repo("/var/backups/borg") is False
+
+    def test_local_relative_path(self) -> None:
+        assert ba._is_remote_repo("backups/borg") is False
+        assert ba._is_remote_repo("~/backups/borg") is False
+
+    def test_empty_string(self) -> None:
+        assert ba._is_remote_repo("") is False
+
+
+class TestInitializeBorgEnvironmentSshGating:
+    """Ssh-agent and BORG_RSH setup skipped for local repos."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_env_and_state(
+        self, monkeypatch: Any, mock_cfg: Any
+    ) -> Iterator[Any]:
+        """Reset the once-per-process init flag plus the env vars the
+        function touches so each test sees a clean slate."""
+        monkeypatch.setattr(ba, "_borg_env_initialized", False)
+        for var in ("BORG_RSH", "BORG_PASSPHRASE", "BORG_REMOTE_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        yield mock_cfg
+        monkeypatch.setattr(ba, "_borg_env_initialized", False)
+
+    @contextlib.contextmanager
+    def _patch_externals(self, repo: str) -> Iterator[Any]:
+        """Patch the side-effecting helpers and yield the ssh-agent
+        mock so tests can assert against its call status."""
+        with (
+            patch.object(ba, "load_passphrase", return_value="pw"),
+            patch.object(ba, "start_ssh_agent", autospec=True) as mock_agent,
+            patch.object(ba.CFG, "BORG_REPO", repo),
+            patch.object(ba.CFG, "BORG_REPO_HOSTKEY", "fake-hostkey"),
+        ):
+            yield mock_agent
+
+    def test_local_path_skips_ssh_setup(self) -> None:
+        with self._patch_externals("/var/backups/borg") as mock_agent:
+            ba.initialize_borg_environment()
+            assert mock_agent.called is False
+        assert "BORG_RSH" not in os.environ
+        assert os.environ.get("BORG_PASSPHRASE") == "pw"
+
+    def test_ssh_scheme_runs_ssh_setup(self) -> None:
+        with self._patch_externals("ssh://user@host/srv/borg") as mock_agent:
+            ba.initialize_borg_environment()
+            assert mock_agent.called is True
+        assert "BORG_RSH" in os.environ
+        assert "ssh -F /dev/null" in os.environ["BORG_RSH"]
+
+    def test_user_at_host_runs_ssh_setup(self) -> None:
+        with self._patch_externals("user@host:/srv/borg") as mock_agent:
+            ba.initialize_borg_environment()
+            assert mock_agent.called is True
+        assert "BORG_RSH" in os.environ
+
+
+class TestDoEnvironment:
+    """do_environment prints ssh-add only for remote BORG_REPO."""
+
+    def test_local_repo_omits_ssh_add(self, mock_cfg: Any, caplog: Any) -> None:
+        with patch.object(ba.CFG, "BORG_REPO", "/var/backups/borg"):
+            with caplog.at_level(logging.INFO):
+                ba.do_environment()
+        messages = [r.message for r in caplog.records]
+        assert not any("ssh-add" in m for m in messages)
+        assert any("export BORG_PASSPHRASE=" in m for m in messages)
+        assert any("export BORG_REPO=" in m for m in messages)
+
+    def test_remote_repo_emits_ssh_add(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        with patch.object(ba.CFG, "BORG_REPO", "user@host:/srv/borg"):
+            with caplog.at_level(logging.INFO):
+                ba.do_environment()
+        messages = [r.message for r in caplog.records]
+        assert any("ssh-add -q" in m for m in messages)
 
 
 class TestMain:
