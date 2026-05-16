@@ -38,6 +38,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    UnknownArgRoutedToSubparserBase,
 )
 
 # Repository root directory (parent of tests/)
@@ -476,6 +477,17 @@ class TestArgumentParser:
                             "check age help should show --config"
                         )
                 break
+
+
+class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
+    """Unknown args print the subcommand's usage, including nested."""
+
+    PARSER_FUNC = staticmethod(ba.args_parser)
+    CASES = [
+        (["list", "--bogus"], "list"),
+        (["check", "age", "--bogus"], "check age"),
+        (["repair", "repo", "--bogus"], "repair repo"),
+    ]
 
 
 class TestCmdCallbacks(CmdCallbacksBase):
