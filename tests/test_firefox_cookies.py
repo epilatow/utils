@@ -29,6 +29,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    UnknownArgRoutedToSubparserBase,
 )
 
 # Repository root directory (parent of tests/)
@@ -436,6 +437,19 @@ class TestArgumentParser:
                     "netscape",
                 ]
             )
+
+
+class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
+    """Unknown args print the subcommand's usage line."""
+
+    PARSER_FUNC = staticmethod(fc.build_parser)
+    CASES = [
+        (["list", "--bogus"], "list"),
+        (["list-domains", "--bogus"], "list-domains"),
+        (["list-profiles", "--bogus"], "list-profiles"),
+        (["list-containers", "--bogus"], "list-containers"),
+        (["self-test", "--bogus"], "self-test"),
+    ]
 
 
 # =============================================================================
