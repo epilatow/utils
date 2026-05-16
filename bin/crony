@@ -64,7 +64,9 @@ more TOML config bundles and applies the corresponding platform
 units, runs jobs through a uniform shim (so logs, locks, gates,
 and notifications behave the same on both platforms), and reports
 state via `crony status`. The default columns are:
-  JOB       the full namespaced name `<bundle>.<short>`
+  JOB       the full namespaced name `<bundle>.<short>`, indented
+            two spaces per group-nesting level when the entry is in
+            an active target's dispatch tree, in execution order
   CONFIG    synced  | stale    | missing | orphan  | masked
   SCHEDULE  the cron / interval / `grouped` value for the entry,
             or `disabled` when the unit is off at the scheduler
@@ -5179,6 +5181,54 @@ def do_trigger(
         raise SystemExit(worst_rc)
 
 
+def _build_status_tree(
+    bundles: Bundles, host: str, platform: str
+) -> tuple[list[str], dict[str, int]]:
+    """Return the DFS order and per-name depth of each active target tree.
+
+    For each bundle, resolves the target that activates on
+    (host, platform) and walks `target.jobs` -> group.jobs ->
+    leaves in list order, preserving the order each parent
+    declared its children. Both selected and masked entries are
+    recorded so the renderer can place a masked-but-in-tree row
+    at its config depth instead of below the tree. The per-walk
+    visited-set bounds the walk if a malformed config somehow
+    bypasses `_validate_config` (e.g. tests constructing Config
+    directly without going through `parse_config`); under the
+    single-parent invariant from validation it never deduplicates
+    a real traversal.
+    """
+    order: list[str] = []
+    depth: dict[str, int] = {}
+
+    def _walk(
+        bundle: Bundle,
+        short: str,
+        d: int,
+        seen: set[str],
+    ) -> None:
+        full = bundle.full_name(short)
+        if full in seen:
+            return
+        seen.add(full)
+        order.append(full)
+        depth[full] = d
+        g = bundle.config.job_groups.get(short)
+        if g is None:
+            return
+        for child in g.jobs:
+            _walk(bundle, child, d + 1, seen)
+
+    for b in bundles.bundles:
+        target = resolve_target(b.config, host, platform)
+        if target is None:
+            continue
+        seen: set[str] = set()
+        for ref in target.jobs:
+            _walk(b, ref, 0, seen)
+    return order, depth
+
+
 _STATUS_COL_HEADERS: dict[str, str] = {
     "job": "JOB",
     "kind": "KIND",
@@ -5217,6 +5267,11 @@ Columns
                     force a single source. Empty when the entry isn't a
                     member of any group.
   job               Full namespaced name `<bundle>.<short>`. Always shown.
+                    Rows in an active target's dispatch tree are indented
+                    two spaces per group-nesting level and ordered by the
+                    target / group `jobs` lists (execution order). Off-tree
+                    rows (orphans, names not in any active target) follow
+                    below, unindented, in sorted order.
   kind              "job" or "group". Falls back to the snapshot's recorded
                     kind for rows whose live config no longer
                     defines the entry.
@@ -5669,6 +5724,14 @@ def do_status(
             active = active | set(masked_by_full)
         full_names = sorted(active)
 
+    tree_order, tree_depth = _build_status_tree(
+        bundles, current_host(), platform
+    )
+    if bundle is not None:
+        tree_order = [n for n in tree_order if n.startswith(f"{bundle}.")]
+        tree_depth = {
+            n: d for n, d in tree_depth.items() if n.startswith(f"{bundle}.")
+        }
     pending_groups, current_groups = _build_group_membership(bundles)
     rows: list[dict[str, str]] = []
     any_stale = False
@@ -5738,6 +5801,26 @@ def do_status(
                 "pending-schedule": pending_sched_cell,
             }
         )
+
+    # Order rows by tree DFS to surface execution order rather
+    # than alphabetical: roots from each active target first, then
+    # group children indented by depth, then off-tree rows
+    # (orphans, CLI args outside any tree, masked entries not in
+    # any active target) below in stable sorted order. The JOB
+    # cell carries two spaces of indent per depth level so the
+    # visual nesting matches the dispatch graph.
+    rows_by_name = {r["job"]: r for r in rows}
+    ordered: list[dict[str, str]] = []
+    for full in tree_order:
+        r = rows_by_name.pop(full, None)
+        if r is None:
+            continue
+        r = dict(r)
+        r["job"] = "  " * tree_depth[full] + r["job"]
+        ordered.append(r)
+    for full in sorted(rows_by_name):
+        ordered.append(rows_by_name[full])
+    rows = ordered
 
     # Per-column width: max of the header label and the longest
     # cell, so a long "last-ran" value (`12d ago`) doesn't get

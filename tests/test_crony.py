@@ -5255,6 +5255,199 @@ class TestStatusReport:
         assert "borgadm.k" in out
         assert "default.j" not in out
 
+    def test_rows_ordered_by_target_tree_execution_order(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Tree DFS order, not alphabetical: target.jobs and
+        # group.jobs list order is preserved end-to-end, and
+        # children are indented two spaces per depth level.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "zzz-first": {"command": "true"},
+                    "aaa-second": {"command": "true"},
+                    "mmm-third": {"command": "true"},
+                },
+                "job-group": {
+                    "inner": {
+                        "jobs": ["zzz-first", "aaa-second", "mmm-third"],
+                    },
+                    "root": {"jobs": ["inner"], "schedule": "*-*-* 02:30"},
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        for short in ("zzz-first", "aaa-second", "mmm-third", "inner", "root"):
+            crony.apply_one(cfg, short)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out_lines = capsys.readouterr().out.splitlines()
+        # Drop the header line; remaining lines are the rows in
+        # rendering order.
+        rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
+        assert rendered == [
+            "default.root",
+            "  default.inner",
+            "    default.zzz-first",
+            "    default.aaa-second",
+            "    default.mmm-third",
+        ]
+
+    def test_off_tree_rows_render_below_unindented_and_sorted(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # An on-disk remnant (no longer in any active target) renders
+        # below the tree without indentation, alphabetically ordered
+        # alongside other off-tree rows.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "tree-job": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "orphan-job": {
+                        "command": "true",
+                        "schedule": "*-*-* 04:00",
+                    },
+                },
+            },
+            default_target_jobs=["tree-job", "orphan-job"],
+        )
+        crony.apply_one(cfg, "tree-job")
+        crony.apply_one(cfg, "orphan-job")
+        # Rewrite config so orphan-job is no longer in any target;
+        # its on-disk state remains, surfacing as a remnant.
+        h.config(
+            {
+                "job": {
+                    "tree-job": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "orphan-job": {
+                        "command": "true",
+                        "schedule": "*-*-* 04:00",
+                    },
+                },
+            },
+            default_target_jobs=["tree-job"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out_lines = capsys.readouterr().out.splitlines()
+        rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
+        # tree-job comes first (root of the active target's tree);
+        # orphan-job follows below, unindented.
+        assert rendered == ["default.tree-job", "default.orphan-job"]
+
+    def test_masked_in_tree_row_renders_at_config_depth(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A child filtered out by `hosts` is masked on this host
+        # but still in the active target's config tree. With --all,
+        # its row appears at its configured depth (indented), not
+        # banished to the off-tree section below.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        monkeypatch.setattr(crony, "current_host", lambda: "this-host")
+        h.config(
+            {
+                "job": {
+                    "leaf-here": {"command": "true"},
+                    "leaf-elsewhere": {
+                        "command": "true",
+                        "hosts": ["other-host"],
+                    },
+                },
+                "job-group": {
+                    "root": {
+                        "jobs": ["leaf-here", "leaf-elsewhere"],
+                        "schedule": "*-*-* 02:30",
+                    },
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+        )
+        out_lines = capsys.readouterr().out.splitlines()
+        rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
+        assert rendered == [
+            "default.root",
+            "  default.leaf-here",
+            "  default.leaf-elsewhere",
+        ]
+
+    def test_bundle_filter_scopes_tree_rendering(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `--bundle <name>` restricts the table to that bundle's
+        # tree -- rows from other bundles' active trees are
+        # excluded and don't perturb the indentation widths of the
+        # filtered view.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {
+                "job": {
+                    "leaf": {"command": "true"},
+                },
+                "job-group": {
+                    "root": {"jobs": ["leaf"], "schedule": "*-*-* 02:30"},
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        crony.apply_one(cfg, "leaf")
+        crony.apply_one(cfg, "root")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+            "\n"
+            '[target.darwin]\njobs = ["k"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job",
+            show_masked=False,
+            bundle="default",
+            config_current=False,
+            config_pending=False,
+        )
+        out_lines = capsys.readouterr().out.splitlines()
+        rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
+        assert rendered == [
+            "default.root",
+            "  default.leaf",
+        ]
+
     def test_kind_column_shows_job_or_group(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
