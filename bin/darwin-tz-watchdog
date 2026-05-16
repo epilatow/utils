@@ -1,0 +1,299 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_darwin_tz_watchdog.py
+# Always run the test suite after making modifications.
+
+"""Restart macOS UserEventAgent-Aqua when its cached timezone is stale.
+
+UserEventAgent-Aqua monitors `StartCalendarInterval` triggers for
+user-mode LaunchAgents. The process caches the timezone at start
+and does not re-read it when `/etc/localtime` changes. After a
+timezone switch (e.g. travel), calendar intervals continue to
+fire against the old timezone -- a job scheduled for `02:30` in
+the new local zone fires at 02:30 in the *old* zone, which can
+be several hours off.
+
+This watchdog compares the symlink mtime of `/etc/localtime`
+(updated when the system timezone changes) to the start time of
+UserEventAgent-Aqua. If the timezone link is newer, the agent is
+restarted by sending SIGTERM to its pid; launchd's KeepAlive
+respawns it and the new instance reads the current zone.
+
+`launchctl kickstart -k` would be the clean way to do this, but
+SIP blocks user-level launchctl operations on Apple-provided
+agents (exit 150, "Operation not permitted while System
+Integrity Protection is engaged"). Killing the pid we own
+sidesteps the launchctl restriction.
+
+The script exits immediately on non-darwin platforms (systemd
+timers on linux re-read the zone on each evaluation and don't
+have this bug, so there's nothing to watch).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import logging
+import os
+import platform
+import signal
+import subprocess
+import sys
+import traceback
+from pathlib import Path
+
+# Configure logging to stderr so notification output (decision /
+# action) stays in stdout when piped.
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+    stream=sys.stderr,
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+UEA_AQUA_LABEL = "com.apple.UserEventAgent-Aqua"
+TZ_SYMLINK = Path("/etc/localtime")
+
+# ps -o lstart= prints e.g. "Fri Apr 10 08:07:23 2026" -- abbreviated
+# weekday, abbreviated month, day-of-month (space-padded), HH:MM:SS,
+# 4-digit year. `%c` is locale-dependent so we spell the format out.
+PS_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+
+
+# =============================================================================
+# Exit codes
+# =============================================================================
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+
+
+# =============================================================================
+# Errors
+# =============================================================================
+
+
+class WatchdogError(Exception):
+    """Watchdog failed to perform a required step."""
+
+
+# =============================================================================
+# OS probes
+# =============================================================================
+
+
+def _tz_mtime(path: Path = TZ_SYMLINK) -> float:
+    """Return mtime (epoch seconds) of the timezone symlink itself.
+
+    `lstat` -- not `stat` -- is intentional: `/etc/localtime` is a
+    symlink, and switching timezones updates the symlink (bumping
+    *its* mtime) while leaving the underlying zone-data file
+    alone. Following the symlink would miss every TZ switch.
+    """
+    return path.lstat().st_mtime
+
+
+def _uea_aqua_pid() -> int | None:
+    """Return the PID of UserEventAgent-Aqua, or None if not loaded.
+
+    Resolves via `launchctl print gui/<uid>/<label>` rather than
+    pgrep so the lookup is keyed to the launchd service identity
+    (stable across macOS versions) instead of a process-name
+    substring match.
+    """
+    proc = subprocess.run(
+        [
+            "launchctl",
+            "print",
+            f"gui/{os.getuid()}/{UEA_AQUA_LABEL}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("pid ="):
+            try:
+                return int(stripped.split("=", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _process_start_epoch(pid: int) -> float:
+    """Return start time (epoch seconds) of `pid` via `ps -o lstart=`.
+
+    `ps` prints lstart in the *current* local timezone. The
+    returned naive datetime is then converted with `.timestamp()`,
+    which interprets it in the current local zone -- so the
+    round-trip gives an epoch consistent with `_tz_mtime`.
+    """
+    proc = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise WatchdogError(
+            f"ps failed for pid {pid}: {proc.stderr.strip()!r}"
+        )
+    line = proc.stdout.strip()
+    if not line:
+        raise WatchdogError(f"ps returned no lstart for pid {pid}")
+    try:
+        naive = datetime.datetime.strptime(line, PS_LSTART_FORMAT)
+    except ValueError as exc:
+        raise WatchdogError(
+            f"unrecognised lstart format {line!r}: {exc}"
+        ) from exc
+    return naive.timestamp()
+
+
+def _restart_uea_aqua(pid: int) -> None:
+    """Send SIGTERM to UEA-Aqua so launchd respawns a fresh instance.
+
+    The respawned process re-reads the current timezone on
+    startup, which is the whole point of the restart. Plain kill
+    -- rather than `launchctl kickstart -k` -- because SIP blocks
+    user-level launchctl operations on Apple-provided agents
+    (exit 150). The signaled process is owned by the current
+    user, so `os.kill` is not SIP-restricted.
+
+    A "no such process" ESRCH between detection and signaling is
+    benign: launchd already restarted the agent for some other
+    reason, and a fresh instance reads the current zone anyway.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise WatchdogError(
+            f"kill({pid}, SIGTERM) refused: {exc}"
+        ) from exc
+
+
+# =============================================================================
+# Decision
+# =============================================================================
+
+
+def _format_epoch(epoch: float) -> str:
+    """Format an epoch as local time for human-readable diagnostics."""
+    return datetime.datetime.fromtimestamp(epoch).strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    ).rstrip()
+
+
+def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
+    """Detect stale UEA-Aqua and (unless dry-run) restart it.
+
+    Returns an exit code suitable for `sys.exit`. The "nothing to
+    do" path (fresh enough agent, or UEA-Aqua not loaded) returns
+    0 silently so the watchdog is cheap to schedule -- only the
+    action path or an error produces stdout / stderr.
+    """
+    pid = _uea_aqua_pid()
+    if pid is None:
+        # Not loaded means there's nothing stale to restart. A
+        # later login session will spawn a fresh instance that
+        # reads the current zone, so the bug can't manifest in
+        # this state.
+        if verbose:
+            print(f"noop: {UEA_AQUA_LABEL} not loaded")
+        return EXIT_OK
+
+    tz_mtime = _tz_mtime()
+    start_epoch = _process_start_epoch(pid)
+    is_stale = tz_mtime > start_epoch
+
+    if verbose:
+        print(f"pid:         {pid}")
+        print(f"agent start: {_format_epoch(start_epoch)}")
+        print(f"tz mtime:    {_format_epoch(tz_mtime)}")
+        print(f"stale:       {is_stale}")
+
+    if not is_stale:
+        return EXIT_OK
+
+    if dry_run:
+        print(
+            f"would restart {UEA_AQUA_LABEL} "
+            f"(tz mtime newer than process start)"
+        )
+        return EXIT_OK
+
+    _restart_uea_aqua(pid)
+    print(
+        f"restarted {UEA_AQUA_LABEL} pid={pid} "
+        f"(was started {_format_epoch(start_epoch)}, "
+        f"tz updated {_format_epoch(tz_mtime)})"
+    )
+    return EXIT_OK
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Restart macOS UserEventAgent-Aqua when its cached "
+            "timezone is stale relative to /etc/localtime."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print decision diagnostics (pid, times, staleness).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Report what would happen without signaling the agent."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Bail before argparse on non-darwin: the script has nothing
+    # to do, and skipping --help / unknown-arg errors means
+    # cross-platform scheduling can invoke it unconditionally.
+    if platform.system() != "Darwin":
+        return EXIT_OK
+    args = _build_parser().parse_args(argv)
+    try:
+        return check_and_restart(
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+    except WatchdogError as exc:
+        logger.error("tz-agent-watchdog: %s", exc)
+        return EXIT_ERROR
+    except Exception:
+        # Last-resort guard so crony notifications carry a
+        # traceback instead of silent exit codes when something
+        # the script didn't anticipate breaks.
+        traceback.print_exc(file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
