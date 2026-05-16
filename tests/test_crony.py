@@ -29,6 +29,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    UnknownArgRoutedToSubparserBase,
 )
 
 # Repository root directory (parent of tests/)
@@ -73,6 +74,17 @@ class TestHelpOutput:
         # short tagline lives in description, design lives in
         # epilog after the exit-code list.
         assert text.index("exit codes:") < text.index("CONFIG    synced")
+
+
+class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
+    """Unknown args print the subcommand's usage line."""
+
+    PARSER_FUNC = staticmethod(crony.build_parser)
+    CASES = [
+        (["status", "--bogus"], "status"),
+        (["logs", "--bogus"], "logs"),
+        (["enable", "--bogus"], "enable"),
+    ]
 
 
 class TestCmdCallbacks(CmdCallbacksBase):

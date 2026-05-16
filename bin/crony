@@ -38,7 +38,16 @@ import xml.sax.saxutils
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
-from typing import IO, Any, Callable, Iterable, Iterator, NamedTuple
+from typing import (
+    IO,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    TYPE_CHECKING,
+)
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -6590,9 +6599,65 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
 # =============================================================================
 
 
+if TYPE_CHECKING:
+    _SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
+else:
+    _SubParsersActionBase = argparse._SubParsersAction
+
+
+class _StrictSubParsersAction(_SubParsersActionBase):
+    """Subparsers action that errors on the subparser, not the root.
+
+    Stdlib's _SubParsersAction.__call__ calls parse_known_args on the
+    chosen subparser and stashes any leftover tokens on the top-level
+    namespace, so an unknown-arg error is reported by the root parser
+    -- with its program name and usage line, obscuring which
+    subcommand the user actually typed. Calling parse_args (strict)
+    on the subparser routes the error through the subparser's own
+    error(), giving "crony <subcommand>: error: ..." with the
+    subcommand's usage line.
+
+    Stdlib's deprecation-warning branch
+    (add_parser(deprecated=True), 3.13+) is intentionally omitted:
+    no crony subcommand uses deprecated=True, and the stdlib hook
+    (parser._warning) is private and version-gated.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        parser_name = values[0]
+        arg_strings = values[1:]
+        if self.dest is not argparse.SUPPRESS:
+            setattr(namespace, self.dest, parser_name)
+        try:
+            subparser = self._name_parser_map[parser_name]
+        except KeyError as exc:
+            choices = ", ".join(self._name_parser_map)
+            raise argparse.ArgumentError(
+                self,
+                f"unknown parser {parser_name!r} (choices: {choices})",
+            ) from exc
+        subnamespace = subparser.parse_args(arg_strings)
+        for key, value in vars(subnamespace).items():
+            setattr(namespace, key, value)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that installs the strict subparsers action."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.register("action", "parsers", _StrictSubParsersAction)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description=(
             "User-level scheduled-job manager for macOS "
             "(launchd LaunchAgents) and Linux (systemd user timers)."
