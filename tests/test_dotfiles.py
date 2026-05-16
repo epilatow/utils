@@ -25,6 +25,7 @@ from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
     IsolateHomeFixtureBase,
+    UnknownArgRoutedToSubparserBase,
     isolate_home,
 )
 
@@ -102,6 +103,18 @@ class TestArgumentParser:
         args = parser.parse_args(["cleanup", "--dry-run"])
         assert args.command == "cleanup"
         assert args.dry_run is True
+
+
+class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
+    """Unknown args print the subcommand's usage line."""
+
+    PARSER_FUNC = staticmethod(df.build_parser)
+    CASES = [
+        (["install", "--bogus"], "install"),
+        (["remove", "--bogus"], "remove"),
+        (["audit", "--bogus"], "audit"),
+        (["cleanup", "--bogus"], "cleanup"),
+    ]
 
 
 class TestDotfileEntry:
