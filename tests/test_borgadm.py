@@ -43,6 +43,15 @@ from conftest import (
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
 
+# Real user uv cache, captured at import time before the per-test
+# `_isolate_home` fixture rewrites $HOME. Subprocesses launched out of
+# e2e fixtures inherit this via UV_CACHE_DIR so they hit the warm
+# parent cache instead of building a fresh venv per call under their
+# fake HOME.
+_REAL_UV_CACHE_DIR = os.environ.get(
+    "UV_CACHE_DIR", os.path.expanduser("~/.cache/uv")
+)
+
 # Import borgadm module from bin/ (works with or without .py extension)
 _script_path = REPO_ROOT / "bin" / "borgadm"
 if not _script_path.exists():
@@ -166,6 +175,16 @@ class BorgE2EFixture:
     def _subprocess_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.home)
+        # Borgadm is a `uv run --script` entrypoint, so each subprocess
+        # call resolves its script venv via uv's cache. Without this, uv
+        # falls back to $HOME/.cache/uv -- our fake-HOME -- which is
+        # empty for every test and forces a fresh build per invocation.
+        # Inherit the real user's uv cache (captured at module import
+        # before the autouse `_isolate_home` fixture rewrote $HOME) so
+        # subprocesses hit the warm parent cache. uv's cache is
+        # content-addressed and lock-coordinated, so cross-process
+        # sharing is safe.
+        env.setdefault("UV_CACHE_DIR", _REAL_UV_CACHE_DIR)
         # Unencrypted repos prompt interactively on first access. The
         # opt-in env var silences the prompt for our local test repo.
         env["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
@@ -249,11 +268,11 @@ def _have_borg() -> bool:
     return shutil.which("borg") is not None
 
 
-# Skip the E2E suite when borg or ssh-keygen aren't installed. Both are
-# required for the fixture itself, not just individual tests.
+# Skip the E2E suite when borg isn't installed. The fixture talks to a
+# local borg repo, so no ssh tooling is needed.
 e2e_requires_borg = pytest.mark.skipif(
-    not _have_borg() or shutil.which("ssh-keygen") is None,
-    reason="borg and ssh-keygen must be installed for E2E tests",
+    not _have_borg(),
+    reason="borg must be installed for E2E tests",
 )
 
 
@@ -263,92 +282,55 @@ def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
     tests can drive `borgadm` via subprocess against actual archives.
 
     Layout:
-      <short-home>/                # HOME for the subprocess; created
-                                   # under /tmp because macOS
-                                   # /usr/bin/ssh-agent puts its unix
-                                   # socket at $HOME/.ssh/agent/... and
-                                   # pytest's tmp_path under
-                                   # /private/var/folders/... brushes
-                                   # the sockaddr_un.sun_path limit
-                                   # (104 bytes).
+      <_isolate_home>/             # HOME for the subprocess
         .borgadm                   # config pointing at the local repo
         .borg_passphrase           # dummy, repo uses --encryption=none
-        .ssh/id_borg.net           # passphrase-less ed25519 key
       <tmp_path>/repo/             # the borg repo (encryption=none)
       <tmp_path>/src/<set>/...     # source dirs, one per backup set
     """
-    home = Path(tempfile.mkdtemp(prefix="be2e_home_", dir="/tmp"))
-    try:
-        repo_path = tmp_path / "repo"
-        backup_root = tmp_path / "src"
-        backup_root.mkdir()
+    home = _isolate_home
+    repo_path = tmp_path / "repo"
+    backup_root = tmp_path / "src"
+    backup_root.mkdir()
 
-        sets: dict[str, list[Path]] = {}
-        for set_name, paths in _E2E_SETS.items():
-            absolute_paths: list[Path] = []
-            for rel in paths:
-                full = backup_root / rel.rstrip("/")
-                full.mkdir(parents=True)
-                (full / f"{set_name}-file.txt").write_text(
-                    f"{set_name} content\n"
-                )
-                absolute_paths.append(full)
-            sets[set_name] = absolute_paths
+    sets: dict[str, list[Path]] = {}
+    for set_name, paths in _E2E_SETS.items():
+        absolute_paths: list[Path] = []
+        for rel in paths:
+            full = backup_root / rel.rstrip("/")
+            full.mkdir(parents=True)
+            (full / f"{set_name}-file.txt").write_text(f"{set_name} content\n")
+            absolute_paths.append(full)
+        sets[set_name] = absolute_paths
 
-        ssh_dir = home / ".ssh"
-        ssh_dir.mkdir(parents=True)
-        sshkey_file = ssh_dir / "id_borg.net"
-        subprocess.run(
-            [
-                "ssh-keygen",
-                "-t",
-                "ed25519",
-                "-N",
-                "",
-                "-f",
-                str(sshkey_file),
-                "-q",
-                "-C",
-                "borgadm-e2e-test",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        sshkey_file.chmod(0o600)
+    passphrase_file = home / ".borg_passphrase"
+    passphrase_file.write_text("e2e-test-passphrase\n")
+    passphrase_file.chmod(0o600)
 
-        passphrase_file = home / ".borg_passphrase"
-        passphrase_file.write_text("e2e-test-passphrase\n")
-        passphrase_file.chmod(0o600)
+    subprocess.run(
+        ["borg", "init", "--encryption=none", str(repo_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
-        subprocess.run(
-            ["borg", "init", "--encryption=none", str(repo_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    backup_sets_cfg = {name: {"paths": _E2E_SETS[name]} for name in _E2E_SETS}
+    config_path = home / ".borgadm"
+    config_path.write_text(
+        f"BORG_REPO = {repo_path}\n"
+        f"BACKUP_NAME = test\n"
+        f"BACKUP_ROOT = {backup_root}\n"
+        f"BORG_PASSPHRASE_FILE = {passphrase_file}\n"
+        f"BACKUP_SETS = {json.dumps(backup_sets_cfg)}\n"
+    )
 
-        backup_sets_cfg = {
-            name: {"paths": _E2E_SETS[name]} for name in _E2E_SETS
-        }
-        config_path = home / ".borgadm"
-        config_path.write_text(
-            f"BORG_REPO = {repo_path}\n"
-            f"BACKUP_NAME = test\n"
-            f"BACKUP_ROOT = {backup_root}\n"
-            f"BORG_PASSPHRASE_FILE = {passphrase_file}\n"
-            f"BORG_SSHKEY_FILE = {sshkey_file}\n"
-            f"BACKUP_SETS = {json.dumps(backup_sets_cfg)}\n"
-        )
-
-        yield BorgE2EFixture(
-            repo_path=repo_path,
-            backup_root=backup_root,
-            home=home,
-            config_path=config_path,
-            sets=sets,
-        )
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
+    yield BorgE2EFixture(
+        repo_path=repo_path,
+        backup_root=backup_root,
+        home=home,
+        config_path=config_path,
+        sets=sets,
+    )
 
 
 class TestArgumentParser:
@@ -3281,7 +3263,6 @@ class TestE2EFixture:
         assert (borg_e2e.repo_path / "README").is_file()
         assert borg_e2e.config_path.is_file()
         assert (borg_e2e.home / ".borg_passphrase").is_file()
-        assert (borg_e2e.home / ".ssh" / "id_borg.net").is_file()
         # Each declared set has at least one populated source path.
         for set_name, paths in borg_e2e.sets.items():
             assert paths, f"set {set_name!r} has no source paths"
@@ -3299,8 +3280,8 @@ class TestE2EFixture:
         self, borg_e2e: BorgE2EFixture
     ) -> None:
         """`borgadm list` succeeds on an empty repo (smoke test that the
-        subprocess invocation path -- config parsing, ssh-agent startup,
-        env init -- all work end-to-end)."""
+        subprocess invocation path -- config parsing, env init -- works
+        end-to-end)."""
         result = borg_e2e.run("list")
         assert result.returncode == 0, (
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
