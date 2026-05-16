@@ -469,12 +469,30 @@ class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
         super().handleError(record)
 
 
+# Sentinel attribute marking a logging.Handler as installed by
+# initialize_logger().  Used to remove the previous generation of handlers
+# from the root logger on re-init, so repeated calls (each test exercising
+# cli(), or any long-running embedding that re-enters cli()) don't
+# accumulate handlers and open file descriptors without bound.
+_BORGADM_HANDLER_TAG = "_borgadm_handler"
+
+
+def _install_handler(handler: logging.Handler) -> None:
+    setattr(handler, _BORGADM_HANDLER_TAG, True)
+    logger.addHandler(handler)
+
+
 def initialize_logger(
     logfile_path: str | Path,
     verbose: bool = False,
     timestamp_messages: bool = False,
     enable_notifications: bool = False,
 ) -> None:
+    for existing in list(logger.handlers):
+        if getattr(existing, _BORGADM_HANDLER_TAG, False):
+            logger.removeHandler(existing)
+            existing.close()
+
     logger.setLevel(logging.DEBUG)  # Capture all logs for the file
 
     # In memory logger for notifications
@@ -487,7 +505,7 @@ def initialize_logger(
         "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
     )
     memory_handler.setFormatter(memory_formatter)
-    logger.addHandler(memory_handler)
+    _install_handler(memory_handler)
 
     # File handler - all messages with full formatting
     file_handler = logging.FileHandler(logfile_path)
@@ -496,7 +514,7 @@ def initialize_logger(
         "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
     )
     file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
+    _install_handler(file_handler)
 
     # Stdout handler for INFO messages only
     stdout_handler = BrokenPipeAwareStreamHandler(sys.stdout)
@@ -506,7 +524,7 @@ def initialize_logger(
         "%(asctime)s: %(message)s" if timestamp_messages else "%(message)s"
     )
     stdout_handler.setFormatter(logging.Formatter(stdout_fmt))
-    logger.addHandler(stdout_handler)
+    _install_handler(stdout_handler)
 
     # Stderr handler for WARNING and worse (or DEBUG+ if verbose)
     stderr_handler = BrokenPipeAwareStreamHandler(sys.stderr)
@@ -518,7 +536,7 @@ def initialize_logger(
         else "%(levelname)s: %(message)s"
     )
     stderr_handler.setFormatter(logging.Formatter(stderr_fmt))
-    logger.addHandler(stderr_handler)
+    _install_handler(stderr_handler)
 
     def log_exceptions(
         exc_type: type[BaseException],

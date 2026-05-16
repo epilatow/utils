@@ -2238,6 +2238,35 @@ class TestTimestampMessages:
         finally:
             root.handlers = old_handlers
 
+    def test_initialize_logger_is_idempotent(self, tmp_path: Path) -> None:
+        """Repeated initialize_logger calls don't accumulate handlers.
+
+        Each cli() invocation in a long-running process (test session,
+        embedded use) calls initialize_logger. Without cleanup, every
+        call would attach four more handlers (memory / file / stdout /
+        stderr) to the root logger, each holding open a file descriptor
+        and writing every log line one extra time -- driving session
+        time and log-file size up roughly linearly per cli() call.
+        """
+        root = logging.getLogger()
+        old_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            ba.initialize_logger(str(tmp_path / "a.log"))
+            after_first = len(root.handlers)
+            for i in range(5):
+                ba.initialize_logger(str(tmp_path / f"{i}.log"))
+            assert len(root.handlers) == after_first
+
+            for h in root.handlers:
+                if isinstance(h, logging.FileHandler):
+                    assert h.baseFilename == str(tmp_path / "4.log")
+        finally:
+            for h in list(root.handlers):
+                root.removeHandler(h)
+                h.close()
+            root.handlers = old_handlers
+
 
 class TestStartEndMarkers:
     """Test start/end timing markers for repo-operating commands."""
