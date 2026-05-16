@@ -398,6 +398,52 @@ class CmdCallbacksBase:
         assert result == 1
 
 
+class UnknownArgRoutedToSubparserBase:
+    """Assert unknown args print the chosen subparser's usage line.
+
+    Stdlib argparse stashes leftover tokens on the top-level namespace
+    and raises from the root parser, so the user sees the root's
+    program name and usage line for a flag the subparser rejected.
+    Utilities that install a strict subparsers action route the error
+    through the chosen subparser instead. This base verifies that the
+    "usage:" line and the "<prog> <subcommand>: error: ..." line both
+    reference the actual subcommand path.
+
+    Subclasses set:
+      PARSER_FUNC: callable returning a fresh ArgumentParser.
+      CASES: list of (argv, subcommand_path) tuples, where
+        subcommand_path is the space-joined subcommand chain expected
+        in the usage / error lines (e.g. "list", "check age").
+    """
+
+    PARSER_FUNC: ClassVar[Any]
+    CASES: ClassVar[list[tuple[list[str], str]]]
+
+    def test_unknown_arg_reports_subparser_usage(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for argv, suffix in self.CASES:
+            parser = type(self).PARSER_FUNC()
+            with pytest.raises(SystemExit) as exc_info:
+                parser.parse_args(argv)
+            assert exc_info.value.code == 2, (
+                f"Expected parse error for {argv!r}"
+            )
+            err = capsys.readouterr().err
+            first_line = err.splitlines()[0]
+            assert first_line.startswith("usage: "), (
+                f"Expected 'usage:' line for {argv!r}, got: {err!r}"
+            )
+            assert f" {suffix} [-h]" in first_line, (
+                f"Expected subcommand {suffix!r} in usage line "
+                f"for {argv!r}, got: {first_line!r}"
+            )
+            assert f" {suffix}: error: " in err, (
+                f"Expected {suffix!r} error line for {argv!r}, got: {err!r}"
+            )
+
+
 def run_tests(
     test_file: str,
     script_path: Path,
