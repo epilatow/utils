@@ -67,7 +67,7 @@ state via `crony status`. The default columns are:
   JOB       the full namespaced name `<bundle>.<short>`, indented
             two spaces per group-nesting level when the entry is in
             an active target's dispatch tree, in execution order
-  CONFIG    synced  | stale    | missing | orphan  | masked
+  CONFIG    synced  | stale    | missing | orphan  | masked | error
   SCHEDULE  the cron / interval / `grouped` value for the entry,
             or `disabled` when the unit is off at the scheduler
   LAST      ok      | fail     | timeout | gated   | running | never | unknown
@@ -76,7 +76,15 @@ state via `crony status`. The default columns are:
 `config=masked` only appears with `crony status -a/--all` (no
 remnants to clean up); a filter-excluded entry with leftover
 unit / hash / state-dir reports as `config=orphan` in the default
-view, with `masked-by` explaining the filter axis. Several
+view, with `masked-by` explaining the filter axis. `config=error`
+flags an entry whose bundle config was rejected (e.g. unknown key
+or invalid name); the entry's installed unit, if any, is left
+untouched. `crony apply <errored-name>` refuses with a clear
+"config error" message; `crony destroy <errored-name>` is
+accepted so a prior install can still be cleaned up; the
+remaining lifecycle commands (`enable`, `disable`, `trigger`)
+operate on the installed unit as usual since they need no
+parsed Config field. Several
 opt-in columns are available via `--cols`, including `unit`
 (scheduler-side state: enabled / disabled / grouped / none),
 `groups` (group memberships), `kind` (job vs group), `masked-by`
@@ -641,11 +649,23 @@ class NotificationResult:
 
 @dataclass
 class Config:
-    """Top-level parsed config (one bundle's content)."""
+    """Top-level parsed config (one bundle's content).
+
+    Per-entity ConfigErrors from `[job.*]` and `[job-group.*]`
+    sections are caught and recorded in `errored_jobs` /
+    `errored_job_groups` rather than aborting the whole bundle.
+    Each errored short-name maps to its error message. The
+    corresponding entries do NOT appear in `jobs` / `job_groups`
+    -- consumers that need to act on a parsed entity must check
+    the errored map first. Validation, status rendering, and
+    lifecycle commands treat errored names as defined-but-inert.
+    """
 
     defaults: Defaults = field(default_factory=Defaults)
     jobs: dict[str, Job] = field(default_factory=dict)
     job_groups: dict[str, JobGroup] = field(default_factory=dict)
+    errored_jobs: dict[str, str] = field(default_factory=dict)
+    errored_job_groups: dict[str, str] = field(default_factory=dict)
     platform_targets: dict[str, Target] = field(default_factory=dict)
     host_targets: dict[str, Target] = field(default_factory=dict)
 
@@ -692,12 +712,23 @@ class Bundles:
         return None
 
     def all_full_names(self) -> set[str]:
-        """Return every defined `<bundle>.<short>` (jobs + groups)."""
+        """Return every defined `<bundle>.<short>` (jobs + groups).
+
+        Errored entries count as defined for this view: even though
+        the parser rejected their config, the bundle still claims
+        the name. `crony destroy` uses this to allow cleanup of an
+        errored entry's previously-applied installation without
+        the user having to first fix the config.
+        """
         out: set[str] = set()
         for b in self.bundles:
             for short in b.config.jobs:
                 out.add(b.full_name(short))
             for short in b.config.job_groups:
+                out.add(b.full_name(short))
+            for short in b.config.errored_jobs:
+                out.add(b.full_name(short))
+            for short in b.config.errored_job_groups:
                 out.add(b.full_name(short))
         return out
 
@@ -1503,15 +1534,31 @@ def _collect_target_parents(
 
 
 def _validate_config(config: Config) -> None:
-    """Cross-cutting validation: name collisions, references, applicability."""
-    # Job/group name collision
-    overlap = set(config.jobs) & set(config.job_groups)
+    """Cross-cutting validation: name collisions, references, applicability.
+
+    Errored entries (names in `config.errored_jobs` /
+    `config.errored_job_groups`) participate in `all_names` so
+    references from groups / targets don't raise `undefined name`,
+    but they're skipped in checks that depend on per-entity fields
+    (chain-walk schedule discovery, notify_channels). Structural
+    checks that don't depend on fields (name collision, cycle
+    detection, single-parent count) still cover errored names so
+    the user sees those problems even when a sibling typo is
+    pending.
+    """
+    # Job/group name collision -- errored names participate so a
+    # typo'd `[job.x]` plus a valid `[job-group.x]` still surfaces
+    # the collision.
+    all_job_names = set(config.jobs) | set(config.errored_jobs)
+    all_group_names = set(config.job_groups) | set(config.errored_job_groups)
+    overlap = all_job_names & all_group_names
     if overlap:
         raise ConfigError(
             f"name collision: {sorted(overlap)} appear as both "
             f"[job.*] and [job-group.*]"
         )
-    all_names = set(config.jobs) | set(config.job_groups)
+    all_names = all_job_names | all_group_names
+    errored_names = set(config.errored_jobs) | set(config.errored_job_groups)
     # Group children must reference a defined job or group (nested
     # groups are supported; the chain validation below ensures every
     # path bottoms out in a schedule).
@@ -1568,6 +1615,13 @@ def _validate_config(config: Config) -> None:
             cycle = " -> ".join(path[path.index(ref) :] + (ref,))
             raise ConfigError(f"{target_label}: cycle in group chain: {cycle}")
         path = path + (ref,)
+        if ref in errored_names:
+            # Errored entry: stop walking. We can't inspect its
+            # schedule field, and the per-entity error is already
+            # attributed to this name -- piling on with a
+            # "would never fire" chain error would just hide the
+            # underlying problem behind a derived one.
+            return
         if ref in config.jobs:
             job = config.jobs[ref]
             scheduled = job.schedule is not None or job.interval is not None
@@ -1633,9 +1687,26 @@ def _validate_config(config: Config) -> None:
                 )
 
     _check("[defaults]", config.defaults.notify_channels)
+    # Per-job channel references are per-entity: a single job's
+    # bad notify_channels reference promotes that job into the
+    # errored map, leaving siblings parseable. Per-target and
+    # per-defaults references still raise (target/defaults
+    # tolerance is out of scope).
+    bad_job_channel: dict[str, str] = {}
     for jname, job in config.jobs.items():
-        if job.notify_channels is not None:
-            _check(f"[job.{jname}]", job.notify_channels)
+        if job.notify_channels is None:
+            continue
+        for ch in job.notify_channels:
+            if ch not in defined_channels:
+                bad_job_channel[jname] = (
+                    f"[job.{jname}]: notify_channels entry {ch!r} "
+                    f"is not defined; expected one of "
+                    f"{sorted(defined_channels) or '[]'}"
+                )
+                break
+    for jname, msg in bad_job_channel.items():
+        del config.jobs[jname]
+        config.errored_jobs[jname] = msg
     for tname, target in config.platform_targets.items():
         if target.notify_channels is not None:
             _check(f"[target.{tname}]", target.notify_channels)
@@ -1647,6 +1718,12 @@ def _validate_config(config: Config) -> None:
 def _load_one_bundle(name: str, path: Path) -> Bundle:
     """Parse a single bundle file and validate it. Raises ConfigError
     on parse / schema failure, naming the source path for context.
+
+    Per-entity ConfigErrors (a single bad job or group inside an
+    otherwise-valid bundle) do not raise: `parse_config` records
+    them on `Config.errored_jobs` / `errored_job_groups` and they
+    surface at status time with `config=error` plus a logged line
+    here so the user sees the problem regardless of subcommand.
     """
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -1656,6 +1733,14 @@ def _load_one_bundle(name: str, path: Path) -> Bundle:
         config = parse_config(raw)
     except ConfigError as e:
         raise ConfigError(f"{path}: {e}") from e
+    # Per-entity error messages from `_parse_job` /
+    # `_parse_job_group` are already prefixed with
+    # `[job.X]` / `[job-group.X]`; we only prepend the bundle
+    # path so the user sees which file produced each error.
+    for msg in sorted(config.errored_jobs.values()):
+        logger.error("%s: %s", path, msg)
+    for msg in sorted(config.errored_job_groups.values()):
+        logger.error("%s: %s", path, msg)
     return Bundle(name=name, source=path, config=config)
 
 
@@ -1750,17 +1835,27 @@ def parse_config(raw: dict[str, Any]) -> Config:
     if not isinstance(job_section, dict):
         raise ConfigError("[job] must be a table")
     for name, body in job_section.items():
-        if not isinstance(body, dict):
-            raise ConfigError(f"[job.{name}] must be a table")
-        config.jobs[name] = _parse_job(name, body)
+        # Per-entity ConfigError tolerance: a parse failure on
+        # one job records its error and continues so sibling jobs
+        # still parse. Catching ConfigError (not Exception) keeps
+        # genuine bugs surfacing as tracebacks.
+        try:
+            if not isinstance(body, dict):
+                raise ConfigError(f"[job.{name}] must be a table")
+            config.jobs[name] = _parse_job(name, body)
+        except ConfigError as exc:
+            config.errored_jobs[name] = str(exc)
 
     group_section = raw.get("job-group", {})
     if not isinstance(group_section, dict):
         raise ConfigError("[job-group] must be a table")
     for name, body in group_section.items():
-        if not isinstance(body, dict):
-            raise ConfigError(f"[job-group.{name}] must be a table")
-        config.job_groups[name] = _parse_job_group(name, body)
+        try:
+            if not isinstance(body, dict):
+                raise ConfigError(f"[job-group.{name}] must be a table")
+            config.job_groups[name] = _parse_job_group(name, body)
+        except ConfigError as exc:
+            config.errored_job_groups[name] = str(exc)
 
     target_section = raw.get("target", {})
     if not isinstance(target_section, dict):
@@ -4300,7 +4395,7 @@ def _config_state(
 def _config_state_for(
     config: Config, short: str, full_name: str, platform: str
 ) -> str:
-    """Return CONFIG axis value: synced / stale / missing / orphan.
+    """Return CONFIG axis value: synced / stale / missing / orphan / error.
 
     `short` is the bundle-local name (used to look up the entry in
     `config`); `full_name` is the namespaced name used for the
@@ -4313,7 +4408,15 @@ def _config_state_for(
     A "stamp" is the narrower hash-or-unit set -- the entry is
     actively installed and apply / enable / disable / trigger can
     operate on it.
+
+    `error` takes precedence over every other axis value: an
+    entry whose bundle config rejected it can't be compared
+    against the installed state (we don't have its fields), so
+    whatever's currently on disk is left alone and surfaced as
+    `error` so the user can fix the config.
     """
+    if short in config.errored_jobs or short in config.errored_job_groups:
+        return "error"
     in_config = short in config.jobs or short in config.job_groups
     hash_path = _hash_path_for(full_name)
     has_hash = hash_path.exists()
@@ -4610,6 +4713,28 @@ def do_init(force: bool, bundle: str | None) -> None:
     logger.info("wrote default config to %s", CONFIG_FILE)
 
 
+def _errored_full_names(
+    bundles: Bundles, bundle: str | None = None
+) -> set[str]:
+    """Full-namespaced names of entries whose bundle config rejected them.
+
+    Walks every bundle (or just `bundle` when scoped). Errored
+    entries are pulled from each bundle's `errored_jobs` and
+    `errored_job_groups` maps -- they were never selected by any
+    target, so the regular selection / mask walks don't surface
+    them.
+    """
+    out: set[str] = set()
+    for b in bundles.bundles:
+        if bundle is not None and b.name != bundle:
+            continue
+        for short in b.config.errored_jobs:
+            out.add(b.full_name(short))
+        for short in b.config.errored_job_groups:
+            out.add(b.full_name(short))
+    return out
+
+
 def _selected_full_names_per_bundle(
     bundles: Bundles,
 ) -> tuple[dict[str, tuple[Bundle, str]], set[str]]:
@@ -4667,11 +4792,20 @@ def _selected_and_masked_full_names_per_bundle(
             full = b.full_name(short)
             by_full[full] = (b, short)
             masked_by_full[full] = reason
-        defined = set(b.config.jobs) | set(b.config.job_groups)
+        defined = (
+            set(b.config.jobs)
+            | set(b.config.job_groups)
+            | set(b.config.errored_jobs)
+            | set(b.config.errored_job_groups)
+        )
         accounted = sel_jobs | sel_groups | set(masked.keys())
         for short in defined - accounted:
             full = b.full_name(short)
             by_full[full] = (b, short)
+            # Errored entries get the same `unused` label as
+            # genuinely-unused ones at this layer; `_resolve_state_axes`
+            # promotes them back to `error` so the user sees the
+            # actual problem instead of a generic mask.
             masked_by_full[full] = "unused"
     return by_full, selected, masked_by_full
 
@@ -4776,6 +4910,15 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 
     if jobs:
         normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
+        errored = _errored_full_names(bundles, bundle)
+        errored_in_args = sorted(n for n in normalized if n in errored)
+        if errored_in_args:
+            # An errored entry has no parsed Config fields, so we
+            # can't render its plist / unit. Bail before any
+            # partial apply happens.
+            raise UsageError(
+                f"config error -- fix and re-run apply: {errored_in_args}"
+            )
         unknown = [n for n in normalized if n not in by_full]
         if bundle is not None:
             # Under `-b`, a name that exists in `by_full` but is
@@ -5259,7 +5402,11 @@ _STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
 _STATUS_HELP_EPILOG_TEMPLATE: str = """\
 Columns
 -------
-  config            synced | stale | missing | orphan | masked.
+  config            synced | stale | missing | orphan | masked | error.
+                    `error` flags an entry whose bundle config was
+                    rejected (e.g. unknown key); the installed unit,
+                    if any, is left untouched and `crony apply`
+                    refuses the name until the config is fixed.
   groups            Comma-separated full names of groups containing this
                     entry. Same default-vs-pending rules as `schedule`:
                     starred when the applied membership differs from the
@@ -5415,7 +5562,11 @@ def _resolve_state_axes(
     otherwise. Both `do_status` and `do_audit` flow through this
     override so the two views converge: status surfaces the
     cleanup row in the default view, audit flags the orphan as
-    a CONFIG drift.
+    a CONFIG drift. `"error"` is exempt from the mask-reason
+    override: an entry whose bundle rejected its config is always
+    surfaced as `error` so the user can fix the config -- the
+    `"unused"` label assigned by the bundle walk is an artifact
+    of the entry not being parsed into the bundle's selection set.
     """
     bn, short = parse_full_name(full)
     bundle = bundles.by_name(bn)
@@ -5427,7 +5578,7 @@ def _resolve_state_axes(
         entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
             short
         )
-    if mask_reason:
+    if mask_reason and cfg_state != "error":
         cfg_state = "orphan" if full in remnants else "masked"
     if cfg_state == "missing":
         unit_state = "none"
@@ -5719,7 +5870,12 @@ def do_status(
     if jobs:
         full_names = [resolve_cli_name(n, bundle) for n in jobs]
     else:
-        active = selected | remnants
+        errored_full = _errored_full_names(bundles, bundle)
+        # Errored entries always surface in the default view --
+        # without this the user can fix a typo only by reading
+        # the warning line; they wouldn't see the entry in the
+        # table itself.
+        active = selected | remnants | errored_full
         if show_masked:
             active = active | set(masked_by_full)
         full_names = sorted(active)
@@ -6047,10 +6203,10 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     linger are skipped -- they're about the whole-host picture,
     not any one bundle.
 
-    Bad means CONFIG drift (stale/missing/orphan), the scheduler
-    being unable to fire (unknown, plus disabled by default), or
-    a recent failed/timeout run. Names in output are full
-    namespaced (`<bundle>.<short>`).
+    Bad means CONFIG drift (stale/missing/orphan/error), the
+    scheduler being unable to fire (unknown, plus disabled by
+    default), or a recent failed/timeout run. Names in output
+    are full namespaced (`<bundle>.<short>`).
     """
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
@@ -6059,13 +6215,16 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
         _selected_and_masked_full_names_per_bundle(bundles)
     )
     remnants = discovered_names()
+    errored_full = _errored_full_names(bundles, bundle)
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
-        candidates = sorted(selected | bundle_prefix_filter(remnants, bundle))
+        candidates = sorted(
+            selected | bundle_prefix_filter(remnants, bundle) | errored_full
+        )
     else:
-        candidates = sorted(selected | remnants)
+        candidates = sorted(selected | remnants | errored_full)
 
-    bad_config = {"stale", "missing", "orphan"}
+    bad_config = {"stale", "missing", "orphan", "error"}
     bad_unit_state = {"none"}
     if not exclude_disabled:
         bad_unit_state = bad_unit_state | {"disabled"}

@@ -117,6 +117,41 @@ def _job(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
+    """Assert parse_config records a per-entity error for job `short`.
+
+    Per-entity parse failures land in `Config.errored_jobs` instead
+    of raising, so tests of bad-shape inputs check the recorded
+    message rather than wrapping the call in `pytest.raises`.
+    """
+    cfg = crony.parse_config(raw)
+    assert short in cfg.errored_jobs, (
+        f"expected {short!r} in errored_jobs, got {list(cfg.errored_jobs)}"
+    )
+    assert re.search(match, cfg.errored_jobs[short]), (
+        f"errored_jobs[{short!r}]={cfg.errored_jobs[short]!r} "
+        f"did not match {match!r}"
+    )
+    assert short not in cfg.jobs
+
+
+def _assert_errored_job_group(
+    raw: dict[str, Any], short: str, match: str
+) -> None:
+    """As `_assert_errored_job` but for `[job-group.*]` entries."""
+    cfg = crony.parse_config(raw)
+    assert short in cfg.errored_job_groups, (
+        f"expected {short!r} in errored_job_groups, got "
+        f"{list(cfg.errored_job_groups)}"
+    )
+    assert re.search(match, cfg.errored_job_groups[short]), (
+        f"errored_job_groups[{short!r}]="
+        f"{cfg.errored_job_groups[short]!r} "
+        f"did not match {match!r}"
+    )
+    assert short not in cfg.job_groups
+
+
 # =============================================================================
 # Schedule format
 # =============================================================================
@@ -458,46 +493,52 @@ class TestParseJob:
         assert cfg.jobs["j"].args == ["--flag", "value"]
 
     def test_command_xor_script_both(self) -> None:
-        with pytest.raises(crony.ConfigError, match="exactly one of"):
-            crony.parse_config(
-                self._cfg(
-                    {
-                        "command": "x",
-                        "script": "y",
-                        "schedule": "daily",
-                    }
-                )
-            )
+        _assert_errored_job(
+            self._cfg(
+                {
+                    "command": "x",
+                    "script": "y",
+                    "schedule": "daily",
+                }
+            ),
+            "j",
+            "exactly one of",
+        )
 
     def test_command_xor_script_neither(self) -> None:
-        with pytest.raises(crony.ConfigError, match="exactly one of"):
-            crony.parse_config(self._cfg({"schedule": "daily"}))
+        _assert_errored_job(
+            self._cfg({"schedule": "daily"}), "j", "exactly one of"
+        )
 
     def test_args_with_command_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="only valid with"):
-            crony.parse_config(self._cfg(_job(args=["a"])))
+        _assert_errored_job(self._cfg(_job(args=["a"])), "j", "only valid with")
 
     def test_gate_xor_gate_script(self) -> None:
-        with pytest.raises(crony.ConfigError, match="mutually exclusive"):
-            crony.parse_config(self._cfg(_job(gate="x", gate_script="y.sh")))
+        _assert_errored_job(
+            self._cfg(_job(gate="x", gate_script="y.sh")),
+            "j",
+            "mutually exclusive",
+        )
 
     def test_gate_args_without_gate_script(self) -> None:
-        with pytest.raises(
-            crony.ConfigError, match="only valid with 'gate_script'"
-        ):
-            crony.parse_config(self._cfg(_job(gate="x", gate_args=["a"])))
+        _assert_errored_job(
+            self._cfg(_job(gate="x", gate_args=["a"])),
+            "j",
+            "only valid with 'gate_script'",
+        )
 
     def test_schedule_xor_interval(self) -> None:
-        with pytest.raises(crony.ConfigError, match="mutually exclusive"):
-            crony.parse_config(
-                self._cfg(
-                    {
-                        "command": "x",
-                        "schedule": "daily",
-                        "interval": "30min",
-                    }
-                )
-            )
+        _assert_errored_job(
+            self._cfg(
+                {
+                    "command": "x",
+                    "schedule": "daily",
+                    "interval": "30min",
+                }
+            ),
+            "j",
+            "mutually exclusive",
+        )
 
     def test_interval_form(self) -> None:
         cfg = crony.parse_config(
@@ -507,30 +548,37 @@ class TestParseJob:
         assert cfg.jobs["j"].schedule is None
 
     def test_invalid_platforms_value(self) -> None:
-        with pytest.raises(crony.ConfigError, match="not in"):
-            crony.parse_config(self._cfg(_job(platforms=["windows"])))
+        _assert_errored_job(
+            self._cfg(_job(platforms=["windows"])), "j", "not in"
+        )
 
     def test_invalid_notify_channel(self) -> None:
-        with pytest.raises(crony.ConfigError, match="notify_channels"):
-            crony.parse_config(
-                self._cfg(_job(notify_channels=["carrier-pigeon"]))
-            )
+        # notify_channels validation runs in _validate_config, but
+        # per-job references promote the job into errored_jobs
+        # (same tolerance shape as parse-time per-entity errors).
+        _assert_errored_job(
+            self._cfg(_job(notify_channels=["carrier-pigeon"])),
+            "j",
+            "notify_channels",
+        )
 
     def test_negative_timeout(self) -> None:
-        with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config(self._cfg(_job(job_timeout_sec=-1)))
+        _assert_errored_job(
+            self._cfg(_job(job_timeout_sec=-1)), "j", "positive"
+        )
 
     def test_zero_timeout(self) -> None:
-        with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config(self._cfg(_job(job_timeout_sec=0)))
+        _assert_errored_job(self._cfg(_job(job_timeout_sec=0)), "j", "positive")
 
     def test_env_must_be_string_dict(self) -> None:
-        with pytest.raises(crony.ConfigError, match="string -> string"):
-            crony.parse_config(self._cfg(_job(env={"FOO": 42})))
+        _assert_errored_job(
+            self._cfg(_job(env={"FOO": 42})), "j", "string -> string"
+        )
 
     def test_unknown_job_key(self) -> None:
-        with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config(self._cfg(_job(surprise="boom")))
+        _assert_errored_job(
+            self._cfg(_job(surprise="boom")), "j", "unknown key"
+        )
 
     def test_group_only_job_no_schedule(self) -> None:
         # Valid only when referenced by a group.
@@ -556,10 +604,11 @@ class TestParseJobGroup:
         assert cfg.job_groups["g"].schedule == "*-*-* 03:00"
 
     def test_empty_jobs_list(self) -> None:
-        with pytest.raises(crony.ConfigError, match="non-empty list"):
-            crony.parse_config(
-                {"job-group": {"g": {"jobs": [], "schedule": "daily"}}}
-            )
+        _assert_errored_job_group(
+            {"job-group": {"g": {"jobs": [], "schedule": "daily"}}},
+            "g",
+            "non-empty list",
+        )
 
     def test_schedule_optional(self) -> None:
         # A group with no schedule / no interval is a transit group:
@@ -576,51 +625,54 @@ class TestParseJobGroup:
         assert cfg.job_groups["g"].interval is None
 
     def test_both_schedule_and_interval(self) -> None:
-        with pytest.raises(crony.ConfigError, match="mutually exclusive"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "g": {
-                            "jobs": ["a"],
-                            "schedule": "daily",
-                            "interval": "1h",
-                        }
-                    },
-                }
-            )
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "interval": "1h",
+                    }
+                },
+            },
+            "g",
+            "mutually exclusive",
+        )
 
     def test_unknown_group_key(self) -> None:
-        with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "g": {
-                            "jobs": ["a"],
-                            "schedule": "daily",
-                            "surprise": True,
-                        }
-                    },
-                }
-            )
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "surprise": True,
+                    }
+                },
+            },
+            "g",
+            "unknown key",
+        )
 
     def test_group_rejects_notify_channels(self) -> None:
         # Groups don't carry notify settings: per-child cascade
         # resolves notify via job/target/defaults instead.
-        with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "g": {
-                            "jobs": ["a"],
-                            "schedule": "daily",
-                            "notify_channels": ["ntfy"],
-                        }
-                    },
-                }
-            )
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "notify_channels": ["ntfy"],
+                    }
+                },
+            },
+            "g",
+            "unknown key",
+        )
 
 
 class TestParseTarget:
@@ -3953,8 +4005,7 @@ class TestNameShape:
         ["", ".", "..", ".hidden", "a/b", "has space", "-leading"],
     )
     def test_invalid_job_name(self, bad_name: str) -> None:
-        with pytest.raises(crony.ConfigError, match="must match"):
-            crony.parse_config({"job": {bad_name: _job()}})
+        _assert_errored_job({"job": {bad_name: _job()}}, bad_name, "must match")
 
     @pytest.mark.parametrize(
         "good_name",
@@ -3965,18 +4016,19 @@ class TestNameShape:
         assert good_name in cfg.jobs
 
     def test_invalid_group_name(self) -> None:
-        with pytest.raises(crony.ConfigError, match="must match"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "bad/name": {
-                            "jobs": ["a"],
-                            "schedule": "daily",
-                        }
-                    },
-                }
-            )
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "bad/name": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                    }
+                },
+            },
+            "bad/name",
+            "must match",
+        )
 
     def test_invalid_host_name(self) -> None:
         with pytest.raises(crony.ConfigError, match="must match"):
@@ -6376,6 +6428,301 @@ class TestResolveStateAxes:
         )
         assert cfg_state == "synced"
         assert sched == "disabled"
+
+
+class TestPerEntityConfigErrors:
+    """A parse-time ConfigError on one entity records itself on the
+    Config's errored_* maps instead of aborting the whole bundle.
+    Siblings still parse, status renders the errored entity with
+    `config=error`, and lifecycle commands leave its installed unit
+    alone.
+    """
+
+    def test_sibling_jobs_survive_bad_job(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "good": _job(),
+                    "bad": _job(surprise="boom"),
+                },
+            }
+        )
+        assert "good" in cfg.jobs
+        assert "bad" not in cfg.jobs
+        assert "bad" in cfg.errored_jobs
+        assert "unknown key" in cfg.errored_jobs["bad"]
+
+    def test_sibling_groups_survive_bad_group(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {"a": _job(), "b": _job()},
+                "job-group": {
+                    "ok": {"jobs": ["a"], "schedule": "daily"},
+                    "bad": {
+                        "jobs": ["b"],
+                        "schedule": "daily",
+                        "surprise": True,
+                    },
+                },
+            }
+        )
+        assert "ok" in cfg.job_groups
+        assert "bad" not in cfg.job_groups
+        assert "bad" in cfg.errored_job_groups
+
+    def test_group_references_errored_leaf_does_not_raise(self) -> None:
+        # The group is well-formed; only its referenced leaf has a
+        # parse error. The parent group is treated as valid; chain
+        # validation stops at the errored leaf without raising
+        # "would never fire", since the errored leaf might have had
+        # a schedule if it had parsed.
+        cfg = crony.parse_config(
+            {
+                "job": {"bad": _job(surprise="boom")},
+                "job-group": {
+                    "g": {"jobs": ["bad"], "schedule": "daily"},
+                },
+                "target": {"darwin": {"jobs": ["g"]}},
+            }
+        )
+        assert "g" in cfg.job_groups
+        assert "bad" in cfg.errored_jobs
+
+    def test_target_references_errored_root_does_not_raise(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {"bad": _job(surprise="boom")},
+                "target": {"darwin": {"jobs": ["bad"]}},
+            }
+        )
+        assert "bad" in cfg.errored_jobs
+        assert "darwin" in cfg.platform_targets
+
+    def test_collision_with_errored_still_raises(self) -> None:
+        # Errored entries participate in the collision check so a
+        # typo'd `[job.x]` plus a valid `[job-group.x]` still
+        # surfaces the structural problem.
+        with pytest.raises(crony.ConfigError, match="name collision"):
+            crony.parse_config(
+                {
+                    "job": {"x": _job(surprise="boom")},
+                    "job-group": {"x": {"jobs": ["x"], "schedule": "daily"}},
+                }
+            )
+
+    def test_notify_channels_promotes_job_to_errored(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "ok": _job(),
+                    "bad": _job(notify_channels=["nope"]),
+                },
+            }
+        )
+        assert "ok" in cfg.jobs
+        assert "bad" not in cfg.jobs
+        assert "bad" in cfg.errored_jobs
+        assert "notify_channels" in cfg.errored_jobs["bad"]
+
+    def test_load_one_bundle_logs_per_entity_errors(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "good": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=["good"],
+        )
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+            bundles = crony.load_all_bundles()
+        # `path: [job.bad]: unknown key(s) ['surprise']`
+        assert any(
+            "[job.bad]" in r.message and "unknown key" in r.message
+            for r in caplog.records
+        )
+        # The good sibling parsed successfully.
+        bundle = bundles.by_name("default")
+        assert bundle is not None
+        assert "good" in bundle.config.jobs
+        assert "bad" in bundle.config.errored_jobs
+
+    def test_status_renders_error_for_errored_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "good": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=["good"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        # Both names appear; bad gets "error", good gets a normal
+        # status word (missing here -- never applied).
+        assert h.full("good") in out
+        assert h.full("bad") in out
+        # The full("bad") row carries "error" somewhere on it.
+        bad_row = next(
+            line for line in out.splitlines() if h.full("bad") in line
+        )
+        assert "error" in bad_row
+
+    def test_apply_explicit_errored_name_raises_config_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=[],
+        )
+        with pytest.raises(crony.UsageError, match="config error"):
+            crony.do_apply(jobs=[h.full("bad")], verbose=False, bundle=None)
+
+    def test_apply_no_args_skips_errored_silently(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # With siblings: the good job applies, the errored sibling
+        # is never selected (no parsed Job to install).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "good": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=["good"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        # The good plist landed; the bad one didn't.
+        assert (h.agents / f"org.crony.{h.full('good')}.plist").exists()
+        assert not (h.agents / f"org.crony.{h.full('bad')}.plist").exists()
+
+    def test_destroy_accepts_errored_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The user previously applied an entry, then later edited
+        # the config and introduced a typo. The errored state
+        # shouldn't block them from cleaning up the prior install.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+        # Now break the config -- same name, bad body.
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_destroy(
+            jobs=[h.full("j")],
+            preserve_runtime=False,
+            bundle=None,
+            orphans=False,
+        )
+        assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+
+    def test_audit_flags_errored_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=[],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        with pytest.raises(crony.AuditFailedError):
+            crony.do_audit(exclude_disabled=False, bundle=None)
+        out = capsys.readouterr().out
+        assert h.full("bad") in out
+        assert "error" in out
+
+    def test_resolve_state_axes_returns_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "bad": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "surprise": True,
+                    },
+                },
+            },
+            default_target_jobs=[],
+        )
+        bundles = crony.load_all_bundles()
+        cfg_state, _unit_state, _last_state = crony._resolve_state_axes(
+            bundles, h.full("bad"), "darwin", crony.stamped_names()
+        )
+        assert cfg_state == "error"
 
 
 class TestAudit:
