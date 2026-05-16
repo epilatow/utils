@@ -6322,6 +6322,56 @@ class TestLogs:
         assert "line 15" in out
         assert "line 14" not in out
 
+    def test_default_n_non_tail_is_200(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `n=None` -> 200 for one-shot reads: the wider window keeps
+        # parity with `tail -n 200` and the historical default.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        log = h.state / h.full("j") / "run.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            "\n".join(f"line {i}" for i in range(300)) + "\n",
+            encoding="utf-8",
+        )
+        crony.do_logs(
+            name="j",
+            n=None,
+            since=None,
+            tail=False,
+            path=False,
+            latest=False,
+        )
+        out = capsys.readouterr().out
+        assert "line 299" in out
+        assert "line 100" in out
+        assert "line 99" not in out
+
+    def test_default_n_tail_is_10(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `crony logs -t` with no `-n` prints only the last 10 history
+        # lines before entering the follow loop, so the interactive
+        # tail doesn't dump the full retained log first.
+        log = tmp_path / "run.log"
+        lines = [f"line-{i}\n" for i in range(50)]
+        log.write_text("".join(lines))
+
+        def _interrupt(*args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(crony.time, "sleep", _interrupt)
+        # Mirrors the resolution `do_logs` performs when `n is None`
+        # and `tail` is True.
+        crony._follow_log(log, n=10)
+        out = capsys.readouterr().out
+        printed = out.splitlines()
+        assert printed == [f"line-{i}" for i in range(40, 50)]
+
     def test_missing_log_raises(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])

@@ -5708,7 +5708,7 @@ def do_status(
 
 def do_logs(
     name: str,
-    n: int,
+    n: int | None,
     since: str | None,
     tail: bool,
     path: bool,
@@ -5727,15 +5727,15 @@ def do_logs(
     -l/--latest print only the most recent run's entry (from the
                 last `=== ... ===` header to EOF). Overrides -n /
                 --since; mutually exclusive with --tail.
-    -n N        print the last N lines (default 200). With
-                `--tail`, also controls how many lines of history
-                are shown before live-tailing begins; `-n 0`
-                skips the history.
+    -n N        print the last N lines (default 200, or 10 with
+                `--tail`). With `--tail`, controls how many lines
+                of history are shown before live-tailing begins;
+                `-n 0` skips the history.
     -s/--since X
                 parse X as a duration ('1h', '2d') or ISO timestamp
                 and skip log content older than that. Run-header
                 timestamps anchor the cut.
-    -t/--tail   show the last `-n` lines (default 200) and then
+    -t/--tail   show the last `-n` lines (default 10) and then
                 follow appended output (-f semantics) until
                 interrupted.
     """
@@ -5748,6 +5748,8 @@ def do_logs(
         raise UsageError(f"no log for {full!r} (state dir: {STATE_DIR / full})")
     if tail and latest:
         raise UsageError("--tail and --latest are mutually exclusive")
+    if n is None:
+        n = 10 if tail else 200
     if tail:
         _follow_log(log_path, n=n)
         return
@@ -6566,8 +6568,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.add_argument(
         "-n",
         type=int,
-        default=200,
-        help="Print the last N lines (default 200)",
+        default=None,
+        help="Print the last N lines (default: 200, or 10 with --tail)",
     )
     p_logs.add_argument(
         "-s",
