@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["tomlkit"]
 # ///
 # This is AI generated code
 #
@@ -30,7 +31,8 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
+import tomlkit
+import tomlkit.exceptions
 import traceback
 import urllib.error
 import urllib.request
@@ -1925,8 +1927,8 @@ def _load_one_bundle(name: str, path: Path) -> Bundle:
     problem regardless of subcommand.
     """
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as e:
+        raw = tomlkit.loads(path.read_text(encoding="utf-8"))
+    except tomlkit.exceptions.ParseError as e:
         raise ConfigError(f"TOML parse error in {path}: {e}") from e
     try:
         config = parse_config(raw)
@@ -2017,8 +2019,8 @@ def load_config(path: Path | None = None) -> Config:
     if not path.exists():
         raise ConfigError(f"config not found: {path}")
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as e:
+        raw = tomlkit.loads(path.read_text(encoding="utf-8"))
+    except tomlkit.exceptions.ParseError as e:
         raise ConfigError(f"TOML parse error in {path}: {e}") from e
     return parse_config(raw)
 

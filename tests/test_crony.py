@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit"]
 # ///
 # This is AI generated code
 
@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
+import tomlkit
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
@@ -1786,7 +1786,7 @@ class TestInit:
             if section_re.match(line) or kv_re.match(line):
                 extracted.append(line[2:])
         text = "\n".join(extracted)
-        crony.parse_config(tomllib.loads(text))
+        crony.parse_config(tomlkit.loads(text))
 
 
 # =============================================================================
@@ -1871,45 +1871,8 @@ class _RunnerHarness:
             target_section.setdefault("darwin", {})
             assert isinstance(target_section["darwin"], dict)
             target_section["darwin"].setdefault("jobs", default_target_jobs)
-        self.cfg_file.write_text(_toml_dump(full), encoding="utf-8")
+        self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
         return crony.parse_config(full)
-
-
-def _toml_dump(data: dict[str, Any]) -> str:
-    """Minimal TOML emitter for the test harness's small configs.
-
-    Python's stdlib has tomllib for reading but no writer; rather
-    than pull in a third-party dep just for tests, this emits the
-    subset of TOML the harness actually produces.
-    """
-    out: list[str] = []
-
-    def _val(v: Any) -> str:
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, (int, float)):
-            return str(v)
-        if isinstance(v, str):
-            return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
-        if isinstance(v, list):
-            return "[" + ", ".join(_val(x) for x in v) + "]"
-        raise TypeError(f"unsupported value type: {type(v).__name__}")
-
-    def _emit(prefix: list[str], body: dict[str, Any]) -> None:
-        scalars = [(k, v) for k, v in body.items() if not isinstance(v, dict)]
-        tables = [(k, v) for k, v in body.items() if isinstance(v, dict)]
-        if prefix:
-            out.append(f"[{'.'.join(prefix)}]")
-        for k, v in scalars:
-            out.append(f"{k} = {_val(v)}")
-        if scalars and tables:
-            out.append("")
-        for k, v in tables:
-            _emit(prefix + [k], v)
-            out.append("")
-
-    _emit([], data)
-    return "\n".join(out) + "\n"
 
 
 def _last_run(state: Path, name: str) -> dict[str, Any]:
