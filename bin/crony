@@ -315,6 +315,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # command   = "brew update && brew upgrade && brew cleanup"
 # platforms = ["darwin"]               # filter: skip on non-darwin hosts
 # # hosts   = ["mymac"]                # filter: only on listed hostnames
+# # hosts   = ["!noisyhost"]           # or: every host except listed
+# #                                    #   (all entries must use `!`, or none)
 # schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
@@ -350,6 +352,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # jobs      = ["brew-update", "uv-update", "git-pull-utils"]
 # # platforms = ["darwin"]             # filter: as on jobs
 # # hosts     = ["mymac"]              # filter: as on jobs
+# # hosts     = ["!noisyhost"]         # `!` negation also supported here
 
 # Nested group: this one has no schedule of its own; it fires only
 # when the daily-updates group above (or some other scheduled
@@ -566,6 +569,22 @@ class Defaults:
 
 
 @dataclass
+class HostList:
+    """A `hosts = [...]` filter.
+
+    Empty `names` = applies everywhere (the common case). Non-empty
+    with `negated=False` is an allowlist (apply only on listed
+    hosts). Non-empty with `negated=True` is a denylist (apply on
+    every host except listed). The parser enforces that entries
+    are all-positive or all-negated (`!host`) within a single
+    list -- mixing is rejected.
+    """
+
+    names: list[str] = field(default_factory=list)
+    negated: bool = False
+
+
+@dataclass
 class Job:
     """A single schedulable unit of work."""
 
@@ -578,13 +597,12 @@ class Job:
     gate_args: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
-    # Empty list = applies to every platform / host. Non-empty
-    # list = applies only on listed platforms / hosts; otherwise
-    # the entry is silently skipped at selection time (so a
-    # bundle can describe both darwin and linux jobs and have
-    # each host pick up only its applicable subset).
+    # `platforms`: empty list = applies to every platform. Non-empty
+    # = applies only on listed platforms; otherwise the entry is
+    # silently skipped at selection time. `hosts` works the same
+    # way but additionally supports negation -- see HostList.
     platforms: list[str] = field(default_factory=list)
-    hosts: list[str] = field(default_factory=list)
+    hosts: HostList = field(default_factory=HostList)
     job_timeout_sec: int | None = None
     # None = inherit from target/defaults; [] = explicit empty (this
     # job sends no external notifications even if defaults / target
@@ -613,6 +631,7 @@ class JobGroup:
 
     `platforms` / `hosts` work the same way as on Job: empty
     means "applies everywhere", non-empty restricts selection.
+    `hosts` supports negation via `!host` entries -- see HostList.
     A group filtered out doesn't recurse into its children; a
     child filtered out is skipped while siblings continue.
     """
@@ -622,7 +641,7 @@ class JobGroup:
     schedule: str | None = None
     interval: str | None = None
     platforms: list[str] = field(default_factory=list)
-    hosts: list[str] = field(default_factory=list)
+    hosts: HostList = field(default_factory=HostList)
 
 
 @dataclass
@@ -1186,6 +1205,37 @@ def _parse_platforms_field(raw: dict[str, Any], where: str) -> list[str]:
     return platforms
 
 
+def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
+    """Parse a `hosts = [...]` field with optional `!` negation.
+
+    Entries prefixed with `!` make the whole list a denylist
+    (apply on every host except listed); unprefixed entries make
+    it an allowlist. Mixing the two forms within one list is
+    rejected -- the intent is ambiguous (does `!b` subtract from
+    the allowlist, or deny `b` while allowing everything else?).
+    An entry that is just `!` is rejected as empty.
+    """
+    entries = _string_list(raw, "hosts", where)
+    if not entries:
+        return HostList()
+    negated = [e.startswith("!") for e in entries]
+    if any(negated) and not all(negated):
+        raise ConfigError(
+            f"{where}: 'hosts' entries must all be negated ('!host') or none"
+        )
+    if not any(negated):
+        return HostList(names=entries, negated=False)
+    stripped: list[str] = []
+    for e in entries:
+        name = e[1:]
+        if not name:
+            raise ConfigError(
+                f"{where}: 'hosts' entry '!' is empty after the negation prefix"
+            )
+        stripped.append(name)
+    return HostList(names=stripped, negated=True)
+
+
 def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
     """Extract a dict-of-string-to-string field, defaulting to {}."""
     val = raw.get(key)
@@ -1424,7 +1474,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
     if interval is not None:
         parse_interval_seconds(interval)
     platforms = _parse_platforms_field(raw, where)
-    hosts = _string_list(raw, "hosts", where)
+    hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec <= 0:
@@ -1472,7 +1522,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
     if interval is not None:
         parse_interval_seconds(interval)
     platforms = _parse_platforms_field(raw, where)
-    hosts = _string_list(raw, "hosts", where)
+    hosts = _parse_hosts_field(raw, where)
     return JobGroup(
         name=name,
         jobs=jobs,
@@ -1914,23 +1964,28 @@ def resolve_target(config: Config, host: str, platform: str) -> Target | None:
 
 def _mask_reason(
     platforms: list[str],
-    hosts: list[str],
+    hosts: HostList,
     *,
     host: str,
     platform: str,
 ) -> str | None:
     """Return the axis (or axes) that mask this entry, or None.
 
-    Empty list = "applies everywhere" (the common case). A
-    non-empty list with no match on its axis contributes that
-    axis name to the reason. Both axes can mask simultaneously
-    (`"host,platform"`); a single-axis mask returns
-    `"platform"` or `"host"`. None means the entry applies on
-    this (host, platform).
+    Empty `platforms` / empty `hosts.names` = "applies everywhere"
+    (the common case). A non-empty `platforms` with no match
+    contributes "platform" to the reason. A non-empty `hosts`
+    contributes "host" when the membership check fails -- the
+    sense flips with `hosts.negated` (allowlist vs denylist).
+    Both axes can mask simultaneously (`"host,platform"`); a
+    single-axis mask returns `"platform"` or `"host"`. None means
+    the entry applies on this (host, platform).
     """
     parts: list[str] = []
-    if hosts and host not in hosts:
-        parts.append("host")
+    if hosts.names:
+        listed = host in hosts.names
+        masked = listed if hosts.negated else not listed
+        if masked:
+            parts.append("host")
     if platforms and platform not in platforms:
         parts.append("platform")
     if not parts:
@@ -1940,7 +1995,7 @@ def _mask_reason(
 
 def _entry_applies_here(
     platforms: list[str],
-    hosts: list[str],
+    hosts: HostList,
     *,
     host: str,
     platform: str,

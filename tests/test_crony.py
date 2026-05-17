@@ -564,6 +564,20 @@ class TestParseJob:
             self._cfg(_job(platforms=["windows"])), "j", "not in"
         )
 
+    def test_hosts_mixed_negation_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(hosts=["alpha", "!beta"])),
+            "j",
+            "must all be negated",
+        )
+
+    def test_hosts_empty_negation_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(hosts=["!"])),
+            "j",
+            "empty after the negation prefix",
+        )
+
     def test_invalid_notify_channel(self) -> None:
         # notify_channels validation runs in _validate_config, but
         # per-job references promote the job into errored_jobs
@@ -666,6 +680,38 @@ class TestParseJobGroup:
             },
             "g",
             "unknown key",
+        )
+
+    def test_group_hosts_mixed_negation_rejected(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "hosts": ["alpha", "!beta"],
+                    }
+                },
+            },
+            "g",
+            "must all be negated",
+        )
+
+    def test_group_hosts_empty_negation_rejected(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "hosts": ["!"],
+                    }
+                },
+            },
+            "g",
+            "empty after the negation prefix",
         )
 
     def test_group_rejects_notify_channels(self) -> None:
@@ -1296,6 +1342,55 @@ class TestSelectionFilters:
         # On a different host: group filtered, child not reached.
         monkeypatch.setattr(crony, "current_host", lambda: "beta")
         target = crony.resolve_target(cfg, "beta", "darwin")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g" not in sel_groups
+        assert "a" not in sel_jobs
+
+    def test_job_hosts_filter_negated(self, monkeypatch: Any) -> None:
+        # A `hosts = ["!squee"]` filter is a denylist: the job
+        # applies on every host except the listed ones.
+        cfg = self._cfg(
+            {
+                "job": {"a": _job(hosts=["!squee"])},
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        # On a non-listed host: selected.
+        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        target = crony.resolve_target(cfg, "alpha", "darwin")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" in sel_jobs
+        # On the listed (denied) host: filtered out.
+        monkeypatch.setattr(crony, "current_host", lambda: "squee")
+        target = crony.resolve_target(cfg, "squee", "darwin")
+        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        assert "a" not in sel_jobs
+
+    def test_group_hosts_filter_negated(self, monkeypatch: Any) -> None:
+        cfg = self._cfg(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "hosts": ["!squee"],
+                    },
+                },
+                "target": {"darwin": {"jobs": ["g"]}},
+            }
+        )
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        # On a non-denied host: group + child selected.
+        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        target = crony.resolve_target(cfg, "alpha", "darwin")
+        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        assert "g" in sel_groups
+        assert "a" in sel_jobs
+        # On the denied host: group filtered, child not reached.
+        monkeypatch.setattr(crony, "current_host", lambda: "squee")
+        target = crony.resolve_target(cfg, "squee", "darwin")
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
