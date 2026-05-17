@@ -679,14 +679,28 @@ class NotificationResult:
 class Config:
     """Top-level parsed config (one bundle's content).
 
-    Per-entity ConfigErrors from `[job.*]` and `[job-group.*]`
-    sections are caught and recorded in `errored_jobs` /
-    `errored_job_groups` rather than aborting the whole bundle.
-    Each errored short-name maps to its error message. The
-    corresponding entries do NOT appear in `jobs` / `job_groups`
-    -- consumers that need to act on a parsed entity must check
-    the errored map first. Validation, status rendering, and
-    lifecycle commands treat errored names as defined-but-inert.
+    Per-entity ConfigErrors from `[job.*]`, `[job-group.*]`, and
+    `[target.*]` sections are caught and recorded in
+    `errored_jobs` / `errored_job_groups` /
+    `errored_platform_targets` / `errored_host_targets` rather
+    than aborting the whole bundle. Each errored short-name maps
+    to its error message. The corresponding entries do NOT appear
+    in the live `jobs` / `job_groups` / `platform_targets` /
+    `host_targets` maps -- consumers that need to act on a parsed
+    entity must check the errored map first.
+
+    Surface points for errored entries:
+      - Always: logged at ERROR by `_load_one_bundle`, and
+        included as warnings by `crony validate` (which then
+        exits non-zero).
+      - Jobs and groups also: shown as a `config=error` row in
+        `crony status` (the row namespace is keyed by
+        `<bundle>.<short>`, which targets don't inhabit -- they're
+        keyed by platform / hostname instead).
+      - Lifecycle commands treat errored jobs / groups as
+        defined-but-inert; an errored target is simply absent from
+        target resolution (matching the existing "no target for
+        this host" semantics).
     """
 
     defaults: Defaults = field(default_factory=Defaults)
@@ -696,6 +710,8 @@ class Config:
     errored_job_groups: dict[str, str] = field(default_factory=dict)
     platform_targets: dict[str, Target] = field(default_factory=dict)
     host_targets: dict[str, Target] = field(default_factory=dict)
+    errored_platform_targets: dict[str, str] = field(default_factory=dict)
+    errored_host_targets: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1595,19 +1611,24 @@ def _collect_target_parents(
 def _validate_config(config: Config) -> None:
     """Cross-cutting validation: name collisions, references, applicability.
 
-    Errored entries (names in `config.errored_jobs` /
-    `config.errored_job_groups`) participate in `all_names` so
-    references from groups / targets don't raise `undefined name`,
-    but they're skipped in checks that depend on per-entity fields
-    (chain-walk schedule discovery, notify_channels). Structural
-    checks that don't depend on fields (name collision, cycle
-    detection, single-parent count) still cover errored names so
-    the user sees those problems even when a sibling typo is
-    pending.
+    Per-entity validation failures (a single group with an
+    undefined-name reference, a single target with a bad chain or
+    bad notify_channels) demote the offending entity into the
+    matching errored_* map and remove it from the live map, so
+    sibling entries remain loadable and the bundle as a whole keeps
+    resolving. Only bundle-level structural failures (name
+    collision across `[job.*]` / `[job-group.*]`, `[defaults]`
+    notify_channels references) raise and abort the bundle.
+
+    Errored entries participate in name-resolution so other groups
+    / targets that reference them don't ALSO fail with
+    `undefined name`, but they're skipped in checks that depend on
+    per-entity fields (chain-walk schedule discovery,
+    notify_channels lookups).
     """
     # Job/group name collision -- errored names participate so a
     # typo'd `[job.x]` plus a valid `[job-group.x]` still surfaces
-    # the collision.
+    # the collision. Structural / unattributable -> raise.
     all_job_names = set(config.jobs) | set(config.errored_jobs)
     all_group_names = set(config.job_groups) | set(config.errored_job_groups)
     overlap = all_job_names & all_group_names
@@ -1616,141 +1637,39 @@ def _validate_config(config: Config) -> None:
             f"name collision: {sorted(overlap)} appear as both "
             f"[job.*] and [job-group.*]"
         )
+
+    # Group children must reference a defined job or group. A bad
+    # reference demotes just the offending group; siblings remain
+    # loadable. Nested groups are supported -- the per-target chain
+    # validation below ensures every reachable path bottoms out in
+    # a schedule.
     all_names = all_job_names | all_group_names
-    errored_names = set(config.errored_jobs) | set(config.errored_job_groups)
-    # Group children must reference a defined job or group (nested
-    # groups are supported; the chain validation below ensures every
-    # path bottoms out in a schedule).
+    bad_group: dict[str, str] = {}
     for gname, group in config.job_groups.items():
         for child in group.jobs:
             if child not in all_names:
-                raise ConfigError(
+                bad_group[gname] = (
                     f"[job-group.{gname}]: 'jobs' references "
                     f"undefined name {child!r}"
                 )
-    # Targets reference defined jobs or groups
-    for tname, target in config.platform_targets.items():
-        for ref in target.jobs:
-            if ref not in all_names:
-                raise ConfigError(
-                    f"[target.{tname}]: 'jobs' references "
-                    f"undefined name {ref!r}"
-                )
-        if tname not in _VALID_PLATFORMS:
-            raise ConfigError(
-                f"[target.{tname}]: platform must be one of "
-                f"{sorted(_VALID_PLATFORMS)}"
-            )
-    for hname, target in config.host_targets.items():
-        for ref in target.jobs:
-            if ref not in all_names:
-                raise ConfigError(
-                    f"[target.host.{hname}]: 'jobs' references "
-                    f"undefined name {ref!r}"
-                )
-    # `platforms` / `hosts` filter at selection time, not at
-    # validate time: a single bundle is allowed to describe both
-    # darwin and linux entries (or per-host overrides) and have
-    # each host pick up only its applicable subset. A
-    # configuration that's contradictory on a given host (e.g. a
-    # target.linux that references a darwin-only entry) just
-    # produces an empty selection on that host -- exactly the
-    # filter-and-skip semantics the cross-platform bundle pattern
-    # needs.
+                break
+    for gname, msg in bad_group.items():
+        del config.job_groups[gname]
+        config.errored_job_groups[gname] = msg
 
-    # Per-target chain validation: every path from a target reference
-    # down through groups to a leaf job must contain a schedule/interval
-    # somewhere. This catches both schedule-less jobs that nothing
-    # would dispatch and broken chains where the user added a layer
-    # of grouping but forgot to schedule any of it. Cycle detection
-    # piggy-backs on the same walk.
-    def _walk_chain(
-        ref: str,
-        target_label: str,
-        path: tuple[str, ...],
-        seen_schedule: bool,
-    ) -> None:
-        if ref in path:
-            cycle = " -> ".join(path[path.index(ref) :] + (ref,))
-            raise ConfigError(f"{target_label}: cycle in group chain: {cycle}")
-        path = path + (ref,)
-        if ref in errored_names:
-            # Errored entry: stop walking. We can't inspect its
-            # schedule field, and the per-entity error is already
-            # attributed to this name -- piling on with a
-            # "would never fire" chain error would just hide the
-            # underlying problem behind a derived one.
-            return
-        if ref in config.jobs:
-            job = config.jobs[ref]
-            scheduled = job.schedule is not None or job.interval is not None
-            if not seen_schedule and not scheduled:
-                raise ConfigError(
-                    f"{target_label}: chain "
-                    f"{' -> '.join(path)} has no schedule "
-                    f"anywhere -- {ref!r} would never fire"
-                )
-            return
-        # Group: recurse with updated seen_schedule.
-        group = config.job_groups[ref]
-        scheduled = group.schedule is not None or group.interval is not None
-        new_seen = seen_schedule or scheduled
-        for child in group.jobs:
-            _walk_chain(child, target_label, path, new_seen)
-
-    targets_to_check: list[tuple[str, Target]] = [
-        (f"[target.{tname}]", t) for tname, t in config.platform_targets.items()
-    ] + [
-        (f"[target.host.{hname}]", t)
-        for hname, t in config.host_targets.items()
-    ]
-    for label, target in targets_to_check:
-        for ref in target.jobs:
-            _walk_chain(ref, label, (), seen_schedule=False)
-
-    # Single-parent invariant: within a single target's subtree
-    # (the dispatch graph that any one host activates), each name
-    # appears as a child of at most one parent. A target lists its
-    # roots, groups list their children -- if A is reachable from
-    # the target both directly and through a group, or from two
-    # different groups, the platform schedulers would dispatch it
-    # twice on every fire. Duplicate references inside a single
-    # parent's `jobs` list count as multiple parents for the same
-    # reason. Cross-target overlap is fine: only one target ever
-    # activates on a given host, so two targets that both reference
-    # the same root produce independent dispatch graphs on the
-    # hosts they apply to.
-    for label, target in targets_to_check:
-        parents = _collect_target_parents(config, target)
-        for child, parent_list in parents.items():
-            if len(parent_list) > 1:
-                raise ConfigError(
-                    f"{label}: {child!r} has multiple parents in this "
-                    f"target's subtree: {', '.join(parent_list)}"
-                )
-
-    # notify_channels references must resolve to defined channels in
-    # this bundle's [defaults.notify.*] section. The reference checks
-    # run only when channels are actually selected somewhere -- an
-    # absent channels list at every layer means the bundle never
-    # dispatches, regardless of what's defined.
+    # notify_channels references must resolve to defined channels
+    # in this bundle's [defaults.notify.*] section. `[defaults]`
+    # references are unattributable -> raise; per-job and per-target
+    # references are per-entity -> demote.
     defined_channels = set(config.defaults.notify_channel_defs.keys())
+    for ch in config.defaults.notify_channels:
+        if ch not in defined_channels:
+            raise ConfigError(
+                f"[defaults]: notify_channels entry {ch!r} is not "
+                f"defined; expected one of "
+                f"{sorted(defined_channels) or '[]'}"
+            )
 
-    def _check(layer_name: str, channels: list[str]) -> None:
-        for ch in channels:
-            if ch not in defined_channels:
-                raise ConfigError(
-                    f"{layer_name}: notify_channels entry {ch!r} "
-                    f"is not defined; expected one of "
-                    f"{sorted(defined_channels) or '[]'}"
-                )
-
-    _check("[defaults]", config.defaults.notify_channels)
-    # Per-job channel references are per-entity: a single job's
-    # bad notify_channels reference promotes that job into the
-    # errored map, leaving siblings parseable. Per-target and
-    # per-defaults references still raise (target/defaults
-    # tolerance is out of scope).
     bad_job_channel: dict[str, str] = {}
     for jname, job in config.jobs.items():
         if job.notify_channels is None:
@@ -1766,23 +1685,142 @@ def _validate_config(config: Config) -> None:
     for jname, msg in bad_job_channel.items():
         del config.jobs[jname]
         config.errored_jobs[jname] = msg
+
+    # Recompute name sets now that demoted groups and jobs sit in
+    # the errored_* maps. `all_names` feeds target undefined-name
+    # checks; `errored_names` lets the chain walk skip past an
+    # errored leaf without piling on a derived "would never fire"
+    # error.
+    all_job_names = set(config.jobs) | set(config.errored_jobs)
+    all_group_names = set(config.job_groups) | set(config.errored_job_groups)
+    all_names = all_job_names | all_group_names
+    errored_names = set(config.errored_jobs) | set(config.errored_job_groups)
+
+    # Per-target validation: undefined refs in `jobs`, invalid
+    # platform name for a `[target.<platform>]`, undefined
+    # notify_channels reference, chain cycle, chain with no
+    # schedule, and multi-parent within the target's subtree all
+    # demote just the offending target. `platforms` / `hosts`
+    # filters apply at selection time, not validate time -- a
+    # bundle is allowed to describe both darwin and linux entries
+    # and have each host pick up only its applicable subset.
+    def _validate_target(
+        label: str, tname: str, target: Target, is_host: bool
+    ) -> str | None:
+        if not is_host and tname not in _VALID_PLATFORMS:
+            return (
+                f"{label}: platform must be one of {sorted(_VALID_PLATFORMS)}"
+            )
+        for ref in target.jobs:
+            if ref not in all_names:
+                return f"{label}: 'jobs' references undefined name {ref!r}"
+        if target.notify_channels is not None:
+            for ch in target.notify_channels:
+                if ch not in defined_channels:
+                    return (
+                        f"{label}: notify_channels entry {ch!r} is "
+                        f"not defined; expected one of "
+                        f"{sorted(defined_channels) or '[]'}"
+                    )
+        # Chain walk: every path from the target through groups to
+        # a leaf job must contain a schedule somewhere; cycles in
+        # the group graph are caught on the way down. A walk into
+        # an errored entry stops without complaint -- the per-entity
+        # error is already attributed and piling on a derived "would
+        # never fire" would just hide it.
+        chain_error: list[str] = []
+
+        def _walk_chain(
+            ref: str, path: tuple[str, ...], seen_schedule: bool
+        ) -> None:
+            if chain_error:
+                return
+            if ref in path:
+                cycle = " -> ".join(path[path.index(ref) :] + (ref,))
+                chain_error.append(f"{label}: cycle in group chain: {cycle}")
+                return
+            path = path + (ref,)
+            if ref in errored_names:
+                # Errored leaf: skip. The per-entity error is
+                # already attributed; a derived "would never
+                # fire" would just hide it. Consequence: a
+                # target whose every root resolves only to
+                # errored entries passes target validation and
+                # dispatches nothing -- the user learns about
+                # the dead chain via the load-time ERROR log
+                # and `crony validate`.
+                return
+            if ref in config.jobs:
+                job = config.jobs[ref]
+                scheduled = job.schedule is not None or job.interval is not None
+                if not seen_schedule and not scheduled:
+                    chain_error.append(
+                        f"{label}: chain {' -> '.join(path)} has "
+                        f"no schedule anywhere -- {ref!r} would "
+                        f"never fire"
+                    )
+                return
+            group = config.job_groups[ref]
+            scheduled = group.schedule is not None or group.interval is not None
+            new_seen = seen_schedule or scheduled
+            for child in group.jobs:
+                _walk_chain(child, path, new_seen)
+
+        for ref in target.jobs:
+            _walk_chain(ref, (), False)
+            if chain_error:
+                return chain_error[0]
+
+        # Single-parent invariant: within a single target's subtree
+        # (the dispatch graph one host activates) each name appears
+        # as a child of at most one parent. A duplicate reference
+        # inside a single parent's `jobs` list still doubles
+        # dispatch and counts. Cross-target overlap is fine: only
+        # one target ever activates on a given host.
+        parents = _collect_target_parents(config, target)
+        for child, parent_list in parents.items():
+            if len(parent_list) > 1:
+                return (
+                    f"{label}: {child!r} has multiple parents in "
+                    f"this target's subtree: "
+                    f"{', '.join(parent_list)}"
+                )
+        return None
+
+    bad_platform: dict[str, str] = {}
     for tname, target in config.platform_targets.items():
-        if target.notify_channels is not None:
-            _check(f"[target.{tname}]", target.notify_channels)
+        err = _validate_target(
+            f"[target.{tname}]", tname, target, is_host=False
+        )
+        if err is not None:
+            bad_platform[tname] = err
+    for tname, msg in bad_platform.items():
+        del config.platform_targets[tname]
+        config.errored_platform_targets[tname] = msg
+
+    bad_host: dict[str, str] = {}
     for hname, target in config.host_targets.items():
-        if target.notify_channels is not None:
-            _check(f"[target.host.{hname}]", target.notify_channels)
+        err = _validate_target(
+            f"[target.host.{hname}]", hname, target, is_host=True
+        )
+        if err is not None:
+            bad_host[hname] = err
+    for hname, msg in bad_host.items():
+        del config.host_targets[hname]
+        config.errored_host_targets[hname] = msg
 
 
 def _load_one_bundle(name: str, path: Path) -> Bundle:
     """Parse a single bundle file and validate it. Raises ConfigError
     on parse / schema failure, naming the source path for context.
 
-    Per-entity ConfigErrors (a single bad job or group inside an
-    otherwise-valid bundle) do not raise: `parse_config` records
-    them on `Config.errored_jobs` / `errored_job_groups` and they
-    surface at status time with `config=error` plus a logged line
-    here so the user sees the problem regardless of subcommand.
+    Per-entity ConfigErrors (a single bad job, group, or target
+    inside an otherwise-valid bundle) do not raise: `parse_config`
+    and `_validate_config` record them on `Config.errored_jobs` /
+    `errored_job_groups` / `errored_platform_targets` /
+    `errored_host_targets`, and they surface at status time with
+    `config=error` plus a logged line here so the user sees the
+    problem regardless of subcommand.
     """
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -1792,13 +1830,17 @@ def _load_one_bundle(name: str, path: Path) -> Bundle:
         config = parse_config(raw)
     except ConfigError as e:
         raise ConfigError(f"{path}: {e}") from e
-    # Per-entity error messages from `_parse_job` /
-    # `_parse_job_group` are already prefixed with
-    # `[job.X]` / `[job-group.X]`; we only prepend the bundle
-    # path so the user sees which file produced each error.
+    # Per-entity error messages are already prefixed with
+    # `[job.X]` / `[job-group.X]` / `[target.X]` /
+    # `[target.host.X]`; we only prepend the bundle path so the
+    # user sees which file produced each error.
     for msg in sorted(config.errored_jobs.values()):
         logger.error("%s: %s", path, msg)
     for msg in sorted(config.errored_job_groups.values()):
+        logger.error("%s: %s", path, msg)
+    for msg in sorted(config.errored_platform_targets.values()):
+        logger.error("%s: %s", path, msg)
+    for msg in sorted(config.errored_host_targets.values()):
         logger.error("%s: %s", path, msg)
     return Bundle(name=name, source=path, config=config)
 
@@ -6504,17 +6546,39 @@ def do_validate(bundle: str | None) -> None:
         else list(bundles.bundles)
     )
     for b in target_bundles:
+        # Per-entity validation failures (errored jobs / groups /
+        # targets) have to flip the validate exit code -- a CI
+        # gate that runs `crony validate` won't notice a broken
+        # bundle entry otherwise. The per-entity error message is
+        # already prefixed with its section header, so emit it
+        # verbatim alongside `_validate_bundle_warnings` output.
+        config = b.config
+        for msg in sorted(config.errored_jobs.values()):
+            warnings.append(f"{b.source}: {msg}")
+        for msg in sorted(config.errored_job_groups.values()):
+            warnings.append(f"{b.source}: {msg}")
+        for msg in sorted(config.errored_platform_targets.values()):
+            warnings.append(f"{b.source}: {msg}")
+        for msg in sorted(config.errored_host_targets.values()):
+            warnings.append(f"{b.source}: {msg}")
         for w in _validate_bundle_warnings(b):
             warnings.append(f"{b.source}: {w}")
 
     print(f"bundles loaded: {len(target_bundles)}")
     for b in target_bundles:
         config = b.config
+        errored = (
+            len(config.errored_jobs)
+            + len(config.errored_job_groups)
+            + len(config.errored_platform_targets)
+            + len(config.errored_host_targets)
+        )
+        errored_suffix = f", errored={errored}" if errored else ""
         print(
             f"  {b.name} ({b.source}): "
             f"jobs={len(config.jobs)}, groups={len(config.job_groups)}, "
             f"targets: platform={len(config.platform_targets)} "
-            f"host={len(config.host_targets)}"
+            f"host={len(config.host_targets)}{errored_suffix}"
         )
     if warnings:
         print("warnings:")

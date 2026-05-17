@@ -164,6 +164,40 @@ def _assert_errored_job_group(
     assert short not in cfg.job_groups
 
 
+def _assert_errored_platform_target(
+    raw: dict[str, Any], platform: str, match: str
+) -> None:
+    """As `_assert_errored_job` but for `[target.<platform>]` entries."""
+    cfg = crony.parse_config(raw)
+    assert platform in cfg.errored_platform_targets, (
+        f"expected {platform!r} in errored_platform_targets, got "
+        f"{list(cfg.errored_platform_targets)}"
+    )
+    assert re.search(match, cfg.errored_platform_targets[platform]), (
+        f"errored_platform_targets[{platform!r}]="
+        f"{cfg.errored_platform_targets[platform]!r} "
+        f"did not match {match!r}"
+    )
+    assert platform not in cfg.platform_targets
+
+
+def _assert_errored_host_target(
+    raw: dict[str, Any], host: str, match: str
+) -> None:
+    """As `_assert_errored_job` but for `[target.host.<name>]`."""
+    cfg = crony.parse_config(raw)
+    assert host in cfg.errored_host_targets, (
+        f"expected {host!r} in errored_host_targets, got "
+        f"{list(cfg.errored_host_targets)}"
+    )
+    assert re.search(match, cfg.errored_host_targets[host]), (
+        f"errored_host_targets[{host!r}]="
+        f"{cfg.errored_host_targets[host]!r} "
+        f"did not match {match!r}"
+    )
+    assert host not in cfg.host_targets
+
+
 # =============================================================================
 # Schedule format
 # =============================================================================
@@ -757,13 +791,14 @@ class TestParseTarget:
         assert cfg.host_targets["my-host"].kind == "host"
 
     def test_invalid_platform_name(self) -> None:
-        with pytest.raises(crony.ConfigError, match="platform must be one of"):
-            crony.parse_config(
-                {
-                    "job": {"a": _job()},
-                    "target": {"windows": {"jobs": ["a"]}},
-                }
-            )
+        _assert_errored_platform_target(
+            {
+                "job": {"a": _job()},
+                "target": {"windows": {"jobs": ["a"]}},
+            },
+            "windows",
+            "platform must be one of",
+        )
 
     def test_target_unknown_key(self) -> None:
         with pytest.raises(crony.ConfigError, match="unknown key"):
@@ -793,10 +828,29 @@ class TestValidateConfig:
             )
 
     def test_group_references_undefined_name(self) -> None:
-        with pytest.raises(crony.ConfigError, match="undefined name"):
-            crony.parse_config(
-                {"job-group": {"g": {"jobs": ["nope"], "schedule": "daily"}}}
-            )
+        _assert_errored_job_group(
+            {"job-group": {"g": {"jobs": ["nope"], "schedule": "daily"}}},
+            "g",
+            "undefined name",
+        )
+
+    def test_group_undefined_ref_does_not_drop_siblings(self) -> None:
+        # A single bad group must not take other groups or the
+        # bundle with it -- a typo in one entry leaves the rest of
+        # the bundle resolvable.
+        cfg = crony.parse_config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "bad": {"jobs": ["nope"], "schedule": "daily"},
+                    "good": {"jobs": ["a"], "schedule": "daily"},
+                },
+                "target": {"darwin": {"jobs": ["good"]}},
+            }
+        )
+        assert "bad" in cfg.errored_job_groups
+        assert "good" in cfg.job_groups
+        assert "darwin" in cfg.platform_targets
 
     def test_nested_groups_supported(self) -> None:
         # A group can reference another group; only the chain to a
@@ -818,92 +872,98 @@ class TestValidateConfig:
 
     def test_chain_without_schedule_rejected(self) -> None:
         # A target reaches `a` via a chain with no schedule anywhere:
-        # `a` would never fire, so reject at validate time.
-        with pytest.raises(crony.ConfigError, match="no schedule anywhere"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "leaf": {"jobs": ["a"]},
-                        "root": {"jobs": ["leaf"]},
-                    },
-                    "target": {"darwin": {"jobs": ["root"]}},
-                }
-            )
+        # `a` would never fire. The target carries the per-entity
+        # error since the chain belongs to it.
+        _assert_errored_platform_target(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "leaf": {"jobs": ["a"]},
+                    "root": {"jobs": ["leaf"]},
+                },
+                "target": {"darwin": {"jobs": ["root"]}},
+            },
+            "darwin",
+            "no schedule anywhere",
+        )
 
     def test_chain_cycle_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="cycle"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "job-group": {
-                        "g1": {"jobs": ["g2"], "schedule": "daily"},
-                        "g2": {"jobs": ["g1"]},
-                    },
-                    "target": {"darwin": {"jobs": ["g1"]}},
-                }
-            )
+        _assert_errored_platform_target(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g1": {"jobs": ["g2"], "schedule": "daily"},
+                    "g2": {"jobs": ["g1"]},
+                },
+                "target": {"darwin": {"jobs": ["g1"]}},
+            },
+            "darwin",
+            "cycle in group chain",
+        )
 
     def test_multi_parent_target_and_group_rejected(self) -> None:
         # Target lists both group G and job A directly; G also lists
         # A. Within this target's subtree A has two parents, so the
         # platform schedulers would dispatch A twice per fire.
-        with pytest.raises(crony.ConfigError, match="multiple parents"):
-            crony.parse_config(
-                {
-                    "job": {
-                        "a": {
-                            "command": "true",
-                            "schedule": "*-*-* 03:00",
-                        },
+        _assert_errored_platform_target(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
                     },
-                    "job-group": {
-                        "g": {"jobs": ["a"], "schedule": "daily"},
-                    },
-                    "target": {"darwin": {"jobs": ["g", "a"]}},
-                }
-            )
+                },
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "daily"},
+                },
+                "target": {"darwin": {"jobs": ["g", "a"]}},
+            },
+            "darwin",
+            "multiple parents",
+        )
 
     def test_multi_parent_two_groups_rejected(self) -> None:
         # Two groups under the same scheduled root both list job A.
         # Walked from the target, A has two parent groups.
-        with pytest.raises(crony.ConfigError, match="multiple parents"):
-            crony.parse_config(
-                {
-                    "job": {
-                        "a": {
-                            "command": "true",
-                            "schedule": "*-*-* 03:00",
-                        },
+        _assert_errored_platform_target(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
                     },
-                    "job-group": {
-                        "g1": {"jobs": ["a"]},
-                        "g2": {"jobs": ["a"]},
-                        "root": {
-                            "jobs": ["g1", "g2"],
-                            "schedule": "daily",
-                        },
+                },
+                "job-group": {
+                    "g1": {"jobs": ["a"]},
+                    "g2": {"jobs": ["a"]},
+                    "root": {
+                        "jobs": ["g1", "g2"],
+                        "schedule": "daily",
                     },
-                    "target": {"darwin": {"jobs": ["root"]}},
-                }
-            )
+                },
+                "target": {"darwin": {"jobs": ["root"]}},
+            },
+            "darwin",
+            "multiple parents",
+        )
 
     def test_multi_parent_duplicate_in_list_rejected(self) -> None:
         # Same parent referencing the same child twice in its `jobs`
         # list still doubles the dispatch on every fire, so it's
         # also flagged.
-        with pytest.raises(crony.ConfigError, match="multiple parents"):
-            crony.parse_config(
-                {
-                    "job": {
-                        "a": {
-                            "command": "true",
-                            "schedule": "*-*-* 03:00",
-                        },
+        _assert_errored_platform_target(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
                     },
-                    "target": {"darwin": {"jobs": ["a", "a"]}},
-                }
-            )
+                },
+                "target": {"darwin": {"jobs": ["a", "a"]}},
+            },
+            "darwin",
+            "multiple parents",
+        )
 
     def test_multi_parent_cross_target_allowed(self) -> None:
         # Two targets each listing the same group is fine: only one
@@ -923,8 +983,34 @@ class TestValidateConfig:
         assert "g" in cfg.job_groups
 
     def test_target_references_undefined_name(self) -> None:
-        with pytest.raises(crony.ConfigError, match="undefined name"):
-            crony.parse_config({"target": {"darwin": {"jobs": ["nope"]}}})
+        _assert_errored_platform_target(
+            {"target": {"darwin": {"jobs": ["nope"]}}},
+            "darwin",
+            "undefined name",
+        )
+
+    def test_host_target_references_undefined_name(self) -> None:
+        _assert_errored_host_target(
+            {"target": {"host": {"my-host": {"jobs": ["nope"]}}}},
+            "my-host",
+            "undefined name",
+        )
+
+    def test_one_bad_target_does_not_drop_siblings(self) -> None:
+        # A typo'd target.linux must not take target.darwin with
+        # it -- per-target failures stay scoped.
+        cfg = crony.parse_config(
+            {
+                "job": {"a": _job()},
+                "target": {
+                    "darwin": {"jobs": ["a"]},
+                    "linux": {"jobs": ["nope"]},
+                },
+            }
+        )
+        assert "linux" in cfg.errored_platform_targets
+        assert "darwin" in cfg.platform_targets
+        assert "linux" not in cfg.platform_targets
 
     def test_target_references_group_ok(self) -> None:
         cfg = crony.parse_config(
@@ -949,14 +1035,15 @@ class TestValidateConfig:
     ) -> None:
         # A target referencing a job with no schedule and no chain
         # to a schedule is the canonical "this would never fire"
-        # case.
-        with pytest.raises(crony.ConfigError, match="no schedule anywhere"):
-            crony.parse_config(
-                {
-                    "job": {"a": {"command": "true"}},
-                    "target": {"darwin": {"jobs": ["a"]}},
-                }
-            )
+        # case. The target carries the per-entity error.
+        _assert_errored_platform_target(
+            {
+                "job": {"a": {"command": "true"}},
+                "target": {"darwin": {"jobs": ["a"]}},
+            },
+            "darwin",
+            "no schedule anywhere",
+        )
 
     def test_referenced_group_only_job_ok(self) -> None:
         cfg = crony.parse_config(
@@ -6445,6 +6532,42 @@ class TestValidate:
         with pytest.raises(crony.UsageError, match="unknown bundle"):
             crony.do_validate(bundle="ghost")
 
+    def test_warns_on_errored_job_group(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A demoted entry (here a job-group with an undefined-name
+        # ref) must flip validate's exit code -- a CI gate that
+        # runs `crony validate` shouldn't pass on a config that
+        # has a broken entry.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            '[job.good]\ncommand = "true"\nschedule = "daily"\n'
+            '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_validate(bundle=None)
+        assert exc.value.code == int(crony.ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "undefined name" in out
+        assert "errored=1" in out
+
+    def test_warns_on_errored_target(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["nope"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony.do_validate(bundle=None)
+        assert exc.value.code == int(crony.ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "[target.darwin]" in out
+        assert "undefined name" in out
+
 
 class TestResolveStateAxes:
     """Direct unit tests for `_resolve_state_axes`. `do_status` and
@@ -7568,6 +7691,55 @@ class TestBundleLoading:
         assert names == ["default", "ok"]
         # The broken bundle's path is in the error output.
         assert any("broken.toml" in r.message for r in caplog.records)
+
+    def test_bundle_loads_despite_undefined_group_ref(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # A `[job-group.X]` whose `jobs` list references a name
+        # that doesn't exist must not take the whole bundle down:
+        # the bundle stays loadable, the bad group sits in
+        # errored_job_groups, and the error is logged with the
+        # source path.
+        cfg_file, _ = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text(
+            '[job.good]\ncommand = "true"\nschedule = "daily"\n'
+            '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+            bundles = crony.load_all_bundles()
+        assert [b.name for b in bundles.bundles] == ["default"]
+        config = bundles.by_name("default").config
+        assert "good" in config.jobs
+        assert "bad" in config.errored_job_groups
+        assert any(
+            "undefined name" in r.message and "bad" in r.message
+            for r in caplog.records
+        )
+
+    def test_bundle_loads_despite_errored_target(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # A `[target.<platform>]` with a bad ref demotes just
+        # that target -- siblings (here, a host target) remain
+        # live and the bundle keeps loading.
+        cfg_file, _ = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["nope"]\n'
+            '[target.host.squee]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+            bundles = crony.load_all_bundles()
+        assert [b.name for b in bundles.bundles] == ["default"]
+        config = bundles.by_name("default").config
+        assert "darwin" in config.errored_platform_targets
+        assert "squee" in config.host_targets
+        assert any(
+            "undefined name" in r.message and "[target.darwin]" in r.message
+            for r in caplog.records
+        )
 
     def test_invalid_filename_rejected(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
