@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import tomlkit
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec, patch
@@ -878,6 +879,98 @@ class TestParseJobGroup:
             },
             "g",
             "unknown key",
+        )
+
+
+class TestUuidField:
+    """Optional `uuid` on jobs and groups is parsed when present
+    and validated for canonical lowercase 8-4-4-4-12 form. Malformed
+    values demote to errored-entity rather than tearing down the
+    bundle so other entries still apply.
+    """
+
+    GOOD = "aabbccdd-1234-5678-9abc-aabbccddeeff"
+
+    def test_job_uuid_round_trip(self) -> None:
+        cfg = crony.parse_config(
+            {"job": {"j": {"command": "true", "uuid": self.GOOD}}}
+        )
+        assert cfg.jobs["j"].uuid == self.GOOD
+
+    def test_job_uuid_absent_defaults_none(self) -> None:
+        cfg = crony.parse_config({"job": {"j": _job()}})
+        assert cfg.jobs["j"].uuid is None
+
+    def test_job_uuid_rejects_non_string(self) -> None:
+        _assert_errored_job(
+            {"job": {"j": {"command": "true", "uuid": 42}}},
+            "j",
+            "must be str",
+        )
+
+    def test_job_uuid_rejects_garbage(self) -> None:
+        _assert_errored_job(
+            {"job": {"j": {"command": "true", "uuid": "not-a-uuid"}}},
+            "j",
+            "not a valid UUID",
+        )
+
+    def test_job_uuid_rejects_missing_dashes(self) -> None:
+        _assert_errored_job(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "uuid": "12345678123456781234567812345678",
+                    }
+                }
+            },
+            "j",
+            "canonical",
+        )
+
+    def test_job_uuid_rejects_uppercase(self) -> None:
+        _assert_errored_job(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "uuid": self.GOOD.upper(),
+                    }
+                }
+            },
+            "j",
+            "canonical",
+        )
+
+    def test_group_uuid_round_trip(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "uuid": self.GOOD,
+                    }
+                },
+            }
+        )
+        assert cfg.job_groups["g"].uuid == self.GOOD
+
+    def test_group_uuid_rejects_garbage(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "uuid": "nope",
+                    }
+                }
+            },
+            "g",
+            "not a valid UUID",
         )
 
 
@@ -1843,6 +1936,166 @@ class TestInit:
                 extracted.append(line[2:])
         text = "\n".join(extracted)
         crony.parse_config(tomlkit.loads(text))
+
+
+class TestUuidGenerateAction:
+    """`crony config uuid-generate` prints a single canonical UUID
+    on stdout. Used by users hand-editing a config before the file
+    is otherwise valid (the `config update` path requires a parsable
+    file).
+    """
+
+    def test_emits_one_canonical_uuid(self, capsys: Any) -> None:
+        crony.do_uuid_generate()
+        out = capsys.readouterr().out.strip()
+        parsed = uuid.UUID(out)
+        assert str(parsed) == out
+
+
+class TestConfigUpdateAction:
+    """`crony config update` assigns UUIDs to jobs and groups that
+    lack one, rewriting the bundle file in place via tomlkit so
+    comments and key order survive. Files where every job and
+    group already has a UUID are skipped (no rewrite).
+    """
+
+    def _redirect(self, monkeypatch: Any, tmp_path: Path) -> tuple[Path, Path]:
+        cfg_dir = tmp_path / "crony"
+        cfg_file = cfg_dir / "config.toml"
+        cfg_dropin = cfg_dir / "config"
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
+        return cfg_file, cfg_dropin
+
+    def test_fills_missing_uuids_in_default_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file, _ = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_file.write_text(
+            "[job.a]\n"
+            'command = "true"\n'
+            'schedule = "daily"\n'
+            "\n"
+            "[job-group.g]\n"
+            'jobs = ["a"]\n'
+            'schedule = "daily"\n',
+            encoding="utf-8",
+        )
+        crony.do_config_update(bundle=None)
+        doc = tomlkit.loads(cfg_file.read_text(encoding="utf-8"))
+        a_uuid = doc["job"]["a"]["uuid"]
+        g_uuid = doc["job-group"]["g"]["uuid"]
+        assert isinstance(a_uuid, str)
+        assert isinstance(g_uuid, str)
+        # Distinct, valid uuid4 form.
+        assert a_uuid != g_uuid
+        assert str(uuid.UUID(a_uuid)) == a_uuid
+        assert str(uuid.UUID(g_uuid)) == g_uuid
+
+    def test_idempotent_when_all_present(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file, _ = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        body = (
+            "[job.a]\n"
+            'uuid = "12345678-1234-5678-1234-567812345678"\n'
+            'command = "true"\n'
+            'schedule = "daily"\n'
+        )
+        cfg_file.write_text(body, encoding="utf-8")
+        mtime_before = cfg_file.stat().st_mtime_ns
+        crony.do_config_update(bundle=None)
+        # Body must be byte-for-byte identical AND mtime untouched:
+        # the no-change path skips the write_text entirely.
+        assert cfg_file.read_text(encoding="utf-8") == body
+        assert cfg_file.stat().st_mtime_ns == mtime_before
+
+    def test_preserves_comments_and_key_order(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file, _ = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        body = (
+            "# top-level comment\n"
+            "[job.a]\n"
+            "# inline comment for command\n"
+            'command = "true"\n'
+            'schedule = "daily"\n'
+        )
+        cfg_file.write_text(body, encoding="utf-8")
+        crony.do_config_update(bundle=None)
+        new_body = cfg_file.read_text(encoding="utf-8")
+        # Comments survive the round-trip.
+        assert "# top-level comment" in new_body
+        assert "# inline comment for command" in new_body
+        # Pre-existing keys keep their relative order.
+        cmd_pos = new_body.index("command")
+        sched_pos = new_body.index("schedule")
+        assert cmd_pos < sched_pos
+
+    def test_scoped_to_one_bundle(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file, cfg_dropin = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_dropin.mkdir(parents=True)
+        cfg_file.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        other = cfg_dropin / "borgadm.toml"
+        other.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        crony.do_config_update(bundle="borgadm")
+        # The borgadm bundle got a uuid; the default bundle did not.
+        other_doc = tomlkit.loads(other.read_text(encoding="utf-8"))
+        default_doc = tomlkit.loads(cfg_file.read_text(encoding="utf-8"))
+        assert "uuid" in other_doc["job"]["a"]
+        assert "uuid" not in default_doc["job"]["a"]
+
+    def test_unknown_bundle_errors(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file, _ = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_file.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.UsageError, match="bundle 'ghost'"):
+            crony.do_config_update(bundle="ghost")
+
+    def test_no_config_at_all_errors(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._redirect(monkeypatch, tmp_path)
+        with pytest.raises(crony.ConfigError, match="no config"):
+            crony.do_config_update(bundle=None)
+
+    def test_parse_error_in_one_file_does_not_block_others(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        cfg_file, cfg_dropin = self._redirect(monkeypatch, tmp_path)
+        cfg_file.parent.mkdir(parents=True)
+        cfg_dropin.mkdir(parents=True)
+        cfg_file.write_text(
+            '[job.a]\ncommand = "true"\nschedule = "daily"\n',
+            encoding="utf-8",
+        )
+        broken = cfg_dropin / "broken.toml"
+        broken.write_text("not valid toml [[[", encoding="utf-8")
+        with caplog.at_level("ERROR"):
+            crony.do_config_update(bundle=None)
+        # Default bundle's job got a uuid even though broken.toml failed.
+        default_doc = tomlkit.loads(cfg_file.read_text(encoding="utf-8"))
+        assert "uuid" in default_doc["job"]["a"]
+        # The broken file was reported.
+        assert any("broken.toml" in r.message for r in caplog.records)
 
 
 # =============================================================================

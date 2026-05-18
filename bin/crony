@@ -36,6 +36,7 @@ import tomlkit.exceptions
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 import xml.sax.saxutils
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -324,8 +325,17 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # interval are optional; a job with neither fires only when a
 # scheduled group dispatches it. Validation rejects a target chain
 # that reaches a job through a path with no schedule anywhere.
+#
+# `uuid` is the stable per-bundle identity of the entry, decoupled
+# from `name` so that renaming a job in this file is recognized as
+# a rename rather than a delete plus an unrelated add. Hand-edit a
+# new entry without it and run `crony config update` to fill the
+# field in place; the same `update` action works on `[job-group.*]`
+# blocks below. `crony config uuid-generate` prints one fresh UUID
+# for editor seeding when `update` can't yet parse the file.
 
 # [job.brew-update]
+# uuid      = "aabbccdd-1234-5678-9abc-aabbccddeeff"   # `crony config update`
 # command   = "brew update && brew upgrade && brew cleanup"
 # platforms = ["darwin"]               # filter: skip on non-darwin hosts
 # # hosts   = ["mymac"]                # filter: only on listed hostnames
@@ -377,6 +387,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # contain a schedule somewhere, or validation rejects it.
 
 # [job-group.daily-updates]
+# uuid      = "11223344-5566-7788-99aa-bbccddeeff00"
 # schedule  = "*-*-* 03:00"
 # jobs      = ["brew-update", "uv-update", "git-pull-utils"]
 # # platforms = ["darwin"]             # filter: as on jobs
@@ -627,6 +638,10 @@ class Job:
     """A single schedulable unit of work."""
 
     name: str
+    # Stable per-bundle identity, decoupled from `name`. Optional at
+    # parse time -- `crony config update` fills missing values in
+    # place via tomlkit round-trip.
+    uuid: str | None = None
     command: str | None = None
     script: str | None = None
     args: list[str] = field(default_factory=list)
@@ -685,6 +700,7 @@ class JobGroup:
     """
 
     name: str
+    uuid: str | None = None
     jobs: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
@@ -1006,6 +1022,7 @@ _KNOWN_DEFAULTS: frozenset[str] = frozenset(
 
 _KNOWN_JOB: frozenset[str] = frozenset(
     {
+        "uuid",
         "command",
         "script",
         "args",
@@ -1027,6 +1044,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
 
 _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
     {
+        "uuid",
         "jobs",
         "schedule",
         "interval",
@@ -1168,6 +1186,34 @@ def _validate_name(name: str, where: str) -> None:
             f"[A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, "
             f"empty, or leading punctuation)"
         )
+
+
+def _parse_uuid_field(raw: dict[str, Any], where: str) -> str | None:
+    """Read the optional `uuid` field as a canonical UUID string.
+
+    Returns None when the key is absent. Rejects non-string values
+    and any form other than canonical lowercase 8-4-4-4-12 (the
+    `uuid.uuid4()` default). The strict-format check catches
+    copy-paste mistakes like missing dashes or uppercase early
+    rather than letting them flow into the identity comparison.
+    """
+    value = _typed_field(raw, "uuid", str, where)
+    if value is None:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as e:
+        raise ConfigError(
+            f"{where}: 'uuid' is not a valid UUID: {value!r} ({e})"
+        ) from e
+    canonical = str(parsed)
+    if value != canonical:
+        raise ConfigError(
+            f"{where}: 'uuid' must be canonical lowercase "
+            f"8-4-4-4-12 form (got {value!r}, expected "
+            f"{canonical!r})"
+        )
+    return canonical
 
 
 def _validate_bundle_name(name: str, where: str) -> None:
@@ -1546,6 +1592,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
     _validate_name(name, f"[job.{name}]")
     where = f"[job.{name}]"
     _reject_unknown_keys(raw, _KNOWN_JOB, where)
+    job_uuid = _parse_uuid_field(raw, where)
     command = _typed_field(raw, "command", str, where)
     script = _typed_field(raw, "script", str, where)
     if (command is None) == (script is None):
@@ -1598,6 +1645,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
             )
     return Job(
         name=name,
+        uuid=job_uuid,
         command=command,
         script=script,
         args=args,
@@ -1628,6 +1676,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
     _validate_name(name, f"[job-group.{name}]")
     where = f"[job-group.{name}]"
     _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
+    group_uuid = _parse_uuid_field(raw, where)
     jobs = _string_list(raw, "jobs", where)
     if not jobs:
         raise ConfigError(f"{where}: 'jobs' must be a non-empty list")
@@ -1645,6 +1694,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
     hosts = _parse_hosts_field(raw, where)
     return JobGroup(
         name=name,
+        uuid=group_uuid,
         jobs=jobs,
         schedule=schedule,
         interval=interval,
@@ -5309,6 +5359,122 @@ def do_init(force: bool, bundle: str | None) -> None:
     logger.info("wrote default config to %s", CONFIG_FILE)
 
 
+def do_uuid_generate() -> None:
+    """Print one freshly-minted UUID to stdout.
+
+    Convenience for users hand-editing a config: when adding a new
+    job or group, pipe the output into the editor instead of
+    looking up the canonical format separately. `crony config update`
+    does the same insertion automatically for missing UUIDs, but
+    that path can't help when the user wants to seed a new entry
+    before the file is otherwise valid.
+    """
+    print(uuid.uuid4())
+
+
+def _bundle_files_for_update(
+    bundle: str | None,
+) -> list[tuple[str, Path]]:
+    """Enumerate the (bundle_name, path) pairs that `config update`
+    should scan, honoring `--bundle` scoping.
+
+    Mirrors `load_all_bundles` so the same files reachable to apply
+    are reachable to update. Returns paths even when the file is
+    syntactically broken -- the caller surfaces parse failures
+    per-file rather than aborting the whole pass.
+    """
+    candidates: list[tuple[str, Path]] = []
+    if CONFIG_FILE.exists():
+        candidates.append((DEFAULT_BUNDLE_NAME, CONFIG_FILE))
+    if CONFIG_DROPIN_DIR.exists():
+        for path in sorted(CONFIG_DROPIN_DIR.glob("*.toml")):
+            candidates.append((path.stem, path))
+    if bundle is not None:
+        candidates = [
+            (name, path) for (name, path) in candidates if name == bundle
+        ]
+    return candidates
+
+
+def _insert_missing_uuids_in_section(
+    doc: tomlkit.TOMLDocument, section: str
+) -> int:
+    """Assign a fresh UUID to every subtable of `[<section>.*]`
+    that lacks one. Returns the count of insertions made.
+
+    Tables that already have a `uuid` key are left untouched; we
+    don't re-canonicalize or re-roll, since the assigned UUID is
+    the durable identity.
+    """
+    added = 0
+    parent = doc.get(section)
+    if parent is None:
+        return 0
+    if not isinstance(parent, tomlkit.items.Table):
+        return 0
+    for _short, subtable in parent.items():
+        if not isinstance(subtable, tomlkit.items.Table):
+            continue
+        if "uuid" in subtable:
+            continue
+        subtable["uuid"] = str(uuid.uuid4())
+        added += 1
+    return added
+
+
+def do_config_update(bundle: str | None) -> None:
+    """Assign UUIDs to every `[job.*]` and `[job-group.*]` that
+    lacks one, rewriting the bundle file in place.
+
+    tomlkit preserves comments, whitespace, and key order, so a
+    user-curated config keeps its layout after the update. Files
+    that already have all UUIDs are left untouched (no rewrite,
+    no logged change). Per-file parse failures are reported and
+    skipped so one broken bundle doesn't block updates to other
+    bundles.
+    """
+    if bundle is not None:
+        try:
+            _validate_bundle_name(bundle, "--bundle")
+        except ConfigError as e:
+            raise UsageError(str(e)) from e
+    files = _bundle_files_for_update(bundle)
+    if not files:
+        if bundle is None:
+            raise ConfigError(
+                f"no config: expected {CONFIG_FILE} or "
+                f"{CONFIG_DROPIN_DIR}/*.toml"
+            )
+        raise UsageError(
+            f"no config file for bundle {bundle!r} "
+            f"(expected {CONFIG_DROPIN_DIR}/{bundle}.toml)"
+        )
+    for bundle_name, path in files:
+        try:
+            doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        except tomlkit.exceptions.ParseError as e:
+            logger.error("%s: TOML parse error: %s", path, e)
+            continue
+        added_jobs = _insert_missing_uuids_in_section(doc, "job")
+        added_groups = _insert_missing_uuids_in_section(doc, "job-group")
+        total = added_jobs + added_groups
+        if total == 0:
+            logger.info(
+                "%s (bundle %s): no missing uuids",
+                path,
+                bundle_name,
+            )
+            continue
+        path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        logger.info(
+            "%s (bundle %s): added %d uuid%s",
+            path,
+            bundle_name,
+            total,
+            "" if total == 1 else "s",
+        )
+
+
 def _errored_full_names(
     bundles: Bundles, bundle: str | None = None
 ) -> set[str]:
@@ -7334,6 +7500,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_config_update = config_subparsers.add_parser(
+        "update",
+        help="Assign UUIDs to jobs and groups that lack one",
+    )
+    p_config_update.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Scope the rewrite to one bundle file. Without this "
+            "flag every bundle file is scanned."
+        ),
+    )
+
+    config_subparsers.add_parser(
+        "uuid-generate",
+        help="Print one freshly-minted UUID",
+    )
+
     # apply
     p_apply = subparsers.add_parser(
         "apply",
@@ -7698,6 +7883,8 @@ def build_parser() -> argparse.ArgumentParser:
 COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "config init": do_init,
     "config validate": do_validate,
+    "config update": do_config_update,
+    "config uuid-generate": do_uuid_generate,
     "apply": do_apply,
     "destroy": do_destroy,
     "enable": do_enable,
