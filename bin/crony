@@ -79,7 +79,8 @@ state via `crony status`. The default columns are:
   CONFIG    synced  | stale    | missing | orphan  | masked | error
   SCHEDULE  the cron / interval / `grouped` value for the entry,
             or `disabled` when the unit is off at the scheduler
-  LAST      ok      | fail     | timeout | gated   | running | never | unknown
+  LAST      ok      | fail     | timeout  | gated   | canceled |
+            running | pending  | never    | unknown
   LAST RAN  compact relative time of the last run (e.g. `5m ago`)
 
 `config=masked` only appears with `crony status -a/--all` (no
@@ -117,6 +118,17 @@ completion via kernel-level pid-exit notification (kqueue on
 darwin, pidfd_open on linux) -- no polling. Groups dispatch each
 child through the same mechanism, with a cumulative deadline
 pinned at apply time as 1.05 * sum-of-children's-timeouts.
+
+Interactive jobs (`interactive = true` on `[job.<name>]`) sit
+pending in the background after their fire and prompt the user
+via an osascript dialog (Run / Delay / Cancel) before running.
+Auto-tagged `platforms = ["darwin"]` -- the dialog and idle
+detection are macOS-only. The runner waits for the user to be
+continuously active for `interactive_active` (default 10min),
+then prompts; "Delay Job" sleeps `interactive_delay` (default
+1h) and re-waits. `crony status` reports such a job as
+`pending` during the wait. `crony trigger` bypasses the wait
+and runs the command immediately.
 
 Apply pins each entry's runtime parameters into a JSON snapshot
 in the entry's state dir (`STATE_DIR/<full>/snapshot.json`,
@@ -336,6 +348,21 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # [job.uv-update]
 # command = "uv self update && uv tool upgrade --all"
 # gate    = "command -v uv"
+
+# Interactive job: sits pending after its fire and pops an
+# osascript dialog (Run / Delay / Cancel) once the user has been
+# active continuously for `interactive_active` (default 10min).
+# Auto-tags `platforms = ["darwin"]`, so a non-darwin host
+# silently skips it. May live in a [job-group.*]; the group
+# dispatches it async (no wait) and the child's interactive wait
+# runs independently of the group's deadline.
+# [job.weekly-prompt]
+# command            = "/usr/local/bin/some-interactive-task"
+# schedule           = "Sun *-*-* 12:00"  # weekly at noon
+# interactive        = true
+# # Optional knobs (defaults shown):
+# # interactive_active = "10min"          # required user-active window
+# # interactive_delay  = "1h"             # sleep after "Delay Job"
 
 
 # ----------------------------------------------------------------------------
@@ -584,6 +611,15 @@ class HostList:
     negated: bool = False
 
 
+# Resolution-time defaults for interactive jobs whose user did not
+# override `interactive_active` / `interactive_delay`. 10 min of
+# continuous active input is conservative enough that a passing
+# wiggle of the mouse doesn't trigger the dialog; a 1h delay after
+# "Delay Job" gives breathing room before crony asks again.
+_INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
+_INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
+
+
 @dataclass
 class Job:
     """A single schedulable unit of work."""
@@ -609,6 +645,16 @@ class Job:
     # would).
     notify_channels: list[str] | None = None
     env: dict[str, str] = field(default_factory=dict)
+    # Interactive jobs sit pending in the background after their
+    # scheduled fire and prompt the user before running. The two
+    # `_sec` knobs are None when the user didn't set them; the
+    # snapshot resolver substitutes baked defaults. Validation
+    # auto-tags `platforms = ["darwin"]` (the dialog and idle-
+    # detection helpers are macOS-only) and rejects placement
+    # inside any [job-group.*].
+    interactive: bool = False
+    interactive_active_sec: int | None = None
+    interactive_delay_sec: int | None = None
 
 
 @dataclass
@@ -971,6 +1017,9 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "job_timeout_sec",
         "notify_channels",
         "env",
+        "interactive",
+        "interactive_active",
+        "interactive_delay",
     }
 )
 
@@ -1252,6 +1301,44 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
     return HostList(names=stripped, negated=True)
 
 
+def _parse_interactive_fields(
+    raw: dict[str, Any], where: str
+) -> tuple[bool, int | None, int | None]:
+    """Parse the three `interactive*` fields together.
+
+    Returns `(interactive, active_sec, delay_sec)`. The two `_sec`
+    values are `None` when the user did not provide a time-span
+    string; the snapshot resolver substitutes the baked default.
+    Either time-span set without `interactive = true` is a config
+    error (catches "I wrote the knob but forgot the flag"), and a
+    zero / negative time-span is rejected.
+    """
+    raw_interactive = _typed_field(raw, "interactive", bool, where)
+    interactive = bool(raw_interactive)
+    active_sec = _parse_interactive_timespan(
+        raw, "interactive_active", where, interactive
+    )
+    delay_sec = _parse_interactive_timespan(
+        raw, "interactive_delay", where, interactive
+    )
+    return interactive, active_sec, delay_sec
+
+
+def _parse_interactive_timespan(
+    raw: dict[str, Any], key: str, where: str, interactive: bool
+) -> int | None:
+    """Parse one `interactive_active` / `interactive_delay` knob."""
+    text = _typed_field(raw, key, str, where)
+    if text is None:
+        return None
+    if not interactive:
+        raise ConfigError(f"{where}: {key!r} set without 'interactive = true'")
+    secs = parse_interval_seconds(text)
+    if secs <= 0:
+        raise ConfigError(f"{where}: {key!r} must be positive")
+    return secs
+
+
 def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
     """Extract a dict-of-string-to-string field, defaulting to {}."""
     val = raw.get(key)
@@ -1495,6 +1582,18 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec <= 0:
         raise ConfigError(f"{where}: job_timeout_sec must be positive")
+    interactive, interactive_active_sec, interactive_delay_sec = (
+        _parse_interactive_fields(raw, where)
+    )
+    if interactive:
+        if not platforms:
+            platforms = ["darwin"]
+        elif platforms != ["darwin"]:
+            raise ConfigError(
+                f"{where}: 'interactive = true' implies "
+                f"platforms = ['darwin']; remove or change the "
+                f"'platforms' override"
+            )
     return Job(
         name=name,
         command=command,
@@ -1510,6 +1609,9 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
         job_timeout_sec=job_timeout_sec,
         notify_channels=channels,
         env=_string_dict(raw, "env", where),
+        interactive=interactive,
+        interactive_active_sec=interactive_active_sec,
+        interactive_delay_sec=interactive_delay_sec,
     )
 
 
@@ -2212,7 +2314,10 @@ def resolved_group_timeout_sec(
     Children not selected on this host contribute zero (own
     filter excludes them or empty-group cascade demoted them) --
     the parent won't trigger them here, so the budget shouldn't
-    reserve their time either.
+    reserve their time either. Interactive children also
+    contribute zero: the group fires them async (no wait), so
+    their `job_timeout_sec` doesn't bound any actual wait inside
+    `run_group` and would just inflate the budget.
     """
     group = config.job_groups[group_name]
     sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
@@ -2221,9 +2326,10 @@ def resolved_group_timeout_sec(
         if child not in sel_jobs and child not in sel_groups:
             continue
         if child in config.jobs:
-            total += resolved_job_timeout_sec(
-                config, target, config.jobs[child]
-            )
+            child_job = config.jobs[child]
+            if child_job.interactive:
+                continue
+            total += resolved_job_timeout_sec(config, target, child_job)
         else:
             total += resolved_group_timeout_sec(config, target, child)
     return max(1, int(total * _GROUP_TIMEOUT_PADDING))
@@ -2243,7 +2349,7 @@ def resolved_group_timeout_sec(
 # without a re-apply.
 
 
-_SNAPSHOT_SCHEMA: int = 2
+_SNAPSHOT_SCHEMA: int = 3
 
 
 @dataclass
@@ -2278,6 +2384,14 @@ class JobSnapshot:
     # rely on the dataclass default rather than a schema bump.
     schedule: str | None = None
     interval: str | None = None
+    # Interactive runner controls. `interactive_active_sec` and
+    # `interactive_delay_sec` are always resolved (non-None) in
+    # the snapshot so the runner doesn't re-consult any defaults
+    # table; the per-job `_sec` knobs cascade through the resolver
+    # to the baked defaults defined alongside the Job dataclass.
+    interactive: bool = False
+    interactive_active_sec: int = _INTERACTIVE_ACTIVE_DEFAULT_SEC
+    interactive_delay_sec: int = _INTERACTIVE_DELAY_DEFAULT_SEC
 
 
 @dataclass
@@ -2329,6 +2443,17 @@ def _resolve_job_snapshot(
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
         schedule=job.schedule,
         interval=job.interval,
+        interactive=job.interactive,
+        interactive_active_sec=(
+            job.interactive_active_sec
+            if job.interactive_active_sec is not None
+            else _INTERACTIVE_ACTIVE_DEFAULT_SEC
+        ),
+        interactive_delay_sec=(
+            job.interactive_delay_sec
+            if job.interactive_delay_sec is not None
+            else _INTERACTIVE_DELAY_DEFAULT_SEC
+        ),
     )
 
 
@@ -2514,18 +2639,21 @@ class GroupRunResult:
 def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     """Worst-of children's exit_class, with a precedence ladder.
 
-    A group with no children, or one whose children are all `ok`
-    or `gated`, rolls up as `ok`: gating is a per-child concept
-    ("intentionally not run") that doesn't describe a group-level
-    outcome. Any child failure (fail / signal / timeout) surfaces
-    as the worst child's exit_class -- timeout outranks fail /
-    signal so a group with a timed-out child shows TIMEOUT in the
-    status view rather than being masked by a sibling's plain
-    fail.
+    A group with no children, or one whose children are all `ok`,
+    `gated`, or `dispatched`, rolls up as `ok`: gating is a per-
+    child concept ("intentionally not run") that doesn't describe
+    a group-level outcome, and `dispatched` records an interactive
+    child the group fired async (it makes no claim about whether
+    the user later clicked Run Job). Any child failure (fail /
+    signal / timeout) surfaces as the worst child's exit_class --
+    timeout outranks fail / signal so a group with a timed-out
+    child shows TIMEOUT in the status view rather than being
+    masked by a sibling's plain fail.
     """
     precedence = {
         "ok": 0,
         "gated": 0,
+        "dispatched": 0,
         "fail": 1,
         "signal": 1,
         "timeout": 2,
@@ -3275,6 +3403,225 @@ def _resolve_notify_at_runtime(
     )
 
 
+def _darwin_hid_idle_seconds() -> float:
+    """Seconds since the last HID input event on macOS.
+
+    Reads `HIDIdleTime` (nanoseconds) from `IOHIDSystem` via
+    `ioreg` and converts to seconds. Returns 0.0 if `ioreg` is
+    unavailable or unparseable -- treating unknown idle state as
+    "user is active right now" is the safer default for the wait
+    loop (we err toward prompting sooner rather than never).
+    """
+    try:
+        proc = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0.0
+    for line in proc.stdout.splitlines():
+        if '"HIDIdleTime"' not in line:
+            continue
+        _, _, rhs = line.partition("=")
+        try:
+            return int(rhs.strip()) / 1_000_000_000
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _darwin_screen_locked() -> bool:
+    """True if the macOS login session is currently screen-locked.
+
+    Reads the `CGSSessionScreenIsLocked` flag from IOConsoleUsers
+    via `ioreg`. Returns False on any failure -- assuming unlocked
+    on infrastructure error matches "user is present" and
+    delegates the final present-check to HIDIdleTime, which is
+    the primary signal.
+    """
+    try:
+        proc = subprocess.run(
+            ["ioreg", "-n", "Root", "-d", "1"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return '"CGSSessionScreenIsLocked"=Yes' in proc.stdout
+
+
+def _wait_for_user_active(
+    required_sec: int,
+    *,
+    bypass_check: Callable[[], bool] | None = None,
+    poll_sec: int = 30,
+    idle_break_sec: int = 60,
+) -> bool:
+    """Block until the user has been active for `required_sec`
+    continuous seconds, polling every `poll_sec`. Returns True on
+    success; returns False when `bypass_check` returns True so
+    the caller can short-circuit (a user trigger arriving while a
+    pending waiter holds the lock signals via this path).
+
+    "Active" means `HIDIdleTime <= idle_break_sec` and the screen
+    is not locked. Continuity is measured from the moment the
+    wait first observed the user as active -- a user who was
+    already typing when the wait began still has to satisfy the
+    full `required_sec` of polled-active time before the wait
+    returns. Any idle break (locked screen, idle > break) resets
+    the accumulator. `poll_sec` must be < `idle_break_sec` so a
+    brief active blip between polls doesn't get missed; the
+    defaults (30s poll, 60s break) give a healthy margin.
+    """
+    active_since: float | None = None
+    while True:
+        if bypass_check is not None and bypass_check():
+            return False
+        idle = _darwin_hid_idle_seconds()
+        locked = _darwin_screen_locked()
+        present = not locked and idle <= idle_break_sec
+        if present:
+            now = time.monotonic()
+            if active_since is None:
+                active_since = now - idle
+            elif now - active_since >= required_sec:
+                return True
+        else:
+            active_since = None
+        time.sleep(poll_sec)
+
+
+def _delay_or_bypass(
+    delay_sec: int,
+    *,
+    bypass_check: Callable[[], bool],
+    poll_sec: int = 30,
+) -> bool:
+    """Sleep up to `delay_sec`, polling `bypass_check` every
+    `poll_sec`. Returns True if the full delay elapsed; False if
+    `bypass_check` returned True mid-sleep. Used by the
+    interactive delay-then-reprompt path so a "Delay Job" choice
+    doesn't strand the runner in an unbreakable hour-long sleep
+    when the user changes their mind and triggers manually.
+    """
+    elapsed = 0
+    while elapsed < delay_sec:
+        if bypass_check():
+            return False
+        chunk = min(poll_sec, delay_sec - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+    return True
+
+
+def _show_interactive_dialog(job_name: str, message: str) -> str:
+    """Pop the three-button approval dialog. Returns one of
+    'run' / 'delay' / 'cancel'.
+
+    Uses `osascript display dialog`. Clicking the cancel button
+    (or dismissing the dialog) maps to 'cancel'; clicking Run Job
+    maps to 'run' and Delay Job to 'delay'. Any subprocess
+    failure (osascript missing, dialog killed) also maps to
+    'cancel' -- silently running without user confirmation would
+    defeat the whole point of the flag.
+    """
+
+    def _esc(s: str) -> str:
+        # AppleScript string-literal escaping: backslash and double-
+        # quote are the two special characters inside a "..."
+        # literal. Note this is NOT shell escaping -- the script is
+        # passed as a single argv entry to `osascript -e`, so no
+        # shell parser sees it; `shlex.quote` would emit POSIX
+        # single-quoted bytes that AppleScript would parse as
+        # something else entirely.
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    safe_message = _esc(message)
+    safe_name = _esc(job_name)
+    script = (
+        f'display dialog "{safe_message}" '
+        f'with title "crony: {safe_name}" '
+        f'buttons {{"Cancel Job", "Delay Job", "Run Job"}} '
+        f'default button "Run Job" '
+        f'cancel button "Cancel Job"'
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "cancel"
+    if proc.returncode != 0:
+        return "cancel"
+    out = proc.stdout
+    if "Run Job" in out:
+        return "run"
+    if "Delay Job" in out:
+        return "delay"
+    return "cancel"
+
+
+def _interactive_wait_and_prompt(snap: JobSnapshot, log_file: IO[bytes]) -> str:
+    """Run the wait/prompt/delay loop for an interactive job.
+
+    Returns 'run' or 'cancel'. Logs each phase transition into
+    the run.log so post-mortem audit can see how long the user
+    took, whether they delayed, etc.
+
+    Polls `_consume_user_trigger_flag` inside both the active-
+    wait and the delay-sleep so a `crony trigger` arriving while
+    the runner holds the lock (and the kickstarted second runner
+    is exiting LockBusy) breaks the waiter out and runs the
+    command. Without the poll, that flag would sit on disk until
+    the next scheduled fire and silently bypass *that* wait.
+    """
+
+    def _bypass() -> bool:
+        return _consume_user_trigger_flag(snap.name)
+
+    while True:
+        log_file.write(
+            (
+                f"interactive: waiting for "
+                f"{snap.interactive_active_sec}s continuous active "
+                f"input\n"
+            ).encode()
+        )
+        if not _wait_for_user_active(
+            snap.interactive_active_sec, bypass_check=_bypass
+        ):
+            log_file.write(
+                b"interactive: bypass (user-triggered during wait)\n"
+            )
+            return "run"
+        log_file.write(b"interactive: prompting user\n")
+        choice = _show_interactive_dialog(
+            snap.name,
+            f"crony wants to run '{snap.name}'. Now?",
+        )
+        log_file.write(f"interactive: user chose {choice}\n".encode())
+        if choice in ("run", "cancel"):
+            return choice
+        log_file.write(
+            f"interactive: delaying for {snap.interactive_delay_sec}s\n".encode()
+        )
+        if not _delay_or_bypass(
+            snap.interactive_delay_sec, bypass_check=_bypass
+        ):
+            log_file.write(
+                b"interactive: bypass (user-triggered during delay)\n"
+            )
+            return "run"
+
+
 def run_job(
     snap: JobSnapshot,
     *,
@@ -3381,6 +3728,44 @@ def run_job(
                         )
                         return 0
 
+                if snap.interactive:
+                    bypass = _consume_user_trigger_flag(full_name)
+                    if bypass:
+                        log_file.write(
+                            b"interactive: bypass (user-triggered)\n"
+                        )
+                    else:
+                        pending_flag = sd / "pending.flag"
+                        pending_flag.write_bytes(b"")
+                        try:
+                            choice = _interactive_wait_and_prompt(
+                                snap, log_file
+                            )
+                        finally:
+                            pending_flag.unlink(missing_ok=True)
+                        if choice == "cancel":
+                            result = JobRunResult(
+                                job=full_name,
+                                host=host,
+                                platform=platform,
+                                started_at=started_iso,
+                                ended_at=_now_iso(),
+                                duration_sec=time.time() - started,
+                                exit_class="canceled",
+                                exit_code=0,
+                                signal=None,
+                                gate=gate,
+                                log_path=str(log_path),
+                                log_bytes_this_run=(
+                                    log_path.stat().st_size - log_size_before
+                                ),
+                                notifications={},
+                            )
+                            _write_last_run(
+                                last_run_path, dataclasses.asdict(result)
+                            )
+                            return 0
+
                 argv = _command_argv(snap)
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
                 try:
@@ -3472,6 +3857,20 @@ def _child_timeout_from_snapshot(child_full_name: str) -> float:
     return float(cs.group_budget_sec)
 
 
+def _child_is_interactive(child_full_name: str) -> bool:
+    """True iff the child is a job whose pinned snapshot has
+    `interactive = True`. Groups and non-interactive jobs return
+    False. A missing snapshot returns False so the existing
+    UnitNotInstalledError path inside the sync dispatch still
+    fires and surfaces the issue with its usual error.
+    """
+    try:
+        cs = _load_snapshot(child_full_name)
+    except PreconditionError:
+        return False
+    return isinstance(cs, JobSnapshot) and cs.interactive
+
+
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
@@ -3531,6 +3930,38 @@ def run_group(
 
                 deadline = time.monotonic() + group_budget
                 for child_full_name in child_full:
+                    if _child_is_interactive(child_full_name):
+                        # Interactive children fire async (no wait,
+                        # no budget deduction). Their own runner does
+                        # the user-active wait + dialog independently;
+                        # the parent group's outcome doesn't depend on
+                        # whether the user ever clicked Run Job.
+                        log_file.write(
+                            (
+                                f"-> {child_full_name}: dispatched "
+                                f"(interactive, async)\n"
+                            ).encode()
+                        )
+                        try:
+                            _trigger_unit(child_full_name, platform)
+                            children.append(
+                                GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class="dispatched",
+                                    exit_code=0,
+                                )
+                            )
+                        except UnitNotInstalledError as e:
+                            log_file.write(f"   {e}\n".encode())
+                            children.append(
+                                GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class="fail",
+                                    exit_code=int(ExitCode.PRECONDITION),
+                                )
+                            )
+                        continue
+
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         log_file.write(
@@ -4419,10 +4850,13 @@ def _is_launchd_loaded(label: str) -> bool:
 def _last_run_state(name: str) -> str:
     """Return LAST axis value for a stamped entity.
 
-    Lock-held implies a run is currently in flight; otherwise read
-    last-run.json's recorded exit_class. Absence of either means the
-    entity has never run -- new install, group-only job that's never
-    been triggered, etc.
+    Lock-held implies a run is currently in flight: "pending" when
+    the in-flight run is an interactive job sitting in its wait
+    loop (signaled by a `pending.flag` file in the state dir),
+    "running" otherwise. Without the lock, read last-run.json's
+    recorded exit_class. Absence of either means the entity has
+    never run -- new install, group-only job that's never been
+    triggered, etc.
     """
     sd = STATE_DIR / name
     lock_path = sd / "run.lock"
@@ -4431,6 +4865,8 @@ def _last_run_state(name: str) -> str:
             with _acquire_lock(lock_path):
                 pass
         except LockBusyError:
+            if (sd / "pending.flag").exists():
+                return "pending"
             return "running"
     last_run = sd / "last-run.json"
     if not last_run.exists():
@@ -4440,7 +4876,7 @@ def _last_run_state(name: str) -> str:
     except (OSError, json.JSONDecodeError):
         return "unknown"
     cls = raw.get("exit_class")
-    if cls in ("ok", "fail", "timeout", "gated", "signal"):
+    if cls in ("ok", "fail", "timeout", "gated", "signal", "canceled"):
         return cls if cls != "signal" else "fail"
     return "unknown"
 
@@ -4613,7 +5049,9 @@ def _disable_unit(name: str, platform: str) -> None:
     )
 
 
-def _trigger_unit(name: str, platform: str) -> None:
+def _trigger_unit(
+    name: str, platform: str, *, triggered_by_user: bool = False
+) -> None:
     """Ask the platform scheduler to fire `name` immediately.
 
     On darwin, `launchctl kickstart` invokes the agent now (rather
@@ -4625,6 +5063,16 @@ def _trigger_unit(name: str, platform: str) -> None:
     no-op -- the in-flight run continues and there is no fresh
     fire. Waiters that need to know the next completion's outcome
     use `_trigger_unit_sync` instead.
+
+    `triggered_by_user` writes a one-shot sentinel flag in the
+    entity's state dir, consumed by `crony run` on startup to
+    skip the interactive wait. Group-dispatched fires
+    (`run_group` -> `_trigger_unit_sync` -> `_trigger_unit`) keep
+    the default False so a group never accidentally bypasses an
+    interactive wait. Under the current validation rules groups
+    can't contain interactive jobs so this is defense-in-depth,
+    but it keeps the signal scoped to the dispatcher rather than
+    sprinkled at the CLI handler.
 
     Raises `UnitNotInstalledError` if the platform unit file
     doesn't exist. Refusing early matters for the group-dispatch
@@ -4639,20 +5087,59 @@ def _trigger_unit(name: str, platform: str) -> None:
             f"unit for {name!r} is not installed on this host "
             f"(run `crony apply` to re-pin the parent's snapshot)"
         )
-    if platform == "linux":
-        # The timer's job is to fire the .service; trigger by
-        # starting the service directly.
-        service_unit = f"{BASENAME}-{name}.service"
-        subprocess.run(
-            ["systemctl", "--user", "start", service_unit],
-            check=True,
-        )
-        return
-    label = _label_for(name)
-    subprocess.run(
-        ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
-        check=True,
-    )
+    if triggered_by_user:
+        _write_user_trigger_flag(name)
+    succeeded = False
+    try:
+        if platform == "linux":
+            # The timer's job is to fire the .service; trigger
+            # by starting the service directly.
+            service_unit = f"{BASENAME}-{name}.service"
+            subprocess.run(
+                ["systemctl", "--user", "start", service_unit],
+                check=True,
+            )
+        else:
+            label = _label_for(name)
+            subprocess.run(
+                ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
+                check=True,
+            )
+        succeeded = True
+    finally:
+        if triggered_by_user and not succeeded:
+            # Don't strand the bypass flag on disk if the kickstart
+            # never reached the scheduler. The next legitimately
+            # scheduled fire would otherwise consume it and skip
+            # its wait silently.
+            _user_trigger_flag_path(name).unlink(missing_ok=True)
+
+
+def _user_trigger_flag_path(name: str) -> Path:
+    """Filesystem path of the one-shot user-trigger sentinel."""
+    return STATE_DIR / name / "user-trigger.flag"
+
+
+def _write_user_trigger_flag(name: str) -> None:
+    """Write the user-trigger sentinel just before kicking the
+    platform scheduler. Empty file -- presence is the signal.
+    """
+    sd = STATE_DIR / name
+    sd.mkdir(parents=True, exist_ok=True)
+    _user_trigger_flag_path(name).write_bytes(b"")
+
+
+def _consume_user_trigger_flag(name: str) -> bool:
+    """Read-and-delete the user-trigger sentinel. Returns True if
+    the flag was present (the runner should bypass the interactive
+    wait), False otherwise.
+    """
+    p = _user_trigger_flag_path(name)
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 class TriggerStartTimeout(JobTimeoutError):
@@ -4683,6 +5170,7 @@ def _trigger_unit_sync(
     *,
     job_timeout: float,
     trigger_timeout: float,
+    triggered_by_user: bool = False,
 ) -> dict[str, Any]:
     """Fire `full_name` via the platform and wait for completion.
 
@@ -4727,7 +5215,7 @@ def _trigger_unit_sync(
     last_run_path = sd / "last-run.json"
     platform = current_platform()
 
-    _trigger_unit(full_name, platform)
+    _trigger_unit(full_name, platform, triggered_by_user=triggered_by_user)
 
     started_at = time.monotonic()
     while True:
@@ -5389,7 +5877,7 @@ def do_trigger(
 
     if not wait:
         for full in normalized:
-            _trigger_unit(full, platform)
+            _trigger_unit(full, platform, triggered_by_user=True)
             logger.info("%s: triggered", full)
         return
 
@@ -5420,7 +5908,12 @@ def do_trigger(
             if trigger_timeout is not None
             else float(b.config.defaults.trigger_timeout_sec)
         )
-        rec = _trigger_unit_sync(full, job_timeout=timeout, trigger_timeout=tt)
+        rec = _trigger_unit_sync(
+            full,
+            job_timeout=timeout,
+            trigger_timeout=tt,
+            triggered_by_user=True,
+        )
         cls = rec.get("exit_class", "ok")
         rc = _trigger_exit_code(rec)
         logger.info("%s: %s (exit %s)", full, cls, rc)

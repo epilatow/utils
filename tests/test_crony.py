@@ -651,6 +651,64 @@ class TestParseJob:
         assert cfg.jobs["a"].schedule is None
         assert cfg.jobs["a"].interval is None
 
+    def test_interactive_auto_tags_platform_darwin(self) -> None:
+        cfg = crony.parse_config(self._cfg(_job(interactive=True)))
+        assert cfg.jobs["j"].interactive is True
+        assert cfg.jobs["j"].platforms == ["darwin"]
+
+    def test_interactive_explicit_darwin_platform_ok(self) -> None:
+        cfg = crony.parse_config(
+            self._cfg(_job(interactive=True, platforms=["darwin"]))
+        )
+        assert cfg.jobs["j"].interactive is True
+
+    def test_interactive_with_linux_platform_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive=True, platforms=["linux"])),
+            "j",
+            "implies platforms",
+        )
+
+    def test_interactive_with_multi_platform_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive=True, platforms=["darwin", "linux"])),
+            "j",
+            "implies platforms",
+        )
+
+    def test_interactive_active_resolves_to_seconds(self) -> None:
+        cfg = crony.parse_config(
+            self._cfg(_job(interactive=True, interactive_active="5min"))
+        )
+        assert cfg.jobs["j"].interactive_active_sec == 300
+
+    def test_interactive_delay_resolves_to_seconds(self) -> None:
+        cfg = crony.parse_config(
+            self._cfg(_job(interactive=True, interactive_delay="2h"))
+        )
+        assert cfg.jobs["j"].interactive_delay_sec == 7200
+
+    def test_interactive_active_without_flag_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive_active="10min")),
+            "j",
+            "interactive = true",
+        )
+
+    def test_interactive_delay_without_flag_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive_delay="1h")),
+            "j",
+            "interactive = true",
+        )
+
+    def test_interactive_active_zero_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive=True, interactive_active="0s")),
+            "j",
+            "must be positive",
+        )
+
 
 class TestParseJobGroup:
     def test_valid_group(self) -> None:
@@ -851,6 +909,44 @@ class TestValidateConfig:
         assert "bad" in cfg.errored_job_groups
         assert "good" in cfg.job_groups
         assert "darwin" in cfg.platform_targets
+
+    def test_interactive_as_direct_target_child_ok(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                },
+                "target": {"darwin": {"jobs": ["iv"]}},
+            }
+        )
+        assert "iv" in cfg.jobs
+        assert cfg.jobs["iv"].interactive is True
+
+    def test_interactive_inside_group_is_allowed(self) -> None:
+        # The group dispatches the interactive child async, so it
+        # is allowed as a [job-group.*] member -- no demotion.
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                },
+                "job-group": {
+                    "g": {"jobs": ["iv"], "schedule": "daily"},
+                },
+                "target": {"darwin": {"jobs": ["g"]}},
+            }
+        )
+        assert "g" in cfg.job_groups
+        assert cfg.job_groups["g"].jobs == ["iv"]
+        assert "iv" in cfg.jobs
 
     def test_nested_groups_supported(self) -> None:
         # A group can reference another group; only the chain to a
@@ -2493,6 +2589,140 @@ class TestRunGroup:
         assert rec["jobs_run"][1]["exit_class"] == "ok"
         # Group rollup: a fail child surfaces at the group level.
         assert rec["exit_class"] == "fail"
+
+
+class TestRunGroupInteractive:
+    """A group that contains an interactive child fires that child
+    async (via `_trigger_unit`, not `_trigger_unit_sync`) and moves
+    on without waiting. The interactive child's own runner does its
+    wait + dialog independently, and the parent group's deadline
+    excludes the child's job_timeout_sec.
+    """
+
+    def test_interactive_child_dispatched_async(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    },
+                    "regular": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["iv", "regular"],
+                        "schedule": "daily",
+                    },
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        # Snapshots so `_child_is_interactive` can read them.
+        h.write_snap(cfg, "iv")
+        h.write_snap(cfg, "regular")
+
+        sync_calls: list[str] = []
+        async_calls: list[str] = []
+
+        def _stub_sync(
+            full_name: str,
+            *,
+            job_timeout: float,
+            trigger_timeout: float,
+            triggered_by_user: bool = False,
+        ) -> dict[str, Any]:
+            sync_calls.append(full_name)
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        def _stub_async(name: str, platform: str, **kw: Any) -> None:
+            async_calls.append(name)
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_sync)
+        monkeypatch.setattr(crony, "_trigger_unit", _stub_async)
+
+        rc = crony.run_group(h.snap(cfg, "g"))
+        assert rc == 0
+
+        # Interactive child went through the async path; the
+        # regular sibling kept the sync path.
+        assert async_calls == [h.full("iv")]
+        assert sync_calls == [h.full("regular")]
+
+        # The group's last-run.json records the dispatch as a
+        # child with exit_class="dispatched"; rollup stays "ok"
+        # because dispatched has precedence 0.
+        rec = _last_run(h.state, "g")
+        iv_rec = next(c for c in rec["jobs_run"] if c["name"] == h.full("iv"))
+        assert iv_rec["exit_class"] == "dispatched"
+        assert iv_rec["exit_code"] == 0
+        assert rec["exit_class"] == "ok"
+
+    def test_group_budget_excludes_interactive_children(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                        # Big timeout that would inflate the
+                        # group's budget if not skipped.
+                        "job_timeout_sec": 10_000,
+                    },
+                    "regular": {
+                        "command": "true",
+                        "job_timeout_sec": 100,
+                    },
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["iv", "regular"],
+                        "schedule": "daily",
+                    },
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        target = crony.resolve_target(cfg, "test-host", "darwin")
+        budget = crony.resolved_group_timeout_sec(cfg, target, "g")
+        # Only the non-interactive child contributes:
+        # 1.05 * 100 == 105.
+        assert budget == 105
+
+    def test_dispatched_does_not_poison_rollup(self) -> None:
+        # `dispatched` has precedence 0 so it ties with ok / gated
+        # in the rollup; a group with only dispatched children
+        # rolls up as "ok".
+        rollup = crony._rollup_group_exit_class(
+            [
+                crony.GroupChildResult(
+                    name="a", exit_class="dispatched", exit_code=0
+                ),
+                crony.GroupChildResult(name="b", exit_class="ok", exit_code=0),
+            ]
+        )
+        assert rollup == "ok"
+
+    def test_dispatched_rolls_up_under_fail(self) -> None:
+        rollup = crony._rollup_group_exit_class(
+            [
+                crony.GroupChildResult(
+                    name="a", exit_class="dispatched", exit_code=0
+                ),
+                crony.GroupChildResult(
+                    name="b", exit_class="fail", exit_code=1
+                ),
+            ]
+        )
+        assert rollup == "fail"
 
 
 class TestTriggerUnitNotInstalled:
@@ -7875,7 +8105,7 @@ class TestTriggerUnitSync:
         sd = h.state / full
         sd.mkdir()
 
-        def _stub_trigger(name: str, platform: str) -> None:
+        def _stub_trigger(name: str, platform: str, **kw: Any) -> None:
             # Pretend the runner ran and wrote a fresh result.
             (sd / "last-run.json").write_text(
                 '{"ended_at": "2099-01-01T00:00:00-08:00",'
@@ -7934,7 +8164,7 @@ class TestTriggerUnitSync:
         sd = h.state / full
         sd.mkdir()
 
-        def _stub_trigger(name: str, platform: str) -> None:
+        def _stub_trigger(name: str, platform: str, **kw: Any) -> None:
             # Write a last-run.json whose ended_at is the same
             # whole-second timestamp `_now_iso()` would produce
             # right now -- modeling a sub-second run.
@@ -8550,6 +8780,477 @@ class TestLifecycleSmoke:
             jobs=[], preserve_runtime=False, bundle=None, orphans=False
         )
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+
+
+class TestInteractiveHelpers:
+    """Unit tests for the darwin idle / lock / dialog helpers."""
+
+    def test_hid_idle_parses_nanoseconds(self, monkeypatch: Any) -> None:
+        sample = (
+            '  | |   "HIDIdleTime" = 7500000000\n'
+            '  | |   "HIDKeyboardCapsLockOn" = No\n'
+        )
+
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(a, 0, stdout=sample, stderr="")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._darwin_hid_idle_seconds() == 7.5
+
+    def test_hid_idle_missing_field_returns_zero(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(a, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._darwin_hid_idle_seconds() == 0.0
+
+    def test_hid_idle_subprocess_failure_returns_zero(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("ioreg not found")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._darwin_hid_idle_seconds() == 0.0
+
+    def test_screen_locked_yes(self, monkeypatch: Any) -> None:
+        out = (
+            "IOConsoleUsers = "
+            '({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserNameKey"="me"})'
+        )
+
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._darwin_screen_locked() is True
+
+    def test_screen_locked_no(self, monkeypatch: Any) -> None:
+        out = 'IOConsoleUsers = ({"kCGSSessionUserNameKey"="me"})'
+
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._darwin_screen_locked() is False
+
+    def test_wait_returns_after_continuous_active(
+        self, monkeypatch: Any
+    ) -> None:
+        # Script: first poll shows the user idle (gap), every
+        # subsequent poll shows them active. After enough active
+        # polls, the accumulator hits the threshold and the wait
+        # returns. With poll_sec=30 and required=120, the first
+        # active poll records active_since = (30 - 10) = 20s; the
+        # accumulator hits 120s when monotonic reaches 140 (poll 5).
+        idle_values = iter([100.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        monkeypatch.setattr(
+            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        )
+        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        now = [0.0]
+        monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            crony.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)
+        )
+        crony._wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
+        # Reached the return path; bound the elapsed time so a
+        # broken loop would have hung the test.
+        assert now[0] <= 300
+
+    def test_wait_resets_on_idle_break(self, monkeypatch: Any) -> None:
+        # Active for two polls, then a long idle gap resets the
+        # accumulator, then active again until threshold met.
+        idle_values = iter(
+            [10.0, 10.0, 200.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+        )
+        monkeypatch.setattr(
+            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        )
+        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        now = [0.0]
+        monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            crony.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)
+        )
+        crony._wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
+
+    def test_wait_treats_locked_screen_as_idle(self, monkeypatch: Any) -> None:
+        # Even with idle == 0, a locked screen prevents the active
+        # accumulator from advancing.
+        locked_values = iter([True, True, False, False, False, False, False])
+        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 0.0)
+        monkeypatch.setattr(
+            crony, "_darwin_screen_locked", lambda: next(locked_values)
+        )
+        now = [0.0]
+        monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            crony.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)
+        )
+        crony._wait_for_user_active(60, poll_sec=30, idle_break_sec=60)
+
+    def test_wait_bypass_check_short_circuits(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 0.0)
+        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        # Trip the bypass on the first poll; idle / lock checks are
+        # never consulted.
+        assert (
+            crony._wait_for_user_active(
+                100_000, bypass_check=lambda: True, poll_sec=1
+            )
+            is False
+        )
+
+    def test_wait_returns_true_when_threshold_met(
+        self, monkeypatch: Any
+    ) -> None:
+        # Same harness as the threshold-met test, but with a
+        # bypass_check that always returns False -- the wait should
+        # complete normally and return True.
+        idle_values = iter([100.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        monkeypatch.setattr(
+            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        )
+        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        now = [0.0]
+        monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            crony.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)
+        )
+        assert (
+            crony._wait_for_user_active(
+                120,
+                bypass_check=lambda: False,
+                poll_sec=30,
+                idle_break_sec=60,
+            )
+            is True
+        )
+
+    def test_delay_or_bypass_completes_full_delay(
+        self, monkeypatch: Any
+    ) -> None:
+        now = [0.0]
+        monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            crony.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)
+        )
+        assert (
+            crony._delay_or_bypass(120, bypass_check=lambda: False, poll_sec=30)
+            is True
+        )
+        assert now[0] >= 120
+
+    def test_delay_or_bypass_short_circuits_on_bypass(
+        self, monkeypatch: Any
+    ) -> None:
+        # First two polls return False; third returns True. The
+        # sleep should exit early without completing the full delay.
+        bypass_values = iter([False, False, True])
+        monkeypatch.setattr(crony.time, "monotonic", lambda: 0.0)
+        sleeps: list[float] = []
+        monkeypatch.setattr(crony.time, "sleep", sleeps.append)
+        assert (
+            crony._delay_or_bypass(
+                3600,
+                bypass_check=lambda: next(bypass_values),
+                poll_sec=30,
+            )
+            is False
+        )
+        # Two sleep chunks happened (one between each bypass check)
+        # before the third check fired.
+        assert sleeps == [30, 30]
+
+    def test_dialog_run_button(self, monkeypatch: Any) -> None:
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                a, 0, stdout="button returned:Run Job\n", stderr=""
+            )
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._show_interactive_dialog("foo", "msg") == "run"
+
+    def test_dialog_delay_button(self, monkeypatch: Any) -> None:
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                a, 0, stdout="button returned:Delay Job\n", stderr=""
+            )
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._show_interactive_dialog("foo", "msg") == "delay"
+
+    def test_dialog_cancel_button(self, monkeypatch: Any) -> None:
+        # osascript exits non-zero when the cancel button is the
+        # bound cancel.
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(a, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._show_interactive_dialog("foo", "msg") == "cancel"
+
+    def test_dialog_osascript_missing_maps_to_cancel(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError("osascript not found")
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        assert crony._show_interactive_dialog("foo", "msg") == "cancel"
+
+
+class TestUserTriggerFlag:
+    """The one-shot sentinel file written by `_trigger_unit` when
+    the user invokes `crony trigger` and consumed by `crony run` to
+    bypass the interactive wait.
+    """
+
+    def test_write_and_consume_roundtrip(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        # No flag yet -> consume returns False.
+        assert not crony._consume_user_trigger_flag(full)
+        crony._write_user_trigger_flag(full)
+        assert (h.state / full / "user-trigger.flag").exists()
+        assert crony._consume_user_trigger_flag(full)
+        assert not (h.state / full / "user-trigger.flag").exists()
+        # Second consume on absent flag returns False.
+        assert not crony._consume_user_trigger_flag(full)
+
+    def test_trigger_unit_writes_flag_only_when_user_initiated(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        unit = tmp_path / "fake.plist"
+        unit.write_text("")
+        monkeypatch.setattr(crony, "_dispatch_unit_path", lambda *a, **kw: unit)
+        monkeypatch.setattr(
+            crony.subprocess,
+            "run",
+            lambda *a, **kw: subprocess.CompletedProcess(a, 0),
+        )
+        crony._trigger_unit(full, "darwin", triggered_by_user=True)
+        flag = h.state / full / "user-trigger.flag"
+        assert flag.exists()
+        flag.unlink()
+        crony._trigger_unit(full, "darwin")
+        assert not flag.exists()
+
+    def test_trigger_unit_unlinks_flag_on_kickstart_failure(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # If the platform-scheduler kick fails after we've written
+        # the bypass flag, the flag must NOT be left on disk -- the
+        # next legitimately scheduled fire would otherwise consume
+        # it and silently skip its wait.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        unit = tmp_path / "fake.plist"
+        unit.write_text("")
+        monkeypatch.setattr(crony, "_dispatch_unit_path", lambda *a, **kw: unit)
+
+        def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+            raise subprocess.CalledProcessError(1, a[0])
+
+        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        with pytest.raises(subprocess.CalledProcessError):
+            crony._trigger_unit(full, "darwin", triggered_by_user=True)
+        assert not (h.state / full / "user-trigger.flag").exists()
+
+
+class TestRunJobInteractive:
+    """End-to-end run_job behavior for interactive jobs. The wait /
+    prompt helper is monkeypatched to return scripted choices so
+    the tests don't depend on idle detection or osascript.
+    """
+
+    def test_run_path_execs_command(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                }
+            },
+            default_target_jobs=["iv"],
+        )
+        monkeypatch.setattr(
+            crony,
+            "_interactive_wait_and_prompt",
+            lambda snap, log_file: "run",
+        )
+        rc = crony.run_job(h.snap(cfg, "iv"))
+        assert rc == 0
+        rec = _last_run(h.state, "iv")
+        assert rec["exit_class"] == "ok"
+        assert not (h.state / h.full("iv") / "pending.flag").exists()
+
+    def test_cancel_path_records_canceled_without_exec(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        sentinel = tmp_path / "exec-sentinel"
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": f"touch {sentinel}",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                }
+            },
+            default_target_jobs=["iv"],
+        )
+        monkeypatch.setattr(
+            crony,
+            "_interactive_wait_and_prompt",
+            lambda snap, log_file: "cancel",
+        )
+        rc = crony.run_job(h.snap(cfg, "iv"))
+        assert rc == 0
+        rec = _last_run(h.state, "iv")
+        assert rec["exit_class"] == "canceled"
+        # The wrapped command never ran.
+        assert not sentinel.exists()
+        assert not (h.state / h.full("iv") / "pending.flag").exists()
+
+    def test_user_trigger_flag_bypasses_wait_loop(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                }
+            },
+            default_target_jobs=["iv"],
+        )
+        full = h.full("iv")
+        # Snapshot resolution creates the state dir, but the flag
+        # might be written by trigger BEFORE the runner starts. Mimic
+        # that: write the flag before run_job.
+        (h.state / full).mkdir(parents=True, exist_ok=True)
+        crony._write_user_trigger_flag(full)
+
+        called: list[bool] = []
+
+        def _no_wait(snap: Any, log_file: Any) -> str:
+            called.append(True)
+            return "run"
+
+        monkeypatch.setattr(crony, "_interactive_wait_and_prompt", _no_wait)
+        rc = crony.run_job(h.snap(cfg, "iv"))
+        assert rc == 0
+        assert called == []
+        rec = _last_run(h.state, "iv")
+        assert rec["exit_class"] == "ok"
+        # The flag was consumed.
+        assert not (h.state / full / "user-trigger.flag").exists()
+
+    def test_user_trigger_mid_wait_breaks_out_and_execs(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The P1 case from the prior review: a `crony trigger` that
+        # arrives WHILE the interactive runner is already in its
+        # wait loop must break the waiter out and run the command.
+        # Without this guarantee, the bypass flag would sit on disk
+        # until the next scheduled fire.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                    }
+                }
+            },
+            default_target_jobs=["iv"],
+        )
+        full = h.full("iv")
+        # Drive the real _interactive_wait_and_prompt: HID idle is
+        # high (idle break), screen is locked -- no natural
+        # accumulation -- but on the second poll a `crony trigger`
+        # writes the bypass flag and the wait short-circuits.
+        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 999.0)
+        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: True)
+        sleeps = [0]
+
+        def fake_sleep(s: float) -> None:
+            sleeps[0] += 1
+            if sleeps[0] == 1:
+                (h.state / full).mkdir(parents=True, exist_ok=True)
+                crony._write_user_trigger_flag(full)
+
+        monkeypatch.setattr(crony.time, "sleep", fake_sleep)
+
+        rc = crony.run_job(h.snap(cfg, "iv"))
+        assert rc == 0
+        rec = _last_run(h.state, "iv")
+        assert rec["exit_class"] == "ok"
+        # The flag was consumed during the wait.
+        assert not (h.state / full / "user-trigger.flag").exists()
+
+
+class TestLastRunStateInteractive:
+    """`_last_run_state` reports `pending` for an interactive job
+    sitting in its wait loop, and `canceled` for a completed run
+    whose user clicked Cancel Job.
+    """
+
+    def test_pending_when_lock_held_and_flag_present(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        sd = h.state / full
+        sd.mkdir(parents=True)
+        (sd / "pending.flag").write_bytes(b"")
+        with crony._acquire_lock(sd / "run.lock"):
+            assert crony._last_run_state(full) == "pending"
+
+    def test_running_when_lock_held_without_flag(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        sd = h.state / full
+        sd.mkdir(parents=True)
+        with crony._acquire_lock(sd / "run.lock"):
+            assert crony._last_run_state(full) == "running"
+
+    def test_canceled_from_last_run_json(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("iv")
+        sd = h.state / full
+        sd.mkdir(parents=True)
+        (sd / "last-run.json").write_text(
+            '{"exit_class": "canceled", '
+            '"started_at": "2099-01-01T00:00:00-08:00"}',
+            encoding="utf-8",
+        )
+        assert crony._last_run_state(full) == "canceled"
 
 
 if __name__ == "__main__":
