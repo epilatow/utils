@@ -5865,6 +5865,78 @@ class TestEnableDisable:
         assert any(h.full("g") in lbl for lbl in labels)
 
 
+class TestStatusUuidColumn:
+    """`uuid` is an opt-in column. Default `cols=None` hides it;
+    `cols="job,uuid"` surfaces the entity's stable identity for
+    scripts that want to correlate status output with disk state
+    or with the config file's `uuid =` keys.
+    """
+
+    def test_opt_in_uuid_column_renders(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,uuid",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        assert "UUID" in out
+        assert cfg.jobs["j"].uuid in out
+
+    def test_uuid_column_omitted_by_default(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        assert "UUID" not in out
+        assert cfg.jobs["j"].uuid not in out
+
+    def test_uuid_column_for_orphan_row_comes_from_snapshot(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        sd = h.fabricate_orphan("ghost")
+        ghost_uuid = sd.name
+        h.config({}, default_target_jobs=[])
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,uuid,config",
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        assert ghost_uuid in out
+        assert "orphan" in out
+
+
 class TestStatusReport:
     def test_prints_table(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -6406,6 +6478,7 @@ class TestStatusReport:
         assert "LAST" in header
         assert "LAST RAN" in header
         assert "MASKED BY" in header
+        assert "UUID" in header
 
     def test_cols_default_alias_matches_no_cols(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7149,6 +7222,7 @@ class TestStatusReport:
             "unit-name",
             "unit-schedule",
             "pending-schedule",
+            "uuid",
         ]:
             assert col in text
         # `default` alias enumerates its expansion verbatim so the

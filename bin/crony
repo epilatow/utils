@@ -6777,6 +6777,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-name": "UNIT NAME",
     "unit-schedule": "UNIT SCHEDULE",
     "pending-schedule": "PENDING SCHEDULE",
+    "uuid": "UUID",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job",
@@ -6858,6 +6859,11 @@ Columns
   unit-schedule     The applied schedule from the on-disk snapshot, with
                     no asterisk and no fallback to pending. Empty when
                     no snapshot exists or it predates the schedule field.
+  uuid              The entry's stable per-bundle identity. Sourced from
+                    the live config when the entry is still defined, or
+                    from the on-disk snapshot for orphan rows whose
+                    config entry has since been removed. Empty when
+                    neither side has a uuid to report.
 
 Aliases
 -------
@@ -7322,6 +7328,11 @@ def do_status(
             any_stale = True
             groups_cell = f"{groups_cell} *"
         unit_name = _unit_name_for(full, entry, platform, config)
+        if entry is not None:
+            entity_uuid = entry.uuid
+        else:
+            cur_ref = config.current.by_full_name.get(full)
+            entity_uuid = cur_ref.uuid if cur_ref is not None else ""
         rows.append(
             {
                 "job": full,
@@ -7336,6 +7347,7 @@ def do_status(
                 "unit-name": unit_name,
                 "unit-schedule": unit_sched_cell,
                 "pending-schedule": pending_sched_cell,
+                "uuid": entity_uuid,
             }
         )
 
