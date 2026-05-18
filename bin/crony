@@ -2466,7 +2466,7 @@ def resolved_group_timeout_sec(
 # at fire time.
 
 
-_SNAPSHOT_SCHEMA: int = 3
+_SNAPSHOT_SCHEMA: int = 4
 
 
 @dataclass(frozen=True)
@@ -2534,8 +2534,11 @@ class Job:
 @dataclass
 class JobGroup:
     """Resolved runtime parameters for a job-group. `children` are
-    full namespaced names; `group_budget_sec` is the pre-padded
-    cumulative deadline computed once at apply time.
+    bundle-scoped uuids; the runner resolves each back to its
+    current full name via the child's own snapshot at dispatch
+    time so a rename in config doesn't flip the parent's hash.
+    `group_budget_sec` is the pre-padded cumulative deadline
+    computed once at apply time.
     """
 
     schema: int
@@ -2568,20 +2571,12 @@ def _state_dir_by_name(full_name: str) -> Path | None:
     one matches. None when no matching snapshot exists (the entry
     was never applied, or its snapshot is missing / unreadable).
 
-    When more than one state dir reports the same `name` -- e.g.
-    after a `destroy --preserve-runtime` leaves a residual
-    snapshot on disk and the user then swaps the entry's uuid in
-    config (a manual edit, or removing the `uuid =` line and re-
-    running `crony config update` to mint a fresh one) before
-    re-applying -- the live entry wins: a dir with a `hash` stamp
-    present takes precedence over a dir whose snapshot is leftover
-    residue. Without this preference, the runner / `crony logs
-    <name>` would non-deterministically land on the stale
-    snapshot.
-
-    Used by code paths that take a name on the command line (the
-    runner, `crony logs`, `crony trigger --wait`) and don't have
-    the live config in hand to look up the uuid directly.
+    Used by the runner-side code paths (the runner shim, `crony
+    trigger --wait`) that take a name on the command line and
+    don't have a Config in hand to look up the uuid directly.
+    Status / logs / audit / destroy use `Config.resolve` instead,
+    which reads from the once-built `Config.pending.by_full_name`
+    / `Config.current.by_full_name` indexes.
     """
     bundle_name, _, _ = full_name.partition(".")
     if not bundle_name:
@@ -2589,8 +2584,6 @@ def _state_dir_by_name(full_name: str) -> Path | None:
     bundle_dir = STATE_DIR / bundle_name
     if not bundle_dir.is_dir():
         return None
-    live: Path | None = None
-    residual: Path | None = None
     for uuid_dir in bundle_dir.iterdir():
         snap_p = uuid_dir / "snapshot.json"
         if not snap_p.is_file():
@@ -2599,14 +2592,9 @@ def _state_dir_by_name(full_name: str) -> Path | None:
             raw = json.loads(snap_p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if raw.get("name") != full_name:
-            continue
-        if (uuid_dir / "hash").is_file():
-            live = uuid_dir
-            break
-        if residual is None:
-            residual = uuid_dir
-    return live or residual
+        if raw.get("name") == full_name:
+            return uuid_dir
+    return None
 
 
 def _resolve_job_snapshot(
@@ -2679,11 +2667,17 @@ def _resolve_group_snapshot(
     dispatcher trying to trigger a unit that wasn't installed.
     """
     sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    children = [
-        f"{bundle_name}.{c}"
-        for c in group.jobs
-        if c in sel_jobs or c in sel_groups
-    ]
+    # Children are stored as uuids (not full names) so renaming a
+    # child in config doesn't flip the parent's hash -- the uuid
+    # edge is unchanged. The runner resolves each child uuid to
+    # its current full name by reading the child's snapshot at
+    # dispatch time.
+    children: list[str] = []
+    for c in group.jobs:
+        if c in sel_jobs:
+            children.append(config.jobs[c].uuid)
+        elif c in sel_groups:
+            children.append(config.job_groups[c].uuid)
     return JobGroup(
         schema=_SNAPSHOT_SCHEMA,
         kind="group",
@@ -4375,6 +4369,29 @@ def run_job(
         return int(ExitCode.LOCK_BUSY)
 
 
+def _child_full_name_from_uuid(
+    parent_bundle: str, child_uuid: str
+) -> str | None:
+    """Resolve a child's uuid (as stored in a parent's
+    `snapshot.children`) to its full namespaced name by reading
+    the child's own snapshot. The runner dispatches each child via
+    the platform unit label, which is keyed by full name; storing
+    uuids on the parent keeps the parent's hash stable across
+    child renames, at the cost of one snapshot read per child at
+    dispatch time. Returns None when the child snapshot is missing
+    or unreadable.
+    """
+    snap_p = _entity_state_dir(parent_bundle, child_uuid) / "snapshot.json"
+    if not snap_p.is_file():
+        return None
+    try:
+        raw = json.loads(snap_p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = raw.get("name")
+    return name if isinstance(name, str) else None
+
+
 def _child_timeout_from_snapshot(child_full_name: str) -> float:
     """Per-child wait cap for the group runner. Reads the child's
     pinned snapshot rather than the live config, so the cap is
@@ -4456,11 +4473,27 @@ def run_group(
             log_file = open(log_path, "ab", buffering=0)
             children: list[GroupChildResult] = []
             try:
-                child_full = list(snap.children)
+                # snap.children stores uuids; resolve each to its
+                # current full name via the child's own snapshot.
+                # A None resolution means the child has no state
+                # dir on this host -- log and treat as a fail row
+                # so the group rollup catches it.
+                resolved_children: list[tuple[str, str | None]] = [
+                    (
+                        child_uuid,
+                        _child_full_name_from_uuid(snap.bundle, child_uuid),
+                    )
+                    for child_uuid in snap.children
+                ]
+                child_full = [n for _u, n in resolved_children if n is not None]
+                header_children = [
+                    n if n is not None else f"{snap.bundle}:{u}"
+                    for u, n in resolved_children
+                ]
                 header = (
                     f"\n=== {started_iso} group {full_name} "
                     f"budget={group_budget}s "
-                    f"children={child_full} ===\n"
+                    f"children={header_children} ===\n"
                 ).encode()
                 log_file.write(header)
 
@@ -4562,6 +4595,28 @@ def run_group(
                             exit_code=rc,
                         )
                     )
+
+                # Synthetic FAIL rows for children whose snapshot is
+                # absent on this host (rename mid-flight, partial
+                # state wipe, or a uuid the parent's snapshot still
+                # references but no child snapshot resolves). Emitted
+                # after the dispatch loop so log order matches the
+                # header's child list.
+                for child_uuid, resolved_name in resolved_children:
+                    if resolved_name is None:
+                        log_file.write(
+                            (
+                                f"-> uuid {child_uuid}: no snapshot on this "
+                                f"host (FAIL)\n"
+                            ).encode()
+                        )
+                        children.append(
+                            GroupChildResult(
+                                name=f"{snap.bundle}:{child_uuid}",
+                                exit_class="fail",
+                                exit_code=int(ExitCode.PRECONDITION),
+                            )
+                        )
 
                 result = GroupRunResult(
                     host=host,
@@ -5109,16 +5164,13 @@ def apply_one(
     return "added" if old_hash is None else "updated"
 
 
-def destroy_one(name: str, *, preserve_runtime: bool = False) -> None:
+def destroy_one(name: str) -> None:
     """Remove a single name's platform unit and apply-time state.
 
-    Default wipes the entire entry dir along with the platform
-    unit files, leaving no on-disk trace of the entry on this
-    host. `preserve_runtime=True` keeps the run-time artifacts
-    (run.log, last-run.json, run.lock) so a later post-mortem is
-    still possible -- only the unit, hash, and snapshot are
-    removed. Errok throughout so a partially-installed unit can
-    still be cleaned up.
+    Always a full wipe: the platform unit files and the entire
+    uuid-keyed state dir go away in one shot. Tolerant of partial
+    state throughout so a partially-installed unit can still be
+    cleaned up.
     """
     platform = current_platform()
     _deactivate_unit(name, platform)
@@ -5133,19 +5185,7 @@ def destroy_one(name: str, *, preserve_runtime: bool = False) -> None:
     sd = _state_dir_by_name(name)
     if sd is None:
         return
-    if preserve_runtime:
-        # Keep snapshot.json so the entity remains addressable by
-        # name through `_state_dir_by_name`: a follow-up non-preserve
-        # destroy can still resolve this dir from the entry's full
-        # name, and the live-vs-residual tiebreak inside
-        # `_state_dir_by_name` (preferring a uuid dir with a `hash`
-        # stamp) keeps subsequent `crony logs` / runner traffic on
-        # the live re-apply rather than this residue. The `hash`
-        # stamp goes away so `config=stale` surfaces and the user
-        # is prompted to re-apply or fully wipe.
-        (sd / "hash").unlink(missing_ok=True)
-    else:
-        shutil.rmtree(sd)
+    shutil.rmtree(sd)
 
 
 def _iter_state_entities() -> Iterator[tuple[str, str, Path]]:
@@ -5166,8 +5206,8 @@ def _iter_state_entities() -> Iterator[tuple[str, str, Path]]:
 
 def _recover_full_name(state_dir: Path) -> str | None:
     """Return the full namespaced name a state dir was last
-    applied under, or None when the snapshot is missing /
-    unreadable (e.g. after a `--preserve-runtime` destroy).
+    applied under, or None when the snapshot is missing or
+    unreadable.
     """
     snap_p = state_dir / "snapshot.json"
     if not snap_p.is_file():
@@ -5184,29 +5224,13 @@ def _state_dir_stamps() -> set[str]:
     """Full names whose state dir contains a `hash` stamp.
 
     Names are recovered from `snapshot.json`'s `name` field; a
-    state dir whose snapshot has been removed (e.g. via
-    `--preserve-runtime`) is therefore invisible to this set.
+    state dir whose snapshot is missing or unreadable is
+    invisible to this set.
     """
     out: set[str] = set()
     for _bundle, _uuid, state_dir in _iter_state_entities():
         if not (state_dir / "hash").is_file():
             continue
-        name = _recover_full_name(state_dir)
-        if name is not None:
-            out.add(name)
-    return out
-
-
-def _state_dir_names() -> set[str]:
-    """Full names with a state dir on this host, with or without a hash.
-
-    Broader than `_state_dir_stamps()`: a state dir whose `hash`
-    was stripped by a `--preserve-runtime` destroy still counts
-    as long as `snapshot.json` is still present (the runtime-only
-    leftover case the flag is designed for).
-    """
-    out: set[str] = set()
-    for _bundle, _uuid, state_dir in _iter_state_entities():
         name = _recover_full_name(state_dir)
         if name is not None:
             out.add(name)
@@ -5241,7 +5265,7 @@ def _platform_unit_names() -> set[str]:
 
 
 def stamped_names() -> set[str]:
-    """Names crony has actively installed on this host.
+    """Names crony has any on-disk remnant of on this host.
 
     Union of `_state_dir_stamps()` (hash present, the normal
     "applied via crony" case) and `_platform_unit_names()` (units
@@ -5250,27 +5274,8 @@ def stamped_names() -> set[str]:
     hash to detect drift; with unit-only, we can still report
     the entry as `orphan` and let `crony destroy` clean up the
     unit files.
-
-    Used by callers that need an entry actually wired up on the
-    host: `apply` (orphan removal), `enable`, `disable`,
-    `trigger`. For the broader "any leftover" set that includes
-    state-dir-only remnants from prior non-purge destroys, see
-    `discovered_names()`.
     """
     return _state_dir_stamps() | _platform_unit_names()
-
-
-def discovered_names() -> set[str]:
-    """Every name crony has any on-disk remnant of on this host.
-
-    Superset of `stamped_names()` that also includes state dirs
-    surviving from a `--preserve-runtime` destroy -- the dir
-    lingers with `run.log` / `last-run.json` / `run.lock` but no
-    hash and no unit. Without this set those names would be
-    invisible to status / audit / destroy, and a follow-up
-    destroy could not find them to clean up.
-    """
-    return _state_dir_names() | _platform_unit_names()
 
 
 # =============================================================================
@@ -6300,17 +6305,14 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 
 def do_destroy(
     jobs: list[str],
-    preserve_runtime: bool,
     bundle: str | None,
     orphans: bool,
 ) -> None:
-    """Remove platform units.
+    """Remove platform units. Always a full wipe -- the platform
+    unit files and the entry's state dir both go away.
 
     No args: factory reset -- every crony-managed remnant on this
-    host. Discovery covers state dirs (with or without hash) plus
-    platform unit files, so leftovers from an earlier
-    `--preserve-runtime` destroy are reachable without tracking
-    paths down by hand.
+    host. Discovery covers state dirs plus platform unit files.
 
     With `--bundle <name>` and no positional args: scope the reset
     to that bundle's discovered names. Other bundles' remnants
@@ -6326,12 +6328,6 @@ def do_destroy(
     discovered set; refuses if a name's run.lock is currently
     held. Under `--bundle`, bare names resolve in that bundle and
     qualified names must match it.
-
-    `preserve_runtime=True` (CLI: `--preserve-runtime`) keeps
-    `run.log`, `last-run.json`, and `run.lock` for post-mortem
-    review; the unit, hash, and snapshot are still removed. The
-    default fully wipes the entry's state dir so destroy leaves
-    no on-disk trace.
     """
     if orphans and jobs:
         raise UsageError(
@@ -6345,7 +6341,7 @@ def do_destroy(
         # name with an on-disk remnant (so a leftover state dir or
         # unit can still be destroyed after the bundle is gone).
         defined = set(by_full.keys()) | bundles.all_full_names()
-        known = defined | discovered_names()
+        known = defined | stamped_names()
         if bundle is not None:
             known = bundle_prefix_filter(known, bundle)
         normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
@@ -6354,7 +6350,7 @@ def do_destroy(
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
     else:
-        names = discovered_names()
+        names = stamped_names()
         if orphans:
             _by_full, selected = _selected_full_names_per_bundle(bundles)
             names = names - selected
@@ -6375,12 +6371,8 @@ def do_destroy(
                 raise LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 )
-        destroy_one(full, preserve_runtime=preserve_runtime)
-        logger.info(
-            "%s: %s",
-            full,
-            "destroyed (runtime kept)" if preserve_runtime else "destroyed",
-        )
+        destroy_one(full)
+        logger.info("%s: destroyed", full)
 
 
 def _entry_schedule_state(bundles: TomlConfig, full: str) -> str:
@@ -7016,19 +7008,40 @@ def _build_group_membership(
     """Reverse-index group membership from the pending and current
     graphs.
 
-    Returns `(pending, current)` where `<table>[<full>]` lists the
-    full names of every group whose `children` list contains `<full>`
-    in that graph. The two diverge when a group has been edited but
-    not re-applied. Each value list is sorted for stable display
-    order.
+    Returns `(pending, current)` where `<table>[<child_full>]` lists
+    the full names of every group whose `children` list contains
+    the child in that graph. Each graph's `children` lists hold
+    uuids (the apply-time edge), so we resolve each uuid back to
+    its own graph's full name before keying the table. The two
+    sides diverge when a group has been edited but not re-applied.
+    Each value list is sorted for stable display order.
     """
+
+    def _resolve(
+        graph: Graph, parent_bundle: str, child_uuid: str
+    ) -> str | None:
+        ref = EntityRef(parent_bundle, child_uuid)
+        child_j = graph.jobs.get(ref)
+        if child_j is not None:
+            return child_j.name
+        child_g = graph.groups.get(ref)
+        if child_g is not None:
+            return child_g.name
+        return None
+
     pending: dict[str, list[str]] = {}
     for parent in config.pending.groups.values():
-        for child_full in parent.children:
+        for child_uuid in parent.children:
+            child_full = _resolve(config.pending, parent.bundle, child_uuid)
+            if child_full is None:
+                continue
             pending.setdefault(child_full, []).append(parent.name)
     current: dict[str, list[str]] = {}
     for parent in config.current.groups.values():
-        for child_full in parent.children:
+        for child_uuid in parent.children:
+            child_full = _resolve(config.current, parent.bundle, child_uuid)
+            if child_full is None:
+                continue
             current.setdefault(child_full, []).append(parent.name)
     for table in (pending, current):
         for v in table.values():
@@ -7160,7 +7173,7 @@ def do_status(
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
-    remnants = discovered_names()
+    remnants = stamped_names()
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
         remnants = bundle_prefix_filter(remnants, bundle)
@@ -7548,7 +7561,7 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
-    remnants = discovered_names()
+    remnants = stamped_names()
     errored_full = _errored_full_names(bundles, bundle)
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
@@ -7757,7 +7770,7 @@ def do_validate(bundle: str | None) -> None:
     warnings: list[str] = []
     if bundle is None:
         _by_full, selected = _selected_full_names_per_bundle(bundles)
-        remnants = discovered_names()
+        remnants = stamped_names()
         orphans = sorted(remnants - selected)
         if orphans:
             warnings.append(f"orphans on this host: {orphans}")
@@ -8138,15 +8151,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "TomlJob/group names. With no args: factory reset. "
             "With names: surgical removal."
-        ),
-    )
-    p_destroy.add_argument(
-        "--preserve-runtime",
-        action="store_true",
-        help=(
-            "Keep run.log, last-run.json, and run.lock for "
-            "post-mortem; only the unit, hash, and snapshot "
-            "are removed. Default: full wipe."
         ),
     )
     p_destroy.add_argument(

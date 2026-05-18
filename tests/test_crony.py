@@ -3057,6 +3057,8 @@ class TestRunGroup:
             },
             default_target_jobs=["g"],
         )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
         _stub_trigger_sync(
             monkeypatch,
             {
@@ -3092,6 +3094,8 @@ class TestRunGroup:
             },
             default_target_jobs=["g"],
         )
+        h.write_snap(cfg, "good")
+        h.write_snap(cfg, "bad")
         _stub_trigger_sync(
             monkeypatch,
             {
@@ -3136,6 +3140,8 @@ class TestRunGroup:
                 h.full("b"): {"exit_code": 0, "exit_class": "ok"},
             },
         )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
         crony.run_group(h.snap(cfg, "g"))
         rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
@@ -3219,6 +3225,8 @@ class TestRunGroup:
 
         monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_advance)
 
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
         rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = h.last_run("g")
@@ -3267,6 +3275,8 @@ class TestRunGroup:
             return {"exit_code": 0, "exit_class": "ok"}
 
         monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+        h.write_snap(cfg, "missing")
+        h.write_snap(cfg, "ok")
         rc = crony.run_group(h.snap(cfg, "g"))
         # Group orchestration succeeds (rc 0); the child failure
         # surfaces in the rolled-up exit_class and per-child
@@ -3281,6 +3291,54 @@ class TestRunGroup:
         assert rec["jobs_run"][1]["name"] == h.full("ok")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
         # Group rollup: a fail child surfaces at the group level.
+        assert rec["exit_class"] == "fail"
+
+    def test_group_fails_child_with_no_snapshot_on_host(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child uuid the parent's snapshot references can be
+        # unresolvable on this host: rename mid-flight, a partial
+        # state wipe, or a stale snapshot referencing an uuid that
+        # was never applied here. The runner records a synthetic
+        # `<bundle>:<uuid>` fail row so the rollup catches it
+        # and the dispatch loop continues for siblings whose
+        # snapshot does resolve.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "gone": {"command": "true"},
+                    "ok": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["gone", "ok"],
+                        "schedule": "daily",
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+
+        def _stub(
+            full_name: str, *, job_timeout: float, trigger_timeout: float
+        ) -> dict[str, Any]:
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+        # Only "ok" gets a snapshot; "gone" stays unresolvable.
+        h.write_snap(cfg, "ok")
+        rc = crony.run_group(h.snap(cfg, "g"))
+        assert rc == 0
+        rec = h.last_run("g")
+        # Resolved child ran first; the synthetic fail row trails.
+        assert rec["jobs_run"][0]["name"] == h.full("ok")
+        assert rec["jobs_run"][0]["exit_class"] == "ok"
+        gone_uuid = cfg.jobs["gone"].uuid
+        synthetic = rec["jobs_run"][1]
+        assert synthetic["name"] == f"default:{gone_uuid}"
+        assert synthetic["exit_class"] == "fail"
+        assert synthetic["exit_code"] == int(crony.ExitCode.PRECONDITION)
         assert rec["exit_class"] == "fail"
 
 
@@ -4742,9 +4800,7 @@ class TestDestroy:
         crony.apply_one(cfg, "j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert (h.state_dir("j") / "hash").exists()
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=False
-        )
+        crony.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert not (h.state_dir("j") / "hash").exists()
 
@@ -4761,18 +4817,15 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
-        crony.do_destroy(
-            jobs=["a"], preserve_runtime=False, bundle=None, orphans=False
-        )
+        crony.do_destroy(jobs=["a"], bundle=None, orphans=False)
         assert not (h.state_dir("a") / "hash").exists()
         assert (h.state_dir("b") / "hash").exists()
 
     def test_default_destroy_wipes_state_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Default destroy fully wipes the state dir, including run-
-        # time artifacts. `--preserve-runtime` is the opt-in to keep
-        # them.
+        # Destroy fully wipes the state dir, including runtime
+        # artifacts like run.log / last-run.json / run.lock.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -4782,93 +4835,7 @@ class TestDestroy:
         sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         (sd / "run.log").write_text("...")
-        crony.do_destroy(
-            jobs=["j"], preserve_runtime=False, bundle=None, orphans=False
-        )
-        assert not sd.exists()
-
-    def test_preserve_runtime_keeps_runtime_artifacts(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # `--preserve-runtime` removes the unit, hash, and snapshot
-        # but keeps run.log / last-run.json / run.lock for post-
-        # mortem. The state dir survives without a hash.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        crony.apply_one(cfg, "j")
-        sd = h.state_dir("j")
-        (sd / "run.log").write_text("...", encoding="utf-8")
-        (sd / "last-run.json").write_text("{}", encoding="utf-8")
-        crony.do_destroy(
-            jobs=["j"], preserve_runtime=True, bundle=None, orphans=False
-        )
-        assert sd.exists()
-        assert not (sd / "hash").exists()
-        # snapshot.json is preserved so a follow-up non-preserve
-        # destroy can still resolve this state dir from the
-        # entry's full name.
-        assert (sd / "snapshot.json").exists()
-        assert (sd / "run.log").read_text() == "..."
-        assert (sd / "last-run.json").read_text() == "{}"
-
-    def test_destroy_cleans_residue_from_preserve_runtime_destroy(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # The state dir left behind by a `--preserve-runtime`
-        # destroy has no hash and no unit. A follow-up default
-        # destroy must still find it via the broader discovery
-        # (state-dir presence) and wipe it -- otherwise the
-        # leftover would be invisible to crony forever.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        crony.apply_one(cfg, "j")
-        sd = h.state_dir("j")
-        (sd / "run.log").write_text("...", encoding="utf-8")
-        crony.do_destroy(
-            jobs=[], preserve_runtime=True, bundle=None, orphans=False
-        )
-        assert sd.exists()
-        assert not (sd / "hash").exists()
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=False
-        )
-        assert not sd.exists()
-
-    def test_destroy_cleans_residue_under_bundle(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # TomlBundle-scoped variant: a default `--bundle X` destroy
-        # must reach state-dir-only residue from a prior
-        # `--preserve-runtime --bundle X` destroy in that
-        # bundle's namespace.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        (h.cfg_dropin / "private.toml").write_text(
-            _uuid_toml(
-                '[job.j]\ncommand = "true"\nschedule = "*-*-* 03:00"\n'
-                "\n"
-                '[target.darwin]\njobs = ["j"]\n',
-            ),
-            encoding="utf-8",
-        )
-        bundles = crony.load_all_bundles()
-        priv = bundles.by_name("private")
-        assert priv is not None
-        crony.apply_one(priv.config, "j", bundle_name="private")
-        sd = h.state / "private" / priv.config.jobs["j"].uuid
-        (sd / "run.log").write_text("...", encoding="utf-8")
-        crony.do_destroy(
-            jobs=[], preserve_runtime=True, bundle="private", orphans=False
-        )
-        assert sd.exists()
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle="private", orphans=False
-        )
+        crony.do_destroy(jobs=["j"], bundle=None, orphans=False)
         assert not sd.exists()
 
     def test_unknown_name_rejected(
@@ -4879,7 +4846,6 @@ class TestDestroy:
         with pytest.raises(crony.UsageError, match="unknown"):
             crony.do_destroy(
                 jobs=["ghost"],
-                preserve_runtime=False,
                 bundle=None,
                 orphans=False,
             )
@@ -4909,7 +4875,6 @@ class TestDestroy:
             with pytest.raises(crony.LockBusyError) as exc:
                 crony.do_destroy(
                     jobs=["j"],
-                    preserve_runtime=False,
                     bundle=None,
                     orphans=False,
                 )
@@ -4938,9 +4903,7 @@ class TestDestroy:
         shutil.rmtree(h.state)
         assert plist.exists()
         # Factory reset still finds and removes the orphan plist.
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=False
-        )
+        crony.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not plist.exists()
 
     def test_bundle_unknown_rejected(
@@ -4951,7 +4914,6 @@ class TestDestroy:
         with pytest.raises(crony.UsageError, match="unknown bundle"):
             crony.do_destroy(
                 jobs=[],
-                preserve_runtime=False,
                 bundle="ghost",
                 orphans=False,
             )
@@ -4983,7 +4945,6 @@ class TestDestroy:
         assert k_dir.exists()
         crony.do_destroy(
             jobs=[],
-            preserve_runtime=False,
             bundle="borgadm",
             orphans=False,
         )
@@ -5010,7 +4971,6 @@ class TestDestroy:
         with pytest.raises(crony.UsageError, match="bundle 'default'"):
             crony.do_destroy(
                 jobs=["default.j"],
-                preserve_runtime=False,
                 bundle="borgadm",
                 orphans=False,
             )
@@ -5045,9 +5005,7 @@ class TestDestroy:
             },
             default_target_jobs=["live"],
         )
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=True
-        )
+        crony.do_destroy(jobs=[], bundle=None, orphans=True)
         assert (h.state_dir("live") / "hash").exists()
         assert not renamed_dir.exists()
         assert not (h.agents / f"org.crony.{h.full('renamed')}.plist").exists()
@@ -5088,7 +5046,6 @@ class TestDestroy:
         )
         crony.do_destroy(
             jobs=[],
-            preserve_runtime=False,
             bundle="borgadm",
             orphans=True,
         )
@@ -5103,7 +5060,6 @@ class TestDestroy:
         with pytest.raises(crony.UsageError, match="mutually exclusive"):
             crony.do_destroy(
                 jobs=["foo"],
-                preserve_runtime=False,
                 bundle=None,
                 orphans=True,
             )
@@ -5119,9 +5075,7 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=True
-        )
+        crony.do_destroy(jobs=[], bundle=None, orphans=True)
         assert (h.state_dir("j") / "hash").exists()
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
@@ -5862,42 +5816,6 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         shutil.rmtree(h.state)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        crony.do_status(
-            jobs=[],
-            cols=None,
-            show_masked=False,
-            config_current=False,
-            config_pending=False,
-            bundle=None,
-        )
-        out = capsys.readouterr().out
-        assert h.full("j") in out
-        assert "orphan" in out
-
-    def test_orphan_appears_when_only_state_dir_remains(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        # A `--preserve-runtime` destroy removes the unit and the
-        # hash but keeps run.log / last-run.json. Status must
-        # still surface that residual state dir as orphan so the
-        # user can clean it up with a follow-up default destroy
-        # (or `destroy --orphans`).
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        crony.apply_one(cfg, "j")
-        sd = h.state_dir("j")
-        (sd / "run.log").write_text("...", encoding="utf-8")
-        h.config({}, default_target_jobs=[])
-        crony.do_destroy(
-            jobs=[], preserve_runtime=True, bundle=None, orphans=False
-        )
-        assert sd.exists()
-        assert not (sd / "hash").exists()
-        assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7900,7 +7818,6 @@ class TestPerEntityConfigErrors:
         )
         crony.do_destroy(
             jobs=[h.full("j")],
-            preserve_runtime=False,
             bundle=None,
             orphans=False,
         )
@@ -9316,7 +9233,12 @@ class TestSnapshotLifecycle:
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "group"
-        assert snap["children"] == [h.full("a"), h.full("b")]
+        # Children are uuids on disk (rename-stable identity edge);
+        # the runner resolves each back to a full name at dispatch.
+        assert snap["children"] == [
+            cfg.jobs["a"].uuid,
+            cfg.jobs["b"].uuid,
+        ]
         # 1.05 * (100 + 200) = 315
         assert snap["group_budget_sec"] == 315
 
@@ -9355,7 +9277,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
-        assert snap["children"] == [h.full("a")]
+        assert snap["children"] == [cfg.jobs["a"].uuid]
         # Budget reflects only `a`: 1.05 * 100 = 105.
         assert snap["group_budget_sec"] == 105
 
@@ -9387,7 +9309,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
-        assert snap["children"] == [h.full("a")]
+        assert snap["children"] == [cfg.jobs["a"].uuid]
         assert snap["group_budget_sec"] == 105
 
     def test_group_snapshot_drops_masked_child_subgroup(
@@ -9420,7 +9342,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
-        assert snap["children"] == [h.full("a")]
+        assert snap["children"] == [cfg.jobs["a"].uuid]
         assert snap["group_budget_sec"] == 105
 
     def test_command_edit_flips_hash(
@@ -9747,9 +9669,7 @@ class TestLifecycleSmoke:
         out = capsys.readouterr().out
         assert "synced" in out
         # destroy -> factory reset
-        crony.do_destroy(
-            jobs=[], preserve_runtime=False, bundle=None, orphans=False
-        )
+        crony.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
