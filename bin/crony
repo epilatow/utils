@@ -134,11 +134,14 @@ then prompts; "Delay TomlJob" sleeps `interactive_delay` (default
 and runs the command immediately.
 
 Apply pins each entry's runtime parameters into a JSON snapshot
-in the entry's state dir (`STATE_DIR/<full>/snapshot.json`,
-alongside `hash`, `run.log`, `last-run.json`, etc.). The runner
-reads the snapshot, never the live config: editing the toml
-without `apply` therefore has no effect on running units, and
-audit catches any drift via the hash.
+in the entry's state dir (`STATE_DIR/<bundle>/<uuid>/snapshot.json`,
+alongside `hash`, `run.log`, `last-run.json`, etc.). The state
+dir is keyed on the entry's `uuid` so renaming a job in the
+config preserves its history -- only deleting the entry (or
+changing its `uuid`) loses it. The runner reads the snapshot,
+never the live config: editing the toml without `apply`
+therefore has no effect on running units, and audit catches any
+drift via the hash.
 
 TomlBundleConfig bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -2112,7 +2115,7 @@ def load_all_bundles() -> TomlConfig:
     return bundles
 
 
-def load_config(path: Path | None = None) -> TomlBundleConfig:
+def load_toml_bundle_config(path: Path | None = None) -> TomlBundleConfig:
     """Load a single config file as a `TomlBundleConfig` (single-bundle view).
 
     Suited to tests and any caller that has one specific config
@@ -2450,22 +2453,38 @@ def resolved_group_timeout_sec(
 # =============================================================================
 # APPLIED SNAPSHOT
 # =============================================================================
-# Apply pins each entry's runtime parameters into a JSON snapshot
-# next to the platform unit. The runner reads the snapshot, never
-# the live config: editing the toml without `apply` therefore has
-# no effect on running units. The hash includes the snapshot so
-# any drift forces a re-apply (and audit catches the mismatch).
+# Apply pins each entry's behavior-relevant runtime parameters
+# into a JSON snapshot next to the platform unit. The runner
+# reads these pinned fields, so editing the toml without `apply`
+# has no effect on running units. The hash includes the snapshot
+# so any drift forces a re-apply (and audit catches the
+# mismatch).
 #
 # notify_channels are deliberately NOT pinned -- routing is
 # separable from "what runs", and notify edits should take effect
-# without a re-apply.
+# without a re-apply. The runner reads them from the live config
+# at fire time.
 
 
 _SNAPSHOT_SCHEMA: int = 3
 
 
+@dataclass(frozen=True)
+class EntityRef:
+    """Stable per-(bundle, uuid) identity for a Job or JobGroup.
+
+    Bundle-scoped because UUIDs are unique within a bundle but
+    can repeat across bundles (uuid4 collision is astronomically
+    unlikely; the bundle prefix makes it a non-concern). Frozen
+    so it can key dicts and live in sets.
+    """
+
+    bundle: str
+    uuid: str
+
+
 @dataclass
-class JobSnapshot:
+class Job:
     """Resolved runtime parameters for a single job. Most fields are
     final values: paths are pre-expanded (`~` and `$VAR`), timeouts
     are post-cascade. `env` is the deliberate exception -- it stores
@@ -2479,7 +2498,9 @@ class JobSnapshot:
 
     schema: int
     kind: str  # "job"
-    name: str  # full namespaced name
+    name: str  # full namespaced name `<bundle>.<short>`
+    bundle: str  # the bundle this entry lives in (matches state-dir parent)
+    uuid: str  # the entry's identity within the bundle (matches state-dir name)
     command: str | None
     script: str | None
     args: list[str]
@@ -2505,9 +2526,13 @@ class JobSnapshot:
     interactive_active_sec: int = _INTERACTIVE_ACTIVE_DEFAULT_SEC
     interactive_delay_sec: int = _INTERACTIVE_DELAY_DEFAULT_SEC
 
+    @property
+    def ref(self) -> EntityRef:
+        return EntityRef(self.bundle, self.uuid)
+
 
 @dataclass
-class GroupSnapshot:
+class JobGroup:
     """Resolved runtime parameters for a job-group. `children` are
     full namespaced names; `group_budget_sec` is the pre-padded
     cumulative deadline computed once at apply time.
@@ -2515,16 +2540,73 @@ class GroupSnapshot:
 
     schema: int
     kind: str  # "group"
-    name: str  # full namespaced name
+    name: str  # full namespaced name `<bundle>.<short>`
+    bundle: str
+    uuid: str
     children: list[str]
     group_budget_sec: int
     trigger_timeout_sec: int
     schedule: str | None = None
     interval: str | None = None
 
+    @property
+    def ref(self) -> EntityRef:
+        return EntityRef(self.bundle, self.uuid)
 
-def _snapshot_path_for(full_name: str) -> Path:
-    return STATE_DIR / full_name / "snapshot.json"
+
+def _entity_state_dir(bundle_name: str, entity_uuid: str) -> Path:
+    return STATE_DIR / bundle_name / entity_uuid
+
+
+def _snapshot_path_for(bundle_name: str, entity_uuid: str) -> Path:
+    return _entity_state_dir(bundle_name, entity_uuid) / "snapshot.json"
+
+
+def _state_dir_by_name(full_name: str) -> Path | None:
+    """Find the state dir for a full namespaced name by reading
+    `snapshot.json` in every uuid-keyed subdir of the bundle until
+    one matches. None when no matching snapshot exists (the entry
+    was never applied, or its snapshot is missing / unreadable).
+
+    When more than one state dir reports the same `name` -- e.g.
+    after a `destroy --preserve-runtime` leaves a residual
+    snapshot on disk and the user then swaps the entry's uuid in
+    config (a manual edit, or removing the `uuid =` line and re-
+    running `crony config update` to mint a fresh one) before
+    re-applying -- the live entry wins: a dir with a `hash` stamp
+    present takes precedence over a dir whose snapshot is leftover
+    residue. Without this preference, the runner / `crony logs
+    <name>` would non-deterministically land on the stale
+    snapshot.
+
+    Used by code paths that take a name on the command line (the
+    runner, `crony logs`, `crony trigger --wait`) and don't have
+    the live config in hand to look up the uuid directly.
+    """
+    bundle_name, _, _ = full_name.partition(".")
+    if not bundle_name:
+        return None
+    bundle_dir = STATE_DIR / bundle_name
+    if not bundle_dir.is_dir():
+        return None
+    live: Path | None = None
+    residual: Path | None = None
+    for uuid_dir in bundle_dir.iterdir():
+        snap_p = uuid_dir / "snapshot.json"
+        if not snap_p.is_file():
+            continue
+        try:
+            raw = json.loads(snap_p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if raw.get("name") != full_name:
+            continue
+        if (uuid_dir / "hash").is_file():
+            live = uuid_dir
+            break
+        if residual is None:
+            residual = uuid_dir
+    return live or residual
 
 
 def _resolve_job_snapshot(
@@ -2532,8 +2614,9 @@ def _resolve_job_snapshot(
     target: Target | None,
     job: TomlJob,
     full_name: str,
-) -> JobSnapshot:
-    """Build a JobSnapshot by applying every cascade once."""
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
+) -> Job:
+    """Build a Job by applying every cascade once."""
     args = [_expand_path_field(a) for a in job.args]
     gate_args = [_expand_path_field(a) for a in job.gate_args]
     script = (
@@ -2544,10 +2627,12 @@ def _resolve_job_snapshot(
         if job.gate_script is not None
         else None
     )
-    return JobSnapshot(
+    return Job(
         schema=_SNAPSHOT_SCHEMA,
         kind="job",
         name=full_name,
+        bundle=bundle_name,
+        uuid=job.uuid,
         command=job.command,
         script=script,
         args=args,
@@ -2578,8 +2663,8 @@ def _resolve_group_snapshot(
     group: TomlJobGroup,
     bundle_name: str,
     full_name: str,
-) -> GroupSnapshot:
-    """Build a GroupSnapshot. `group_budget_sec` is recomputed from
+) -> JobGroup:
+    """Build a JobGroup. `group_budget_sec` is recomputed from
     the live config (not from children's pinned snapshots), so an
     apply pass that walks topologically still produces the right
     parent budget regardless of children's prior applied state.
@@ -2599,10 +2684,12 @@ def _resolve_group_snapshot(
         for c in group.jobs
         if c in sel_jobs or c in sel_groups
     ]
-    return GroupSnapshot(
+    return JobGroup(
         schema=_SNAPSHOT_SCHEMA,
         kind="group",
         name=full_name,
+        bundle=bundle_name,
+        uuid=group.uuid,
         children=children,
         group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
         trigger_timeout_sec=config.defaults.trigger_timeout_sec,
@@ -2615,7 +2702,7 @@ def _resolve_snapshot_for(
     config: TomlBundleConfig,
     short: str,
     bundle_name: str = DEFAULT_BUNDLE_NAME,
-) -> JobSnapshot | GroupSnapshot:
+) -> Job | JobGroup:
     """Resolve a snapshot for a single config entry by short name.
 
     Convenience for callers that have a TomlBundleConfig + short name and
@@ -2626,7 +2713,7 @@ def _resolve_snapshot_for(
     target = resolve_target(config, current_host(), current_platform())
     if short in config.jobs:
         return _resolve_job_snapshot(
-            config, target, config.jobs[short], full_name
+            config, target, config.jobs[short], full_name, bundle_name
         )
     if short in config.job_groups:
         return _resolve_group_snapshot(
@@ -2635,7 +2722,7 @@ def _resolve_snapshot_for(
     raise PreconditionError(f"unknown job/group: {short!r}")
 
 
-def _serialize_snapshot(snap: JobSnapshot | GroupSnapshot) -> str:
+def _serialize_snapshot(snap: Job | JobGroup) -> str:
     """Stable JSON for hash inclusion: sorted keys, no whitespace
     variance. Hash stability matters more than human readability
     -- audit and apply use this same serialization."""
@@ -2644,15 +2731,24 @@ def _serialize_snapshot(snap: JobSnapshot | GroupSnapshot) -> str:
     )
 
 
-def _load_snapshot(full_name: str) -> JobSnapshot | GroupSnapshot:
+def _load_snapshot(full_name: str) -> Job | JobGroup:
     """Load and validate a snapshot file. Raises PreconditionError
     if missing (entry not applied) or schema mismatch (re-apply
-    required)."""
-    p = _snapshot_path_for(full_name)
-    if not p.exists():
+    required).
+
+    Resolves the on-disk path by walking the bundle's uuid-keyed
+    state dirs for a snapshot whose `name` matches; the caller
+    only knows the full namespaced name, not which uuid owns it.
+    """
+    state_dir = _state_dir_by_name(full_name)
+    if state_dir is None:
         raise PreconditionError(
-            f"no snapshot for {full_name!r} (run `crony apply` first)"
+            f"no snapshot for {full_name!r} (run `crony apply` "
+            f"first; if state exists on disk, ensure "
+            f"{STATE_DIR}/<bundle>/<uuid>/snapshot.json is "
+            f"parseable)"
         )
+    p = state_dir / "snapshot.json"
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
@@ -2667,9 +2763,9 @@ def _load_snapshot(full_name: str) -> JobSnapshot | GroupSnapshot:
         )
     kind = raw.get("kind")
     if kind == "job":
-        return JobSnapshot(**raw)
+        return Job(**raw)
     if kind == "group":
-        return GroupSnapshot(**raw)
+        return JobGroup(**raw)
     raise PreconditionError(
         f"snapshot for {full_name!r} has unknown kind {kind!r}"
     )
@@ -2694,9 +2790,14 @@ def _load_snapshot(full_name: str) -> JobSnapshot | GroupSnapshot:
 
 @dataclass
 class JobRunResult:
-    """Recorded as last-run.json for each completed job run."""
+    """Recorded as last-run.json for each completed job run.
 
-    job: str
+    Identity isn't repeated in the record: the file already lives at
+    `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
+    `snapshot.json` in the same dir carries the full namespaced name
+    of the entity it was applied as.
+    """
+
     host: str
     platform: str
     started_at: str
@@ -2732,6 +2833,11 @@ class GroupChildResult:
 class GroupRunResult:
     """Recorded as last-run.json for each completed group run.
 
+    Identity isn't repeated in the record: the file already lives at
+    `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
+    `snapshot.json` in the same dir carries the full namespaced
+    name of the group it was applied as.
+
     `exit_class` is a rollup from `jobs_run`: timeout outranks
     fail / signal (which are equally severe), and ok / gated tie
     at the bottom (gating is "intentionally not run", not a
@@ -2740,7 +2846,6 @@ class GroupRunResult:
     of re-deriving the rollup on every query.
     """
 
-    group: str
     host: str
     platform: str
     started_at: str
@@ -2749,6 +2854,302 @@ class GroupRunResult:
     exit_class: str
     log_path: str
     jobs_run: list[GroupChildResult]
+
+
+# =============================================================================
+# CONFIG MODEL (pending + current graphs, runtime state, world view)
+# =============================================================================
+# Built once at startup by `load_config()`. The rest of crony treats
+# the result as read-only: apply / destroy plan their work against
+# the loaded Config, perform disk mutations, and exit. A caller that
+# needs the post-mutation view re-invokes `load_config()`. No code
+# path re-scans the state-dir tree after load.
+
+
+@dataclass
+class RuntimeState:
+    """Per-entity disk state outside `snapshot.json`. Populated for
+    entities in `Config.current`; pending-only entities don't have
+    one. Built once at load and never re-read.
+    """
+
+    state_dir: Path
+    hash: str
+    last_run: JobRunResult | GroupRunResult | None
+    is_running: bool
+    is_pending: bool
+    has_user_trigger_flag: bool
+
+
+@dataclass
+class Graph:
+    """One world view: either the pending config (built from
+    `TomlConfig` + cascade resolution) or the current applied state
+    (built from `snapshot.json` files). The two graphs share an
+    identity space (`EntityRef`) but their node sets and edge sets
+    are independent: each can list entities the other doesn't, and
+    a paired entity's fields may diverge between sides.
+    """
+
+    jobs: dict[EntityRef, Job] = field(default_factory=dict)
+    groups: dict[EntityRef, JobGroup] = field(default_factory=dict)
+    by_full_name: dict[str, EntityRef] = field(default_factory=dict)
+
+    def refs(self) -> set[EntityRef]:
+        return set(self.jobs) | set(self.groups)
+
+    def kind_of(self, ref: EntityRef) -> str | None:
+        if ref in self.jobs:
+            return "job"
+        if ref in self.groups:
+            return "group"
+        return None
+
+
+@dataclass
+class Config:
+    """Whole-process state. Built once at startup by `load_config()`;
+    treated as read-only by the rest of crony. Apply / destroy plan
+    against the loaded Config, perform disk mutations, and either
+    exit (the typical one-shot CLI case) or the caller re-invokes
+    `load_config()` if it needs the post-mutation view.
+    """
+
+    toml_config: TomlConfig
+    pending: Graph
+    current: Graph
+    runtime: dict[EntityRef, RuntimeState]
+    orphan_unit_labels: set[str]
+    host: str
+    platform: str
+
+    def all_refs(self) -> set[EntityRef]:
+        return self.pending.refs() | self.current.refs()
+
+    def config_state(self, ref: EntityRef) -> str:
+        """synced | stale | missing | orphan for the entity at `ref`.
+
+        `synced` if both graphs hold the entity and the two
+        instances are field-equal; `stale` if both hold it but
+        differ; `missing` if only `pending` has it (never applied);
+        `orphan` if only `current` has it (config-side removed,
+        disk-side lingers).
+        """
+        p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
+        c = self.current.jobs.get(ref) or self.current.groups.get(ref)
+        if p is None and c is None:
+            raise KeyError(ref)
+        if p is None:
+            return "orphan"
+        if c is None:
+            return "missing"
+        return "synced" if p == c else "stale"
+
+    def resolve(self, full_name: str) -> EntityRef | None:
+        """Look up an entity by its full namespaced name. Pending
+        wins (the user's current mental model); falls back to
+        current so `crony logs <renamed-old-name>` still finds the
+        entry whose name changed in config since apply.
+        """
+        return self.pending.by_full_name.get(
+            full_name
+        ) or self.current.by_full_name.get(full_name)
+
+
+def _parse_last_run(
+    raw: dict[str, Any], kind: str
+) -> JobRunResult | GroupRunResult | None:
+    """Deserialize last-run.json contents into the kind-appropriate
+    record. Returns None if the raw dict isn't valid for either
+    shape (corrupt write, schema drift).
+    """
+    if kind == "job":
+        try:
+            notifications_raw = raw.get("notifications", {})
+            notifications = {
+                ch: NotificationResult(**nr)
+                for ch, nr in notifications_raw.items()
+            }
+            payload = {k: v for k, v in raw.items() if k != "notifications"}
+            return JobRunResult(notifications=notifications, **payload)
+        except TypeError:
+            return None
+    if kind == "group":
+        try:
+            jobs_run = [GroupChildResult(**c) for c in raw.get("jobs_run", [])]
+            payload = {k: v for k, v in raw.items() if k != "jobs_run"}
+            return GroupRunResult(jobs_run=jobs_run, **payload)
+        except TypeError:
+            return None
+    return None
+
+
+def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
+    """Snapshot the runtime-only state inside one state dir: the
+    install hash, parsed last-run record, and presence of the
+    lock / pending / user-trigger flag files.
+    """
+    hash_path = state_dir / "hash"
+    hash_value = (
+        hash_path.read_text(encoding="utf-8").strip()
+        if hash_path.is_file()
+        else ""
+    )
+
+    last_run: JobRunResult | GroupRunResult | None = None
+    last_run_path = state_dir / "last-run.json"
+    if last_run_path.is_file():
+        try:
+            raw = json.loads(last_run_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict):
+            last_run = _parse_last_run(raw, kind)
+
+    is_running = False
+    lock_path = state_dir / "run.lock"
+    if lock_path.is_file():
+        try:
+            with _acquire_lock(lock_path):
+                pass
+        except LockBusyError:
+            is_running = True
+
+    return RuntimeState(
+        state_dir=state_dir,
+        hash=hash_value,
+        last_run=last_run,
+        is_running=is_running,
+        is_pending=(state_dir / "pending.flag").is_file(),
+        has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
+    )
+
+
+def _build_pending_graph(
+    toml_config: TomlConfig, host: str, platform: str
+) -> Graph:
+    """Walk every bundle's TomlConfig, run cascade resolution +
+    host/platform selection, and produce the pending graph. Entries
+    masked out for this host don't appear in the graph -- they're
+    not "what apply would install here", and they pair via the
+    orphan path when their on-disk remnants outlive a host-filter
+    edit.
+    """
+    pending = Graph()
+    for bundle in toml_config.bundles:
+        target = resolve_target(bundle.config, host, platform)
+        sel_jobs, sel_groups = selected_jobs_and_groups(bundle.config, target)
+        for short in sel_jobs:
+            toml_job = bundle.config.jobs.get(short)
+            if toml_job is None:
+                continue
+            full_name = bundle.full_name(short)
+            snap_j = _resolve_job_snapshot(
+                bundle.config, target, toml_job, full_name, bundle.name
+            )
+            pending.jobs[snap_j.ref] = snap_j
+            pending.by_full_name[full_name] = snap_j.ref
+        for short in sel_groups:
+            toml_group = bundle.config.job_groups.get(short)
+            if toml_group is None:
+                continue
+            full_name = bundle.full_name(short)
+            snap_g = _resolve_group_snapshot(
+                bundle.config, target, toml_group, bundle.name, full_name
+            )
+            pending.groups[snap_g.ref] = snap_g
+            pending.by_full_name[full_name] = snap_g.ref
+    return pending
+
+
+def _build_current_graph(
+    state_root: Path,
+) -> tuple[Graph, dict[EntityRef, RuntimeState]]:
+    """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
+    with a parseable schema-matched `snapshot.json` becomes a
+    current-graph node; the rest of the dir contents become its
+    `RuntimeState`. Snapshots with wrong / missing schema (or
+    unreadable JSON) are silently skipped -- they'll surface as
+    schema-mismatch errors at apply / run time.
+    """
+    current = Graph()
+    runtime: dict[EntityRef, RuntimeState] = {}
+    if not state_root.exists():
+        return current, runtime
+    for bundle_dir in state_root.iterdir():
+        if not bundle_dir.is_dir():
+            continue
+        for uuid_dir in bundle_dir.iterdir():
+            if not uuid_dir.is_dir():
+                continue
+            snap_path = uuid_dir / "snapshot.json"
+            if not snap_path.is_file():
+                continue
+            try:
+                raw = json.loads(snap_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(raw, dict)
+                or raw.get("schema") != _SNAPSHOT_SCHEMA
+            ):
+                continue
+            kind = raw.get("kind")
+            if kind == "job":
+                try:
+                    snap_j = Job(**raw)
+                except TypeError:
+                    continue
+                current.jobs[snap_j.ref] = snap_j
+                current.by_full_name[snap_j.name] = snap_j.ref
+                runtime[snap_j.ref] = _read_runtime_state(uuid_dir, "job")
+            elif kind == "group":
+                try:
+                    snap_g = JobGroup(**raw)
+                except TypeError:
+                    continue
+                current.groups[snap_g.ref] = snap_g
+                current.by_full_name[snap_g.name] = snap_g.ref
+                runtime[snap_g.ref] = _read_runtime_state(uuid_dir, "group")
+    return current, runtime
+
+
+def load_config() -> Config:
+    """Build the whole-process Config: parse every bundle's TOML,
+    walk the state-dir tree once, build pending + current graphs +
+    runtime state in memory, and detect platform-unit-only orphans.
+    """
+    host = current_host()
+    platform = current_platform()
+
+    toml_config = load_all_bundles()
+    pending = _build_pending_graph(toml_config, host, platform)
+    current, runtime = _build_current_graph(STATE_DIR)
+
+    # Platform units (launchd plist / systemd timer) whose name
+    # isn't in either graph: usually leftovers from a state-dir
+    # wipe that didn't touch the platform side. Discovered here
+    # so destroy / status can surface them without re-scanning.
+    in_use_labels: set[str] = set()
+    for snap_j in pending.jobs.values():
+        in_use_labels.add(snap_j.name)
+    for snap_g in pending.groups.values():
+        in_use_labels.add(snap_g.name)
+    for snap_j in current.jobs.values():
+        in_use_labels.add(snap_j.name)
+    for snap_g in current.groups.values():
+        in_use_labels.add(snap_g.name)
+    orphan_unit_labels = _platform_unit_names() - in_use_labels
+
+    return Config(
+        toml_config=toml_config,
+        pending=pending,
+        current=current,
+        runtime=runtime,
+        orphan_unit_labels=orphan_unit_labels,
+        host=host,
+        platform=platform,
+    )
 
 
 def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
@@ -2783,9 +3184,16 @@ def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     return worst_class
 
 
-def _state_dir_for(name: str) -> Path:
-    """State directory for a named job or group, created on demand."""
-    d = STATE_DIR / name
+def _state_dir_for(bundle_name: str, entity_uuid: str) -> Path:
+    """State directory for an entity, materialized on disk.
+
+    Returns the uuid-keyed state dir for `(bundle_name, entity_uuid)`,
+    creating it (and the bundle subdir) when missing. Used by apply
+    and the runner -- both write files under the returned path on
+    every call, so a pre-existing empty dir is the right starting
+    state.
+    """
+    d = _entity_state_dir(bundle_name, entity_uuid)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2896,7 +3304,7 @@ def _resolve_script(script: str) -> Path:
     return p
 
 
-def _command_argv(snap: JobSnapshot) -> list[str]:
+def _command_argv(snap: Job) -> list[str]:
     """argv for the job's main command, drawn from the snapshot.
 
     Snapshot fields are pre-resolved at apply time (script paths
@@ -2909,7 +3317,7 @@ def _command_argv(snap: JobSnapshot) -> list[str]:
     return [snap.script, *snap.args]
 
 
-def _gate_argv(snap: JobSnapshot) -> list[str] | None:
+def _gate_argv(snap: Job) -> list[str] | None:
     """argv for the gate, or None if the snapshot has no gate."""
     if snap.gate is not None:
         return ["/bin/sh", "-c", snap.gate]
@@ -3149,10 +3557,10 @@ def _retrieve_secret(
     return None
 
 
-def _format_summary(result: JobRunResult) -> str:
+def _format_summary(result: JobRunResult, full_name: str) -> str:
     """One-line-per-field human summary for notification bodies."""
     return (
-        f"TomlJob:        {result.job}\n"
+        f"TomlJob:        {full_name}\n"
         f"Host:       {result.host}\n"
         f"Platform:   {result.platform}\n"
         f"Started:    {result.started_at}\n"
@@ -3220,6 +3628,7 @@ def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
 
 def _build_email_message(
     result: JobRunResult,
+    full_name: str,
     log_text: str,
     cfg: NotifyEmail,
     attach_log: bool,
@@ -3236,7 +3645,7 @@ def _build_email_message(
     """
     msg = EmailMessage()
     msg["Subject"] = (
-        f"[crony/{result.host}] {result.job} {result.exit_class} "
+        f"[crony/{result.host}] {full_name} {result.exit_class} "
         f"(exit {result.exit_code})"
     )
     msg["From"] = cfg.from_addr or cfg.smtp_user
@@ -3244,7 +3653,7 @@ def _build_email_message(
     if extra_headers:
         for k, v in extra_headers.items():
             msg[k] = v
-    body = _format_summary(result)
+    body = _format_summary(result, full_name)
     if attach_log and log_text:
         body += _LOG_SEPARATOR + _format_log_for_notification(
             log_text, attach_max_kb
@@ -3362,6 +3771,7 @@ def _post_ntfy(
 def _send_email_for(
     channel: NotifyChannel,
     result: JobRunResult,
+    full_name: str,
     log_text: str,
     defaults: Defaults,
 ) -> None:
@@ -3382,6 +3792,7 @@ def _send_email_for(
         )
     msg = _build_email_message(
         result,
+        full_name,
         log_text,
         channel.email,
         defaults.notify_attach_log,
@@ -3394,6 +3805,7 @@ def _send_email_for(
 def _send_ntfy_for(
     channel: NotifyChannel,
     result: JobRunResult,
+    full_name: str,
     log_text: str,
     defaults: Defaults,
 ) -> None:
@@ -3413,7 +3825,7 @@ def _send_ntfy_for(
             f"(configure token_keychain_service or token_file)"
         )
     title = (
-        f"[crony/{result.host}] {result.job} "
+        f"[crony/{result.host}] {full_name} "
         f"{result.exit_class} (exit {result.exit_code})"
     )
     _post_ntfy(
@@ -3421,7 +3833,7 @@ def _send_ntfy_for(
         token,
         title,
         result.exit_class,
-        _format_summary(result),
+        _format_summary(result, full_name),
         log_text,
         defaults.notify_attach_log,
         extra_headers=channel.headers,
@@ -3429,12 +3841,12 @@ def _send_ntfy_for(
 
 
 # Per-transport sender table. Each entry takes (channel, result,
-# log_text, defaults) and raises on failure. Adding a new transport
-# is one new function plus one entry here plus a name in
+# full_name, log_text, defaults) and raises on failure. Adding a new
+# transport is one new function plus one entry here plus a name in
 # _VALID_NOTIFY_TRANSPORTS.
 _NOTIFY_DISPATCH: dict[
     str,
-    Callable[[NotifyChannel, JobRunResult, str, Defaults], None],
+    Callable[[NotifyChannel, JobRunResult, str, str, Defaults], None],
 ] = {
     "email": _send_email_for,
     "ntfy": _send_ntfy_for,
@@ -3449,7 +3861,10 @@ assert set(_NOTIFY_DISPATCH.keys()) == _VALID_NOTIFY_TRANSPORTS, (
 
 
 def _dispatch_notify(
-    result: JobRunResult, log_text: str, defaults: Defaults
+    result: JobRunResult,
+    full_name: str,
+    log_text: str,
+    defaults: Defaults,
 ) -> None:
     """Fan out to every channel in result.notifications.
 
@@ -3473,7 +3888,7 @@ def _dispatch_notify(
                 raise ConfigError(
                     f"unknown notify transport: {channel.transport!r}"
                 )
-            sender(channel, result, log_text, defaults)
+            sender(channel, result, full_name, log_text, defaults)
             result.notifications[channel_name] = NotificationResult(
                 sent=True, error=None, error_class=None
             )
@@ -3684,7 +4099,7 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     return "cancel"
 
 
-def _interactive_wait_and_prompt(snap: JobSnapshot, log_file: IO[bytes]) -> str:
+def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     """Run the wait/prompt/delay loop for an interactive job.
 
     Returns 'run' or 'cancel'. Logs each phase transition into
@@ -3699,8 +4114,10 @@ def _interactive_wait_and_prompt(snap: JobSnapshot, log_file: IO[bytes]) -> str:
     the next scheduled fire and silently bypass *that* wait.
     """
 
+    sd = _entity_state_dir(snap.bundle, snap.uuid)
+
     def _bypass() -> bool:
-        return _consume_user_trigger_flag(snap.name)
+        return _consume_user_trigger_flag(sd)
 
     while True:
         log_file.write(
@@ -3738,7 +4155,7 @@ def _interactive_wait_and_prompt(snap: JobSnapshot, log_file: IO[bytes]) -> str:
 
 
 def run_job(
-    snap: JobSnapshot,
+    snap: Job,
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
@@ -3762,7 +4179,7 @@ def run_job(
         if not os.access(sp, os.X_OK):
             raise PreconditionError(f"script not executable: {sp}")
 
-    sd = _state_dir_for(full_name)
+    sd = _state_dir_for(snap.bundle, snap.uuid)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -3822,7 +4239,6 @@ def run_job(
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
                         result = JobRunResult(
-                            job=full_name,
                             host=host,
                             platform=platform,
                             started_at=started_iso,
@@ -3844,7 +4260,7 @@ def run_job(
                         return 0
 
                 if snap.interactive:
-                    bypass = _consume_user_trigger_flag(full_name)
+                    bypass = _consume_user_trigger_flag(sd)
                     if bypass:
                         log_file.write(
                             b"interactive: bypass (user-triggered)\n"
@@ -3860,7 +4276,6 @@ def run_job(
                             pending_flag.unlink(missing_ok=True)
                         if choice == "cancel":
                             result = JobRunResult(
-                                job=full_name,
                                 host=host,
                                 platform=platform,
                                 started_at=started_iso,
@@ -3914,7 +4329,6 @@ def run_job(
                     ch: NotificationResult(sent=False) for ch in notify_channels
                 }
                 result = JobRunResult(
-                    job=full_name,
                     host=host,
                     platform=platform,
                     started_at=started_iso,
@@ -3939,7 +4353,9 @@ def run_job(
                         )[-200_000:]
                     except OSError:
                         pass
-                    _dispatch_notify(result, log_text, notify_defaults)
+                    _dispatch_notify(
+                        result, full_name, log_text, notify_defaults
+                    )
 
                 _write_last_run(last_run_path, dataclasses.asdict(result))
                 return surfaced_rc
@@ -3967,7 +4383,7 @@ def _child_timeout_from_snapshot(child_full_name: str) -> float:
         cs = _load_snapshot(child_full_name)
     except PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
-    if isinstance(cs, JobSnapshot):
+    if isinstance(cs, Job):
         return float(cs.job_timeout_sec)
     return float(cs.group_budget_sec)
 
@@ -3983,14 +4399,14 @@ def _child_is_interactive(child_full_name: str) -> bool:
         cs = _load_snapshot(child_full_name)
     except PreconditionError:
         return False
-    return isinstance(cs, JobSnapshot) and cs.interactive
+    return isinstance(cs, Job) and cs.interactive
 
 
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
 def run_group(
-    snap: GroupSnapshot,
+    snap: JobGroup,
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
@@ -4015,7 +4431,7 @@ def run_group(
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = _state_dir_for(full_name)
+    sd = _state_dir_for(snap.bundle, snap.uuid)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -4143,7 +4559,6 @@ def run_group(
                     )
 
                 result = GroupRunResult(
-                    group=full_name,
                     host=host,
                     platform=platform,
                     started_at=started_iso,
@@ -4202,8 +4617,8 @@ def _timer_path_for(name: str) -> Path:
     return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
 
 
-def _hash_path_for(name: str) -> Path:
-    return STATE_DIR / name / "hash"
+def _hash_path_for(bundle_name: str, entity_uuid: str) -> Path:
+    return _entity_state_dir(bundle_name, entity_uuid) / "hash"
 
 
 def _systemd_unit_name(name: str) -> str:
@@ -4451,7 +4866,7 @@ def _compute_unit_hash(
     name: str,
     entry: TomlJob | TomlJobGroup,
     platform: str,
-    snapshot: JobSnapshot | GroupSnapshot,
+    snapshot: Job | JobGroup,
 ) -> str:
     """SHA-256 of rendered unit content + serialized snapshot.
 
@@ -4614,12 +5029,12 @@ def apply_one(
 
     schedule, interval = _entity_schedule(entry)
     platform = current_platform()
-    hash_path = _hash_path_for(full_name)
-    snapshot_path = _snapshot_path_for(full_name)
+    hash_path = _hash_path_for(bundle_name, entry.uuid)
+    snapshot_path = _snapshot_path_for(bundle_name, entry.uuid)
     target = resolve_target(config, current_host(), platform)
     if isinstance(entry, TomlJob):
-        snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
-            config, target, entry, full_name
+        snapshot: Job | JobGroup = _resolve_job_snapshot(
+            config, target, entry, full_name, bundle_name
         )
     else:
         snapshot = _resolve_group_snapshot(
@@ -4707,34 +5122,90 @@ def destroy_one(name: str, *, preserve_runtime: bool = False) -> None:
     else:
         _service_path_for(name).unlink(missing_ok=True)
         _timer_path_for(name).unlink(missing_ok=True)
+    # State dir is uuid-keyed; resolve via snapshot.json's `name`
+    # field. A missing snapshot means there's no state dir to
+    # clean up (the platform unit was the only remnant).
+    sd = _state_dir_by_name(name)
+    if sd is None:
+        return
     if preserve_runtime:
-        _hash_path_for(name).unlink(missing_ok=True)
-        _snapshot_path_for(name).unlink(missing_ok=True)
+        # Keep snapshot.json so the entity remains addressable by
+        # name through `_state_dir_by_name`: a follow-up non-preserve
+        # destroy can still resolve this dir from the entry's full
+        # name, and the live-vs-residual tiebreak inside
+        # `_state_dir_by_name` (preferring a uuid dir with a `hash`
+        # stamp) keeps subsequent `crony logs` / runner traffic on
+        # the live re-apply rather than this residue. The `hash`
+        # stamp goes away so `config=stale` surfaces and the user
+        # is prompted to re-apply or fully wipe.
+        (sd / "hash").unlink(missing_ok=True)
     else:
-        sd = STATE_DIR / name
-        if sd.exists():
-            shutil.rmtree(sd)
+        shutil.rmtree(sd)
+
+
+def _iter_state_entities() -> Iterator[tuple[str, str, Path]]:
+    """Yield `(bundle_name, entity_uuid, state_dir)` for every
+    uuid-keyed state dir present on this host. Used by the
+    recovered-name helpers and orphan sweepers.
+    """
+    if not STATE_DIR.exists():
+        return
+    for bundle_dir in STATE_DIR.iterdir():
+        if not bundle_dir.is_dir():
+            continue
+        for uuid_dir in bundle_dir.iterdir():
+            if not uuid_dir.is_dir():
+                continue
+            yield bundle_dir.name, uuid_dir.name, uuid_dir
+
+
+def _recover_full_name(state_dir: Path) -> str | None:
+    """Return the full namespaced name a state dir was last
+    applied under, or None when the snapshot is missing /
+    unreadable (e.g. after a `--preserve-runtime` destroy).
+    """
+    snap_p = state_dir / "snapshot.json"
+    if not snap_p.is_file():
+        return None
+    try:
+        raw = json.loads(snap_p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = raw.get("name")
+    return name if isinstance(name, str) else None
 
 
 def _state_dir_stamps() -> set[str]:
-    """Names whose state dir contains a `hash` stamp."""
-    if not STATE_DIR.exists():
-        return set()
-    return {d.name for d in STATE_DIR.iterdir() if (d / "hash").is_file()}
+    """Full names whose state dir contains a `hash` stamp.
+
+    Names are recovered from `snapshot.json`'s `name` field; a
+    state dir whose snapshot has been removed (e.g. via
+    `--preserve-runtime`) is therefore invisible to this set.
+    """
+    out: set[str] = set()
+    for _bundle, _uuid, state_dir in _iter_state_entities():
+        if not (state_dir / "hash").is_file():
+            continue
+        name = _recover_full_name(state_dir)
+        if name is not None:
+            out.add(name)
+    return out
 
 
 def _state_dir_names() -> set[str]:
-    """Names with a state dir on this host, with or without a hash.
+    """Full names with a state dir on this host, with or without a hash.
 
     Broader than `_state_dir_stamps()`: a state dir whose `hash`
-    was stripped by a `--preserve-runtime` destroy still counts.
-    These are the leftover-runtime cases (`run.log`,
-    `last-run.json`, `run.lock`) that the opt-in
-    `--preserve-runtime` flag deliberately keeps for post-mortem.
+    was stripped by a `--preserve-runtime` destroy still counts
+    as long as `snapshot.json` is still present (the runtime-only
+    leftover case the flag is designed for).
     """
-    if not STATE_DIR.exists():
-        return set()
-    return {d.name for d in STATE_DIR.iterdir() if d.is_dir()}
+    out: set[str] = set()
+    for _bundle, _uuid, state_dir in _iter_state_entities():
+        name = _recover_full_name(state_dir)
+        if name is not None:
+            out.add(name)
+    return out
 
 
 def _platform_unit_names() -> set[str]:
@@ -4973,7 +5444,9 @@ def _last_run_state(name: str) -> str:
     never run -- new install, group-only job that's never been
     triggered, etc.
     """
-    sd = STATE_DIR / name
+    sd = _state_dir_by_name(name)
+    if sd is None:
+        return "never"
     lock_path = sd / "run.lock"
     if lock_path.exists():
         try:
@@ -5004,7 +5477,9 @@ def _last_ran_at(name: str) -> str:
     Returns "never" when there's no last-run record and "unknown"
     when the file exists but its timestamp is unreadable.
     """
-    sd = STATE_DIR / name
+    sd = _state_dir_by_name(name)
+    if sd is None:
+        return "never"
     last_run = sd / "last-run.json"
     if not last_run.exists():
         return "never"
@@ -5075,10 +5550,26 @@ def _config_state_for(
     if short in config.errored_jobs or short in config.errored_job_groups:
         return "error"
     in_config = short in config.jobs or short in config.job_groups
-    hash_path = _hash_path_for(full_name)
-    has_hash = hash_path.exists()
+    entry: TomlJob | TomlJobGroup | None = config.jobs.get(
+        short
+    ) or config.job_groups.get(short)
+    bn, _ = parse_full_name(full_name)
+    # State dir address depends on the entity's uuid (config side)
+    # when the entry exists, or on whatever snapshot is present on
+    # disk (recovered-by-name) otherwise. The latter handles the
+    # orphan case where the entry was deleted but its state dir
+    # lingers.
+    hash_path: Path | None
+    state_dir: Path | None
+    if entry is not None:
+        hash_path = _hash_path_for(bn, entry.uuid)
+        state_dir = _entity_state_dir(bn, entry.uuid)
+    else:
+        state_dir = _state_dir_by_name(full_name)
+        hash_path = state_dir / "hash" if state_dir is not None else None
+    has_hash = hash_path is not None and hash_path.exists()
     has_unit = full_name in _platform_unit_names()
-    has_state_dir = (STATE_DIR / full_name).is_dir()
+    has_state_dir = state_dir is not None and state_dir.is_dir()
     has_stamp = has_hash or has_unit
     has_remnant = has_stamp or has_state_dir
     if not in_config:
@@ -5090,14 +5581,11 @@ def _config_state_for(
         # wiped). Treat as drift so the user gets a clear "re-
         # apply" signal.
         return "stale"
-    entry: TomlJob | TomlJobGroup = (
-        config.jobs.get(short) or config.job_groups[short]
-    )
-    bn, _ = parse_full_name(full_name)
+    assert entry is not None and hash_path is not None
     target = resolve_target(config, current_host(), platform)
     if isinstance(entry, TomlJob):
-        snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
-            config, target, entry, full_name
+        snapshot: Job | JobGroup = _resolve_job_snapshot(
+            config, target, entry, full_name, bn
         )
     else:
         snapshot = _resolve_group_snapshot(config, target, entry, bn, full_name)
@@ -5204,8 +5692,9 @@ def _trigger_unit(
             f"unit for {name!r} is not installed on this host "
             f"(run `crony apply` to re-pin the parent's snapshot)"
         )
-    if triggered_by_user:
-        _write_user_trigger_flag(name)
+    state_dir = _state_dir_by_name(name) if triggered_by_user else None
+    if triggered_by_user and state_dir is not None:
+        _write_user_trigger_flag(state_dir)
     succeeded = False
     try:
         if platform == "linux":
@@ -5224,36 +5713,37 @@ def _trigger_unit(
             )
         succeeded = True
     finally:
-        if triggered_by_user and not succeeded:
+        if triggered_by_user and state_dir is not None and not succeeded:
             # Don't strand the bypass flag on disk if the kickstart
             # never reached the scheduler. The next legitimately
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
-            _user_trigger_flag_path(name).unlink(missing_ok=True)
+            _user_trigger_flag_path(state_dir).unlink(missing_ok=True)
 
 
-def _user_trigger_flag_path(name: str) -> Path:
+def _user_trigger_flag_path(state_dir: Path) -> Path:
     """Filesystem path of the one-shot user-trigger sentinel."""
-    return STATE_DIR / name / "user-trigger.flag"
+    return state_dir / "user-trigger.flag"
 
 
-def _write_user_trigger_flag(name: str) -> None:
+def _write_user_trigger_flag(state_dir: Path) -> None:
     """Write the user-trigger sentinel just before kicking the
-    platform scheduler. Empty file -- presence is the signal.
+    platform scheduler. Empty file -- presence is the signal. The
+    caller passes the entry's uuid-keyed state dir so the sentinel
+    lives alongside the other per-run files (run.lock, pending.flag,
+    last-run.json).
     """
-    sd = STATE_DIR / name
-    sd.mkdir(parents=True, exist_ok=True)
-    _user_trigger_flag_path(name).write_bytes(b"")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _user_trigger_flag_path(state_dir).write_bytes(b"")
 
 
-def _consume_user_trigger_flag(name: str) -> bool:
+def _consume_user_trigger_flag(state_dir: Path) -> bool:
     """Read-and-delete the user-trigger sentinel. Returns True if
     the flag was present (the runner should bypass the interactive
     wait), False otherwise.
     """
-    p = _user_trigger_flag_path(name)
     try:
-        p.unlink()
+        _user_trigger_flag_path(state_dir).unlink()
     except FileNotFoundError:
         return False
     return True
@@ -5303,7 +5793,7 @@ def _trigger_unit_sync(
 
     Mechanism: a pre-trigger timestamp T is taken, the platform
     is asked to fire the unit, and the waiter watches for the
-    runner's pid (published via `<state>/<full_name>/run.pid`) to
+    runner's pid (published via `<state>/<bundle>/<uuid>/run.pid`) to
     exit via kqueue / pidfd kernel-level notification. When the
     pid is gone, last-run.json is read; if its `ended_at` is at
     or after T, the run is "ours" (semantics: the next completion
@@ -5326,10 +5816,14 @@ def _trigger_unit_sync(
     # unit isn't installed, `_trigger_unit` raises and the caller
     # (typically `run_group`) soft-fails the child; creating the
     # state dir just for the waiter's reads would leave a phantom
-    # remnant behind for a unit that never existed.
-    sd = STATE_DIR / full_name
-    pid_path = sd / "run.pid"
-    last_run_path = sd / "last-run.json"
+    # remnant behind for a unit that never existed. The state dir
+    # is uuid-keyed; we resolve it via the on-disk snapshot's
+    # `name` -- the caller has already triggered the unit, which
+    # means apply ran and wrote a snapshot, so this lookup
+    # succeeds during the watcher's polling window.
+    sd = _state_dir_by_name(full_name)
+    pid_path = sd / "run.pid" if sd is not None else None
+    last_run_path = sd / "last-run.json" if sd is not None else None
     platform = current_platform()
 
     _trigger_unit(full_name, platform, triggered_by_user=triggered_by_user)
@@ -5337,11 +5831,20 @@ def _trigger_unit_sync(
     started_at = time.monotonic()
     while True:
         elapsed = time.monotonic() - started_at
-        pid = _read_pid_file(pid_path)
+        # The state dir may not exist yet when `_trigger_unit_sync`
+        # starts (e.g. first fire of an entry); rediscover each
+        # iteration so the watcher catches the runner once apply +
+        # snapshot have landed.
+        if sd is None:
+            sd = _state_dir_by_name(full_name)
+            if sd is not None:
+                pid_path = sd / "run.pid"
+                last_run_path = sd / "last-run.json"
+        pid = _read_pid_file(pid_path) if pid_path is not None else None
         # `last-run.json` check goes first so a sub-second run
         # whose pid file came and went between iterations is
         # still observable via the file the runner wrote at exit.
-        if last_run_path.exists():
+        if last_run_path is not None and last_run_path.exists():
             rec: dict[str, Any] | None
             try:
                 parsed = json.loads(last_run_path.read_text(encoding="utf-8"))
@@ -5872,8 +6375,9 @@ def do_destroy(
     for full in full_names_to_destroy:
         # Refuse if a run is in progress; a partial destroy would
         # leave the running shim with deleted state under it.
-        lock_path = STATE_DIR / full / "run.lock"
-        if lock_path.exists():
+        sd = _state_dir_by_name(full)
+        lock_path = sd / "run.lock" if sd is not None else None
+        if lock_path is not None and lock_path.exists():
             try:
                 with _acquire_lock(lock_path):
                     pass
@@ -6439,9 +6943,10 @@ def _snapshot_says_scheduled(full: str) -> bool | None:
     snapshots both fall through). Used to guess UNIT NAME for
     entries whose live config no longer exists.
     """
-    snap_path = _snapshot_path_for(full)
-    if not snap_path.exists():
+    state_dir = _state_dir_by_name(full)
+    if state_dir is None:
         return None
+    snap_path = state_dir / "snapshot.json"
     try:
         raw = json.loads(snap_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -6492,9 +6997,10 @@ def _kind_from_snapshot(full: str) -> str:
     lookup turns up nothing. Returns "" if no snapshot is present
     or the file is unreadable.
     """
-    snap_path = _snapshot_path_for(full)
-    if not snap_path.exists():
+    state_dir = _state_dir_by_name(full)
+    if state_dir is None:
         return ""
+    snap_path = state_dir / "snapshot.json"
     try:
         raw = json.loads(snap_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -6533,26 +7039,25 @@ def _build_group_membership(
             for child_short in g.jobs:
                 pending.setdefault(b.full_name(child_short), []).append(g_full)
     current: dict[str, list[str]] = {}
-    if STATE_DIR.exists():
-        for entry_dir in STATE_DIR.iterdir():
-            if not entry_dir.is_dir():
-                continue
-            snap = entry_dir / "snapshot.json"
-            if not snap.exists():
-                continue
-            try:
-                raw = json.loads(snap.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(raw, dict) or raw.get("kind") != "group":
-                continue
-            children = raw.get("children")
-            if not isinstance(children, list):
-                continue
-            g_full = raw.get("name") or entry_dir.name
-            for child in children:
-                if isinstance(child, str):
-                    current.setdefault(child, []).append(g_full)
+    for _bundle_name, _uuid, entry_dir in _iter_state_entities():
+        snap = entry_dir / "snapshot.json"
+        if not snap.exists():
+            continue
+        try:
+            raw = json.loads(snap.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict) or raw.get("kind") != "group":
+            continue
+        children = raw.get("children")
+        if not isinstance(children, list):
+            continue
+        group_name = raw.get("name")
+        if not isinstance(group_name, str):
+            continue
+        for child in children:
+            if isinstance(child, str):
+                current.setdefault(child, []).append(group_name)
     for table in (pending, current):
         for v in table.values():
             v.sort()
@@ -6607,8 +7112,9 @@ def _schedule_cells(
             sched, interval = _entity_schedule(entry)
             pending = _schedule_display(sched, interval)
     current: str | None = None
-    snap_path = _snapshot_path_for(full)
-    if snap_path.exists():
+    state_dir = _state_dir_by_name(full)
+    snap_path = state_dir / "snapshot.json" if state_dir is not None else None
+    if snap_path is not None and snap_path.exists():
         try:
             raw = json.loads(snap_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -6873,12 +7379,33 @@ def do_logs(
                 interrupted.
     """
     full = normalize_full_name(name)
-    log_path = STATE_DIR / full / "run.log"
+    sd = _state_dir_by_name(full)
+    if sd is None and path:
+        # `--path` only prints where the log would land. Fall back
+        # to the live config's uuid so a fresh `crony logs --path
+        # X` works pre-apply (callers like log rotation cron
+        # entries materialize the path before the first run).
+        bundle_name, _, short = full.partition(".")
+        try:
+            bundles = load_all_bundles()
+        except ConfigError:
+            bundles = None
+        if bundles is not None:
+            bundle = bundles.by_name(bundle_name)
+            if bundle is not None:
+                entry = bundle.config.jobs.get(
+                    short
+                ) or bundle.config.job_groups.get(short)
+                if entry is not None:
+                    sd = _entity_state_dir(bundle_name, entry.uuid)
+    if sd is None:
+        raise UsageError(f"no log for {full!r} (no applied state on this host)")
+    log_path = sd / "run.log"
     if path:
         print(log_path)
         return
     if not log_path.exists():
-        raise UsageError(f"no log for {full!r} (state dir: {STATE_DIR / full})")
+        raise UsageError(f"no log for {full!r} (state dir: {sd})")
     if tail and latest:
         raise UsageError("--tail and --latest are mutually exclusive")
     if n is None:
@@ -7017,7 +7544,7 @@ def do_run(name: str, dry_run: bool, skip_gate: bool) -> None:
     """
     full_name = normalize_full_name(name)
     snap = _load_snapshot(full_name)
-    if isinstance(snap, JobSnapshot):
+    if isinstance(snap, Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
         rc = run_group(snap, dry_run=dry_run, skip_gate=skip_gate)
@@ -7338,7 +7865,6 @@ def _notify_test_one_bundle(
     if not use_channels:
         return ([], [])
     result = JobRunResult(
-        job=f"{bundle.name}.notify-test",
         host=current_host(),
         platform=current_platform(),
         started_at=_now_iso(),
@@ -7359,7 +7885,9 @@ def _notify_test_one_bundle(
         f"(bundle: {bundle.name}).\n"
         "if you can read this, the channel is working end-to-end.\n"
     )
-    _dispatch_notify(result, log_text, config.defaults)
+    _dispatch_notify(
+        result, f"{bundle.name}.notify-test", log_text, config.defaults
+    )
     successes = [ch for ch, nr in result.notifications.items() if nr.sent]
     failures = [
         (ch, nr) for ch, nr in result.notifications.items() if not nr.sent

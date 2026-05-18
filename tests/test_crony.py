@@ -9,12 +9,13 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import importlib.machinery
 import importlib.util
+import json
 import logging
 import os
-import argparse
-import json
 import re
 import shutil
 import subprocess
@@ -1555,19 +1556,19 @@ class TestLoadConfigFromFile:
         )
         f = tmp_path / "config.toml"
         f.write_text(cfg_text)
-        cfg = crony.load_config(f)
+        cfg = crony.load_toml_bundle_config(f)
         assert "brew-update" in cfg.jobs
         assert cfg.jobs["brew-update"].schedule == "*-*-* 03:15"
 
     def test_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(crony.ConfigError, match="not found"):
-            crony.load_config(tmp_path / "absent.toml")
+            crony.load_toml_bundle_config(tmp_path / "absent.toml")
 
     def test_bad_toml(self, tmp_path: Path) -> None:
         f = tmp_path / "config.toml"
         f.write_text("this is not [toml")
         with pytest.raises(crony.ConfigError, match="TOML parse error"):
-            crony.load_config(f)
+            crony.load_toml_bundle_config(f)
 
 
 # =============================================================================
@@ -2343,12 +2344,117 @@ class _RunnerHarness:
         self.state = state
         self.cfg_file = cfg_file
         self.cfg_dropin = cfg_dropin
+        self._last_cfg: Any | None = None
+        # Stable short -> uuid mapping across successive `config()`
+        # calls so a test that builds a fresh config to simulate a
+        # drift / edit keeps the same identity for an entry, not a
+        # fresh one (which would look like a delete + add to apply).
+        self._uuid_pins: dict[tuple[str, str], dict[str, str]] = {}
 
     def full(self, short: str) -> str:
         """The full namespaced name for a short job/group name in the
-        default bundle, used for state-path / unit-label assertions.
+        default bundle, used for unit-label assertions and CLI
+        argument construction.
         """
         return f"{crony.DEFAULT_BUNDLE_NAME}.{short}"
+
+    def fabricate_orphan(
+        self,
+        short: str,
+        *,
+        bundle: str = crony.DEFAULT_BUNDLE_NAME,
+        hash_stamp: bool = True,
+        kind: str = "job",
+    ) -> Path:
+        """Plant a state dir whose snapshot records a name that no
+        live config selects -- i.e. a remnant of a previously-applied
+        entry that's since been removed. Used by orphan-detection
+        tests that need to verify the apply / destroy paths see and
+        clean up such remnants.
+        """
+        # Use a deterministic uuid so re-stamps in the same test
+        # collide on the same dir rather than fanning out. The
+        # uuid format here is arbitrary -- production code reads
+        # the snapshot's `name` field to resolve a state dir from
+        # a CLI full name and never validates that the directory
+        # name is itself a canonical uuid4.
+        orphan_uuid = str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"orphan/{bundle}.{short}")
+        )
+        sd = self.state / bundle / orphan_uuid
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": kind,
+                    "name": f"{bundle}.{short}",
+                    "bundle": bundle,
+                    "uuid": orphan_uuid,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if hash_stamp:
+            (sd / "hash").write_text("legacy\n", encoding="utf-8")
+        return sd
+
+    def last_run(self, short: str, cfg: Any | None = None) -> dict[str, Any]:
+        """Read last-run.json for `<default>.<short>` and return its
+        parsed dict.
+        """
+        return _cast_dict(
+            (self.state_dir(short, cfg=cfg) / "last-run.json").read_text()
+        )
+
+    def state_dir(
+        self,
+        short: str,
+        cfg: Any | None = None,
+        *,
+        bundle: str = crony.DEFAULT_BUNDLE_NAME,
+        ensure_snapshot: bool = True,
+    ) -> Path:
+        """uuid-keyed state directory for `<bundle>.<short>`.
+
+        `cfg` is the parsed TomlBundleConfig for the bundle, used to look up the
+        entry's uuid. Pass it explicitly when the harness's `_last_cfg`
+        is stale (e.g. mid-test config rewrite that doesn't go through
+        the harness). Most callers omit it and rely on the most-recent
+        `h.config(...)` result.
+
+        `ensure_snapshot=True` materializes a minimal snapshot.json so
+        the runtime helpers that resolve a state dir by walking
+        `snapshot.json` (logs, trigger, status) can find it. Useful
+        for tests that fabricate a state dir without actually running
+        apply.
+        """
+        cfg = cfg or self._last_cfg
+        assert cfg is not None, "no config built yet for state_dir lookup"
+        entity_uuid: str = (
+            cfg.jobs[short].uuid
+            if short in cfg.jobs
+            else cfg.job_groups[short].uuid
+        )
+        sd = self.state / bundle / entity_uuid
+        if ensure_snapshot:
+            sd.mkdir(parents=True, exist_ok=True)
+            snap_p = sd / "snapshot.json"
+            if not snap_p.exists():
+                kind = "job" if short in cfg.jobs else "group"
+                snap_p.write_text(
+                    json.dumps(
+                        {
+                            "schema": crony._SNAPSHOT_SCHEMA,
+                            "kind": kind,
+                            "name": f"{bundle}.{short}",
+                            "bundle": bundle,
+                            "uuid": entity_uuid,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+        return sd
 
     def snap(self, cfg: Any, short: str) -> Any:
         """Resolve a snapshot for a default-bundle entry. Convenience
@@ -2362,8 +2468,8 @@ class _RunnerHarness:
         Used by group runner tests where children are loaded from
         their own snapshot files (not from the parent's config)."""
         snap = self.snap(cfg, short)
-        full = self.full(short)
-        p = self.state / full / "snapshot.json"
+        sd = self.state_dir(short, cfg=cfg)
+        p = sd / "snapshot.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         import dataclasses as _dc
         import json as _json
@@ -2389,9 +2495,32 @@ class _RunnerHarness:
             target_section.setdefault("darwin", {})
             assert isinstance(target_section["darwin"], dict)
             target_section["darwin"].setdefault("jobs", default_target_jobs)
+        # Re-use uuids previously assigned to the same short name
+        # so a successive `h.config(...)` call simulates an edit
+        # to the same entity rather than a delete + replace.
+        for section in ("job", "job-group"):
+            entries = full.get(section)
+            if not isinstance(entries, dict):
+                continue
+            for short, body in entries.items():
+                if not isinstance(body, dict) or "uuid" in body:
+                    continue
+                pinned = self._uuid_pins.get((section, short))
+                if pinned is not None:
+                    body["uuid"] = pinned
         _inject_uuids(full)
+        # Record the (section, short) -> uuid pins for next time.
+        for section in ("job", "job-group"):
+            entries = full.get(section)
+            if not isinstance(entries, dict):
+                continue
+            for short, body in entries.items():
+                if isinstance(body, dict) and isinstance(body.get("uuid"), str):
+                    self._uuid_pins[(section, short)] = body["uuid"]
         self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
-        return crony.parse_config(full)
+        cfg = crony.parse_config(full)
+        self._last_cfg = cfg
+        return cfg
 
 
 def _last_run(state: Path, name: str) -> dict[str, Any]:
@@ -2403,7 +2532,28 @@ def _last_run(state: Path, name: str) -> dict[str, Any]:
     """
     if "." not in name:
         name = f"{crony.DEFAULT_BUNDLE_NAME}.{name}"
-    text = (state / name / "last-run.json").read_text()
+    # State dirs are uuid-keyed under the bundle subdir; resolve
+    # the path via the snapshot file rather than reconstructing
+    # from the full name (which is no longer the on-disk key).
+    bundle, _, _ = name.partition(".")
+    bundle_dir = state / bundle
+    last_run_path: Path | None = None
+    if bundle_dir.is_dir():
+        for uuid_dir in bundle_dir.iterdir():
+            snap = uuid_dir / "snapshot.json"
+            if not snap.is_file():
+                continue
+            try:
+                raw = json.loads(snap.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if raw.get("name") == name:
+                last_run_path = uuid_dir / "last-run.json"
+                break
+    assert last_run_path is not None, (
+        f"no state dir for {name!r} under {bundle_dir}"
+    )
+    text = last_run_path.read_text()
     return _cast_dict(text)
 
 
@@ -2595,7 +2745,7 @@ class TestRunJobBasics:
         )
         rc = crony.run_job(h.snap(cfg, "ok"))
         assert rc == 0
-        rec = _last_run(h.state, "ok")
+        rec = h.last_run("ok")
         assert rec["exit_class"] == "ok"
         assert rec["exit_code"] == 0
         assert rec["gate"] == "none"
@@ -2617,7 +2767,7 @@ class TestRunJobBasics:
         )
         rc = crony.run_job(h.snap(cfg, "fail"))
         assert rc == 17
-        rec = _last_run(h.state, "fail")
+        rec = h.last_run("fail")
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 17
 
@@ -2657,7 +2807,7 @@ class TestRunJobBasics:
         rc = crony.run_job(h.snap(cfg, "ok"), dry_run=True)
         assert rc == 0
         # No last-run.json written on dry-run
-        assert not (h.state / h.full("ok") / "last-run.json").exists()
+        assert not (h.state_dir("ok") / "last-run.json").exists()
 
 
 class TestRunJobGate:
@@ -2679,7 +2829,7 @@ class TestRunJobGate:
         )
         rc = crony.run_job(h.snap(cfg, "g"))
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
         assert rec["gate"] == "passed"
 
@@ -2701,12 +2851,12 @@ class TestRunJobGate:
         )
         rc = crony.run_job(h.snap(cfg, "g"))
         assert rc == 0  # gated exits 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         assert rec["exit_class"] == "gated"
         assert rec["gate"] == "failed"
         # Main command never ran -> exit_code recorded as 0 placeholder
         assert rec["exit_code"] == 0
-        log = (h.state / h.full("g") / "run.log").read_text()
+        log = (h.state_dir("g") / "run.log").read_text()
         assert "skipping job" in log
 
     def test_skip_gate_runs_command_anyway(
@@ -2727,7 +2877,7 @@ class TestRunJobGate:
         )
         rc = crony.run_job(h.snap(cfg, "g"), skip_gate=True)
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
         assert rec["gate"] == "none"
 
@@ -2741,9 +2891,11 @@ class TestRunJobLockContention:
             {"job": {"j": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["j"],
         )
-        # Pre-acquire the lock from another file descriptor.
-        sd = h.state / h.full("j")
-        sd.mkdir()
+        # Pre-acquire the lock from another file descriptor. The
+        # state dir is created with a snapshot stub via state_dir's
+        # ensure_snapshot helper so the runner's `_state_dir_by_name`
+        # path can find it in the recovery loop.
+        sd = h.state_dir("j")
         lock = sd / "run.lock"
         import fcntl as _fcntl
 
@@ -2777,7 +2929,7 @@ class TestRunJobNotify:
             default_target_jobs=["fail"],
         )
         crony.run_job(h.snap(cfg, "fail"))
-        rec = _last_run(h.state, "fail")
+        rec = h.last_run("fail")
         assert rec["notifications"] == {}
 
     def test_listing_undefined_channel_rejected_at_parse(
@@ -2857,7 +3009,7 @@ class TestRunGroup:
         )
         rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         names = [c["name"] for c in rec["jobs_run"]]
         assert names == [h.full("a"), h.full("b")]
         # Children fire in declared order through the platform stub.
@@ -2893,7 +3045,7 @@ class TestRunGroup:
         rc = crony.run_group(h.snap(cfg, "g"))
         # Group orchestration succeeds even if a child failed.
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         assert rec["jobs_run"][0]["name"] == h.full("bad")
         assert rec["jobs_run"][0]["exit_class"] == "fail"
         assert rec["jobs_run"][0]["exit_code"] == 3
@@ -2928,7 +3080,7 @@ class TestRunGroup:
             },
         )
         crony.run_group(h.snap(cfg, "g"))
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
 
     def test_group_dry_run_skips_children(
@@ -2947,8 +3099,8 @@ class TestRunGroup:
         assert rc == 0
         # No last-run.json for either group or child on dry-run.
         # The stub was never called.
-        assert not (h.state / h.full("g") / "last-run.json").exists()
-        assert not (h.state / h.full("a") / "last-run.json").exists()
+        assert not (h.state_dir("g") / "last-run.json").exists()
+        assert not (h.state_dir("a") / "last-run.json").exists()
         assert crony._ledger == []
 
     def test_group_budget_exhausted_skips_remaining(
@@ -3012,7 +3164,7 @@ class TestRunGroup:
 
         rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         # Only `a` actually fired; `b` was budget-skipped.
         assert called == [h.full("a")]
         assert rec["jobs_run"][0]["name"] == h.full("a")
@@ -3063,7 +3215,7 @@ class TestRunGroup:
         # surfaces in the rolled-up exit_class and per-child
         # records so the runner's notification path fires.
         assert rc == 0
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         missing_rec = rec["jobs_run"][0]
         assert missing_rec["name"] == h.full("missing")
         assert missing_rec["exit_class"] == "fail"
@@ -3140,7 +3292,7 @@ class TestRunGroupInteractive:
         # The group's last-run.json records the dispatch as a
         # child with exit_class="dispatched"; rollup stays "ok"
         # because dispatched has precedence 0.
-        rec = _last_run(h.state, "g")
+        rec = h.last_run("g")
         iv_rec = next(c for c in rec["jobs_run"] if c["name"] == h.full("iv"))
         assert iv_rec["exit_class"] == "dispatched"
         assert iv_rec["exit_code"] == 0
@@ -3238,8 +3390,10 @@ class TestTriggerUnitNotInstalled:
         platform = crony.current_platform()
         with pytest.raises(crony.UnitNotInstalledError, match="not installed"):
             crony._trigger_unit(full, platform)
-        # No state dir leaked.
-        assert not (h.state / full).exists()
+        # No state dir leaked: the bundle subdir for default
+        # should not have any uuid-keyed entries.
+        bundle_dir = h.state / crony.DEFAULT_BUNDLE_NAME
+        assert not bundle_dir.exists() or not any(bundle_dir.iterdir())
 
     def test_trigger_unit_sync_does_not_create_state_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -3398,7 +3552,6 @@ class TestEmailNotify:
 
     def _make_failed_result(self, channels: list[str]) -> Any:
         return crony.JobRunResult(
-            job="j",
             host="h",
             platform="darwin",
             started_at="2026-05-02T10:00:00-07:00",
@@ -3428,7 +3581,9 @@ class TestEmailNotify:
         smtp_inst.__exit__.return_value = None
         monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(result, "log content here", cfg.defaults)
+        crony._dispatch_notify(
+            result, "default.j", "log content here", cfg.defaults
+        )
 
         assert result.notifications["email"].sent is True
         assert result.notifications["email"].error is None
@@ -3440,7 +3595,7 @@ class TestEmailNotify:
         assert sent["To"] == "you@example.com"
         assert sent["From"] == "crony@example.com"
         body = sent.get_content()
-        assert "TomlJob:        j" in body
+        assert "TomlJob:        default.j" in body
         assert "fail" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
@@ -3466,7 +3621,7 @@ class TestEmailNotify:
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest-run-detail\n"
         )
-        crony._dispatch_notify(result, log_text, cfg.defaults)
+        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
         sent = smtp_inst.send_message.call_args[0][0]
         body = sent.get_content()
         assert "newest-run-detail" in body
@@ -3483,7 +3638,7 @@ class TestEmailNotify:
         )
         monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(result, "log", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is False
         assert "ConnectionRefusedError" in (
             result.notifications["email"].error or ""
@@ -3508,7 +3663,7 @@ class TestEmailNotify:
             }
         )
         result = self._make_failed_result(["email"])
-        crony._dispatch_notify(result, "log", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is False
         assert "no SMTP password" in (result.notifications["email"].error or "")
 
@@ -3548,7 +3703,7 @@ class TestEmailNotify:
         smtp_inst.__exit__.return_value = None
         monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(result, "log", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is True
         sent = smtp_inst.send_message.call_args[0][0]
         assert sent["Reply-To"] == "support@example.com"
@@ -3584,7 +3739,6 @@ class TestNtfyNotify:
 
     def _make_failed_result(self, channels: list[str]) -> Any:
         return crony.JobRunResult(
-            job="j",
             host="h",
             platform="darwin",
             started_at="2026-05-02T10:00:00-07:00",
@@ -3624,7 +3778,9 @@ class TestNtfyNotify:
             return _Resp()
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
-        crony._dispatch_notify(result, "log content here", cfg.defaults)
+        crony._dispatch_notify(
+            result, "default.j", "log content here", cfg.defaults
+        )
 
         assert result.notifications["ntfy"].sent is True
         assert result.notifications["ntfy"].error is None
@@ -3684,7 +3840,7 @@ class TestNtfyNotify:
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest-run-detail\n"
         )
-        crony._dispatch_notify(result, log_text, cfg.defaults)
+        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
         body = captured["data"].decode("utf-8")
         assert "newest-run-detail" in body
         assert "older-run-detail" not in body
@@ -3718,7 +3874,7 @@ class TestNtfyNotify:
             + ("X" * 5000)
             + "MARKER-AT-TAIL\n"
         )
-        crony._dispatch_notify(result, log_text, cfg.defaults)
+        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
         body_bytes = captured["data"]
         assert len(body_bytes) <= 3 * 1024
         body = body_bytes.decode("utf-8", errors="replace")
@@ -3770,7 +3926,9 @@ class TestNtfyNotify:
             return _Resp()
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
-        crony._dispatch_notify(result, "log content not in body", cfg.defaults)
+        crony._dispatch_notify(
+            result, "default.j", "log content not in body", cfg.defaults
+        )
         body = captured["data"].decode("utf-8")
         # Human summary keys are present; log content is not.
         assert "TomlJob:" in body
@@ -3791,7 +3949,7 @@ class TestNtfyNotify:
             )
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
-        crony._dispatch_notify(result, "log", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["ntfy"].sent is False
         assert "503" in (result.notifications["ntfy"].error or "")
 
@@ -3838,7 +3996,7 @@ class TestNtfyNotify:
             return _Resp()
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
-        crony._dispatch_notify(result, "log", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["ntfy-email"].sent is True
         # User headers reached the request. urllib normalizes header
         # keys via .capitalize().
@@ -3895,7 +4053,6 @@ class TestMultiChannelDispatch:
     ) -> None:
         cfg = self._config(tmp_path)
         result = crony.JobRunResult(
-            job="j",
             host="h",
             platform="darwin",
             started_at="2026-05-02T10:00:00-07:00",
@@ -3924,7 +4081,7 @@ class TestMultiChannelDispatch:
             )
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _fail_post)
-        crony._dispatch_notify(result, "log content", cfg.defaults)
+        crony._dispatch_notify(result, "default.j", "log content", cfg.defaults)
 
         # email succeeded
         assert result.notifications["email"].sent is True
@@ -3970,7 +4127,7 @@ class TestNotifyChannelOrderPreserved:
             default_target_jobs=["fail"],
         )
         crony.run_job(h.snap(cfg, "fail"))
-        rec = _last_run(h.state, "fail")
+        rec = h.last_run("fail")
         assert list(rec["notifications"].keys()) == order
 
 
@@ -4252,7 +4409,7 @@ class TestApplyDarwin:
         assert "plutil" in commands
         assert "launchctl" in commands
         # Hash stamp written
-        assert (h.state / h.full("j") / "hash").exists()
+        assert (h.state_dir("j") / "hash").exists()
 
     def test_idempotent_when_unchanged(
         self, tmp_path: Path, monkeypatch: Any
@@ -4313,24 +4470,20 @@ class TestApplyFullSync:
         # Pre-stamp an orphan: an entry's state dir with a `hash`
         # file but no corresponding config entry. `crony apply`
         # with no args treats it as an orphan and destroys it.
-        orphan_dir = h.state / "old"
-        orphan_dir.mkdir(parents=True)
-        (orphan_dir / "hash").write_text("legacy\n")
+        orphan_dir = h.fabricate_orphan("old")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
-        assert (h.state / h.full("j") / "hash").exists()
+        assert (h.state_dir("j") / "hash").exists()
         assert not (orphan_dir / "hash").exists()
 
     def test_surgical_apply_leaves_orphans(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        orphan_dir = h.state / "old"
-        orphan_dir.mkdir(parents=True)
-        (orphan_dir / "hash").write_text("legacy\n")
+        orphan_dir = h.fabricate_orphan("old")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
@@ -4348,9 +4501,7 @@ class TestApplyFullSync:
         # doesn't keep surfacing in status / audit after the
         # next apply.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        orphan_dir = h.state / "old"
-        orphan_dir.mkdir(parents=True)
-        (orphan_dir / "hash").write_text("legacy\n")
+        orphan_dir = h.fabricate_orphan("old")
         (orphan_dir / "run.log").write_text("old run\n")
         (orphan_dir / "last-run.json").write_text("{}")
         h.config(
@@ -4438,10 +4589,8 @@ class TestApplyFullSync:
         # must only prune orphans inside the borgadm namespace;
         # default's orphan stays put.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        for ns in ("default.gone", "borgadm.gone"):
-            d = h.state / ns
-            d.mkdir(parents=True)
-            (d / "hash").write_text("legacy\n")
+        default_orphan = h.fabricate_orphan("gone", bundle="default")
+        borgadm_orphan = h.fabricate_orphan("gone", bundle="borgadm")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
@@ -4452,8 +4601,8 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         crony.do_apply(jobs=[], verbose=False, bundle="borgadm")
-        assert (h.state / "default.gone" / "hash").exists()
-        assert not (h.state / "borgadm.gone" / "hash").exists()
+        assert (default_orphan / "hash").exists()
+        assert not (borgadm_orphan / "hash").exists()
 
     def test_bundle_resolves_bare_name_in_scope(
         self, tmp_path: Path, monkeypatch: Any
@@ -4471,7 +4620,59 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         crony.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
-        assert (h.state / "borgadm.k" / "hash").exists()
+        bundles = crony.load_all_bundles()
+        borgadm_cfg = bundles.by_name("borgadm").config
+        k_uuid = borgadm_cfg.jobs["k"].uuid
+        assert (h.state / "borgadm" / k_uuid / "hash").exists()
+
+
+class TestApplyRenamePreservesHistory:
+    """The whole point of keying state by uuid: a TOML edit that
+    only changes a job's short name keeps the same state dir, so
+    run.log and last-run.json carry over to the new name. The old
+    name's platform unit becomes a stale label and is cleaned up
+    by the standard orphan sweep on the next full apply.
+    """
+
+    def test_rename_keeps_state_destroys_old_unit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "foo": {"command": "true", "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["foo"],
+        )
+        crony.apply_one(cfg, "foo")
+        # Plant a run.log artifact so we can prove it survives the
+        # rename via the state dir's uuid-keyed continuity.
+        foo_dir = h.state_dir("foo", cfg=cfg)
+        log = foo_dir / "run.log"
+        log.write_text("from the foo era\n", encoding="utf-8")
+        # Rename the entry from `foo` to `bar`, keeping the same
+        # uuid (the harness pins shorts across successive config
+        # calls). Full sync apply: re-renders the unit at the new
+        # label and orphan-sweeps the stale `foo` plist.
+        cfg2_raw = {
+            "job": {
+                "bar": {"command": "true", "schedule": "*-*-* 03:00"},
+            },
+        }
+        # The pin keys on (section, short); the rename short is
+        # different, so seed the new short with foo's uuid by hand.
+        foo_uuid = cfg.jobs["foo"].uuid
+        cfg2_raw["job"]["bar"]["uuid"] = foo_uuid
+        h.config(cfg2_raw, default_target_jobs=["bar"])
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        # State dir didn't move (same uuid -> same path); log
+        # survives untouched.
+        assert (foo_dir / "run.log").read_text() == "from the foo era\n"
+        # New label is wired up; old label is gone.
+        assert (h.agents / f"org.crony.{h.full('bar')}.plist").exists()
+        assert not (h.agents / f"org.crony.{h.full('foo')}.plist").exists()
 
 
 class TestDestroy:
@@ -4483,12 +4684,12 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert (h.state / h.full("j") / "hash").exists()
+        assert (h.state_dir("j") / "hash").exists()
         crony.do_destroy(
             jobs=[], preserve_runtime=False, bundle=None, orphans=False
         )
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert not (h.state / h.full("j") / "hash").exists()
+        assert not (h.state_dir("j") / "hash").exists()
 
     def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -4506,8 +4707,8 @@ class TestDestroy:
         crony.do_destroy(
             jobs=["a"], preserve_runtime=False, bundle=None, orphans=False
         )
-        assert not (h.state / h.full("a") / "hash").exists()
-        assert (h.state / h.full("b") / "hash").exists()
+        assert not (h.state_dir("a") / "hash").exists()
+        assert (h.state_dir("b") / "hash").exists()
 
     def test_default_destroy_wipes_state_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -4521,7 +4722,7 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         (sd / "run.log").write_text("...")
         crony.do_destroy(
@@ -4541,7 +4742,7 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         (sd / "run.log").write_text("...", encoding="utf-8")
         (sd / "last-run.json").write_text("{}", encoding="utf-8")
         crony.do_destroy(
@@ -4549,7 +4750,10 @@ class TestDestroy:
         )
         assert sd.exists()
         assert not (sd / "hash").exists()
-        assert not (sd / "snapshot.json").exists()
+        # snapshot.json is preserved so a follow-up non-preserve
+        # destroy can still resolve this state dir from the
+        # entry's full name.
+        assert (sd / "snapshot.json").exists()
         assert (sd / "run.log").read_text() == "..."
         assert (sd / "last-run.json").read_text() == "{}"
 
@@ -4567,7 +4771,7 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         (sd / "run.log").write_text("...", encoding="utf-8")
         crony.do_destroy(
             jobs=[], preserve_runtime=True, bundle=None, orphans=False
@@ -4599,7 +4803,7 @@ class TestDestroy:
         priv = bundles.by_name("private")
         assert priv is not None
         crony.apply_one(priv.config, "j", bundle_name="private")
-        sd = h.state / "private.j"
+        sd = h.state / "private" / priv.config.jobs["j"].uuid
         (sd / "run.log").write_text("...", encoding="utf-8")
         crony.do_destroy(
             jobs=[], preserve_runtime=True, bundle="private", orphans=False
@@ -4639,7 +4843,7 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         lock_path = sd / "run.lock"
         held = open(lock_path, "w")
@@ -4718,14 +4922,16 @@ class TestDestroy:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        k_dir = h.state / "borgadm" / borgadm.config.jobs["k"].uuid
+        assert k_dir.exists()
         crony.do_destroy(
             jobs=[],
             preserve_runtime=False,
             bundle="borgadm",
             orphans=False,
         )
-        assert (h.state / "default.j" / "hash").exists()
-        assert not (h.state / "borgadm.k").exists()
+        assert (h.state_dir("j") / "hash").exists()
+        assert not k_dir.exists()
 
     def test_bundle_qualified_other_bundle_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -4771,6 +4977,7 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "live")
         crony.apply_one(cfg, "renamed")
+        renamed_dir = h.state_dir("renamed", cfg=cfg)
         # Drop `renamed` from config without applying -- now
         # selected={live} but discovered={live,renamed}.
         h.config(
@@ -4784,8 +4991,8 @@ class TestDestroy:
         crony.do_destroy(
             jobs=[], preserve_runtime=False, bundle=None, orphans=True
         )
-        assert (h.state / h.full("live") / "hash").exists()
-        assert not (h.state / h.full("renamed")).exists()
+        assert (h.state_dir("live") / "hash").exists()
+        assert not renamed_dir.exists()
         assert not (h.agents / f"org.crony.{h.full('renamed')}.plist").exists()
 
     def test_orphans_flag_under_bundle_scopes_to_bundle(
@@ -4799,6 +5006,7 @@ class TestDestroy:
             default_target_jobs=["old_d"],
         )
         crony.apply_one(cfg, "old_d")
+        default_old_d_dir = h.state_dir("old_d")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
                 '[job.old_b]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
@@ -4811,6 +5019,9 @@ class TestDestroy:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         crony.apply_one(borgadm.config, "old_b", bundle_name="borgadm")
+        borgadm_old_b_dir = (
+            h.state / "borgadm" / borgadm.config.jobs["old_b"].uuid
+        )
         # Strip both entries from their configs, leaving them
         # as orphan remnants on disk.
         h.config({}, default_target_jobs=[])
@@ -4824,8 +5035,8 @@ class TestDestroy:
             bundle="borgadm",
             orphans=True,
         )
-        assert (h.state / "default.old_d" / "hash").exists()
-        assert not (h.state / "borgadm.old_b").exists()
+        assert (default_old_d_dir / "hash").exists()
+        assert not borgadm_old_b_dir.exists()
 
     def test_orphans_flag_with_positional_names_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -4854,7 +5065,7 @@ class TestDestroy:
         crony.do_destroy(
             jobs=[], preserve_runtime=False, bundle=None, orphans=True
         )
-        assert (h.state / h.full("j") / "hash").exists()
+        assert (h.state_dir("j") / "hash").exists()
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
@@ -5153,9 +5364,7 @@ class TestConfigState:
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         # Stamp the entry on disk: per-entry dir with a `hash` file.
-        orphan_dir = h.state / h.full("old")
-        orphan_dir.mkdir(parents=True)
-        (orphan_dir / "hash").write_text("legacy\n")
+        h.fabricate_orphan("old")
         cfg = h.config({}, default_target_jobs=[])
         assert crony._config_state(cfg, "old", "darwin") == "orphan"
 
@@ -5564,9 +5773,7 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        ghost_dir = h.state / "ghost"
-        ghost_dir.mkdir(parents=True)
-        (ghost_dir / "hash").write_text("legacy\n")
+        h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
@@ -5625,7 +5832,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         (sd / "run.log").write_text("...", encoding="utf-8")
         h.config({}, default_target_jobs=[])
         crony.do_destroy(
@@ -5703,7 +5910,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        sd = h.state / h.full("j")
+        sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         five_min_ago = (
             _dt.datetime.now(_dt.timezone.utc).astimezone()
@@ -7176,9 +7383,7 @@ class TestValidate:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        ghost_dir = h.state / "ghost"
-        ghost_dir.mkdir(parents=True)
-        (ghost_dir / "hash").write_text("legacy\n")
+        h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         with pytest.raises(SystemExit) as exc:
             crony.do_validate(bundle=None)
@@ -7241,9 +7446,7 @@ class TestValidate:
         # ignores them. The orphan stamp here would normally
         # trigger a WARNING; --bundle borgadm should exit clean.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        ghost_dir = h.state / "ghost"
-        ghost_dir.mkdir(parents=True)
-        (ghost_dir / "hash").write_text("legacy\n")
+        h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
@@ -7319,8 +7522,7 @@ class TestResolveStateAxes:
         # entry to consult so sched falls through to _unit_state
         # (stubbed to "enabled" to surface the branch).
         ghost = h.full("ghost")
-        (h.state / ghost).mkdir(parents=True)
-        (h.state / ghost / "hash").write_text("legacy\n")
+        h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         bundles = crony.load_all_bundles()
@@ -7702,7 +7904,7 @@ class TestAudit:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        last_run = h.state / h.full("j") / "last-run.json"
+        last_run = h.state_dir("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
         crony.do_audit(exclude_disabled=False, bundle=None)
@@ -7719,7 +7921,7 @@ class TestAudit:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        last_run = h.state / h.full("j") / "last-run.json"
+        last_run = h.state_dir("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "fail"}', encoding="utf-8")
         with pytest.raises(crony.AuditFailedError):
@@ -7769,7 +7971,7 @@ class TestAudit:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
-        last_run = h.state / h.full("j") / "last-run.json"
+        last_run = h.state_dir("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "ok"}', encoding="utf-8")
         with pytest.raises(crony.AuditFailedError):
@@ -7788,7 +7990,7 @@ class TestAudit:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        last_run = h.state / h.full("j") / "last-run.json"
+        last_run = h.state_dir("j") / "last-run.json"
         last_run.parent.mkdir(parents=True, exist_ok=True)
         last_run.write_text('{"exit_class": "fail"}', encoding="utf-8")
         # borgadm bundle's job is clean (selected via [target.darwin]).
@@ -7805,8 +8007,12 @@ class TestAudit:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
-        clean_last = h.state / "borgadm.k" / "last-run.json"
-        clean_last.parent.mkdir(parents=True, exist_ok=True)
+        clean_last = (
+            h.state
+            / "borgadm"
+            / borgadm.config.jobs["k"].uuid
+            / "last-run.json"
+        )
         clean_last.write_text('{"exit_class": "ok"}', encoding="utf-8")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_audit(exclude_disabled=False, bundle="borgadm")
@@ -7838,9 +8044,7 @@ class TestAudit:
             ),
             encoding="utf-8",
         )
-        gone_dir = h.state / "borgadm.gone"
-        gone_dir.mkdir(parents=True)
-        (gone_dir / "hash").write_text("legacy\n", encoding="utf-8")
+        h.fabricate_orphan("gone", bundle="borgadm")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         with pytest.raises(crony.AuditFailedError):
             crony.do_audit(exclude_disabled=False, bundle="borgadm")
@@ -7872,7 +8076,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(
             "\n".join(f"line {i}" for i in range(20)) + "\n",
@@ -7896,7 +8100,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(
             "\n".join(f"line {i}" for i in range(300)) + "\n",
@@ -7957,7 +8161,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("hello\n", encoding="utf-8")
         crony.do_logs(
@@ -7983,7 +8187,7 @@ class TestLogs:
             name="j", n=0, since=None, tail=False, path=True, latest=False
         )
         out = capsys.readouterr().out.strip()
-        expected = h.state / h.full("j") / "run.log"
+        expected = h.state_dir("j") / "run.log"
         assert out == str(expected)
 
     def test_since_filters_old_runs(
@@ -7994,7 +8198,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         old_iso = "2026-01-01T03:15:00-08:00"
         import datetime as _dt
@@ -8092,7 +8296,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(
             "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
@@ -8124,7 +8328,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("orphan content with no === header\n", encoding="utf-8")
         crony.do_logs(
@@ -8146,7 +8350,7 @@ class TestLogs:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        log = h.state / h.full("j") / "run.log"
+        log = h.state_dir("j") / "run.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n")
         with pytest.raises(crony.UsageError, match="mutually exclusive"):
@@ -8552,6 +8756,174 @@ class TestBundleLoading:
         assert any("default.toml" in r.message for r in caplog.records)
 
 
+class TestLoadConfig:
+    """`load_config()` builds the whole-process Config: parsed TOML +
+    pending graph (from cascade resolution) + current graph (from
+    on-disk snapshots) + runtime state + orphan-unit detection. It's
+    the one-shot scan that every later read path consults instead of
+    re-walking the disk.
+    """
+
+    def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        cfg_dropin = tmp_path / "config_dropin"
+        cfg_dropin.mkdir()
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
+        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        return cfg_file
+
+    def test_pending_graph_built_from_toml(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_a = "11111111-2222-3333-4444-555555555555"
+        cfg_file.write_text(
+            f'[job.a]\nuuid = "{uuid_a}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        config = crony.load_config()
+        ref = crony.EntityRef("default", uuid_a)
+        assert ref in config.pending.jobs
+        assert config.pending.jobs[ref].name == "default.a"
+        # No on-disk snapshot yet -> nothing in current.
+        assert ref not in config.current.jobs
+        assert config.config_state(ref) == "missing"
+
+    def test_current_only_entry_is_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        uuid_g = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        # Plant a state dir + snapshot for an entry that no TOML
+        # defines. (Empty config file = no jobs.)
+        crony.CONFIG_FILE.write_text("", encoding="utf-8")
+        sd = crony.STATE_DIR / "default" / uuid_g
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": "job",
+                    "name": "default.gone",
+                    "bundle": "default",
+                    "uuid": uuid_g,
+                    "command": "true",
+                    "script": None,
+                    "args": [],
+                    "gate": None,
+                    "gate_script": None,
+                    "gate_args": [],
+                    "env": {},
+                    "job_timeout_sec": 600,
+                    "schedule": "daily",
+                    "interval": None,
+                    "interactive": False,
+                    "interactive_active_sec": 600,
+                    "interactive_delay_sec": 3600,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (sd / "hash").write_text("legacy\n", encoding="utf-8")
+        config = crony.load_config()
+        ref = crony.EntityRef("default", uuid_g)
+        assert config.config_state(ref) == "orphan"
+        assert ref in config.runtime
+        assert config.runtime[ref].hash == "legacy"
+
+    def test_synced_when_pending_matches_current(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_a = "33333333-4444-5555-6666-777777777777"
+        cfg_file.write_text(
+            f'[job.a]\nuuid = "{uuid_a}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        # Build a snapshot that matches what apply would write.
+        bundles = crony.load_all_bundles()
+        target = crony.resolve_target(
+            bundles.bundles[0].config, "test-host", "darwin"
+        )
+        snap = crony._resolve_job_snapshot(
+            bundles.bundles[0].config,
+            target,
+            bundles.bundles[0].config.jobs["a"],
+            "default.a",
+            "default",
+        )
+        sd = crony.STATE_DIR / "default" / uuid_a
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(dataclasses.asdict(snap)), encoding="utf-8"
+        )
+        (sd / "hash").write_text("h\n", encoding="utf-8")
+        config = crony.load_config()
+        ref = crony.EntityRef("default", uuid_a)
+        assert config.config_state(ref) == "synced"
+
+    def test_stale_when_pending_differs(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_a = "44444444-5555-6666-7777-888888888888"
+        cfg_file.write_text(
+            f'[job.a]\nuuid = "{uuid_a}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        target = crony.resolve_target(
+            bundles.bundles[0].config, "test-host", "darwin"
+        )
+        snap = crony._resolve_job_snapshot(
+            bundles.bundles[0].config,
+            target,
+            bundles.bundles[0].config.jobs["a"],
+            "default.a",
+            "default",
+        )
+        sd = crony.STATE_DIR / "default" / uuid_a
+        sd.mkdir(parents=True)
+        # Persist a snapshot with a divergent command vs what TOML
+        # currently says ("true" vs "stale-command").
+        diverged = dataclasses.asdict(snap)
+        diverged["command"] = "stale-command"
+        (sd / "snapshot.json").write_text(
+            json.dumps(diverged), encoding="utf-8"
+        )
+        (sd / "hash").write_text("h\n", encoding="utf-8")
+        config = crony.load_config()
+        ref = crony.EntityRef("default", uuid_a)
+        assert config.config_state(ref) == "stale"
+
+    def test_resolve_finds_by_pending_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_a = "55555555-6666-7777-8888-999999999999"
+        cfg_file.write_text(
+            f'[job.a]\nuuid = "{uuid_a}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        config = crony.load_config()
+        ref = config.resolve("default.a")
+        assert ref is not None
+        assert ref.uuid == uuid_a
+
+
 class TestBundleNamespacing:
     """TomlJob names from different bundles get distinct namespaced
     forms; bundle-local short names can collide freely."""
@@ -8642,8 +9014,7 @@ class TestTriggerUnitSync:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        sd = h.state / full
-        sd.mkdir()
+        sd = h.fabricate_orphan("foo")
 
         def _stub_trigger(name: str, platform: str, **kw: Any) -> None:
             # Pretend the runner ran and wrote a fresh result.
@@ -8665,7 +9036,7 @@ class TestTriggerUnitSync:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        (h.state / full).mkdir()
+        h.fabricate_orphan("foo")
         monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
         with pytest.raises(crony.TriggerStartTimeout, match="never produced"):
             crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=1.0)
@@ -8679,8 +9050,7 @@ class TestTriggerUnitSync:
         # one appears or the trigger_timeout fires.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        sd = h.state / full
-        sd.mkdir()
+        sd = h.fabricate_orphan("foo")
         (sd / "last-run.json").write_text(
             '{"ended_at": "1970-01-01T00:00:00-00:00",'
             ' "exit_code": 0, "exit_class": "ok"}',
@@ -8701,8 +9071,7 @@ class TestTriggerUnitSync:
         # spins until `trigger_timeout`.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        sd = h.state / full
-        sd.mkdir()
+        sd = h.fabricate_orphan("foo")
 
         def _stub_trigger(name: str, platform: str, **kw: Any) -> None:
             # Write a last-run.json whose ended_at is the same
@@ -8733,8 +9102,7 @@ class TestTriggerUnitSync:
         # as `timeout` even after a clean `ok` exit.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        sd = h.state / full
-        sd.mkdir()
+        sd = h.fabricate_orphan("foo")
 
         # Stub the platform trigger to write a pid file
         # immediately. The pid points at the real test process
@@ -8836,7 +9204,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / h.full("j") / "snapshot.json"
+        snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "job"
@@ -8858,7 +9226,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        entry_dir = h.state / h.full("j")
+        entry_dir = h.state_dir("j")
         assert (entry_dir / "hash").is_file()
         assert (entry_dir / "snapshot.json").is_file()
         assert not (h.state / "installed").exists()
@@ -8886,7 +9254,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
         crony.apply_one(cfg, "g")
-        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "group"
         assert snap["children"] == [h.full("a"), h.full("b")]
@@ -8926,7 +9294,7 @@ class TestSnapshotLifecycle:
         # `b` is masked on test-host; apply skips it via target
         # selection. The group snapshot must do the same.
         crony.apply_one(cfg, "g")
-        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [h.full("a")]
         # Budget reflects only `a`: 1.05 * 100 = 105.
@@ -8958,7 +9326,7 @@ class TestSnapshotLifecycle:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "g")
-        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [h.full("a")]
         assert snap["group_budget_sec"] == 105
@@ -8991,7 +9359,7 @@ class TestSnapshotLifecycle:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "g")
-        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [h.full("a")]
         assert snap["group_budget_sec"] == 105
@@ -9067,7 +9435,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / h.full("j") / "snapshot.json"
+        snap_path = h.state_dir("j") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # Literal $PATH preserved -- expansion happens at fire time.
         assert snap["env"] == {"PATH": "/extra:$PATH"}
@@ -9139,10 +9507,10 @@ class TestSnapshotLifecycle:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("j")
-        p = h.state / full / "snapshot.json"
-        p.parent.mkdir(parents=True)
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / "deadbeef-uuid"
+        sd.mkdir(parents=True)
         # schema=999 simulates a future version we don't support.
-        p.write_text(
+        (sd / "snapshot.json").write_text(
             '{"schema": 999, "kind": "job", "name": "default.j"}',
             encoding="utf-8",
         )
@@ -9179,7 +9547,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["g"],
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
-        snap_path = h.state / h.full("g") / "snapshot.json"
+        snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
         assert snap["group_budget_sec"] == 105
@@ -9213,7 +9581,7 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        snap_path = h.state / h.full("j") / "snapshot.json"
+        snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
         crony.destroy_one(h.full("j"))
         assert not snap_path.exists()
@@ -9254,13 +9622,16 @@ class TestSnapshotBackwardLoad:
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         full = h.full("j")
-        snap_dir = h.state / full
+        legacy_uuid = "11112222-3333-4444-5555-666677778888"
+        snap_dir = h.state / crony.DEFAULT_BUNDLE_NAME / legacy_uuid
         snap_dir.mkdir(parents=True)
         # Pre-existing snapshot lacking schedule / interval keys.
         legacy = {
             "schema": crony._SNAPSHOT_SCHEMA,
             "kind": "job",
             "name": full,
+            "bundle": crony.DEFAULT_BUNDLE_NAME,
+            "uuid": legacy_uuid,
             "command": "true",
             "script": None,
             "args": [],
@@ -9272,7 +9643,7 @@ class TestSnapshotBackwardLoad:
         }
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
         snap = crony._load_snapshot(full)
-        assert isinstance(snap, crony.JobSnapshot)
+        assert isinstance(snap, crony.Job)
         assert snap.schedule is None
         assert snap.interval is None
 
@@ -9553,21 +9924,24 @@ class TestUserTriggerFlag:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
-        full = h.full("iv")
-        # No flag yet -> consume returns False.
-        assert not crony._consume_user_trigger_flag(full)
-        crony._write_user_trigger_flag(full)
-        assert (h.state / full / "user-trigger.flag").exists()
-        assert crony._consume_user_trigger_flag(full)
-        assert not (h.state / full / "user-trigger.flag").exists()
+        # The flag lives inside the entity's uuid-keyed state dir so
+        # it sits alongside run.lock / pending.flag / last-run.json
+        # rather than under a phantom legacy path.
+        sd = h.fabricate_orphan("iv")
+        assert not crony._consume_user_trigger_flag(sd)
+        crony._write_user_trigger_flag(sd)
+        assert (sd / "user-trigger.flag").exists()
+        assert crony._consume_user_trigger_flag(sd)
+        assert not (sd / "user-trigger.flag").exists()
         # Second consume on absent flag returns False.
-        assert not crony._consume_user_trigger_flag(full)
+        assert not crony._consume_user_trigger_flag(sd)
 
     def test_trigger_unit_writes_flag_only_when_user_initiated(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("iv")
+        sd = h.fabricate_orphan("iv")
         unit = tmp_path / "fake.plist"
         unit.write_text("")
         monkeypatch.setattr(crony, "_dispatch_unit_path", lambda *a, **kw: unit)
@@ -9577,7 +9951,7 @@ class TestUserTriggerFlag:
             lambda *a, **kw: subprocess.CompletedProcess(a, 0),
         )
         crony._trigger_unit(full, "darwin", triggered_by_user=True)
-        flag = h.state / full / "user-trigger.flag"
+        flag = sd / "user-trigger.flag"
         assert flag.exists()
         flag.unlink()
         crony._trigger_unit(full, "darwin")
@@ -9592,6 +9966,7 @@ class TestUserTriggerFlag:
         # it and silently skip its wait.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("iv")
+        sd = h.fabricate_orphan("iv")
         unit = tmp_path / "fake.plist"
         unit.write_text("")
         monkeypatch.setattr(crony, "_dispatch_unit_path", lambda *a, **kw: unit)
@@ -9602,7 +9977,7 @@ class TestUserTriggerFlag:
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
         with pytest.raises(subprocess.CalledProcessError):
             crony._trigger_unit(full, "darwin", triggered_by_user=True)
-        assert not (h.state / full / "user-trigger.flag").exists()
+        assert not (sd / "user-trigger.flag").exists()
 
 
 class TestRunJobInteractive:
@@ -9634,7 +10009,7 @@ class TestRunJobInteractive:
         )
         rc = crony.run_job(h.snap(cfg, "iv"))
         assert rc == 0
-        rec = _last_run(h.state, "iv")
+        rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
         assert not (h.state / h.full("iv") / "pending.flag").exists()
 
@@ -9662,7 +10037,7 @@ class TestRunJobInteractive:
         )
         rc = crony.run_job(h.snap(cfg, "iv"))
         assert rc == 0
-        rec = _last_run(h.state, "iv")
+        rec = h.last_run("iv")
         assert rec["exit_class"] == "canceled"
         # The wrapped command never ran.
         assert not sentinel.exists()
@@ -9684,12 +10059,12 @@ class TestRunJobInteractive:
             },
             default_target_jobs=["iv"],
         )
-        full = h.full("iv")
         # Snapshot resolution creates the state dir, but the flag
         # might be written by trigger BEFORE the runner starts. Mimic
-        # that: write the flag before run_job.
-        (h.state / full).mkdir(parents=True, exist_ok=True)
-        crony._write_user_trigger_flag(full)
+        # that: write the flag before run_job, into the uuid-keyed
+        # state dir.
+        sd = h.state_dir("iv", cfg=cfg)
+        crony._write_user_trigger_flag(sd)
 
         called: list[bool] = []
 
@@ -9701,10 +10076,10 @@ class TestRunJobInteractive:
         rc = crony.run_job(h.snap(cfg, "iv"))
         assert rc == 0
         assert called == []
-        rec = _last_run(h.state, "iv")
+        rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
         # The flag was consumed.
-        assert not (h.state / full / "user-trigger.flag").exists()
+        assert not (sd / "user-trigger.flag").exists()
 
     def test_user_trigger_mid_wait_breaks_out_and_execs(
         self, tmp_path: Path, monkeypatch: Any
@@ -9727,7 +10102,7 @@ class TestRunJobInteractive:
             },
             default_target_jobs=["iv"],
         )
-        full = h.full("iv")
+        sd = h.state_dir("iv", cfg=cfg)
         # Drive the real _interactive_wait_and_prompt: HID idle is
         # high (idle break), screen is locked -- no natural
         # accumulation -- but on the second poll a `crony trigger`
@@ -9739,17 +10114,16 @@ class TestRunJobInteractive:
         def fake_sleep(s: float) -> None:
             sleeps[0] += 1
             if sleeps[0] == 1:
-                (h.state / full).mkdir(parents=True, exist_ok=True)
-                crony._write_user_trigger_flag(full)
+                crony._write_user_trigger_flag(sd)
 
         monkeypatch.setattr(crony.time, "sleep", fake_sleep)
 
         rc = crony.run_job(h.snap(cfg, "iv"))
         assert rc == 0
-        rec = _last_run(h.state, "iv")
+        rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
         # The flag was consumed during the wait.
-        assert not (h.state / full / "user-trigger.flag").exists()
+        assert not (sd / "user-trigger.flag").exists()
 
 
 class TestLastRunStateInteractive:
@@ -9763,8 +10137,7 @@ class TestLastRunStateInteractive:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("iv")
-        sd = h.state / full
-        sd.mkdir(parents=True)
+        sd = h.fabricate_orphan("iv")
         (sd / "pending.flag").write_bytes(b"")
         with crony._acquire_lock(sd / "run.lock"):
             assert crony._last_run_state(full) == "pending"
@@ -9774,8 +10147,7 @@ class TestLastRunStateInteractive:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("iv")
-        sd = h.state / full
-        sd.mkdir(parents=True)
+        sd = h.fabricate_orphan("iv")
         with crony._acquire_lock(sd / "run.lock"):
             assert crony._last_run_state(full) == "running"
 
@@ -9784,8 +10156,7 @@ class TestLastRunStateInteractive:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("iv")
-        sd = h.state / full
-        sd.mkdir(parents=True)
+        sd = h.fabricate_orphan("iv")
         (sd / "last-run.json").write_text(
             '{"exit_class": "canceled", '
             '"started_at": "2099-01-01T00:00:00-08:00"}',
