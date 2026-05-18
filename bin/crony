@@ -97,7 +97,7 @@ untouched. `crony apply <errored-name>` refuses with a clear
 accepted so a prior install can still be cleaned up; the
 remaining lifecycle commands (`enable`, `disable`, `trigger`)
 operate on the installed unit as usual since they need no
-parsed Config field. Several
+parsed TomlBundleConfig field. Several
 opt-in columns are available via `--cols`, including `unit`
 (scheduler-side state: enabled / disabled / grouped / none),
 `groups` (group memberships), `kind` (job vs group), `masked-by`
@@ -128,7 +128,7 @@ via an osascript dialog (Run / Delay / Cancel) before running.
 Auto-tagged `platforms = ["darwin"]` -- the dialog and idle
 detection are macOS-only. The runner waits for the user to be
 continuously active for `interactive_active` (default 10min),
-then prompts; "Delay Job" sleeps `interactive_delay` (default
+then prompts; "Delay TomlJob" sleeps `interactive_delay` (default
 1h) and re-waits. `crony status` reports such a job as
 `pending` during the wait. `crony trigger` bypasses the wait
 and runs the command immediately.
@@ -140,13 +140,13 @@ reads the snapshot, never the live config: editing the toml
 without `apply` therefore has no effect on running units, and
 audit catches any drift via the hash.
 
-Config bundles:
+TomlBundleConfig bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
   ~/.config/crony/config/<x>.toml -> bundle name "<x>"
 
-Bundles are independent: each has its own [defaults], targets, and
+TomlConfig are independent: each has its own [defaults], targets, and
 notify config; jobs/groups defined in one bundle don't see another's.
-Job and group names are namespaced as <bundle>.<short>; bare CLI
+TomlJob and group names are namespaced as <bundle>.<short>; bare CLI
 input (`crony trigger foo`) is shorthand for `default.foo` and only
 ever resolves to the default bundle. The `-b/--bundle <name>` flag
 on multi-job subcommands (apply, destroy, status, enable, disable,
@@ -244,7 +244,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 #                                       [A-Za-z0-9][A-Za-z0-9_-]*)
 # Each bundle is independent: its [defaults], targets, groups, and
 # notify config apply only to the jobs defined in the same file.
-# Job and group names are namespaced as <bundle>.<short>; on the
+# TomlJob and group names are namespaced as <bundle>.<short>; on the
 # CLI, a bare name (`crony trigger foo`) is shorthand for
 # `default.foo` and never falls through to other bundles. The
 # `-b/--bundle <name>` flag on multi-job subcommands (apply,
@@ -374,7 +374,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # interactive        = true
 # # Optional knobs (defaults shown):
 # # interactive_active = "10min"          # required user-active window
-# # interactive_delay  = "1h"             # sleep after "Delay Job"
+# # interactive_delay  = "1h"             # sleep after "Delay TomlJob"
 
 
 # ----------------------------------------------------------------------------
@@ -628,18 +628,18 @@ class HostList:
 # override `interactive_active` / `interactive_delay`. 10 min of
 # continuous active input is conservative enough that a passing
 # wiggle of the mouse doesn't trigger the dialog; a 1h delay after
-# "Delay Job" gives breathing room before crony asks again.
+# "Delay TomlJob" gives breathing room before crony asks again.
 _INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
 _INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
 
 
 @dataclass
-class Job:
+class TomlJob:
     """A single schedulable unit of work."""
 
     name: str
     # Stable per-bundle identity, decoupled from `name`. Every live
-    # Job in `Config.jobs` carries one; `_parse_job` rejects bodies
+    # TomlJob in `TomlBundleConfig.jobs` carries one; `_parse_job` rejects bodies
     # without `uuid` into `errored_jobs`. `crony config update`
     # populates the field in place via tomlkit round-trip for
     # configs that don't yet have one.
@@ -677,7 +677,7 @@ class Job:
 
 
 @dataclass
-class JobGroup:
+class TomlJobGroup:
     """A scheduled sequencer that fires named jobs in order.
 
     Groups don't carry notify settings: children run independently
@@ -694,7 +694,7 @@ class JobGroup:
     can hit its own per-job timeout before the parent's
     cumulative deadline fires.
 
-    `platforms` / `hosts` work the same way as on Job: empty
+    `platforms` / `hosts` work the same way as on TomlJob: empty
     means "applies everywhere", non-empty restricts selection.
     `hosts` supports negation via `!host` entries -- see HostList.
     A group filtered out doesn't recurse into its children; a
@@ -717,7 +717,7 @@ class Target:
     `kind` is "platform" (e.g. darwin/linux) or "host" (a specific host).
 
     A target deliberately carries no timeout knob: timeouts are a
-    per-leaf-job concern (`Job.job_timeout_sec` cascading to
+    per-leaf-job concern (`TomlJob.job_timeout_sec` cascading to
     `Defaults.job_timeout_sec`) because a target / group is a
     selection-or-sequencing concept, not an executor. Effective
     deadlines for groups are auto-computed from their children
@@ -742,7 +742,7 @@ class NotificationResult:
 
 
 @dataclass
-class Config:
+class TomlBundleConfig:
     """Top-level parsed config (one bundle's content).
 
     Per-entity ConfigErrors from `[job.*]`, `[job-group.*]`, and
@@ -770,8 +770,8 @@ class Config:
     """
 
     defaults: Defaults = field(default_factory=Defaults)
-    jobs: dict[str, Job] = field(default_factory=dict)
-    job_groups: dict[str, JobGroup] = field(default_factory=dict)
+    jobs: dict[str, TomlJob] = field(default_factory=dict)
+    job_groups: dict[str, TomlJobGroup] = field(default_factory=dict)
     errored_jobs: dict[str, str] = field(default_factory=dict)
     errored_job_groups: dict[str, str] = field(default_factory=dict)
     platform_targets: dict[str, Target] = field(default_factory=dict)
@@ -781,8 +781,8 @@ class Config:
 
 
 @dataclass
-class Bundle:
-    """One config file's contribution: a bundle name + parsed Config.
+class TomlBundle:
+    """One config file's contribution: a bundle name + parsed TomlBundleConfig.
 
     The bundle name namespaces the bundle's job and group names: a
     short name `daily-update` defined in bundle `borgadm` has the
@@ -792,26 +792,26 @@ class Bundle:
 
     name: str
     source: Path
-    config: Config
+    config: TomlBundleConfig
 
     def full_name(self, short: str) -> str:
         return f"{self.name}.{short}"
 
 
 @dataclass
-class Bundles:
+class TomlConfig:
     """All loaded bundles, keyed by bundle name. Order is the load
     order (config.toml first, then config/*.toml lex-sorted)."""
 
-    bundles: list[Bundle] = field(default_factory=list)
+    bundles: list[TomlBundle] = field(default_factory=list)
 
-    def by_name(self, bundle_name: str) -> Bundle | None:
+    def by_name(self, bundle_name: str) -> TomlBundle | None:
         for b in self.bundles:
             if b.name == bundle_name:
                 return b
         return None
 
-    def find_for_short(self, bundle_name: str, short: str) -> Bundle | None:
+    def find_for_short(self, bundle_name: str, short: str) -> TomlBundle | None:
         """Return the bundle defining `<bundle_name>.<short>` (job or
         group), or None if no such name exists in that bundle."""
         b = self.by_name(bundle_name)
@@ -998,7 +998,7 @@ def validate_schedule(s: str) -> None:
 # CONFIG LOADING
 # =============================================================================
 # Reads TOML, validates structurally and cross-cuttingly, and returns a
-# fully-typed Config. Raises ConfigError on any problem.
+# fully-typed TomlBundleConfig. Raises ConfigError on any problem.
 
 
 _KNOWN_TOPLEVEL: frozenset[str] = frozenset(
@@ -1173,7 +1173,7 @@ def _typed_field(
 # cleanly into `<bundle>.foo.bar` on disk.
 _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# Bundle names come from filenames (config.toml -> "default";
+# TomlBundle names come from filenames (config.toml -> "default";
 # config/<x>.toml -> "x"). The dot is reserved as the namespace
 # separator between bundle and short name, so bundle names cannot
 # themselves contain dots.
@@ -1281,7 +1281,7 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
     return f"{bundle}.{short}"
 
 
-def require_known_bundle(bundles: Bundles, bundle: str | None) -> None:
+def require_known_bundle(bundles: TomlConfig, bundle: str | None) -> None:
     """Reject `--bundle <name>` if `<name>` isn't a loaded bundle."""
     if bundle is not None and bundles.by_name(bundle) is None:
         raise UsageError(f"unknown bundle: {bundle!r}")
@@ -1306,7 +1306,7 @@ def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
 def _parse_platforms_field(raw: dict[str, Any], where: str) -> list[str]:
     """Parse a `platforms = [...]` field with allowed-value check.
 
-    Both Job and JobGroup carry `platforms`; the allowed values
+    Both TomlJob and TomlJobGroup carry `platforms`; the allowed values
     (`darwin`, `linux`) are the same. Hosts have no fixed allow-
     list -- they're whatever the user names their machines.
     """
@@ -1532,7 +1532,7 @@ def _parse_notify_channels(
     """Parse a `notify_channels` list (structural validation only).
 
     `required=True` (Defaults) returns [] when the key is absent.
-    `required=False` (Job/Target) returns None when absent so the
+    `required=False` (TomlJob/Target) returns None when absent so the
     cascade can inherit from a layer below. Duplicate entries and
     non-string entries raise. Whether each entry actually resolves
     to a defined channel is checked later in `_validate_config`,
@@ -1589,7 +1589,7 @@ def _parse_defaults(raw: dict[str, Any]) -> Defaults:
     )
 
 
-def _parse_job(name: str, raw: dict[str, Any]) -> Job:
+def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     """Parse [job.<name>]."""
     _validate_name(name, f"[job.{name}]")
     where = f"[job.{name}]"
@@ -1650,7 +1650,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
                 f"platforms = ['darwin']; remove or change the "
                 f"'platforms' override"
             )
-    return Job(
+    return TomlJob(
         name=name,
         uuid=job_uuid,
         command=command,
@@ -1672,7 +1672,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
     )
 
 
-def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
+def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     """Parse [job-group.<name>].
 
     schedule / interval are both optional: a group with neither is a
@@ -1704,7 +1704,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
         parse_interval_seconds(interval)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
-    return JobGroup(
+    return TomlJobGroup(
         name=name,
         uuid=group_uuid,
         jobs=jobs,
@@ -1734,7 +1734,7 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
 
 
 def _collect_target_parents(
-    config: Config, target: Target
+    config: TomlBundleConfig, target: Target
 ) -> dict[str, list[str]]:
     """Map each name reachable from `target` to its parent reference(s).
 
@@ -1774,7 +1774,7 @@ def _collect_target_parents(
     return parents
 
 
-def _validate_config(config: Config) -> None:
+def _validate_config(config: TomlBundleConfig) -> None:
     """Cross-cutting validation: name collisions, references, applicability.
 
     Per-entity validation failures (a single group with an
@@ -1792,7 +1792,7 @@ def _validate_config(config: Config) -> None:
     per-entity fields (chain-walk schedule discovery,
     notify_channels lookups).
     """
-    # Job/group name collision -- errored names participate so a
+    # TomlJob/group name collision -- errored names participate so a
     # typo'd `[job.x]` plus a valid `[job-group.x]` still surfaces
     # the collision. Structural / unattributable -> raise.
     all_job_names = set(config.jobs) | set(config.errored_jobs)
@@ -1976,7 +1976,7 @@ def _validate_config(config: Config) -> None:
         config.errored_host_targets[hname] = msg
 
 
-def _demote_duplicate_uuids(config: Config, bundle_name: str) -> None:
+def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
     """Demote every job/group that shares a UUID with a sibling
     in the same bundle into the errored maps. Operates in-place.
 
@@ -2019,13 +2019,13 @@ def _demote_duplicate_uuids(config: Config, bundle_name: str) -> None:
                 config.errored_job_groups[short] = entity_msg
 
 
-def _load_one_bundle(name: str, path: Path) -> Bundle:
+def _load_one_bundle(name: str, path: Path) -> TomlBundle:
     """Parse a single bundle file and validate it. Raises ConfigError
     on parse / schema failure, naming the source path for context.
 
     Per-entity ConfigErrors (a single bad job, group, or target
     inside an otherwise-valid bundle) do not raise: `parse_config`
-    and `_validate_config` record them on `Config.errored_jobs` /
+    and `_validate_config` record them on `TomlBundleConfig.errored_jobs` /
     `errored_job_groups` / `errored_platform_targets` /
     `errored_host_targets`, and they surface at status time with
     `config=error` plus a logged line here so the user sees the
@@ -2052,23 +2052,23 @@ def _load_one_bundle(name: str, path: Path) -> Bundle:
         logger.error("%s: %s", path, msg)
     for msg in sorted(config.errored_host_targets.values()):
         logger.error("%s: %s", path, msg)
-    return Bundle(name=name, source=path, config=config)
+    return TomlBundle(name=name, source=path, config=config)
 
 
-def load_all_bundles() -> Bundles:
+def load_all_bundles() -> TomlConfig:
     """Load every bundle: `config.toml` (-> bundle 'default') plus
     `config/*.toml` (each -> bundle named after its filename stem).
 
     Per-bundle failures are isolated: a bundle that fails to parse,
     fails schema validation, or has an invalid filename is dropped
     with a CONFIG-level error logged for that source. Subsequent
-    bundles continue loading. The returned Bundles contains only
+    bundles continue loading. The returned TomlConfig contains only
     the bundles that loaded successfully.
 
     It is an error if no bundles load -- either every config file is
     broken or no config files exist at all.
     """
-    bundles = Bundles()
+    bundles = TomlConfig()
     errors: list[str] = []
     seen_names: set[str] = set()
 
@@ -2112,11 +2112,11 @@ def load_all_bundles() -> Bundles:
     return bundles
 
 
-def load_config(path: Path | None = None) -> Config:
-    """Load a single config file as a `Config` (single-bundle view).
+def load_config(path: Path | None = None) -> TomlBundleConfig:
+    """Load a single config file as a `TomlBundleConfig` (single-bundle view).
 
     Suited to tests and any caller that has one specific config
-    path in hand and wants the parsed `Config` for that file
+    path in hand and wants the parsed `TomlBundleConfig` for that file
     alone. Production code paths walk every bundle and should use
     `load_all_bundles()` instead.
     """
@@ -2133,11 +2133,11 @@ def load_config(path: Path | None = None) -> Config:
     return config
 
 
-def parse_config(raw: dict[str, Any]) -> Config:
-    """Parse a top-level config dict into a validated Config."""
+def parse_config(raw: dict[str, Any]) -> TomlBundleConfig:
+    """Parse a top-level config dict into a validated TomlBundleConfig."""
     _reject_unknown_keys(raw, _KNOWN_TOPLEVEL, "(top level)")
 
-    config = Config()
+    config = TomlBundleConfig()
 
     if "defaults" in raw:
         if not isinstance(raw["defaults"], dict):
@@ -2203,7 +2203,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
 # =============================================================================
 
 
-def resolve_target(config: Config, host: str, platform: str) -> Target | None:
+def resolve_target(
+    config: TomlBundleConfig, host: str, platform: str
+) -> Target | None:
     """Pick the effective target for (host, platform).
 
     Host target wins; otherwise the platform target; otherwise None
@@ -2265,7 +2267,7 @@ def _entry_applies_here(
 
 
 def selected_jobs_and_groups(
-    config: Config, target: Target | None
+    config: TomlBundleConfig, target: Target | None
 ) -> tuple[set[str], set[str]]:
     """Compute the set of job and group names selected by target.
 
@@ -2286,7 +2288,7 @@ def selected_jobs_and_groups(
 
 
 def selected_and_masked_jobs_and_groups(
-    config: Config, target: Target | None
+    config: TomlBundleConfig, target: Target | None
 ) -> tuple[set[str], set[str], dict[str, str]]:
     """Walk the target's selection, distinguishing selected from masked.
 
@@ -2365,7 +2367,7 @@ def selected_and_masked_jobs_and_groups(
 
 
 def resolved_notify_channels(
-    config: Config, target: Target | None, job: Job
+    config: TomlBundleConfig, target: Target | None, job: TomlJob
 ) -> list[str]:
     """Cascade notify_channels: target > job > defaults.
 
@@ -2383,7 +2385,7 @@ def resolved_notify_channels(
 
 
 def resolved_job_timeout_sec(
-    config: Config, target: Target | None, job: Job
+    config: TomlBundleConfig, target: Target | None, job: TomlJob
 ) -> int:
     """Cascade job_timeout_sec: job > defaults.
 
@@ -2391,7 +2393,7 @@ def resolved_job_timeout_sec(
     `resolved_notify_channels` (and to keep callers unaware of the
     cascade shape) but does not contribute -- targets and groups
     intentionally have no user-tunable timeout knob; see the
-    `Target` and `JobGroup` docstrings for the rationale.
+    `Target` and `TomlJobGroup` docstrings for the rationale.
     """
     del target
     if job.job_timeout_sec is not None:
@@ -2408,7 +2410,7 @@ _GROUP_TIMEOUT_PADDING: float = 1.05
 
 
 def resolved_group_timeout_sec(
-    config: Config, target: Target | None, group_name: str
+    config: TomlBundleConfig, target: Target | None, group_name: str
 ) -> int:
     """Auto-computed effective timeout for a group.
 
@@ -2498,7 +2500,7 @@ class JobSnapshot:
     # `interactive_delay_sec` are always resolved (non-None) in
     # the snapshot so the runner doesn't re-consult any defaults
     # table; the per-job `_sec` knobs cascade through the resolver
-    # to the baked defaults defined alongside the Job dataclass.
+    # to the baked defaults defined alongside the TomlJob dataclass.
     interactive: bool = False
     interactive_active_sec: int = _INTERACTIVE_ACTIVE_DEFAULT_SEC
     interactive_delay_sec: int = _INTERACTIVE_DELAY_DEFAULT_SEC
@@ -2526,7 +2528,10 @@ def _snapshot_path_for(full_name: str) -> Path:
 
 
 def _resolve_job_snapshot(
-    config: Config, target: Target | None, job: Job, full_name: str
+    config: TomlBundleConfig,
+    target: Target | None,
+    job: TomlJob,
+    full_name: str,
 ) -> JobSnapshot:
     """Build a JobSnapshot by applying every cascade once."""
     args = [_expand_path_field(a) for a in job.args]
@@ -2568,9 +2573,9 @@ def _resolve_job_snapshot(
 
 
 def _resolve_group_snapshot(
-    config: Config,
+    config: TomlBundleConfig,
     target: Target | None,
-    group: JobGroup,
+    group: TomlJobGroup,
     bundle_name: str,
     full_name: str,
 ) -> GroupSnapshot:
@@ -2607,13 +2612,13 @@ def _resolve_group_snapshot(
 
 
 def _resolve_snapshot_for(
-    config: Config,
+    config: TomlBundleConfig,
     short: str,
     bundle_name: str = DEFAULT_BUNDLE_NAME,
 ) -> JobSnapshot | GroupSnapshot:
     """Resolve a snapshot for a single config entry by short name.
 
-    Convenience for callers that have a Config + short name and
+    Convenience for callers that have a TomlBundleConfig + short name and
     want the resolved snapshot in one step (apply pipeline + tests
     that exercise the runner without going through full apply).
     """
@@ -2754,7 +2759,7 @@ def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     child concept ("intentionally not run") that doesn't describe
     a group-level outcome, and `dispatched` records an interactive
     child the group fired async (it makes no claim about whether
-    the user later clicked Run Job). Any child failure (fail /
+    the user later clicked Run TomlJob). Any child failure (fail /
     signal / timeout) surfaces as the worst child's exit_class --
     timeout outranks fail / signal so a group with a timed-out
     child shows TIMEOUT in the status view rather than being
@@ -3147,7 +3152,7 @@ def _retrieve_secret(
 def _format_summary(result: JobRunResult) -> str:
     """One-line-per-field human summary for notification bodies."""
     return (
-        f"Job:        {result.job}\n"
+        f"TomlJob:        {result.job}\n"
         f"Host:       {result.host}\n"
         f"Platform:   {result.platform}\n"
         f"Started:    {result.started_at}\n"
@@ -3615,7 +3620,7 @@ def _delay_or_bypass(
     """Sleep up to `delay_sec`, polling `bypass_check` every
     `poll_sec`. Returns True if the full delay elapsed; False if
     `bypass_check` returned True mid-sleep. Used by the
-    interactive delay-then-reprompt path so a "Delay Job" choice
+    interactive delay-then-reprompt path so a "Delay TomlJob" choice
     doesn't strand the runner in an unbreakable hour-long sleep
     when the user changes their mind and triggers manually.
     """
@@ -3634,8 +3639,8 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     'run' / 'delay' / 'cancel'.
 
     Uses `osascript display dialog`. Clicking the cancel button
-    (or dismissing the dialog) maps to 'cancel'; clicking Run Job
-    maps to 'run' and Delay Job to 'delay'. Any subprocess
+    (or dismissing the dialog) maps to 'cancel'; clicking Run TomlJob
+    maps to 'run' and Delay TomlJob to 'delay'. Any subprocess
     failure (osascript missing, dialog killed) also maps to
     'cancel' -- silently running without user confirmation would
     defeat the whole point of the flag.
@@ -3656,9 +3661,9 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     script = (
         f'display dialog "{safe_message}" '
         f'with title "crony: {safe_name}" '
-        f'buttons {{"Cancel Job", "Delay Job", "Run Job"}} '
-        f'default button "Run Job" '
-        f'cancel button "Cancel Job"'
+        f'buttons {{"Cancel TomlJob", "Delay TomlJob", "Run TomlJob"}} '
+        f'default button "Run TomlJob" '
+        f'cancel button "Cancel TomlJob"'
     )
     try:
         proc = subprocess.run(
@@ -3672,9 +3677,9 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     if proc.returncode != 0:
         return "cancel"
     out = proc.stdout
-    if "Run Job" in out:
+    if "Run TomlJob" in out:
         return "run"
-    if "Delay Job" in out:
+    if "Delay TomlJob" in out:
         return "delay"
     return "cancel"
 
@@ -4045,7 +4050,7 @@ def run_group(
                         # no budget deduction). Their own runner does
                         # the user-active wait + dialog independently;
                         # the parent group's outcome doesn't depend on
-                        # whether the user ever clicked Run Job.
+                        # whether the user ever clicked Run TomlJob.
                         log_file.write(
                             (
                                 f"-> {child_full_name}: dispatched "
@@ -4421,7 +4426,7 @@ def _render_units(
 
 
 def _entity_schedule(
-    entry: Job | JobGroup,
+    entry: TomlJob | TomlJobGroup,
 ) -> tuple[str | None, str | None]:
     """Return (schedule, interval) for either entity kind."""
     return entry.schedule, entry.interval
@@ -4444,7 +4449,7 @@ def _schedule_display(schedule: str | None, interval: str | None) -> str:
 
 def _compute_unit_hash(
     name: str,
-    entry: Job | JobGroup,
+    entry: TomlJob | TomlJobGroup,
     platform: str,
     snapshot: JobSnapshot | GroupSnapshot,
 ) -> str:
@@ -4577,7 +4582,7 @@ def _deactivate_unit(name: str, platform: str) -> None:
 
 
 def apply_one(
-    config: Config,
+    config: TomlBundleConfig,
     name: str,
     *,
     dry_run: bool = False,
@@ -4600,7 +4605,7 @@ def apply_one(
     scheduled -> unscheduled.
     """
     if name in config.jobs:
-        entry: Job | JobGroup = config.jobs[name]
+        entry: TomlJob | TomlJobGroup = config.jobs[name]
     elif name in config.job_groups:
         entry = config.job_groups[name]
     else:
@@ -4612,7 +4617,7 @@ def apply_one(
     hash_path = _hash_path_for(full_name)
     snapshot_path = _snapshot_path_for(full_name)
     target = resolve_target(config, current_host(), platform)
-    if isinstance(entry, Job):
+    if isinstance(entry, TomlJob):
         snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
             config, target, entry, full_name
         )
@@ -5030,7 +5035,7 @@ def _last_ran_at(name: str) -> str:
 
 
 def _config_state(
-    config: Config,
+    config: TomlBundleConfig,
     name: str,
     platform: str,
     *,
@@ -5045,7 +5050,7 @@ def _config_state(
 
 
 def _config_state_for(
-    config: Config, short: str, full_name: str, platform: str
+    config: TomlBundleConfig, short: str, full_name: str, platform: str
 ) -> str:
     """Return CONFIG axis value: synced / stale / missing / orphan / error.
 
@@ -5085,10 +5090,12 @@ def _config_state_for(
         # wiped). Treat as drift so the user gets a clear "re-
         # apply" signal.
         return "stale"
-    entry: Job | JobGroup = config.jobs.get(short) or config.job_groups[short]
+    entry: TomlJob | TomlJobGroup = (
+        config.jobs.get(short) or config.job_groups[short]
+    )
     bn, _ = parse_full_name(full_name)
     target = resolve_target(config, current_host(), platform)
-    if isinstance(entry, Job):
+    if isinstance(entry, TomlJob):
         snapshot: JobSnapshot | GroupSnapshot = _resolve_job_snapshot(
             config, target, entry, full_name
         )
@@ -5534,7 +5541,7 @@ def do_config_update(bundle: str | None) -> None:
 
 
 def _errored_full_names(
-    bundles: Bundles, bundle: str | None = None
+    bundles: TomlConfig, bundle: str | None = None
 ) -> set[str]:
     """Full-namespaced names of entries whose bundle config rejected them.
 
@@ -5556,8 +5563,8 @@ def _errored_full_names(
 
 
 def _selected_full_names_per_bundle(
-    bundles: Bundles,
-) -> tuple[dict[str, tuple[Bundle, str]], set[str]]:
+    bundles: TomlConfig,
+) -> tuple[dict[str, tuple[TomlBundle, str]], set[str]]:
     """Return (full_name -> (bundle, short)) and full_names set,
     spanning every bundle's selection on the current host.
 
@@ -5569,7 +5576,7 @@ def _selected_full_names_per_bundle(
     """
     host = current_host()
     platform = current_platform()
-    by_full: dict[str, tuple[Bundle, str]] = {}
+    by_full: dict[str, tuple[TomlBundle, str]] = {}
     for b in bundles.bundles:
         target = resolve_target(b.config, host, platform)
         sel_jobs, sel_groups = selected_jobs_and_groups(b.config, target)
@@ -5579,8 +5586,8 @@ def _selected_full_names_per_bundle(
 
 
 def _selected_and_masked_full_names_per_bundle(
-    bundles: Bundles,
-) -> tuple[dict[str, tuple[Bundle, str]], set[str], dict[str, str]]:
+    bundles: TomlConfig,
+) -> tuple[dict[str, tuple[TomlBundle, str]], set[str], dict[str, str]]:
     """Spans every bundle, returning selected and masked names.
 
     `by_full` maps full_name -> (bundle, short) for every entry
@@ -5596,7 +5603,7 @@ def _selected_and_masked_full_names_per_bundle(
     """
     host = current_host()
     platform = current_platform()
-    by_full: dict[str, tuple[Bundle, str]] = {}
+    by_full: dict[str, tuple[TomlBundle, str]] = {}
     selected: set[str] = set()
     masked_by_full: dict[str, str] = {}
     for b in bundles.bundles:
@@ -5631,7 +5638,7 @@ def _selected_and_masked_full_names_per_bundle(
 
 
 def _expand_apply_subtree(
-    by_full: dict[str, tuple[Bundle, str]], full_names: list[str]
+    by_full: dict[str, tuple[TomlBundle, str]], full_names: list[str]
 ) -> list[str]:
     """Expand each name to include its transitive group children.
 
@@ -5659,7 +5666,7 @@ def _expand_apply_subtree(
 
 
 def _topo_apply_order(
-    by_full: dict[str, tuple[Bundle, str]], full_names: list[str]
+    by_full: dict[str, tuple[TomlBundle, str]], full_names: list[str]
 ) -> list[str]:
     """Order names so each group's children are applied first.
 
@@ -5733,7 +5740,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         errored = _errored_full_names(bundles, bundle)
         errored_in_args = sorted(n for n in normalized if n in errored)
         if errored_in_args:
-            # An errored entry has no parsed Config fields, so we
+            # An errored entry has no parsed TomlBundleConfig fields, so we
             # can't render its plist / unit. Bail before any
             # partial apply happens.
             raise UsageError(
@@ -5775,7 +5782,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     if current_platform() == "darwin":
         for full in full_names_to_apply:
             b, short = by_full[full]
-            entry: Job | JobGroup = (
+            entry: TomlJob | TomlJobGroup = (
                 b.config.jobs.get(short) or b.config.job_groups[short]
             )
             schedule, _interval = _entity_schedule(entry)
@@ -5882,7 +5889,7 @@ def do_destroy(
         )
 
 
-def _entry_schedule_state(bundles: Bundles, full: str) -> str:
+def _entry_schedule_state(bundles: TomlConfig, full: str) -> str:
     """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`.
 
     `unresolved` covers a name whose bundle or short doesn't
@@ -5894,7 +5901,7 @@ def _entry_schedule_state(bundles: Bundles, full: str) -> str:
     b = bundles.by_name(bn)
     if b is None:
         return "unresolved"
-    entry: Job | JobGroup | None = b.config.jobs.get(
+    entry: TomlJob | TomlJobGroup | None = b.config.jobs.get(
         short
     ) or b.config.job_groups.get(short)
     if entry is None:
@@ -5909,7 +5916,7 @@ def _resolve_bulk_names(
     jobs: list[str],
     bundle: str | None,
     stamped: set[str],
-    bundles: Bundles,
+    bundles: TomlConfig,
     scheduled_only: bool,
 ) -> list[str]:
     """Derive the operate-on name set for enable / disable / trigger.
@@ -5936,7 +5943,7 @@ def _resolve_bulk_names(
 
 
 def _refuse_unscheduled_full(
-    bundles: Bundles, full_names: list[str], verb: str
+    bundles: TomlConfig, full_names: list[str], verb: str
 ) -> None:
     """Reject entries with no schedule (nothing to enable/disable)."""
     unscheduled = [
@@ -6150,7 +6157,7 @@ def do_trigger(
 
 
 def _build_status_tree(
-    bundles: Bundles, host: str, platform: str
+    bundles: TomlConfig, host: str, platform: str
 ) -> tuple[list[str], dict[str, int]]:
     """Return the DFS order and per-name depth of each active target tree.
 
@@ -6161,7 +6168,7 @@ def _build_status_tree(
     recorded so the renderer can place a masked-but-in-tree row
     at its config depth instead of below the tree. The per-walk
     visited-set bounds the walk if a malformed config somehow
-    bypasses `_validate_config` (e.g. tests constructing Config
+    bypasses `_validate_config` (e.g. tests constructing TomlBundleConfig
     directly without going through `parse_config`); under the
     single-parent invariant from validation it never deduplicates
     a real traversal.
@@ -6170,7 +6177,7 @@ def _build_status_tree(
     depth: dict[str, int] = {}
 
     def _walk(
-        bundle: Bundle,
+        bundle: TomlBundle,
         short: str,
         d: int,
         seen: set[str],
@@ -6364,7 +6371,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 
 
 def _resolve_state_axes(
-    bundles: Bundles,
+    bundles: TomlConfig,
     full: str,
     platform: str,
     remnants: set[str],
@@ -6397,7 +6404,7 @@ def _resolve_state_axes(
     bundle = bundles.by_name(bn)
     if bundle is None:
         cfg_state = "orphan" if full in remnants else "missing"
-        entry: Job | JobGroup | None = None
+        entry: TomlJob | TomlJobGroup | None = None
     else:
         cfg_state = _config_state_for(bundle.config, short, full, platform)
         entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
@@ -6419,7 +6426,7 @@ def _resolve_state_axes(
     return cfg_state, unit_state, last_state
 
 
-def _entry_is_scheduled(entry: Job | JobGroup | None) -> bool:
+def _entry_is_scheduled(entry: TomlJob | TomlJobGroup | None) -> bool:
     if entry is None:
         return False
     sched, interval = _entity_schedule(entry)
@@ -6449,7 +6456,7 @@ def _snapshot_says_scheduled(full: str) -> bool | None:
 
 
 def _unit_name_for(
-    full: str, entry: Job | JobGroup | None, platform: str
+    full: str, entry: TomlJob | TomlJobGroup | None, platform: str
 ) -> str:
     """Platform unit identifier for the UNIT NAME column.
 
@@ -6508,7 +6515,7 @@ _STALE_VALUE_FOOTER: str = (
 
 
 def _build_group_membership(
-    bundles: Bundles,
+    bundles: TomlConfig,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Reverse-index group membership across all bundles.
 
@@ -6575,7 +6582,7 @@ def _groups_cells(
 
 
 def _schedule_cells(
-    bundles: Bundles,
+    bundles: TomlConfig,
     full: str,
     config_source: str,
 ) -> tuple[str, bool]:
@@ -6725,7 +6732,7 @@ def do_status(
             if bdl is not None
             else None
         )
-        if isinstance(entry, JobGroup):
+        if isinstance(entry, TomlJobGroup):
             kind = "group"
         elif entry is not None:
             kind = "job"
@@ -7132,7 +7139,7 @@ def _secret_warning(
 
 
 def _validate_bundle_warnings(
-    bundle: Bundle,
+    bundle: TomlBundle,
 ) -> list[str]:
     """Return per-bundle warnings: defined channels whose secrets
     don't resolve, channels defined but never referenced, etc."""
@@ -7310,18 +7317,18 @@ def do_validate(bundle: str | None) -> None:
 
 
 def _notify_test_one_bundle(
-    bundle: Bundle, channel: str | None
+    bundle: TomlBundle, channel: str | None
 ) -> tuple[list[str], list[tuple[str, NotificationResult]]]:
     """Run notify-test against one bundle. Returns (successes, failures)."""
     config = bundle.config
     if channel is not None:
         use_channels = [channel]
     else:
-        # Synthetic transient Job built only to feed
+        # Synthetic transient TomlJob built only to feed
         # `resolved_notify_channels`. The uuid is never persisted
         # and never compared against any real entry, so the
         # all-zeros placeholder is fine.
-        synthetic_job = Job(
+        synthetic_job = TomlJob(
             name="notify-test",
             uuid="00000000-0000-0000-0000-000000000000",
             command="true",
@@ -7363,7 +7370,7 @@ def _notify_test_one_bundle(
 def do_notify_test(channel: str | None, bundle: str | None) -> None:
     """Send a synthetic failure notification.
 
-    Bundle / channel resolution follows crony's bare-input rule: when
+    TomlBundle / channel resolution follows crony's bare-input rule: when
     nothing is specified, only the default bundle is exercised (never
     a fan-out across every bundle).
 
@@ -7594,7 +7601,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job/group names. With no args: full sync (install "
+            "TomlJob/group names. With no args: full sync (install "
             "missing, fix drift, remove orphans). With names: "
             "surgical update of those entries only."
         ),
@@ -7626,7 +7633,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job/group names. With no args: factory reset. "
+            "TomlJob/group names. With no args: factory reset. "
             "With names: surgical removal."
         ),
     )
@@ -7670,7 +7677,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job names to enable. Omit when --bundle is given to "
+            "TomlJob names to enable. Omit when --bundle is given to "
             "enable every scheduled stamped entry in that bundle."
         ),
     )
@@ -7695,7 +7702,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job names to disable. Omit when --bundle is given to "
+            "TomlJob names to disable. Omit when --bundle is given to "
             "disable every scheduled stamped entry in that bundle."
         ),
     )
@@ -7720,7 +7727,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job names to trigger via launchd / systemctl. Omit "
+            "TomlJob names to trigger via launchd / systemctl. Omit "
             "when --bundle is given to trigger every stamped entry "
             "in that bundle."
         ),
@@ -7823,7 +7830,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_logs.add_argument(
         "name",
-        help="Job name",
+        help="TomlJob name",
     )
     p_logs.add_argument(
         "-n",

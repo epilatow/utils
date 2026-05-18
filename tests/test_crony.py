@@ -307,7 +307,7 @@ def _uuid_toml(text: str) -> str:
 def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
     """Assert parse_config records a per-entity error for job `short`.
 
-    Per-entity parse failures land in `Config.errored_jobs` instead
+    Per-entity parse failures land in `TomlBundleConfig.errored_jobs` instead
     of raising, so tests of bad-shape inputs check the recorded
     message rather than wrapping the call in `pytest.raises`.
     """
@@ -450,7 +450,7 @@ class TestSchedule:
 
 
 # =============================================================================
-# Config parsing - structural
+# TomlBundleConfig parsing - structural
 # =============================================================================
 
 
@@ -848,9 +848,7 @@ class TestParseJob:
         assert cfg.jobs["j"].interactive_active_sec == 300
 
     def test_interactive_delay_resolves_to_seconds(self) -> None:
-        cfg = _parse(
-            self._cfg(_job(interactive=True, interactive_delay="2h"))
-        )
+        cfg = _parse(self._cfg(_job(interactive=True, interactive_delay="2h")))
         assert cfg.jobs["j"].interactive_delay_sec == 7200
 
     def test_interactive_active_without_flag_rejected(self) -> None:
@@ -1779,7 +1777,7 @@ class TestResolution:
 class TestSelectionFilters:
     """Per-entry `platforms` / `hosts` filters silently filter
     entries out of the selection on incompatible (host, platform).
-    Both Job and JobGroup carry the same fields with the same
+    Both TomlJob and TomlJobGroup carry the same fields with the same
     semantics; a filtered group does not recurse into its
     children.
     """
@@ -2354,7 +2352,7 @@ class _RunnerHarness:
 
     def snap(self, cfg: Any, short: str) -> Any:
         """Resolve a snapshot for a default-bundle entry. Convenience
-        for runner tests that build a Config and call run_job /
+        for runner tests that build a TomlBundleConfig and call run_job /
         run_group directly without going through full apply.
         """
         return crony._resolve_snapshot_for(cfg, short)
@@ -2378,7 +2376,7 @@ class _RunnerHarness:
     def config(
         self, raw: dict[str, Any], *, default_target_jobs: list[str]
     ) -> Any:
-        """Build a Config with a darwin target selecting these jobs.
+        """Build a TomlBundleConfig with a darwin target selecting these jobs.
 
         Persists the raw config to the on-disk file so subprocess
         re-invocations of `crony run <child>` (group dispatch) load
@@ -2455,14 +2453,14 @@ class TestPathFieldExpansion:
         # (apply); the runner then pulls already-expanded argv from
         # the snapshot.
         monkeypatch.setenv("HOME", "/home/user")
-        job = crony.Job(
+        job = crony.TomlJob(
             name="j",
             uuid=str(uuid.uuid4()),
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.Config(), None, job, "default.j"
+            crony.TomlBundleConfig(), None, job, "default.j"
         )
         assert snap.script == "/abs/path.sh"
         assert snap.args == [
@@ -2481,7 +2479,7 @@ class TestPathFieldExpansion:
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        job = crony.Job(
+        job = crony.TomlJob(
             name="j",
             uuid=str(uuid.uuid4()),
             command="true",
@@ -2489,7 +2487,7 @@ class TestPathFieldExpansion:
             gate_args=["$HOME/state"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.Config(), None, job, "default.j"
+            crony.TomlBundleConfig(), None, job, "default.j"
         )
         assert snap.gate_script == "/abs/gate.sh"
         assert snap.gate_args == ["/home/user/state"]
@@ -2561,7 +2559,7 @@ class TestRuntimeEnvExpansion:
     def test_inherited_keys_not_overridden_by_unset_job_env(
         self, monkeypatch: Any
     ) -> None:
-        # Job env is overlay; absent keys inherit unchanged.
+        # TomlJob env is overlay; absent keys inherit unchanged.
         monkeypatch.setenv("HOME", "/Users/edp")
         monkeypatch.setenv("LANG", "en_US.UTF-8")
         env = crony._runtime_env({"FOO": "bar"})
@@ -3442,7 +3440,7 @@ class TestEmailNotify:
         assert sent["To"] == "you@example.com"
         assert sent["From"] == "crony@example.com"
         body = sent.get_content()
-        assert "Job:        j" in body
+        assert "TomlJob:        j" in body
         assert "fail" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
@@ -3647,7 +3645,7 @@ class TestNtfyNotify:
         # this fixture, so latest-entry extraction passes the
         # text through unchanged.)
         body = captured["data"].decode("utf-8")
-        assert "Job:" in body
+        assert "TomlJob:" in body
         assert "Exit class:" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
@@ -3725,7 +3723,7 @@ class TestNtfyNotify:
         assert len(body_bytes) <= 3 * 1024
         body = body_bytes.decode("utf-8", errors="replace")
         # Summary block intact at the top.
-        assert body.startswith("Job:")
+        assert body.startswith("TomlJob:")
         assert "Exit class:" in body
         # Log section follows the separator and shows the tail.
         assert "--- log (latest run) ---" in body
@@ -3775,7 +3773,7 @@ class TestNtfyNotify:
         crony._dispatch_notify(result, "log content not in body", cfg.defaults)
         body = captured["data"].decode("utf-8")
         # Human summary keys are present; log content is not.
-        assert "Job:" in body
+        assert "TomlJob:" in body
         assert "Exit class:" in body
         assert "log content not in body" not in body
 
@@ -4584,7 +4582,7 @@ class TestDestroy:
     def test_destroy_cleans_residue_under_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Bundle-scoped variant: a default `--bundle X` destroy
+        # TomlBundle-scoped variant: a default `--bundle X` destroy
         # must reach state-dir-only residue from a prior
         # `--preserve-runtime --bundle X` destroy in that
         # bundle's namespace.
@@ -4914,7 +4912,7 @@ class TestTypeStrictness:
 
 
 class TestNameShape:
-    """Job/group/host names map onto filesystem paths and unit labels.
+    """TomlJob/group/host names map onto filesystem paths and unit labels.
 
     They must be safe filename characters; reject empty, leading
     punctuation, slashes, and spaces at parse time so later code
@@ -5478,7 +5476,7 @@ class TestEnableDisable:
     def test_enable_bulk_skips_unscheduled_in_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Bundle has one scheduled job and one schedule-less group
+        # TomlBundle has one scheduled job and one schedule-less group
         # member. `enable -b foo` enables the scheduled one and
         # silently skips the unscheduled one rather than aborting.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
@@ -6639,7 +6637,7 @@ class TestStatusReport:
     def test_groups_column_shows_membership(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # Job `a` belongs to group `g`. The groups column lists `g`.
+        # TomlJob `a` belongs to group `g`. The groups column lists `g`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -6667,7 +6665,7 @@ class TestStatusReport:
     def test_groups_column_lists_multiple_groups_comma_separated(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # Job `a` is a child of two groups. The single-parent
+        # TomlJob `a` is a child of two groups. The single-parent
         # invariant rejects a target reaching the same name twice,
         # so only `g1` is in the target; `g2` is defined but dead.
         # The GROUPS column reports every membership in the bundle
@@ -7400,7 +7398,7 @@ class TestResolveStateAxes:
 
 class TestPerEntityConfigErrors:
     """A parse-time ConfigError on one entity records itself on the
-    Config's errored_* maps instead of aborting the whole bundle.
+    TomlBundleConfig's errored_* maps instead of aborting the whole bundle.
     Siblings still parse, status renders the errored entity with
     `config=error`, and lifecycle commands leave its installed unit
     alone.
@@ -7590,7 +7588,7 @@ class TestPerEntityConfigErrors:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # With siblings: the good job applies, the errored sibling
-        # is never selected (no parsed Job to install).
+        # is never selected (no parsed TomlJob to install).
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -8555,7 +8553,7 @@ class TestBundleLoading:
 
 
 class TestBundleNamespacing:
-    """Job names from different bundles get distinct namespaced
+    """TomlJob names from different bundles get distinct namespaced
     forms; bundle-local short names can collide freely."""
 
     def test_same_short_name_in_two_bundles_ok(
@@ -9511,7 +9509,7 @@ class TestInteractiveHelpers:
     def test_dialog_run_button(self, monkeypatch: Any) -> None:
         def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Run Job\n", stderr=""
+                a, 0, stdout="button returned:Run TomlJob\n", stderr=""
             )
 
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
@@ -9520,7 +9518,7 @@ class TestInteractiveHelpers:
     def test_dialog_delay_button(self, monkeypatch: Any) -> None:
         def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Delay Job\n", stderr=""
+                a, 0, stdout="button returned:Delay TomlJob\n", stderr=""
             )
 
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
@@ -9757,7 +9755,7 @@ class TestRunJobInteractive:
 class TestLastRunStateInteractive:
     """`_last_run_state` reports `pending` for an interactive job
     sitting in its wait loop, and `canceled` for a completed run
-    whose user clicked Cancel Job.
+    whose user clicked Cancel TomlJob.
     """
 
     def test_pending_when_lock_held_and_flag_present(
