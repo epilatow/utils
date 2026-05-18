@@ -1248,21 +1248,69 @@ def parse_full_name(arg: str) -> tuple[str, str]:
     return (bundle, short)
 
 
-def normalize_full_name(arg: str) -> str:
-    """CLI input -> canonical `<bundle>.<short>` form.
+def parse_entity_ref(arg: str) -> EntityRef | None:
+    """Parse `<bundle>:<UUID>` input/display form into an
+    `EntityRef`, or return None when `arg` isn't that shape.
 
-    Convenience wrapper over `parse_full_name`: bare 'foo'
-    becomes 'default.foo', already-namespaced inputs round-trip.
-    Used at the entry point of every CLI handler that takes
-    user-supplied job references so downstream code can rely on
-    one normalized form.
+    Status output uses this form for refs with no recoverable
+    name (corrupt snapshots, broken entries, future unit-only
+    orphans) so an operator can paste the JOB cell back into
+    `crony destroy`, `crony logs`, etc. The same form is
+    `crony run`'s positional argv: the platform unit hands the
+    runner a `<bundle>:<UUID>` it can address `_entity_state_dir`
+    with directly. The colon separator distinguishes the uuid
+    form from the dot-separated `<bundle>.<short>` name form
+    (a name can't contain a colon).
+
+    Both pieces are validated -- `bundle` must match
+    `_BUNDLE_NAME_RE` and `UUID` must be a canonical
+    8-4-4-4-12 `uuid.UUID()`-parseable string -- because the
+    parsed ref flows into a `_entity_state_dir(bundle, uuid)`
+    path composition that `shutil.rmtree` later trusts. An
+    unvalidated `../../etc` would point at a path outside
+    `STATE_DIR/<bundle>/`.
     """
+    if ":" not in arg:
+        return None
+    bundle, _, entity_uuid = arg.partition(":")
+    if not bundle or not entity_uuid:
+        return None
+    if not _BUNDLE_NAME_RE.match(bundle):
+        return None
+    try:
+        parsed = uuid.UUID(entity_uuid)
+    except ValueError:
+        return None
+    if entity_uuid != str(parsed):
+        return None
+    return EntityRef(bundle, entity_uuid)
+
+
+def format_entity_ref(ref: EntityRef) -> str:
+    """Render an `EntityRef` in `<bundle>:<UUID>` form. Round-trips
+    with `parse_entity_ref`.
+    """
+    return f"{ref.bundle}:{ref.uuid}"
+
+
+def normalize_full_name(arg: str) -> str:
+    """CLI input -> canonical form.
+
+    For the dot-separated name form (`<bundle>.<short>` or bare
+    `<short>`): bare 'foo' becomes 'default.foo', already-
+    namespaced inputs round-trip. For the colon-separated ref
+    form (`<bundle>:<UUID>`): pass through unchanged so the
+    downstream lookup can recognize it. Used at the entry point
+    of every CLI handler that takes user-supplied job references.
+    """
+    if parse_entity_ref(arg) is not None:
+        return arg
     bundle, short = parse_full_name(arg)
     return f"{bundle}.{short}"
 
 
 def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
-    """CLI input -> canonical `<bundle>.<short>` honoring `-b`.
+    """CLI input -> canonical form honoring `-b`.
 
     With `scope_bundle` None this is `normalize_full_name`. With
     `scope_bundle` set, bare `arg` resolves in that bundle (so
@@ -1270,9 +1318,19 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
     round-trips, and `<other>.<short>` is rejected -- under `-b`
     every name on the command line must belong to that bundle so
     a bulk operation can't sneak in a cross-bundle reference.
+    Ref-form inputs (`<bundle>:<UUID>`) must also match the
+    scope under `-b`.
     """
     if scope_bundle is None:
         return normalize_full_name(arg)
+    ref = parse_entity_ref(arg)
+    if ref is not None:
+        if ref.bundle != scope_bundle:
+            raise UsageError(
+                f"{arg!r} is in bundle {ref.bundle!r} but --bundle "
+                f"{scope_bundle!r} is set"
+            )
+        return arg
     bundle, short = parse_full_name(arg)
     if "." not in arg:
         return f"{scope_bundle}.{short}"
@@ -2930,7 +2988,18 @@ class Config:
         wins (the user's current mental model); falls back to
         current so `crony logs <renamed-old-name>` still finds the
         entry whose name changed in config since apply.
+
+        Also accepts the `<bundle>:<UUID>` input
+        form: when an entity has no recoverable name (a corrupt
+        snapshot.json with a parseable filename but unparseable
+        body, or a future broken / unit-only orphan with no
+        config-side name) status emits the uuid form so the
+        operator can address it. The form parses directly to an
+        `EntityRef` without consulting any by-name map.
         """
+        ref = parse_entity_ref(full_name)
+        if ref is not None:
+            return ref
         return self.pending.by_full_name.get(
             full_name
         ) or self.current.by_full_name.get(full_name)
@@ -4587,7 +4656,9 @@ def run_group(
                         )
                         children.append(
                             GroupChildResult(
-                                name=f"{snap.bundle}:{child_uuid}",
+                                name=format_entity_ref(
+                                    EntityRef(snap.bundle, child_uuid)
+                                ),
                                 exit_class="fail",
                                 exit_code=int(ExitCode.PRECONDITION),
                             )
@@ -5166,23 +5237,30 @@ def apply_one(
     return "added" if old_hash is None else "updated"
 
 
-def destroy_one(name: str, state_dir: Path | None) -> None:
-    """Remove a single name's platform unit and apply-time state.
+def destroy_one(name: str | None, state_dir: Path | None) -> None:
+    """Remove a single entity's platform unit and apply-time state.
 
     Always a full wipe: the platform unit files and the entire
     uuid-keyed state dir go away in one shot. Tolerant of partial
-    state throughout so a partially-installed unit can still be
-    cleaned up. `state_dir` is the uuid-keyed dir (resolved by
-    the caller via Config); None means there's no state dir to
-    clean up (a unit-only orphan).
+    state throughout so a partially-installed entity can still be
+    cleaned up.
+
+    `name` is the full namespaced name used for platform unit
+    paths (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`).
+    Pass `None` when no name is recoverable -- e.g. a ref-form
+    destroy whose state dir snapshot is unparseable -- to skip
+    platform unit cleanup. `state_dir` is the uuid-keyed dir
+    (resolved by the caller via Config); None means there's no
+    state dir to clean up.
     """
-    platform = current_platform()
-    _deactivate_unit(name, platform)
-    if platform == "darwin":
-        _plist_path_for(name).unlink(missing_ok=True)
-    else:
-        _service_path_for(name).unlink(missing_ok=True)
-        _timer_path_for(name).unlink(missing_ok=True)
+    if name is not None:
+        platform = current_platform()
+        _deactivate_unit(name, platform)
+        if platform == "darwin":
+            _plist_path_for(name).unlink(missing_ok=True)
+        else:
+            _service_path_for(name).unlink(missing_ok=True)
+            _timer_path_for(name).unlink(missing_ok=True)
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
@@ -6364,6 +6442,15 @@ def do_destroy(
     discovered set; refuses if a name's run.lock is currently
     held. Under `--bundle`, bare names resolve in that bundle and
     qualified names must match it.
+
+    Also accepts the `<bundle>:<UUID>` input form
+    so an operator can copy the JOB cell from a status row for
+    an entity with no recoverable name (corrupt snapshot, broken
+    entry) and paste it here. The input validates iff the
+    addressed state dir exists; the entity's actual name (used
+    for platform unit cleanup) is recovered from the snapshot
+    when readable, otherwise the platform unit cleanup is
+    dropped and only the state dir is wiped.
     """
     if orphans and jobs:
         raise UsageError(
@@ -6382,7 +6469,21 @@ def do_destroy(
         if bundle is not None:
             known = bundle_prefix_filter(known, bundle)
         normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
-        unknown = [n for n in normalized if n not in known]
+        # A `<bundle>:<UUID>` input is "known" iff
+        # its state dir exists on disk; this lets the operator
+        # destroy entries that have no recoverable name (corrupt
+        # snapshots) by pasting the form from a status row.
+        unknown = []
+        for n in normalized:
+            if n in known:
+                continue
+            syn = parse_entity_ref(n)
+            if (
+                syn is not None
+                and _entity_state_dir(syn.bundle, syn.uuid).is_dir()
+            ):
+                continue
+            unknown.append(n)
         if unknown:
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
@@ -6404,13 +6505,31 @@ def do_destroy(
         # is on disk. Pending is a last resort only for an entry
         # with no current side at all (no state dir to clean up
         # anyway -- only the platform unit, which destroy_one
-        # handles via the name).
-        ref = config.current.by_full_name.get(
-            full
-        ) or config.pending.by_full_name.get(full)
+        # handles via the name). A `<bundle>:<UUID>`
+        # `<bundle>:<UUID>` input addresses a state dir
+        # directly by ref without going through any by_full_name
+        # map.
+        syn = parse_entity_ref(full)
+        ref = (
+            syn
+            or config.current.by_full_name.get(full)
+            or config.pending.by_full_name.get(full)
+        )
         sd = (
             _entity_state_dir(ref.bundle, ref.uuid) if ref is not None else None
         )
+        # Recover the entity's actual name for platform unit
+        # cleanup: a `<bundle>:<UUID>` input doesn't carry the namespaced
+        # name the unit file is keyed by, so destroy_one would
+        # leak the unit. Read the snapshot's `name` field; if the
+        # snapshot is unparseable or missing, drop the platform
+        # unit cleanup (no name -> no path to construct).
+        if syn is not None:
+            name_for_cleanup: str | None = (
+                _recover_full_name(sd) if sd is not None else None
+            )
+        else:
+            name_for_cleanup = full
         # Refuse if a run is in progress; a partial destroy would
         # leave the running shim with deleted state under it.
         lock_path = sd / "run.lock" if sd is not None else None
@@ -6422,7 +6541,7 @@ def do_destroy(
                 raise LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 )
-        destroy_one(full, sd)
+        destroy_one(name_for_cleanup, sd)
         logger.info("%s: destroyed", full)
 
 
@@ -7411,7 +7530,10 @@ def do_logs(
     """Print a job's recent log output.
 
     `name` is the full namespaced name (`<bundle>.<short>`); bare
-    input is shorthand for `default.<short>`.
+    input is shorthand for `default.<short>`. Also accepts the
+    `<bundle>:<UUID>` ref form for entities with no recoverable
+    name (corrupt snapshot, broken entry) so the operator can
+    paste a JOB cell from a status row directly.
 
     -p/--path   print the log file's path and exit (no content read).
                 Path resolution is purely structural -- prints even
@@ -7442,16 +7564,15 @@ def do_logs(
     if config is not None:
         ref = config.resolve(full)
         if ref is not None:
-            rt = config.runtime.get(ref)
-            if rt is not None:
-                sd = rt.state_dir
-            elif path:
-                # `--path` only prints where the log would land.
-                # Pre-apply, no runtime state exists; fall back to
-                # the pending entity's uuid so a `crony logs --path
-                # X` works for log rotation cron entries that need
-                # to materialize the path before the first run.
-                sd = _entity_state_dir(ref.bundle, ref.uuid)
+            # Derive the state dir directly from the ref. This
+            # path is what `RuntimeState.state_dir` would
+            # contain when an entry is in `config.runtime`, and
+            # it's also defined for refs that aren't (`<bundle>:<UUID>`
+            # input whose snapshot is unparseable, pre-apply
+            # entries, future broken / unit-only orphans). The
+            # `log_path.exists()` check below handles "path is
+            # well-defined but no log there yet".
+            sd = _entity_state_dir(ref.bundle, ref.uuid)
     if sd is None:
         raise UsageError(f"no log for {full!r} (no applied state on this host)")
     log_path = sd / "run.log"
@@ -7597,14 +7718,14 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     surfaced via SystemExit so it propagates to launchd /
     systemd; cli() converts that into the process exit.
     """
-    bundle, sep, entity_uuid = ref.partition(":")
-    if not sep or not bundle or not entity_uuid:
+    parsed = parse_entity_ref(ref)
+    if parsed is None:
         raise UsageError(
             f"crony run takes <bundle>:<uuid>, got {ref!r}; "
             f"this entry point is for platform-unit invocation. "
             f"Use `crony trigger <name>` to fire by name."
         )
-    snap = _load_snapshot(bundle, entity_uuid)
+    snap = _load_snapshot(parsed.bundle, parsed.uuid)
     if isinstance(snap, Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:

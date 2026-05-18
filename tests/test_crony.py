@@ -2843,7 +2843,7 @@ class TestRunJobBasics:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony.do_run(
-                ref="default:never-applied-uuid",
+                ref="default:11111111-2222-3333-4444-999999999999",
                 dry_run=False,
                 skip_gate=False,
             )
@@ -8690,6 +8690,225 @@ class TestParseFullName:
     def test_empty_short_rejected(self) -> None:
         with pytest.raises(crony.UsageError):
             crony.parse_full_name("default.")
+
+
+class TestEntityRefInput:
+    """The `<bundle>:<UUID>` input form lets an operator address
+    an entity that has no recoverable config-side name (corrupt
+    snapshot.json, broken entity, unit-only orphan) by pasting the
+    JOB cell from a status row back into a subcommand. The same
+    form is what platform units pass to `crony run`. The parser
+    validates both pieces so the resulting `EntityRef` is safe
+    to compose into a state-dir path.
+    """
+
+    _CANONICAL_UUID = "11111111-2222-3333-4444-555555555555"
+
+    def test_parse_round_trips(self) -> None:
+        ref = crony.EntityRef("default", self._CANONICAL_UUID)
+        rendered = crony.format_entity_ref(ref)
+        assert rendered == f"default:{self._CANONICAL_UUID}"
+        assert crony.parse_entity_ref(rendered) == ref
+
+    def test_parse_with_non_default_bundle(self) -> None:
+        ref = crony.EntityRef("borgadm", self._CANONICAL_UUID)
+        rendered = crony.format_entity_ref(ref)
+        assert crony.parse_entity_ref(rendered) == ref
+
+    def test_parse_non_ref_returns_none(self) -> None:
+        # Dot-separated names aren't entity refs.
+        assert crony.parse_entity_ref("default.foo") is None
+        # Bare names aren't entity refs either.
+        assert crony.parse_entity_ref("foo") is None
+        # Bundle-only (no uuid body).
+        assert crony.parse_entity_ref("default:") is None
+        # No bundle.
+        assert crony.parse_entity_ref(f":{self._CANONICAL_UUID}") is None
+
+    def test_parse_rejects_non_canonical_uuid(self) -> None:
+        # Validation runs because the parsed ref flows into a
+        # path that `shutil.rmtree` later trusts -- a malformed
+        # uuid must fail at parse time, not at filesystem time.
+        assert crony.parse_entity_ref("default:not-a-uuid") is None
+        assert crony.parse_entity_ref("default:abc123") is None
+        # Path-traversal-shaped uuid bodies must be rejected so
+        # `crony destroy` can't be tricked into `rmtree`-ing
+        # `STATE_DIR/default/../../etc`.
+        assert crony.parse_entity_ref("default:../../etc") is None
+
+    def test_parse_rejects_invalid_bundle_name(self) -> None:
+        # Bundle names are constrained by `_BUNDLE_NAME_RE`; an
+        # invalid bundle prevents the path composition from
+        # walking outside `STATE_DIR`.
+        bad = f"../etc:{self._CANONICAL_UUID}"
+        assert crony.parse_entity_ref(bad) is None
+
+
+class TestConfigResolveEntityRef:
+    """`Config.resolve` accepts the `<bundle>:<UUID>` input form
+    and returns the parsed ref directly -- the entity doesn't
+    have to be in `current.by_full_name` or `pending.by_full_name`
+    for the lookup to succeed.
+    """
+
+    def test_resolve_returns_ref_for_entity_ref_form(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        cfg = crony.load_config()
+        ref_input = "default:11111111-2222-3333-4444-555555555555"
+        ref = cfg.resolve(ref_input)
+        assert ref == crony.EntityRef(
+            "default", "11111111-2222-3333-4444-555555555555"
+        )
+
+
+class TestDestroyByEntityRef:
+    """`do_destroy` accepts a `<bundle>:<UUID>` input and wipes
+    the state dir at the addressed ref even when no config /
+    snapshot / unit covers it.
+    """
+
+    def test_destroy_by_ref_wipes_state_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        # Fabricate a state dir with no parseable snapshot at all,
+        # only the directory and a stray run.log file -- the
+        # state-dir presence is what makes destroy accept the
+        # ref input.
+        ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd.mkdir(parents=True)
+        (sd / "run.log").write_text("stale\n", encoding="utf-8")
+        h.config({}, default_target_jobs=[])
+        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
+        assert not sd.exists()
+
+    def test_destroy_by_ref_rejects_unknown_state_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        # Even a canonical-shaped uuid whose state dir doesn't
+        # exist is rejected -- destroy refuses to act on a ref
+        # input that addresses nothing.
+        ghost_uuid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        with pytest.raises(crony.UsageError, match="unknown name"):
+            crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
+
+    def test_destroy_by_ref_rejects_path_traversal(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The ref parser rejects non-canonical uuid bodies;
+        # destroy then treats the input as a normal full name and
+        # rejects it as unknown. The would-be
+        # `STATE_DIR/default/../../etc` target is never composed.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        attack = f"{crony.DEFAULT_BUNDLE_NAME}:../../etc"
+        with pytest.raises(crony.UsageError, match="unknown name"):
+            crony.do_destroy(jobs=[attack], bundle=None, orphans=False)
+
+    def test_destroy_by_ref_recovers_name_for_unit_cleanup(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # When the addressed state dir has a parseable snapshot
+        # the ref-form destroy must use the snapshot's `name`
+        # field for platform unit cleanup -- otherwise the unit
+        # file would leak (the ref input has no
+        # `<bundle>.<short>` shape to match the installed
+        # `org.crony.<name>.plist`).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert plist.exists()
+        sd = h.state_dir("j", cfg=cfg)
+        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{cfg.jobs['j'].uuid}"
+        crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
+        # Both the state dir AND the platform unit are gone.
+        assert not sd.exists()
+        assert not plist.exists()
+
+    def test_destroy_by_ref_refuses_during_run_lock_held(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The run-lock guard applies on the ref-form path too:
+        # a destroy mid-run would leave the running shim with
+        # deleted state under it.
+        import fcntl as _fcntl
+
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd.mkdir(parents=True)
+        lock = sd / "run.lock"
+        held = open(lock, "w")
+        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            h.config({}, default_target_jobs=[])
+            ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+            with pytest.raises(crony.LockBusyError, match="run in progress"):
+                crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
+        finally:
+            _fcntl.flock(held, _fcntl.LOCK_UN)
+            held.close()
+        # State dir survived because the destroy refused.
+        assert sd.exists()
+
+
+class TestLogsByEntityRef:
+    """`do_logs` accepts a `<bundle>:<UUID>` input and reads the
+    state dir's run.log directly via the parsed ref -- the entity
+    doesn't have to appear in `Config.runtime` for the lookup to
+    succeed.
+    """
+
+    def test_logs_by_ref_reads_run_log(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd.mkdir(parents=True)
+        (sd / "run.log").write_text("hello\n", encoding="utf-8")
+        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        crony.do_logs(
+            name=ref_input,
+            n=200,
+            since=None,
+            tail=False,
+            path=False,
+            latest=False,
+        )
+        out = capsys.readouterr().out
+        assert "hello" in out
+
+    def test_logs_by_ref_path_mode(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        ghost_uuid = "deadbeef-1111-1111-1111-deadbeef1111"
+        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        crony.do_logs(
+            name=ref_input,
+            n=None,
+            since=None,
+            tail=False,
+            path=True,
+            latest=False,
+        )
+        out = capsys.readouterr().out.strip()
+        assert out.endswith(f"{ghost_uuid}/run.log")
 
 
 class TestBundleLoading:
