@@ -3613,11 +3613,16 @@ def _format_summary(result: JobRunResult, full_name: str) -> str:
     )
 
 
-# Each `crony run` invocation writes a header line to run.log of
-# the form:
+# Each `crony run` invocation writes a header line to run.log.
+# Two shapes:
 #   === <ISO ts> <full.name> pid=<N> ===
-# `_extract_latest_log_entry` finds the last such header and
-# returns everything from there to EOF (the most recent run's
+#       Ordinary run: name resolved, snapshot loaded, pid known.
+#   === <ISO ts> CANCELED <bundle>:<uuid> ===
+#       Snapshot couldn't be loaded (missing, unreadable, wrong
+#       schema, unknown kind). No pid; the line surfaces the
+#       cancel for `crony logs --latest`.
+# `_extract_latest_log_entry` finds the last `=== ... ===` header
+# and returns everything from there to EOF (the most recent run's
 # trace). Used by `crony logs --latest` (single-run readout) and
 # the ntfy notify path (3KB inline body instead of a full-log
 # attachment).
@@ -5543,7 +5548,14 @@ def _last_run_state(config: Config, full_name: str) -> str:
     if rt.last_run is None:
         return "never"
     cls = rt.last_run.exit_class
-    if cls in ("ok", "fail", "timeout", "gated", "signal", "canceled"):
+    if cls in (
+        "ok",
+        "fail",
+        "timeout",
+        "gated",
+        "signal",
+        "canceled",
+    ):
         return cls if cls != "signal" else "fail"
     return "unknown"
 
@@ -6685,10 +6697,10 @@ def _trigger_exit_code(rec: dict[str, Any]) -> int:
     """Map a last-run.json record to a process exit code.
 
     `exit_code` is None whenever the job didn't reach a normal exit
-    (timeout, signal, gate refusal, precondition fail, lock contention).
-    `... or 0` would mask all of those as success; instead, derive the
-    code from the exit_class so a `crony trigger --wait` against a
-    timed-out job exits non-zero.
+    (timeout, signal, gate refusal, lock contention). `... or 0`
+    would mask all of those as success; instead, derive the
+    code from the exit_class so a `crony trigger --wait` against
+    a timed-out job exits non-zero.
     """
     rc = rec.get("exit_code")
     if rc is not None:
@@ -6701,8 +6713,6 @@ def _trigger_exit_code(rec: dict[str, Any]) -> int:
         return 128 + int(sig) if sig else int(ExitCode.ERROR)
     if cls == "lock_busy":
         return int(ExitCode.LOCK_BUSY)
-    if cls == "precondition":
-        return int(ExitCode.PRECONDITION)
     if cls == "gated":
         return 0
     return 0
@@ -6934,8 +6944,8 @@ Columns
   kind              "job" or "group". Falls back to the snapshot's recorded
                     kind for rows whose live config no longer
                     defines the entry.
-  last              Last-run outcome: ok | fail | timeout | gated | running
-                    | never | unknown.
+  last              Last-run outcome: ok | fail | timeout | gated | canceled
+                    | running | pending | never | unknown.
   last-ran          Compact relative time of the last run, e.g. "5m ago".
   masked-by         `host` and / or `platform` joined with `,`
                     (e.g. `host,platform` when both axes exclude
@@ -7717,6 +7727,18 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     per-group pipeline. The wrapped command's exit code is
     surfaced via SystemExit so it propagates to launchd /
     systemd; cli() converts that into the process exit.
+
+    When the pinned snapshot can't be loaded (missing, unreadable,
+    wrong schema, unknown kind), the runner records a
+    `last-run.json` with `exit_class="canceled"` so the failure
+    surfaces in `crony status` and isn't silently dropped by the
+    scheduler. The "canceled" label is shared with interactive-
+    job cancels: both have the same operator-facing meaning
+    ("crony run never got to the user's command"). Without this
+    record, a snapshot-schema bump -- which makes every entity's
+    pinned snapshot unloadable until the user re-applies -- looks
+    the same in `crony status` as an ordinary "edited config,
+    not yet applied" drift while scheduled fires silently fail.
     """
     parsed = parse_entity_ref(ref)
     if parsed is None:
@@ -7725,12 +7747,58 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
             f"this entry point is for platform-unit invocation. "
             f"Use `crony trigger <name>` to fire by name."
         )
-    snap = _load_snapshot(parsed.bundle, parsed.uuid)
+    try:
+        snap = _load_snapshot(parsed.bundle, parsed.uuid)
+    except PreconditionError as exc:
+        _record_snapshot_load_failure(parsed.bundle, parsed.uuid, exc)
+        raise
     if isinstance(snap, Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
         rc = run_group(snap, dry_run=dry_run, skip_gate=skip_gate)
     raise SystemExit(rc)
+
+
+def _record_snapshot_load_failure(
+    bundle: str, entity_uuid: str, exc: PreconditionError
+) -> None:
+    """Write a minimal `last-run.json` recording a snapshot-load
+    failure so the cancel surfaces in `crony status` -- same
+    `canceled` label interactive-job cancels use.
+
+    Skipped when the state dir doesn't exist on disk: creating it
+    just to hold the error record would leave an orphaned dir
+    that subsequently has to be cleaned up. In that case the
+    operator discovers the issue via the platform scheduler's
+    own exit-code surface (and, with later commits, the
+    unit-only orphan that surfaces in `crony status`).
+
+    A run.log line accompanies the JSON so `crony logs` shows
+    the underlying reason -- the JSON keeps the schema flat
+    (just enough for `_parse_last_run` to surface
+    `exit_class="canceled"`) rather than extending the
+    `JobRunResult` / `GroupRunResult` dataclasses with a new
+    error variant.
+    """
+    state_dir = _entity_state_dir(bundle, entity_uuid)
+    if not state_dir.is_dir():
+        return
+    now = _now_iso()
+    payload: dict[str, Any] = {
+        "host": current_host(),
+        "platform": current_platform(),
+        "started_at": now,
+        "ended_at": now,
+        "duration_sec": 0.0,
+        "exit_class": "canceled",
+        "exit_code": int(ExitCode.PRECONDITION),
+        "reason": str(exc),
+    }
+    _write_last_run(state_dir / "last-run.json", payload)
+    log_path = state_dir / "run.log"
+    line = f"\n=== {now} CANCELED {bundle}:{entity_uuid} ===\n   {exc}\n"
+    with open(log_path, "ab") as f:
+        f.write(line.encode("utf-8"))
 
 
 def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
@@ -7770,7 +7838,7 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     bad_unit_state = {"none"}
     if not exclude_disabled:
         bad_unit_state = bad_unit_state | {"disabled"}
-    bad_last = {"fail", "timeout"}
+    bad_last = {"fail", "timeout", "canceled"}
 
     rows: list[tuple[str, str, str, str]] = []
     for full in candidates:

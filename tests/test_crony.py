@@ -2848,6 +2848,155 @@ class TestRunJobBasics:
                 skip_gate=False,
             )
 
+    def test_run_records_last_run_on_schema_mismatch(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A schema bump makes every entity's pinned snapshot
+        # unloadable until re-apply. Without this record, the
+        # scheduled fire silently fails -- `crony status` shows
+        # the entry as `stale` (which the user reads as
+        # "edit-not-yet-applied") and the same outcome repeats
+        # every subsequent fire. The canceled row makes the
+        # failure visible.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        uuid_value = "11112222-3333-4444-5555-666677778888"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            '{"schema": 999, "kind": "job", "name": "default.j"}',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.PreconditionError, match="schema 999"):
+            crony.do_run(
+                ref=f"default:{uuid_value}",
+                dry_run=False,
+                skip_gate=False,
+            )
+        rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
+        assert rec["exit_class"] == "canceled"
+        assert rec["exit_code"] == int(crony.ExitCode.PRECONDITION)
+        assert "schema 999" in rec["reason"]
+        # run.log gained the canceled entry too.
+        assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+
+    def test_run_skips_last_run_write_when_state_dir_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # No state dir on disk: don't create one just to hold the
+        # error -- that would leave an orphan dir the operator has
+        # to clean up. The PreconditionError still propagates so
+        # the platform sees a non-zero exit.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        uuid_value = "11112222-3333-4444-5555-eeeeffff0000"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        assert not sd.exists()
+        with pytest.raises(crony.PreconditionError, match="no snapshot"):
+            crony.do_run(
+                ref=f"default:{uuid_value}",
+                dry_run=False,
+                skip_gate=False,
+            )
+        assert not sd.exists()
+
+    def test_run_records_last_run_on_unreadable_snapshot(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        uuid_value = "11112222-3333-4444-5555-aaaabbbbcccc"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd.mkdir(parents=True)
+        # Corrupt JSON: parser bails before schema / kind checks.
+        (sd / "snapshot.json").write_text("{not valid json", encoding="utf-8")
+        with pytest.raises(crony.PreconditionError, match="unreadable"):
+            crony.do_run(
+                ref=f"default:{uuid_value}",
+                dry_run=False,
+                skip_gate=False,
+            )
+        rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
+        assert rec["exit_class"] == "canceled"
+
+    def test_run_records_last_run_on_unknown_kind(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        uuid_value = "11112222-3333-4444-5555-bbbbccccdddd"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd.mkdir(parents=True)
+        # Schema matches, but `kind` is neither "job" nor "group".
+        (sd / "snapshot.json").write_text(
+            f'{{"schema": {crony._SNAPSHOT_SCHEMA}, '
+            f'"kind": "banana", "name": "default.j"}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.PreconditionError, match="unknown kind"):
+            crony.do_run(
+                ref=f"default:{uuid_value}",
+                dry_run=False,
+                skip_gate=False,
+            )
+        rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
+        assert rec["exit_class"] == "canceled"
+
+    def test_canceled_surfaces_in_status_last_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The whole point of writing last-run.json: `crony status`
+        # shows the canceled label in the LAST column on the next
+        # refresh, so a scheduled fire that bailed on a schema
+        # mismatch becomes visible.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        sd = h.state_dir("j", cfg=cfg)
+        # Stash a canceled record directly to skip the runner
+        # plumbing for the assertion-of-display.
+        (sd / "last-run.json").write_text(
+            '{"exit_class": "canceled", "started_at": '
+            '"2026-01-01T00:00:00-08:00", "exit_code": 64, '
+            '"reason": "snapshot has schema 3 expected 4"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        # LAST column carries the canceled label; not silently
+        # turned into "unknown" by the legacy mapping.
+        assert "canceled" in out
+
+    def test_canceled_flagged_by_audit(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        sd = h.state_dir("j", cfg=cfg)
+        (sd / "last-run.json").write_text(
+            '{"exit_class": "canceled", "started_at": '
+            '"2026-01-01T00:00:00-08:00", "exit_code": 64}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        with pytest.raises(crony.AuditFailedError):
+            crony.do_audit(exclude_disabled=False, bundle=None)
+
     def test_dry_run_does_not_exec(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
