@@ -2944,6 +2944,35 @@ class Graph:
         return None
 
 
+@dataclass(frozen=True)
+class BrokenEntity:
+    """An on-disk entity this crony binary can't fully interpret.
+
+    Populated by `_build_current_graph` whenever a state-dir
+    snapshot exists but can't be turned into a `Job` /
+    `JobGroup`: wrong `schema`, unrecognized `kind`, dataclass
+    `TypeError`, or unreadable JSON. `name` is recovered from
+    `raw["name"]` when the JSON parsed far enough; `None` when
+    the file itself is corrupt. `reason` is a one-line
+    description suitable for surfacing in status / audit (the
+    operator needs to know *why* re-apply is required).
+    `source_path` is the on-disk artifact that couldn't be
+    interpreted -- today always the entity's snapshot.json, but
+    the dataclass deliberately doesn't bake that assumption into
+    its name so other broken-entity kinds can share it.
+    """
+
+    bundle: str
+    uuid: str
+    name: str | None
+    reason: str
+    source_path: Path
+
+    @property
+    def ref(self) -> EntityRef:
+        return EntityRef(self.bundle, self.uuid)
+
+
 @dataclass
 class Config:
     """Whole-process state. Built once at startup by `load_config()`;
@@ -2956,23 +2985,32 @@ class Config:
     toml_config: TomlConfig
     pending: Graph
     current: Graph
+    broken: dict[EntityRef, BrokenEntity]
+    broken_by_full_name: dict[str, EntityRef]
     runtime: dict[EntityRef, RuntimeState]
     orphan_unit_labels: set[str]
     host: str
     platform: str
 
     def all_refs(self) -> set[EntityRef]:
-        return self.pending.refs() | self.current.refs()
+        return self.pending.refs() | self.current.refs() | set(self.broken)
 
     def config_state(self, ref: EntityRef) -> str:
-        """synced | stale | missing | orphan for the entity at `ref`.
+        """synced | stale | broken | missing | orphan for `ref`.
 
+        `broken` wins over the other axes: if the on-disk
+        snapshot can't be loaded the entity is reported as
+        broken regardless of whether pending also defines it
+        (apply will overwrite the broken snapshot with a fresh
+        one). The remaining axes mirror graph membership:
         `synced` if both graphs hold the entity and the two
         instances are field-equal; `stale` if both hold it but
-        differ; `missing` if only `pending` has it (never applied);
-        `orphan` if only `current` has it (config-side removed,
-        disk-side lingers).
+        differ; `missing` if only `pending` has it (never
+        applied); `orphan` if only `current` has it (config-side
+        removed, disk-side lingers).
         """
+        if ref in self.broken:
+            return "broken"
         p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
         c = self.current.jobs.get(ref) or self.current.groups.get(ref)
         if p is None and c is None:
@@ -2983,26 +3021,69 @@ class Config:
             return "missing"
         return "synced" if p == c else "stale"
 
-    def resolve(self, full_name: str) -> EntityRef | None:
-        """Look up an entity by its full namespaced name. Pending
-        wins (the user's current mental model); falls back to
-        current so `crony logs <renamed-old-name>` still finds the
-        entry whose name changed in config since apply.
+    def resolve_runnable(self, full_name: str) -> EntityRef | None:
+        """An entry that can be triggered: snapshot parseable and
+        the platform unit installable. Source: `current` only.
 
-        Also accepts the `<bundle>:<UUID>` input
-        form: when an entity has no recoverable name (a corrupt
-        snapshot.json with a parseable filename but unparseable
-        body, or a future broken / unit-only orphan with no
-        config-side name) status emits the uuid form so the
-        operator can address it. The form parses directly to an
-        `EntityRef` without consulting any by-name map.
+        Broken / unit-only / pending-only entries are not
+        runnable -- triggering them would fire a unit whose
+        snapshot can't load, or whose unit file isn't on disk,
+        or that was never applied at all. `crony trigger`
+        checks this method first and refuses with a clear
+        `run apply` message when it returns None.
+
+        `<bundle>:<UUID>` ref-form inputs are honored only when
+        the addressed entry is in `current` -- a ref-form
+        address targeting a broken / unit-only / unknown entry
+        returns None on purpose.
         """
         ref = parse_entity_ref(full_name)
         if ref is not None:
-            return ref
-        return self.pending.by_full_name.get(
+            return ref if ref in self.current.refs() else None
+        return self.current.by_full_name.get(full_name)
+
+    def resolve_current(self, full_name: str) -> EntityRef | None:
+        """An entity with on-disk presence that destroy must
+        clean up. Sources, in order: `current` (parseable
+        snapshots), then `broken` (state dirs whose snapshot
+        can't be loaded).
+
+        No `pending` fallback: a pending-only entry has no
+        on-disk state to wipe. The current-first order matches
+        what the installed unit's argv actually addresses
+        (`<bundle>:<uuid>` resolved at apply time), so destroy
+        cleans the dir the unit is reading from -- not a
+        phantom dir produced by a pending uuid edit that hasn't
+        been applied yet.
+        """
+        ref = parse_entity_ref(full_name)
+        if ref is not None:
+            if ref in self.current.refs() or ref in self.broken:
+                return ref
+            return None
+        return self.current.by_full_name.get(
             full_name
-        ) or self.current.by_full_name.get(full_name)
+        ) or self.broken_by_full_name.get(full_name)
+
+    def resolve_pending(self, full_name: str) -> EntityRef | None:
+        """An entry defined in the parsed TOML config but not
+        necessarily applied yet. Source: `pending` only.
+
+        Callers that want a broader lookup (status, logs, the
+        kind label for an orphan row) compose explicitly:
+        `config.resolve_current(n) or config.resolve_pending(n)`
+        for "current-first, fall back to pending," or
+        `config.resolve_pending(n) or config.resolve_current(n)`
+        for "pending-first." No single bias is baked in here so
+        the chosen direction shows up at the call site.
+
+        `<bundle>:<UUID>` ref-form inputs are honored only when
+        the addressed entry is in `pending`.
+        """
+        ref = parse_entity_ref(full_name)
+        if ref is not None:
+            return ref if ref in self.pending.refs() else None
+        return self.pending.by_full_name.get(full_name)
 
 
 def _parse_last_run(raw: dict[str, Any]) -> LastRun:
@@ -3103,18 +3184,22 @@ def _build_pending_graph(
 
 def _build_current_graph(
     state_root: Path,
-) -> tuple[Graph, dict[EntityRef, RuntimeState]]:
+) -> tuple[Graph, dict[EntityRef, BrokenEntity], dict[EntityRef, RuntimeState]]:
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
     with a parseable schema-matched `snapshot.json` becomes a
     current-graph node; the rest of the dir contents become its
-    `RuntimeState`. Snapshots with wrong / missing schema (or
-    unreadable JSON) are silently skipped -- they'll surface as
-    schema-mismatch errors at apply / run time.
+    `RuntimeState`. Snapshots that exist but can't be turned into
+    a `Job` / `JobGroup` (corrupt JSON, wrong schema, unrecognized
+    kind, dataclass `TypeError`) become `BrokenEntity` records so
+    status / destroy / audit can surface them with a clear
+    "re-apply required" signal instead of treating the entry as
+    silently absent.
     """
     current = Graph()
+    broken: dict[EntityRef, BrokenEntity] = {}
     runtime: dict[EntityRef, RuntimeState] = {}
     if not state_root.exists():
-        return current, runtime
+        return current, broken, runtime
     for bundle_dir in state_root.iterdir():
         if not bundle_dir.is_dir():
             continue
@@ -3124,20 +3209,53 @@ def _build_current_graph(
             snap_path = uuid_dir / "snapshot.json"
             if not snap_path.is_file():
                 continue
+            ref = EntityRef(bundle_dir.name, uuid_dir.name)
             try:
                 raw = json.loads(snap_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                broken[ref] = BrokenEntity(
+                    bundle=bundle_dir.name,
+                    uuid=uuid_dir.name,
+                    name=None,
+                    reason=f"snapshot.json unreadable: {exc}",
+                    source_path=snap_path,
+                )
                 continue
-            if (
-                not isinstance(raw, dict)
-                or raw.get("schema") != _SNAPSHOT_SCHEMA
-            ):
+            raw_name = raw.get("name") if isinstance(raw, dict) else None
+            name_hint = raw_name if isinstance(raw_name, str) else None
+            if not isinstance(raw, dict):
+                broken[ref] = BrokenEntity(
+                    bundle=bundle_dir.name,
+                    uuid=uuid_dir.name,
+                    name=name_hint,
+                    reason="snapshot.json is not a JSON object",
+                    source_path=snap_path,
+                )
+                continue
+            if raw.get("schema") != _SNAPSHOT_SCHEMA:
+                broken[ref] = BrokenEntity(
+                    bundle=bundle_dir.name,
+                    uuid=uuid_dir.name,
+                    name=name_hint,
+                    reason=(
+                        f"snapshot schema {raw.get('schema')!r} "
+                        f"(expected {_SNAPSHOT_SCHEMA})"
+                    ),
+                    source_path=snap_path,
+                )
                 continue
             kind = raw.get("kind")
             if kind == "job":
                 try:
                     snap_j = Job(**raw)
-                except TypeError:
+                except TypeError as exc:
+                    broken[ref] = BrokenEntity(
+                        bundle=bundle_dir.name,
+                        uuid=uuid_dir.name,
+                        name=name_hint,
+                        reason=f"job dataclass conversion failed: {exc}",
+                        source_path=snap_path,
+                    )
                     continue
                 current.jobs[snap_j.ref] = snap_j
                 current.by_full_name[snap_j.name] = snap_j.ref
@@ -3145,12 +3263,27 @@ def _build_current_graph(
             elif kind == "group":
                 try:
                     snap_g = JobGroup(**raw)
-                except TypeError:
+                except TypeError as exc:
+                    broken[ref] = BrokenEntity(
+                        bundle=bundle_dir.name,
+                        uuid=uuid_dir.name,
+                        name=name_hint,
+                        reason=f"group dataclass conversion failed: {exc}",
+                        source_path=snap_path,
+                    )
                     continue
                 current.groups[snap_g.ref] = snap_g
                 current.by_full_name[snap_g.name] = snap_g.ref
                 runtime[snap_g.ref] = _read_runtime_state(uuid_dir, "group")
-    return current, runtime
+            else:
+                broken[ref] = BrokenEntity(
+                    bundle=bundle_dir.name,
+                    uuid=uuid_dir.name,
+                    name=name_hint,
+                    reason=f"unrecognized snapshot kind {kind!r}",
+                    source_path=snap_path,
+                )
+    return current, broken, runtime
 
 
 def load_config() -> Config:
@@ -3163,7 +3296,7 @@ def load_config() -> Config:
 
     toml_config = load_all_bundles()
     pending = _build_pending_graph(toml_config, host, platform)
-    current, runtime = _build_current_graph(STATE_DIR)
+    current, broken, runtime = _build_current_graph(STATE_DIR)
 
     # Platform units (launchd plist / systemd timer) whose name
     # isn't in either graph: usually leftovers from a state-dir
@@ -3178,12 +3311,22 @@ def load_config() -> Config:
         in_use_labels.add(snap_j.name)
     for snap_g in current.groups.values():
         in_use_labels.add(snap_g.name)
+    for broken_entry in broken.values():
+        if broken_entry.name is not None:
+            in_use_labels.add(broken_entry.name)
     orphan_unit_labels = _platform_unit_names() - in_use_labels
+
+    broken_by_full_name: dict[str, EntityRef] = {}
+    for ref, broken_entry in broken.items():
+        if broken_entry.name is not None:
+            broken_by_full_name[broken_entry.name] = ref
 
     return Config(
         toml_config=toml_config,
         pending=pending,
         current=current,
+        broken=broken,
+        broken_by_full_name=broken_by_full_name,
         runtime=runtime,
         orphan_unit_labels=orphan_unit_labels,
         host=host,
@@ -5536,8 +5679,12 @@ def _last_run_state(config: Config, full_name: str) -> str:
     recorded exit_class. Absence of either means the entity has
     never run -- new install, group-only job that's never been
     triggered, etc.
+
+    The lookup goes through `resolve_current` because runtime
+    state lives at the *current* uuid's state dir; a pending-
+    only entry has no runtime and resolves to "never".
     """
-    ref = config.resolve(full_name)
+    ref = config.resolve_current(full_name)
     if ref is None:
         return "never"
     rt = config.runtime.get(ref)
@@ -5564,9 +5711,11 @@ def _last_ran_at(config: Config, full_name: str) -> str:
     """Return a compact "when did this last run" string for status.
 
     Returns "never" when there's no last-run record and "unknown"
-    when the recorded timestamp is unreadable.
+    when the recorded timestamp is unreadable. The lookup goes
+    through `resolve_current` because runtime state lives at the
+    *current* uuid; a pending-only entry has no runtime record.
     """
-    ref = config.resolve(full_name)
+    ref = config.resolve_current(full_name)
     if ref is None:
         return "never"
     rt = config.runtime.get(ref)
@@ -6511,22 +6660,15 @@ def do_destroy(
     for full in full_names_to_destroy:
         # The state dir to wipe is the one the installed unit's
         # argv already addresses: the *current* (most-recently-
-        # applied) uuid. When a user has edited a uuid in TOML but
-        # not yet re-applied, pending and current diverge;
-        # `current.by_full_name` is the source of truth for what
-        # is on disk. Pending is a last resort only for an entry
-        # with no current side at all (no state dir to clean up
-        # anyway -- only the platform unit, which destroy_one
-        # handles via the name). A `<bundle>:<UUID>`
-        # `<bundle>:<UUID>` input addresses a state dir
-        # directly by ref without going through any by_full_name
-        # map.
-        syn = parse_entity_ref(full)
-        ref = (
-            syn
-            or config.current.by_full_name.get(full)
-            or config.pending.by_full_name.get(full)
-        )
+        # applied) uuid. `resolve_current` consults `current`
+        # first, then `broken`; no `pending` fallback because a
+        # pending-only entry has nothing on disk to wipe. A
+        # ref-form input whose state dir exists but holds no
+        # snapshot is accepted by the upstream validation and
+        # lands here as `direct_ref` -- use it directly since
+        # neither Config source knows about it.
+        direct_ref = parse_entity_ref(full)
+        ref = config.resolve_current(full) or direct_ref
         sd = (
             _entity_state_dir(ref.bundle, ref.uuid) if ref is not None else None
         )
@@ -6536,7 +6678,7 @@ def do_destroy(
         # leak the unit. Read the snapshot's `name` field; if the
         # snapshot is unparseable or missing, drop the platform
         # unit cleanup (no name -> no path to construct).
-        if syn is not None:
+        if direct_ref is not None:
             name_for_cleanup: str | None = (
                 _recover_full_name(sd) if sd is not None else None
             )
@@ -6776,15 +6918,12 @@ def do_trigger(
     platform = current_platform()
 
     def _state_dir_for_full(full: str) -> Path:
-        # Track the *current* uuid: the installed unit's argv
-        # addresses the current state dir, so the user-trigger
-        # flag and the wait-watcher must too. Pending is consulted
-        # only if no current side exists -- in that case the unit
-        # itself can't be installed either, so the call will fail
-        # at `_dispatch_unit_path` regardless.
-        ref = config.current.by_full_name.get(
-            full
-        ) or config.pending.by_full_name.get(full)
+        # Trigger requires a runnable entity: the installed unit's
+        # argv addresses the *current* uuid, so the user-trigger
+        # flag and the wait-watcher must too. `resolve_runnable`
+        # encodes that semantic (current only -- broken / unit-
+        # only / pending-only entries can't sensibly be triggered).
+        ref = config.resolve_runnable(full)
         if ref is None:
             raise UsageError(
                 f"no resolvable entity for {full!r} (apply may be stale)"
@@ -7136,11 +7275,17 @@ def _entry_is_scheduled(entry: TomlJob | TomlJobGroup | None) -> bool:
 
 def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
     """`True` / `False` if the current-graph entry for `full`
-    records schedule fields; `None` otherwise (the entry isn't in
-    the current graph). Used to guess UNIT NAME for entries whose
-    live config no longer exists.
+    records schedule fields; `None` otherwise. Used to guess UNIT
+    NAME for entries whose live config no longer exists.
+
+    The lookup goes through `resolve_runnable` (current only).
+    A broken or unit-only or pending-only entry returns `None`
+    here because it's not in `current` -- the caller
+    (`_unit_name_for`) then renders an empty cell or falls
+    through to the pending-side answer if a `TomlJob` /
+    `TomlJobGroup` is in hand.
     """
-    ref = config.current.by_full_name.get(full)
+    ref = config.resolve_runnable(full)
     if ref is None:
         return None
     snap_j = config.current.jobs.get(ref)
@@ -7287,20 +7432,25 @@ def _schedule_cells(
     pending and current values disagree on this field, regardless
     of mode.
     """
-    ref = config.resolve(full)
     pending_disp: str | None = None
     current_disp: str | None = None
-    if ref is not None:
+    # Look up each side by name independently so a divergent
+    # uuid (user edited `uuid =` in TOML but hasn't re-applied)
+    # still finds both entries.
+    pending_ref = config.resolve_pending(full)
+    if pending_ref is not None:
         pending_entry = config.pending.jobs.get(
-            ref
-        ) or config.pending.groups.get(ref)
-        current_entry = config.current.jobs.get(
-            ref
-        ) or config.current.groups.get(ref)
+            pending_ref
+        ) or config.pending.groups.get(pending_ref)
         if pending_entry is not None:
             pending_disp = _schedule_display(
                 pending_entry.schedule, pending_entry.interval
             )
+    current_ref = config.resolve_current(full)
+    if current_ref is not None:
+        current_entry = config.current.jobs.get(
+            current_ref
+        ) or config.current.groups.get(current_ref)
         if current_entry is not None:
             current_disp = _schedule_display(
                 current_entry.schedule, current_entry.interval
@@ -7420,7 +7570,11 @@ def do_status(
         elif entry is not None:
             kind = "job"
         else:
-            ref = config.resolve(full)
+            # No TOML entry: fall back to the on-disk kind label.
+            # Only `current` carries `kind_of` info; broken /
+            # unit-only orphans don't, so they render an empty
+            # kind cell.
+            ref = config.resolve_current(full)
             kind = config.current.kind_of(ref) or "" if ref is not None else ""
         # Resolve the runtime axes up-front. The schedule cell
         # below uses unit_state to decide whether to surface
@@ -7460,7 +7614,7 @@ def do_status(
         if entry is not None:
             entity_uuid = entry.uuid
         else:
-            cur_ref = config.current.by_full_name.get(full)
+            cur_ref = config.resolve_current(full)
             entity_uuid = cur_ref.uuid if cur_ref is not None else ""
         rows.append(
             {
@@ -7572,16 +7726,28 @@ def do_logs(
         config = None
     sd: Path | None = None
     if config is not None:
-        ref = config.resolve(full)
+        # Logs: prefer the current ref (where the run.log actually
+        # lives), fall back to pending so `--path` mode prints the
+        # canonical location for a pre-apply entry, and finally
+        # fall back to a ref-form input's parsed ref so an
+        # operator can read a state dir that isn't in any Config
+        # source (e.g. a snapshot-less remnant the user wants to
+        # inspect before destroying).
+        ref = (
+            config.resolve_current(full)
+            or config.resolve_pending(full)
+            or parse_entity_ref(full)
+        )
         if ref is not None:
             # Derive the state dir directly from the ref. This
             # path is what `RuntimeState.state_dir` would
             # contain when an entry is in `config.runtime`, and
-            # it's also defined for refs that aren't (`<bundle>:<UUID>`
-            # input whose snapshot is unparseable, pre-apply
-            # entries, future broken / unit-only orphans). The
-            # `log_path.exists()` check below handles "path is
-            # well-defined but no log there yet".
+            # it's also defined for refs that aren't
+            # (`<bundle>:<UUID>` input whose snapshot is
+            # unparseable, pre-apply entries, broken / future
+            # unit-only orphans). The `log_path.exists()` check
+            # below handles "path is well-defined but no log
+            # there yet".
             sd = _entity_state_dir(ref.bundle, ref.uuid)
     if sd is None:
         raise UsageError(f"no log for {full!r} (no applied state on this host)")

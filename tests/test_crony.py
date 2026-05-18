@@ -8907,10 +8907,18 @@ class TestConfigResolveEntityRef:
         h.config({}, default_target_jobs=[])
         cfg = crony.load_config()
         ref_input = "default:11111111-2222-3333-4444-555555555555"
-        ref = cfg.resolve(ref_input)
-        assert ref == crony.EntityRef(
+        # The ref-form is recognized by all three resolve methods.
+        # When the entity isn't in any side (this test has no
+        # pending or current entry), the methods all return None
+        # for the ref since the ref doesn't appear in their
+        # backing source. The ref-form parser still gives the
+        # caller a way to construct an EntityRef explicitly:
+        assert crony.parse_entity_ref(ref_input) == crony.EntityRef(
             "default", "11111111-2222-3333-4444-555555555555"
         )
+        assert cfg.resolve_runnable(ref_input) is None
+        assert cfg.resolve_current(ref_input) is None
+        assert cfg.resolve_pending(ref_input) is None
 
 
 class TestDestroyByEntityRef:
@@ -9449,9 +9457,194 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         config = crony.load_config()
-        ref = config.resolve("default.a")
+        ref = config.resolve_pending("default.a")
         assert ref is not None
         assert ref.uuid == uuid_a
+
+
+class TestConfigBroken:
+    """`Config.broken` carries the entities whose on-disk
+    snapshot can't be loaded by this crony binary. `_build_current_graph`
+    populates it instead of silently dropping the state dir;
+    `Config.config_state` returns `"broken"` for refs that land
+    there, beating the synced / stale / orphan / missing axes.
+    """
+
+    def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        cfg_dropin = tmp_path / "config_dropin"
+        cfg_dropin.mkdir()
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
+        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        cfg_file.write_text("", encoding="utf-8")
+        return cfg_file
+
+    def _plant_state(self, uuid_value: str, contents: str) -> tuple[Any, Path]:
+        sd = crony.STATE_DIR / "default" / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(contents, encoding="utf-8")
+        return crony.EntityRef("default", uuid_value), sd
+
+    def test_wrong_schema_recorded_as_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        ref, _ = self._plant_state(
+            "11111111-1111-1111-1111-111111111111",
+            json.dumps(
+                {"schema": 999, "kind": "job", "name": "default.legacy"}
+            ),
+        )
+        config = crony.load_config()
+        assert ref in config.broken
+        assert ref not in config.current.jobs
+        assert ref not in config.runtime
+        assert config.broken[ref].name == "default.legacy"
+        assert "schema 999" in config.broken[ref].reason
+        assert config.config_state(ref) == "broken"
+        # Name-recovery let it land in broken_by_full_name.
+        assert config.broken_by_full_name.get("default.legacy") == ref
+
+    def test_unrecognized_kind_recorded_as_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        ref, _ = self._plant_state(
+            "22222222-2222-2222-2222-222222222222",
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": "banana",
+                    "name": "default.j",
+                }
+            ),
+        )
+        config = crony.load_config()
+        assert ref in config.broken
+        assert "banana" in config.broken[ref].reason
+        assert config.config_state(ref) == "broken"
+
+    def test_dataclass_type_error_recorded_as_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        # Right schema + kind but missing required fields -> Job(**raw) raises.
+        ref, _ = self._plant_state(
+            "33333333-3333-3333-3333-333333333333",
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": "job",
+                    "name": "default.partial",
+                }
+            ),
+        )
+        config = crony.load_config()
+        assert ref in config.broken
+        assert config.broken[ref].name == "default.partial"
+        assert "dataclass conversion" in config.broken[ref].reason
+
+    def test_corrupt_json_recorded_as_broken_without_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        ref, _ = self._plant_state(
+            "44444444-4444-4444-4444-444444444444",
+            "{not valid json",
+        )
+        config = crony.load_config()
+        assert ref in config.broken
+        # No recoverable name from corrupt JSON; the entry is
+        # reachable only by ref (or the synthetic input form).
+        assert config.broken[ref].name is None
+        assert "unreadable" in config.broken[ref].reason
+        assert ref not in config.broken_by_full_name.values()
+
+    def test_broken_beats_orphan_when_only_current_side_exists(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A broken state dir with no pending entry would otherwise
+        # report as `orphan`; broken wins so the operator sees the
+        # specific "snapshot can't load" reason.
+        self._setup(tmp_path, monkeypatch)
+        ref, _ = self._plant_state(
+            "55555555-5555-5555-5555-555555555555",
+            json.dumps(
+                {"schema": 999, "kind": "job", "name": "default.unowned"}
+            ),
+        )
+        config = crony.load_config()
+        assert config.config_state(ref) == "broken"
+
+
+class TestResolveMethods:
+    """The three named resolvers encode the operation's intent at
+    the call site: `resolve_runnable` for trigger (current only),
+    `resolve_current` for destroy (current + broken),
+    `resolve_pending` for apply / pending-side displays. Callers
+    that want a broader lookup compose explicitly so the chain
+    direction is visible at the call site instead of baked in.
+    """
+
+    def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        cfg_dropin = tmp_path / "config_dropin"
+        cfg_dropin.mkdir()
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
+        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        return cfg_file
+
+    def test_pending_only_resolves_via_pending_not_runnable_or_current(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_a = "11111111-aaaa-bbbb-cccc-dddddddddddd"
+        cfg_file.write_text(
+            f'[job.a]\nuuid = "{uuid_a}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["a"]\n',
+            encoding="utf-8",
+        )
+        config = crony.load_config()
+        assert config.resolve_pending("default.a") is not None
+        # Never applied -> not in current, so trigger / destroy
+        # have nothing on disk to act on.
+        assert config.resolve_runnable("default.a") is None
+        assert config.resolve_current("default.a") is None
+
+    def test_broken_current_but_not_runnable_or_pending(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A broken entry is in `current` from destroy's
+        # perspective (state dir on disk to wipe) but never
+        # `runnable` (snapshot can't load, so a fire would bail)
+        # and never `pending` (no TOML entry for it).
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text("", encoding="utf-8")
+        uuid_b = "22222222-aaaa-bbbb-cccc-dddddddddddd"
+        sd = crony.STATE_DIR / "default" / uuid_b
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {"schema": 999, "kind": "job", "name": "default.legacy"}
+            ),
+            encoding="utf-8",
+        )
+        config = crony.load_config()
+        ref = crony.EntityRef("default", uuid_b)
+        assert config.resolve_runnable("default.legacy") is None
+        assert config.resolve_current("default.legacy") == ref
+        assert config.resolve_pending("default.legacy") is None
 
 
 class TestBundleNamespacing:
