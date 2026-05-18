@@ -2373,11 +2373,11 @@ class _RunnerHarness:
         clean up such remnants.
         """
         # Use a deterministic uuid so re-stamps in the same test
-        # collide on the same dir rather than fanning out. The
-        # uuid format here is arbitrary -- production code reads
-        # the snapshot's `name` field to resolve a state dir from
-        # a CLI full name and never validates that the directory
-        # name is itself a canonical uuid4.
+        # collide on the same dir rather than fanning out. The uuid
+        # format here is arbitrary -- the directory name itself is
+        # the storage key (no canonical-uuid4 validation), and
+        # production lookups go through `Config.current.by_full_name`
+        # built by `_build_current_graph`'s tree walk.
         orphan_uuid = str(
             uuid.uuid5(uuid.NAMESPACE_DNS, f"orphan/{bundle}.{short}")
         )
@@ -2843,7 +2843,9 @@ class TestRunJobBasics:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony.do_run(
-                name="default.never-applied", dry_run=False, skip_gate=False
+                ref="default:never-applied-uuid",
+                dry_run=False,
+                skip_gate=False,
             )
 
     def test_dry_run_does_not_exec(
@@ -2950,8 +2952,8 @@ class TestRunJobLockContention:
         )
         # Pre-acquire the lock from another file descriptor. The
         # state dir is created with a snapshot stub via state_dir's
-        # ensure_snapshot helper so the runner's `_state_dir_by_name`
-        # path can find it in the recovery loop.
+        # ensure_snapshot helper so the runner has a snapshot to
+        # load before reaching the lock acquisition.
         sd = h.state_dir("j")
         lock = sd / "run.lock"
         import fcntl as _fcntl
@@ -3022,11 +3024,16 @@ def _stub_trigger_sync(
     ledger: list[dict[str, Any]] = []
 
     def _stub(
-        full_name: str, *, job_timeout: float, trigger_timeout: float
+        full_name: str,
+        *,
+        state_dir: Path,
+        job_timeout: float,
+        trigger_timeout: float,
     ) -> dict[str, Any]:
         ledger.append(
             {
                 "full_name": full_name,
+                "state_dir": state_dir,
                 "job_timeout": job_timeout,
                 "trigger_timeout": trigger_timeout,
             }
@@ -3193,7 +3200,11 @@ class TestRunGroup:
         )
 
         def _slow(
-            full_name: str, *, job_timeout: float, trigger_timeout: float
+            full_name: str,
+            *,
+            state_dir: Path,
+            job_timeout: float,
+            trigger_timeout: float,
         ) -> dict[str, Any]:
             # Burn 11 seconds of monotonic time using a fake clock;
             # we monkeypatch time.monotonic to make this fast.
@@ -3216,6 +3227,7 @@ class TestRunGroup:
         def _stub_advance(
             full_name: str,
             *,
+            state_dir: Path,
             job_timeout: float,
             trigger_timeout: float,
         ) -> dict[str, Any]:
@@ -3266,7 +3278,11 @@ class TestRunGroup:
         )
 
         def _stub(
-            full_name: str, *, job_timeout: float, trigger_timeout: float
+            full_name: str,
+            *,
+            state_dir: Path,
+            job_timeout: float,
+            trigger_timeout: float,
         ) -> dict[str, Any]:
             if full_name == h.full("missing"):
                 raise crony.UnitNotInstalledError(
@@ -3321,7 +3337,11 @@ class TestRunGroup:
         )
 
         def _stub(
-            full_name: str, *, job_timeout: float, trigger_timeout: float
+            full_name: str,
+            *,
+            state_dir: Path,
+            job_timeout: float,
+            trigger_timeout: float,
         ) -> dict[str, Any]:
             return {"exit_code": 0, "exit_class": "ok"}
 
@@ -3383,6 +3403,7 @@ class TestRunGroupInteractive:
         def _stub_sync(
             full_name: str,
             *,
+            state_dir: Path,
             job_timeout: float,
             trigger_timeout: float,
             triggered_by_user: bool = False,
@@ -3520,9 +3541,17 @@ class TestTriggerUnitNotInstalled:
         h = _RunnerHarness(tmp_path, monkeypatch)
         self._isolate_unit_dirs(tmp_path, monkeypatch)
         full = h.full("ghost")
+        ghost_sd = h.state / crony.DEFAULT_BUNDLE_NAME / "u-ghost"
         with pytest.raises(crony.UnitNotInstalledError):
-            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=5.0)
-        assert not (h.state / full).exists()
+            crony._trigger_unit_sync(
+                full,
+                state_dir=ghost_sd,
+                job_timeout=5.0,
+                trigger_timeout=5.0,
+            )
+        # The waiter took read-only stance; refusing didn't create
+        # the state dir we pointed it at.
+        assert not ghost_sd.exists()
 
 
 # =============================================================================
@@ -4407,11 +4436,14 @@ class _ApplyHarness(_RunnerHarness):
         self.sysd = sysd
 
 
+_REF = "default:u-test"
+
+
 class TestPlistRendering:
     """_render_plist produces well-formed launchd plists."""
 
     def test_keyword_daily(self) -> None:
-        plist = crony._render_plist("brew", "daily", None)
+        plist = crony._render_plist("brew", "default", "u-test", "daily", None)
         assert "<key>Label</key>" in plist
         assert "<string>org.crony.brew</string>" in plist
         assert "<key>StartCalendarInterval</key>" in plist
@@ -4420,33 +4452,41 @@ class TestPlistRendering:
         assert "<integer>0</integer>" in plist
 
     def test_oncalendar_simple_time(self) -> None:
-        plist = crony._render_plist("j", "*-*-* 03:15", None)
+        plist = crony._render_plist(
+            "j", "default", "u-test", "*-*-* 03:15", None
+        )
         assert "<key>Hour</key>" in plist
         assert "<integer>3</integer>" in plist
         assert "<integer>15</integer>" in plist
 
     def test_oncalendar_dow_with_time(self) -> None:
-        plist = crony._render_plist("j", "Mon *-*-* 09:00", None)
+        plist = crony._render_plist(
+            "j", "default", "u-test", "Mon *-*-* 09:00", None
+        )
         assert "<key>Weekday</key>" in plist
         assert "<integer>1</integer>" in plist  # Mon=1
 
     def test_oncalendar_first_of_month(self) -> None:
-        plist = crony._render_plist("j", "*-*-01 03:00", None)
+        plist = crony._render_plist(
+            "j", "default", "u-test", "*-*-01 03:00", None
+        )
         assert "<key>Day</key>" in plist
         assert "<integer>1</integer>" in plist
 
     def test_interval(self) -> None:
-        plist = crony._render_plist("j", None, "30min")
+        plist = crony._render_plist("j", "default", "u-test", None, "30min")
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
 
     def test_step_pattern_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="step / range / list"):
-            crony._render_plist("j", "*:0/15", None)
+            crony._render_plist("j", "default", "u-test", "*:0/15", None)
 
     def test_range_pattern_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="step / range / list"):
-            crony._render_plist("j", "Mon..Fri *-*-* 09:00", None)
+            crony._render_plist(
+                "j", "default", "u-test", "Mon..Fri *-*-* 09:00", None
+            )
 
     def test_program_args_invoke_uv_with_absolute_path(
         self, monkeypatch: Any
@@ -4458,22 +4498,24 @@ class TestPlistRendering:
         # ProgramArguments so the unit doesn't depend on PATH.
         monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
         monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
-        plist = crony._render_plist("j", "daily", None)
+        plist = crony._render_plist("j", "default", "u-test", "daily", None)
         assert "<string>/abs/uv</string>" in plist
         assert "<string>run</string>" in plist
         assert "<string>--script</string>" in plist
         assert "<string>/abs/crony</string>" in plist
-        assert "<string>j</string>" in plist
+        # The runner argv carries the bundle:uuid ref, not the name,
+        # so it can locate the state dir directly without scanning.
+        assert "<string>default:u-test</string>" in plist
 
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
-        svc = crony._render_systemd_service("brew")
+        svc = crony._render_systemd_service("brew", "default", "u-test")
         assert "[Unit]" in svc
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
         assert "ExecStart=" in svc
-        assert " run brew" in svc
+        assert " run default:u-test" in svc
         assert "WorkingDirectory=%h" in svc
 
     def test_timer_oncalendar(self) -> None:
@@ -4495,8 +4537,11 @@ class TestSystemdRendering:
         # launchd plist case).
         monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
         monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
-        svc = crony._render_systemd_service("j")
-        assert "ExecStart=/abs/uv run --script /abs/crony run j" in svc
+        svc = crony._render_systemd_service("j", "default", "u-test")
+        assert (
+            "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
+            in svc
+        )
 
     def test_uv_executable_errors_when_uv_not_on_path(
         self, monkeypatch: Any
@@ -5377,7 +5422,19 @@ class TestConfigState:
         # Stamp the entry on disk: per-entry dir with a `hash` file.
         h.fabricate_orphan("old")
         cfg = h.config({}, default_target_jobs=[])
-        assert crony._config_state(cfg, "old", "darwin") == "orphan"
+        # The status / audit pipeline passes the current graph's
+        # by_full_name index so the orphan branch can locate the
+        # state dir without a name->uuid disk scan.
+        loaded = crony.load_config()
+        assert (
+            crony._config_state(
+                cfg,
+                "old",
+                "darwin",
+                current_by_full_name=loaded.current.by_full_name,
+            )
+            == "orphan"
+        )
 
 
 class TestEnableDisable:
@@ -5587,6 +5644,61 @@ class TestEnableDisable:
             crony.do_trigger(
                 jobs=["j"], wait=False, trigger_timeout=10, bundle=None
             )
+
+    def test_trigger_targets_current_uuid_when_pending_diverges(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The installed unit's argv carries the *current* (most-
+        # recently-applied) uuid; a uuid edit in TOML before
+        # re-apply makes `pending.by_full_name` point at a fresh
+        # ref. `do_trigger` must resolve via current so the user-
+        # trigger flag lands in the dir the runner actually reads.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        current_sd = h.state_dir("j", cfg=cfg)
+        assert current_sd.name == "11111111-1111-1111-1111-111111111111"
+        # Edit the uuid in config without re-applying. Pending now
+        # references a different ref than current.
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "uuid": "22222222-2222-2222-2222-222222222222",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(
+            crony.subprocess,
+            "run",
+            lambda *a, **kw: subprocess.CompletedProcess(a, 0),
+        )
+        crony.do_trigger(
+            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        )
+        # Flag landed in the current (installed) state dir.
+        assert (current_sd / "user-trigger.flag").exists()
+        pending_sd = (
+            h.state
+            / crony.DEFAULT_BUNDLE_NAME
+            / "22222222-2222-2222-2222-222222222222"
+        )
+        assert not (pending_sd / "user-trigger.flag").exists()
 
     def test_trigger_works_on_schedule_less_job(
         self, tmp_path: Path, monkeypatch: Any
@@ -9002,7 +9114,7 @@ class TestTriggerUnitSync:
 
         monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
         rec = crony._trigger_unit_sync(
-            full, job_timeout=5.0, trigger_timeout=5.0
+            full, state_dir=sd, job_timeout=5.0, trigger_timeout=5.0
         )
         assert rec["exit_code"] == 0
         assert rec["exit_class"] == "ok"
@@ -9012,10 +9124,12 @@ class TestTriggerUnitSync:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
-        h.fabricate_orphan("foo")
+        sd = h.fabricate_orphan("foo")
         monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
         with pytest.raises(crony.TriggerStartTimeout, match="never produced"):
-            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=1.0)
+            crony._trigger_unit_sync(
+                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+            )
 
     def test_stale_last_run_json_loops_until_fresh_arrives(
         self, tmp_path: Path, monkeypatch: Any
@@ -9034,7 +9148,9 @@ class TestTriggerUnitSync:
         )
         monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
         with pytest.raises(crony.TriggerStartTimeout):
-            crony._trigger_unit_sync(full, job_timeout=5.0, trigger_timeout=1.0)
+            crony._trigger_unit_sync(
+                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+            )
 
     def test_subsecond_run_is_recognized_as_fresh(
         self, tmp_path: Path, monkeypatch: Any
@@ -9061,7 +9177,7 @@ class TestTriggerUnitSync:
 
         monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
         rec = crony._trigger_unit_sync(
-            full, job_timeout=5.0, trigger_timeout=2.0
+            full, state_dir=sd, job_timeout=5.0, trigger_timeout=2.0
         )
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 4
@@ -9103,7 +9219,7 @@ class TestTriggerUnitSync:
         monkeypatch.setattr(crony, "_trigger_unit", lambda *a, **kw: None)
         monkeypatch.setattr(crony, "_wait_for_pid_exit", _stub_wait)
         rec = crony._trigger_unit_sync(
-            full, job_timeout=120.0, trigger_timeout=1.0
+            full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
         )
         # The runner completed, even though trigger_timeout (1s)
         # was tighter than what a real-world startup might take.
@@ -9487,8 +9603,8 @@ class TestSnapshotLifecycle:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
-        full = h.full("j")
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / "deadbeef-uuid"
+        uuid_value = "deadbeef-uuid"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         # schema=999 simulates a future version we don't support.
         (sd / "snapshot.json").write_text(
@@ -9496,14 +9612,16 @@ class TestSnapshotLifecycle:
             encoding="utf-8",
         )
         with pytest.raises(crony.PreconditionError, match="schema 999"):
-            crony._load_snapshot(full)
+            crony._load_snapshot(crony.DEFAULT_BUNDLE_NAME, uuid_value)
 
     def test_load_snapshot_refuses_missing(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h = _RunnerHarness(tmp_path, monkeypatch)
+        _ = _RunnerHarness(tmp_path, monkeypatch)
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
-            crony._load_snapshot(h.full("never-applied"))
+            crony._load_snapshot(
+                crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid"
+            )
 
     def test_topological_apply_propagates_leaf_edit_to_group(
         self, tmp_path: Path, monkeypatch: Any
@@ -9564,7 +9682,7 @@ class TestSnapshotLifecycle:
         crony.apply_one(cfg, "j")
         snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
-        crony.destroy_one(h.full("j"))
+        crony.destroy_one(h.full("j"), h.state_dir("j"))
         assert not snap_path.exists()
 
     def test_run_subcommand_hidden_from_top_level_help(self) -> None:
@@ -9623,7 +9741,8 @@ class TestSnapshotBackwardLoad:
             "job_timeout_sec": 600,
         }
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
-        snap = crony._load_snapshot(full)
+        _ = full
+        snap = crony._load_snapshot(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
         assert isinstance(snap, crony.Job)
         assert snap.schedule is None
         assert snap.interval is None
@@ -9929,7 +10048,9 @@ class TestUserTriggerFlag:
             "run",
             lambda *a, **kw: subprocess.CompletedProcess(a, 0),
         )
-        crony._trigger_unit(full, "darwin", triggered_by_user=True)
+        crony._trigger_unit(
+            full, "darwin", triggered_by_user=True, state_dir=sd
+        )
         flag = sd / "user-trigger.flag"
         assert flag.exists()
         flag.unlink()
@@ -9955,7 +10076,9 @@ class TestUserTriggerFlag:
 
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
         with pytest.raises(subprocess.CalledProcessError):
-            crony._trigger_unit(full, "darwin", triggered_by_user=True)
+            crony._trigger_unit(
+                full, "darwin", triggered_by_user=True, state_dir=sd
+            )
         assert not (sd / "user-trigger.flag").exists()
 
 
