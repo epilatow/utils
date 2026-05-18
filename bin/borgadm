@@ -5,7 +5,9 @@
 # This is human generated code that's been AI modified
 #
 # IMPORTANT: This script has tests in tests/test_borgadm.py
-# Always run the `self-test` subcommand after making modifications.
+# Always run the `self-test --e2e` subcommand after making
+# modifications -- the E2E suite is opt-in and is the part that
+# exercises borgadm end-to-end against a real borg repo.
 
 from __future__ import annotations
 
@@ -2267,7 +2269,11 @@ def do_environment() -> None:
         logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
-def do_self_test(verbose: bool = False, coverage: bool = False) -> int:
+def do_self_test(
+    verbose: bool = False,
+    coverage: bool = False,
+    e2e: bool = False,
+) -> int:
     """Run tests by invoking the test file directly."""
     repo_root = _repo_root()
     test_file = repo_root / "tests" / "test_borgadm.py"
@@ -2277,6 +2283,8 @@ def do_self_test(verbose: bool = False, coverage: bool = False) -> int:
         cmd.append("--verbose")
     if coverage:
         cmd.append("--coverage")
+    if e2e:
+        cmd.append("--e2e")
 
     return subprocess.run(cmd, cwd=repo_root).returncode
 
@@ -2636,6 +2644,15 @@ def args_parser() -> argparse.ArgumentParser:
         "--coverage",
         action="store_true",
         help="Run with coverage report",
+    )
+    self_test.add_argument(
+        "--e2e",
+        action="store_true",
+        help=(
+            "Include tests marked @pytest.mark.e2e (slow, "
+            "subprocess-based). Off by default; required after "
+            "modifying borgadm."
+        ),
     )
 
     def add_common_args(p: argparse.ArgumentParser) -> None:

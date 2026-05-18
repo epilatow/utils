@@ -12,6 +12,9 @@ epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = 
 
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests"]
+markers = [
+    "e2e: end-to-end tests that subprocess the script under test (slow; opt-in via --e2e)",
+]
 
 [tool.repo-shared.markdown]
 # Repo's pre-existing markdown was wrapped at 78. Pinned here so a

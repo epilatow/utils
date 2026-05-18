@@ -42,6 +42,13 @@ gated by platform checks.
   `uv run pytest _repo_shared/tests`.
 - The test suite owns ruff and mypy enforcement -- a green run is the gate for
   "ready to commit".
+- Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
+  subprocess the script under test (currently just the borgadm suite under
+  `tests/test_borgadm.py`). They are slow (tens of minutes serially) and are
+  excluded from the default `tests/run_all.py` run. Run them via
+  `tests/run_all.py --e2e` (or the individual test file with `--e2e`). When
+  making changes to a utility that has an e2e suite, run with `--e2e` before
+  declaring the change complete.
 
 ## Conventions
 

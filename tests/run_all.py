@@ -83,8 +83,15 @@ def run_test_file(
     *,
     verbose: bool = False,
     coverage: bool = False,
+    e2e: bool = False,
 ) -> TestResult:
-    """Run a single test file as a subprocess."""
+    """Run a single test file as a subprocess.
+
+    Every test file must accept ``--e2e``; today this is satisfied
+    by routing through ``conftest.run_tests``, which owns the flag.
+    A new test file that bypasses ``run_tests`` must accept ``--e2e``
+    on its own.
+    """
     name = path.stem
     print_banner(f"Test: {name}")
 
@@ -93,6 +100,8 @@ def run_test_file(
         cmd.append("--verbose")
     if coverage:
         cmd.append("--coverage")
+    if e2e:
+        cmd.append("--e2e")
 
     cp = subprocess.run(cmd, cwd=REPO_ROOT)
     return TestResult(name=name, returncode=cp.returncode)
@@ -188,6 +197,15 @@ def add_arguments(
         action="store_true",
         help="Run with coverage report",
     )
+    parser.add_argument(
+        "--e2e",
+        action="store_true",
+        help=(
+            "Include tests marked @pytest.mark.e2e (slow, subprocess-"
+            "based suites such as borgadm's). Off by default; turn "
+            "on when changes warrant the full end-to-end run."
+        ),
+    )
 
 
 def main() -> int:
@@ -215,6 +233,7 @@ def main() -> int:
             test_file,
             verbose=args.verbose,
             coverage=args.coverage,
+            e2e=args.e2e,
         )
         results.append(result)
 

@@ -283,13 +283,24 @@ class CmdCallbacksBase:
         assert parser is not None
 
     def test_self_test_parses_flags(self) -> None:
-        """self-test subcommand parses -v/--coverage."""
+        """self-test subcommand parses common -v/--coverage flags."""
         parser = type(self).PARSER_FUNC()
         cmd = type(self).SELF_TEST_CMD
         args = parser.parse_args([cmd, "-v", "--coverage"])
         assert args.command == cmd
         assert args.verbose is True
         assert args.coverage is True
+
+    def _self_test_default_kwargs(self) -> dict[str, Any]:
+        """Defaults the parser produces for ``self-test`` minus
+        the ``command`` key dispatch consumes. Lets the dispatch
+        assertion stay correct as utilities add self-test flags."""
+        parser = type(self).PARSER_FUNC()
+        kwargs: dict[str, Any] = vars(
+            parser.parse_args([type(self).SELF_TEST_CMD])
+        )
+        kwargs.pop("command", None)
+        return kwargs
 
     def test_no_args_parses_without_error(self) -> None:
         """parse_args([]) succeeds with command=None."""
@@ -375,7 +386,7 @@ class CmdCallbacksBase:
         ):
             result = type(self).CLI_FUNC()
         assert result == 0
-        mock.assert_called_once_with(verbose=False, coverage=False)
+        mock.assert_called_once_with(**self._self_test_default_kwargs())
 
     def test_cli_self_test_returns_test_results(
         self,
@@ -477,9 +488,29 @@ def run_tests(
         action="store_true",
         help="Run with coverage report",
     )
+    parser.add_argument(
+        "--e2e",
+        action="store_true",
+        help=(
+            "Include tests marked @pytest.mark.e2e (slow, "
+            "subprocess-based). Off by default; on for explicit "
+            "utility-change verification."
+        ),
+    )
     args = parser.parse_args()
 
     pytest_args = [test_file, "-p", "no:cacheprovider"]
+    if args.e2e:
+        # pytest-xdist parallelises the slow E2E suite if the
+        # test file's PEP 723 deps include it; otherwise we
+        # silently fall back to serial execution, which is fine
+        # for utilities that have no e2e tests to parallelise.
+        import importlib.util
+
+        if importlib.util.find_spec("xdist") is not None:
+            pytest_args.extend(["-n", "auto"])
+    else:
+        pytest_args.extend(["-m", "not e2e"])
     if args.verbose:
         pytest_args.append("-v")
     if args.coverage:

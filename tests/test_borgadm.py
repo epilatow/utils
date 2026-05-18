@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov"]
+# dependencies = ["pytest", "pytest-cov", "pytest-xdist"]
 # ///
 # This is human generated code that's been AI modified
 
@@ -267,12 +267,12 @@ def _have_borg() -> bool:
     return shutil.which("borg") is not None
 
 
-# Skip the E2E suite when borg isn't installed. The fixture talks to a
-# local borg repo, so no ssh tooling is needed.
-e2e_requires_borg = pytest.mark.skipif(
-    not _have_borg(),
-    reason="borg must be installed for E2E tests",
-)
+def _require_borg_or_fail() -> None:
+    if not _have_borg():
+        pytest.fail(
+            "borg must be installed to run the E2E suite (--e2e was "
+            "requested but `borg` is not on PATH)."
+        )
 
 
 @pytest.fixture
@@ -287,6 +287,7 @@ def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
       <tmp_path>/repo/             # the borg repo (encryption=none)
       <tmp_path>/src/<set>/...     # source dirs, one per backup set
     """
+    _require_borg_or_fail()
     home = _isolate_home
     repo_path = tmp_path / "repo"
     backup_root = tmp_path / "src"
@@ -2387,6 +2388,51 @@ class TestDoEnvironment:
         assert any("ssh-add -q" in m for m in messages)
 
 
+class TestRequireBorgOrFail:
+    """The borg_e2e fixture's preflight check.
+
+    Hard-fails (rather than silently skipping) when borg is missing
+    so that an explicit --e2e request on a borg-less machine
+    surfaces as a real test failure.
+    """
+
+    def test_passes_when_borg_present(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/borg")
+        _require_borg_or_fail()
+
+    def test_fails_when_borg_missing(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+        with pytest.raises(pytest.fail.Exception) as exc_info:
+            _require_borg_or_fail()
+        assert "borg must be installed" in str(exc_info.value)
+
+
+class TestDoSelfTest:
+    """Test do_self_test argv assembly."""
+
+    def _captured_argv(self, **kwargs: Any) -> list[str]:
+        with patch.object(ba.subprocess, "run", autospec=True) as run:
+            run.return_value = Mock(returncode=0)
+            ba.do_self_test(**kwargs)
+            return list(run.call_args.args[0])
+
+    def test_default_omits_flags(self) -> None:
+        argv = self._captured_argv()
+        assert "--verbose" not in argv
+        assert "--coverage" not in argv
+        assert "--e2e" not in argv
+
+    def test_e2e_flag_forwarded(self) -> None:
+        """--e2e is the canonical flag for verifying borgadm changes."""
+        argv = self._captured_argv(e2e=True)
+        assert "--e2e" in argv
+
+    def test_verbose_and_coverage_forwarded(self) -> None:
+        argv = self._captured_argv(verbose=True, coverage=True)
+        assert "--verbose" in argv
+        assert "--coverage" in argv
+
+
 class TestMain:
     """Test main() error reporting."""
 
@@ -3389,7 +3435,7 @@ class TestWrapperBinary:
             mock_borgadm.chmod(0o755)
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2EFixture:
     """Smoke tests pinning the borg_e2e fixture itself.
 
@@ -3589,7 +3635,7 @@ def _list_borgadm(fixture: BorgE2EFixture, *flags: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2EList:
     """E2E coverage for borgadm's list_backups full/partial classification.
 
@@ -3818,7 +3864,7 @@ def _set_backup_sets(
     fixture.config_path.write_text("\n".join(rewritten) + "\n")
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2ECreate:
     """E2E coverage for `borgadm create` archive naming.
 
@@ -3962,7 +4008,7 @@ class TestE2ECreate:
         assert len(timestamps) == 2
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2EPrune:
     """E2E coverage for `borgadm prune` retention + partial handling.
 
@@ -4170,7 +4216,7 @@ class TestE2EPrune:
         assert sorted(borg_e2e.archives()) == [full_a, full_b]
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2EExtract:
     """E2E coverage for `borgadm extract --delete` path filtering.
 
@@ -4461,7 +4507,7 @@ class TestE2EExtract:
         assert "no full backups found" in result.stderr.lower()
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2EDelete:
     """E2E coverage for `borgadm delete` archive-resolution behavior.
 
@@ -4581,7 +4627,7 @@ class TestE2EDelete:
         assert "no archives found for timestamp" in result.stderr.lower()
 
 
-@e2e_requires_borg
+@pytest.mark.e2e
 class TestE2ECfgDrift:
     """E2E coverage for cfg.BACKUP_SETS drift against existing archives.
 

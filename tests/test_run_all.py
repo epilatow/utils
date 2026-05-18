@@ -152,6 +152,81 @@ class TestRunTestFile:
         result = ra.run_test_file(script, coverage=True)
         assert result.success is True
 
+    def test_e2e_flag(self, tmp_repo: Path) -> None:
+        """Pass --e2e when e2e=True."""
+        tests_dir = tmp_repo / "tests"
+        script = tests_dir / "test_e2e.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(\n"
+            "    0 if '--e2e' in sys.argv else 1\n"
+            ")\n"
+        )
+        script.chmod(0o755)
+        result = ra.run_test_file(script, e2e=True)
+        assert result.success is True
+
+    def test_default_no_e2e_flag(self, tmp_repo: Path) -> None:
+        """Do not pass --e2e by default."""
+        tests_dir = tmp_repo / "tests"
+        script = tests_dir / "test_no_e2e.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.exit(\n"
+            "    1 if '--e2e' in sys.argv else 0\n"
+            ")\n"
+        )
+        script.chmod(0o755)
+        result = ra.run_test_file(script)
+        assert result.success is True
+
+
+# =============================================================
+# Tests: conftest.run_tests (--e2e marker filter)
+# =============================================================
+
+
+class TestRunTestsE2eMarkerFilter:
+    """conftest.run_tests' --e2e flag controls the marker filter.
+
+    Without --e2e, the e2e suite is excluded via ``-m "not e2e"``.
+    With --e2e, no marker filter is added (so e2e tests run too).
+    """
+
+    @staticmethod
+    def _invoke(argv: list[str]) -> list[str]:
+        """Run conftest.run_tests with the given argv, capture
+        the pytest argv it would have invoked."""
+        from conftest import run_tests
+
+        captured: list[list[str]] = []
+
+        def fake_main(args: list[str]) -> int:
+            captured.append(list(args))
+            return 0
+
+        with (
+            patch("sys.argv", ["test_file.py", *argv]),
+            patch("pytest.main", fake_main),
+            pytest.raises(SystemExit),
+        ):
+            run_tests("test_file.py", Path("/tmp/script"), Path("/tmp"))
+        assert captured, "pytest.main was not called"
+        return captured[0]
+
+    def test_default_excludes_e2e_marker(self) -> None:
+        argv = self._invoke([])
+        assert "-m" in argv
+        assert argv[argv.index("-m") + 1] == "not e2e"
+
+    def test_e2e_flag_drops_marker_filter(self) -> None:
+        argv = self._invoke(["--e2e"])
+        # The marker filter is gone when --e2e is set, so the
+        # suite collects both e2e and non-e2e tests.
+        assert "not e2e" not in argv
+
 
 # =============================================================
 # Tests: run_repo_shared_phase
@@ -301,6 +376,18 @@ class TestArgumentParser:
         ra.add_arguments(parser)
         args = parser.parse_args([])
         assert args.coverage is False
+
+    def test_e2e_flag(self) -> None:
+        parser = ra.build_parser()
+        ra.add_arguments(parser)
+        args = parser.parse_args(["--e2e"])
+        assert args.e2e is True
+
+    def test_default_no_e2e(self) -> None:
+        parser = ra.build_parser()
+        ra.add_arguments(parser)
+        args = parser.parse_args([])
+        assert args.e2e is False
 
 
 # =============================================================
