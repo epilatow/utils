@@ -638,10 +638,12 @@ class Job:
     """A single schedulable unit of work."""
 
     name: str
-    # Stable per-bundle identity, decoupled from `name`. Optional at
-    # parse time -- `crony config update` fills missing values in
-    # place via tomlkit round-trip.
-    uuid: str | None = None
+    # Stable per-bundle identity, decoupled from `name`. Every live
+    # Job in `Config.jobs` carries one; `_parse_job` rejects bodies
+    # without `uuid` into `errored_jobs`. `crony config update`
+    # populates the field in place via tomlkit round-trip for
+    # configs that don't yet have one.
+    uuid: str
     command: str | None = None
     script: str | None = None
     args: list[str] = field(default_factory=list)
@@ -700,7 +702,7 @@ class JobGroup:
     """
 
     name: str
-    uuid: str | None = None
+    uuid: str
     jobs: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
@@ -1593,6 +1595,11 @@ def _parse_job(name: str, raw: dict[str, Any]) -> Job:
     where = f"[job.{name}]"
     _reject_unknown_keys(raw, _KNOWN_JOB, where)
     job_uuid = _parse_uuid_field(raw, where)
+    if job_uuid is None:
+        raise ConfigError(
+            f"{where}: 'uuid' is required; run `crony config update` "
+            f"to assign UUIDs"
+        )
     command = _typed_field(raw, "command", str, where)
     script = _typed_field(raw, "script", str, where)
     if (command is None) == (script is None):
@@ -1677,6 +1684,11 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> JobGroup:
     where = f"[job-group.{name}]"
     _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
     group_uuid = _parse_uuid_field(raw, where)
+    if group_uuid is None:
+        raise ConfigError(
+            f"{where}: 'uuid' is required; run `crony config update` "
+            f"to assign UUIDs"
+        )
     jobs = _string_list(raw, "jobs", where)
     if not jobs:
         raise ConfigError(f"{where}: 'jobs' must be a non-empty list")
@@ -1964,6 +1976,49 @@ def _validate_config(config: Config) -> None:
         config.errored_host_targets[hname] = msg
 
 
+def _demote_duplicate_uuids(config: Config, bundle_name: str) -> None:
+    """Demote every job/group that shares a UUID with a sibling
+    in the same bundle into the errored maps. Operates in-place.
+
+    UUIDs are bundle-scoped, so this check runs after each bundle's
+    `parse_config` rather than across bundles. Duplicates are almost
+    always a copy-paste mistake; both sides are demoted rather than
+    picking a winner so the user sees the conflict on both rows and
+    is forced to resolve.
+    """
+    bucket: dict[str, list[tuple[str, str]]] = {}
+    for short, job in config.jobs.items():
+        bucket.setdefault(job.uuid, []).append(("job", short))
+    for short, group in config.job_groups.items():
+        bucket.setdefault(group.uuid, []).append(("job-group", short))
+
+    for uuid_str, entries in bucket.items():
+        if len(entries) < 2:
+            continue
+        full_names = sorted(
+            f"{bundle_name}.{short}" for _kind, short in entries
+        )
+        quoted = [repr(fn) for fn in full_names]
+        if len(quoted) == 2:
+            sites = f"{quoted[0]} and {quoted[1]}"
+        else:
+            sites = f"{', '.join(quoted[:-1])}, and {quoted[-1]}"
+        msg = (
+            f"duplicate uuid {uuid_str} on {sites}; "
+            f"remove one of the duplicates and run "
+            f"`crony config update` to assign a fresh uuid"
+        )
+        for kind, short in entries:
+            where = f"[{kind}.{short}]"
+            entity_msg = f"{where}: {msg}"
+            if kind == "job":
+                config.jobs.pop(short, None)
+                config.errored_jobs[short] = entity_msg
+            else:
+                config.job_groups.pop(short, None)
+                config.errored_job_groups[short] = entity_msg
+
+
 def _load_one_bundle(name: str, path: Path) -> Bundle:
     """Parse a single bundle file and validate it. Raises ConfigError
     on parse / schema failure, naming the source path for context.
@@ -1984,6 +2039,7 @@ def _load_one_bundle(name: str, path: Path) -> Bundle:
         config = parse_config(raw)
     except ConfigError as e:
         raise ConfigError(f"{path}: {e}") from e
+    _demote_duplicate_uuids(config, name)
     # Per-entity error messages are already prefixed with
     # `[job.X]` / `[job-group.X]` / `[target.X]` /
     # `[target.host.X]`; we only prepend the bundle path so the
@@ -2072,7 +2128,9 @@ def load_config(path: Path | None = None) -> Config:
         raw = tomlkit.loads(path.read_text(encoding="utf-8"))
     except tomlkit.exceptions.ParseError as e:
         raise ConfigError(f"TOML parse error in {path}: {e}") from e
-    return parse_config(raw)
+    config = parse_config(raw)
+    _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
+    return config
 
 
 def parse_config(raw: dict[str, Any]) -> Config:
@@ -7259,7 +7317,15 @@ def _notify_test_one_bundle(
     if channel is not None:
         use_channels = [channel]
     else:
-        synthetic_job = Job(name="notify-test", command="true")
+        # Synthetic transient Job built only to feed
+        # `resolved_notify_channels`. The uuid is never persisted
+        # and never compared against any real entry, so the
+        # all-zeros placeholder is fine.
+        synthetic_job = Job(
+            name="notify-test",
+            uuid="00000000-0000-0000-0000-000000000000",
+            command="true",
+        )
         target = resolve_target(config, current_host(), current_platform())
         use_channels = resolved_notify_channels(config, target, synthetic_job)
     if not use_channels:

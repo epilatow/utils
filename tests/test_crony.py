@@ -266,6 +266,44 @@ def _job(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
+    """Stamp a fresh UUID on every job/group in a test config that
+    lacks one. Returns `raw` for chaining.
+
+    UUIDs are required on every parsed entry, but most tests
+    exercise unrelated parser behavior and would otherwise have
+    to repeat boilerplate `"uuid": str(uuid.uuid4())` lines on
+    each fixture. Tests that specifically exercise missing or
+    duplicate UUID validation bypass this helper.
+    """
+    for section in ("job", "job-group"):
+        entries = raw.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for body in entries.values():
+            if isinstance(body, dict) and "uuid" not in body:
+                body["uuid"] = str(uuid.uuid4())
+    return raw
+
+
+def _parse(raw: dict[str, Any]) -> Any:
+    """Auto-stamp missing uuids and parse. The dominant test path."""
+    return crony.parse_config(_inject_uuids(raw))
+
+
+def _uuid_toml(text: str) -> str:
+    """Stamp missing uuids on every `[job.*]` / `[job-group.*]`
+    table in a TOML string. Mirrors what `crony config update`
+    does on a real bundle file; lets fixtures that write raw TOML
+    to disk stay focused on the surface they exercise rather than
+    repeating `uuid = "..."` lines.
+    """
+    doc = tomlkit.parse(text)
+    crony._insert_missing_uuids_in_section(doc, "job")
+    crony._insert_missing_uuids_in_section(doc, "job-group")
+    return tomlkit.dumps(doc)
+
+
 def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
     """Assert parse_config records a per-entity error for job `short`.
 
@@ -273,7 +311,7 @@ def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
     of raising, so tests of bad-shape inputs check the recorded
     message rather than wrapping the call in `pytest.raises`.
     """
-    cfg = crony.parse_config(raw)
+    cfg = _parse(raw)
     assert short in cfg.errored_jobs, (
         f"expected {short!r} in errored_jobs, got {list(cfg.errored_jobs)}"
     )
@@ -288,7 +326,7 @@ def _assert_errored_job_group(
     raw: dict[str, Any], short: str, match: str
 ) -> None:
     """As `_assert_errored_job` but for `[job-group.*]` entries."""
-    cfg = crony.parse_config(raw)
+    cfg = _parse(raw)
     assert short in cfg.errored_job_groups, (
         f"expected {short!r} in errored_job_groups, got "
         f"{list(cfg.errored_job_groups)}"
@@ -305,7 +343,7 @@ def _assert_errored_platform_target(
     raw: dict[str, Any], platform: str, match: str
 ) -> None:
     """As `_assert_errored_job` but for `[target.<platform>]` entries."""
-    cfg = crony.parse_config(raw)
+    cfg = _parse(raw)
     assert platform in cfg.errored_platform_targets, (
         f"expected {platform!r} in errored_platform_targets, got "
         f"{list(cfg.errored_platform_targets)}"
@@ -322,7 +360,7 @@ def _assert_errored_host_target(
     raw: dict[str, Any], host: str, match: str
 ) -> None:
     """As `_assert_errored_job` but for `[target.host.<name>]`."""
-    cfg = crony.parse_config(raw)
+    cfg = _parse(raw)
     assert host in cfg.errored_host_targets, (
         f"expected {host!r} in errored_host_targets, got "
         f"{list(cfg.errored_host_targets)}"
@@ -436,14 +474,14 @@ def _ntfy_block(**overrides: Any) -> dict[str, Any]:
 
 class TestParseDefaults:
     def test_empty_config_uses_defaults(self) -> None:
-        cfg = crony.parse_config({})
+        cfg = _parse({})
         assert cfg.defaults.notify_channels == []
         assert cfg.defaults.job_timeout_sec == 1800
         assert cfg.defaults.notify_attach_log is True
         assert cfg.defaults.notify_channel_defs == {}
 
     def test_override_defaults(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy"],
@@ -467,18 +505,14 @@ class TestParseDefaults:
         # block is a config error -- the dispatcher would have
         # nothing to send through.
         with pytest.raises(crony.ConfigError, match="not defined"):
-            crony.parse_config(
-                {"defaults": {"notify_channels": ["carrier-pigeon"]}}
-            )
+            _parse({"defaults": {"notify_channels": ["carrier-pigeon"]}})
 
     def test_duplicate_notify_channels_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="listed twice"):
-            crony.parse_config(
-                {"defaults": {"notify_channels": ["ntfy", "ntfy"]}}
-            )
+            _parse({"defaults": {"notify_channels": ["ntfy", "ntfy"]}})
 
     def test_multi_channel_defaults(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["email", "ntfy"],
@@ -497,10 +531,10 @@ class TestParseDefaults:
         # gone; ensure it surfaces as an unknown key rather than
         # being silently ignored.
         with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config({"defaults": {"notify_channel": "ntfy"}})
+            _parse({"defaults": {"notify_channel": "ntfy"}})
 
     def test_notify_email_subsection(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify": {
@@ -527,12 +561,10 @@ class TestParseDefaults:
 
     def test_notify_email_missing_required(self) -> None:
         with pytest.raises(crony.ConfigError, match="required"):
-            crony.parse_config(
-                {"defaults": {"notify": {"email": {"to": "x@y.com"}}}}
-            )
+            _parse({"defaults": {"notify": {"email": {"to": "x@y.com"}}}})
 
     def test_notify_ntfy_subsection(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify": {
@@ -552,10 +584,10 @@ class TestParseDefaults:
         # `notify.foo` doesn't match a built-in transport; the user
         # must declare `transport=`.
         with pytest.raises(crony.ConfigError, match="transport"):
-            crony.parse_config({"defaults": {"notify": {"foo": _ntfy_block()}}})
+            _parse({"defaults": {"notify": {"foo": _ntfy_block()}}})
 
     def test_arbitrary_channel_with_transport(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify": {
@@ -576,7 +608,7 @@ class TestParseDefaults:
 
     def test_unknown_transport_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="transport"):
-            crony.parse_config(
+            _parse(
                 {
                     "defaults": {
                         "notify": {"carrier-pigeon": {"transport": "carrier"}}
@@ -586,7 +618,7 @@ class TestParseDefaults:
 
     def test_reserved_email_header_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="cannot be overridden"):
-            crony.parse_config(
+            _parse(
                 {
                     "defaults": {
                         "notify": {
@@ -601,7 +633,7 @@ class TestParseDefaults:
 
     def test_reserved_ntfy_header_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="cannot be overridden"):
-            crony.parse_config(
+            _parse(
                 {
                     "defaults": {
                         "notify": {
@@ -620,7 +652,7 @@ class TestParseDefaults:
         # config can't accidentally turn the inline-body design into
         # the very attachment behavior it was designed to avoid.
         with pytest.raises(crony.ConfigError, match="cannot be overridden"):
-            crony.parse_config(
+            _parse(
                 {
                     "defaults": {
                         "notify": {
@@ -634,7 +666,7 @@ class TestParseDefaults:
             )
 
     def test_email_headers_pass_through(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify": {
@@ -658,12 +690,12 @@ class TestParseJob:
         return {"job": {"j": body}}
 
     def test_command_form_minimal(self) -> None:
-        cfg = crony.parse_config(self._cfg(_job()))
+        cfg = _parse(self._cfg(_job()))
         assert cfg.jobs["j"].command == "true"
         assert cfg.jobs["j"].script is None
 
     def test_script_with_args(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             self._cfg(
                 {
                     "script": "scripts/foo.sh",
@@ -724,9 +756,7 @@ class TestParseJob:
         )
 
     def test_interval_form(self) -> None:
-        cfg = crony.parse_config(
-            self._cfg({"command": "x", "interval": "1h30min"})
-        )
+        cfg = _parse(self._cfg({"command": "x", "interval": "1h30min"}))
         assert cfg.jobs["j"].interval == "1h30min"
         assert cfg.jobs["j"].schedule is None
 
@@ -779,7 +809,7 @@ class TestParseJob:
 
     def test_group_only_job_no_schedule(self) -> None:
         # Valid only when referenced by a group.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
@@ -789,14 +819,12 @@ class TestParseJob:
         assert cfg.jobs["a"].interval is None
 
     def test_interactive_auto_tags_platform_darwin(self) -> None:
-        cfg = crony.parse_config(self._cfg(_job(interactive=True)))
+        cfg = _parse(self._cfg(_job(interactive=True)))
         assert cfg.jobs["j"].interactive is True
         assert cfg.jobs["j"].platforms == ["darwin"]
 
     def test_interactive_explicit_darwin_platform_ok(self) -> None:
-        cfg = crony.parse_config(
-            self._cfg(_job(interactive=True, platforms=["darwin"]))
-        )
+        cfg = _parse(self._cfg(_job(interactive=True, platforms=["darwin"])))
         assert cfg.jobs["j"].interactive is True
 
     def test_interactive_with_linux_platform_rejected(self) -> None:
@@ -814,13 +842,13 @@ class TestParseJob:
         )
 
     def test_interactive_active_resolves_to_seconds(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             self._cfg(_job(interactive=True, interactive_active="5min"))
         )
         assert cfg.jobs["j"].interactive_active_sec == 300
 
     def test_interactive_delay_resolves_to_seconds(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             self._cfg(_job(interactive=True, interactive_delay="2h"))
         )
         assert cfg.jobs["j"].interactive_delay_sec == 7200
@@ -849,7 +877,7 @@ class TestParseJob:
 
 class TestParseJobGroup:
     def test_valid_group(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
@@ -870,7 +898,7 @@ class TestParseJobGroup:
         # it parses fine, but its chains are checked at validate
         # time (a target referencing it through a path with no
         # schedule errors).
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"]}},
@@ -963,23 +991,42 @@ class TestParseJobGroup:
 
 
 class TestUuidField:
-    """Optional `uuid` on jobs and groups is parsed when present
-    and validated for canonical lowercase 8-4-4-4-12 form. Malformed
-    values demote to errored-entity rather than tearing down the
-    bundle so other entries still apply.
+    """Required `uuid` on jobs and groups is parsed when present,
+    validated for canonical lowercase 8-4-4-4-12 form, and demotes
+    to errored-entity when missing or malformed so other entries
+    in the same bundle still apply.
     """
 
     GOOD = "aabbccdd-1234-5678-9abc-aabbccddeeff"
 
     def test_job_uuid_round_trip(self) -> None:
-        cfg = crony.parse_config(
-            {"job": {"j": {"command": "true", "uuid": self.GOOD}}}
-        )
+        cfg = _parse({"job": {"j": {"command": "true", "uuid": self.GOOD}}})
         assert cfg.jobs["j"].uuid == self.GOOD
 
-    def test_job_uuid_absent_defaults_none(self) -> None:
+    def test_job_missing_uuid_is_errored(self) -> None:
+        # Bypass `_parse` so `_inject_uuids` doesn't paper over the
+        # condition we're verifying.
         cfg = crony.parse_config({"job": {"j": _job()}})
-        assert cfg.jobs["j"].uuid is None
+        assert "j" in cfg.errored_jobs
+        assert "uuid" in cfg.errored_jobs["j"]
+        assert "crony config update" in cfg.errored_jobs["j"]
+        assert "j" not in cfg.jobs
+
+    def test_group_missing_uuid_is_errored(self) -> None:
+        cfg = crony.parse_config(
+            {
+                "job": {
+                    "a": {"command": "true", "uuid": self.GOOD},
+                },
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "daily"},
+                },
+            }
+        )
+        assert "g" in cfg.errored_job_groups
+        assert "uuid" in cfg.errored_job_groups["g"]
+        assert "crony config update" in cfg.errored_job_groups["g"]
+        assert "g" not in cfg.job_groups
 
     def test_job_uuid_rejects_non_string(self) -> None:
         _assert_errored_job(
@@ -1024,7 +1071,7 @@ class TestUuidField:
         )
 
     def test_group_uuid_round_trip(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
@@ -1054,9 +1101,93 @@ class TestUuidField:
         )
 
 
+class TestDuplicateUuidInBundle:
+    """UUIDs are bundle-scoped, so this check runs after each
+    bundle's parse_config. Both entries sharing the duplicate
+    UUID are demoted into the errored maps with the same message
+    -- the user sees the conflict on every side, not just one,
+    and other bundles/entries remain operational.
+    """
+
+    GOOD = "aabbccdd-1234-5678-9abc-aabbccddeeff"
+
+    def _write_and_load(self, tmp_path: Path, body: str) -> Any:
+        path = tmp_path / "bundle.toml"
+        path.write_text(body, encoding="utf-8")
+        return crony._load_one_bundle("default", path)
+
+    def test_duplicate_uuid_on_two_jobs_demotes_both(
+        self, tmp_path: Path
+    ) -> None:
+        bundle = self._write_and_load(
+            tmp_path,
+            f'[job.a]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n\n'
+            f'[job.b]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n',
+        )
+        cfg = bundle.config
+        assert "a" not in cfg.jobs
+        assert "b" not in cfg.jobs
+        for short in ("a", "b"):
+            msg = cfg.errored_jobs[short]
+            assert "duplicate uuid" in msg
+            assert self.GOOD in msg
+            assert "'default.a'" in msg
+            assert "'default.b'" in msg
+            assert "crony config update" in msg
+
+    def test_duplicate_uuid_across_job_and_group_demotes_both(
+        self, tmp_path: Path
+    ) -> None:
+        bundle = self._write_and_load(
+            tmp_path,
+            f'[job.a]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n\n'
+            f'[job-group.g]\nuuid = "{self.GOOD}"\n'
+            'jobs = ["a"]\nschedule = "daily"\n',
+        )
+        cfg = bundle.config
+        assert "a" not in cfg.jobs
+        assert "g" not in cfg.job_groups
+        assert "duplicate uuid" in cfg.errored_jobs["a"]
+        assert "duplicate uuid" in cfg.errored_job_groups["g"]
+
+    def test_three_way_duplicate_names_all_sites(self, tmp_path: Path) -> None:
+        # When 3+ entries share a UUID, the message names every
+        # site so the user sees every place that needs fixing on
+        # the first reload, not just two.
+        bundle = self._write_and_load(
+            tmp_path,
+            f'[job.a]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n\n'
+            f'[job.b]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n\n'
+            f'[job.c]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n',
+        )
+        cfg = bundle.config
+        for short in ("a", "b", "c"):
+            msg = cfg.errored_jobs[short]
+            assert "'default.a'" in msg
+            assert "'default.b'" in msg
+            assert "'default.c'" in msg
+
+    def test_distinct_uuids_load_normally(self, tmp_path: Path) -> None:
+        bundle = self._write_and_load(
+            tmp_path,
+            f'[job.a]\nuuid = "{self.GOOD}"\n'
+            'command = "true"\nschedule = "daily"\n\n'
+            '[job.b]\nuuid = "11223344-5566-7788-99aa-bbccddeeff00"\n'
+            'command = "true"\nschedule = "daily"\n',
+        )
+        assert set(bundle.config.jobs) == {"a", "b"}
+        assert not bundle.config.errored_jobs
+
+
 class TestParseTarget:
     def test_platform_target(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job()},
                 "target": {"darwin": {"jobs": ["a"]}},
@@ -1068,7 +1199,7 @@ class TestParseTarget:
         assert t.kind == "platform"
 
     def test_host_target(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job()},
                 "target": {"host": {"my-host": {"jobs": ["a"]}}},
@@ -1089,7 +1220,7 @@ class TestParseTarget:
 
     def test_target_unknown_key(self) -> None:
         with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config(
+            _parse(
                 {
                     "job": {"a": _job()},
                     "target": {"darwin": {"jobs": ["a"], "surprise": "x"}},
@@ -1105,7 +1236,7 @@ class TestParseTarget:
 class TestValidateConfig:
     def test_name_collision(self) -> None:
         with pytest.raises(crony.ConfigError, match="name collision"):
-            crony.parse_config(
+            _parse(
                 {
                     "job": {"foo": _job()},
                     "job-group": {
@@ -1125,7 +1256,7 @@ class TestValidateConfig:
         # A single bad group must not take other groups or the
         # bundle with it -- a typo in one entry leaves the rest of
         # the bundle resolvable.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
@@ -1140,7 +1271,7 @@ class TestValidateConfig:
         assert "darwin" in cfg.platform_targets
 
     def test_interactive_as_direct_target_child_ok(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "iv": {
@@ -1158,7 +1289,7 @@ class TestValidateConfig:
     def test_interactive_inside_group_is_allowed(self) -> None:
         # The group dispatches the interactive child async, so it
         # is allowed as a [job-group.*] member -- no demotion.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "iv": {
@@ -1180,7 +1311,7 @@ class TestValidateConfig:
     def test_nested_groups_supported(self) -> None:
         # A group can reference another group; only the chain to a
         # target needs to contain a schedule somewhere.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
@@ -1294,7 +1425,7 @@ class TestValidateConfig:
         # Two targets each listing the same group is fine: only one
         # target activates on a given host, so the dispatch graphs
         # are disjoint at runtime.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
@@ -1324,7 +1455,7 @@ class TestValidateConfig:
     def test_one_bad_target_does_not_drop_siblings(self) -> None:
         # A typo'd target.linux must not take target.darwin with
         # it -- per-target failures stay scoped.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job()},
                 "target": {
@@ -1338,7 +1469,7 @@ class TestValidateConfig:
         assert "linux" not in cfg.platform_targets
 
     def test_target_references_group_ok(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
@@ -1352,7 +1483,7 @@ class TestValidateConfig:
         # weight but harmless -- the user might be staging. Validation
         # only fires when a target reaches a chain without a schedule;
         # this config has no target, so it parses fine.
-        cfg = crony.parse_config({"job": {"a": {"command": "true"}}})
+        cfg = _parse({"job": {"a": {"command": "true"}}})
         assert "a" in cfg.jobs
 
     def test_target_reaching_schedule_less_job_directly_rejected(
@@ -1371,7 +1502,7 @@ class TestValidateConfig:
         )
 
     def test_referenced_group_only_job_ok(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
@@ -1389,7 +1520,7 @@ class TestValidateConfig:
         # applicable subset.
         monkeypatch.setattr(crony, "current_platform", lambda: "linux")
         monkeypatch.setattr(crony, "current_host", lambda: "host-l")
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "a": _job(platforms=["darwin"]),
@@ -1406,7 +1537,7 @@ class TestValidateConfig:
 class TestUnknownTopLevel:
     def test_unknown_toplevel_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="unknown"):
-            crony.parse_config({"surprise": {}})
+            _parse({"surprise": {}})
 
 
 # =============================================================================
@@ -1416,7 +1547,7 @@ class TestUnknownTopLevel:
 
 class TestLoadConfigFromFile:
     def test_loads_valid_config(self, tmp_path: Path) -> None:
-        cfg_text = (
+        cfg_text = _uuid_toml(
             "[defaults]\n"
             "notify_channels = []\n"
             "\n"
@@ -1448,7 +1579,7 @@ class TestLoadConfigFromFile:
 
 class TestResolution:
     def test_host_target_wins(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job(), "b": _job()},
                 "target": {
@@ -1463,7 +1594,7 @@ class TestResolution:
         assert target.kind == "host"
 
     def test_falls_back_to_platform(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job()},
                 "target": {"darwin": {"jobs": ["a"]}},
@@ -1475,11 +1606,11 @@ class TestResolution:
         assert target.kind == "platform"
 
     def test_no_target_returns_none(self) -> None:
-        cfg = crony.parse_config({})
+        cfg = _parse({})
         assert crony.resolve_target(cfg, "h", "darwin") is None
 
     def test_selected_includes_group_children(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "a": {"command": "true"},
@@ -1501,13 +1632,13 @@ class TestResolution:
         assert groups == {"g"}
 
     def test_selected_for_no_target_is_empty(self) -> None:
-        cfg = crony.parse_config({})
+        cfg = _parse({})
         jobs, groups = crony.selected_jobs_and_groups(cfg, None)
         assert jobs == set()
         assert groups == set()
 
     def test_notify_target_wins(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": [],
@@ -1531,7 +1662,7 @@ class TestResolution:
         ]
 
     def test_notify_job_overrides_defaults(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": [],
@@ -1547,7 +1678,7 @@ class TestResolution:
         ]
 
     def test_notify_default_fallback(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy"],
@@ -1565,7 +1696,7 @@ class TestResolution:
     def test_notify_target_empty_list_overrides_job(self) -> None:
         # An explicit empty list at the target layer suppresses
         # job-level channels (no inheritance from defaults).
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy"],
@@ -1587,7 +1718,7 @@ class TestResolution:
         assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == []
 
     def test_notify_multi_channel_resolution(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": [],
@@ -1609,7 +1740,7 @@ class TestResolution:
         ]
 
     def test_timeout_cascade_job_overrides_defaults(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {"job_timeout_sec": 100},
                 "job": {"a": _job(job_timeout_sec=200)},
@@ -1624,7 +1755,7 @@ class TestResolution:
         # per-leaf-job concern. An attempt to set one in the target
         # block must surface as a config error, not silently no-op.
         with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony.parse_config(
+            _parse(
                 {
                     "job": {"a": _job()},
                     "target": {
@@ -1634,7 +1765,7 @@ class TestResolution:
             )
 
     def test_timeout_default_fallback(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {"job_timeout_sec": 100},
                 "job": {"a": _job()},
@@ -1654,7 +1785,7 @@ class TestSelectionFilters:
     """
 
     def _cfg(self, raw: dict[str, Any]) -> Any:
-        return crony.parse_config(raw)
+        return _parse(raw)
 
     def test_job_with_matching_platform_selected(
         self, monkeypatch: Any
@@ -2015,7 +2146,7 @@ class TestInit:
             if section_re.match(line) or kv_re.match(line):
                 extracted.append(line[2:])
         text = "\n".join(extracted)
-        crony.parse_config(tomlkit.loads(text))
+        _parse(tomlkit.loads(text))
 
 
 class TestUuidGenerateAction:
@@ -2260,6 +2391,7 @@ class _RunnerHarness:
             target_section.setdefault("darwin", {})
             assert isinstance(target_section["darwin"], dict)
             target_section["darwin"].setdefault("jobs", default_target_jobs)
+        _inject_uuids(full)
         self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
         return crony.parse_config(full)
 
@@ -2325,6 +2457,7 @@ class TestPathFieldExpansion:
         monkeypatch.setenv("HOME", "/home/user")
         job = crony.Job(
             name="j",
+            uuid=str(uuid.uuid4()),
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
@@ -2350,6 +2483,7 @@ class TestPathFieldExpansion:
         monkeypatch.setenv("HOME", "/home/user")
         job = crony.Job(
             name="j",
+            uuid=str(uuid.uuid4()),
             command="true",
             gate_script="/abs/gate.sh",
             gate_args=["$HOME/state"],
@@ -3241,7 +3375,7 @@ class TestEmailNotify:
         secret = tmp_path / "smtp-pw"
         secret.write_text("hunter2")
         secret.chmod(0o600)
-        return crony.parse_config(
+        return _parse(
             {
                 "defaults": {
                     "notify_channels": ["email"],
@@ -3359,7 +3493,7 @@ class TestEmailNotify:
 
     def test_missing_smtp_password_records_error(self, tmp_path: Path) -> None:
         # Build a config that omits smtp_pass_*.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["email"],
@@ -3388,7 +3522,7 @@ class TestEmailNotify:
         secret = tmp_path / "smtp-pw"
         secret.write_text("hunter2")
         secret.chmod(0o600)
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["email"],
@@ -3432,7 +3566,7 @@ class TestNtfyNotify:
         secret = tmp_path / "ntfy-token"
         secret.write_text("tk_test")
         secret.chmod(0o600)
-        return crony.parse_config(
+        return _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy"],
@@ -3608,7 +3742,7 @@ class TestNtfyNotify:
         secret = tmp_path / "ntfy-token"
         secret.write_text("tk_test")
         secret.chmod(0o600)
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy"],
@@ -3671,7 +3805,7 @@ class TestNtfyNotify:
         secret = tmp_path / "ntfy-token"
         secret.write_text("tk_test")
         secret.chmod(0o600)
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "defaults": {
                     "notify_channels": ["ntfy-email"],
@@ -3734,7 +3868,7 @@ class TestMultiChannelDispatch:
         ntfy_secret = tmp_path / "ntfy-token"
         ntfy_secret.write_text("tk_test")
         ntfy_secret.chmod(0o600)
-        return crony.parse_config(
+        return _parse(
             {
                 "defaults": {
                     "notify_channels": ["email", "ntfy"],
@@ -4312,9 +4446,11 @@ class TestApplyFullSync:
             (d / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         crony.do_apply(jobs=[], verbose=False, bundle="borgadm")
@@ -4329,9 +4465,11 @@ class TestApplyFullSync:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         crony.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
@@ -4452,9 +4590,11 @@ class TestDestroy:
         # bundle's namespace.
         h = _ApplyHarness(tmp_path, monkeypatch)
         (h.cfg_dropin / "private.toml").write_text(
-            '[job.j]\ncommand = "true"\nschedule = "*-*-* 03:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["j"]\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "*-*-* 03:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["j"]\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -4569,9 +4709,11 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "j")
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -4597,9 +4739,11 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "j")
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         with pytest.raises(crony.UsageError, match="bundle 'default'"):
@@ -4658,9 +4802,11 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "old_d")
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.old_b]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["old_b"]\n',
+            _uuid_toml(
+                '[job.old_b]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["old_b"]\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -4743,23 +4889,23 @@ class TestTypeStrictness:
 
     def test_bool_rejected_for_int_field(self) -> None:
         with pytest.raises(crony.ConfigError, match="bool"):
-            crony.parse_config({"defaults": {"job_timeout_sec": True}})
+            _parse({"defaults": {"job_timeout_sec": True}})
 
     def test_negative_default_timeout_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"job_timeout_sec": -5}})
+            _parse({"defaults": {"job_timeout_sec": -5}})
 
     def test_zero_default_timeout_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"job_timeout_sec": 0}})
+            _parse({"defaults": {"job_timeout_sec": 0}})
 
     def test_negative_default_attach_max_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"notify_attach_max_kb": -1}})
+            _parse({"defaults": {"notify_attach_max_kb": -1}})
 
     def test_negative_default_log_keep_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
-            crony.parse_config({"defaults": {"log_keep_runs": 0}})
+            _parse({"defaults": {"log_keep_runs": 0}})
 
 
 # =============================================================================
@@ -4788,7 +4934,7 @@ class TestNameShape:
         ["a", "brew-update", "rust_update", "Job1", "x.y.z"],
     )
     def test_valid_job_name(self, good_name: str) -> None:
-        cfg = crony.parse_config({"job": {good_name: _job()}})
+        cfg = _parse({"job": {good_name: _job()}})
         assert good_name in cfg.jobs
 
     def test_invalid_group_name(self) -> None:
@@ -4808,7 +4954,7 @@ class TestNameShape:
 
     def test_invalid_host_name(self) -> None:
         with pytest.raises(crony.ConfigError, match="must match"):
-            crony.parse_config(
+            _parse(
                 {
                     "job": {"a": _job()},
                     "target": {"host": {"bad name": {"jobs": ["a"]}}},
@@ -6061,9 +6207,11 @@ class TestStatusReport:
         )
         crony.apply_one(cfg, "j")
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -6251,9 +6399,11 @@ class TestStatusReport:
         crony.apply_one(cfg, "leaf")
         crony.apply_one(cfg, "root")
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -7098,7 +7248,9 @@ class TestValidate:
         (ghost_dir / "hash").write_text("legacy\n")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.foo]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.foo]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         crony.do_validate(bundle="borgadm")
@@ -7123,8 +7275,10 @@ class TestValidate:
         # has a broken entry.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.cfg_file.write_text(
-            '[job.good]\ncommand = "true"\nschedule = "daily"\n'
-            '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.good]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         with pytest.raises(SystemExit) as exc:
@@ -7139,8 +7293,10 @@ class TestValidate:
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.cfg_file.write_text(
-            '[job.a]\ncommand = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["nope"]\n',
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[target.darwin]\njobs = ["nope"]\n',
+            ),
             encoding="utf-8",
         )
         with pytest.raises(SystemExit) as exc:
@@ -7251,7 +7407,7 @@ class TestPerEntityConfigErrors:
     """
 
     def test_sibling_jobs_survive_bad_job(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "good": _job(),
@@ -7265,7 +7421,7 @@ class TestPerEntityConfigErrors:
         assert "unknown key" in cfg.errored_jobs["bad"]
 
     def test_sibling_groups_survive_bad_group(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"a": _job(), "b": _job()},
                 "job-group": {
@@ -7288,7 +7444,7 @@ class TestPerEntityConfigErrors:
         # validation stops at the errored leaf without raising
         # "would never fire", since the errored leaf might have had
         # a schedule if it had parsed.
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"bad": _job(surprise="boom")},
                 "job-group": {
@@ -7301,7 +7457,7 @@ class TestPerEntityConfigErrors:
         assert "bad" in cfg.errored_jobs
 
     def test_target_references_errored_root_does_not_raise(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {"bad": _job(surprise="boom")},
                 "target": {"darwin": {"jobs": ["bad"]}},
@@ -7315,7 +7471,7 @@ class TestPerEntityConfigErrors:
         # typo'd `[job.x]` plus a valid `[job-group.x]` still
         # surfaces the structural problem.
         with pytest.raises(crony.ConfigError, match="name collision"):
-            crony.parse_config(
+            _parse(
                 {
                     "job": {"x": _job(surprise="boom")},
                     "job-group": {"x": {"jobs": ["x"], "schedule": "daily"}},
@@ -7323,7 +7479,7 @@ class TestPerEntityConfigErrors:
             )
 
     def test_notify_channels_promotes_job_to_errored(self) -> None:
-        cfg = crony.parse_config(
+        cfg = _parse(
             {
                 "job": {
                     "ok": _job(),
@@ -7639,9 +7795,11 @@ class TestAudit:
         last_run.write_text('{"exit_class": "fail"}', encoding="utf-8")
         # borgadm bundle's job is clean (selected via [target.darwin]).
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
-            "\n"
-            '[target.darwin]\njobs = ["k"]\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
             encoding="utf-8",
         )
         # Apply borgadm.k so it's stamped + has a clean last-run.
@@ -7675,9 +7833,11 @@ class TestAudit:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
-            '[job.foo]\ncommand = "true"\nschedule = "daily"\n'
-            "\n"
-            '[target.darwin]\njobs = ["foo"]\n',
+            _uuid_toml(
+                '[job.foo]\ncommand = "true"\nschedule = "daily"\n'
+                "\n"
+                '[target.darwin]\njobs = ["foo"]\n',
+            ),
             encoding="utf-8",
         )
         gone_dir = h.state / "borgadm.gone"
@@ -8186,7 +8346,9 @@ class TestBundleLoading:
     def test_default_only(self, tmp_path: Path, monkeypatch: Any) -> None:
         cfg_file, _ = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -8198,11 +8360,15 @@ class TestBundleLoading:
     ) -> None:
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         (dropin / "borgadm.toml").write_text(
-            '[job.prune]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.prune]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -8218,7 +8384,9 @@ class TestBundleLoading:
         # still load successfully (no requirement that default exists).
         _, dropin = self._setup(tmp_path, monkeypatch)
         (dropin / "private.toml").write_text(
-            '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
@@ -8238,7 +8406,9 @@ class TestBundleLoading:
         cfg_file.write_text("", encoding="utf-8")
         for name in ("zulu", "alpha", "mike"):
             (dropin / f"{name}.toml").write_text(
-                f'[job.j_{name}]\ncommand = "true"\nschedule = "daily"\n',
+                _uuid_toml(
+                    f'[job.j_{name}]\ncommand = "true"\nschedule = "daily"\n',
+                ),
                 encoding="utf-8",
             )
         bundles = crony.load_all_bundles()
@@ -8256,7 +8426,9 @@ class TestBundleLoading:
         # A syntactically broken bundle is dropped; siblings still load.
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.good]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.good]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         (dropin / "broken.toml").write_text(
@@ -8264,7 +8436,9 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         (dropin / "ok.toml").write_text(
-            '[job.fine]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.fine]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
@@ -8284,8 +8458,10 @@ class TestBundleLoading:
         # source path.
         cfg_file, _ = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.good]\ncommand = "true"\nschedule = "daily"\n'
-            '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.good]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.bad]\njobs = ["nope"]\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
@@ -8307,9 +8483,11 @@ class TestBundleLoading:
         # live and the bundle keeps loading.
         cfg_file, _ = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.a]\ncommand = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["nope"]\n'
-            '[target.host.squee]\njobs = ["a"]\n',
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[target.darwin]\njobs = ["nope"]\n'
+                '[target.host.squee]\njobs = ["a"]\n',
+            ),
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
@@ -8330,11 +8508,15 @@ class TestBundleLoading:
         # bundle name (contains the namespace separator).
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         (dropin / "has.dot.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
@@ -8353,11 +8535,15 @@ class TestBundleLoading:
         # already claimed by `config.toml`. The dropin is dropped.
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
-            '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.j]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         (dropin / "default.toml").write_text(
-            '[job.k]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
@@ -8385,11 +8571,15 @@ class TestBundleNamespacing:
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
 
         cfg_file.write_text(
-            '[job.daily-update]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.daily-update]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         (cfg_dropin / "borgadm.toml").write_text(
-            '[job.daily-update]\ncommand = "true"\nschedule = "daily"\n',
+            _uuid_toml(
+                '[job.daily-update]\ncommand = "true"\nschedule = "daily"\n',
+            ),
             encoding="utf-8",
         )
         bundles = crony.load_all_bundles()
