@@ -1116,12 +1116,15 @@ class TestList:
         caplog: Any,
         full: dict[str, list[str]] | None = None,
         partial: dict[str, list[str]] | None = None,
+        unknown: list[str] | None = None,
         **kwargs: Any,
     ) -> list[str]:
         if full is None:
             full = self.FULL_BACKUPS
         if partial is None:
             partial = self.PARTIAL_BACKUPS
+        if unknown is None:
+            unknown = []
         with (
             patch.object(
                 ba,
@@ -1139,6 +1142,12 @@ class TestList:
                         "20250102_120000": "day",
                     }
                 ),
+            ),
+            patch.object(
+                ba,
+                "list_unknown_archives",
+                autospec=True,
+                return_value=unknown,
             ),
             caplog.at_level(logging.INFO),
         ):
@@ -1194,6 +1203,122 @@ class TestList:
         assert any("20250103_120000" in m for m in msgs)
         assert not any("20250102_120000" in m for m in msgs)
         assert not any("20250101_120000" in m for m in msgs)
+
+    def test_list_warns_per_unknown_archive(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """Each archive whose name starts with BACKUP_NAME- but
+        doesn't parse becomes one WARNING log record, so a future
+        grep or summary can act on each name independently."""
+        self._run_list(
+            caplog,
+            unknown=["home-garbage", "home-stale-archive"],
+        )
+        warnings = [
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("home-garbage" in m for m in warnings)
+        assert any("home-stale-archive" in m for m in warnings)
+
+    def test_list_no_warning_when_no_unknowns(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """A clean repo (no unknown archives) emits no WARNING records
+        from the unknown-archive surface."""
+        self._run_list(caplog)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == []
+
+
+class TestListUnknownArchives:
+    """Unit-level coverage of list_unknown_archives.
+
+    Drives the classifier through a mocked list_backups_raw so the
+    edge cases (foreign prefix, malformed shape, borg checkpoint
+    archives) can be exercised without standing up a real borg repo.
+    """
+
+    @staticmethod
+    def _make_raw(lines: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["borg", "list"],
+            returncode=0,
+            stdout="\n".join(lines) + "\n" if lines else "",
+            stderr="",
+        )
+
+    def _run(self, mock_cfg: Any, lines: list[str]) -> list[str]:
+        # list_backups_raw is functools.cache-d, so clear before each
+        # mock injection to avoid cross-test contamination.
+        ba.list_backups_raw.cache_clear()
+        with patch.object(
+            ba,
+            "list_backups_raw",
+            autospec=True,
+            return_value=self._make_raw(lines),
+        ):
+            result: list[str] = ba.list_unknown_archives()
+            return result
+
+    def test_empty_repo_returns_empty(self, mock_cfg: Any) -> None:
+        assert self._run(mock_cfg, []) == []
+
+    def test_well_formed_archives_are_silent(self, mock_cfg: Any) -> None:
+        """Archives that parse cleanly are not unknown."""
+        result = self._run(
+            mock_cfg,
+            [
+                "home-set1-20260101_120000_1of2",
+                "home-set1-20260101_120000_2of2",
+            ],
+        )
+        assert result == []
+
+    def test_foreign_prefix_is_silent(self, mock_cfg: Any) -> None:
+        """A name that doesn't start with BACKUP_NAME- isn't ours
+        and stays out of the unknown list."""
+        assert self._run(mock_cfg, ["manual-backup-keep-this"]) == []
+
+    def test_home_prefix_malformed_is_unknown(self, mock_cfg: Any) -> None:
+        """Anything that looks like ours but doesn't parse surfaces."""
+        result = self._run(
+            mock_cfg, ["home-garbage", "home-set1-not-a-timestamp"]
+        )
+        assert result == ["home-garbage", "home-set1-not-a-timestamp"]
+
+    def test_borg_checkpoint_is_silent(self, mock_cfg: Any) -> None:
+        """`.checkpoint` and `.checkpoint.N` on a real archive shape
+        are borg-managed intermediate state and are filtered out
+        before the unknown-archive check so borg's own cleanup
+        remains in charge. The pre-NofM legacy shape is also
+        accepted so checkpoints of legacy archives still filter."""
+        result = self._run(
+            mock_cfg,
+            [
+                "home-set1-20260101_120000_1of2.checkpoint",
+                "home-set1-20260101_120000_1of2.checkpoint.42",
+                "home-set1-20260101_120000.checkpoint",
+            ],
+        )
+        assert result == []
+
+    def test_checkpoint_filter_requires_timestamp_prefix(
+        self, mock_cfg: Any
+    ) -> None:
+        """A name that ends in `.checkpoint` but isn't preceded by a
+        real archive shape (no timestamp) is not borg's checkpoint --
+        it's a malformed user-or-tool artifact and surfaces as
+        unknown rather than getting filtered."""
+        result = self._run(mock_cfg, ["home-stale.checkpoint"])
+        assert result == ["home-stale.checkpoint"]
+
+    def test_sorted_output(self, mock_cfg: Any) -> None:
+        """Order is deterministic regardless of borg's emission order."""
+        result = self._run(
+            mock_cfg,
+            ["home-zzz", "home-aaa", "home-mmm"],
+        )
+        assert result == ["home-aaa", "home-mmm", "home-zzz"]
 
 
 class TestAutomate:
@@ -3598,8 +3723,9 @@ class TestE2EList:
     def test_archive_names_outside_pattern_are_ignored(
         self, borg_e2e: BorgE2EFixture
     ) -> None:
-        """Archives whose names don't match the BACKUP_NAME-set-TS
-        pattern are ignored entirely (neither full nor partial)."""
+        """Archives whose names don't share the BACKUP_NAME- prefix
+        are not borgadm's to manage: filtered out of every list mode
+        (default, --no-include-partial, --only-partial)."""
         ts = "20260101_120000"
         borg_e2e.make_archive(f"test-set-a-{ts}")
         borg_e2e.make_archive(f"test-set-b-{ts}")
@@ -3607,6 +3733,35 @@ class TestE2EList:
         assert _list_borgadm(borg_e2e) == [ts]
         assert _list_borgadm(borg_e2e, "--no-include-partial") == [ts]
         assert _list_borgadm(borg_e2e, "--only-partial") == []
+
+    def test_foreign_prefix_archives_do_not_warn(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """The unknown-archive warning surface is gated on the
+        BACKUP_NAME- prefix. A foreign-prefix archive triggers neither
+        the warning nor the non-zero exit-status side effect."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("manual-backup-keep-this")
+        result = borg_e2e.run("list")
+        assert "manual-backup-keep-this" not in result.stderr
+        assert "WARNING" not in result.stderr
+
+    def test_list_warns_on_home_prefixed_unknown_archive(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """An archive that shares the BACKUP_NAME- prefix but does
+        not parse as {BACKUP_NAME}-{set}-{ts}_NofM is surfaced as a
+        WARNING on stderr, so a malformed leftover doesn't quietly
+        hide in the repo."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(f"test-set-a-{ts}")
+        borg_e2e.make_archive(f"test-set-b-{ts}")
+        borg_e2e.make_archive("test-stale-leftover")
+        result = borg_e2e.run("list")
+        assert "test-stale-leftover" in result.stderr
+        assert "WARNING" in result.stderr
 
     def test_legacy_archives_classified_as_full(
         self, borg_e2e: BorgE2EFixture
@@ -3974,6 +4129,58 @@ class TestE2EPrune:
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         assert borg_e2e.archives() == [f"test-set-a-{legacy_ts}"]
+
+    def test_prune_warns_on_unknown_without_flag(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """Without --cleanup-unknown, prune surfaces the unknown
+        archive as a stderr WARNING but leaves it in place. The
+        partial sweep and retention stages still run as usual."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        borg_e2e.make_archive("test-stale-leftover")
+        result = borg_e2e.run("prune")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "test-stale-leftover" in result.stderr
+        assert "WARNING" in result.stderr
+        assert "test-stale-leftover" in borg_e2e.archives()
+
+    def test_prune_cleanup_unknown_dry_run_does_not_delete(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """--cleanup-unknown with --dry-run names the archive in
+        the output but leaves the repo untouched."""
+        ts = "20260101_120000"
+        borg_e2e.make_archive(_archive_name("set-a", ts, 1, 2))
+        borg_e2e.make_archive(_archive_name("set-b", ts, 2, 2))
+        borg_e2e.make_archive("test-stale-leftover")
+        before = sorted(borg_e2e.archives())
+        result = borg_e2e.run("prune", "--cleanup-unknown", "--dry-run")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "test-stale-leftover" in result.stdout
+        assert sorted(borg_e2e.archives()) == before
+
+    def test_prune_cleanup_unknown_deletes(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """--cleanup-unknown removes the unknown archive while leaving
+        the full set in place."""
+        ts = "20260101_120000"
+        full_a = _archive_name("set-a", ts, 1, 2)
+        full_b = _archive_name("set-b", ts, 2, 2)
+        borg_e2e.make_archive(full_a)
+        borg_e2e.make_archive(full_b)
+        borg_e2e.make_archive("test-stale-leftover")
+        result = borg_e2e.run("prune", "--cleanup-unknown")
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert sorted(borg_e2e.archives()) == [full_a, full_b]
 
     def test_prune_subjects_legacy_archives_to_retention(
         self, borg_e2e: BorgE2EFixture

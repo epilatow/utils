@@ -946,6 +946,41 @@ def list_backups(
     return rv
 
 
+# Matches borg's checkpoint archives -- intermediate state from
+# interrupted backups. borg prune cleans them up itself, so borgadm
+# leaves them alone rather than surface them as "unknown". The
+# timestamp prefix is required so a malformed name like
+# `{BACKUP_NAME}-foo.checkpoint` (no real archive shape) still
+# surfaces as unknown rather than getting filtered.
+_BORG_CHECKPOINT_RE = re.compile(
+    r"-\d{8}_\d{6}(?:_\d+of\d+)?\.checkpoint(?:\.\d+)?$"
+)
+
+
+def list_unknown_archives() -> list[str]:
+    """Return archive names that look like borgadm's own but don't
+    parse into the expected shape.
+
+    "Looks like borgadm's own" = starts with f"{cfg.BACKUP_NAME}-".
+    Names with a foreign prefix stay silent (a user may keep other
+    archives in the same repo). Names matching borg's `.checkpoint`
+    / `.checkpoint.N` shape are filtered out for the same reason.
+    """
+    cfg = get_cfg()
+    result = list_backups_raw()
+    prefix = f"{cfg.BACKUP_NAME}-"
+    unknown: list[str] = []
+    for line in result.stdout.strip().splitlines():
+        name = line.strip()
+        if not name.startswith(prefix):
+            continue
+        if _BORG_CHECKPOINT_RE.search(name):
+            continue
+        if _ArchiveName.from_str(cfg.BACKUP_NAME, name) is None:
+            unknown.append(name)
+    return sorted(unknown)
+
+
 def is_mountpoint(path: Path) -> bool:
     try:
         output = subprocess.check_output(["mount"], text=True)
@@ -1788,7 +1823,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         logger.info(f"Create archive, finish: {archive}{dry})")
 
     if not no_prune:
-        do_prune(dry_run=dry_run, progress=progress)
+        do_prune(dry_run=dry_run, progress=progress, cleanup_unknown=False)
 
 
 def do_delete(
@@ -2017,9 +2052,32 @@ def do_list(
         else:
             logger.info(f"{ts}{keep_tag}")
 
+    for name in list_unknown_archives():
+        logger.warning(f"Unknown archive in repo: {name}")
 
-def do_prune(dry_run: bool, progress: bool) -> None:
+
+def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
     cfg = get_cfg()
+
+    unknown = list_unknown_archives()
+    if unknown and cleanup_unknown:
+        logger.info(f"Pruning unknown archives: {unknown}")
+        cmd = borg_cmd() + ["delete"]
+        cmd += ["--progress"] if progress else []
+        if dry_run:
+            cmd.append("--dry-run")
+        else:
+            cmd.append("--stats")
+        cmd.append(cfg.BORG_REPO)
+        cmd += unknown
+        run_cmd(cmd, allow_output=progress)
+    elif unknown:
+        for name in unknown:
+            logger.warning(
+                f"Unknown archive left in repo: {name}"
+                " (pass --cleanup-unknown to remove)"
+            )
+
     partial_archives = [
         a.removeprefix(f"{cfg.BORG_REPO}::")
         for archives in list_backups(partial=True).values()
@@ -2574,6 +2632,18 @@ def args_parser() -> argparse.ArgumentParser:
     add_dry_run(prune)
     add_progress(prune)
     add_prune_args(prune)
+    prune.add_argument(
+        "--cleanup-unknown",
+        action="store_true",
+        help=(
+            "Delete archives whose names start with the configured"
+            " BACKUP_NAME prefix but don't match the expected"
+            " {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM shape."
+            " Default: warn but leave in place. Either way, an"
+            " unknown archive in the repo causes list and prune to"
+            " exit with the WARNING status."
+        ),
+    )
 
     rsync = add_parser("rsync", help="Rsync latest archive")
     add_target_dir(rsync)
