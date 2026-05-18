@@ -30,6 +30,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    SentinelHomeBase,
     UnknownArgRoutedToSubparserBase,
 )
 
@@ -46,6 +47,85 @@ assert _spec and _spec.loader
 crony = importlib.util.module_from_spec(_spec)
 sys.modules["crony"] = crony
 _spec.loader.exec_module(crony)
+
+
+def isolate_crony_home(
+    module: Any,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Redirect every host-touching crony default to a non-existent
+    sentinel under tmp_path.
+
+    crony resolves its config/state/launchd/systemd paths from $HOME
+    at import time. A test that forgets to monkeypatch the in-process
+    module attributes (CONFIG_FILE, STATE_DIR, etc.) -- or that spawns
+    a subprocess that re-reads the CRONY_* env vars -- would land on
+    the user's real config and state dirs. This fixture wires every
+    attribute and matching env var to a per-test sentinel; the
+    sentinel itself is never created, so a stray write fails loudly
+    rather than silently mutating the user's dotfiles.
+
+    Tests that need to actually write files override these on top
+    via monkeypatch.setattr / setenv; pytest's monkeypatch stack
+    layers cleanly atop this fixture.
+    """
+    sentinel = tmp_path / "_home_sentinel_unwritten"
+    monkeypatch.setattr(Path, "home", lambda: sentinel)
+    layout = {
+        "CONFIG_DIR": sentinel / ".config" / "crony",
+        "CONFIG_FILE": sentinel / ".config" / "crony" / "config.toml",
+        "CONFIG_DROPIN_DIR": sentinel / ".config" / "crony" / "config",
+        "STATE_DIR": sentinel / ".local" / "state" / "crony",
+        "LAUNCHAGENTS_DIR": sentinel / "Library" / "LaunchAgents",
+        "SYSTEMD_USER_DIR": sentinel / ".config" / "systemd" / "user",
+    }
+    for attr, path in layout.items():
+        monkeypatch.setattr(module, attr, path)
+        monkeypatch.setenv(f"CRONY_{attr}", str(path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
+    isolate_crony_home(crony, tmp_path, monkeypatch)
+
+
+class TestIsolateCronyHomeFixture(SentinelHomeBase):
+    """Pin the autouse `_isolate_home` fixture so a future refactor
+    can't quietly remove the safety net. Inherits the generic
+    Path.home() + sentinel-non-existence checks and adds the
+    crony-specific attribute/env-var matrix assertions.
+    """
+
+    def test_all_attributes_under_sentinel(self) -> None:
+        sentinel = Path.home()
+        for attr in (
+            "CONFIG_DIR",
+            "CONFIG_FILE",
+            "CONFIG_DROPIN_DIR",
+            "STATE_DIR",
+            "LAUNCHAGENTS_DIR",
+            "SYSTEMD_USER_DIR",
+        ):
+            value = getattr(crony, attr)
+            assert str(value).startswith(str(sentinel)), (
+                f"crony.{attr}={value!r} escaped the sentinel"
+            )
+
+    def test_all_env_vars_under_sentinel(self) -> None:
+        sentinel = Path.home()
+        for attr in (
+            "CONFIG_DIR",
+            "CONFIG_FILE",
+            "CONFIG_DROPIN_DIR",
+            "STATE_DIR",
+            "LAUNCHAGENTS_DIR",
+            "SYSTEMD_USER_DIR",
+        ):
+            value = os.environ[f"CRONY_{attr}"]
+            assert value.startswith(str(sentinel)), (
+                f"CRONY_{attr}={value!r} escaped the sentinel"
+            )
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
