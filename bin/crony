@@ -109,7 +109,7 @@ Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
 Plus operational subcommands: status, logs, trigger, audit,
-validate, notify-test, init, self-test.
+notify-test, config, self-test.
 
 `trigger` asks the platform (launchd / systemd) to fire the unit
 immediately, the same path a scheduled fire would take. To run a
@@ -229,7 +229,7 @@ _initialize_logger()
 # =============================================================================
 # DEFAULT CONFIG TEMPLATE
 # =============================================================================
-# Emitted by `crony init`. Every section is commented out so a user can
+# Emitted by `crony config init`. Every section is commented out so a user can
 # uncomment the bits they want without touching the explanatory prose.
 
 _DEFAULT_CONFIG_TEMPLATE: str = """\
@@ -739,7 +739,7 @@ class Config:
 
     Surface points for errored entries:
       - Always: logged at ERROR by `_load_one_bundle`, and
-        included as warnings by `crony validate` (which then
+        included as warnings by `crony config validate` (which then
         exits non-zero).
       - Jobs and groups also: shown as a `config=error` row in
         `crony status` (the row namespace is keyed by
@@ -1852,7 +1852,7 @@ def _validate_config(config: Config) -> None:
                 # errored entries passes target validation and
                 # dispatches nothing -- the user learns about
                 # the dead chain via the load-time ERROR log
-                # and `crony validate`.
+                # and `crony config validate`.
                 return
             if ref in config.jobs:
                 job = config.jobs[ref]
@@ -5284,7 +5284,7 @@ def do_init(force: bool, bundle: str | None) -> None:
         if bundle == DEFAULT_BUNDLE_NAME:
             raise UsageError(
                 f"--bundle {DEFAULT_BUNDLE_NAME!r} would shadow "
-                f"config.toml; use plain `crony init` (without "
+                f"config.toml; use plain `crony config init` (without "
                 f"--bundle) for the default bundle"
             )
         try:
@@ -7043,7 +7043,7 @@ def do_validate(bundle: str | None) -> None:
     for b in target_bundles:
         # Per-entity validation failures (errored jobs / groups /
         # targets) have to flip the validate exit code -- a CI
-        # gate that runs `crony validate` won't notice a broken
+        # gate that runs `crony config validate` won't notice a broken
         # bundle entry otherwise. The per-entity error message is
         # already prefixed with its section header, so emit it
         # verbatim alongside `_validate_bundle_warnings` output.
@@ -7289,22 +7289,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Subcommands",
     )
 
-    # init
-    p_init = subparsers.add_parser(
-        "init", help="Generate a default config file"
+    # config (parent for init / validate)
+    p_config = subparsers.add_parser(
+        "config",
+        help="Manage the config file",
     )
-    p_init.add_argument(
+    config_subparsers = p_config.add_subparsers(
+        dest="action",
+        metavar="<action>",
+        required=True,
+    )
+
+    p_config_init = config_subparsers.add_parser(
+        "init",
+        help="Generate a default config file",
+    )
+    p_config_init.add_argument(
         "--force",
         action="store_true",
         help="Overwrite an existing config file",
     )
-    p_init.add_argument(
+    p_config_init.add_argument(
         "-b",
         "--bundle",
         default=None,
         help=(
             "Write to config/<bundle>.toml instead of config.toml "
             "(creates the dropin dir if missing)"
+        ),
+    )
+
+    p_config_validate = config_subparsers.add_parser(
+        "validate",
+        help="Lint config; report orphans, linger, etc",
+    )
+    p_config_validate.add_argument(
+        "-b",
+        "--bundle",
+        default=None,
+        help=(
+            "Restrict per-bundle warnings to one bundle. "
+            "Cross-host checks (orphans, linger) are skipped in "
+            "this mode -- run without --bundle for those."
         ),
     )
 
@@ -7621,22 +7647,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict audit to jobs from one bundle",
     )
 
-    # validate
-    p_validate = subparsers.add_parser(
-        "validate",
-        help="Lint config; report orphans, linger, etc",
-    )
-    p_validate.add_argument(
-        "-b",
-        "--bundle",
-        default=None,
-        help=(
-            "Restrict per-bundle warnings to one bundle. "
-            "Cross-host checks (orphans, linger) are skipped in "
-            "this mode -- run without --bundle for those."
-        ),
-    )
-
     # notify-test
     p_nt = subparsers.add_parser(
         "notify-test",
@@ -7686,7 +7696,8 @@ def build_parser() -> argparse.ArgumentParser:
 # =============================================================================
 
 COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
-    "init": do_init,
+    "config init": do_init,
+    "config validate": do_validate,
     "apply": do_apply,
     "destroy": do_destroy,
     "enable": do_enable,
@@ -7696,7 +7707,6 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "logs": do_logs,
     "run": do_run,
     "audit": do_audit,
-    "validate": do_validate,
     "notify-test": do_notify_test,
 }
 
@@ -7708,6 +7718,7 @@ def cli() -> int:
 
     args_dict = vars(args)
     command = args_dict.pop("command")
+    action = args_dict.pop("action", None)
 
     if not command:
         parser.print_help()
@@ -7719,8 +7730,10 @@ def cli() -> int:
             coverage=args_dict.pop("coverage"),
         )
 
+    dispatch_key = f"{command} {action}" if action else command
+
     try:
-        COMMAND_CALLBACKS[command](**args_dict)
+        COMMAND_CALLBACKS[dispatch_key](**args_dict)
     except SystemExit as e:
         # `crony run` raises SystemExit(<wrapped-rc>) so an
         # arbitrary exit code from the executed job (0-255) reaches

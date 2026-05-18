@@ -23,7 +23,7 @@ import time
 import tomlkit
 from pathlib import Path
 from typing import Any
-from unittest.mock import create_autospec
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from conftest import (
@@ -95,7 +95,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(crony.cli)
     MODULE = crony
     EXIT_CODE_USAGE = crony.ExitCode.USAGE
-    TEST_SUBCOMMAND = "validate"
+    TEST_SUBCOMMAND = "audit"
     EXCEPTION_EXIT_CODE_MAP = [
         (crony.UsageError("t"), crony.ExitCode.USAGE),
         (crony.ConfigError("t"), crony.ExitCode.CONFIG),
@@ -115,6 +115,62 @@ class TestCmdCallbacks(CmdCallbacksBase):
         ),
         (RuntimeError("t"), crony.ExitCode.ERROR),
     ]
+
+
+class TestConfigSubcommandDispatch:
+    """The `config` parent routes its nested actions through the
+    "<command> <action>" key in COMMAND_CALLBACKS. These tests pin
+    that the nested form actually reaches the right callback (a
+    flat dispatch table without the join would silently do
+    nothing) and that argparse's strict-subparsers error path
+    fires for missing/unknown actions on the parent.
+    """
+
+    def test_config_init_dispatches_to_do_init(self) -> None:
+        mock_cb = MagicMock()
+        with (
+            patch.dict(
+                crony.COMMAND_CALLBACKS,
+                {"config init": mock_cb},
+            ),
+            patch("sys.argv", ["prog", "config", "init", "--force"]),
+        ):
+            result = crony.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(force=True, bundle=None)
+
+    def test_config_validate_dispatches_to_do_validate(self) -> None:
+        mock_cb = MagicMock()
+        with (
+            patch.dict(
+                crony.COMMAND_CALLBACKS,
+                {"config validate": mock_cb},
+            ),
+            patch("sys.argv", ["prog", "config", "validate", "-b", "foo"]),
+        ):
+            result = crony.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(bundle="foo")
+
+    def test_config_without_action_errors(self, capsys: Any) -> None:
+        with (
+            patch("sys.argv", ["prog", "config"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            crony.cli()
+        assert exc_info.value.code != 0
+        err = capsys.readouterr().err
+        assert "config" in err
+
+    def test_config_unknown_action_errors(self, capsys: Any) -> None:
+        with (
+            patch("sys.argv", ["prog", "config", "bogus"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            crony.cli()
+        assert exc_info.value.code != 0
+        err = capsys.readouterr().err
+        assert "bogus" in err
 
 
 # =============================================================================
@@ -1665,7 +1721,7 @@ class TestSelectionFilters:
 
 
 # =============================================================================
-# crony init
+# crony config init
 # =============================================================================
 
 
@@ -6618,7 +6674,7 @@ class TestStatusReport:
 
 
 # =============================================================================
-# validate / audit / logs
+# config validate / audit / logs
 # =============================================================================
 
 
@@ -6730,7 +6786,7 @@ class TestValidate:
     ) -> None:
         # A demoted entry (here a job-group with an undefined-name
         # ref) must flip validate's exit code -- a CI gate that
-        # runs `crony validate` shouldn't pass on a config that
+        # runs `crony config validate` shouldn't pass on a config that
         # has a broken entry.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.cfg_file.write_text(
@@ -8701,8 +8757,9 @@ class TestSnapshotBackwardLoad:
 
 
 class TestLifecycleSmoke:
-    """End-to-end smoke covering init -> edit -> validate -> apply ->
-    status -> destroy via the public function entry points. Catches
+    """End-to-end smoke covering config-init -> edit -> config-validate
+    -> apply -> status -> destroy via the public function entry points.
+    Catches
     regressions where subcommands stop composing even when each one
     passes its own tests in isolation.
     """
