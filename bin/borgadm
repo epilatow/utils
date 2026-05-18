@@ -211,22 +211,16 @@ _BORG_REPO_HOSTKEY: str = ""
 # position of the set's name in sorted set-name order. When M has
 # two or more digits, N is zero-padded to match (e.g. 01of11,
 # ..., 11of11) so archive names sort correctly in alphabetical
-# listings.
+# listings. The suffix is required: an archive whose name shares
+# the BACKUP_NAME- prefix but does not parse into this shape is
+# surfaced as "unknown" by list and removable via `prune
+# --cleanup-unknown`.
 #
 # The NofM suffix is the source of truth for set completeness: a
 # timestamp is "full" when every N in 1..M is present and "partial"
 # otherwise. Adding, removing, or renaming a set changes which N
 # future archives get but does NOT retroactively reclassify existing
 # archives -- old archives keep their original NofM.
-#
-# Archives without a `_NofM` suffix are treated as legacy/complete:
-# the prune partial-sweep never touches them, so an upgrade through
-# this change cannot mistake an old archive for an incomplete set.
-# They remain subject to GFS retention like any other full backup,
-# so suffix-less archives still age out normally. Running
-# `borgadm prune` on the previous release immediately before
-# upgrading is the way to clear genuine pre-upgrade partials:
-# afterward they are indistinguishable from complete sets.
 _BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
 
 
@@ -803,49 +797,42 @@ def list_backups_raw() -> subprocess.CompletedProcess[Any]:
 class _ArchiveName:
     """A borg archive name, parsed into its components.
 
-    The string form is `{backup_name}-{set_name}-YYYYMMDD_HHMMSS[_NofM]`
-    -- the part after `::` in a full `repo::archive` reference. `n` and
-    `m` are None for legacy (pre-NofM) archives that don't carry a
-    suffix. `str()` renders the name and `from_str()` parses one back,
-    so do_create (emitting names) and list_backups (reading them) share
+    The string form is `{backup_name}-{set_name}-YYYYMMDD_HHMMSS_NofM`
+    -- the part after `::` in a full `repo::archive` reference.
+    `str()` renders the name and `from_str()` parses one back, so
+    do_create (emitting names) and list_backups (reading them) share
     exactly one definition of the shape.
     """
 
     backup_name: str
     set_name: str
     timestamp: str
-    n: Optional[int]
-    m: Optional[int]
+    n: int
+    m: int
 
     def __str__(self) -> str:
         """Render the archive name. Zero-pads N to M's digit count
-        when both are present so archive names sort correctly when
-        M >= 10 (e.g. 01of11 rather than 1of11)."""
+        so archive names sort correctly when M >= 10 (e.g. 01of11
+        rather than 1of11)."""
         base = f"{self.backup_name}-{self.set_name}-{self.timestamp}"
-        if self.n is None or self.m is None:
-            return base
         width = len(str(self.m))
         return f"{base}_{self.n:0{width}d}of{self.m}"
 
     def __lt__(self, other: _ArchiveName) -> bool:
         """Total order over archive names: by backup_name, then
-        timestamp, then NofM-suffixed names ahead of legacy ones
-        (suffixed ascending by N, mirroring do_create's emission
-        order), then set_name, then M. None values for n/m collapse
-        into an explicit lower-priority bucket so a legacy name never
-        has to be compared against an int."""
+        timestamp, then ascending N (mirroring do_create's emission
+        order), then set_name, then M."""
         if not isinstance(other, _ArchiveName):
             return NotImplemented
         return self._order_key() < other._order_key()
 
-    def _order_key(self) -> Tuple[str, str, int, int, str, int]:
+    def _order_key(self) -> Tuple[str, str, int, str, int]:
         return (
             self.backup_name,
             self.timestamp,
-            0 if self.n is not None else 1,
-            self.n if self.n is not None else 0,
+            self.n,
             self.set_name,
-            self.m if self.m is not None else 0,
+            self.m,
         )
 
     @classmethod
@@ -853,15 +840,13 @@ class _ArchiveName:
         """Parse a borg archive name into an _ArchiveName.
 
         Returns None when `name` does not match the expected
-        `{backup_name}-{set_name}-YYYYMMDD_HHMMSS[_NofM]` shape -- the
+        `{backup_name}-{set_name}-YYYYMMDD_HHMMSS_NofM` shape -- the
         normal outcome for non-borgadm archives a user may have in
         the repo. Set-name is captured as the literal token between
         backup_name and the timestamp; it carries no semantic weight
         beyond display ordering.
         """
-        pattern = (
-            re.escape(backup_name) + r"-(.+)-(\d{8}_\d{6})(?:_(\d+)of(\d+))?$"
-        )
+        pattern = re.escape(backup_name) + r"-(.+)-(\d{8}_\d{6})_(\d+)of(\d+)$"
         match = re.match(pattern, name)
         if match is None:
             return None
@@ -870,8 +855,8 @@ class _ArchiveName:
             backup_name=backup_name,
             set_name=set_name,
             timestamp=ts,
-            n=int(n_str) if n_str is not None else None,
-            m=int(m_str) if m_str is not None else None,
+            n=int(n_str),
+            m=int(m_str),
         )
 
 
@@ -885,16 +870,9 @@ def _archive_entries_are_complete(entries: list[_ArchiveName]) -> bool:
     archives correctly, and surfacing the bug beats returning a
     misleading classification.
 
-    Two completeness cases:
-      - Any archive lacks a suffix: the set is legacy/complete.
-        Pre-NofM archives don't carry the N-of-M membership signal,
-        so the safe rule is to never flag them partial. They are
-        still subject to GFS retention like any other complete set
-        -- "complete" only exempts a set from the prune partial
-        sweep, not from age-based retention.
-      - All archives are suffixed: completeness requires a single
-        consistent M and N values covering 1..M exactly. Inconsistent
-        Ms or a missing N is incomplete.
+    Completeness requires a single consistent M across the entries
+    and N values that cover 1..M exactly. Inconsistent Ms or a
+    missing N is incomplete.
     """
     backup_names = {e.backup_name for e in entries}
     assert len(backup_names) == 1, (
@@ -908,13 +886,10 @@ def _archive_entries_are_complete(entries: list[_ArchiveName]) -> bool:
     assert len(set_names) == len(set(set_names)), (
         f"entries must have distinct set names; got {sorted(set_names)}"
     )
-    if any(e.n is None or e.m is None for e in entries):
-        return True
     m_values = {e.m for e in entries}
     if len(m_values) != 1:
         return False
     (m,) = m_values
-    assert m is not None
     n_values = {e.n for e in entries}
     return n_values == set(range(1, m + 1))
 
@@ -948,12 +923,13 @@ def list_backups(
 
 # Matches borg's checkpoint archives -- intermediate state from
 # interrupted backups. borg prune cleans them up itself, so borgadm
-# leaves them alone rather than surface them as "unknown". The
-# timestamp prefix is required so a malformed name like
-# `{BACKUP_NAME}-foo.checkpoint` (no real archive shape) still
-# surfaces as unknown rather than getting filtered.
+# leaves them alone rather than surface them as "unknown". The full
+# archive shape (timestamp + NofM) is required so a malformed name
+# like `{BACKUP_NAME}-foo.checkpoint` or a checkpoint of a
+# suffix-less archive still surfaces as unknown rather than getting
+# filtered.
 _BORG_CHECKPOINT_RE = re.compile(
-    r"-\d{8}_\d{6}(?:_\d+of\d+)?\.checkpoint(?:\.\d+)?$"
+    r"-\d{8}_\d{6}_\d+of\d+\.checkpoint(?:\.\d+)?$"
 )
 
 
@@ -2095,12 +2071,6 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
         cmd += partial_archives
         run_cmd(cmd, allow_output=progress)
 
-    # Retention runs over every complete backup, legacy archives
-    # included. list_backups() (partial=False) already excludes
-    # incomplete sets, and legacy archives classify as complete, so
-    # they age out through the same GFS retention as NofM archives --
-    # "complete" exempts a set from the partial sweep above, not from
-    # retention.
     archives = list_backups()
     ts_keep = ts_to_keep(set(archives.keys()))
     ts_prune = archives.keys() - ts_keep.keys()
