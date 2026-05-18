@@ -2383,17 +2383,47 @@ class _RunnerHarness:
         )
         sd = self.state / bundle / orphan_uuid
         sd.mkdir(parents=True, exist_ok=True)
-        (sd / "snapshot.json").write_text(
-            json.dumps(
+        # Fully populated snapshot matching what apply would have
+        # written. load_config skips snapshots missing required
+        # fields (TypeError from Job(**raw)); incomplete fixtures
+        # would silently fall out of the current graph.
+        snapshot: dict[str, Any] = {
+            "schema": crony._SNAPSHOT_SCHEMA,
+            "kind": kind,
+            "name": f"{bundle}.{short}",
+            "bundle": bundle,
+            "uuid": orphan_uuid,
+        }
+        if kind == "job":
+            snapshot.update(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
-                    "kind": kind,
-                    "name": f"{bundle}.{short}",
-                    "bundle": bundle,
-                    "uuid": orphan_uuid,
+                    "command": "true",
+                    "script": None,
+                    "args": [],
+                    "gate": None,
+                    "gate_script": None,
+                    "gate_args": [],
+                    "env": {},
+                    "job_timeout_sec": 600,
+                    "schedule": "daily",
+                    "interval": None,
+                    "interactive": False,
+                    "interactive_active_sec": 600,
+                    "interactive_delay_sec": 3600,
                 }
-            ),
-            encoding="utf-8",
+            )
+        else:
+            snapshot.update(
+                {
+                    "children": [],
+                    "group_budget_sec": 600,
+                    "trigger_timeout_sec": 15,
+                    "schedule": "daily",
+                    "interval": None,
+                }
+            )
+        (sd / "snapshot.json").write_text(
+            json.dumps(snapshot), encoding="utf-8"
         )
         if hash_stamp:
             (sd / "hash").write_text("legacy\n", encoding="utf-8")
@@ -2442,18 +2472,45 @@ class _RunnerHarness:
             snap_p = sd / "snapshot.json"
             if not snap_p.exists():
                 kind = "job" if short in cfg.jobs else "group"
-                snap_p.write_text(
-                    json.dumps(
+                # Fully populated snapshot so load_config can build
+                # the entity's runtime state; a partial dict would
+                # be skipped by Job(**raw) / JobGroup(**raw).
+                payload: dict[str, Any] = {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": kind,
+                    "name": f"{bundle}.{short}",
+                    "bundle": bundle,
+                    "uuid": entity_uuid,
+                }
+                if kind == "job":
+                    payload.update(
                         {
-                            "schema": crony._SNAPSHOT_SCHEMA,
-                            "kind": kind,
-                            "name": f"{bundle}.{short}",
-                            "bundle": bundle,
-                            "uuid": entity_uuid,
+                            "command": "true",
+                            "script": None,
+                            "args": [],
+                            "gate": None,
+                            "gate_script": None,
+                            "gate_args": [],
+                            "env": {},
+                            "job_timeout_sec": 600,
+                            "schedule": "daily",
+                            "interval": None,
+                            "interactive": False,
+                            "interactive_active_sec": 600,
+                            "interactive_delay_sec": 3600,
                         }
-                    ),
-                    encoding="utf-8",
-                )
+                    )
+                else:
+                    payload.update(
+                        {
+                            "children": [],
+                            "group_budget_sec": 600,
+                            "trigger_timeout_sec": 15,
+                            "schedule": "daily",
+                            "interval": None,
+                        }
+                    )
+                snap_p.write_text(json.dumps(payload), encoding="utf-8")
         return sd
 
     def snap(self, cfg: Any, short: str) -> Any:
@@ -6995,12 +7052,14 @@ class TestStatusReport:
             config_pending=True,
         )
         out = capsys.readouterr().out
-        # Pending says `a` is in no group; cell is empty (no
-        # asterisk, since the user picked the source).
+        # Pending says `a` is in no group; cell is empty. The `*`
+        # divergence indicator still fires because the applied
+        # current does still record `a` as a member of `default.g`,
+        # which differs from the empty pending value.
         for line in out.splitlines():
             if "default.a " in line:
                 assert "default.g" not in line
-                assert " *" not in line
+                assert "*" in line
 
     def test_opt_in_columns_not_in_default_set(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7216,9 +7275,15 @@ class TestStatusReport:
         assert "stale" in out
         assert "crony apply" in out
 
-    def test_config_current_shows_applied_no_asterisk(
+    def test_config_current_shows_applied_with_asterisk_on_diverge(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
+        # `*` is a pure divergence indicator -- it shows whenever
+        # pending and current disagree on the field, regardless of
+        # which side `--config-current` / `--config-pending` is
+        # displaying. The user reads it as "the other view says
+        # something different here", not as "the displayed value
+        # is stale relative to pending".
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -7239,13 +7304,10 @@ class TestStatusReport:
             config_pending=False,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 03:00" in out
+        assert "*-*-* 03:00 *" in out
         assert "*-*-* 09:00" not in out
-        assert "*-*-* 03:00 *" not in out
-        assert "*-*-* 09:00 *" not in out
-        assert "stale" not in out
 
-    def test_config_pending_shows_config_no_asterisk(
+    def test_config_pending_shows_config_with_asterisk_on_diverge(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -7268,11 +7330,8 @@ class TestStatusReport:
             config_pending=True,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 09:00" in out
+        assert "*-*-* 09:00 *" in out
         assert "*-*-* 03:00" not in out
-        assert "*-*-* 03:00 *" not in out
-        assert "*-*-* 09:00 *" not in out
-        assert "stale" not in out
 
     def test_config_current_and_pending_mutually_exclusive(
         self, tmp_path: Path, monkeypatch: Any
@@ -7525,9 +7584,9 @@ class TestResolveStateAxes:
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        bundles = crony.load_all_bundles()
+        config = crony.load_config()
         cfg, sched, last = crony._resolve_state_axes(
-            bundles, ghost, "darwin", crony.stamped_names()
+            config, ghost, "darwin", crony.stamped_names()
         )
         assert cfg == "orphan"
         assert sched == "enabled"
@@ -7547,9 +7606,9 @@ class TestResolveStateAxes:
             return "enabled"
 
         monkeypatch.setattr(crony, "_unit_state", _stub_sched)
-        bundles = crony.load_all_bundles()
+        config = crony.load_config()
         cfg, unit_state, last = crony._resolve_state_axes(
-            bundles, h.full("ghost"), "darwin", set()
+            config, h.full("ghost"), "darwin", set()
         )
         assert cfg == "missing"
         assert unit_state == "none"
@@ -7573,9 +7632,9 @@ class TestResolveStateAxes:
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        bundles = crony.load_all_bundles()
+        config = crony.load_config()
         _, sched, _ = crony._resolve_state_axes(
-            bundles, h.full("a"), "darwin", crony.stamped_names()
+            config, h.full("a"), "darwin", crony.stamped_names()
         )
         assert sched == "grouped"
 
@@ -7590,9 +7649,9 @@ class TestResolveStateAxes:
         )
         crony.apply_one(cfg, "j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
-        bundles = crony.load_all_bundles()
+        config = crony.load_config()
         cfg_state, sched, _ = crony._resolve_state_axes(
-            bundles, h.full("j"), "darwin", crony.stamped_names()
+            config, h.full("j"), "darwin", crony.stamped_names()
         )
         assert cfg_state == "synced"
         assert sched == "disabled"
@@ -7886,9 +7945,9 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=[],
         )
-        bundles = crony.load_all_bundles()
+        config = crony.load_config()
         cfg_state, _unit_state, _last_state = crony._resolve_state_axes(
-            bundles, h.full("bad"), "darwin", crony.stamped_names()
+            config, h.full("bad"), "darwin", crony.stamped_names()
         )
         assert cfg_state == "error"
 
@@ -10136,33 +10195,44 @@ class TestLastRunStateInteractive:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
         full = h.full("iv")
         sd = h.fabricate_orphan("iv")
         (sd / "pending.flag").write_bytes(b"")
         with crony._acquire_lock(sd / "run.lock"):
-            assert crony._last_run_state(full) == "pending"
+            config = crony.load_config()
+            assert crony._last_run_state(config, full) == "pending"
 
     def test_running_when_lock_held_without_flag(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
         full = h.full("iv")
         sd = h.fabricate_orphan("iv")
         with crony._acquire_lock(sd / "run.lock"):
-            assert crony._last_run_state(full) == "running"
+            config = crony.load_config()
+            assert crony._last_run_state(config, full) == "running"
 
     def test_canceled_from_last_run_json(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
         full = h.full("iv")
         sd = h.fabricate_orphan("iv")
         (sd / "last-run.json").write_text(
             '{"exit_class": "canceled", '
-            '"started_at": "2099-01-01T00:00:00-08:00"}',
+            '"started_at": "2099-01-01T00:00:00-08:00",'
+            ' "host": "h", "platform": "darwin",'
+            ' "ended_at": "2099-01-01T00:00:01-08:00",'
+            ' "duration_sec": 1.0, "exit_code": 0,'
+            ' "signal": null, "gate": "none",'
+            ' "log_path": "/tmp/run.log", "log_bytes_this_run": 0}',
             encoding="utf-8",
         )
-        assert crony._last_run_state(full) == "canceled"
+        config = crony.load_config()
+        assert crony._last_run_state(config, full) == "canceled"
 
 
 if __name__ == "__main__":

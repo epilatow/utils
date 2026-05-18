@@ -2867,6 +2867,21 @@ class GroupRunResult:
 
 
 @dataclass
+class LastRun:
+    """Display-side view of `last-run.json`. Captures the fields
+    status / audit consume regardless of whether the underlying
+    record was a `JobRunResult` (the per-job runner output) or a
+    `GroupRunResult` (the group-level rollup); the full records
+    stay as the on-disk serialization shape. Fields are optional
+    because last-run.json can be partial / corrupt and we'd rather
+    surface "unknown" than have load_config abort.
+    """
+
+    exit_class: str | None
+    started_at: str | None
+
+
+@dataclass
 class RuntimeState:
     """Per-entity disk state outside `snapshot.json`. Populated for
     entities in `Config.current`; pending-only entities don't have
@@ -2875,7 +2890,7 @@ class RuntimeState:
 
     state_dir: Path
     hash: str
-    last_run: JobRunResult | GroupRunResult | None
+    last_run: LastRun | None
     is_running: bool
     is_pending: bool
     has_user_trigger_flag: bool
@@ -2956,32 +2971,22 @@ class Config:
         ) or self.current.by_full_name.get(full_name)
 
 
-def _parse_last_run(
-    raw: dict[str, Any], kind: str
-) -> JobRunResult | GroupRunResult | None:
-    """Deserialize last-run.json contents into the kind-appropriate
-    record. Returns None if the raw dict isn't valid for either
-    shape (corrupt write, schema drift).
+def _parse_last_run(raw: dict[str, Any]) -> LastRun:
+    """Extract the display-relevant subset of `last-run.json`.
+
+    The full `JobRunResult` / `GroupRunResult` shapes are the on-disk
+    serialization; status / audit only consume `exit_class` and
+    `started_at`, so we pull those out tolerantly. A partial /
+    corrupt last-run.json still produces a LastRun with whatever
+    fields landed, rather than disqualifying the entity from
+    runtime state altogether.
     """
-    if kind == "job":
-        try:
-            notifications_raw = raw.get("notifications", {})
-            notifications = {
-                ch: NotificationResult(**nr)
-                for ch, nr in notifications_raw.items()
-            }
-            payload = {k: v for k, v in raw.items() if k != "notifications"}
-            return JobRunResult(notifications=notifications, **payload)
-        except TypeError:
-            return None
-    if kind == "group":
-        try:
-            jobs_run = [GroupChildResult(**c) for c in raw.get("jobs_run", [])]
-            payload = {k: v for k, v in raw.items() if k != "jobs_run"}
-            return GroupRunResult(jobs_run=jobs_run, **payload)
-        except TypeError:
-            return None
-    return None
+    exit_class = raw.get("exit_class")
+    started_at = raw.get("started_at")
+    return LastRun(
+        exit_class=exit_class if isinstance(exit_class, str) else None,
+        started_at=started_at if isinstance(started_at, str) else None,
+    )
 
 
 def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
@@ -2996,7 +3001,7 @@ def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
         else ""
     )
 
-    last_run: JobRunResult | GroupRunResult | None = None
+    last_run: LastRun | None = None
     last_run_path = state_dir / "last-run.json"
     if last_run_path.is_file():
         try:
@@ -3004,7 +3009,7 @@ def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
         except (OSError, json.JSONDecodeError):
             raw = None
         if isinstance(raw, dict):
-            last_run = _parse_last_run(raw, kind)
+            last_run = _parse_last_run(raw)
 
     is_running = False
     lock_path = state_dir / "run.lock"
@@ -5433,7 +5438,7 @@ def _is_launchd_loaded(label: str) -> bool:
     return False
 
 
-def _last_run_state(name: str) -> str:
+def _last_run_state(config: Config, full_name: str) -> str:
     """Return LAST axis value for a stamped entity.
 
     Lock-held implies a run is currently in flight: "pending" when
@@ -5444,50 +5449,35 @@ def _last_run_state(name: str) -> str:
     never run -- new install, group-only job that's never been
     triggered, etc.
     """
-    sd = _state_dir_by_name(name)
-    if sd is None:
+    ref = config.resolve(full_name)
+    if ref is None:
         return "never"
-    lock_path = sd / "run.lock"
-    if lock_path.exists():
-        try:
-            with _acquire_lock(lock_path):
-                pass
-        except LockBusyError:
-            if (sd / "pending.flag").exists():
-                return "pending"
-            return "running"
-    last_run = sd / "last-run.json"
-    if not last_run.exists():
+    rt = config.runtime.get(ref)
+    if rt is None:
         return "never"
-    try:
-        raw = json.loads(last_run.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "unknown"
-    cls = raw.get("exit_class")
+    if rt.is_running:
+        return "pending" if rt.is_pending else "running"
+    if rt.last_run is None:
+        return "never"
+    cls = rt.last_run.exit_class
     if cls in ("ok", "fail", "timeout", "gated", "signal", "canceled"):
         return cls if cls != "signal" else "fail"
     return "unknown"
 
 
-def _last_ran_at(name: str) -> str:
+def _last_ran_at(config: Config, full_name: str) -> str:
     """Return a compact "when did this last run" string for status.
 
-    Reads the entity's `last-run.json` and formats `started_at` as
-    a relative-time string (e.g. "5m ago", "3h ago", "2d ago").
     Returns "never" when there's no last-run record and "unknown"
-    when the file exists but its timestamp is unreadable.
+    when the recorded timestamp is unreadable.
     """
-    sd = _state_dir_by_name(name)
-    if sd is None:
+    ref = config.resolve(full_name)
+    if ref is None:
         return "never"
-    last_run = sd / "last-run.json"
-    if not last_run.exists():
+    rt = config.runtime.get(ref)
+    if rt is None or rt.last_run is None:
         return "never"
-    try:
-        raw = json.loads(last_run.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "unknown"
-    started = raw.get("started_at")
+    started = rt.last_run.started_at
     if not started:
         return "unknown"
     try:
@@ -6875,7 +6865,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 
 
 def _resolve_state_axes(
-    bundles: TomlConfig,
+    config: Config,
     full: str,
     platform: str,
     remnants: set[str],
@@ -6905,7 +6895,7 @@ def _resolve_state_axes(
     of the entry not being parsed into the bundle's selection set.
     """
     bn, short = parse_full_name(full)
-    bundle = bundles.by_name(bn)
+    bundle = config.toml_config.by_name(bn)
     if bundle is None:
         cfg_state = "orphan" if full in remnants else "missing"
         entry: TomlJob | TomlJobGroup | None = None
@@ -6926,7 +6916,7 @@ def _resolve_state_axes(
             unit_state = "grouped"
         else:
             unit_state = _unit_state(full, platform)
-    last_state = _last_run_state(full)
+    last_state = _last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
 
@@ -7021,120 +7011,105 @@ _STALE_VALUE_FOOTER: str = (
 
 
 def _build_group_membership(
-    bundles: TomlConfig,
+    config: Config,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Reverse-index group membership across all bundles.
+    """Reverse-index group membership from the pending and current
+    graphs.
 
-    Returns `(pending, current)`. `pending[<full>]` lists the group
-    full names that include `<full>` as a child in the live config.
-    `current[<full>]` lists the group full names whose on-disk
-    snapshot's `children` list still records `<full>` as a member.
-    The two diverge when a group has been edited but not re-applied.
-    Each value list is sorted for stable display order.
+    Returns `(pending, current)` where `<table>[<full>]` lists the
+    full names of every group whose `children` list contains `<full>`
+    in that graph. The two diverge when a group has been edited but
+    not re-applied. Each value list is sorted for stable display
+    order.
     """
     pending: dict[str, list[str]] = {}
-    for b in bundles.bundles:
-        for g_short, g in b.config.job_groups.items():
-            g_full = b.full_name(g_short)
-            for child_short in g.jobs:
-                pending.setdefault(b.full_name(child_short), []).append(g_full)
+    for parent in config.pending.groups.values():
+        for child_full in parent.children:
+            pending.setdefault(child_full, []).append(parent.name)
     current: dict[str, list[str]] = {}
-    for _bundle_name, _uuid, entry_dir in _iter_state_entities():
-        snap = entry_dir / "snapshot.json"
-        if not snap.exists():
-            continue
-        try:
-            raw = json.loads(snap.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(raw, dict) or raw.get("kind") != "group":
-            continue
-        children = raw.get("children")
-        if not isinstance(children, list):
-            continue
-        group_name = raw.get("name")
-        if not isinstance(group_name, str):
-            continue
-        for child in children:
-            if isinstance(child, str):
-                current.setdefault(child, []).append(group_name)
+    for parent in config.current.groups.values():
+        for child_full in parent.children:
+            current.setdefault(child_full, []).append(parent.name)
     for table in (pending, current):
         for v in table.values():
             v.sort()
     return pending, current
 
 
+def _diverged(pending: object, current: object) -> bool:
+    """`*`-annotation predicate: the entity exists in both graphs
+    AND the values disagree on this field. The annotation never
+    depends on the display mode -- it just signals "the other view
+    of this cell says something different."
+    """
+    return pending is not None and current is not None and pending != current
+
+
 def _groups_cells(
-    pending: list[str], current: list[str], config_source: str
+    pending: list[str] | None,
+    current: list[str] | None,
+    config_source: str,
 ) -> tuple[str, bool]:
     """Return `(cell, is_stale)` for the GROUPS column.
 
-    Mirrors `_schedule_cells`: default mode shows current with
-    `is_stale=True` when pending differs (so the renderer can
-    annotate the cell and print the shared stale-value footer);
-    `current` and `pending` force a single source. Empty groups
-    list -> empty cell.
+    Display rules per mode:
+      default:          current's value if present, else pending's.
+      --config-current: current's value if present, else empty.
+      --config-pending: pending's value if present, else empty.
+
+    The `*` annotation fires whenever both pending and current have
+    values for the field and they disagree, regardless of mode.
     """
-    p_str = ",".join(pending)
-    c_str = ",".join(current)
+    p_str = ",".join(pending) if pending is not None else None
+    c_str = ",".join(current) if current is not None else None
+    is_stale = _diverged(p_str, c_str)
     if config_source == "current":
-        return (c_str, False)
+        return (c_str or "", is_stale)
     if config_source == "pending":
-        return (p_str, False)
-    if not c_str:
-        return (p_str, False)
-    return (c_str, p_str != c_str)
+        return (p_str or "", is_stale)
+    # default: prefer current, fall back to pending.
+    if c_str:
+        return (c_str, is_stale)
+    return (p_str or "", is_stale)
 
 
 def _schedule_cells(
-    bundles: TomlConfig,
+    config: Config,
     full: str,
     config_source: str,
 ) -> tuple[str, bool]:
     """Return (cell, is_stale) for the SCHEDULE column.
 
-    `config_source` is "default", "current", or "pending". The
-    default source shows the applied (current) schedule when one
-    exists, with `is_stale` true if the pending schedule differs;
-    falls back to pending for entries that have never been
-    applied. `current` and `pending` force a single source and
-    never set is_stale (the user picked the source explicitly).
-    Cells with no value at all return an empty string.
+    Display rules mirror `_groups_cells`. `*` shows whenever the
+    pending and current values disagree on this field, regardless
+    of mode.
     """
-    bn, short = parse_full_name(full)
-    bundle = bundles.by_name(bn)
-    pending: str | None = None
-    if bundle is not None:
-        entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
-            short
-        )
-        if entry is not None:
-            sched, interval = _entity_schedule(entry)
-            pending = _schedule_display(sched, interval)
-    current: str | None = None
-    state_dir = _state_dir_by_name(full)
-    snap_path = state_dir / "snapshot.json" if state_dir is not None else None
-    if snap_path is not None and snap_path.exists():
-        try:
-            raw = json.loads(snap_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = None
-        if isinstance(raw, dict) and ("schedule" in raw or "interval" in raw):
-            # Both keys present-but-None means the entry was grouped
-            # at apply time; render as `grouped` to match the
-            # pending-schedule and schedule columns. Legacy
-            # snapshots written before these fields existed have
-            # neither key and fall through with current=None so
-            # status doesn't fabricate a schedule it doesn't know.
-            cs, ci = raw.get("schedule"), raw.get("interval")
-            current = _schedule_display(cs, ci)
+    ref = config.resolve(full)
+    pending_disp: str | None = None
+    current_disp: str | None = None
+    if ref is not None:
+        pending_entry = config.pending.jobs.get(
+            ref
+        ) or config.pending.groups.get(ref)
+        current_entry = config.current.jobs.get(
+            ref
+        ) or config.current.groups.get(ref)
+        if pending_entry is not None:
+            pending_disp = _schedule_display(
+                pending_entry.schedule, pending_entry.interval
+            )
+        if current_entry is not None:
+            current_disp = _schedule_display(
+                current_entry.schedule, current_entry.interval
+            )
+    is_stale = _diverged(pending_disp, current_disp)
     if config_source == "current":
-        return (current or "", False)
+        return (current_disp or "", is_stale)
     if config_source == "pending":
-        return (pending or "", False)
-    if current is None:
-        return (pending or "", False)
-    return (current, pending is not None and pending != current)
+        return (pending_disp or "", is_stale)
+    if current_disp is not None:
+        return (current_disp, is_stale)
+    return (pending_disp or "", is_stale)
 
 
 def do_status(
@@ -7178,9 +7153,10 @@ def do_status(
         else "default"
     )
     selected_cols = _parse_status_cols(cols)
-    bundles = load_all_bundles()
+    config = load_config()
+    bundles = config.toml_config
     require_known_bundle(bundles, bundle)
-    platform = current_platform()
+    platform = config.platform
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
@@ -7218,15 +7194,13 @@ def do_status(
             active = active | set(masked_by_full)
         full_names = sorted(active)
 
-    tree_order, tree_depth = _build_status_tree(
-        bundles, current_host(), platform
-    )
+    tree_order, tree_depth = _build_status_tree(bundles, config.host, platform)
     if bundle is not None:
         tree_order = [n for n in tree_order if n.startswith(f"{bundle}.")]
         tree_depth = {
             n: d for n, d in tree_depth.items() if n.startswith(f"{bundle}.")
         }
-    pending_groups, current_groups = _build_group_membership(bundles)
+    pending_groups, current_groups = _build_group_membership(config)
     rows: list[dict[str, str]] = []
     any_stale = False
     for full in full_names:
@@ -7243,7 +7217,8 @@ def do_status(
         elif entry is not None:
             kind = "job"
         else:
-            kind = _kind_from_snapshot(full)
+            ref = config.resolve(full)
+            kind = config.current.kind_of(ref) or "" if ref is not None else ""
         # Resolve the runtime axes up-front. The schedule cell
         # below uses unit_state to decide whether to surface
         # "disabled" instead of the cron expression. The mask-
@@ -7252,10 +7227,10 @@ def do_status(
         # entry shows as `orphan` if there's on-disk state to
         # clean up, `masked` otherwise.
         cfg_state, unit_state, last = _resolve_state_axes(
-            bundles, full, platform, remnants, mask_reason=mask_reason
+            config, full, platform, remnants, mask_reason=mask_reason
         )
-        last_ran = _last_ran_at(full)
-        sched_cell, sched_stale = _schedule_cells(bundles, full, config_source)
+        last_ran = _last_ran_at(config, full)
+        sched_cell, sched_stale = _schedule_cells(config, full, config_source)
         if config_source != "pending" and unit_state == "disabled":
             # The default and --config-current views describe
             # what the host will actually run. A disabled timer
@@ -7268,8 +7243,8 @@ def do_status(
         if sched_stale:
             any_stale = True
             sched_cell = f"{sched_cell} *"
-        unit_sched_cell, _ = _schedule_cells(bundles, full, "current")
-        pending_sched_cell, _ = _schedule_cells(bundles, full, "pending")
+        unit_sched_cell, _ = _schedule_cells(config, full, "current")
+        pending_sched_cell, _ = _schedule_cells(config, full, "pending")
         groups_cell, groups_stale = _groups_cells(
             pending_groups.get(full, []),
             current_groups.get(full, []),
@@ -7379,25 +7354,24 @@ def do_logs(
                 interrupted.
     """
     full = normalize_full_name(name)
-    sd = _state_dir_by_name(full)
-    if sd is None and path:
-        # `--path` only prints where the log would land. Fall back
-        # to the live config's uuid so a fresh `crony logs --path
-        # X` works pre-apply (callers like log rotation cron
-        # entries materialize the path before the first run).
-        bundle_name, _, short = full.partition(".")
-        try:
-            bundles = load_all_bundles()
-        except ConfigError:
-            bundles = None
-        if bundles is not None:
-            bundle = bundles.by_name(bundle_name)
-            if bundle is not None:
-                entry = bundle.config.jobs.get(
-                    short
-                ) or bundle.config.job_groups.get(short)
-                if entry is not None:
-                    sd = _entity_state_dir(bundle_name, entry.uuid)
+    try:
+        config = load_config()
+    except ConfigError:
+        config = None
+    sd: Path | None = None
+    if config is not None:
+        ref = config.resolve(full)
+        if ref is not None:
+            rt = config.runtime.get(ref)
+            if rt is not None:
+                sd = rt.state_dir
+            elif path:
+                # `--path` only prints where the log would land.
+                # Pre-apply, no runtime state exists; fall back to
+                # the pending entity's uuid so a `crony logs --path
+                # X` works for log rotation cron entries that need
+                # to materialize the path before the first run.
+                sd = _entity_state_dir(ref.bundle, ref.uuid)
     if sd is None:
         raise UsageError(f"no log for {full!r} (no applied state on this host)")
     log_path = sd / "run.log"
@@ -7567,9 +7541,10 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     default), or a recent failed/timeout run. Names in output
     are full namespaced (`<bundle>.<short>`).
     """
-    bundles = load_all_bundles()
+    config = load_config()
+    bundles = config.toml_config
     require_known_bundle(bundles, bundle)
-    platform = current_platform()
+    platform = config.platform
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
@@ -7593,7 +7568,7 @@ def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
     for full in candidates:
         mask_reason = masked_by_full.get(full, "")
         cfg_state, unit_state, last_state = _resolve_state_axes(
-            bundles, full, platform, remnants, mask_reason=mask_reason
+            config, full, platform, remnants, mask_reason=mask_reason
         )
         is_bad = (
             cfg_state in bad_config
