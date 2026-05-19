@@ -9475,7 +9475,10 @@ class TestConfigBroken:
         config = crony.load_config()
         assert ref in config.broken
         assert ref not in config.current.jobs
-        assert ref not in config.runtime
+        # Broken entries get a runtime entry so the unit-config /
+        # last / last-ran columns can read the same state-dir
+        # files normal current entries read.
+        assert ref in config.runtime
         assert config.broken[ref].name == "default.legacy"
         assert "schema 999" in config.broken[ref].reason
         assert config.config_state(ref) == "broken"
@@ -9633,6 +9636,87 @@ class TestStatusBrokenSurface:
         out = capsys.readouterr().out
         assert f"default:{uuid_value}" in out
         assert "broken" in out
+
+
+class TestUnitOnlyOrphan:
+    """A platform unit file with no corresponding state dir
+    becomes a `Config.unit_only` entry with a deterministic
+    synthetic uuid. Destroy reaches it through `resolve_current`,
+    same as the broken-state surface. The synthetic uuid is
+    `uuid5(NAMESPACE_DNS, "crony.unit-only/<full_name>")` so
+    repeat loads address the same entity.
+    """
+
+    def _setup(
+        self, tmp_path: Path, monkeypatch: Any, platform: str = "darwin"
+    ) -> _ApplyHarness:
+        return _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+
+    def test_unit_file_with_no_state_dir_lands_in_unit_only(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = self._setup(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        plist = h.agents / "org.crony.default.ghost.plist"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text("", encoding="utf-8")
+        config = crony.load_config()
+        ref = config.unit_only_by_full_name.get("default.ghost")
+        assert ref is not None
+        # The synthetic uuid is deterministic: repeat loads
+        # produce the same ref.
+        config2 = crony.load_config()
+        assert config2.unit_only_by_full_name["default.ghost"] == ref
+        # The platform unit path is captured in RuntimeState.
+        rt = config.runtime[ref]
+        assert rt.unit_path == plist
+        assert rt.unit_file_present is True
+        # `config_state` reports orphan, not broken / synced /
+        # stale.
+        assert config.config_state(ref) == "orphan"
+
+    def test_destroy_wipes_unit_only_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = self._setup(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        plist = h.agents / "org.crony.default.ghost.plist"
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text("", encoding="utf-8")
+        crony.do_destroy(jobs=["default.ghost"], bundle=None, orphans=False)
+        assert not plist.exists()
+
+
+class TestStatusUnitConfigColumn:
+    """`crony status --cols ...,unit-config` shows the on-disk
+    path of the platform unit file. The cell value comes from
+    `RuntimeState.unit_path` so subcommands don't re-walk the
+    unit dirs themselves.
+    """
+
+    def test_unit_config_renders_plist_path(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-config",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+            exclude_disabled=False,
+        )
+        out = capsys.readouterr().out
+        assert "UNIT CONFIG" in out
+        assert "org.crony.default.j.plist" in out
 
 
 class TestStatusExcludeHealthy:

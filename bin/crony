@@ -2900,8 +2900,16 @@ class LastRun:
 @dataclass
 class RuntimeState:
     """Per-entity disk state outside `snapshot.json`. Populated for
-    entities in `Config.current`; pending-only entities don't have
-    one. Built once at load and never re-read.
+    entities in `Config.current` and `Config.unit_only`;
+    pending-only entities don't have one. Built once at load and
+    never re-read.
+
+    `unit_path` / `unit_file_present` capture the platform-side
+    observation (launchd plist / systemd .service or .timer) so
+    subcommands read it from Config rather than walking
+    `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR` themselves. Following
+    the load_config boundary rule: all platform-state queries
+    happen here at load time.
     """
 
     state_dir: Path
@@ -2910,6 +2918,8 @@ class RuntimeState:
     is_running: bool
     is_pending: bool
     has_user_trigger_flag: bool
+    unit_path: Path | None = None
+    unit_file_present: bool = False
 
 
 @dataclass
@@ -2935,6 +2945,29 @@ class Graph:
         if ref in self.groups:
             return "group"
         return None
+
+
+@dataclass(frozen=True)
+class UnitOnlyOrphan:
+    """A platform-side entity with no corresponding state dir.
+
+    Populated by `load_config` for any platform unit file
+    (launchd plist / systemd .service or .timer) whose
+    `<bundle>.<short>` doesn't match a current or broken entity.
+    The synthetic uuid is `uuid.uuid5(NAMESPACE_DNS,
+    "crony.unit-only/<full_name>")` -- deterministic so repeat
+    loads address the same entity, indistinguishable downstream
+    from a config-generated uuid4.
+    """
+
+    bundle: str
+    uuid: str
+    name: str
+    has_unit_file: bool
+
+    @property
+    def ref(self) -> EntityRef:
+        return EntityRef(self.bundle, self.uuid)
 
 
 @dataclass(frozen=True)
@@ -2980,13 +3013,19 @@ class Config:
     current: Graph
     broken: dict[EntityRef, BrokenEntity]
     broken_by_full_name: dict[str, EntityRef]
+    unit_only: dict[EntityRef, UnitOnlyOrphan]
+    unit_only_by_full_name: dict[str, EntityRef]
     runtime: dict[EntityRef, RuntimeState]
-    orphan_unit_labels: set[str]
     host: str
     platform: str
 
     def all_refs(self) -> set[EntityRef]:
-        return self.pending.refs() | self.current.refs() | set(self.broken)
+        return (
+            self.pending.refs()
+            | self.current.refs()
+            | set(self.broken)
+            | set(self.unit_only)
+        )
 
     def config_state(self, ref: EntityRef) -> str:
         """synced | stale | broken | missing | orphan for `ref`.
@@ -2999,11 +3038,13 @@ class Config:
         `synced` if both graphs hold the entity and the two
         instances are field-equal; `stale` if both hold it but
         differ; `missing` if only `pending` has it (never
-        applied); `orphan` if only `current` has it (config-side
-        removed, disk-side lingers).
+        applied); `orphan` if only `current` or `unit_only` has
+        it (config-side removed, disk-side lingers).
         """
         if ref in self.broken:
             return "broken"
+        if ref in self.unit_only:
+            return "orphan"
         p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
         c = self.current.jobs.get(ref) or self.current.groups.get(ref)
         if p is None and c is None:
@@ -3038,8 +3079,9 @@ class Config:
     def resolve_current(self, full_name: str) -> EntityRef | None:
         """An entity with on-disk presence that destroy must
         clean up. Sources, in order: `current` (parseable
-        snapshots), then `broken` (state dirs whose snapshot
-        can't be loaded).
+        snapshots), `broken` (state dirs whose snapshot can't
+        be loaded), then `unit_only` (platform unit files with
+        no state dir).
 
         No `pending` fallback: a pending-only entry has no
         on-disk state to wipe. The current-first order matches
@@ -3051,12 +3093,18 @@ class Config:
         """
         ref = parse_entity_ref(full_name)
         if ref is not None:
-            if ref in self.current.refs() or ref in self.broken:
+            if (
+                ref in self.current.refs()
+                or ref in self.broken
+                or ref in self.unit_only
+            ):
                 return ref
             return None
-        return self.current.by_full_name.get(
-            full_name
-        ) or self.broken_by_full_name.get(full_name)
+        return (
+            self.current.by_full_name.get(full_name)
+            or self.broken_by_full_name.get(full_name)
+            or self.unit_only_by_full_name.get(full_name)
+        )
 
     def resolve_pending(self, full_name: str) -> EntityRef | None:
         """An entry defined in the parsed TOML config but not
@@ -3097,10 +3145,19 @@ def _parse_last_run(raw: dict[str, Any]) -> LastRun:
     )
 
 
-def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
+def _read_runtime_state(
+    state_dir: Path,
+    kind: str,
+    *,
+    full_name: str | None = None,
+    platform: str | None = None,
+) -> RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
     install hash, parsed last-run record, and presence of the
-    lock / pending / user-trigger flag files.
+    lock / pending / user-trigger flag files. When `full_name`
+    and `platform` are supplied, also probe the platform unit
+    file path so subcommands can read it from RuntimeState
+    instead of walking the unit dirs ad-hoc.
     """
     hash_path = state_dir / "hash"
     hash_value = (
@@ -3128,6 +3185,10 @@ def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
         except LockBusyError:
             is_running = True
 
+    unit_path: Path | None = None
+    if full_name is not None and platform is not None:
+        unit_path = _platform_unit_path(full_name, platform)
+
     return RuntimeState(
         state_dir=state_dir,
         hash=hash_value,
@@ -3135,6 +3196,8 @@ def _read_runtime_state(state_dir: Path, kind: str) -> RuntimeState:
         is_running=is_running,
         is_pending=(state_dir / "pending.flag").is_file(),
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
+        unit_path=unit_path,
+        unit_file_present=unit_path is not None,
     )
 
 
@@ -3177,6 +3240,7 @@ def _build_pending_graph(
 
 def _build_current_graph(
     state_root: Path,
+    platform: str,
 ) -> tuple[Graph, dict[EntityRef, BrokenEntity], dict[EntityRef, RuntimeState]]:
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
     with a parseable schema-matched `snapshot.json` becomes a
@@ -3252,7 +3316,12 @@ def _build_current_graph(
                     continue
                 current.jobs[snap_j.ref] = snap_j
                 current.by_full_name[snap_j.name] = snap_j.ref
-                runtime[snap_j.ref] = _read_runtime_state(uuid_dir, "job")
+                runtime[snap_j.ref] = _read_runtime_state(
+                    uuid_dir,
+                    "job",
+                    full_name=snap_j.name,
+                    platform=platform,
+                )
             elif kind == "group":
                 try:
                     snap_g = JobGroup(**raw)
@@ -3267,7 +3336,12 @@ def _build_current_graph(
                     continue
                 current.groups[snap_g.ref] = snap_g
                 current.by_full_name[snap_g.name] = snap_g.ref
-                runtime[snap_g.ref] = _read_runtime_state(uuid_dir, "group")
+                runtime[snap_g.ref] = _read_runtime_state(
+                    uuid_dir,
+                    "group",
+                    full_name=snap_g.name,
+                    platform=platform,
+                )
             else:
                 broken[ref] = BrokenEntity(
                     bundle=bundle_dir.name,
@@ -3276,6 +3350,20 @@ def _build_current_graph(
                     reason=f"unrecognized snapshot kind {kind!r}",
                     source_path=snap_path,
                 )
+    # Broken entries get a runtime entry too -- the state dir
+    # exists and carries the same per-run files (last-run.json /
+    # run.lock / pending.flag / user-trigger.flag) as a normal
+    # current entry, plus the platform unit path. Without this
+    # the unit-config / last / last-ran columns render empty
+    # for broken rows even when those files are on disk.
+    for ref, broken_entry in broken.items():
+        state_dir = _entity_state_dir(ref)
+        runtime[ref] = _read_runtime_state(
+            state_dir,
+            kind="",
+            full_name=broken_entry.name,
+            platform=platform,
+        )
     return current, broken, runtime
 
 
@@ -3289,30 +3377,51 @@ def load_config() -> Config:
 
     toml_config = load_all_bundles()
     pending = _build_pending_graph(toml_config, host, platform)
-    current, broken, runtime = _build_current_graph(STATE_DIR)
-
-    # Platform units (launchd plist / systemd timer) whose name
-    # isn't in either graph: usually leftovers from a state-dir
-    # wipe that didn't touch the platform side. Discovered here
-    # so destroy / status can surface them without re-scanning.
-    in_use_labels: set[str] = set()
-    for snap_j in pending.jobs.values():
-        in_use_labels.add(snap_j.name)
-    for snap_g in pending.groups.values():
-        in_use_labels.add(snap_g.name)
-    for snap_j in current.jobs.values():
-        in_use_labels.add(snap_j.name)
-    for snap_g in current.groups.values():
-        in_use_labels.add(snap_g.name)
-    for broken_entry in broken.values():
-        if broken_entry.name is not None:
-            in_use_labels.add(broken_entry.name)
-    orphan_unit_labels = _platform_unit_names() - in_use_labels
+    current, broken, runtime = _build_current_graph(STATE_DIR, platform)
 
     broken_by_full_name: dict[str, EntityRef] = {}
     for ref, broken_entry in broken.items():
         if broken_entry.name is not None:
             broken_by_full_name[broken_entry.name] = ref
+
+    # Platform unit files whose name isn't in `current` or
+    # `broken`: state-dir-less remnants (typically a state wipe
+    # without `crony destroy` first). Synthesize a deterministic
+    # `uuid5` so the entity has a stable EntityRef downstream and
+    # `destroy` can address it through the same machinery as
+    # other on-disk entities.
+    accounted_labels: set[str] = set(current.by_full_name)
+    accounted_labels.update(broken_by_full_name)
+    unit_only: dict[EntityRef, UnitOnlyOrphan] = {}
+    unit_only_by_full_name: dict[str, EntityRef] = {}
+    for full_name in _platform_unit_names() - accounted_labels:
+        bundle_name, _, _ = full_name.partition(".")
+        if not bundle_name:
+            continue
+        synthetic = str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"crony.unit-only/{full_name}")
+        )
+        ref = EntityRef(bundle_name, synthetic)
+        unit_only[ref] = UnitOnlyOrphan(
+            bundle=bundle_name,
+            uuid=synthetic,
+            name=full_name,
+            has_unit_file=True,
+        )
+        unit_only_by_full_name[full_name] = ref
+        # Make the platform path available through RuntimeState so
+        # status's unit-config column doesn't re-walk the unit dirs.
+        unit_path = _platform_unit_path(full_name, platform)
+        runtime[ref] = RuntimeState(
+            state_dir=_entity_state_dir(ref),
+            hash="",
+            last_run=None,
+            is_running=False,
+            is_pending=False,
+            has_user_trigger_flag=False,
+            unit_path=unit_path,
+            unit_file_present=unit_path is not None,
+        )
 
     return Config(
         toml_config=toml_config,
@@ -3320,8 +3429,9 @@ def load_config() -> Config:
         current=current,
         broken=broken,
         broken_by_full_name=broken_by_full_name,
+        unit_only=unit_only,
+        unit_only_by_full_name=unit_only_by_full_name,
         runtime=runtime,
-        orphan_unit_labels=orphan_unit_labels,
         host=host,
         platform=platform,
     )
@@ -4857,6 +4967,26 @@ def _service_path_for(name: str) -> Path:
 
 def _timer_path_for(name: str) -> Path:
     return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
+
+
+def _platform_unit_path(name: str, platform: str) -> Path | None:
+    """Path of the on-disk platform unit file for `name`, or None
+    when no file is present. The status `unit-config` column reads
+    this from `RuntimeState`; the load_config boundary rule means
+    no caller walks the unit dirs ad-hoc.
+
+    On darwin: the launchd plist. On linux: the `.timer` if
+    present (scheduled entries), else the `.service` (group-only
+    / transit entries).
+    """
+    if platform == "darwin":
+        p = _plist_path_for(name)
+        return p if p.is_file() else None
+    timer = _timer_path_for(name)
+    if timer.is_file():
+        return timer
+    service = _service_path_for(name)
+    return service if service.is_file() else None
 
 
 def _hash_path_for(ref: EntityRef) -> Path:
@@ -7021,6 +7151,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-schedule": "UNIT SCHEDULE",
     "pending-schedule": "PENDING SCHEDULE",
     "uuid": "UUID",
+    "unit-config": "UNIT CONFIG",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job",
@@ -7107,6 +7238,10 @@ Columns
                     from the on-disk snapshot for orphan rows whose
                     config entry has since been removed. Empty when
                     neither side has a uuid to report.
+  unit-config       Filesystem path of the platform unit file
+                    (`org.crony.<name>.plist` on macOS;
+                    `crony-<name>.{{timer,service}}` on Linux).
+                    Empty when no file exists on disk.
 
 Aliases
 -------
@@ -7551,7 +7686,11 @@ def do_status(
         # Errored entries always surface in the default view --
         # without this the user can fix a typo only by reading
         # the warning line; they wouldn't see the entry in the
-        # table itself.
+        # table itself. Unit-only orphans (platform unit files
+        # with no state dir) are already in `remnants` via
+        # `stamped_names() | _platform_unit_names()`, so we don't
+        # add them separately -- `Config.unit_only` is the
+        # ref-side index for destroy / row population to use.
         active = selected | remnants | errored_full | broken_synthetic
         if show_masked:
             active = active | set(masked_by_full)
@@ -7625,6 +7764,16 @@ def do_status(
         else:
             cur_ref = config.resolve_current(full)
             entity_uuid = cur_ref.uuid if cur_ref is not None else ""
+        # `unit-config`: read the platform unit path from
+        # RuntimeState rather than walking the unit dirs --
+        # `load_config` already captured it at startup. For
+        # pending-only entries (no runtime yet) the cell stays
+        # empty; the path would be `_plist_path_for(full)` etc.
+        # but it doesn't exist on disk so there's nothing to
+        # show.
+        any_ref = config.resolve_current(full) or config.resolve_pending(full)
+        rt = config.runtime.get(any_ref) if any_ref is not None else None
+        unit_config_cell = str(rt.unit_path) if rt and rt.unit_path else ""
         rows.append(
             {
                 "job": full,
@@ -7640,6 +7789,7 @@ def do_status(
                 "unit-schedule": unit_sched_cell,
                 "pending-schedule": pending_sched_cell,
                 "uuid": entity_uuid,
+                "unit-config": unit_config_cell,
             }
         )
 
