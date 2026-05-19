@@ -2969,7 +2969,6 @@ class TestRunJobBasics:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # LAST column carries the canceled label; not silently
@@ -3003,7 +3002,6 @@ class TestRunJobBasics:
             config_pending=False,
             bundle=None,
             exclude_healthy=True,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("j") in out
@@ -4676,8 +4674,10 @@ class TestPlistRendering:
         # so the script's `env -S uv run --script` shebang fails to
         # find uv (exit 127). Render the absolute uv path into
         # ProgramArguments so the unit doesn't depend on PATH.
-        monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
-        monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
+        monkeypatch.setattr(crony, "_uv_executable", lambda: Path("/abs/uv"))
+        monkeypatch.setattr(
+            crony, "_crony_executable", lambda: Path("/abs/crony")
+        )
         plist = crony._render_plist(
             "j", crony.EntityRef("default", "u-test"), "daily", None
         )
@@ -4719,8 +4719,10 @@ class TestSystemdRendering:
         # render uv's absolute path so the unit doesn't depend on
         # whoever's PATH happens to contain it (same reason as the
         # launchd plist case).
-        monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
-        monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
+        monkeypatch.setattr(crony, "_uv_executable", lambda: Path("/abs/uv"))
+        monkeypatch.setattr(
+            crony, "_crony_executable", lambda: Path("/abs/crony")
+        )
         svc = crony._render_systemd_service(
             "j", crony.EntityRef("default", "u-test")
         )
@@ -6102,7 +6104,6 @@ class TestStatusUuidColumn:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "UUID" in out
@@ -6126,7 +6127,6 @@ class TestStatusUuidColumn:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "UUID" not in out
@@ -6148,7 +6148,6 @@ class TestStatusUuidColumn:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert ghost_uuid in out
@@ -6174,7 +6173,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "JOB" in out
@@ -6199,7 +6197,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "ghost" in out
@@ -6231,7 +6228,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("j") in out
@@ -6255,7 +6251,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         header = out.splitlines()[0]
@@ -6281,7 +6276,6 @@ class TestStatusReport:
                 config_current=False,
                 config_pending=False,
                 exclude_healthy=False,
-                exclude_disabled=False,
             )
 
     def test_last_ran_column_shows_relative_time(
@@ -6318,7 +6312,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # Allow a small wallclock drift between writing the file and
@@ -6345,7 +6338,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "never" in out
@@ -6379,7 +6371,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         rows = [r for r in capsys.readouterr().out.splitlines() if r.strip()]
         # The header's CONFIG label and every row's state token
@@ -6421,7 +6412,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("j") not in out
@@ -6433,7 +6423,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("j") in out
@@ -6477,7 +6466,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "MASKED BY" in out
@@ -6517,7 +6505,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "MASKED BY" not in out
@@ -6561,7 +6548,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         row = next(
@@ -6598,7 +6584,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("j") not in out
@@ -6610,7 +6595,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         row = next(
@@ -6658,7 +6642,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         row = next(
@@ -6694,7 +6677,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         row = next(
@@ -6721,7 +6703,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         header = capsys.readouterr().out.splitlines()[0]
         assert "JOB" in header
@@ -6752,7 +6733,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         baseline = capsys.readouterr().out
         crony.do_status(
@@ -6763,7 +6743,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         aliased = capsys.readouterr().out
         assert baseline == aliased
@@ -6788,7 +6767,6 @@ class TestStatusReport:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         header = capsys.readouterr().out.splitlines()[0]
         # JOB first, MASKED BY last; default columns preserved in
@@ -6819,7 +6797,6 @@ class TestStatusReport:
                 config_current=False,
                 config_pending=False,
                 exclude_healthy=False,
-                exclude_disabled=False,
             )
 
     def test_bundle_scopes_table(
@@ -6854,7 +6831,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "borgadm.k" in out
@@ -6894,7 +6870,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out_lines = capsys.readouterr().out.splitlines()
         # Drop the header line; remaining lines are the rows in
@@ -6958,7 +6933,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out_lines = capsys.readouterr().out.splitlines()
         rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
@@ -7002,7 +6976,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out_lines = capsys.readouterr().out.splitlines()
         rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
@@ -7054,7 +7027,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out_lines = capsys.readouterr().out.splitlines()
         rendered = [line.rstrip() for line in out_lines[1:] if line.strip()]
@@ -7085,7 +7057,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # default.j is a job; default.g is a group
@@ -7116,7 +7087,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7142,7 +7112,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "UNIT NAME" in out
@@ -7180,7 +7149,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7214,7 +7182,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7243,7 +7210,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # pending-schedule populated; unit-schedule blank for this row.
@@ -7278,7 +7244,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7310,7 +7275,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7348,7 +7312,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7400,7 +7363,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # `a`'s row carries the stale-marked applied membership.
@@ -7446,7 +7408,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=True,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # Pending says `a` is in no group; cell is empty. The `*`
@@ -7476,7 +7437,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         header = capsys.readouterr().out.splitlines()[0]
         assert "UNIT NAME" not in header
@@ -7561,7 +7521,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7593,7 +7552,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7610,7 +7568,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=True,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7645,7 +7602,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "disabled" in out
@@ -7678,7 +7634,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "*-*-* 03:00 *" in out
@@ -7713,7 +7668,6 @@ class TestStatusReport:
             config_current=True,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "*-*-* 03:00 *" in out
@@ -7741,7 +7695,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=True,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "*-*-* 09:00 *" in out
@@ -7761,7 +7714,6 @@ class TestStatusReport:
                 config_current=True,
                 config_pending=True,
                 exclude_healthy=False,
-                exclude_disabled=False,
             )
 
     def test_unused_mask_reason_surfaces_under_all(
@@ -7792,7 +7744,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "default.extra" not in out
@@ -7805,7 +7756,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         for line in out.splitlines():
@@ -7833,7 +7783,6 @@ class TestStatusReport:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "UNIT" in out
@@ -8238,7 +8187,6 @@ class TestPerEntityConfigErrors:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # Both names appear; bad gets "error", good gets a normal
@@ -8355,7 +8303,6 @@ class TestPerEntityConfigErrors:
             config_pending=False,
             bundle=None,
             exclude_healthy=True,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert h.full("bad") in out
@@ -8861,42 +8808,42 @@ class TestEntityRefInput:
 
     def test_parse_round_trips(self) -> None:
         ref = crony.EntityRef("default", self._CANONICAL_UUID)
-        rendered = crony.format_entity_ref(ref)
+        rendered = str(ref)
         assert rendered == f"default:{self._CANONICAL_UUID}"
-        assert crony.parse_entity_ref(rendered) == ref
+        assert crony.EntityRef.from_str(rendered) == ref
 
     def test_parse_with_non_default_bundle(self) -> None:
         ref = crony.EntityRef("borgadm", self._CANONICAL_UUID)
-        rendered = crony.format_entity_ref(ref)
-        assert crony.parse_entity_ref(rendered) == ref
+        rendered = str(ref)
+        assert crony.EntityRef.from_str(rendered) == ref
 
     def test_parse_non_ref_returns_none(self) -> None:
         # Dot-separated names aren't entity refs.
-        assert crony.parse_entity_ref("default.foo") is None
+        assert crony.EntityRef.from_str("default.foo") is None
         # Bare names aren't entity refs either.
-        assert crony.parse_entity_ref("foo") is None
+        assert crony.EntityRef.from_str("foo") is None
         # Bundle-only (no uuid body).
-        assert crony.parse_entity_ref("default:") is None
+        assert crony.EntityRef.from_str("default:") is None
         # No bundle.
-        assert crony.parse_entity_ref(f":{self._CANONICAL_UUID}") is None
+        assert crony.EntityRef.from_str(f":{self._CANONICAL_UUID}") is None
 
     def test_parse_rejects_non_canonical_uuid(self) -> None:
         # Validation runs because the parsed ref flows into a
         # path that `shutil.rmtree` later trusts -- a malformed
         # uuid must fail at parse time, not at filesystem time.
-        assert crony.parse_entity_ref("default:not-a-uuid") is None
-        assert crony.parse_entity_ref("default:abc123") is None
+        assert crony.EntityRef.from_str("default:not-a-uuid") is None
+        assert crony.EntityRef.from_str("default:abc123") is None
         # Path-traversal-shaped uuid bodies must be rejected so
         # `crony destroy` can't be tricked into `rmtree`-ing
         # `STATE_DIR/default/../../etc`.
-        assert crony.parse_entity_ref("default:../../etc") is None
+        assert crony.EntityRef.from_str("default:../../etc") is None
 
     def test_parse_rejects_invalid_bundle_name(self) -> None:
         # Bundle names are constrained by `_BUNDLE_NAME_RE`; an
         # invalid bundle prevents the path composition from
         # walking outside `STATE_DIR`.
         bad = f"../etc:{self._CANONICAL_UUID}"
-        assert crony.parse_entity_ref(bad) is None
+        assert crony.EntityRef.from_str(bad) is None
 
 
 class TestConfigResolveEntityRef:
@@ -8919,7 +8866,7 @@ class TestConfigResolveEntityRef:
         # for the ref since the ref doesn't appear in their
         # backing source. The ref-form parser still gives the
         # caller a way to construct an EntityRef explicitly:
-        assert crony.parse_entity_ref(ref_input) == crony.EntityRef(
+        assert crony.EntityRef.from_str(ref_input) == crony.EntityRef(
             "default", "11111111-2222-3333-4444-555555555555"
         )
         assert cfg.resolve_runnable(ref_input) is None
@@ -9657,7 +9604,6 @@ class TestStatusBrokenSurface:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "default.j" in out
@@ -9682,7 +9628,6 @@ class TestStatusBrokenSurface:
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert f"default:{uuid_value}" in out
@@ -9720,8 +9665,7 @@ class TestUnitOnlyOrphan:
         assert config2.unit_only_by_full_name["default.ghost"] == ref
         # The platform unit path is captured in RuntimeState.
         rt = config.runtime[ref]
-        assert rt.unit_path == plist
-        assert rt.unit_file_present is True
+        assert rt.unit_config == plist
         # `config_state` reports orphan, not broken / synced /
         # stale.
         assert config.config_state(ref) == "orphan"
@@ -9741,7 +9685,7 @@ class TestUnitOnlyOrphan:
 class TestStatusUnitConfigColumn:
     """`crony status --cols ...,unit-config` shows the on-disk
     path of the platform unit file. The cell value comes from
-    `RuntimeState.unit_path` so subcommands don't re-walk the
+    `RuntimeState.unit_config` so subcommands don't re-walk the
     unit dirs themselves.
     """
 
@@ -9763,7 +9707,6 @@ class TestStatusUnitConfigColumn:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "UNIT CONFIG" in out
@@ -9812,7 +9755,6 @@ class TestStatusExcludeHealthy:
             config_current=False,
             config_pending=False,
             exclude_healthy=True,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "healthy" not in out
@@ -9844,7 +9786,6 @@ class TestStatusExcludeHealthy:
             config_current=False,
             config_pending=False,
             exclude_healthy=True,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "default.j" in out
@@ -9884,13 +9825,41 @@ class TestStatusExcludeHealthy:
             config_current=False,
             config_pending=False,
             exclude_healthy=True,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # The leaf row appears flat -- no leading whitespace
         # before the name -- since tree indent is dropped.
         lines = [ln for ln in out.splitlines() if "default.leaf" in ln]
         assert lines and lines[0].lstrip() == lines[0]
+
+    def test_disabled_unit_survives_exclude_healthy(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A disabled unit isn't firing, so it's unhealthy and must
+        # survive the --exclude-healthy filter even though its
+        # snapshot is synced and it never failed a run.
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
+        uuid_value = "55555555-5555-5555-5555-555555555555"
+        cfg_file.write_text(
+            f'[job.paused]\nuuid = "{uuid_value}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["paused"]\n',
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        crony.apply_one(bundles.bundles[0].config, "paused")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=True,
+        )
+        out = capsys.readouterr().out
+        assert "default.paused" in out
 
 
 class TestResolveMethods:
@@ -10672,24 +10641,24 @@ class TestExtractUnitExecPaths:
             crony.EntityRef("default", "u-test"),
             "*-*-* 03:00",
             None,
-            uv_path="/abs/uv",
-            crony_path="/abs/crony",
+            uv_path=Path("/abs/uv"),
+            crony_path=Path("/abs/crony"),
         )
         assert crony._extract_unit_exec_paths(plist, "darwin") == (
-            "/abs/uv",
-            "/abs/crony",
+            Path("/abs/uv"),
+            Path("/abs/crony"),
         )
 
     def test_extracts_paths_from_systemd_service(self) -> None:
         svc = crony._render_systemd_service(
             "j",
             crony.EntityRef("default", "u-test"),
-            uv_path="/abs/uv",
-            crony_path="/abs/crony",
+            uv_path=Path("/abs/uv"),
+            crony_path=Path("/abs/crony"),
         )
         assert crony._extract_unit_exec_paths(svc, "linux") == (
-            "/abs/uv",
-            "/abs/crony",
+            Path("/abs/uv"),
+            Path("/abs/crony"),
         )
 
     def test_returns_none_for_malformed_plist(self) -> None:
@@ -10759,10 +10728,10 @@ class TestUnitDriftDetection:
         config = crony.load_config()
         unit_dir = h.agents if platform == "darwin" else h.sysd
         if platform == "darwin":
-            unit_path = unit_dir / f"org.crony.{h.full('j')}.plist"
+            unit_config = unit_dir / f"org.crony.{h.full('j')}.plist"
         else:
-            unit_path = unit_dir / f"crony-{h.full('j')}.timer"
-        return h, config, unit_path
+            unit_config = unit_dir / f"crony-{h.full('j')}.timer"
+        return h, config, unit_config
 
     def test_clean_apply_is_not_stale(
         self, tmp_path: Path, monkeypatch: Any
@@ -10774,8 +10743,8 @@ class TestUnitDriftDetection:
     def test_hand_edited_plist_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h, _, unit_path = self._apply_and_load(tmp_path, monkeypatch)
-        content = unit_path.read_text()
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        content = unit_config.read_text()
         # Flip Hour 3 -> Hour 5: snapshot still says 03:00, but the
         # on-disk plist now says 05:00. apply / load_config should
         # notice and flag the install stale.
@@ -10784,7 +10753,7 @@ class TestUnitDriftDetection:
             "<key>Hour</key>\n        <integer>5</integer>",
         )
         assert munged != content
-        unit_path.write_text(munged)
+        unit_config.write_text(munged)
         config = crony.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
@@ -10792,8 +10761,8 @@ class TestUnitDriftDetection:
     def test_missing_unit_file_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h, _, unit_path = self._apply_and_load(tmp_path, monkeypatch)
-        unit_path.unlink()
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        unit_config.unlink()
         config = crony.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
@@ -10813,15 +10782,15 @@ class TestUnitDriftDetection:
     def test_missing_baked_uv_path_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h, _, unit_path = self._apply_and_load(tmp_path, monkeypatch)
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         # Replace the baked uv path with one pointing at a
         # nonexistent file. The unit-drift check resolves the
         # extracted paths against the filesystem and flags the
         # install as broken when either's gone.
-        content = unit_path.read_text()
-        live_uv = crony._uv_executable()
+        content = unit_config.read_text()
+        live_uv = str(crony._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
-        unit_path.write_text(content.replace(live_uv, bogus_uv))
+        unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
@@ -10829,8 +10798,8 @@ class TestUnitDriftDetection:
     def test_apply_refreshes_stale_install(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h, _, unit_path = self._apply_and_load(tmp_path, monkeypatch)
-        unit_path.unlink()
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        unit_config.unlink()
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
@@ -10840,13 +10809,13 @@ class TestUnitDriftDetection:
         # integrity check escalates to `updated` so the unit file
         # gets re-rendered.
         assert result == "updated"
-        assert unit_path.exists()
+        assert unit_config.exists()
 
     def test_status_reports_stale_for_drifted_install(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        h, _, unit_path = self._apply_and_load(tmp_path, monkeypatch)
-        unit_path.unlink()
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        unit_config.unlink()
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10855,7 +10824,6 @@ class TestUnitDriftDetection:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         # Find the row for default.j and confirm CONFIG is stale.
@@ -10974,7 +10942,6 @@ class TestLifecycleSmoke:
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
-            exclude_disabled=False,
         )
         out = capsys.readouterr().out
         assert "synced" in out

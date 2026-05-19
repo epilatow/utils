@@ -1255,51 +1255,6 @@ def parse_full_name(arg: str) -> tuple[str, str]:
     return (bundle, short)
 
 
-def parse_entity_ref(arg: str) -> EntityRef | None:
-    """Parse `<bundle>:<UUID>` input/display form into an
-    `EntityRef`, or return None when `arg` isn't that shape.
-
-    Status output uses this form for refs with no recoverable
-    name (corrupt snapshots, broken entries, future unit-only
-    orphans) so an operator can paste the JOB cell back into
-    `crony destroy`, `crony logs`, etc. The same form is
-    `crony run`'s positional argv: the platform unit hands the
-    runner a `<bundle>:<UUID>` it can address `_entity_state_dir`
-    with directly. The colon separator distinguishes the uuid
-    form from the dot-separated `<bundle>.<short>` name form
-    (a name can't contain a colon).
-
-    Both pieces are validated -- `bundle` must match
-    `_BUNDLE_NAME_RE` and `UUID` must be a canonical
-    8-4-4-4-12 `uuid.UUID()`-parseable string -- because the
-    parsed ref flows into an `_entity_state_dir(ref)` path
-    composition that `shutil.rmtree` later trusts. An
-    unvalidated `../../etc` would point at a path outside
-    `STATE_DIR/<bundle>/`.
-    """
-    if ":" not in arg:
-        return None
-    bundle, _, entity_uuid = arg.partition(":")
-    if not bundle or not entity_uuid:
-        return None
-    if not _BUNDLE_NAME_RE.match(bundle):
-        return None
-    try:
-        parsed = uuid.UUID(entity_uuid)
-    except ValueError:
-        return None
-    if entity_uuid != str(parsed):
-        return None
-    return EntityRef(bundle, entity_uuid)
-
-
-def format_entity_ref(ref: EntityRef) -> str:
-    """Render an `EntityRef` in `<bundle>:<UUID>` form. Round-trips
-    with `parse_entity_ref`.
-    """
-    return f"{ref.bundle}:{ref.uuid}"
-
-
 def normalize_full_name(arg: str) -> str:
     """CLI input -> canonical form.
 
@@ -1310,7 +1265,7 @@ def normalize_full_name(arg: str) -> str:
     downstream lookup can recognize it. Used at the entry point
     of every CLI handler that takes user-supplied job references.
     """
-    if parse_entity_ref(arg) is not None:
+    if EntityRef.from_str(arg) is not None:
         return arg
     bundle, short = parse_full_name(arg)
     return f"{bundle}.{short}"
@@ -1330,7 +1285,7 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
     """
     if scope_bundle is None:
         return normalize_full_name(arg)
-    ref = parse_entity_ref(arg)
+    ref = EntityRef.from_str(arg)
     if ref is not None:
         if ref.bundle != scope_bundle:
             raise UsageError(
@@ -2540,10 +2495,52 @@ class EntityRef:
     can repeat across bundles (uuid4 collision is astronomically
     unlikely; the bundle prefix makes it a non-concern). Frozen
     so it can key dicts and live in sets.
+
+    `str(ref)` renders the `<bundle>:<UUID>` input/display form
+    and `from_str` parses it back; the two round-trip. Status
+    output uses this form for refs with no recoverable name
+    (corrupt snapshots, broken entries, unit-only orphans) so an
+    operator can paste the JOB cell back into `crony destroy`,
+    `crony logs`, etc. The same form is `crony run`'s positional
+    argv: the platform unit hands the runner a `<bundle>:<UUID>`
+    it can address `_entity_state_dir` with directly. The colon
+    separator distinguishes the uuid form from the dot-separated
+    `<bundle>.<short>` name form (a name can't contain a colon).
     """
 
     bundle: str
     uuid: str
+
+    def __str__(self) -> str:
+        return f"{self.bundle}:{self.uuid}"
+
+    @classmethod
+    def from_str(cls, arg: str) -> EntityRef | None:
+        """Parse `<bundle>:<UUID>` form into an `EntityRef`, or
+        return None when `arg` isn't that shape.
+
+        Both pieces are validated -- `bundle` must match
+        `_BUNDLE_NAME_RE` and `UUID` must be a canonical
+        8-4-4-4-12 `uuid.UUID()`-parseable string -- because the
+        parsed ref flows into an `_entity_state_dir(ref)` path
+        composition that `shutil.rmtree` later trusts. An
+        unvalidated `../../etc` would point at a path outside
+        `STATE_DIR/<bundle>/`.
+        """
+        if ":" not in arg:
+            return None
+        bundle, _, entity_uuid = arg.partition(":")
+        if not bundle or not entity_uuid:
+            return None
+        if not _BUNDLE_NAME_RE.match(bundle):
+            return None
+        try:
+            parsed = uuid.UUID(entity_uuid)
+        except ValueError:
+            return None
+        if entity_uuid != str(parsed):
+            return None
+        return cls(bundle, entity_uuid)
 
 
 @dataclass
@@ -2771,7 +2768,7 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
     sees the human-readable identity.
     """
     state_dir = _entity_state_dir(ref)
-    ref_str = format_entity_ref(ref)
+    ref_str = str(ref)
     p = state_dir / "snapshot.json"
     if not p.is_file():
         raise PreconditionError(
@@ -2919,12 +2916,13 @@ class RuntimeState:
     pending-only entities don't have one. Built once at load and
     never re-read.
 
-    `unit_path` / `unit_file_present` capture the platform-side
-    observation (launchd plist / systemd .service or .timer) so
-    subcommands read it from Config rather than walking
-    `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR` themselves. Following
-    the load_config boundary rule: all platform-state queries
-    happen here at load time.
+    `unit_config` is the path of the platform unit file (launchd
+    plist / systemd .service or .timer) when one is present, else
+    None -- captured here so subcommands read it from Config
+    rather than walking `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR`
+    themselves. `unit_config is not None` is the "a unit file
+    exists on disk" test. Following the load_config boundary
+    rule: all platform-state queries happen here at load time.
 
     `unit_is_stale` is True when the platform install diverges
     from what the snapshot would render: missing or hand-edited
@@ -2941,8 +2939,7 @@ class RuntimeState:
     is_running: bool
     is_pending: bool
     has_user_trigger_flag: bool
-    unit_path: Path | None = None
-    unit_file_present: bool = False
+    unit_config: Path | None = None
     unit_is_stale: bool = False
 
 
@@ -3095,7 +3092,7 @@ class Config:
         address targeting a broken / unit-only / unknown entry
         returns None on purpose.
         """
-        ref = parse_entity_ref(full_name)
+        ref = EntityRef.from_str(full_name)
         if ref is not None:
             return ref if ref in self.current.refs() else None
         return self.current.by_full_name.get(full_name)
@@ -3115,7 +3112,7 @@ class Config:
         phantom dir produced by a pending uuid edit that hasn't
         been applied yet.
         """
-        ref = parse_entity_ref(full_name)
+        ref = EntityRef.from_str(full_name)
         if ref is not None:
             if (
                 ref in self.current.refs()
@@ -3145,7 +3142,7 @@ class Config:
         `<bundle>:<UUID>` ref-form inputs are honored only when
         the addressed entry is in `pending`.
         """
-        ref = parse_entity_ref(full_name)
+        ref = EntityRef.from_str(full_name)
         if ref is not None:
             return ref if ref in self.pending.refs() else None
         return self.pending.by_full_name.get(full_name)
@@ -3210,10 +3207,10 @@ def _read_runtime_state(
         except LockBusyError:
             is_running = True
 
-    unit_path: Path | None = None
+    unit_config: Path | None = None
     unit_is_stale = False
     if full_name is not None and platform is not None:
-        unit_path = _platform_unit_path(full_name, platform)
+        unit_config = _platform_unit_config_path(full_name, platform)
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(full_name, snapshot, platform)
 
@@ -3223,8 +3220,7 @@ def _read_runtime_state(
         is_running=is_running,
         is_pending=(state_dir / "pending.flag").is_file(),
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
-        unit_path=unit_path,
-        unit_file_present=unit_path is not None,
+        unit_config=unit_config,
         unit_is_stale=unit_is_stale,
     )
 
@@ -3441,15 +3437,14 @@ def load_config() -> Config:
         unit_only_by_full_name[full_name] = ref
         # Make the platform path available through RuntimeState so
         # status's unit-config column doesn't re-walk the unit dirs.
-        unit_path = _platform_unit_path(full_name, platform)
+        unit_config = _platform_unit_config_path(full_name, platform)
         runtime[ref] = RuntimeState(
             state_dir=_entity_state_dir(ref),
             last_run=None,
             is_running=False,
             is_pending=False,
             has_user_trigger_flag=False,
-            unit_path=unit_path,
-            unit_file_present=unit_path is not None,
+            unit_config=unit_config,
         )
 
     return Config(
@@ -3639,7 +3634,7 @@ def _gate_argv(snap: Job) -> list[str] | None:
     return None
 
 
-def _crony_executable() -> str:
+def _crony_executable() -> Path:
     """Absolute path to bin/crony for re-invocation by groups.
 
     Uses `__file__` rather than `sys.argv[0]` so the subprocess
@@ -3647,10 +3642,10 @@ def _crony_executable() -> str:
     been imported as a module (e.g. by the test suite, where
     sys.argv[0] is pytest, not crony).
     """
-    return str(Path(__file__).resolve())
+    return Path(__file__).resolve()
 
 
-def _uv_executable() -> str:
+def _uv_executable() -> Path:
     """Absolute path to `uv`, baked into platform unit files.
 
     Platform schedulers (launchd, systemd) start a unit's program
@@ -3673,7 +3668,7 @@ def _uv_executable() -> str:
             "absolute path so launchd / systemd don't have to find it "
             "on their minimal PATH."
         )
-    return str(Path(path).resolve())
+    return Path(path).resolve()
 
 
 class ExitOutcome(NamedTuple):
@@ -4808,8 +4803,7 @@ def run_group(
                     (r, n) for r, n in resolved_children if n is not None
                 ]
                 header_children = [
-                    n if n is not None else format_entity_ref(r)
-                    for r, n in resolved_children
+                    n if n is not None else str(r) for r, n in resolved_children
                 ]
                 header = (
                     f"\n=== {started_iso} group {full_name} "
@@ -4927,13 +4921,13 @@ def run_group(
                     if resolved_name is None:
                         log_file.write(
                             (
-                                f"-> ref {format_entity_ref(child_ref)}: "
+                                f"-> ref {child_ref}: "
                                 f"no snapshot on this host (FAIL)\n"
                             ).encode()
                         )
                         children.append(
                             GroupChildResult(
-                                name=format_entity_ref(child_ref),
+                                name=str(child_ref),
                                 exit_class="fail",
                                 exit_code=int(ExitCode.PRECONDITION),
                             )
@@ -4998,11 +4992,11 @@ def _timer_path_for(name: str) -> Path:
     return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
 
 
-def _platform_unit_path(name: str, platform: str) -> Path | None:
-    """Path of the on-disk platform unit file for `name`, or None
-    when no file is present. The status `unit-config` column reads
-    this from `RuntimeState`; the load_config boundary rule means
-    no caller walks the unit dirs ad-hoc.
+def _platform_unit_config_path(name: str, platform: str) -> Path | None:
+    """Path of the on-disk platform unit config file for `name`,
+    or None when no file is present. The status `unit-config`
+    column reads this from `RuntimeState`; the load_config
+    boundary rule means no caller walks the unit dirs ad-hoc.
 
     On darwin: the launchd plist. On linux: the `.timer` if
     present (scheduled entries), else the `.service` (group-only
@@ -5109,8 +5103,8 @@ def _render_plist(
     schedule: str | None,
     interval: str | None,
     *,
-    uv_path: str | None = None,
-    crony_path: str | None = None,
+    uv_path: Path | None = None,
+    crony_path: Path | None = None,
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
@@ -5132,13 +5126,15 @@ def _render_plist(
     what apply originally pinned.
     """
     label = _label_for(name)
+    uv = uv_path if uv_path is not None else _uv_executable()
+    crony = crony_path if crony_path is not None else _crony_executable()
     program_args = [
-        uv_path if uv_path is not None else _uv_executable(),
+        str(uv),
         "run",
         "--script",
-        crony_path if crony_path is not None else _crony_executable(),
+        str(crony),
         "run",
-        format_entity_ref(ref),
+        str(ref),
     ]
     args_xml = "".join(
         f"        <string>{xml.sax.saxutils.escape(a)}</string>\n"
@@ -5186,8 +5182,8 @@ def _render_systemd_service(
     name: str,
     ref: EntityRef,
     *,
-    uv_path: str | None = None,
-    crony_path: str | None = None,
+    uv_path: Path | None = None,
+    crony_path: Path | None = None,
 ) -> str:
     """Render the systemd .service unit. Independent of schedule.
 
@@ -5209,7 +5205,7 @@ def _render_systemd_service(
         "[Service]\n"
         "Type=oneshot\n"
         f"ExecStart={uv} run --script {crony} run "
-        f"{format_entity_ref(ref)}\n"
+        f"{ref}\n"
         "WorkingDirectory=%h\n"
     )
 
@@ -5243,8 +5239,8 @@ def _render_units(
     interval: str | None,
     platform: str,
     *,
-    uv_path: str | None = None,
-    crony_path: str | None = None,
+    uv_path: Path | None = None,
+    crony_path: Path | None = None,
 ) -> dict[str, str]:
     """Return {filename: content} for the platform units of (name, schedule).
 
@@ -5289,7 +5285,7 @@ def _render_units(
 
 def _extract_unit_exec_paths(
     content: str, platform: str
-) -> tuple[str, str] | None:
+) -> tuple[Path, Path] | None:
     """Recover the `(uv_path, crony_path)` baked into a rendered
     unit file. Returns None when the file isn't a crony-shaped
     unit (parse failure, missing expected keys, or argv shape
@@ -5338,7 +5334,7 @@ def _extract_unit_exec_paths(
             return None
     if argv[1] != "run" or argv[2] != "--script" or argv[4] != "run":
         return None
-    return argv[0], argv[3]
+    return Path(argv[0]), Path(argv[3])
 
 
 def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
@@ -5371,8 +5367,8 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
             snap.schedule,
             snap.interval,
             platform,
-            uv_path="",
-            crony_path="",
+            uv_path=Path(),
+            crony_path=Path(),
         ).keys()
     )
     if platform == "linux":
@@ -5395,7 +5391,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         if extracted is None:
             return True
         uv_path, crony_path = extracted
-        if not Path(uv_path).is_file() or not Path(crony_path).is_file():
+        if not uv_path.is_file() or not crony_path.is_file():
             return True
         re_rendered = _render_units(
             full_name,
@@ -6917,7 +6913,7 @@ def do_destroy(
         for n in normalized:
             if n in known:
                 continue
-            syn = parse_entity_ref(n)
+            syn = EntityRef.from_str(n)
             if syn is not None and _entity_state_dir(syn).is_dir():
                 continue
             unknown.append(n)
@@ -6943,7 +6939,7 @@ def do_destroy(
         # snapshot is accepted by the upstream validation and
         # lands here as `direct_ref` -- use it directly since
         # neither Config source knows about it.
-        direct_ref = parse_entity_ref(full)
+        direct_ref = EntityRef.from_str(full)
         ref = config.resolve_current(full) or direct_ref
         sd = _entity_state_dir(ref) if ref is not None else None
         # Recover the entity's actual name for platform unit
@@ -7551,7 +7547,7 @@ def _resolve_state_axes(
     # entries match by `broken_by_full_name`; entries with no
     # recoverable name flow through as a `<bundle>:<UUID>` ref
     # whose parsed form is in `broken`.
-    direct_ref = parse_entity_ref(full)
+    direct_ref = EntityRef.from_str(full)
     if full in config.broken_by_full_name or (
         direct_ref is not None and direct_ref in config.broken
     ):
@@ -7779,7 +7775,6 @@ def do_status(
     config_current: bool,
     config_pending: bool,
     exclude_healthy: bool,
-    exclude_disabled: bool,
 ) -> None:
     """Print the resolved state per job in a tabular view.
 
@@ -7804,11 +7799,10 @@ def do_status(
 
     `--exclude-healthy` drops rows where CONFIG is `synced`,
     UNIT is `enabled` (or `grouped` -- anything that fires), and
-    LAST is `ok` / `never` / `gated`. Output is flat (no tree
-    indent). Always exits 0 -- this is a filter on the display,
-    not a gate. `--exclude-disabled` further drops rows whose
-    unit is intentionally disabled, so a host where some entries
-    are deliberately off doesn't churn the unhealthy table.
+    LAST is `ok` / `never` / `gated`. A disabled unit is
+    unhealthy (it isn't firing), so it survives the filter.
+    Output is flat (no tree indent). Always exits 0 -- this is a
+    filter on the display, not a gate.
     """
     if config_current and config_pending:
         raise UsageError(
@@ -7868,7 +7862,7 @@ def do_status(
         # only through the synthetic `<bundle>:<UUID>` form. The
         # corresponding row carries that form as its JOB cell.
         broken_synthetic = {
-            format_entity_ref(b.ref)
+            str(b.ref)
             for b in config.broken.values()
             if b.name is None and (bundle is None or b.bundle == bundle)
         }
@@ -7962,7 +7956,7 @@ def do_status(
         # show.
         any_ref = config.resolve_current(full) or config.resolve_pending(full)
         rt = config.runtime.get(any_ref) if any_ref is not None else None
-        unit_config_cell = str(rt.unit_path) if rt and rt.unit_path else ""
+        unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         rows.append(
             {
                 "job": full,
@@ -7988,14 +7982,10 @@ def do_status(
         # tree anyway and a half-indented subtree is more
         # confusing than a flat list. Healthy: `config == synced`
         # AND `unit` not in {none, disabled} AND `last` in
-        # {ok, never, gated}. A disabled unit is unhealthy by
-        # default because it isn't firing -- callers that have
-        # deliberately disabled some units pass
-        # `--exclude-disabled` to suppress those rows.
+        # {ok, never, gated}. A disabled unit is unhealthy
+        # because it isn't firing.
         healthy_last = {"ok", "never", "gated"}
-        unhealthy_unit = {"none"}
-        if not exclude_disabled:
-            unhealthy_unit = unhealthy_unit | {"disabled"}
+        unhealthy_unit = {"none", "disabled"}
         rows = [
             r
             for r in rows
@@ -8110,7 +8100,7 @@ def do_logs(
         ref = (
             config.resolve_current(full)
             or config.resolve_pending(full)
-            or parse_entity_ref(full)
+            or EntityRef.from_str(full)
         )
         if ref is not None:
             # Derive the state dir directly from the ref. This
@@ -8280,7 +8270,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     the same in `crony status` as an ordinary "edited config,
     not yet applied" drift while scheduled fires silently fail.
     """
-    parsed = parse_entity_ref(ref)
+    parsed = EntityRef.from_str(ref)
     if parsed is None:
         raise UsageError(
             f"crony run takes <bundle>:<uuid>, got {ref!r}; "
@@ -8336,7 +8326,7 @@ def _record_snapshot_load_failure(
     }
     _write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / "run.log"
-    line = f"\n=== {now} CANCELED {format_entity_ref(ref)} ===\n   {exc}\n"
+    line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))
 
@@ -9055,14 +9045,6 @@ def build_parser() -> argparse.ArgumentParser:
             "scheduler, and last in ok/never/gated. Output is "
             "flat (no tree indent). Always exits 0 -- this is a "
             "filter on the display, not a gate."
-        ),
-    )
-    p_status.add_argument(
-        "--exclude-disabled",
-        action="store_true",
-        help=(
-            "Combined with --exclude-healthy: also drop rows "
-            "whose unit is intentionally disabled."
         ),
     )
 
