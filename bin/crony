@@ -5997,87 +5997,55 @@ def _last_ran_at(config: Config, full_name: str) -> str:
     return f"{secs // 86400}d ago"
 
 
-def _config_state_for(
-    config: TomlBundleConfig,
-    short: str,
-    full_name: str,
-    platform: str,
-    *,
-    current_by_full_name: dict[str, EntityRef] | None = None,
+def _config_axis(
+    config: Config,
+    full: str,
+    entry: TomlJob | TomlJobGroup | None,
+    bn: str,
 ) -> str:
-    """Return CONFIG axis value: synced / stale / missing / orphan / error.
+    """CONFIG axis (synced / stale / broken / missing / orphan)
+    for `full`, derived entirely from the in-memory `Config` --
+    no filesystem or scheduler re-query. `error` is handled by
+    the caller (it's name-based; an errored entry has no ref).
 
-    `short` is the bundle-local name (used to look up the entry in
-    `config`); `full_name` is the namespaced name used for the
-    on-disk snapshot and unit identifier.
-
-    A "remnant" here is any signal that crony has on-disk state
-    for this entry: a state-dir snapshot, a leftover platform unit
-    file, or a state dir surviving a non-purge destroy. All three
-    surface as orphans for destroy when the entry isn't in config.
-    A "stamp" is the narrower snapshot-or-unit set -- the entry is
-    actively installed and apply / enable / disable / trigger can
-    operate on it.
-
-    `error` takes precedence over every other axis value: an
-    entry whose bundle config rejected it can't be compared
-    against the installed state (we don't have its fields), so
-    whatever's currently on disk is left alone and surfaced as
-    `error` so the user can fix the config.
+    The ref to score is the entry's own `<bundle>:<uuid>` when it
+    is still in config, otherwise whatever the on-disk side
+    recovered (current snapshot, broken snapshot, or unit-only
+    orphan). `Config.config_state` reduces the pending and current
+    graphs -- both built once at load -- to a single verdict;
+    `unit_is_stale` (the load-time unit-install integrity check)
+    and a lingering-unit check layer drift signals on top of a
+    bare snapshot comparison.
     """
-    if short in config.errored_jobs or short in config.errored_job_groups:
-        return "error"
-    in_config = short in config.jobs or short in config.job_groups
-    entry: TomlJob | TomlJobGroup | None = config.jobs.get(
-        short
-    ) or config.job_groups.get(short)
-    bn, _ = parse_full_name(full_name)
-    state_dir: Path | None = None
     if entry is not None:
-        state_dir = _entity_state_dir(EntityRef(bn, entry.uuid))
+        ref: EntityRef | None = EntityRef(bn, entry.uuid)
     else:
-        ref = (
-            current_by_full_name.get(full_name)
-            if current_by_full_name is not None
-            else None
-        )
-        if ref is not None:
-            state_dir = _entity_state_dir(ref)
-    has_snapshot = (
-        state_dir is not None and (state_dir / "snapshot.json").is_file()
-    )
-    has_unit = full_name in _platform_unit_names()
-    has_state_dir = state_dir is not None and state_dir.is_dir()
-    has_stamp = has_snapshot or has_unit
-    has_remnant = has_stamp or has_state_dir
-    if not in_config:
-        return "orphan" if has_remnant else "missing"
-    if not has_stamp:
+        ref = config.resolve_current(full) or config.resolve_pending(full)
+    if ref is None or ref not in config.all_refs():
+        # Nothing the in-memory model knows by this ref: an
+        # in-config-but-host-masked entry (absent from the pending
+        # graph) or a bare name with no on-disk state. "missing"
+        # is the pre-mask base the mask layer turns into "masked".
         return "missing"
-    if not has_snapshot:
-        # Unit on disk but no snapshot to compare against (state
-        # was wiped, or the unit pre-dates this crony binary).
-        # Treat as drift so the user gets a clear "re-apply"
-        # signal.
+    state = config.config_state(ref)
+    if (
+        state == "missing"
+        and entry is not None
+        and full in config.unit_only_by_full_name
+    ):
+        # In config and never cleanly applied (no current
+        # snapshot) but a platform unit lingers from a prior apply
+        # whose state dir was wiped -- re-apply territory,
+        # surfaced as drift rather than a clean "not applied."
         return "stale"
-    assert entry is not None and state_dir is not None
-    target = resolve_target(config, current_host(), platform)
-    if isinstance(entry, TomlJob):
-        pending_snapshot: Job | JobGroup = _resolve_job_snapshot(
-            config, target, entry, full_name, bn
-        )
-    else:
-        pending_snapshot = _resolve_group_snapshot(
-            config, target, entry, bn, full_name
-        )
-    # Drift detection: compare the freshly-resolved pending
-    # snapshot to whatever's on disk. Both reduce to the same
-    # dataclass shape so `==` is enough.
-    try:
-        current_snapshot = _load_snapshot(EntityRef(bn, entry.uuid))
-    except PreconditionError:
-        return "stale"
-    return "synced" if current_snapshot == pending_snapshot else "stale"
+    if state == "synced":
+        # Snapshot equality alone isn't enough: a matching
+        # snapshot whose unit file is missing / hand-edited /
+        # unloaded is still stale and apply must re-render.
+        rs = config.runtime.get(ref)
+        if rs is not None and rs.unit_is_stale:
+            return "stale"
+    return state
 
 
 def _enable_unit(name: str, platform: str) -> None:
@@ -7475,50 +7443,31 @@ def _resolve_state_axes(
     mask-reason / synced-stale-missing axes are uninteresting
     until then.
 
-    `mask_reason` is the entry's filter-exclusion reason on this
-    host; when non-empty, the cfg axis becomes `"orphan"` if
-    on-disk remnants exist and `"masked"` otherwise. The
-    orphan-on-mask rule encodes "cleanup needed wins over
-    passive-not-for-this-host."
+    The synced / stale / missing / orphan / broken base comes
+    from `_config_axis`, which scores the entity against the
+    in-memory `Config` (no disk re-query). `mask_reason` is the
+    entry's filter-exclusion reason on this host; when non-empty,
+    the cfg axis becomes `"orphan"` if on-disk remnants exist and
+    `"masked"` otherwise. The orphan-on-mask rule encodes
+    "cleanup needed wins over passive-not-for-this-host."
     """
     bn, short = parse_full_name(full)
     bundle = config.toml_config.by_name(bn)
-    if bundle is None:
-        cfg_state = "orphan" if full in remnants else "missing"
-        entry: TomlJob | TomlJobGroup | None = None
-    else:
-        cfg_state = _config_state_for(
-            bundle.config,
-            short=short,
-            full_name=full,
-            platform=platform,
-            current_by_full_name=config.current.by_full_name,
-        )
-        entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
-            short
-        )
-        # Snapshot equality alone is not enough: an entity with a
-        # matching snapshot but a missing / hand-edited / unloaded
-        # unit file is still stale and apply must re-render. The
-        # unit-install integrity check ran at load time and lives
-        # on RuntimeState; consume it here so the synced verdict
-        # implies "snapshot AND install both match."
-        if cfg_state == "synced" and entry is not None:
-            rs = config.runtime.get(EntityRef(bn, entry.uuid))
-            if rs is not None and rs.unit_is_stale:
-                cfg_state = "stale"
-    # Broken takes precedence over mask-reason the same way
-    # `error` does: a broken snapshot is the operator's
-    # actionable item regardless of whether the entry would
-    # otherwise filter out on this host. Recovered-name broken
-    # entries match by `broken_by_full_name`; entries with no
-    # recoverable name flow through as a `<bundle>:<UUID>` ref
-    # whose parsed form is in `broken`.
-    direct_ref = EntityRef.from_str(full)
-    if full in config.broken_by_full_name or (
-        direct_ref is not None and direct_ref in config.broken
+    entry: TomlJob | TomlJobGroup | None = None
+    if bundle is not None and (
+        short in bundle.config.errored_jobs
+        or short in bundle.config.errored_job_groups
     ):
-        cfg_state = "broken"
+        # An errored entry never parsed into a uuid, so it has no
+        # ref to score against the graphs; `error` is top-of-chain
+        # and surfaces by name.
+        cfg_state = "error"
+    else:
+        if bundle is not None:
+            entry = bundle.config.jobs.get(
+                short
+            ) or bundle.config.job_groups.get(short)
+        cfg_state = _config_axis(config, full, entry, bn)
     if mask_reason and cfg_state not in ("error", "broken"):
         cfg_state = "orphan" if full in remnants else "masked"
     if cfg_state == "missing":

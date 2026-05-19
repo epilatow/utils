@@ -5594,20 +5594,28 @@ class TestUnitStateLinux:
 
 
 class TestConfigState:
+    """`Config.config_state` classification driven through the real
+    apply -> load_config path (vs `TestConfigStateInMemory`, which
+    plants snapshots by hand). Confirms apply_one writes a snapshot
+    that load_config scores as synced, and that a config edit
+    without re-apply flips it to stale.
+    """
+
+    def _ref(self, config: Any, full: str) -> Any:
+        return config.pending.by_full_name.get(
+            full
+        ) or config.current.by_full_name.get(full)
+
     def test_missing_when_in_config_no_stamp(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        assert (
-            crony._config_state_for(
-                cfg, short="j", full_name="default.j", platform="darwin"
-            )
-            == "missing"
-        )
+        config = crony.load_config()
+        assert config.config_state(self._ref(config, "default.j")) == "missing"
 
     def test_synced_after_apply(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -5616,12 +5624,8 @@ class TestConfigState:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        assert (
-            crony._config_state_for(
-                cfg, short="j", full_name="default.j", platform="darwin"
-            )
-            == "synced"
-        )
+        config = crony.load_config()
+        assert config.config_state(self._ref(config, "default.j")) == "synced"
 
     def test_stale_when_config_changes(
         self, tmp_path: Path, monkeypatch: Any
@@ -5632,38 +5636,24 @@ class TestConfigState:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg1, "j")
-        cfg2 = h.config(
+        # Edit the config (new schedule) without re-applying.
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
         )
-        assert (
-            crony._config_state_for(
-                cfg2, short="j", full_name="default.j", platform="darwin"
-            )
-            == "stale"
-        )
+        config = crony.load_config()
+        assert config.config_state(self._ref(config, "default.j")) == "stale"
 
     def test_orphan_stamped_not_in_config(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        # Stamp the entry on disk: per-entry dir with a snapshot.
+        # Stamp the entry on disk, then drop it from the config.
         h.fabricate_orphan("old")
-        cfg = h.config({}, default_target_jobs=[])
-        # The status pipeline passes the current graph's
-        # by_full_name index so the orphan branch can locate the
-        # state dir without a name->uuid disk scan.
-        loaded = crony.load_config()
-        assert (
-            crony._config_state_for(
-                cfg,
-                short="old",
-                full_name="default.old",
-                platform="darwin",
-                current_by_full_name=loaded.current.by_full_name,
-            )
-            == "orphan"
-        )
+        h.config({}, default_target_jobs=[])
+        config = crony.load_config()
+        ref = config.current.by_full_name["default.old"]
+        assert config.config_state(ref) == "orphan"
 
 
 class TestEnableDisable:
@@ -10843,6 +10833,34 @@ class TestUnitDriftDetection:
         )
         out = capsys.readouterr().out
         # Find the row for default.j and confirm CONFIG is stale.
+        for line in out.splitlines():
+            if h.full("j") in line:
+                assert "stale" in line
+                break
+        else:
+            raise AssertionError(f"no row found for {h.full('j')}:\n{out}")
+
+    def test_in_config_unit_lingers_after_snapshot_wipe_is_stale(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Entry still in config and its platform unit on disk, but
+        # the state-dir snapshot was wiped. The in-memory model
+        # records this as a unit-only orphan; `_config_axis`
+        # upgrades the in-config "missing" verdict to "stale" so
+        # the operator is steered to re-apply rather than seeing a
+        # bare "not applied."
+        h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
+        (h.state_dir("j") / "snapshot.json").unlink()
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
         for line in out.splitlines():
             if h.full("j") in line:
                 assert "stale" in line
