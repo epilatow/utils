@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import dataclasses
 import datetime
@@ -19,6 +20,7 @@ import fcntl
 import json
 import logging
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -141,7 +143,11 @@ changing its `uuid`) loses it. The runner reads the snapshot,
 never the live config: editing the toml without `apply`
 therefore has no effect on running units, and `crony status`
 reports any divergence between live config and on-disk snapshot
-as `config=stale` via direct dataclass equality.
+as `config=stale` via direct dataclass equality. The platform
+unit file gets the same drift treatment: a missing / hand-edited
+/ unloaded unit file (or one referencing a uv / crony binary
+that's since been removed) also surfaces as `config=stale` so
+`crony apply` re-renders and re-bootstraps it.
 
 TomlBundleConfig bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -2919,6 +2925,15 @@ class RuntimeState:
     `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR` themselves. Following
     the load_config boundary rule: all platform-state queries
     happen here at load time.
+
+    `unit_is_stale` is True when the platform install diverges
+    from what the snapshot would render: missing or hand-edited
+    unit file, missing uv / crony binary baked into the file, or
+    a unit the scheduler no longer has loaded. Drives the
+    CONFIG=stale axis and forces apply to re-render even when
+    the snapshot itself is unchanged. Set only for entries with
+    a parseable snapshot; defaults False for broken / unit-only
+    refs that don't have a snapshot to compare against.
     """
 
     state_dir: Path
@@ -2928,6 +2943,7 @@ class RuntimeState:
     has_user_trigger_flag: bool
     unit_path: Path | None = None
     unit_file_present: bool = False
+    unit_is_stale: bool = False
 
 
 @dataclass
@@ -3159,6 +3175,7 @@ def _read_runtime_state(
     *,
     full_name: str | None = None,
     platform: str | None = None,
+    snapshot: Job | JobGroup | None = None,
 ) -> RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
     parsed last-run record and presence of the lock / pending /
@@ -3166,6 +3183,13 @@ def _read_runtime_state(
     supplied, also probe the platform unit file path so
     subcommands can read it from RuntimeState instead of walking
     the unit dirs ad-hoc.
+
+    `snapshot` is the parsed `Job` / `JobGroup` for entries in
+    `Config.current`; when supplied (and `full_name` / `platform`
+    are too), the unit-install integrity check runs and
+    `unit_is_stale` reflects the result. Left None for broken
+    refs (no snapshot) and unit-only refs (no state dir to read
+    from).
     """
     last_run: LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -3187,8 +3211,11 @@ def _read_runtime_state(
             is_running = True
 
     unit_path: Path | None = None
+    unit_is_stale = False
     if full_name is not None and platform is not None:
         unit_path = _platform_unit_path(full_name, platform)
+        if snapshot is not None:
+            unit_is_stale = _unit_is_stale(full_name, snapshot, platform)
 
     return RuntimeState(
         state_dir=state_dir,
@@ -3198,6 +3225,7 @@ def _read_runtime_state(
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
         unit_path=unit_path,
         unit_file_present=unit_path is not None,
+        unit_is_stale=unit_is_stale,
     )
 
 
@@ -3321,6 +3349,7 @@ def _build_current_graph(
                     "job",
                     full_name=snap_j.name,
                     platform=platform,
+                    snapshot=snap_j,
                 )
             elif kind == "group":
                 try:
@@ -3341,6 +3370,7 @@ def _build_current_graph(
                     "group",
                     full_name=snap_g.name,
                     platform=platform,
+                    snapshot=snap_g,
                 )
             else:
                 broken[ref] = BrokenEntity(
@@ -5078,6 +5108,9 @@ def _render_plist(
     ref: EntityRef,
     schedule: str | None,
     interval: str | None,
+    *,
+    uv_path: str | None = None,
+    crony_path: str | None = None,
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
@@ -5090,13 +5123,20 @@ def _render_plist(
     launchd's per-agent PATH is `/usr/bin:/bin:/usr/sbin:/sbin`,
     which doesn't contain uv, so the shebang's `env` lookup fails
     with exit 127 before crony can run at all.
+
+    `uv_path` / `crony_path` override the live `_uv_executable()`
+    / `_crony_executable()` resolution: apply leaves them None
+    (use the live paths), the unit-drift integrity check passes
+    the paths it extracted from the on-disk file so the byte-
+    comparison stays meaningful when the live PATH differs from
+    what apply originally pinned.
     """
     label = _label_for(name)
     program_args = [
-        _uv_executable(),
+        uv_path if uv_path is not None else _uv_executable(),
         "run",
         "--script",
-        _crony_executable(),
+        crony_path if crony_path is not None else _crony_executable(),
         "run",
         format_entity_ref(ref),
     ]
@@ -5142,7 +5182,13 @@ def _render_plist(
     )
 
 
-def _render_systemd_service(name: str, ref: EntityRef) -> str:
+def _render_systemd_service(
+    name: str,
+    ref: EntityRef,
+    *,
+    uv_path: str | None = None,
+    crony_path: str | None = None,
+) -> str:
     """Render the systemd .service unit. Independent of schedule.
 
     ExecStart invokes uv with absolute paths and addresses the
@@ -5150,16 +5196,19 @@ def _render_systemd_service(name: str, ref: EntityRef) -> str:
     lookup -- same reason as for plist (see _render_plist's
     docstring). The unit description carries the human-readable
     name.
+
+    `uv_path` / `crony_path` override the live resolvers; see
+    `_render_plist` for the rationale.
     """
-    uv_path = _uv_executable()
-    crony_path = _crony_executable()
+    uv = uv_path if uv_path is not None else _uv_executable()
+    crony = crony_path if crony_path is not None else _crony_executable()
     return (
         "[Unit]\n"
         f"Description=crony job {name}\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={uv_path} run --script {crony_path} run "
+        f"ExecStart={uv} run --script {crony} run "
         f"{format_entity_ref(ref)}\n"
         "WorkingDirectory=%h\n"
     )
@@ -5193,6 +5242,9 @@ def _render_units(
     schedule: str | None,
     interval: str | None,
     platform: str,
+    *,
+    uv_path: str | None = None,
+    crony_path: str | None = None,
 ) -> dict[str, str]:
     """Return {filename: content} for the platform units of (name, schedule).
 
@@ -5206,21 +5258,159 @@ def _render_units(
     so loading doesn't auto-fire). On linux, only the .service file
     is rendered for schedule-less entries; the .timer is omitted
     because a timer with no triggering condition is dead weight.
+
+    `uv_path` / `crony_path` thread through to the per-platform
+    renderers; left None for apply (live resolution) and supplied
+    by the unit-drift integrity check with paths extracted from
+    the existing file.
     """
     if platform == "darwin":
         return {
             f"{_label_for(name)}.plist": _render_plist(
-                name, ref, schedule, interval
+                name,
+                ref,
+                schedule,
+                interval,
+                uv_path=uv_path,
+                crony_path=crony_path,
             )
         }
     units = {
-        f"{BASENAME}-{name}.service": _render_systemd_service(name, ref),
+        f"{BASENAME}-{name}.service": _render_systemd_service(
+            name, ref, uv_path=uv_path, crony_path=crony_path
+        ),
     }
     if schedule is not None or interval is not None:
         units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(
             name, schedule, interval
         )
     return units
+
+
+def _extract_unit_exec_paths(
+    content: str, platform: str
+) -> tuple[str, str] | None:
+    """Recover the `(uv_path, crony_path)` baked into a rendered
+    unit file. Returns None when the file isn't a crony-shaped
+    unit (parse failure, missing expected keys, or argv shape
+    that doesn't match `[uv, "run", "--script", crony, "run",
+    "<bundle>:<uuid>"]`).
+
+    Used by the unit-drift integrity check so it can re-render
+    the expected unit content using the same paths the file was
+    originally rendered with; without that the byte-comparison
+    would false-positive whenever the live `_uv_executable()` /
+    `_crony_executable()` resolution returned a different path
+    than apply originally pinned (e.g. a new shell with a
+    different PATH, or a worktree's crony script running against
+    state dirs apply'd from a different checkout).
+    """
+    argv: list[str]
+    if platform == "darwin":
+        try:
+            data = plistlib.loads(content.encode("utf-8"))
+        except (plistlib.InvalidFileException, ValueError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        args = data.get("ProgramArguments")
+        if not isinstance(args, list) or len(args) != 6:
+            return None
+        if not all(isinstance(a, str) for a in args):
+            return None
+        argv = list(args)
+    else:
+        parser = configparser.ConfigParser(
+            interpolation=None, delimiters=("=",), strict=False
+        )
+        try:
+            parser.read_string(content)
+        except configparser.Error:
+            return None
+        exec_start = parser.get("Service", "ExecStart", fallback=None)
+        if not isinstance(exec_start, str):
+            return None
+        try:
+            argv = shlex.split(exec_start)
+        except ValueError:
+            return None
+        if len(argv) != 6:
+            return None
+    if argv[1] != "run" or argv[2] != "--script" or argv[4] != "run":
+        return None
+    return argv[0], argv[3]
+
+
+def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
+    """True when the platform install diverges from the snapshot.
+
+    Verifies, for each unit file `_render_units` would create:
+    the file exists; its content parses out the `(uv, crony)`
+    exec paths in the expected argv shape; those paths still
+    resolve to files on disk; and the content matches what
+    `_render_units` produces when called with the extracted
+    paths. Additionally flags an orphaned `.timer` left over
+    from a schedule -> unscheduled transition, and a unit the
+    platform scheduler has unloaded (`_unit_state == "none"`).
+
+    Any divergence returns True so `crony status` reports
+    `config=stale` and `crony apply` re-renders / re-bootstraps
+    even when the snapshot itself is unchanged.
+    """
+    if platform == "darwin":
+        unit_dir = LAUNCHAGENTS_DIR
+    else:
+        unit_dir = SYSTEMD_USER_DIR
+    # Filename set is path-independent -- placeholders below
+    # never bleed into the byte comparison, which always
+    # re-renders using paths extracted from the on-disk file.
+    expected_filenames = set(
+        _render_units(
+            full_name,
+            snap.ref,
+            snap.schedule,
+            snap.interval,
+            platform,
+            uv_path="",
+            crony_path="",
+        ).keys()
+    )
+    if platform == "linux":
+        timer_path = _timer_path_for(full_name)
+        if timer_path.is_file() and timer_path.name not in expected_filenames:
+            return True
+    for fname in expected_filenames:
+        path = unit_dir / fname
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return True
+        if fname.endswith(".timer"):
+            if content != _render_systemd_timer(
+                full_name, snap.schedule, snap.interval
+            ):
+                return True
+            continue
+        extracted = _extract_unit_exec_paths(content, platform)
+        if extracted is None:
+            return True
+        uv_path, crony_path = extracted
+        if not Path(uv_path).is_file() or not Path(crony_path).is_file():
+            return True
+        re_rendered = _render_units(
+            full_name,
+            snap.ref,
+            snap.schedule,
+            snap.interval,
+            platform,
+            uv_path=uv_path,
+            crony_path=crony_path,
+        )
+        if content != re_rendered[fname]:
+            return True
+    if _unit_state(full_name, platform) == "none":
+        return True
+    return False
 
 
 def _entity_schedule(
@@ -5402,12 +5592,19 @@ def apply_one(
     # freshly-resolved one. With both sides parsed into the same
     # dataclass shape, equality is a single Python `==`. A
     # missing / unparseable / wrong-schema on-disk snapshot is
-    # "not equal" and triggers a fresh write.
+    # "not equal" and triggers a fresh write. Equality alone
+    # isn't enough though: the unit-install integrity check
+    # catches a hand-edited / missing / unloaded unit file whose
+    # snapshot still matches what apply would resolve, so an
+    # otherwise-clean apply still re-renders and re-bootstraps
+    # the platform side.
     try:
         current_snapshot: Job | JobGroup | None = _load_snapshot(entity_ref)
     except PreconditionError:
         current_snapshot = None
-    if current_snapshot == snapshot:
+    if current_snapshot == snapshot and not _unit_is_stale(
+        full_name, snapshot, platform
+    ):
         return "unchanged"
     is_update = current_snapshot is not None
 
@@ -7337,6 +7534,16 @@ def _resolve_state_axes(
         entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
             short
         )
+        # Snapshot equality alone is not enough: an entity with a
+        # matching snapshot but a missing / hand-edited / unloaded
+        # unit file is still stale and apply must re-render. The
+        # unit-install integrity check ran at load time and lives
+        # on RuntimeState; consume it here so the synced verdict
+        # implies "snapshot AND install both match."
+        if cfg_state == "synced" and entry is not None:
+            rs = config.runtime.get(EntityRef(bn, entry.uuid))
+            if rs is not None and rs.unit_is_stale:
+                cfg_state = "stale"
     # Broken takes precedence over mask-reason the same way
     # `error` does: a broken snapshot is the operator's
     # actionable item regardless of whether the entry would
