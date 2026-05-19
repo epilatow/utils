@@ -797,9 +797,17 @@ class TomlBundle:
 @dataclass
 class TomlConfig:
     """All loaded bundles, keyed by bundle name. Order is the load
-    order (config.toml first, then config/*.toml lex-sorted)."""
+    order (config.toml first, then config/*.toml lex-sorted).
+
+    `errored_bundles` records per-file parse / validation
+    failures so a config that's broken in one bundle doesn't
+    block read-side subcommands (`status`, `destroy`, `logs`)
+    from operating on the rest. Surfaced in `status`'s header so
+    the operator notices.
+    """
 
     bundles: list[TomlBundle] = field(default_factory=list)
+    errored_bundles: dict[str, str] = field(default_factory=dict)
 
     def by_name(self, bundle_name: str) -> TomlBundle | None:
         for b in self.bundles:
@@ -2114,16 +2122,21 @@ def load_all_bundles() -> TomlConfig:
     `config/*.toml` (each -> bundle named after its filename stem).
 
     Per-bundle failures are isolated: a bundle that fails to parse,
-    fails schema validation, or has an invalid filename is dropped
-    with a CONFIG-level error logged for that source. Subsequent
-    bundles continue loading. The returned TomlConfig contains only
-    the bundles that loaded successfully.
+    fails schema validation, or has an invalid filename is recorded
+    in `TomlConfig.errored_bundles` (source path -> error
+    message) with a CONFIG-level error logged for that source.
+    Subsequent bundles continue loading.
 
-    It is an error if no bundles load -- either every config file is
-    broken or no config files exist at all.
+    Returns an empty `TomlConfig` when no candidate files exist or
+    every candidate file fails -- read-side subcommands
+    (`status`, `destroy`, `logs`, `crony run`) operate on the on-
+    disk state alone (`current`, `broken`, `unit_only`), so the
+    runner keeps firing through a config-broken state and the
+    operator can still inspect / clean up the on-disk picture.
+    `apply` is the only path that errors hard against the
+    affected bundle -- it needs pending-side data to do its job.
     """
     bundles = TomlConfig()
-    errors: list[str] = []
     seen_names: set[str] = set()
 
     candidates: list[tuple[str, Path]] = []
@@ -2133,36 +2146,28 @@ def load_all_bundles() -> TomlConfig:
         for path in sorted(CONFIG_DROPIN_DIR.glob("*.toml")):
             candidates.append((path.stem, path))
 
-    if not candidates:
-        raise ConfigError(
-            f"no config: expected {CONFIG_FILE} or {CONFIG_DROPIN_DIR}/*.toml"
-        )
-
     for bundle_name, path in candidates:
         try:
             _validate_bundle_name(bundle_name, str(path))
         except ConfigError as e:
-            errors.append(str(e))
+            bundles.errored_bundles[str(path)] = str(e)
             continue
         if bundle_name in seen_names:
-            errors.append(
-                f"{path}: bundle name {bundle_name!r} collides with "
+            bundles.errored_bundles[str(path)] = (
+                f"bundle name {bundle_name!r} collides with "
                 f"already-loaded bundle; this file will not load"
             )
             continue
         try:
             bundle = _load_one_bundle(bundle_name, path)
         except ConfigError as e:
-            errors.append(str(e))
+            bundles.errored_bundles[str(path)] = str(e)
             continue
         bundles.bundles.append(bundle)
         seen_names.add(bundle_name)
 
-    if errors:
-        for msg in errors:
-            logger.error("%s", msg)
-    if not bundles.bundles:
-        raise ConfigError("no bundles loaded successfully")
+    for src, msg in bundles.errored_bundles.items():
+        logger.error("%s: %s", src, msg)
     return bundles
 
 
@@ -6611,6 +6616,21 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
+    # Apply needs pending-side data for every entry it considers
+    # selected; if some bundles failed to parse, the no-args
+    # orphan-removal sweep would treat every stamped name as
+    # un-selected and wipe it. Refuse the full-sync sweep when
+    # bundles are errored; the operator must either fix the
+    # config or pass explicit names / `--bundle` so the wipe
+    # scope is intentional.
+    if not jobs and bundles.errored_bundles:
+        affected = sorted(bundles.errored_bundles)
+        raise UsageError(
+            "refusing the full-sync apply: one or more config "
+            f"files failed to parse ({affected}). Fix the config "
+            "or pass explicit job names / `--bundle <name>` so "
+            "the orphan-removal scope is intentional."
+        )
     by_full, selected = _selected_full_names_per_bundle(bundles)
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
@@ -7669,6 +7689,16 @@ def do_status(
                 "an active session. Fix: sudo loginctl enable-linger %s",
                 user,
             )
+
+    # Surface bundle parse failures at the top of the report so
+    # the operator sees them before scanning the table. The table
+    # itself shows whatever is interpretable on-disk; entries
+    # whose bundle didn't load show up as orphans or unit_only.
+    if bundles.errored_bundles:
+        print("bundle parse failures (config-side entries not loaded):")
+        for src, msg in bundles.errored_bundles.items():
+            print(f"  {src}: {msg}")
+        print()
 
     full_names: list[str]
     if jobs:

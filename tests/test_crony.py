@@ -4963,6 +4963,28 @@ class TestApplyFullSync:
         k_uuid = borgadm_cfg.jobs["k"].uuid
         assert (h.state / "borgadm" / k_uuid / "hash").exists()
 
+    def test_no_arg_apply_refuses_when_a_bundle_is_errored(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A bundle that failed to parse has no pending-side data;
+        # the no-args sweep would mark every stamped entry of
+        # that bundle as un-selected and wipe it. Refuse the
+        # sweep so the operator either fixes the config or
+        # passes explicit names / `--bundle` to scope the wipe
+        # intentionally. Surgical apply still works.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(h._last_cfg, "j")
+        h.cfg_dropin.mkdir(parents=True, exist_ok=True)
+        (h.cfg_dropin / "broken.toml").write_text(
+            "this is not [valid toml", encoding="utf-8"
+        )
+        with pytest.raises(crony.UsageError, match="refusing the full-sync"):
+            crony.do_apply(jobs=[], verbose=False, bundle=None)
+
 
 class TestApplyRenamePreservesHistory:
     """The whole point of keying state by uuid: a TOML edit that
@@ -9104,12 +9126,17 @@ class TestBundleLoading:
         bundles = crony.load_all_bundles()
         assert [b.name for b in bundles.bundles] == ["private"]
 
-    def test_no_configs_at_all_raises(
+    def test_no_configs_at_all_returns_empty(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # `load_all_bundles` tolerates the no-config case so the
+        # runner / destroy / status keep working off on-disk
+        # state alone. `apply` is the only caller that enforces
+        # "must have a config" -- it needs pending data.
         self._setup(tmp_path, monkeypatch)
-        with pytest.raises(crony.ConfigError, match="no config"):
-            crony.load_all_bundles()
+        bundles = crony.load_all_bundles()
+        assert bundles.bundles == []
+        assert bundles.errored_bundles == {}
 
     def test_lex_sorted_dropin_order(
         self, tmp_path: Path, monkeypatch: Any
@@ -9157,8 +9184,25 @@ class TestBundleLoading:
             bundles = crony.load_all_bundles()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["default", "ok"]
-        # The broken bundle's path is in the error output.
+        # The broken bundle's path is in errored_bundles and in
+        # the error log output.
+        assert any("broken.toml" in src for src in bundles.errored_bundles)
         assert any("broken.toml" in r.message for r in caplog.records)
+
+    def test_all_bundles_broken_returns_empty(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # The runner is config-independent so a fully-broken
+        # config shouldn't take down `crony status` / `destroy` /
+        # `logs`; load_all_bundles returns an empty TomlConfig
+        # with the parse failures captured.
+        cfg_file, dropin = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text("this is not [valid toml", encoding="utf-8")
+        (dropin / "alpha.toml").write_text("also broken (", encoding="utf-8")
+        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+            bundles = crony.load_all_bundles()
+        assert bundles.bundles == []
+        assert len(bundles.errored_bundles) == 2
 
     def test_bundle_loads_despite_undefined_group_ref(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
