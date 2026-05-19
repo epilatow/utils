@@ -1265,8 +1265,8 @@ def parse_entity_ref(arg: str) -> EntityRef | None:
     Both pieces are validated -- `bundle` must match
     `_BUNDLE_NAME_RE` and `UUID` must be a canonical
     8-4-4-4-12 `uuid.UUID()`-parseable string -- because the
-    parsed ref flows into a `_entity_state_dir(bundle, uuid)`
-    path composition that `shutil.rmtree` later trusts. An
+    parsed ref flows into an `_entity_state_dir(ref)` path
+    composition that `shutil.rmtree` later trusts. An
     unvalidated `../../etc` would point at a path outside
     `STATE_DIR/<bundle>/`.
     """
@@ -2615,12 +2615,12 @@ class JobGroup:
         return EntityRef(self.bundle, self.uuid)
 
 
-def _entity_state_dir(bundle_name: str, entity_uuid: str) -> Path:
-    return STATE_DIR / bundle_name / entity_uuid
+def _entity_state_dir(ref: EntityRef) -> Path:
+    return STATE_DIR / ref.bundle / ref.uuid
 
 
-def _snapshot_path_for(bundle_name: str, entity_uuid: str) -> Path:
-    return _entity_state_dir(bundle_name, entity_uuid) / "snapshot.json"
+def _snapshot_path_for(ref: EntityRef) -> Path:
+    return _entity_state_dir(ref) / "snapshot.json"
 
 
 def _resolve_job_snapshot(
@@ -2751,8 +2751,8 @@ def _serialize_snapshot(snap: Job | JobGroup) -> str:
     )
 
 
-def _load_snapshot(bundle: str, entity_uuid: str) -> Job | JobGroup:
-    """Load and validate a snapshot file by uuid. Raises
+def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
+    """Load and validate a snapshot file by ref. Raises
     PreconditionError if missing (entry not applied) or schema
     mismatch (re-apply required).
 
@@ -2762,8 +2762,8 @@ def _load_snapshot(bundle: str, entity_uuid: str) -> Job | JobGroup:
     use the recovered `name` field when available so the operator
     sees the human-readable identity.
     """
-    state_dir = _entity_state_dir(bundle, entity_uuid)
-    ref_str = f"{bundle}:{entity_uuid}"
+    state_dir = _entity_state_dir(ref)
+    ref_str = format_entity_ref(ref)
     p = state_dir / "snapshot.json"
     if not p.is_file():
         raise PreconditionError(
@@ -3366,16 +3366,15 @@ def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     return worst_class
 
 
-def _state_dir_for(bundle_name: str, entity_uuid: str) -> Path:
+def _state_dir_for(ref: EntityRef) -> Path:
     """State directory for an entity, materialized on disk.
 
-    Returns the uuid-keyed state dir for `(bundle_name, entity_uuid)`,
-    creating it (and the bundle subdir) when missing. Used by apply
-    and the runner -- both write files under the returned path on
-    every call, so a pre-existing empty dir is the right starting
-    state.
+    Returns the uuid-keyed state dir for `ref`, creating it (and
+    the bundle subdir) when missing. Used by apply and the runner
+    -- both write files under the returned path on every call, so
+    a pre-existing empty dir is the right starting state.
     """
-    d = _entity_state_dir(bundle_name, entity_uuid)
+    d = _entity_state_dir(ref)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -4301,7 +4300,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     the next scheduled fire and silently bypass *that* wait.
     """
 
-    sd = _entity_state_dir(snap.bundle, snap.uuid)
+    sd = _entity_state_dir(snap.ref)
 
     def _bypass() -> bool:
         return _consume_user_trigger_flag(sd)
@@ -4366,7 +4365,7 @@ def run_job(
         if not os.access(sp, os.X_OK):
             raise PreconditionError(f"script not executable: {sp}")
 
-    sd = _state_dir_for(snap.bundle, snap.uuid)
+    sd = _state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -4557,19 +4556,17 @@ def run_job(
         return int(ExitCode.LOCK_BUSY)
 
 
-def _child_full_name_from_uuid(
-    parent_bundle: str, child_uuid: str
-) -> str | None:
-    """Resolve a child's uuid (as stored in a parent's
-    `snapshot.children`) to its full namespaced name by reading
-    the child's own snapshot. The runner dispatches each child via
-    the platform unit label, which is keyed by full name; storing
-    uuids on the parent keeps the parent's hash stable across
-    child renames, at the cost of one snapshot read per child at
-    dispatch time. Returns None when the child snapshot is missing
-    or unreadable.
+def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
+    """Resolve a child's ref (as stored in a parent's
+    `snapshot.children` -- uuids paired with the parent's bundle)
+    to its full namespaced name by reading the child's own
+    snapshot. The runner dispatches each child via the platform
+    unit label, which is keyed by full name; storing uuids on the
+    parent keeps the parent's hash stable across child renames,
+    at the cost of one snapshot read per child at dispatch time.
+    Returns None when the child snapshot is missing or unreadable.
     """
-    snap_p = _entity_state_dir(parent_bundle, child_uuid) / "snapshot.json"
+    snap_p = _entity_state_dir(child_ref) / "snapshot.json"
     if not snap_p.is_file():
         return None
     try:
@@ -4580,7 +4577,7 @@ def _child_full_name_from_uuid(
     return name if isinstance(name, str) else None
 
 
-def _child_timeout_from_snapshot(bundle: str, child_uuid: str) -> float:
+def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     """Per-child wait cap for the group runner. Reads the child's
     pinned snapshot rather than the live config, so the cap is
     consistent with what the child's own runner will enforce.
@@ -4590,7 +4587,7 @@ def _child_timeout_from_snapshot(bundle: str, child_uuid: str) -> float:
     bounds the wait.
     """
     try:
-        cs = _load_snapshot(bundle, child_uuid)
+        cs = _load_snapshot(child_ref)
     except PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
     if isinstance(cs, Job):
@@ -4598,7 +4595,7 @@ def _child_timeout_from_snapshot(bundle: str, child_uuid: str) -> float:
     return float(cs.group_budget_sec)
 
 
-def _child_is_interactive(bundle: str, child_uuid: str) -> bool:
+def _child_is_interactive(child_ref: EntityRef) -> bool:
     """True iff the child is a job whose pinned snapshot has
     `interactive = True`. Groups and non-interactive jobs return
     False. A missing snapshot returns False so the existing
@@ -4606,7 +4603,7 @@ def _child_is_interactive(bundle: str, child_uuid: str) -> bool:
     fires and surfaces the issue with its usual error.
     """
     try:
-        cs = _load_snapshot(bundle, child_uuid)
+        cs = _load_snapshot(child_ref)
     except PreconditionError:
         return False
     return isinstance(cs, Job) and cs.interactive
@@ -4641,7 +4638,7 @@ def run_group(
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = _state_dir_for(snap.bundle, snap.uuid)
+    sd = _state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -4666,19 +4663,21 @@ def run_group(
                 # A None resolution means the child has no state
                 # dir on this host -- log and treat as a fail row
                 # so the group rollup catches it.
-                resolved_children: list[tuple[str, str | None]] = [
+                resolved_children: list[tuple[EntityRef, str | None]] = [
                     (
-                        child_uuid,
-                        _child_full_name_from_uuid(snap.bundle, child_uuid),
+                        EntityRef(snap.bundle, child_uuid),
+                        _child_full_name_from_uuid(
+                            EntityRef(snap.bundle, child_uuid)
+                        ),
                     )
                     for child_uuid in snap.children
                 ]
                 resolved_pairs = [
-                    (u, n) for u, n in resolved_children if n is not None
+                    (r, n) for r, n in resolved_children if n is not None
                 ]
                 header_children = [
-                    n if n is not None else f"{snap.bundle}:{u}"
-                    for u, n in resolved_children
+                    n if n is not None else format_entity_ref(r)
+                    for r, n in resolved_children
                 ]
                 header = (
                     f"\n=== {started_iso} group {full_name} "
@@ -4688,9 +4687,9 @@ def run_group(
                 log_file.write(header)
 
                 deadline = time.monotonic() + group_budget
-                for child_uuid, child_full_name in resolved_pairs:
-                    child_sd = _entity_state_dir(snap.bundle, child_uuid)
-                    if _child_is_interactive(snap.bundle, child_uuid):
+                for child_ref, child_full_name in resolved_pairs:
+                    child_sd = _entity_state_dir(child_ref)
+                    if _child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
                         # the user-active wait + dialog independently;
@@ -4739,9 +4738,7 @@ def run_group(
                         )
                         continue
 
-                    child_timeout = _child_timeout_from_snapshot(
-                        snap.bundle, child_uuid
-                    )
+                    child_timeout = _child_timeout_from_snapshot(child_ref)
                     child_wait = min(child_timeout, remaining)
 
                     log_file.write(
@@ -4794,19 +4791,17 @@ def run_group(
                 # references but no child snapshot resolves). Emitted
                 # after the dispatch loop so log order matches the
                 # header's child list.
-                for child_uuid, resolved_name in resolved_children:
+                for child_ref, resolved_name in resolved_children:
                     if resolved_name is None:
                         log_file.write(
                             (
-                                f"-> uuid {child_uuid}: no snapshot on this "
-                                f"host (FAIL)\n"
+                                f"-> ref {format_entity_ref(child_ref)}: "
+                                f"no snapshot on this host (FAIL)\n"
                             ).encode()
                         )
                         children.append(
                             GroupChildResult(
-                                name=format_entity_ref(
-                                    EntityRef(snap.bundle, child_uuid)
-                                ),
+                                name=format_entity_ref(child_ref),
                                 exit_class="fail",
                                 exit_code=int(ExitCode.PRECONDITION),
                             )
@@ -4871,8 +4866,8 @@ def _timer_path_for(name: str) -> Path:
     return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
 
 
-def _hash_path_for(bundle_name: str, entity_uuid: str) -> Path:
-    return _entity_state_dir(bundle_name, entity_uuid) / "hash"
+def _hash_path_for(ref: EntityRef) -> Path:
+    return _entity_state_dir(ref) / "hash"
 
 
 def _systemd_unit_name(name: str) -> str:
@@ -4962,16 +4957,15 @@ def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
 
 def _render_plist(
     name: str,
-    bundle: str,
-    entity_uuid: str,
+    ref: EntityRef,
     schedule: str | None,
     interval: str | None,
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
     The Label uses the full namespaced name for human readability;
-    the runner gets the entity's bundle + uuid in `bundle:uuid`
-    form so it can locate the state dir directly without scanning.
+    the runner gets the entity's `<bundle>:<uuid>` ref so it can
+    locate the state dir directly without scanning.
 
     ProgramArguments invokes uv with absolute paths rather than
     relying on the script's `env -S uv run --script` shebang.
@@ -4986,7 +4980,7 @@ def _render_plist(
         "--script",
         _crony_executable(),
         "run",
-        f"{bundle}:{entity_uuid}",
+        format_entity_ref(ref),
     ]
     args_xml = "".join(
         f"        <string>{xml.sax.saxutils.escape(a)}</string>\n"
@@ -5030,11 +5024,11 @@ def _render_plist(
     )
 
 
-def _render_systemd_service(name: str, bundle: str, entity_uuid: str) -> str:
+def _render_systemd_service(name: str, ref: EntityRef) -> str:
     """Render the systemd .service unit. Independent of schedule.
 
     ExecStart invokes uv with absolute paths and addresses the
-    entity by `bundle:uuid` so the runner skips the name->uuid
+    entity by `<bundle>:<uuid>` so the runner skips the name->uuid
     lookup -- same reason as for plist (see _render_plist's
     docstring). The unit description carries the human-readable
     name.
@@ -5048,7 +5042,7 @@ def _render_systemd_service(name: str, bundle: str, entity_uuid: str) -> str:
         "[Service]\n"
         "Type=oneshot\n"
         f"ExecStart={uv_path} run --script {crony_path} run "
-        f"{bundle}:{entity_uuid}\n"
+        f"{format_entity_ref(ref)}\n"
         "WorkingDirectory=%h\n"
     )
 
@@ -5077,8 +5071,7 @@ def _render_systemd_timer(
 
 def _render_units(
     name: str,
-    bundle: str,
-    entity_uuid: str,
+    ref: EntityRef,
     schedule: str | None,
     interval: str | None,
     platform: str,
@@ -5099,13 +5092,11 @@ def _render_units(
     if platform == "darwin":
         return {
             f"{_label_for(name)}.plist": _render_plist(
-                name, bundle, entity_uuid, schedule, interval
+                name, ref, schedule, interval
             )
         }
     units = {
-        f"{BASENAME}-{name}.service": _render_systemd_service(
-            name, bundle, entity_uuid
-        ),
+        f"{BASENAME}-{name}.service": _render_systemd_service(name, ref),
     }
     if schedule is not None or interval is not None:
         units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(
@@ -5138,7 +5129,7 @@ def _schedule_display(schedule: str | None, interval: str | None) -> str:
 
 def _compute_unit_hash(
     name: str,
-    bundle: str,
+    ref: EntityRef,
     entry: TomlJob | TomlJobGroup,
     platform: str,
     snapshot: Job | JobGroup,
@@ -5151,9 +5142,7 @@ def _compute_unit_hash(
     hash, so apply reports updated and audit catches drift.
     """
     schedule, interval = _entity_schedule(entry)
-    units = _render_units(
-        name, bundle, entry.uuid, schedule, interval, platform
-    )
+    units = _render_units(name, ref, schedule, interval, platform)
     h = hashlib.sha256()
     for fname in sorted(units):
         h.update(fname.encode("utf-8"))
@@ -5306,8 +5295,9 @@ def apply_one(
 
     schedule, interval = _entity_schedule(entry)
     platform = current_platform()
-    hash_path = _hash_path_for(bundle_name, entry.uuid)
-    snapshot_path = _snapshot_path_for(bundle_name, entry.uuid)
+    entity_ref = EntityRef(bundle_name, entry.uuid)
+    hash_path = _hash_path_for(entity_ref)
+    snapshot_path = _snapshot_path_for(entity_ref)
     target = resolve_target(config, current_host(), platform)
     if isinstance(entry, TomlJob):
         snapshot: Job | JobGroup = _resolve_job_snapshot(
@@ -5318,7 +5308,7 @@ def apply_one(
             config, target, entry, bundle_name, full_name
         )
     new_hash = _compute_unit_hash(
-        full_name, bundle_name, entry, platform, snapshot
+        full_name, entity_ref, entry, platform, snapshot
     )
     old_hash = hash_path.read_text().strip() if hash_path.exists() else None
 
@@ -5335,9 +5325,7 @@ def apply_one(
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(
-        full_name, bundle_name, entry.uuid, schedule, interval, platform
-    )
+    units = _render_units(full_name, entity_ref, schedule, interval, platform)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name
@@ -5808,8 +5796,9 @@ def _config_state_for(
     hash_path: Path | None
     state_dir: Path | None
     if entry is not None:
-        hash_path = _hash_path_for(bn, entry.uuid)
-        state_dir = _entity_state_dir(bn, entry.uuid)
+        entry_ref = EntityRef(bn, entry.uuid)
+        hash_path = _hash_path_for(entry_ref)
+        state_dir = _entity_state_dir(entry_ref)
     else:
         ref = (
             current_by_full_name.get(full_name)
@@ -5817,8 +5806,8 @@ def _config_state_for(
             else None
         )
         if ref is not None:
-            state_dir = _entity_state_dir(ref.bundle, ref.uuid)
-            hash_path = _hash_path_for(ref.bundle, ref.uuid)
+            state_dir = _entity_state_dir(ref)
+            hash_path = _hash_path_for(ref)
         else:
             state_dir = None
             hash_path = None
@@ -5844,7 +5833,9 @@ def _config_state_for(
         )
     else:
         snapshot = _resolve_group_snapshot(config, target, entry, bn, full_name)
-    new_hash = _compute_unit_hash(full_name, bn, entry, platform, snapshot)
+    new_hash = _compute_unit_hash(
+        full_name, EntityRef(bn, entry.uuid), entry, platform, snapshot
+    )
     old_hash = hash_path.read_text(encoding="utf-8").strip()
     return "synced" if old_hash == new_hash else "stale"
 
@@ -6052,8 +6043,8 @@ def _trigger_unit_sync(
 
     `state_dir` is the entity's uuid-keyed state directory,
     resolved by the caller (via `Config.current` or
-    `_entity_state_dir(bundle, uuid)` from a group parent's
-    snapshot). The path may not exist yet at call time (first
+    `_entity_state_dir(ref)` for a group parent's child). The
+    path may not exist yet at call time (first
     fire); the watcher polls run.pid / last-run.json under it
     without pre-creating the dir, so a unit that fails to load
     leaves no phantom remnant behind.
@@ -6569,11 +6560,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         config_for_orphans = load_config()
         for orphan in sorted(orphans):
             ref = config_for_orphans.current.by_full_name.get(orphan)
-            sd = (
-                _entity_state_dir(ref.bundle, ref.uuid)
-                if ref is not None
-                else None
-            )
+            sd = _entity_state_dir(ref) if ref is not None else None
             destroy_one(orphan, sd)
             logger.info("%s: orphan removed", orphan)
 
@@ -6639,10 +6626,7 @@ def do_destroy(
             if n in known:
                 continue
             syn = parse_entity_ref(n)
-            if (
-                syn is not None
-                and _entity_state_dir(syn.bundle, syn.uuid).is_dir()
-            ):
+            if syn is not None and _entity_state_dir(syn).is_dir():
                 continue
             unknown.append(n)
         if unknown:
@@ -6669,9 +6653,7 @@ def do_destroy(
         # neither Config source knows about it.
         direct_ref = parse_entity_ref(full)
         ref = config.resolve_current(full) or direct_ref
-        sd = (
-            _entity_state_dir(ref.bundle, ref.uuid) if ref is not None else None
-        )
+        sd = _entity_state_dir(ref) if ref is not None else None
         # Recover the entity's actual name for platform unit
         # cleanup: a `<bundle>:<UUID>` input doesn't carry the namespaced
         # name the unit file is keyed by, so destroy_one would
@@ -6928,7 +6910,7 @@ def do_trigger(
             raise UsageError(
                 f"no resolvable entity for {full!r} (apply may be stale)"
             )
-        return _entity_state_dir(ref.bundle, ref.uuid)
+        return _entity_state_dir(ref)
 
     if not wait:
         for full in normalized:
@@ -7748,7 +7730,7 @@ def do_logs(
             # unit-only orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
-            sd = _entity_state_dir(ref.bundle, ref.uuid)
+            sd = _entity_state_dir(ref)
     if sd is None:
         raise UsageError(f"no log for {full!r} (no applied state on this host)")
     log_path = sd / "run.log"
@@ -7914,9 +7896,9 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
             f"Use `crony trigger <name>` to fire by name."
         )
     try:
-        snap = _load_snapshot(parsed.bundle, parsed.uuid)
+        snap = _load_snapshot(parsed)
     except PreconditionError as exc:
-        _record_snapshot_load_failure(parsed.bundle, parsed.uuid, exc)
+        _record_snapshot_load_failure(parsed, exc)
         raise
     if isinstance(snap, Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
@@ -7926,7 +7908,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
 
 
 def _record_snapshot_load_failure(
-    bundle: str, entity_uuid: str, exc: PreconditionError
+    ref: EntityRef, exc: PreconditionError
 ) -> None:
     """Write a minimal `last-run.json` recording a snapshot-load
     failure so the cancel surfaces in `crony status` -- same
@@ -7946,7 +7928,7 @@ def _record_snapshot_load_failure(
     `JobRunResult` / `GroupRunResult` dataclasses with a new
     error variant.
     """
-    state_dir = _entity_state_dir(bundle, entity_uuid)
+    state_dir = _entity_state_dir(ref)
     if not state_dir.is_dir():
         return
     now = _now_iso()
@@ -7962,7 +7944,7 @@ def _record_snapshot_load_failure(
     }
     _write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / "run.log"
-    line = f"\n=== {now} CANCELED {bundle}:{entity_uuid} ===\n   {exc}\n"
+    line = f"\n=== {now} CANCELED {format_entity_ref(ref)} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))
 

@@ -4592,7 +4592,9 @@ class TestPlistRendering:
     """_render_plist produces well-formed launchd plists."""
 
     def test_keyword_daily(self) -> None:
-        plist = crony._render_plist("brew", "default", "u-test", "daily", None)
+        plist = crony._render_plist(
+            "brew", crony.EntityRef("default", "u-test"), "daily", None
+        )
         assert "<key>Label</key>" in plist
         assert "<string>org.crony.brew</string>" in plist
         assert "<key>StartCalendarInterval</key>" in plist
@@ -4602,7 +4604,7 @@ class TestPlistRendering:
 
     def test_oncalendar_simple_time(self) -> None:
         plist = crony._render_plist(
-            "j", "default", "u-test", "*-*-* 03:15", None
+            "j", crony.EntityRef("default", "u-test"), "*-*-* 03:15", None
         )
         assert "<key>Hour</key>" in plist
         assert "<integer>3</integer>" in plist
@@ -4610,31 +4612,38 @@ class TestPlistRendering:
 
     def test_oncalendar_dow_with_time(self) -> None:
         plist = crony._render_plist(
-            "j", "default", "u-test", "Mon *-*-* 09:00", None
+            "j", crony.EntityRef("default", "u-test"), "Mon *-*-* 09:00", None
         )
         assert "<key>Weekday</key>" in plist
         assert "<integer>1</integer>" in plist  # Mon=1
 
     def test_oncalendar_first_of_month(self) -> None:
         plist = crony._render_plist(
-            "j", "default", "u-test", "*-*-01 03:00", None
+            "j", crony.EntityRef("default", "u-test"), "*-*-01 03:00", None
         )
         assert "<key>Day</key>" in plist
         assert "<integer>1</integer>" in plist
 
     def test_interval(self) -> None:
-        plist = crony._render_plist("j", "default", "u-test", None, "30min")
+        plist = crony._render_plist(
+            "j", crony.EntityRef("default", "u-test"), None, "30min"
+        )
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
 
     def test_step_pattern_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="step / range / list"):
-            crony._render_plist("j", "default", "u-test", "*:0/15", None)
+            crony._render_plist(
+                "j", crony.EntityRef("default", "u-test"), "*:0/15", None
+            )
 
     def test_range_pattern_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="step / range / list"):
             crony._render_plist(
-                "j", "default", "u-test", "Mon..Fri *-*-* 09:00", None
+                "j",
+                crony.EntityRef("default", "u-test"),
+                "Mon..Fri *-*-* 09:00",
+                None,
             )
 
     def test_program_args_invoke_uv_with_absolute_path(
@@ -4647,7 +4656,9 @@ class TestPlistRendering:
         # ProgramArguments so the unit doesn't depend on PATH.
         monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
         monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
-        plist = crony._render_plist("j", "default", "u-test", "daily", None)
+        plist = crony._render_plist(
+            "j", crony.EntityRef("default", "u-test"), "daily", None
+        )
         assert "<string>/abs/uv</string>" in plist
         assert "<string>run</string>" in plist
         assert "<string>--script</string>" in plist
@@ -4659,7 +4670,9 @@ class TestPlistRendering:
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
-        svc = crony._render_systemd_service("brew", "default", "u-test")
+        svc = crony._render_systemd_service(
+            "brew", crony.EntityRef("default", "u-test")
+        )
         assert "[Unit]" in svc
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
@@ -4686,7 +4699,9 @@ class TestSystemdRendering:
         # launchd plist case).
         monkeypatch.setattr(crony, "_uv_executable", lambda: "/abs/uv")
         monkeypatch.setattr(crony, "_crony_executable", lambda: "/abs/crony")
-        svc = crony._render_systemd_service("j", "default", "u-test")
+        svc = crony._render_systemd_service(
+            "j", crony.EntityRef("default", "u-test")
+        )
         assert (
             "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
             in svc
@@ -10247,7 +10262,9 @@ class TestSnapshotLifecycle:
             encoding="utf-8",
         )
         with pytest.raises(crony.PreconditionError, match="schema 999"):
-            crony._load_snapshot(crony.DEFAULT_BUNDLE_NAME, uuid_value)
+            crony._load_snapshot(
+                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
+            )
 
     def test_load_snapshot_refuses_missing(
         self, tmp_path: Path, monkeypatch: Any
@@ -10255,7 +10272,7 @@ class TestSnapshotLifecycle:
         _ = _RunnerHarness(tmp_path, monkeypatch)
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony._load_snapshot(
-                crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid"
+                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid")
             )
 
     def test_topological_apply_propagates_leaf_edit_to_group(
@@ -10377,7 +10394,9 @@ class TestSnapshotBackwardLoad:
         }
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
         _ = full
-        snap = crony._load_snapshot(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
+        snap = crony._load_snapshot(
+            crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
+        )
         assert isinstance(snap, crony.Job)
         assert snap.schedule is None
         assert snap.interval is None
