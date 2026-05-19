@@ -5602,7 +5602,12 @@ class TestConfigState:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        assert crony._config_state(cfg, "j", "darwin") == "missing"
+        assert (
+            crony._config_state_for(
+                cfg, short="j", full_name="default.j", platform="darwin"
+            )
+            == "missing"
+        )
 
     def test_synced_after_apply(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -5611,7 +5616,12 @@ class TestConfigState:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
-        assert crony._config_state(cfg, "j", "darwin") == "synced"
+        assert (
+            crony._config_state_for(
+                cfg, short="j", full_name="default.j", platform="darwin"
+            )
+            == "synced"
+        )
 
     def test_stale_when_config_changes(
         self, tmp_path: Path, monkeypatch: Any
@@ -5626,7 +5636,12 @@ class TestConfigState:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
         )
-        assert crony._config_state(cfg2, "j", "darwin") == "stale"
+        assert (
+            crony._config_state_for(
+                cfg2, short="j", full_name="default.j", platform="darwin"
+            )
+            == "stale"
+        )
 
     def test_orphan_stamped_not_in_config(
         self, tmp_path: Path, monkeypatch: Any
@@ -5640,10 +5655,11 @@ class TestConfigState:
         # state dir without a name->uuid disk scan.
         loaded = crony.load_config()
         assert (
-            crony._config_state(
+            crony._config_state_for(
                 cfg,
-                "old",
-                "darwin",
+                short="old",
+                full_name="default.old",
+                platform="darwin",
                 current_by_full_name=loaded.current.by_full_name,
             )
             == "orphan"

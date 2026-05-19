@@ -2745,17 +2745,6 @@ def _resolve_snapshot_for(
     raise PreconditionError(f"unknown job/group: {short!r}")
 
 
-def _serialize_snapshot(snap: Job | JobGroup) -> str:
-    """Stable JSON for the on-disk snapshot file: sorted keys, no
-    whitespace variance. Byte-stable serialization matters more
-    than human readability so a re-serialization of the same
-    dataclass instance round-trips without spurious diffs.
-    """
-    return json.dumps(
-        dataclasses.asdict(snap), sort_keys=True, separators=(",", ":")
-    )
-
-
 def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
     """Load and validate a snapshot file by ref. Raises
     PreconditionError if missing (entry not applied) or schema
@@ -6006,28 +5995,6 @@ def _last_ran_at(config: Config, full_name: str) -> str:
     if secs < 86400:
         return f"{secs // 3600}h ago"
     return f"{secs // 86400}d ago"
-
-
-def _config_state(
-    config: TomlBundleConfig,
-    name: str,
-    platform: str,
-    *,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
-    current_by_full_name: dict[str, EntityRef] | None = None,
-) -> str:
-    """Default-bundle-flavored wrapper around _config_state_for.
-
-    `name` is the short name; the full namespaced name is computed
-    as `<bundle_name>.<name>` (default bundle by default).
-    """
-    return _config_state_for(
-        config,
-        short=name,
-        full_name=f"{bundle_name}.{name}",
-        platform=platform,
-        current_by_full_name=current_by_full_name,
-    )
 
 
 def _config_state_for(
