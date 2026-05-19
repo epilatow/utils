@@ -2362,7 +2362,6 @@ class _RunnerHarness:
         short: str,
         *,
         bundle: str = crony.DEFAULT_BUNDLE_NAME,
-        hash_stamp: bool = True,
         kind: str = "job",
     ) -> Path:
         """Plant a state dir whose snapshot records a name that no
@@ -2424,8 +2423,6 @@ class _RunnerHarness:
         (sd / "snapshot.json").write_text(
             json.dumps(snapshot), encoding="utf-8"
         )
-        if hash_stamp:
-            (sd / "hash").write_text("legacy\n", encoding="utf-8")
         return sd
 
     def last_run(self, short: str, cfg: Any | None = None) -> dict[str, Any]:
@@ -4748,7 +4745,7 @@ class TestApplyDarwin:
         assert "plutil" in commands
         assert "launchctl" in commands
         # Hash stamp written
-        assert (h.state_dir("j") / "hash").exists()
+        assert (h.state_dir("j") / "snapshot.json").exists()
 
     def test_idempotent_when_unchanged(
         self, tmp_path: Path, monkeypatch: Any
@@ -4806,17 +4803,18 @@ class TestApplyFullSync:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        # Pre-stamp an orphan: an entry's state dir with a `hash`
-        # file but no corresponding config entry. `crony apply`
-        # with no args treats it as an orphan and destroys it.
+        # Pre-stamp an orphan: an entry's state dir with a
+        # `snapshot.json` but no corresponding config entry.
+        # `crony apply` with no args treats it as an orphan and
+        # destroys it.
         orphan_dir = h.fabricate_orphan("old")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
-        assert (h.state_dir("j") / "hash").exists()
-        assert not (orphan_dir / "hash").exists()
+        assert (h.state_dir("j") / "snapshot.json").exists()
+        assert not (orphan_dir / "snapshot.json").exists()
 
     def test_surgical_apply_leaves_orphans(
         self, tmp_path: Path, monkeypatch: Any
@@ -4828,7 +4826,7 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=["j"], verbose=False, bundle=None)
-        assert (orphan_dir / "hash").exists()  # left alone
+        assert (orphan_dir / "snapshot.json").exists()  # left alone
 
     def test_no_arg_apply_fully_wipes_orphan_state_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -4939,8 +4937,8 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         crony.do_apply(jobs=[], verbose=False, bundle="borgadm")
-        assert (default_orphan / "hash").exists()
-        assert not (borgadm_orphan / "hash").exists()
+        assert (default_orphan / "snapshot.json").exists()
+        assert not (borgadm_orphan / "snapshot.json").exists()
 
     def test_bundle_resolves_bare_name_in_scope(
         self, tmp_path: Path, monkeypatch: Any
@@ -4961,7 +4959,7 @@ class TestApplyFullSync:
         bundles = crony.load_all_bundles()
         borgadm_cfg = bundles.by_name("borgadm").config
         k_uuid = borgadm_cfg.jobs["k"].uuid
-        assert (h.state / "borgadm" / k_uuid / "hash").exists()
+        assert (h.state / "borgadm" / k_uuid / "snapshot.json").exists()
 
     def test_no_arg_apply_refuses_when_a_bundle_is_errored(
         self, tmp_path: Path, monkeypatch: Any
@@ -5043,11 +5041,12 @@ class TestDestroy:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg, "j")
+        sd = h.state_dir("j", ensure_snapshot=False)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert (h.state_dir("j") / "hash").exists()
+        assert (sd / "snapshot.json").exists()
         crony.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        assert not (h.state_dir("j") / "hash").exists()
+        assert not sd.exists()
 
     def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -5062,9 +5061,11 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "a")
         crony.apply_one(cfg, "b")
+        sd_a = h.state_dir("a", ensure_snapshot=False)
+        sd_b = h.state_dir("b", ensure_snapshot=False)
         crony.do_destroy(jobs=["a"], bundle=None, orphans=False)
-        assert not (h.state_dir("a") / "hash").exists()
-        assert (h.state_dir("b") / "hash").exists()
+        assert not sd_a.exists()
+        assert (sd_b / "snapshot.json").exists()
 
     def test_default_destroy_wipes_state_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -5193,7 +5194,7 @@ class TestDestroy:
             bundle="borgadm",
             orphans=False,
         )
-        assert (h.state_dir("j") / "hash").exists()
+        assert (h.state_dir("j") / "snapshot.json").exists()
         assert not k_dir.exists()
 
     def test_bundle_qualified_other_bundle_rejected(
@@ -5251,7 +5252,7 @@ class TestDestroy:
             default_target_jobs=["live"],
         )
         crony.do_destroy(jobs=[], bundle=None, orphans=True)
-        assert (h.state_dir("live") / "hash").exists()
+        assert (h.state_dir("live") / "snapshot.json").exists()
         assert not renamed_dir.exists()
         assert not (h.agents / f"org.crony.{h.full('renamed')}.plist").exists()
 
@@ -5294,7 +5295,7 @@ class TestDestroy:
             bundle="borgadm",
             orphans=True,
         )
-        assert (default_old_d_dir / "hash").exists()
+        assert (default_old_d_dir / "snapshot.json").exists()
         assert not borgadm_old_b_dir.exists()
 
     def test_orphans_flag_with_positional_names_rejected(
@@ -5321,7 +5322,7 @@ class TestDestroy:
         )
         crony.apply_one(cfg, "j")
         crony.do_destroy(jobs=[], bundle=None, orphans=True)
-        assert (h.state_dir("j") / "hash").exists()
+        assert (h.state_dir("j") / "snapshot.json").exists()
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
@@ -5619,10 +5620,10 @@ class TestConfigState:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        # Stamp the entry on disk: per-entry dir with a `hash` file.
+        # Stamp the entry on disk: per-entry dir with a snapshot.
         h.fabricate_orphan("old")
         cfg = h.config({}, default_target_jobs=[])
-        # The status / audit pipeline passes the current graph's
+        # The status pipeline passes the current graph's
         # by_full_name index so the orphan branch can locate the
         # state dir without a name->uuid disk scan.
         loaded = crony.load_config()
@@ -5953,9 +5954,10 @@ class TestEnableDisable:
     ) -> None:
         # State-dir wipe + surviving platform unit + scheduler
         # reporting `disabled`: re-apply must consult the live
-        # scheduler state, not the absent hash, to decide whether
-        # to preserve the disable. The unit can outlive its hash,
-        # so the disable signal lives only in the scheduler view.
+        # scheduler state, not the absent snapshot, to decide
+        # whether to preserve the disable. The unit can outlive
+        # its state dir, so the disable signal lives only in the
+        # scheduler view.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -6517,8 +6519,8 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # Install a job, then tighten the config so the same entry
-        # is masked here (hosts=["other"]). The on-disk unit / hash
-        # / state-dir become orphaned: `crony destroy --orphans`
+        # is masked here (hosts=["other"]). The on-disk unit /
+        # state-dir become orphaned: `crony destroy --orphans`
         # is the cleanup, and status must surface it as `orphan`
         # in the default view so the cleanup is discoverable. The
         # masked-by column still carries the reason (`host`).
@@ -9385,12 +9387,10 @@ class TestLoadConfig:
             ),
             encoding="utf-8",
         )
-        (sd / "hash").write_text("legacy\n", encoding="utf-8")
         config = crony.load_config()
         ref = crony.EntityRef("default", uuid_g)
         assert config.config_state(ref) == "orphan"
         assert ref in config.runtime
-        assert config.runtime[ref].hash == "legacy"
 
     def test_synced_when_pending_matches_current(
         self, tmp_path: Path, monkeypatch: Any
@@ -9420,7 +9420,6 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(dataclasses.asdict(snap)), encoding="utf-8"
         )
-        (sd / "hash").write_text("h\n", encoding="utf-8")
         config = crony.load_config()
         ref = crony.EntityRef("default", uuid_a)
         assert config.config_state(ref) == "synced"
@@ -9456,7 +9455,6 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(diverged), encoding="utf-8"
         )
-        (sd / "hash").write_text("h\n", encoding="utf-8")
         config = crony.load_config()
         ref = crony.EntityRef("default", uuid_a)
         assert config.config_state(ref) == "stale"
@@ -9637,7 +9635,6 @@ class TestStatusBrokenSurface:
         )
         sd = crony.STATE_DIR / "default" / uuid_value
         sd.mkdir(parents=True)
-        (sd / "hash").write_text("legacy\n", encoding="utf-8")
         (sd / "snapshot.json").write_text(
             json.dumps({"schema": 999, "kind": "job", "name": "default.j"}),
             encoding="utf-8",
@@ -10215,7 +10212,8 @@ class TestSnapshotLifecycle:
     the runner reads from the snapshot, not the live config. These
     tests exercise the snapshot file lifecycle (write, read, refuse
     on schema mismatch) and the drift-detection invariant (an edit
-    to any snapshot-covered field flips the hash).
+    to any snapshot-covered field surfaces as "updated" via
+    dataclass-equality comparison against the on-disk snapshot).
     """
 
     def test_apply_writes_snapshot(
@@ -10247,8 +10245,8 @@ class TestSnapshotLifecycle:
     def test_apply_state_is_co_located_in_entry_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # The hash and snapshot live alongside per-run artifacts in
-        # the entry's state dir, not in a separate `installed/`
+        # The snapshot lives alongside per-run artifacts in the
+        # entry's state dir, not in a separate `installed/`
         # registry. Verify the layout so a refactor doesn't quietly
         # split them again.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -10258,7 +10256,6 @@ class TestSnapshotLifecycle:
         )
         crony.apply_one(cfg, "j")
         entry_dir = h.state_dir("j")
-        assert (entry_dir / "hash").is_file()
         assert (entry_dir / "snapshot.json").is_file()
         assert not (h.state / "installed").exists()
 
@@ -10400,7 +10397,7 @@ class TestSnapshotLifecycle:
         assert snap["children"] == [cfg.jobs["a"].uuid]
         assert snap["group_budget_sec"] == 105
 
-    def test_command_edit_flips_hash(
+    def test_command_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -10409,8 +10406,9 @@ class TestSnapshotLifecycle:
             default_target_jobs=["j"],
         )
         crony.apply_one(cfg1, "j")
-        # Same schedule -- only the command changed; pre-snapshot
-        # this would not flip the hash (apply would say "unchanged").
+        # Same schedule -- only the command changed; this must
+        # land "updated" because the snapshot's `command` field
+        # differs from the on-disk one.
         cfg2 = h.config(
             {
                 "job": {
@@ -10425,13 +10423,13 @@ class TestSnapshotLifecycle:
         result = crony.apply_one(cfg2, "j")
         assert result == "updated"
 
-    def test_hash_stable_across_os_environ_changes(
+    def test_snapshot_stable_across_os_environ_changes(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The snapshot must pin only the user-written `env` dict,
         # not the merged runtime env: variables inherited from
         # the apply shell (SSH_AUTH_SOCK, transient session
-        # state, etc.) would otherwise enter the hash, and a
+        # state, etc.) would otherwise enter the snapshot, and a
         # subsequent apply / status from a different shell would
         # report the entry as stale despite no config change.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -10476,7 +10474,7 @@ class TestSnapshotLifecycle:
         # Literal $PATH preserved -- expansion happens at fire time.
         assert snap["env"] == {"PATH": "/extra:$PATH"}
 
-    def test_env_edit_flips_hash(
+    def test_env_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -10507,7 +10505,7 @@ class TestSnapshotLifecycle:
         )
         assert crony.apply_one(cfg2, "j") == "updated"
 
-    def test_timeout_edit_flips_hash(
+    def test_timeout_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)

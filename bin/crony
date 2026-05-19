@@ -16,7 +16,6 @@ import dataclasses
 import datetime
 import enum
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -88,7 +87,7 @@ state via `crony status`. The default columns are:
 
 `config=masked` only appears with `crony status -a/--all` (no
 remnants to clean up); a filter-excluded entry with leftover
-unit / hash / state-dir reports as `config=orphan` in the default
+unit / state-dir reports as `config=orphan` in the default
 view, with `masked-by` explaining the filter axis. `config=error`
 flags an entry whose bundle config was rejected (e.g. unknown key
 or invalid name); the entry's installed unit, if any, is left
@@ -135,13 +134,14 @@ and runs the command immediately.
 
 Apply pins each entry's runtime parameters into a JSON snapshot
 in the entry's state dir (`STATE_DIR/<bundle>/<uuid>/snapshot.json`,
-alongside `hash`, `run.log`, `last-run.json`, etc.). The state
+alongside `run.log`, `last-run.json`, etc.). The state
 dir is keyed on the entry's `uuid` so renaming a job in the
 config preserves its history -- only deleting the entry (or
 changing its `uuid`) loses it. The runner reads the snapshot,
 never the live config: editing the toml without `apply`
-therefore has no effect on running units, and audit catches any
-drift via the hash.
+therefore has no effect on running units, and `crony status`
+reports any divergence between live config and on-disk snapshot
+as `config=stale` via direct dataclass equality.
 
 TomlBundleConfig bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -157,7 +157,7 @@ trigger) reshapes that resolution: bare names resolve in `<name>`,
 qualified names must match it, and a bare invocation scopes the
 operation to that bundle's selection.
 
-State (logs, locks, last-run records, install hashes) lives at
+State (logs, locks, last-run records, applied snapshots) lives at
 ~/.local/state/crony/.\
 """
 
@@ -783,7 +783,7 @@ class TomlBundle:
     The bundle name namespaces the bundle's job and group names: a
     short name `daily-update` defined in bundle `borgadm` has the
     full name `borgadm.daily-update` everywhere on disk
-    (state dir, hash stamp, launchd label, systemd unit).
+    (state dir, launchd label, systemd unit).
     """
 
     name: str
@@ -2512,9 +2512,10 @@ def resolved_group_timeout_sec(
 # Apply pins each entry's behavior-relevant runtime parameters
 # into a JSON snapshot next to the platform unit. The runner
 # reads these pinned fields, so editing the toml without `apply`
-# has no effect on running units. The hash includes the snapshot
-# so any drift forces a re-apply (and audit catches the
-# mismatch).
+# has no effect on running units. Drift detection compares the
+# freshly-resolved snapshot to the on-disk one via dataclass
+# equality, so any divergence between live config and applied
+# state surfaces as `config=stale` in `crony status`.
 #
 # notify_channels are deliberately NOT pinned -- routing is
 # separable from "what runs", and notify edits should take effect
@@ -2547,9 +2548,10 @@ class Job:
     the user's literal toml `env` dict (no parent-process overlay,
     no $VAR expansion). The runner merges it with the inherited
     process env at fire time. Pinning the inherited env would (a)
-    make the hash unstable across shell sessions, (b) hand the
-    runner whatever SSH_AUTH_SOCK / PATH was in scope when `crony
-    apply` happened to run.
+    make the snapshot unstable across shell sessions (every apply
+    from a different shell would flip the snapshot and report
+    `config=stale`), (b) hand the runner whatever SSH_AUTH_SOCK /
+    PATH was in scope when `crony apply` happened to run.
     """
 
     schema: int
@@ -2592,7 +2594,7 @@ class JobGroup:
     """Resolved runtime parameters for a job-group. `children` are
     bundle-scoped uuids; the runner resolves each back to its
     current full name via the child's own snapshot at dispatch
-    time so a rename in config doesn't flip the parent's hash.
+    time so a rename in config doesn't flip the parent's snapshot.
     `group_budget_sec` is the pre-padded cumulative deadline
     computed once at apply time.
     """
@@ -2692,9 +2694,9 @@ def _resolve_group_snapshot(
     """
     sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
     # Children are stored as uuids (not full names) so renaming a
-    # child in config doesn't flip the parent's hash -- the uuid
-    # edge is unchanged. The runner resolves each child uuid to
-    # its current full name by reading the child's snapshot at
+    # child in config doesn't flip the parent's snapshot -- the
+    # uuid edge is unchanged. The runner resolves each child uuid
+    # to its current full name by reading the child's snapshot at
     # dispatch time.
     children: list[str] = []
     for c in group.jobs:
@@ -2741,9 +2743,11 @@ def _resolve_snapshot_for(
 
 
 def _serialize_snapshot(snap: Job | JobGroup) -> str:
-    """Stable JSON for hash inclusion: sorted keys, no whitespace
-    variance. Hash stability matters more than human readability
-    -- audit and apply use this same serialization."""
+    """Stable JSON for the on-disk snapshot file: sorted keys, no
+    whitespace variance. Byte-stable serialization matters more
+    than human readability so a re-serialization of the same
+    dataclass instance round-trips without spurious diffs.
+    """
     return json.dumps(
         dataclasses.asdict(snap), sort_keys=True, separators=(",", ":")
     )
@@ -2918,7 +2922,6 @@ class RuntimeState:
     """
 
     state_dir: Path
-    hash: str
     last_run: LastRun | None
     is_running: bool
     is_pending: bool
@@ -3158,19 +3161,12 @@ def _read_runtime_state(
     platform: str | None = None,
 ) -> RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
-    install hash, parsed last-run record, and presence of the
-    lock / pending / user-trigger flag files. When `full_name`
-    and `platform` are supplied, also probe the platform unit
-    file path so subcommands can read it from RuntimeState
-    instead of walking the unit dirs ad-hoc.
+    parsed last-run record and presence of the lock / pending /
+    user-trigger flag files. When `full_name` and `platform` are
+    supplied, also probe the platform unit file path so
+    subcommands can read it from RuntimeState instead of walking
+    the unit dirs ad-hoc.
     """
-    hash_path = state_dir / "hash"
-    hash_value = (
-        hash_path.read_text(encoding="utf-8").strip()
-        if hash_path.is_file()
-        else ""
-    )
-
     last_run: LastRun | None = None
     last_run_path = state_dir / "last-run.json"
     if last_run_path.is_file():
@@ -3196,7 +3192,6 @@ def _read_runtime_state(
 
     return RuntimeState(
         state_dir=state_dir,
-        hash=hash_value,
         last_run=last_run,
         is_running=is_running,
         is_pending=(state_dir / "pending.flag").is_file(),
@@ -3419,7 +3414,6 @@ def load_config() -> Config:
         unit_path = _platform_unit_path(full_name, platform)
         runtime[ref] = RuntimeState(
             state_dir=_entity_state_dir(ref),
-            hash="",
             last_run=None,
             is_running=False,
             is_pending=False,
@@ -3547,11 +3541,11 @@ def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
 
     Called at runtime, not apply time: the inherited env is process-
     contextual (SSH_AUTH_SOCK in particular is per-shell-session)
-    and pinning it would (a) make the hash unstable across shells,
-    (b) hand the runner a stale agent socket from whatever shell
-    happened to run `crony apply`. The snapshot stores `user_env`
-    only; this helper produces the merged + expanded env at fire
-    time.
+    and pinning it would (a) make the snapshot unstable across
+    shells, (b) hand the runner a stale agent socket from whatever
+    shell happened to run `crony apply`. The snapshot stores
+    `user_env` only; this helper produces the merged + expanded
+    env at fire time.
     """
     env: dict[str, str] = {}
     for k in (
@@ -4670,7 +4664,7 @@ def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
     to its full namespaced name by reading the child's own
     snapshot. The runner dispatches each child via the platform
     unit label, which is keyed by full name; storing uuids on the
-    parent keeps the parent's hash stable across child renames,
+    parent keeps the parent's snapshot stable across child renames,
     at the cost of one snapshot read per child at dispatch time.
     Returns None when the child snapshot is missing or unreadable.
     """
@@ -4994,10 +4988,6 @@ def _platform_unit_path(name: str, platform: str) -> Path | None:
     return service if service.is_file() else None
 
 
-def _hash_path_for(ref: EntityRef) -> Path:
-    return _entity_state_dir(ref) / "hash"
-
-
 def _systemd_unit_name(name: str) -> str:
     return f"{BASENAME}-{name}.timer"
 
@@ -5255,33 +5245,6 @@ def _schedule_display(schedule: str | None, interval: str | None) -> str:
     return "grouped"
 
 
-def _compute_unit_hash(
-    name: str,
-    ref: EntityRef,
-    entry: TomlJob | TomlJobGroup,
-    platform: str,
-    snapshot: Job | JobGroup,
-) -> str:
-    """SHA-256 of rendered unit content + serialized snapshot.
-
-    The snapshot covers everything the runner consumes (command,
-    gate, env, timeouts, group children + budget); including it
-    in the hash means an edit to any of those fields flips the
-    hash, so apply reports updated and audit catches drift.
-    """
-    schedule, interval = _entity_schedule(entry)
-    units = _render_units(name, ref, schedule, interval, platform)
-    h = hashlib.sha256()
-    for fname in sorted(units):
-        h.update(fname.encode("utf-8"))
-        h.update(b"\0")
-        h.update(units[fname].encode("utf-8"))
-        h.update(b"\0")
-    h.update(b"snapshot\0")
-    h.update(_serialize_snapshot(snapshot).encode("utf-8"))
-    return h.hexdigest()
-
-
 def _activate_unit(
     name: str,
     platform: str,
@@ -5402,8 +5365,8 @@ def apply_one(
 
     `name` is the short name (as written in the bundle's TOML);
     `bundle_name` defaults to "default". The full namespaced name
-    `<bundle_name>.<name>` is what lands on disk (hash stamp,
-    plist / systemd unit identifier).
+    `<bundle_name>.<name>` is what lands on disk (plist / systemd
+    unit identifier).
 
     Every entry installs a platform unit, even schedule-less ones:
     a transit group's plist sits dormant until a parent dispatches
@@ -5424,7 +5387,6 @@ def apply_one(
     schedule, interval = _entity_schedule(entry)
     platform = current_platform()
     entity_ref = EntityRef(bundle_name, entry.uuid)
-    hash_path = _hash_path_for(entity_ref)
     snapshot_path = _snapshot_path_for(entity_ref)
     target = resolve_target(config, current_host(), platform)
     if isinstance(entry, TomlJob):
@@ -5435,21 +5397,27 @@ def apply_one(
         snapshot = _resolve_group_snapshot(
             config, target, entry, bundle_name, full_name
         )
-    new_hash = _compute_unit_hash(
-        full_name, entity_ref, entry, platform, snapshot
-    )
-    old_hash = hash_path.read_text().strip() if hash_path.exists() else None
-
-    if old_hash == new_hash:
+    # Drift detection via direct snapshot comparison: load the
+    # existing on-disk snapshot (if any) and compare it to the
+    # freshly-resolved one. With both sides parsed into the same
+    # dataclass shape, equality is a single Python `==`. A
+    # missing / unparseable / wrong-schema on-disk snapshot is
+    # "not equal" and triggers a fresh write.
+    try:
+        current_snapshot: Job | JobGroup | None = _load_snapshot(entity_ref)
+    except PreconditionError:
+        current_snapshot = None
+    if current_snapshot == snapshot:
         return "unchanged"
+    is_update = current_snapshot is not None
 
     if dry_run:
-        return "added" if old_hash is None else "updated"
+        return "updated" if is_update else "added"
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
     # is the source of truth here (the platform unit can outlive
-    # the state-dir hash); _unit_state returns "none" for a
+    # the state-dir snapshot); _unit_state returns "none" for a
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
@@ -5485,20 +5453,13 @@ def apply_one(
         scheduled=schedule is not None or interval is not None,
     )
 
-    # Snapshot first, hash second: a stale snapshot without a
-    # matching hash is detectable by audit (hash mismatch); the
-    # reverse (hash present, snapshot missing) would let the
-    # runner fail to load the snapshot on a fire it should have
-    # been able to handle.
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(
         json.dumps(dataclasses.asdict(snapshot), indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )
-    hash_path.parent.mkdir(parents=True, exist_ok=True)
-    hash_path.write_text(new_hash + "\n", encoding="utf-8")
-    return "added" if old_hash is None else "updated"
+    return "updated" if is_update else "added"
 
 
 def destroy_one(name: str | None, state_dir: Path | None) -> None:
@@ -5563,16 +5524,14 @@ def _recover_full_name(state_dir: Path) -> str | None:
 
 
 def _state_dir_stamps() -> set[str]:
-    """Full names whose state dir contains a `hash` stamp.
-
-    Names are recovered from `snapshot.json`'s `name` field; a
-    state dir whose snapshot is missing or unreadable is
-    invisible to this set.
+    """Full names whose state dir contains a parseable
+    `snapshot.json`. Names are recovered from the snapshot's
+    `name` field; a state dir whose snapshot is missing or
+    unreadable is invisible to this set (it'll surface elsewhere
+    via `Config.broken`).
     """
     out: set[str] = set()
     for _bundle, _uuid, state_dir in _iter_state_entities():
-        if not (state_dir / "hash").is_file():
-            continue
         name = _recover_full_name(state_dir)
         if name is not None:
             out.add(name)
@@ -5609,13 +5568,10 @@ def _platform_unit_names() -> set[str]:
 def stamped_names() -> set[str]:
     """Names crony has any on-disk remnant of on this host.
 
-    Union of `_state_dir_stamps()` (hash present, the normal
-    "applied via crony" case) and `_platform_unit_names()` (units
-    lingering on disk after a state wipe). Either signal is enough
-    to treat the entry as actionable: with hash-only, we have the
-    hash to detect drift; with unit-only, we can still report
-    the entry as `orphan` and let `crony destroy` clean up the
-    unit files.
+    Union of `_state_dir_stamps()` (snapshot.json present) and
+    `_platform_unit_names()` (units lingering on disk after a
+    state wipe). Either signal is enough to treat the entry as
+    actionable.
     """
     return _state_dir_stamps() | _platform_unit_names()
 
@@ -5893,13 +5849,13 @@ def _config_state_for(
 
     `short` is the bundle-local name (used to look up the entry in
     `config`); `full_name` is the namespaced name used for the
-    on-disk hash stamp and unit identifier.
+    on-disk snapshot and unit identifier.
 
     A "remnant" here is any signal that crony has on-disk state
-    for this entry: the state-dir hash, a leftover platform unit
+    for this entry: a state-dir snapshot, a leftover platform unit
     file, or a state dir surviving a non-purge destroy. All three
     surface as orphans for destroy when the entry isn't in config.
-    A "stamp" is the narrower hash-or-unit set -- the entry is
+    A "stamp" is the narrower snapshot-or-unit set -- the entry is
     actively installed and apply / enable / disable / trigger can
     operate on it.
 
@@ -5916,17 +5872,9 @@ def _config_state_for(
         short
     ) or config.job_groups.get(short)
     bn, _ = parse_full_name(full_name)
-    # State dir address depends on the entity's uuid (config side)
-    # when the entry exists, or on whatever snapshot is present on
-    # disk (recovered-by-name) otherwise. The latter handles the
-    # orphan case where the entry was deleted but its state dir
-    # lingers.
-    hash_path: Path | None
-    state_dir: Path | None
+    state_dir: Path | None = None
     if entry is not None:
-        entry_ref = EntityRef(bn, entry.uuid)
-        hash_path = _hash_path_for(entry_ref)
-        state_dir = _entity_state_dir(entry_ref)
+        state_dir = _entity_state_dir(EntityRef(bn, entry.uuid))
     else:
         ref = (
             current_by_full_name.get(full_name)
@@ -5935,37 +5883,41 @@ def _config_state_for(
         )
         if ref is not None:
             state_dir = _entity_state_dir(ref)
-            hash_path = _hash_path_for(ref)
-        else:
-            state_dir = None
-            hash_path = None
-    has_hash = hash_path is not None and hash_path.exists()
+    has_snapshot = (
+        state_dir is not None and (state_dir / "snapshot.json").is_file()
+    )
     has_unit = full_name in _platform_unit_names()
     has_state_dir = state_dir is not None and state_dir.is_dir()
-    has_stamp = has_hash or has_unit
+    has_stamp = has_snapshot or has_unit
     has_remnant = has_stamp or has_state_dir
     if not in_config:
         return "orphan" if has_remnant else "missing"
     if not has_stamp:
         return "missing"
-    if not has_hash:
-        # Unit on disk but no hash to compare against (state was
-        # wiped). Treat as drift so the user gets a clear "re-
-        # apply" signal.
+    if not has_snapshot:
+        # Unit on disk but no snapshot to compare against (state
+        # was wiped, or the unit pre-dates this crony binary).
+        # Treat as drift so the user gets a clear "re-apply"
+        # signal.
         return "stale"
-    assert entry is not None and hash_path is not None
+    assert entry is not None and state_dir is not None
     target = resolve_target(config, current_host(), platform)
     if isinstance(entry, TomlJob):
-        snapshot: Job | JobGroup = _resolve_job_snapshot(
+        pending_snapshot: Job | JobGroup = _resolve_job_snapshot(
             config, target, entry, full_name, bn
         )
     else:
-        snapshot = _resolve_group_snapshot(config, target, entry, bn, full_name)
-    new_hash = _compute_unit_hash(
-        full_name, EntityRef(bn, entry.uuid), entry, platform, snapshot
-    )
-    old_hash = hash_path.read_text(encoding="utf-8").strip()
-    return "synced" if old_hash == new_hash else "stale"
+        pending_snapshot = _resolve_group_snapshot(
+            config, target, entry, bn, full_name
+        )
+    # Drift detection: compare the freshly-resolved pending
+    # snapshot to whatever's on disk. Both reduce to the same
+    # dataclass shape so `==` is enough.
+    try:
+        current_snapshot = _load_snapshot(EntityRef(bn, entry.uuid))
+    except PreconditionError:
+        return "stale"
+    return "synced" if current_snapshot == pending_snapshot else "stale"
 
 
 def _enable_unit(name: str, platform: str) -> None:
@@ -7219,7 +7171,7 @@ Columns
                     -- which surfaces as `config=masked` for
                     entries with no on-disk state, and as
                     `config=orphan` for entries with leftover
-                    units / hashes / state dirs from a prior apply
+                    units / state dirs from a prior apply
                     (the same `destroy --orphans` cleanup path
                     applies in both cases). `unused` means defined
                     in config but not listed in the host's
