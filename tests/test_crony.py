@@ -9597,6 +9597,83 @@ class TestConfigBroken:
         assert config.config_state(ref) == "broken"
 
 
+class TestStatusBrokenSurface:
+    """`crony status` surfaces broken entries with `CONFIG=broken`
+    so a schema-bump or corrupt-snapshot failure becomes visible
+    instead of looking like ordinary stale drift. Recovered-name
+    broken entries render under their normal name; entries with
+    no recoverable name (corrupt JSON) render as
+    `<bundle>:<UUID>` in the JOB cell.
+    """
+
+    def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        cfg_file = cfg_dir / "config.toml"
+        cfg_dropin = tmp_path / "config_dropin"
+        cfg_dropin.mkdir()
+        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
+        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        return cfg_file
+
+    def test_status_renders_broken_for_schema_mismatch(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        uuid_value = "11111111-1111-1111-1111-111111111111"
+        cfg_file.write_text(
+            f'[job.j]\nuuid = "{uuid_value}"\n'
+            'command = "true"\nschedule = "daily"\n'
+            '[target.darwin]\njobs = ["j"]\n',
+            encoding="utf-8",
+        )
+        sd = crony.STATE_DIR / "default" / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "hash").write_text("legacy\n", encoding="utf-8")
+        (sd / "snapshot.json").write_text(
+            json.dumps({"schema": 999, "kind": "job", "name": "default.j"}),
+            encoding="utf-8",
+        )
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        assert "default.j" in out
+        assert "broken" in out
+
+    def test_status_renders_synthetic_form_for_unrecoverable_name(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text("", encoding="utf-8")
+        uuid_value = "22222222-2222-2222-2222-222222222222"
+        sd = crony.STATE_DIR / "default" / uuid_value
+        sd.mkdir(parents=True)
+        # Corrupt JSON: the `name` field can't be recovered, so the
+        # broken entry is addressable only by ref.
+        (sd / "snapshot.json").write_text("{not valid json", encoding="utf-8")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle=None,
+        )
+        out = capsys.readouterr().out
+        assert f"default:{uuid_value}" in out
+        assert "broken" in out
+
+
 class TestResolveMethods:
     """The three named resolvers encode the operation's intent at
     the call site: `resolve_runnable` for trigger (current only),

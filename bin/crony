@@ -7203,18 +7203,22 @@ def _resolve_state_axes(
     so each caller applies its own filtering / display logic on
     top.
 
+    CONFIG-axis precedence:
+
+        error / broken  >  orphan  >  masked  >  synced / stale / missing
+
+    `error` and `broken` are top-of-chain. `error` reports an
+    entry whose TOML failed to parse; `broken` reports an entry
+    whose on-disk snapshot can't be loaded. Either way the
+    operator's next action is "fix this specific thing," and the
+    mask-reason / synced-stale-missing axes are uninteresting
+    until then.
+
     `mask_reason` is the entry's filter-exclusion reason on this
-    host (from `selected_and_masked_jobs_and_groups`'s masked
-    map, or the literal `"unused"`); when non-empty, the cfg axis
-    becomes `"orphan"` if on-disk remnants exist and `"masked"`
-    otherwise. Both `do_status` and `do_audit` flow through this
-    override so the two views converge: status surfaces the
-    cleanup row in the default view, audit flags the orphan as
-    a CONFIG drift. `"error"` is exempt from the mask-reason
-    override: an entry whose bundle rejected its config is always
-    surfaced as `error` so the user can fix the config -- the
-    `"unused"` label assigned by the bundle walk is an artifact
-    of the entry not being parsed into the bundle's selection set.
+    host; when non-empty, the cfg axis becomes `"orphan"` if
+    on-disk remnants exist and `"masked"` otherwise. The
+    orphan-on-mask rule encodes "cleanup needed wins over
+    passive-not-for-this-host."
     """
     bn, short = parse_full_name(full)
     bundle = config.toml_config.by_name(bn)
@@ -7232,7 +7236,19 @@ def _resolve_state_axes(
         entry = bundle.config.jobs.get(short) or bundle.config.job_groups.get(
             short
         )
-    if mask_reason and cfg_state != "error":
+    # Broken takes precedence over mask-reason the same way
+    # `error` does: a broken snapshot is the operator's
+    # actionable item regardless of whether the entry would
+    # otherwise filter out on this host. Recovered-name broken
+    # entries match by `broken_by_full_name`; entries with no
+    # recoverable name flow through as a `<bundle>:<UUID>` ref
+    # whose parsed form is in `broken`.
+    direct_ref = parse_entity_ref(full)
+    if full in config.broken_by_full_name or (
+        direct_ref is not None and direct_ref in config.broken
+    ):
+        cfg_state = "broken"
+    if mask_reason and cfg_state not in ("error", "broken"):
         cfg_state = "orphan" if full in remnants else "masked"
     if cfg_state == "missing":
         unit_state = "none"
@@ -7520,11 +7536,19 @@ def do_status(
         full_names = [resolve_cli_name(n, bundle) for n in jobs]
     else:
         errored_full = _errored_full_names(bundles, bundle)
+        # Broken entries with no recoverable name are addressable
+        # only through the synthetic `<bundle>:<UUID>` form. The
+        # corresponding row carries that form as its JOB cell.
+        broken_synthetic = {
+            format_entity_ref(b.ref)
+            for b in config.broken.values()
+            if b.name is None and (bundle is None or b.bundle == bundle)
+        }
         # Errored entries always surface in the default view --
         # without this the user can fix a typo only by reading
         # the warning line; they wouldn't see the entry in the
         # table itself.
-        active = selected | remnants | errored_full
+        active = selected | remnants | errored_full | broken_synthetic
         if show_masked:
             active = active | set(masked_by_full)
         full_names = sorted(active)
