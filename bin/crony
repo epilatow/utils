@@ -109,7 +109,7 @@ and applied-vs-pending splits of the schedule column. See
 Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
-Plus operational subcommands: status, logs, trigger, audit,
+Plus operational subcommands: status, logs, trigger,
 notify-test, config, self-test.
 
 `trigger` asks the platform (launchd / systemd) to fire the unit
@@ -442,7 +442,6 @@ class ExitCode(enum.IntEnum):
     CONFIG = 3, "Configuration error"
     ERROR = 4, "General error"
     SUBPROCESS = 5, "Subprocess command failed"
-    AUDIT_FAILED = 6, "audit found jobs in a bad state"
     LOCK_BUSY = 7, "run.lock held by another instance"
     PRECONDITION = 8, "run precondition failed before exec"
     TIMEOUT = 9, "run killed wrapped command on timeout"
@@ -490,12 +489,6 @@ class SubprocessError(subprocess.CalledProcessError, CronyError):
     """Subprocess (launchctl, systemctl, etc) failed."""
 
     exit_code = ExitCode.SUBPROCESS
-
-
-class AuditFailedError(CronyError):
-    """`crony audit` found jobs in a bad state."""
-
-    exit_code = ExitCode.AUDIT_FAILED
 
 
 class LockBusyError(CronyError):
@@ -2322,7 +2315,7 @@ def _entry_applies_here(
     Empty list = "applies everywhere" (the common case).
     Non-empty = restricts selection to listed values. A non-match
     on either axis filters the entry out at selection time;
-    apply / status / audit then never see it on this host.
+    apply / status then never see it on this host.
     """
     return _mask_reason(platforms, hosts, host=host, platform=platform) is None
 
@@ -2864,7 +2857,7 @@ class GroupRunResult:
     `exit_class` is a rollup from `jobs_run`: timeout outranks
     fail / signal (which are equally severe), and ok / gated tie
     at the bottom (gating is "intentionally not run", not a
-    group-level outcome). The status / audit / list readers
+    group-level outcome). The status / list readers
     consult this single field for the group's LAST axis instead
     of re-deriving the rollup on every query.
     """
@@ -2892,7 +2885,7 @@ class GroupRunResult:
 @dataclass
 class LastRun:
     """Display-side view of `last-run.json`. Captures the fields
-    status / audit consume regardless of whether the underlying
+    status consumes regardless of whether the underlying
     record was a `JobRunResult` (the per-job runner output) or a
     `GroupRunResult` (the group-level rollup); the full records
     stay as the on-disk serialization shape. Fields are optional
@@ -2954,7 +2947,7 @@ class BrokenEntity:
     `TypeError`, or unreadable JSON. `name` is recovered from
     `raw["name"]` when the JSON parsed far enough; `None` when
     the file itself is corrupt. `reason` is a one-line
-    description suitable for surfacing in status / audit (the
+    description suitable for surfacing in status (the
     operator needs to know *why* re-apply is required).
     `source_path` is the on-disk artifact that couldn't be
     interpreted -- today always the entity's snapshot.json, but
@@ -3090,7 +3083,7 @@ def _parse_last_run(raw: dict[str, Any]) -> LastRun:
     """Extract the display-relevant subset of `last-run.json`.
 
     The full `JobRunResult` / `GroupRunResult` shapes are the on-disk
-    serialization; status / audit only consume `exit_class` and
+    serialization; status only consumes `exit_class` and
     `started_at`, so we pull those out tolerantly. A partial /
     corrupt last-run.json still produces a LastRun with whatever
     fields landed, rather than disqualifying the entity from
@@ -3191,7 +3184,7 @@ def _build_current_graph(
     `RuntimeState`. Snapshots that exist but can't be turned into
     a `Job` / `JobGroup` (corrupt JSON, wrong schema, unrecognized
     kind, dataclass `TypeError`) become `BrokenEntity` records so
-    status / destroy / audit can surface them with a clear
+    status / destroy can surface them with a clear
     "re-apply required" signal instead of treating the entry as
     silently absent.
     """
@@ -4096,9 +4089,9 @@ def _resolve_notify_at_runtime(
     Notify routing is intentionally NOT pinned in the snapshot:
     edits to notify channels / defaults take effect on the next
     fire without requiring a re-apply. Falls back gracefully when
-    the toml entry has been removed -- audit will already be
-    flagging the orphan, so log-only here is a coherent degraded
-    behavior.
+    the toml entry has been removed -- `crony status` will
+    already be surfacing the orphan, so log-only here is a
+    coherent degraded behavior.
     """
     bn, short = parse_full_name(full_name)
     try:
@@ -4289,8 +4282,8 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     """Run the wait/prompt/delay loop for an interactive job.
 
     Returns 'run' or 'cancel'. Logs each phase transition into
-    the run.log so post-mortem audit can see how long the user
-    took, whether they delayed, etc.
+    the run.log so a post-mortem reader can see how long the
+    user took, whether they delayed, etc.
 
     Polls `_consume_user_trigger_flag` inside both the active-
     wait and the delay-sleep so a `crony trigger` arriving while
@@ -4582,9 +4575,9 @@ def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     pinned snapshot rather than the live config, so the cap is
     consistent with what the child's own runner will enforce.
     Falls back to a generous default if the child snapshot is
-    missing -- that's an audit-flagged condition, but the trigger
-    itself will fail fast and the group's group_budget_sec still
-    bounds the wait.
+    missing -- `crony status` will surface that as a broken or
+    stale entry, but the trigger itself will fail fast and the
+    group's group_budget_sec still bounds the wait.
     """
     try:
         cs = _load_snapshot(child_ref)
@@ -5459,8 +5452,8 @@ def _platform_unit_names() -> set[str]:
     to discover entries whose unit landed on disk but whose state
     dir is missing -- e.g. a state wipe (rm -rf
     ~/.local/state/crony/) without `crony destroy` first. Without
-    this, those units would be invisible to status / audit /
-    destroy and the user would have to track them down manually.
+    this, those units would be invisible to status / destroy
+    and the user would have to track them down manually.
     """
     names: set[str] = set()
     if LAUNCHAGENTS_DIR.exists():
@@ -7196,12 +7189,13 @@ def _resolve_state_axes(
 ) -> tuple[str, str, str]:
     """Compute the (cfg, unit, last) status axes for one full name.
 
-    `do_status` and `do_audit` share this pipeline so a future
-    change to any axis stays consistent across the two views.
-    Returns the values straight from the underlying state readers
-    -- no opinion about whether a given combination is "bad" --
-    so each caller applies its own filtering / display logic on
-    top.
+    `do_status` is the only consumer; the function is factored
+    out so the axis derivation has a single home and the
+    renderer-side filter (`--exclude-healthy`) reads the same
+    triple as the default tree view. Returns the values straight
+    from the underlying state readers -- no opinion about whether
+    a given combination is "bad" -- so the caller applies its own
+    filtering / display logic on top.
 
     CONFIG-axis precedence:
 
@@ -7470,6 +7464,8 @@ def do_status(
     bundle: str | None,
     config_current: bool,
     config_pending: bool,
+    exclude_healthy: bool,
+    exclude_disabled: bool,
 ) -> None:
     """Print the resolved state per job in a tabular view.
 
@@ -7491,6 +7487,14 @@ def do_status(
     `--config-pending` force the SCHEDULE and GROUPS columns to a
     single source and suppress the stale-marker asterisk; the two
     flags are mutually exclusive.
+
+    `--exclude-healthy` drops rows where CONFIG is `synced`,
+    UNIT is `enabled` (or `grouped` -- anything that fires), and
+    LAST is `ok` / `never` / `gated`. Output is flat (no tree
+    indent). Always exits 0 -- this is a filter on the display,
+    not a gate. `--exclude-disabled` further drops rows whose
+    unit is intentionally disabled, so a host where some entries
+    are deliberately off doesn't churn the unhealthy table.
     """
     if config_current and config_pending:
         raise UsageError(
@@ -7585,10 +7589,9 @@ def do_status(
         # Resolve the runtime axes up-front. The schedule cell
         # below uses unit_state to decide whether to surface
         # "disabled" instead of the cron expression. The mask-
-        # aware override inside `_resolve_state_axes` keeps the
-        # cfg cell in sync with `do_audit`: a filter-excluded
-        # entry shows as `orphan` if there's on-disk state to
-        # clean up, `masked` otherwise.
+        # aware override inside `_resolve_state_axes` shows a
+        # filter-excluded entry as `orphan` if there's on-disk
+        # state to clean up, `masked` otherwise.
         cfg_state, unit_state, last = _resolve_state_axes(
             config, full, platform, remnants, mask_reason=mask_reason
         )
@@ -7640,25 +7643,51 @@ def do_status(
             }
         )
 
-    # Order rows by tree DFS to surface execution order rather
-    # than alphabetical: roots from each active target first, then
-    # group children indented by depth, then off-tree rows
-    # (orphans, CLI args outside any tree, masked entries not in
-    # any active target) below in stable sorted order. The JOB
-    # cell carries two spaces of indent per depth level so the
-    # visual nesting matches the dispatch graph.
-    rows_by_name = {r["job"]: r for r in rows}
-    ordered: list[dict[str, str]] = []
-    for full in tree_order:
-        r = rows_by_name.pop(full, None)
-        if r is None:
-            continue
-        r = dict(r)
-        r["job"] = "  " * tree_depth[full] + r["job"]
-        ordered.append(r)
-    for full in sorted(rows_by_name):
-        ordered.append(rows_by_name[full])
-    rows = ordered
+    if exclude_healthy:
+        # Filter to unhealthy rows and render flat -- no tree
+        # indent, since the surviving rows won't reconstruct the
+        # tree anyway and a half-indented subtree is more
+        # confusing than a flat list. Healthy: `config == synced`
+        # AND `unit` not in {none, disabled} AND `last` in
+        # {ok, never, gated}. A disabled unit is unhealthy by
+        # default because it isn't firing -- callers that have
+        # deliberately disabled some units pass
+        # `--exclude-disabled` to suppress those rows.
+        healthy_last = {"ok", "never", "gated"}
+        unhealthy_unit = {"none"}
+        if not exclude_disabled:
+            unhealthy_unit = unhealthy_unit | {"disabled"}
+        rows = [
+            r
+            for r in rows
+            if not (
+                r["config"] == "synced"
+                and r["unit"] not in unhealthy_unit
+                and r["last"] in healthy_last
+            )
+        ]
+        rows = sorted(rows, key=lambda r: r["job"])
+    else:
+        # Order rows by tree DFS to surface execution order
+        # rather than alphabetical: roots from each active target
+        # first, then group children indented by depth, then off-
+        # tree rows (orphans, CLI args outside any tree, masked
+        # entries not in any active target) below in stable
+        # sorted order. The JOB cell carries two spaces of indent
+        # per depth level so the visual nesting matches the
+        # dispatch graph.
+        rows_by_name = {r["job"]: r for r in rows}
+        ordered: list[dict[str, str]] = []
+        for full in tree_order:
+            r = rows_by_name.pop(full, None)
+            if r is None:
+                continue
+            r = dict(r)
+            r["job"] = "  " * tree_depth[full] + r["job"]
+            ordered.append(r)
+        for full in sorted(rows_by_name):
+            ordered.append(rows_by_name[full])
+        rows = ordered
 
     # Per-column width: max of the header label and the longest
     # cell, so a long "last-ran" value (`12d ago`) doesn't get
@@ -7971,91 +8000,6 @@ def _record_snapshot_load_failure(
     line = f"\n=== {now} CANCELED {format_entity_ref(ref)} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))
-
-
-def do_audit(exclude_disabled: bool, bundle: str | None) -> None:
-    """Walk every job; print bad rows; exit AUDIT_FAILED on hits.
-
-    With no --bundle, iterates every bundle's selection plus every
-    on-disk remnant (hash, unit file, or leftover state dir from a
-    prior non-purge destroy), and reports linger status. With
-    --bundle <name>, scopes to that bundle's selected jobs and
-    remnants in that bundle's namespace; cross-host checks like
-    linger are skipped -- they're about the whole-host picture,
-    not any one bundle.
-
-    Bad means CONFIG drift (stale/missing/orphan/error), the
-    scheduler being unable to fire (unknown, plus disabled by
-    default), or a recent failed/timeout run. Names in output
-    are full namespaced (`<bundle>.<short>`).
-    """
-    config = load_config()
-    bundles = config.toml_config
-    require_known_bundle(bundles, bundle)
-    platform = config.platform
-    _by_full, selected, masked_by_full = (
-        _selected_and_masked_full_names_per_bundle(bundles)
-    )
-    remnants = stamped_names()
-    errored_full = _errored_full_names(bundles, bundle)
-    if bundle is not None:
-        selected = bundle_prefix_filter(selected, bundle)
-        candidates = sorted(
-            selected | bundle_prefix_filter(remnants, bundle) | errored_full
-        )
-    else:
-        candidates = sorted(selected | remnants | errored_full)
-
-    bad_config = {"stale", "missing", "orphan", "error"}
-    bad_unit_state = {"none"}
-    if not exclude_disabled:
-        bad_unit_state = bad_unit_state | {"disabled"}
-    bad_last = {"fail", "timeout", "canceled"}
-
-    rows: list[tuple[str, str, str, str]] = []
-    for full in candidates:
-        mask_reason = masked_by_full.get(full, "")
-        cfg_state, unit_state, last_state = _resolve_state_axes(
-            config, full, platform, remnants, mask_reason=mask_reason
-        )
-        is_bad = (
-            cfg_state in bad_config
-            or unit_state in bad_unit_state
-            or last_state in bad_last
-        )
-        if is_bad:
-            rows.append((full, cfg_state, unit_state, last_state))
-
-    warnings: list[str] = []
-    # Linger is host-wide -- skip it under --bundle scoping; the
-    # operator who needs that info runs without --bundle.
-    if bundle is None and platform == "linux":
-        ling = linger_enabled()
-        if ling is False:
-            warnings.append(
-                f"linger DISABLED for {_current_user()} "
-                "-- jobs only fire while logged in"
-            )
-
-    if not rows and not warnings:
-        print("audit: all jobs nominal")
-        return
-
-    if warnings:
-        print("warnings:")
-        for w in warnings:
-            print(f"  - {w}")
-        print()
-    if rows:
-        name_w = max(len(r[0]) for r in rows)
-        name_w = max(name_w, len("JOB"))
-        print(f"{'JOB':<{name_w}} {'CONFIG':10} {'UNIT':10} {'LAST':10}")
-        for name, cs, ss, ls in rows:
-            print(f"{name:<{name_w}} {cs:10} {ss:10} {ls:10}")
-
-    raise AuditFailedError(
-        f"{len(rows)} job(s) in bad state, {len(warnings)} system warning(s)"
-    )
 
 
 def _secret_warning(
@@ -8764,6 +8708,24 @@ def build_parser() -> argparse.ArgumentParser:
             "from the live config (no asterisk on divergence)"
         ),
     )
+    p_status.add_argument(
+        "--exclude-healthy",
+        action="store_true",
+        help=(
+            "Drop rows that are config=synced, enabled in the "
+            "scheduler, and last in ok/never/gated. Output is "
+            "flat (no tree indent). Always exits 0 -- this is a "
+            "filter on the display, not a gate."
+        ),
+    )
+    p_status.add_argument(
+        "--exclude-disabled",
+        action="store_true",
+        help=(
+            "Combined with --exclude-healthy: also drop rows "
+            "whose unit is intentionally disabled."
+        ),
+    )
 
     # logs
     p_logs = subparsers.add_parser(
@@ -8830,23 +8792,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip gate check (force run)",
     )
 
-    # audit
-    p_audit = subparsers.add_parser(
-        "audit",
-        help="Check every job; exit nonzero on any bad state",
-    )
-    p_audit.add_argument(
-        "--exclude-disabled",
-        action="store_true",
-        help="Do not flag intentionally-disabled jobs as bad",
-    )
-    p_audit.add_argument(
-        "-b",
-        "--bundle",
-        default=None,
-        help="Restrict audit to jobs from one bundle",
-    )
-
     # notify-test
     p_nt = subparsers.add_parser(
         "notify-test",
@@ -8908,7 +8853,6 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "status": do_status,
     "logs": do_logs,
     "run": do_run,
-    "audit": do_audit,
     "notify-test": do_notify_test,
 }
 
