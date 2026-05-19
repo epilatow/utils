@@ -4859,6 +4859,111 @@ class TestApplyFullSync:
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert not orphan_dir.exists()
 
+    def test_no_arg_apply_removes_broken_snapshot_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A state dir whose snapshot can't be loaded (wrong schema)
+        # has no recoverable identity in the name-based world, so
+        # the old sweep missed it. The ref-based reconcile removes
+        # it: its ref is on disk but not in the live config.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        broken_dir = h.state / "default" / "dead-beef-uuid"
+        broken_dir.mkdir(parents=True)
+        (broken_dir / "snapshot.json").write_text(
+            json.dumps({"schema": 999, "kind": "job", "name": "default.x"}),
+            encoding="utf-8",
+        )
+        h.config({}, default_target_jobs=[])
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        assert not broken_dir.exists()
+
+    def test_no_arg_apply_removes_unit_only_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A platform unit with no state dir (state wiped without a
+        # destroy) is a unit-only orphan. The ref-based reconcile
+        # removes the lingering unit file.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        plist = h.agents / "org.crony.default.ghost.plist"
+        plist.write_text("", encoding="utf-8")
+        h.config({}, default_target_jobs=[])
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        assert not plist.exists()
+
+    def test_no_arg_apply_leaves_running_orphan_in_place(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An orphan with a run in progress is skipped (not wiped
+        # out from under the running shim); a later apply / destroy
+        # reclaims it.
+        import fcntl as _fcntl
+
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        orphan_dir = h.fabricate_orphan("busy")
+        h.config({}, default_target_jobs=[])
+        held = open(orphan_dir / "run.lock", "w")
+        try:
+            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            crony.do_apply(jobs=[], verbose=False, bundle=None)
+            assert orphan_dir.exists()
+        finally:
+            _fcntl.flock(held, _fcntl.LOCK_UN)
+            held.close()
+
+    def test_uuid_edit_surgical_apply_removes_old_residue(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Change an entry's uuid and apply just that job. The
+        # name-keyed unit is re-pointed at the new uuid and the old
+        # uuid's state dir -- unreachable history -- is reclaimed,
+        # so a surgical apply is self-healing without a full sync.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        old_uuid = cfg1.jobs["j"].uuid
+        crony.apply_one(cfg1, "j")
+        old_dir = h.state / "default" / old_uuid
+        assert old_dir.is_dir()
+        new_uuid = "abcdabcd-1111-2222-3333-444455556666"
+        cfg2 = h.config(
+            {
+                "job": {
+                    "j": {
+                        "uuid": new_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert cfg2.jobs["j"].uuid == new_uuid
+        crony.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert (h.state / "default" / new_uuid / "snapshot.json").is_file()
+        assert not old_dir.exists()
+
+    def test_surgical_apply_leaves_unrelated_broken_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The surgical same-name cleanup only touches the applied
+        # entry's own superseded residue -- an unrelated broken
+        # orphan stays put (no full-sync side effects).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        broken_dir = h.state / "default" / "dead-beef-uuid"
+        broken_dir.mkdir(parents=True)
+        (broken_dir / "snapshot.json").write_text(
+            json.dumps({"schema": 999, "kind": "job", "name": "default.x"}),
+            encoding="utf-8",
+        )
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert broken_dir.exists()
+
     def test_unchanged_suppressed_by_default(
         self,
         tmp_path: Path,
@@ -5000,8 +5105,9 @@ class TestApplyRenamePreservesHistory:
     """The whole point of keying state by uuid: a TOML edit that
     only changes a job's short name keeps the same state dir, so
     run.log and last-run.json carry over to the new name. The old
-    name's platform unit becomes a stale label and is cleaned up
-    by the standard orphan sweep on the next full apply.
+    name's platform unit becomes a stale label; apply_one removes
+    it when re-applying the entry under its new name (unless the
+    old name was handed to a live sibling in a name-swap edit).
     """
 
     def test_rename_keeps_state_destroys_old_unit(
@@ -5043,6 +5149,58 @@ class TestApplyRenamePreservesHistory:
         # New label is wired up; old label is gone.
         assert (h.agents / f"org.crony.{h.full('bar')}.plist").exists()
         assert not (h.agents / f"org.crony.{h.full('foo')}.plist").exists()
+
+    def test_name_swap_preserves_renamed_entry_history(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # One edit renames `aaa` -> `zzz` (keeping its uuid) AND
+        # adds a fresh `aaa` (new uuid) that grabs the freed name.
+        # The freed name `aaa` sorts first, so the new claimant
+        # applies BEFORE the renamed entry: it must not wipe the
+        # renamed entry's state dir as "residue" (that dir is the
+        # live `zzz` now, history and all), and the renamed entry
+        # must not later unlink the new claimant's `aaa` unit.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"aaa": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["aaa"],
+        )
+        crony.apply_one(cfg, "aaa")
+        renamed_uuid = cfg.jobs["aaa"].uuid
+        renamed_dir = h.state / "default" / renamed_uuid
+        (renamed_dir / "run.log").write_text("history\n", encoding="utf-8")
+        # zzz inherits aaa's uuid (the rename); the new aaa gets a
+        # fresh uuid (set explicitly so the harness pin doesn't
+        # re-use the old one).
+        new_aaa_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        h.config(
+            {
+                "job": {
+                    "zzz": {
+                        "uuid": renamed_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    },
+                    "aaa": {
+                        "uuid": new_aaa_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 04:00",
+                    },
+                }
+            },
+            default_target_jobs=["zzz", "aaa"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        # The renamed entry's history survived (not wiped by the
+        # new aaa's residue sweep).
+        assert (renamed_dir / "run.log").read_text() == "history\n"
+        assert (renamed_dir / "snapshot.json").is_file()
+        assert (h.state / "default" / new_aaa_uuid / "snapshot.json").is_file()
+        # Both names have live units: the new aaa re-points the
+        # `aaa` plist at its own uuid; zzz gets its own plist. The
+        # renamed entry must not have unlinked the new aaa's unit.
+        assert (h.agents / f"org.crony.{h.full('zzz')}.plist").exists()
+        assert (h.agents / f"org.crony.{h.full('aaa')}.plist").exists()
 
 
 class TestDestroy:
@@ -6086,10 +6244,12 @@ class TestEnableDisable:
 
 
 class TestStatusUuidColumn:
-    """`uuid` is an opt-in column. Default `cols=None` hides it;
-    `cols="job,uuid"` surfaces the entity's stable identity for
-    scripts that want to correlate status output with disk state
-    or with the config file's `uuid =` keys.
+    """`uuid` is an opt-in column rendering the `<bundle>:<UUID>`
+    ref form. Default `cols=None` hides it (the default identity
+    column is `job-or-uuid`, which shows the plain name for an
+    unambiguous entry); `cols="job,uuid"` surfaces the stable
+    identity for scripts correlating status with disk state or the
+    config file's `uuid =` keys.
     """
 
     def test_opt_in_uuid_column_renders(
@@ -6135,8 +6295,13 @@ class TestStatusUuidColumn:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "UUID" not in out
+        # The default identity column (`job-or-uuid`) shows the
+        # plain name for an unambiguous entry, so the bare uuid
+        # value never appears unless the opt-in `uuid` column is
+        # requested. (The "UUID" substring does appear in the
+        # default "JOB / UUID" header, so assert on the value.)
         assert cfg.jobs["j"].uuid not in out
+        assert "default.j" in out
 
     def test_uuid_column_for_orphan_row_comes_from_snapshot(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -6870,7 +7035,7 @@ class TestStatusReport:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
-            cols="job",
+            cols="job-or-uuid",
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6933,7 +7098,7 @@ class TestStatusReport:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
-            cols="job",
+            cols="job-or-uuid",
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6976,7 +7141,7 @@ class TestStatusReport:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
-            cols="job",
+            cols="job-or-uuid",
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -7027,7 +7192,7 @@ class TestStatusReport:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
-            cols="job",
+            cols="job-or-uuid",
             show_masked=False,
             bundle="default",
             config_current=False,
@@ -9638,6 +9803,122 @@ class TestStatusBrokenSurface:
         out = capsys.readouterr().out
         assert f"default:{uuid_value}" in out
         assert "broken" in out
+
+
+class TestNameCollision:
+    """When two current state dirs recover the same full name (uuid
+    residue that escaped apply's cleanup, or hand-mucked state), the
+    config-matching ref keeps the plain name and the other is
+    `shadowed` -- surfaced by `<bundle>:<UUID>` in the JOB / UUID
+    column so it stays addressable for `crony destroy`.
+    """
+
+    def _plant_residue(
+        self, h: _ApplyHarness, full: str, uuid_value: str
+    ) -> Path:
+        bundle, _, _ = full.partition(".")
+        sd = h.state / bundle / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": "job",
+                    "name": full,
+                    "bundle": bundle,
+                    "uuid": uuid_value,
+                    "command": "true",
+                    "script": None,
+                    "args": [],
+                    "gate": None,
+                    "gate_script": None,
+                    "gate_args": [],
+                    "env": {},
+                    "job_timeout_sec": 600,
+                    "schedule": "*-*-* 03:00",
+                    "interval": None,
+                    "interactive": False,
+                    "interactive_active_sec": 600,
+                    "interactive_delay_sec": 3600,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return sd
+
+    def test_config_matching_ref_keeps_name_other_is_shadowed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        live_uuid = cfg.jobs["j"].uuid
+        crony.apply_one(cfg, "j")
+        # Plant a stray dir recovering the same name under a
+        # different uuid (residue that bypassed apply's cleanup).
+        stray_uuid = "99999999-8888-7777-6666-555544443333"
+        self._plant_residue(h, h.full("j"), stray_uuid)
+        config = crony.load_config()
+        live_ref = crony.EntityRef("default", live_uuid)
+        stray_ref = crony.EntityRef("default", stray_uuid)
+        # The live (config-matching) ref keeps the name; the stray
+        # is shadowed.
+        assert config.current.by_full_name[h.full("j")] == live_ref
+        assert config.shadowed == {stray_ref}
+
+    def test_shadowed_row_renders_by_ref_in_status(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        stray_uuid = "99999999-8888-7777-6666-555544443333"
+        self._plant_residue(h, h.full("j"), stray_uuid)
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        # The live entry shows by name; the shadowed residue shows
+        # by ref form (and as an orphan) so it's addressable.
+        assert h.full("j") in out
+        assert f"default:{stray_uuid}" in out
+        assert "orphan" in out
+
+    def test_full_apply_clears_shadow_but_keeps_live_unit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A no-arg apply reconciles the shadowed residue away, but
+        # the shadow shares the live entry's name-keyed unit -- the
+        # sweep must reclaim only the stray state dir, never unlink
+        # the unit the live entry is still firing from.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        live_uuid = cfg.jobs["j"].uuid
+        crony.apply_one(cfg, "j")
+        stray_uuid = "99999999-8888-7777-6666-555544443333"
+        stray_dir = self._plant_residue(h, h.full("j"), stray_uuid)
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert plist.exists()
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        # Stray residue gone; live state dir and shared unit intact.
+        assert not stray_dir.exists()
+        assert (h.state / "default" / live_uuid / "snapshot.json").is_file()
+        assert plist.exists()
 
 
 class TestUnitOnlyOrphan:

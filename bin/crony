@@ -77,7 +77,9 @@ more TOML config bundles and applies the corresponding platform
 units, runs jobs through a uniform shim (so logs, locks, gates,
 and notifications behave the same on both platforms), and reports
 state via `crony status`. The default columns are:
-  JOB       the full namespaced name `<bundle>.<short>`, indented
+  JOB / UUID  the full namespaced name `<bundle>.<short>`, or the
+            `<bundle>:<UUID>` form when the entry has no recoverable
+            name or its name is shadowed by a collision; indented
             two spaces per group-nesting level when the entry is in
             an active target's dispatch tree, in execution order
   CONFIG    synced  | stale    | missing | orphan  | masked | error
@@ -3028,6 +3030,13 @@ class Config:
     runtime: dict[EntityRef, RuntimeState]
     host: str
     platform: str
+    # Current entries whose full name collides with another current
+    # entry (uuid-edit residue that escaped cleanup, or a hand-mucked
+    # state dir). The name in `current.by_full_name` resolves to the
+    # config-matching ref; these shadowed refs keep their own
+    # snapshot but surface by `<bundle>:<UUID>` in status so they
+    # stay addressable for `crony destroy`.
+    shadowed: set[EntityRef] = field(default_factory=set)
 
     def all_refs(self) -> set[EntityRef]:
         return (
@@ -3064,6 +3073,28 @@ class Config:
         if c is None:
             return "missing"
         return "synced" if p == c else "stale"
+
+    def name_for(self, ref: EntityRef) -> str | None:
+        """Recover the full namespaced name `ref` was last seen
+        under -- from the pending entry, the current snapshot, the
+        recovered broken-entity name, or the unit-only orphan --
+        or None when no side carries a name (a broken snapshot too
+        corrupt to recover one).
+        """
+        for graph in (self.current, self.pending):
+            j = graph.jobs.get(ref)
+            if j is not None:
+                return j.name
+            g = graph.groups.get(ref)
+            if g is not None:
+                return g.name
+        broken = self.broken.get(ref)
+        if broken is not None:
+            return broken.name
+        unit_only = self.unit_only.get(ref)
+        if unit_only is not None:
+            return unit_only.name
+        return None
 
     def resolve_runnable(self, full_name: str) -> EntityRef | None:
         """An entry that can be triggered: snapshot parseable and
@@ -3394,6 +3425,29 @@ def load_config() -> Config:
     pending = _build_pending_graph(toml_config, host, platform)
     current, broken, runtime = _build_current_graph(STATE_DIR, platform)
 
+    # Resolve same-name collisions among current entries. Two state
+    # dirs can recover the same full name (uuid-edit residue that
+    # escaped apply's cleanup, or hand-mucked state). The ref that
+    # matches the live config keeps the plain name; the rest become
+    # `shadowed` and surface by `<bundle>:<UUID>` in status. Without
+    # this, `current.by_full_name` would silently drop all but the
+    # last-scanned ref, hiding the residue.
+    shadowed: set[EntityRef] = set()
+    name_to_refs: dict[str, list[EntityRef]] = {}
+    for ref in current.refs():
+        snap = current.jobs.get(ref) or current.groups.get(ref)
+        assert snap is not None  # ref came from current.refs()
+        name_to_refs.setdefault(snap.name, []).append(ref)
+    pending_refs = pending.refs()
+    for name, refs in name_to_refs.items():
+        if len(refs) < 2:
+            continue
+        winner = next((r for r in refs if r in pending_refs), None)
+        if winner is None:
+            winner = min(refs, key=lambda r: r.uuid)
+        current.by_full_name[name] = winner
+        shadowed.update(r for r in refs if r != winner)
+
     broken_by_full_name: dict[str, EntityRef] = {}
     for ref, broken_entry in broken.items():
         if broken_entry.name is not None:
@@ -3447,6 +3501,7 @@ def load_config() -> Config:
         runtime=runtime,
         host=host,
         platform=platform,
+        shadowed=shadowed,
     )
 
 
@@ -5559,6 +5614,17 @@ def apply_one(
         raise PreconditionError(f"unknown job/group: {name!r}")
     full_name = f"{bundle_name}.{name}"
 
+    # Every uuid / full name the bundle's config currently defines.
+    # Used to keep per-entry cleanup from clobbering a *different*
+    # live entry's state when names move between entries in one
+    # edit (a rename that frees a name another entry then claims).
+    live_uuids = {e.uuid for e in config.jobs.values()} | {
+        e.uuid for e in config.job_groups.values()
+    }
+    live_full_names = {f"{bundle_name}.{s}" for s in config.jobs} | {
+        f"{bundle_name}.{s}" for s in config.job_groups
+    }
+
     schedule, interval = _entity_schedule(entry)
     platform = current_platform()
     entity_ref = EntityRef(bundle_name, entry.uuid)
@@ -5572,6 +5638,14 @@ def apply_one(
         snapshot = _resolve_group_snapshot(
             config, target, entry, bundle_name, full_name
         )
+    # A uuid edit leaves the prior uuid's state dir behind under
+    # the same name (the name-keyed unit re-points at this uuid).
+    # Reclaim it before deciding "unchanged" so the residue is
+    # cleaned even when the new uuid's snapshot already matches --
+    # and so the full-sync orphan sweep can exclude still-selected
+    # names (it trusts apply_one to have handled their residue).
+    if not dry_run:
+        _sweep_superseded_state_dirs(entity_ref, full_name, live_uuids)
     # Drift detection via direct snapshot comparison: load the
     # existing on-disk snapshot (if any) and compare it to the
     # freshly-resolved one. With both sides parsed into the same
@@ -5595,6 +5669,21 @@ def apply_one(
 
     if dry_run:
         return "updated" if is_update else "added"
+
+    # Same uuid, new name: the entry was renamed in config. The
+    # state dir (uuid-keyed) is reused under the new name, but the
+    # old name's platform unit is now stale -- remove it so only
+    # the new name's unit remains. The shared state dir is left
+    # alone (passing no state_dir to destroy_one). Skip when the
+    # old name is itself a live entry (a name-swap edit handed it
+    # to a sibling): that sibling owns the unit now, so removing it
+    # would unlink a unit a live entry is firing from.
+    if (
+        current_snapshot is not None
+        and current_snapshot.name != full_name
+        and current_snapshot.name not in live_full_names
+    ):
+        destroy_one(current_snapshot.name, None)
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
@@ -5703,6 +5792,66 @@ def _recover_full_name(state_dir: Path) -> str | None:
         return None
     name = raw.get("name")
     return name if isinstance(name, str) else None
+
+
+def _run_in_progress(state_dir: Path) -> bool:
+    """True when `state_dir`'s `run.lock` is held by another
+    process -- a fire is in flight. False when the lock file is
+    absent or freely acquirable.
+    """
+    lock_path = state_dir / "run.lock"
+    if not lock_path.is_file():
+        return False
+    try:
+        with _acquire_lock(lock_path):
+            return False
+    except LockBusyError:
+        return True
+
+
+def _sweep_superseded_state_dirs(
+    keep: EntityRef, full_name: str, live_uuids: set[str]
+) -> None:
+    """Remove state dirs in `keep`'s bundle whose snapshot recovers
+    `full_name` under a uuid no live config entry claims.
+
+    These are residue from a uuid edit: the name-keyed platform
+    unit now points at `keep`, so the old uuid dirs are unreachable
+    history. Only the state dir is wiped -- the unit is shared by
+    name and already re-rendered for `keep`.
+
+    `live_uuids` is every uuid the bundle's config currently
+    defines. A dir keyed by one of those belongs to a live entry,
+    not residue -- even when its on-disk name still matches
+    `full_name` because that entry was renamed and hasn't been
+    re-applied yet in this pass (a name-swap edit). Skipping them
+    keeps a live entry's run history from being wiped by a sibling
+    entry that grabbed its old name. A dir with a run in progress
+    is left in place (logged); the next apply or an explicit
+    `crony destroy <bundle>:<uuid>` reclaims it.
+    """
+    bundle_root = STATE_DIR / keep.bundle
+    if not bundle_root.is_dir():
+        return
+    for uuid_dir in sorted(bundle_root.iterdir()):
+        if not uuid_dir.is_dir() or uuid_dir.name in live_uuids:
+            continue
+        if _recover_full_name(uuid_dir) != full_name:
+            continue
+        stray = EntityRef(keep.bundle, uuid_dir.name)
+        if _run_in_progress(uuid_dir):
+            logger.warning(
+                "%s: superseded state dir %s left in place (run in progress)",
+                full_name,
+                stray,
+            )
+            continue
+        destroy_one(None, uuid_dir)
+        logger.info(
+            "%s: removed superseded state dir %s",
+            full_name,
+            stray,
+        )
 
 
 def _state_dir_stamps() -> set[str]:
@@ -6676,9 +6825,15 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """Render and activate platform units to match config.
 
     No args: full sync across every bundle. Install missing, fix
-    drift, remove orphans. With names: surgical update of those
-    entries only -- orphans are left alone so a one-off apply
-    doesn't have side effects on unrelated jobs.
+    drift, and reconcile by identity -- every on-disk entity
+    (current snapshot, broken snapshot, or unit-only orphan) whose
+    ref the live config no longer selects is removed, including
+    superseded uuid-edit residue. With names: surgical update of
+    those entries only -- unrelated orphans are left alone so a
+    one-off apply doesn't have side effects, but each applied
+    entry's own superseded same-name residue (from a uuid edit) is
+    still reclaimed. An orphan with a run in progress is left in
+    place and reclaimed on a later apply.
 
     Names on the CLI are full namespaced names
     (`<bundle>.<short>`). Bare input is shorthand for
@@ -6687,14 +6842,20 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     With `--bundle <name>`, scopes the apply to that bundle: bare
     CLI input resolves there instead of `default`, qualified names
     must match `<name>`, and a no-args sync only touches that
-    bundle's selected jobs and its own orphan stamps -- other
-    bundles' state is untouched.
+    bundle's selected jobs and its own orphans -- other bundles'
+    state is untouched.
 
     `unchanged` results are suppressed by default so the output
     only shows the entries the apply actually touched. `-v` /
     `--verbose` prints them too.
     """
-    bundles = load_all_bundles()
+    # One in-memory model for the whole command: selection comes
+    # from the parsed bundles, drift / orphan reconciliation from
+    # the current + broken + unit-only graphs. apply_one mutates
+    # disk per entry, but the orphan plan is derived from this one
+    # load -- no second `load_config()` after the apply loop.
+    config = load_config()
+    bundles = config.toml_config
     require_known_bundle(bundles, bundle)
     # Apply needs pending-side data for every entry it considers
     # selected; if some bundles failed to parse, the no-args
@@ -6776,16 +6937,46 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
             logger.info("%s: %s", full, result)
 
     if remove_orphans:
-        stamps = stamped_names()
-        if bundle is not None:
-            stamps = bundle_prefix_filter(stamps, bundle)
-        orphans = stamps - selected
-        config_for_orphans = load_config()
-        for orphan in sorted(orphans):
-            ref = config_for_orphans.current.by_full_name.get(orphan)
-            sd = _entity_state_dir(ref) if ref is not None else None
-            destroy_one(orphan, sd)
-            logger.info("%s: orphan removed", orphan)
+        # Reconcile by identity, not by name: anything on disk
+        # (current snapshot, broken snapshot, or unit-only orphan)
+        # whose ref the live config no longer selects is an orphan,
+        # regardless of whether its name is recoverable. A name-
+        # based sweep missed broken snapshots (no recoverable
+        # name) and unit-only orphans.
+        #
+        # Derived from the one up-front `config` (no reload): the
+        # apply loop only installs selected entries and reclaims
+        # their own superseded same-name residue (apply_one's
+        # state-only sweep), so the set of orphans whose name is
+        # NOT selected is unchanged by the loop. Excluding
+        # still-selected names is also what keeps a shared name-
+        # keyed unit safe -- the residue of a live entry is
+        # apply_one's job, not the orphan sweep's, so the sweep
+        # never unlinks a unit a selected entry is still firing.
+        on_disk = (
+            config.current.refs() | set(config.broken) | set(config.unit_only)
+        )
+        live = config.pending.refs()
+        orphan_refs = sorted(
+            (
+                r
+                for r in on_disk - live
+                if (bundle is None or r.bundle == bundle)
+                and config.name_for(r) not in selected
+            ),
+            key=lambda r: (r.bundle, r.uuid),
+        )
+        for ref in orphan_refs:
+            name = config.name_for(ref)
+            sd = _entity_state_dir(ref)
+            label = name if name is not None else str(ref)
+            if sd.is_dir() and _run_in_progress(sd):
+                logger.warning(
+                    "%s: orphan left in place (run in progress)", label
+                )
+                continue
+            destroy_one(name, sd if sd.is_dir() else None)
+            logger.info("%s: orphan removed", label)
 
 
 def do_destroy(
@@ -7239,6 +7430,7 @@ def _build_status_tree(
 
 _STATUS_COL_HEADERS: dict[str, str] = {
     "job": "JOB",
+    "job-or-uuid": "JOB / UUID",
     "kind": "KIND",
     "config": "CONFIG",
     "schedule": "SCHEDULE",
@@ -7254,7 +7446,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-config": "UNIT CONFIG",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
-    "job",
+    "job-or-uuid",
     "config",
     "schedule",
     "last",
@@ -7280,12 +7472,20 @@ Columns
                     pending config; --config-current / --config-pending
                     force a single source. Empty when the entry isn't a
                     member of any group.
-  job               Full namespaced name `<bundle>.<short>`. Always shown.
-                    Rows in an active target's dispatch tree are indented
-                    two spaces per group-nesting level and ordered by the
-                    target / group `jobs` lists (execution order). Off-tree
-                    rows (orphans, names not in any active target) follow
-                    below, unindented, in sorted order.
+  job               Full namespaced name `<bundle>.<short>`. Opt-in. Always
+                    the name, even for a row whose name collides with another
+                    entry's (so you can see what the name was). Empty for a
+                    broken entry with no recoverable name.
+  job-or-uuid       Identity column shown by default. The full namespaced
+                    name when it unambiguously identifies the row; the
+                    `<bundle>:<UUID>` form when the row has no recoverable
+                    name (a corrupt snapshot) or its name is shadowed by a
+                    collision -- so the cell is always pasteable into
+                    `crony destroy` / `crony logs`. Rows in an active target's
+                    dispatch tree are indented two spaces per group-nesting
+                    level and ordered by the target / group `jobs` lists
+                    (execution order). Off-tree rows (orphans, names not in
+                    any active target) follow below, unindented, sorted.
   kind              "job" or "group". Falls back to the snapshot's recorded
                     kind for rows whose live config no longer
                     defines the entry.
@@ -7333,11 +7533,11 @@ Columns
   unit-schedule     The applied schedule from the on-disk snapshot, with
                     no asterisk and no fallback to pending. Empty when
                     no snapshot exists or it predates the schedule field.
-  uuid              The entry's stable per-bundle identity. Sourced from
-                    the live config when the entry is still defined, or
-                    from the on-disk snapshot for orphan rows whose
-                    config entry has since been removed. Empty when
-                    neither side has a uuid to report.
+  uuid              The entry's stable identity in `<bundle>:<UUID>` form
+                    (directly pasteable into `crony destroy` / `crony logs`).
+                    Sourced from the live config when the entry is still
+                    defined, else from the on-disk snapshot for orphan rows.
+                    Empty when neither side has a uuid to report.
   unit-config       Filesystem path of the platform unit file
                     (`org.crony.<name>.plist` on macOS;
                     `crony-<name>.{{timer,service}}` on Linux).
@@ -7375,15 +7575,17 @@ _STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
 def _parse_status_cols(spec: str | None) -> list[str]:
     """Parse the `--cols` argument into an ordered column list.
 
-    Comma-separated; whitespace around names is ignored. `job` is
-    always included (and forced to the first column) because
-    everything else is meaningless without the entity name.
-    `default` and `all` are aliases that expand to the default
-    column set and every column respectively; mixing aliases with
-    explicit names is allowed (`default,masked-by`). Order is
-    preserved across the resolved list with duplicates dropped.
-    Unknown names raise UsageError so a typo is loud, not a silent
-    missing column.
+    Comma-separated; whitespace around names is ignored.
+    `job-or-uuid` is always included (and forced to the first
+    column) because everything else is meaningless without an
+    entity identity, and it's the one column guaranteed to be
+    pasteable back into `crony destroy` even for nameless or
+    name-shadowed rows. `default` and `all` are aliases that
+    expand to the default column set and every column
+    respectively; mixing aliases with explicit names is allowed
+    (`default,masked-by`). Order is preserved across the resolved
+    list with duplicates dropped. Unknown names raise UsageError
+    so a typo is loud, not a silent missing column.
     """
     if not spec:
         return list(_DEFAULT_STATUS_COLS)
@@ -7409,9 +7611,9 @@ def _parse_status_cols(spec: str | None) -> list[str]:
             continue
         seen.add(c)
         cols.append(c)
-    if "job" in cols:
-        cols.remove("job")
-    return ["job"] + cols
+    if "job-or-uuid" in cols:
+        cols.remove("job-or-uuid")
+    return ["job-or-uuid"] + cols
 
 
 def _resolve_state_axes(
@@ -7774,13 +7976,22 @@ def do_status(
         full_names = [resolve_cli_name(n, bundle) for n in jobs]
     else:
         errored_full = _errored_full_names(bundles, bundle)
-        # Broken entries with no recoverable name are addressable
-        # only through the synthetic `<bundle>:<UUID>` form. The
-        # corresponding row carries that form as its JOB cell.
-        broken_synthetic = {
+        # Broken entries with no recoverable name, and current
+        # entries whose name is shadowed by a collision, are
+        # addressable only through the synthetic `<bundle>:<UUID>`
+        # form -- their row carries that form in the JOB / UUID
+        # cell. (A shadowed entry's plain name still belongs to its
+        # collision winner, so adding the name to `active` would
+        # only re-render the winner.)
+        ref_form_only = {
             str(b.ref)
             for b in config.broken.values()
             if b.name is None and (bundle is None or b.bundle == bundle)
+        }
+        ref_form_only |= {
+            str(ref)
+            for ref in config.shadowed
+            if bundle is None or ref.bundle == bundle
         }
         # Errored entries always surface in the default view --
         # without this the user can fix a typo only by reading
@@ -7790,7 +8001,7 @@ def do_status(
         # `stamped_names() | _platform_unit_names()`, so we don't
         # add them separately -- `Config.unit_only` is the
         # ref-side index for destroy / row population to use.
-        active = selected | remnants | errored_full | broken_synthetic
+        active = selected | remnants | errored_full | ref_form_only
         if show_masked:
             active = active | set(masked_by_full)
         full_names = sorted(active)
@@ -7858,11 +8069,24 @@ def do_status(
             any_stale = True
             groups_cell = f"{groups_cell} *"
         unit_name = _unit_name_for(full, entry, platform, config)
-        if entry is not None:
-            entity_uuid = entry.uuid
+        # Identity cells. A `<bundle>:<UUID>` ref-form key (broken
+        # entry with no recoverable name, or a shadowed collision
+        # loser) renders by ref in the JOB / UUID column; its plain
+        # name -- if it has one -- still belongs to another row, so
+        # the JOB column shows it only for the user who opts that
+        # column in. A name-keyed row shows the name in both.
+        direct_ref = EntityRef.from_str(full)
+        if direct_ref is not None:
+            row_ref: EntityRef | None = direct_ref
+            job_cell = config.name_for(direct_ref) or ""
+            job_or_uuid_cell = str(direct_ref)
         else:
-            cur_ref = config.resolve_current(full)
-            entity_uuid = cur_ref.uuid if cur_ref is not None else ""
+            row_ref = config.resolve_current(full) or config.resolve_pending(
+                full
+            )
+            job_cell = full
+            job_or_uuid_cell = full
+        uuid_cell = str(row_ref) if row_ref is not None else ""
         # `unit-config`: read the platform unit path from
         # RuntimeState rather than walking the unit dirs --
         # `load_config` already captured it at startup. For
@@ -7870,12 +8094,12 @@ def do_status(
         # empty; the path would be `_plist_path_for(full)` etc.
         # but it doesn't exist on disk so there's nothing to
         # show.
-        any_ref = config.resolve_current(full) or config.resolve_pending(full)
-        rt = config.runtime.get(any_ref) if any_ref is not None else None
+        rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         rows.append(
             {
-                "job": full,
+                "job": job_cell,
+                "job-or-uuid": job_or_uuid_cell,
                 "kind": kind,
                 "config": cfg_state,
                 "schedule": sched_cell,
@@ -7887,7 +8111,7 @@ def do_status(
                 "unit-name": unit_name,
                 "unit-schedule": unit_sched_cell,
                 "pending-schedule": pending_sched_cell,
-                "uuid": entity_uuid,
+                "uuid": uuid_cell,
                 "unit-config": unit_config_cell,
             }
         )
@@ -7911,27 +8135,35 @@ def do_status(
                 and r["last"] in healthy_last
             )
         ]
-        rows = sorted(rows, key=lambda r: r["job"])
+        rows = sorted(rows, key=lambda r: r["job-or-uuid"])
     else:
         # Order rows by tree DFS to surface execution order
         # rather than alphabetical: roots from each active target
         # first, then group children indented by depth, then off-
         # tree rows (orphans, CLI args outside any tree, masked
         # entries not in any active target) below in stable
-        # sorted order. The JOB cell carries two spaces of indent
-        # per depth level so the visual nesting matches the
-        # dispatch graph.
-        rows_by_name = {r["job"]: r for r in rows}
+        # sorted order. The identity cells carry two spaces of
+        # indent per depth level so the visual nesting matches the
+        # dispatch graph. Rows are keyed by `job-or-uuid` (unique
+        # per row): a collision winner uses its name, while a
+        # shadowed loser and a broken-no-name entry use the
+        # `<bundle>:<UUID>` form, so they never collapse onto the
+        # winner's name -- and only the tree-named winner matches a
+        # `tree_order` entry.
+        rows_by_key = {r["job-or-uuid"]: r for r in rows}
         ordered: list[dict[str, str]] = []
         for full in tree_order:
-            r = rows_by_name.pop(full, None)
+            r = rows_by_key.pop(full, None)
             if r is None:
                 continue
             r = dict(r)
-            r["job"] = "  " * tree_depth[full] + r["job"]
+            indent = "  " * tree_depth[full]
+            r["job-or-uuid"] = indent + r["job-or-uuid"]
+            if r["job"]:
+                r["job"] = indent + r["job"]
             ordered.append(r)
-        for full in sorted(rows_by_name):
-            ordered.append(rows_by_name[full])
+        for key in sorted(rows_by_key):
+            ordered.append(rows_by_key[key])
         rows = ordered
 
     # Per-column width: max of the header label and the longest
