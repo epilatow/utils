@@ -8159,7 +8159,7 @@ class TestResolveStateAxes:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         config = crony.load_config()
         cfg, sched, last = crony._resolve_state_axes(
-            config, ghost, "darwin", crony.stamped_names()
+            config, ghost, "darwin", config.installed_full_names()
         )
         assert cfg == "orphan"
         assert sched == "enabled"
@@ -8207,7 +8207,7 @@ class TestResolveStateAxes:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         config = crony.load_config()
         _, sched, _ = crony._resolve_state_axes(
-            config, h.full("a"), "darwin", crony.stamped_names()
+            config, h.full("a"), "darwin", config.installed_full_names()
         )
         assert sched == "grouped"
 
@@ -8224,7 +8224,7 @@ class TestResolveStateAxes:
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         config = crony.load_config()
         cfg_state, sched, _ = crony._resolve_state_axes(
-            config, h.full("j"), "darwin", crony.stamped_names()
+            config, h.full("j"), "darwin", config.installed_full_names()
         )
         assert cfg_state == "synced"
         assert sched == "disabled"
@@ -8527,7 +8527,7 @@ class TestPerEntityConfigErrors:
         )
         config = crony.load_config()
         cfg_state, _unit_state, _last_state = crony._resolve_state_axes(
-            config, h.full("bad"), "darwin", crony.stamped_names()
+            config, h.full("bad"), "darwin", config.installed_full_names()
         )
         assert cfg_state == "error"
 

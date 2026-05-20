@@ -2893,11 +2893,10 @@ class GroupRunResult:
 # Built once at startup by `load_config()`. The rest of crony treats
 # the result as read-only: apply / destroy plan their work against
 # the loaded Config, perform disk mutations, and exit. A caller that
-# needs the post-mutation view re-invokes `load_config()`. A few
-# discovery paths (status / trigger / destroy) still re-derive the
-# installed-name set from disk via `stamped_names()` rather than
-# `Config.installed_full_names()` -- a remaining migration, not a
-# correctness gap.
+# needs the post-mutation view re-invokes `load_config()`. The
+# config-only `config validate` command -- which never builds a
+# Config -- is the lone path that still re-scans disk directly (via
+# `stamped_names()`) for its best-effort orphan warning.
 
 
 @dataclass
@@ -3068,9 +3067,10 @@ class Config:
         """Full names with something installed on this host: a
         parseable current snapshot, a leftover platform unit
         (`unit_only`), or a broken snapshot whose name was
-        recovered. The model-side equivalent of the old
-        `stamped_names()` disk scan -- the set lifecycle commands
-        (enable / disable) can address.
+        recovered. Computed from the one `load_config()` disk pass
+        -- the addressable set status / trigger / enable / disable
+        / destroy operate on, without re-walking the state-dir and
+        unit trees per command.
         """
         return (
             set(self.current.by_full_name)
@@ -7054,11 +7054,12 @@ def do_destroy(
     bundles = config.toml_config
     require_known_bundle(bundles, bundle)
     # Shadowed collision losers share a live name, so they never
-    # surface in the name-keyed `stamped_names()` discovery set --
-    # collect them by ref. They're always orphans (the winner holds
-    # the name), so both factory-reset and `--orphans` reclaim
-    # them; surgical `destroy <name>` doesn't (the operator can
-    # paste a `<bundle>:<UUID>` from status to target one).
+    # surface in the name-keyed discovery set
+    # (`Config.installed_full_names()`) -- collect them by ref.
+    # They're always orphans (the winner holds the name), so both
+    # factory-reset and `--orphans` reclaim them; surgical
+    # `destroy <name>` doesn't (the operator can paste a
+    # `<bundle>:<UUID>` from status to target one).
     shadowed_refs: list[EntityRef] = []
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
@@ -7066,7 +7067,7 @@ def do_destroy(
         # name with an on-disk remnant (so a leftover state dir or
         # unit can still be destroyed after the bundle is gone).
         defined = set(by_full.keys()) | bundles.all_full_names()
-        known = defined | stamped_names()
+        known = defined | config.installed_full_names()
         if bundle is not None:
             known = bundle_prefix_filter(known, bundle)
         normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
@@ -7086,7 +7087,7 @@ def do_destroy(
             raise UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
     else:
-        names = stamped_names()
+        names = config.installed_full_names()
         if orphans:
             _by_full, selected = _selected_full_names_per_bundle(bundles)
             names = names - selected
@@ -7367,7 +7368,7 @@ def do_trigger(
     config = load_config()
     bundles = config.toml_config
     require_known_bundle(bundles, bundle)
-    stamped = stamped_names()
+    stamped = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, stamped, config, scheduled_only=False
     )
@@ -8007,7 +8008,7 @@ def do_status(
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
     )
-    remnants = stamped_names()
+    remnants = config.installed_full_names()
     if bundle is not None:
         selected = bundle_prefix_filter(selected, bundle)
         remnants = bundle_prefix_filter(remnants, bundle)
@@ -8063,10 +8064,9 @@ def do_status(
         # without this the user can fix a typo only by reading
         # the warning line; they wouldn't see the entry in the
         # table itself. Unit-only orphans (platform unit files
-        # with no state dir) are already in `remnants` via
-        # `stamped_names() | _platform_unit_names()`, so we don't
-        # add them separately -- `Config.unit_only` is the
-        # ref-side index for destroy / row population to use.
+        # with no state dir) are already in `remnants` --
+        # `Config.installed_full_names()` includes the unit-only
+        # set -- so we don't add them separately.
         active = selected | remnants | errored_full | ref_form_only
         if show_masked:
             active = active | set(masked_by_full)
