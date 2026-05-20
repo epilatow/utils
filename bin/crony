@@ -2134,7 +2134,7 @@ def load_all_bundles() -> TomlConfig:
     return bundles
 
 
-def load_toml_bundle_config(path: Path | None = None) -> TomlBundleConfig:
+def load_toml_bundle_config(path: Path) -> TomlBundleConfig:
     """Load a single config file as a `TomlBundleConfig` (single-bundle view).
 
     Suited to tests and any caller that has one specific config
@@ -2142,8 +2142,6 @@ def load_toml_bundle_config(path: Path | None = None) -> TomlBundleConfig:
     alone. Production code paths walk every bundle and should use
     `load_all_bundles()` instead.
     """
-    if path is None:
-        path = CONFIG_FILE
     if not path.exists():
         raise ConfigError(f"config not found: {path}")
     try:
@@ -3223,23 +3221,23 @@ def _read_runtime_state(
     state_dir: Path,
     kind: str,
     *,
-    full_name: str | None = None,
-    platform: str | None = None,
+    full_name: str | None,
+    platform: str,
     snapshot: Job | JobGroup | None = None,
 ) -> RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
     parsed last-run record and presence of the lock / pending /
-    user-trigger flag files. When `full_name` and `platform` are
-    supplied, also probe the platform unit file path so
-    subcommands can read it from RuntimeState instead of walking
-    the unit dirs ad-hoc.
+    user-trigger flag files. When `full_name` is known, also probe
+    the platform unit file path so subcommands can read it from
+    RuntimeState instead of walking the unit dirs ad-hoc.
+    `full_name` is None only for a broken entry whose snapshot
+    didn't yield a recoverable name.
 
     `snapshot` is the parsed `Job` / `JobGroup` for entries in
-    `Config.current`; when supplied (and `full_name` / `platform`
-    are too), the unit-install integrity check runs and
-    `unit_is_stale` reflects the result. Left None for broken
-    refs (no snapshot) and unit-only refs (no state dir to read
-    from).
+    `Config.current`; when supplied (with a known `full_name`),
+    the unit-install integrity check runs and `unit_is_stale`
+    reflects the result. Left None for broken refs (no snapshot)
+    and unit-only refs (no state dir to read from).
     """
     last_run: LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -3262,7 +3260,7 @@ def _read_runtime_state(
 
     unit_config: Path | None = None
     unit_is_stale = False
-    if full_name is not None and platform is not None:
+    if full_name is not None:
         unit_config = _platform_unit_config_path(full_name, platform)
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(full_name, snapshot, platform)
@@ -4023,7 +4021,7 @@ def _build_email_message(
     cfg: NotifyEmail,
     attach_log: bool,
     attach_max_kb: int,
-    extra_headers: dict[str, str] | None = None,
+    extra_headers: dict[str, str],
 ) -> EmailMessage:
     """Construct the RFC822 EmailMessage for a job failure.
 
@@ -4126,7 +4124,7 @@ def _post_ntfy(
     body: str,
     log_text: str,
     attach_log: bool,
-    extra_headers: dict[str, str] | None = None,
+    extra_headers: dict[str, str],
 ) -> None:
     """POST to ntfy. Body mirrors the email layout (human summary +
     latest log entry), capped at _NTFY_MAX_BODY_KB. urlopen raises
@@ -4820,7 +4818,6 @@ def run_group(
     snap: JobGroup,
     *,
     dry_run: bool = False,
-    skip_gate: bool = False,
 ) -> int:
     """Run a job-group from its applied snapshot.
 
@@ -4835,8 +4832,8 @@ def run_group(
     The cumulative deadline (`snap.group_budget_sec`) was pinned
     at apply time. Per-child wait cap pulls the child's pinned
     timeout from its own snapshot so cap and child enforcement
-    agree. `skip_gate` is intentionally unused -- the child's
-    runner reads its own snapshot and applies the gate itself.
+    agree. A group never applies a run-gate of its own -- each
+    child's runner reads its own snapshot and gates itself.
     """
     full_name = snap.name
     group_budget = snap.group_budget_sec
@@ -5512,8 +5509,8 @@ def _activate_unit(
     name: str,
     platform: str,
     *,
-    prior_disabled: bool = False,
-    scheduled: bool = True,
+    prior_disabled: bool,
+    scheduled: bool,
 ) -> None:
     """Load the unit into the platform scheduler.
 
@@ -6634,9 +6631,7 @@ def do_config_update(bundle: str | None) -> None:
         )
 
 
-def _errored_full_names(
-    bundles: TomlConfig, bundle: str | None = None
-) -> set[str]:
+def _errored_full_names(bundles: TomlConfig, bundle: str | None) -> set[str]:
     """Full-namespaced names of entries whose bundle config rejected them.
 
     Walks every bundle (or just `bundle` when scoped). Errored
@@ -8457,7 +8452,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     if isinstance(snap, Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
-        rc = run_group(snap, dry_run=dry_run, skip_gate=skip_gate)
+        rc = run_group(snap, dry_run=dry_run)
     raise SystemExit(rc)
 
 
@@ -8829,7 +8824,7 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     raise CronyError(f"notify-test failed: {detail}")
 
 
-def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
+def do_self_test(*, verbose: bool, coverage: bool) -> int:
     """Run tests by invoking the test file directly."""
     repo_root = Path(__file__).parent.parent
     test_file = repo_root / "tests" / "test_crony.py"
