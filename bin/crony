@@ -5621,6 +5621,7 @@ def apply_one(
     *,
     dry_run: bool = False,
     bundle_name: str = DEFAULT_BUNDLE_NAME,
+    model: Config | None = None,
 ) -> str:
     """Apply a single job or group; return "added", "updated", or
     "unchanged".
@@ -5637,6 +5638,14 @@ def apply_one(
     .timer (which would have nothing to trigger on) is omitted, and
     apply cleans up a stale .timer if an entry transitions
     scheduled -> unscheduled.
+
+    `model` is the whole-process `Config` the calling command
+    (`do_apply`) loaded once at start: the entity's prior snapshot
+    and unit-drift verdict are read from it rather than re-scanning
+    disk per entry. The entity's own state is untouched by the
+    apply loop until this call, so the loaded view still matches
+    disk. Standalone callers (tests) that hold no `Config` pass
+    None and the prior state is read directly.
     """
     if name in config.jobs:
         entry: TomlJob | TomlJobGroup = config.jobs[name]
@@ -5678,24 +5687,35 @@ def apply_one(
     # names (it trusts apply_one to have handled their residue).
     if not dry_run:
         _sweep_superseded_state_dirs(entity_ref, full_name, live_uuids)
-    # Drift detection via direct snapshot comparison: load the
-    # existing on-disk snapshot (if any) and compare it to the
-    # freshly-resolved one. With both sides parsed into the same
-    # dataclass shape, equality is a single Python `==`. A
-    # missing / unparseable / wrong-schema on-disk snapshot is
-    # "not equal" and triggers a fresh write. Equality alone
-    # isn't enough though: the unit-install integrity check
-    # catches a hand-edited / missing / unloaded unit file whose
-    # snapshot still matches what apply would resolve, so an
-    # otherwise-clean apply still re-renders and re-bootstraps
-    # the platform side.
-    try:
-        current_snapshot: Job | JobGroup | None = _load_snapshot(entity_ref)
-    except PreconditionError:
-        current_snapshot = None
-    if current_snapshot == snapshot and not _unit_is_stale(
-        full_name, snapshot, platform
-    ):
+    # Drift detection via direct snapshot comparison: take the
+    # entity's prior on-disk snapshot (if any) and compare it to
+    # the freshly-resolved one. With both sides parsed into the
+    # same dataclass shape, equality is a single Python `==`. A
+    # missing / unparseable / wrong-schema prior snapshot is "not
+    # equal" and triggers a fresh write. Equality alone isn't
+    # enough though: the unit-install integrity check catches a
+    # hand-edited / missing / unloaded unit file whose snapshot
+    # still matches what apply would resolve, so an otherwise-clean
+    # apply still re-renders and re-bootstraps the platform side.
+    #
+    # Both come from the loaded `model` when one is supplied (the
+    # `unit_is_stale` it pinned was computed against the current
+    # snapshot, which equals the pending one in the only branch
+    # where the verdict matters); standalone callers read them
+    # directly.
+    if model is not None:
+        current_snapshot: Job | JobGroup | None = model.current.jobs.get(
+            entity_ref
+        ) or model.current.groups.get(entity_ref)
+        rt = model.runtime.get(entity_ref)
+        unit_stale = rt.unit_is_stale if rt is not None else False
+    else:
+        try:
+            current_snapshot = _load_snapshot(entity_ref)
+        except PreconditionError:
+            current_snapshot = None
+        unit_stale = _unit_is_stale(full_name, snapshot, platform)
+    if current_snapshot == snapshot and not unit_stale:
         return "unchanged"
     is_update = current_snapshot is not None
 
@@ -6964,7 +6984,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 
     for full in full_names_to_apply:
         b, short = by_full[full]
-        result = apply_one(b.config, short, bundle_name=b.name)
+        result = apply_one(b.config, short, bundle_name=b.name, model=config)
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
 
@@ -7117,15 +7137,14 @@ def do_destroy(
         ref = config.resolve_current(full) or direct_ref
         sd = _entity_state_dir(ref) if ref is not None else None
         # Recover the entity's actual name for platform unit
-        # cleanup: a `<bundle>:<UUID>` input doesn't carry the namespaced
-        # name the unit file is keyed by, so destroy_one would
-        # leak the unit. Read the snapshot's `name` field; if the
-        # snapshot is unparseable or missing, drop the platform
-        # unit cleanup (no name -> no path to construct).
+        # cleanup: a `<bundle>:<UUID>` input doesn't carry the
+        # namespaced name the unit file is keyed by, so destroy_one
+        # would leak the unit. The loaded model already recovered
+        # it (`name_for`); None when the snapshot was unparseable
+        # or absent, in which case the platform unit cleanup is
+        # dropped (no name -> no path to construct).
         if direct_ref is not None:
-            name_for_cleanup: str | None = (
-                _recover_full_name(sd) if sd is not None else None
-            )
+            name_for_cleanup: str | None = config.name_for(direct_ref)
         else:
             name_for_cleanup = full
         # Refuse if a run is in progress; a partial destroy would

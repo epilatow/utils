@@ -11179,6 +11179,22 @@ class TestUnitDriftDetection:
         assert result == "updated"
         assert unit_config.exists()
 
+    def test_do_apply_refreshes_stale_install_via_model(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # `do_apply` reads the unit-drift verdict from the Config it
+        # loaded once at start (apply_one's `model` path), not by
+        # re-probing disk per entry. A unit deleted after the first
+        # apply is `unit_is_stale` at load time, so the no-arg apply
+        # re-renders it.
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        unit_config.unlink()
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_apply(jobs=[], verbose=False, bundle=None)
+        assert unit_config.exists()
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(f"{h.full('j')}: updated" in m for m in msgs), msgs
+
     def test_status_reports_stale_for_drifted_install(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
