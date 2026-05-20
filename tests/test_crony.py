@@ -50,6 +50,21 @@ sys.modules["crony"] = crony
 _spec.loader.exec_module(crony)
 
 
+def _apply(short: str, *, bundle: str = crony.DEFAULT_BUNDLE_NAME) -> str:
+    """Apply one entry through the production path: build the
+    `Config` model (one disk pass) and call `apply_one` with the
+    resolved ref -- mirroring what `do_apply` does per entry, so
+    tests exercise the model-based code rather than a standalone
+    path. For tests not built on `_ApplyHarness` (which exposes the
+    same thing as `h.apply`).
+    """
+    config = crony.load_config()
+    ref = config.pending.by_full_name.get(f"{bundle}.{short}")
+    assert ref is not None, f"{bundle}.{short} not selected on this host"
+    result: str = crony.apply_one(config, ref)
+    return result
+
+
 def isolate_crony_home(
     module: Any,
     tmp_path: Path,
@@ -2535,19 +2550,23 @@ class _RunnerHarness:
     def config(
         self, raw: dict[str, Any], *, default_target_jobs: list[str]
     ) -> Any:
-        """Build a TomlBundleConfig with a darwin target selecting these jobs.
+        """Build a TomlBundleConfig with a target (for the platform
+        this harness simulates) selecting these jobs.
 
         Persists the raw config to the on-disk file so subprocess
         re-invocations of `crony run <child>` (group dispatch) load
-        the same config we hand to run_group.
+        the same config we hand to run_group. The target keys on the
+        simulated platform so the entries are actually selected when
+        a later `load_config()` resolves the host's target.
         """
+        plat = crony.current_platform()
         full = dict(raw)
         full.setdefault("target", {})
         target_section = full["target"]
         if isinstance(target_section, dict):
-            target_section.setdefault("darwin", {})
-            assert isinstance(target_section["darwin"], dict)
-            target_section["darwin"].setdefault("jobs", default_target_jobs)
+            target_section.setdefault(plat, {})
+            assert isinstance(target_section[plat], dict)
+            target_section[plat].setdefault("jobs", default_target_jobs)
         # Re-use uuids previously assigned to the same short name
         # so a successive `h.config(...)` call simulates an edit
         # to the same entity rather than a delete + replace.
@@ -2950,7 +2969,7 @@ class TestRunJobBasics:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j", cfg=cfg)
         # Stash a canceled record directly to skip the runner
         # plumbing for the assertion-of-display.
@@ -2986,7 +3005,7 @@ class TestRunJobBasics:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j", cfg=cfg)
         (sd / "last-run.json").write_text(
             '{"exit_class": "canceled", "started_at": '
@@ -4604,6 +4623,13 @@ class _ApplyHarness(_RunnerHarness):
         self.agents = agents
         self.sysd = sysd
 
+    def apply(
+        self, short: str, *, bundle: str = crony.DEFAULT_BUNDLE_NAME
+    ) -> str:
+        """Apply one entry through the production path (see the
+        module-level `_apply`)."""
+        return _apply(short, bundle=bundle)
+
 
 _REF = "default:u-test"
 
@@ -4744,11 +4770,11 @@ class TestApplyDarwin:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        result = crony.apply_one(cfg, "j")
+        result = h.apply("j")
         assert result == "added"
         plist_path = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist_path.exists()
@@ -4763,13 +4789,13 @@ class TestApplyDarwin:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.calls.clear()
-        result = crony.apply_one(cfg, "j")
+        result = h.apply("j")
         assert result == "unchanged"
         # No further launchctl invocations on no-op apply
         assert all(c[0] != "launchctl" for c in h.calls)
@@ -4778,17 +4804,17 @@ class TestApplyDarwin:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg1 = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
-        cfg2 = h.config(
+        h.apply("j")
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
         )
         h.calls.clear()
-        result = crony.apply_one(cfg2, "j")
+        result = h.apply("j")
         assert result == "updated"
         plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
         assert "<integer>4</integer>" in plist
@@ -4799,11 +4825,11 @@ class TestApplyLinux:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         assert (h.sysd / f"crony-{h.full('j')}.service").exists()
         assert (h.sysd / f"crony-{h.full('j')}.timer").exists()
         commands = [c[0] for c in h.calls]
@@ -4923,7 +4949,7 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         old_uuid = cfg1.jobs["j"].uuid
-        crony.apply_one(cfg1, "j")
+        h.apply("j")
         old_dir = h.state / "default" / old_uuid
         assert old_dir.is_dir()
         new_uuid = "abcdabcd-1111-2222-3333-444455556666"
@@ -5092,7 +5118,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(h._last_cfg, "j")
+        h.apply("j")
         h.cfg_dropin.mkdir(parents=True, exist_ok=True)
         (h.cfg_dropin / "broken.toml").write_text(
             "this is not [valid toml", encoding="utf-8"
@@ -5122,7 +5148,7 @@ class TestApplyRenamePreservesHistory:
             },
             default_target_jobs=["foo"],
         )
-        crony.apply_one(cfg, "foo")
+        h.apply("foo")
         # Plant a run.log artifact so we can prove it survives the
         # rename via the state dir's uuid-keyed continuity.
         foo_dir = h.state_dir("foo", cfg=cfg)
@@ -5165,7 +5191,7 @@ class TestApplyRenamePreservesHistory:
             {"job": {"aaa": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["aaa"],
         )
-        crony.apply_one(cfg, "aaa")
+        h.apply("aaa")
         renamed_uuid = cfg.jobs["aaa"].uuid
         renamed_dir = h.state / "default" / renamed_uuid
         (renamed_dir / "run.log").write_text("history\n", encoding="utf-8")
@@ -5206,11 +5232,11 @@ class TestApplyRenamePreservesHistory:
 class TestDestroy:
     def test_factory_reset(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j", ensure_snapshot=False)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert (sd / "snapshot.json").exists()
@@ -5220,7 +5246,7 @@ class TestDestroy:
 
     def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "a": {"command": "true", "schedule": "*-*-* 03:00"},
@@ -5229,8 +5255,8 @@ class TestDestroy:
             },
             default_target_jobs=["a", "b"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "b")
+        h.apply("a")
+        h.apply("b")
         sd_a = h.state_dir("a", ensure_snapshot=False)
         sd_b = h.state_dir("b", ensure_snapshot=False)
         crony.do_destroy(jobs=["a"], bundle=None, orphans=False)
@@ -5243,11 +5269,11 @@ class TestDestroy:
         # Destroy fully wipes the state dir, including runtime
         # artifacts like run.log / last-run.json / run.lock.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         (sd / "run.log").write_text("...")
@@ -5277,11 +5303,11 @@ class TestDestroy:
         import fcntl as _fcntl
 
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         lock_path = sd / "run.lock"
@@ -5308,11 +5334,11 @@ class TestDestroy:
         # factory reset) must still find and clean them up via
         # the platform-unit discovery pass.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist.exists()
         # Wipe state but leave the plist behind.
@@ -5340,11 +5366,11 @@ class TestDestroy:
         # Two bundles, both stamped. `destroy -b borgadm` removes
         # only borgadm's remnants; default's survive.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
@@ -5356,7 +5382,7 @@ class TestDestroy:
         bundles = crony.load_all_bundles()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
-        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        h.apply("k", bundle="borgadm")
         k_dir = h.state / "borgadm" / borgadm.config.jobs["k"].uuid
         assert k_dir.exists()
         crony.do_destroy(
@@ -5371,11 +5397,11 @@ class TestDestroy:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
@@ -5408,8 +5434,8 @@ class TestDestroy:
             },
             default_target_jobs=["live", "renamed"],
         )
-        crony.apply_one(cfg, "live")
-        crony.apply_one(cfg, "renamed")
+        h.apply("live")
+        h.apply("renamed")
         renamed_dir = h.state_dir("renamed", cfg=cfg)
         # Drop `renamed` from config without applying -- now
         # selected={live} but discovered={live,renamed}.
@@ -5432,11 +5458,11 @@ class TestDestroy:
         # Two bundles each have one orphan. `--orphans -b borgadm`
         # touches only borgadm's orphan; default's orphan stays.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"old_d": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["old_d"],
         )
-        crony.apply_one(cfg, "old_d")
+        h.apply("old_d")
         default_old_d_dir = h.state_dir("old_d")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
@@ -5449,7 +5475,7 @@ class TestDestroy:
         bundles = crony.load_all_bundles()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
-        crony.apply_one(borgadm.config, "old_b", bundle_name="borgadm")
+        h.apply("old_b", bundle="borgadm")
         borgadm_old_b_dir = (
             h.state / "borgadm" / borgadm.config.jobs["old_b"].uuid
         )
@@ -5486,11 +5512,11 @@ class TestDestroy:
         # No orphans on disk: `--orphans` is a no-op and active
         # entries are untouched.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         crony.do_destroy(jobs=[], bundle=None, orphans=True)
         assert (h.state_dir("j") / "snapshot.json").exists()
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
@@ -5777,11 +5803,11 @@ class TestConfigState:
 
     def test_synced_after_apply(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         config = crony.load_config()
         assert config.config_state(self._ref(config, "default.j")) == "synced"
 
@@ -5789,11 +5815,11 @@ class TestConfigState:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg1 = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
+        h.apply("j")
         # Edit the config (new schedule) without re-applying.
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
@@ -5819,11 +5845,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.calls.clear()
         crony.do_enable(jobs=["j"], bundle=None)
         cmd = next(c for c in h.calls if c[0] == "systemctl")
@@ -5840,11 +5866,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.calls.clear()
         crony.do_disable(jobs=["j"], bundle=None)
         verbs = [c[1] if len(c) > 1 else "" for c in h.calls]
@@ -5871,14 +5897,14 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
+        h.apply("a")
         with pytest.raises(crony.UsageError, match="grouped entries"):
             crony.do_enable(jobs=["a"], bundle=None)
         with pytest.raises(crony.UsageError, match="grouped entries"):
@@ -5894,14 +5920,14 @@ class TestEnableDisable:
         # applied snapshot -- not the pending edit -- decides
         # whether there's a timer to arm.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
+        h.apply("a")
         # Pending edit: `a` gains its own schedule (still grouped
         # under g too), not applied.
         h.config(
@@ -5918,11 +5944,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.calls.clear()
         crony.do_trigger(
             jobs=["j"], wait=False, trigger_timeout=None, bundle=None
@@ -5938,11 +5964,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.calls.clear()
         crony.do_trigger(
             jobs=["j"], wait=False, trigger_timeout=None, bundle=None
@@ -5973,11 +5999,11 @@ class TestEnableDisable:
         # the config, which no longer describes it -- it must raise
         # a clean UsageError, not a raw KeyError.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="not in the current config"):
             crony.do_trigger(
@@ -5993,11 +6019,11 @@ class TestEnableDisable:
         # `crony trigger --wait` must surface a non-zero exit code
         # when the job times out (exit_code is None for that class).
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(
             crony,
             "_trigger_unit_sync",
@@ -6017,11 +6043,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(
             crony,
             "_trigger_unit_sync",
@@ -6041,11 +6067,11 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "false", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(
             crony,
             "_trigger_unit_sync",
@@ -6095,7 +6121,7 @@ class TestEnableDisable:
             },
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         current_sd = h.state_dir("j", cfg=cfg)
         assert current_sd.name == "11111111-1111-1111-1111-111111111111"
         # Edit the uuid in config without re-applying. Pending now
@@ -6135,14 +6161,14 @@ class TestEnableDisable:
         # Every entry installs a platform unit, including schedule-
         # less group-only jobs. trigger fires that unit directly.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
+        h.apply("a")
         h.calls.clear()
         crony.do_trigger(
             jobs=["a"], wait=False, trigger_timeout=None, bundle=None
@@ -6155,18 +6181,18 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg1 = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
-        cfg2 = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
         )
         h.calls.clear()
-        crony.apply_one(cfg2, "j")
+        h.apply("j")
         # Strip leading flags (`--user`, `--quiet`, etc.) and pull
         # the systemctl subcommand verb so the test isn't tied to
         # flag ordering.
@@ -6187,11 +6213,11 @@ class TestEnableDisable:
         # its state dir, so the disable signal lives only in the
         # scheduler view.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         # Wipe state; the timer file under sysd survives.
         shutil.rmtree(h.state)
         timer = h.sysd / f"crony-{h.full('j')}.timer"
@@ -6200,7 +6226,7 @@ class TestEnableDisable:
         # by hand before the state wipe).
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
         h.calls.clear()
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         verbs = [
             next((a for a in c[1:] if not a.startswith("-")), "")
             for c in h.calls
@@ -6242,7 +6268,7 @@ class TestEnableDisable:
         # member. `enable -b foo` enables the scheduled one and
         # silently skips the unscheduled one rather than aborting.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "a": {"command": "true"},
@@ -6252,9 +6278,9 @@ class TestEnableDisable:
             },
             default_target_jobs=["b", "g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "b")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("b")
+        h.apply("g")
         h.calls.clear()
         crony.do_enable(jobs=[], bundle="default")
         # Only b and g (scheduled) get enable invocations.
@@ -6273,15 +6299,15 @@ class TestEnableDisable:
         # Trigger fires every stamped entry, including schedule-less
         # ones (their dormant units kickstart fine).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 04:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         h.calls.clear()
         crony.do_trigger(
             jobs=[], wait=False, trigger_timeout=None, bundle="default"
@@ -6312,7 +6338,7 @@ class TestStatusUuidColumn:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6335,7 +6361,7 @@ class TestStatusUuidColumn:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6382,11 +6408,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6432,11 +6458,11 @@ class TestStatusReport:
         # discovers it via the platform-unit scan and reports
         # it as orphan so the user can `crony destroy` it.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         # Drop the entry from the config and wipe state, leaving
         # only the plist behind.
         h.config({}, default_target_jobs=[])
@@ -6460,11 +6486,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6509,11 +6535,11 @@ class TestStatusReport:
         import datetime as _dt
 
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         five_min_ago = (
@@ -6547,11 +6573,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6573,7 +6599,7 @@ class TestStatusReport:
         # should now adapt to the longest name actually printed.
         h = _ApplyHarness(tmp_path, monkeypatch)
         long_name = "this-is-a-deliberately-long-job-name-for-alignment"
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     long_name: {
@@ -6584,7 +6610,7 @@ class TestStatusReport:
             },
             default_target_jobs=[long_name],
         )
-        crony.apply_one(cfg, long_name)
+        h.apply(long_name)
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6745,11 +6771,11 @@ class TestStatusReport:
         # in the default view so the cleanup is discoverable. The
         # masked-by column still carries the reason (`host`).
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {
                 "job": {
@@ -6836,7 +6862,7 @@ class TestStatusReport:
         # remnant should now report as `orphan` -- same axis as
         # direct host-mask + remnant, just via the cascade.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
@@ -6845,8 +6871,8 @@ class TestStatusReport:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         h.config(
             {
                 "job": {"a": {"command": "true", "hosts": ["other"]}},
@@ -6882,11 +6908,11 @@ class TestStatusReport:
         # installed it, removing the target reference leaves an
         # orphan -- same as the host-mask case.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=[],
@@ -6912,11 +6938,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6942,11 +6968,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -6976,11 +7002,11 @@ class TestStatusReport:
         # `default,masked-by` keeps the default columns and appends
         # the extra one (deduped, with `job` first).
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7028,11 +7054,11 @@ class TestStatusReport:
         # Two bundles, both selected. `status -b borgadm` prints
         # only borgadm.k -- default.j is out of scope.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
@@ -7044,7 +7070,7 @@ class TestStatusReport:
         bundles = crony.load_all_bundles()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
-        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        h.apply("k", bundle="borgadm")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7066,7 +7092,7 @@ class TestStatusReport:
         # group.jobs list order is preserved end-to-end, and
         # children are indented two spaces per depth level.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "zzz-first": {"command": "true"},
@@ -7083,7 +7109,7 @@ class TestStatusReport:
             default_target_jobs=["root"],
         )
         for short in ("zzz-first", "aaa-second", "mmm-third", "inner", "root"):
-            crony.apply_one(cfg, short)
+            h.apply(short)
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7113,7 +7139,7 @@ class TestStatusReport:
         # below the tree without indentation, alphabetically ordered
         # alongside other off-tree rows.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "tree-job": {
@@ -7128,8 +7154,8 @@ class TestStatusReport:
             },
             default_target_jobs=["tree-job", "orphan-job"],
         )
-        crony.apply_one(cfg, "tree-job")
-        crony.apply_one(cfg, "orphan-job")
+        h.apply("tree-job")
+        h.apply("orphan-job")
         # Rewrite config so orphan-job is no longer in any target;
         # its on-disk state remains, surfacing as a remnant.
         h.config(
@@ -7216,7 +7242,7 @@ class TestStatusReport:
         # excluded and don't perturb the indentation widths of the
         # filtered view.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "leaf": {"command": "true"},
@@ -7227,8 +7253,8 @@ class TestStatusReport:
             },
             default_target_jobs=["root"],
         )
-        crony.apply_one(cfg, "leaf")
-        crony.apply_one(cfg, "root")
+        h.apply("leaf")
+        h.apply("root")
         (h.cfg_dropin / "borgadm.toml").write_text(
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
@@ -7240,7 +7266,7 @@ class TestStatusReport:
         bundles = crony.load_all_bundles()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
-        crony.apply_one(borgadm.config, "k", bundle_name="borgadm")
+        h.apply("k", bundle="borgadm")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7262,15 +7288,15 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
                 "job-group": {"g": {"jobs": ["j"], "schedule": "*-*-* 04:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "j")
-        crony.apply_one(cfg, "g")
+        h.apply("j")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7295,11 +7321,11 @@ class TestStatusReport:
         # Apply, then drop the entry from config so the row turns
         # orphan. KIND falls back to the snapshot's recorded kind.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
@@ -7321,11 +7347,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7347,7 +7373,7 @@ class TestStatusReport:
     ) -> None:
         # Scheduled job -> .timer; grouped job -> .service.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "sched": {
@@ -7360,9 +7386,9 @@ class TestStatusReport:
             },
             default_target_jobs=["sched", "g"],
         )
-        crony.apply_one(cfg, "sched")
-        crony.apply_one(cfg, "gm")
-        crony.apply_one(cfg, "g")
+        h.apply("sched")
+        h.apply("gm")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7387,11 +7413,11 @@ class TestStatusReport:
         # snapshot (old value); pending-schedule reflects the live
         # config (new value); neither carries the stale asterisk.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
@@ -7449,15 +7475,15 @@ class TestStatusReport:
         # `grouped` in unit-schedule, matching pending-schedule
         # and the default schedule column.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7480,15 +7506,15 @@ class TestStatusReport:
     ) -> None:
         # TomlJob `a` belongs to group `g`. The groups column lists `g`.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7504,16 +7530,17 @@ class TestStatusReport:
             if "default.a " in line:
                 assert "default.g" in line
 
-    def test_groups_column_lists_multiple_groups_comma_separated(
+    def test_groups_column_shows_active_membership_not_dead_group(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # TomlJob `a` is a child of two groups. The single-parent
-        # invariant rejects a target reaching the same name twice,
-        # so only `g1` is in the target; `g2` is defined but dead.
-        # The GROUPS column reports every membership in the bundle
-        # regardless of which path the target activates.
+        # TomlJob `a` is listed by two groups in config, but the
+        # single-parent invariant means only one can dispatch it on
+        # this host: `g1` is in the target, `g2` is defined but
+        # unused (no target reaches it). The GROUPS column reflects
+        # active dispatch membership (pending / current graphs), so
+        # `a` shows g1 only -- the dead g2 doesn't surface.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
@@ -7523,9 +7550,7 @@ class TestStatusReport:
             },
             default_target_jobs=["g1"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g1")
-        crony.apply_one(cfg, "g2")
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7539,7 +7564,8 @@ class TestStatusReport:
         out = capsys.readouterr().out
         for line in out.splitlines():
             if "default.a " in line:
-                assert "default.g1,default.g2" in line
+                assert "default.g1" in line
+                assert "default.g2" not in line
 
     def test_groups_default_marks_stale_when_membership_changes(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7548,7 +7574,7 @@ class TestStatusReport:
         # (without re-applying). Default mode shows the applied
         # membership with `*` and the shared stale-value footer.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "a": {"command": "true"},
@@ -7563,9 +7589,9 @@ class TestStatusReport:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "b")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("b")
+        h.apply("g")
         # Drop `a` from the group's children in pending config.
         h.config(
             {
@@ -7599,7 +7625,7 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "a": {"command": "true"},
@@ -7609,8 +7635,8 @@ class TestStatusReport:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         # Pending: swap `a` out for `b`. `a` is no longer in any group.
         h.config(
             {
@@ -7646,11 +7672,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7715,7 +7741,7 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "cron-job": {
@@ -7731,10 +7757,10 @@ class TestStatusReport:
             },
             default_target_jobs=["cron-job", "iv-job", "g"],
         )
-        crony.apply_one(cfg, "cron-job")
-        crony.apply_one(cfg, "iv-job")
-        crony.apply_one(cfg, "child")
-        crony.apply_one(cfg, "g")
+        h.apply("cron-job")
+        h.apply("iv-job")
+        h.apply("child")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -7761,11 +7787,11 @@ class TestStatusReport:
         # cell with `disabled`. --config-pending suppresses the
         # override (the pending value is a config fact).
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         crony.do_status(
             jobs=[],
@@ -7807,11 +7833,11 @@ class TestStatusReport:
         # since the cell is no longer the schedule that would
         # have been compared against pending.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
@@ -7838,11 +7864,11 @@ class TestStatusReport:
         # schedule. Default schedule cell shows the applied
         # (current) value with `*`; footer prints.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         # Rewrite config with a new schedule (no re-apply).
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
@@ -7873,11 +7899,11 @@ class TestStatusReport:
         # something different here", not as "the displayed value
         # is stale relative to pending".
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
@@ -7900,11 +7926,11 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
@@ -7992,11 +8018,11 @@ class TestStatusReport:
         # Stub _unit_state to "none" -- simulating a unit the
         # platform scheduler doesn't see. The cell renders `none`.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "none")
         crony.do_status(
             jobs=[],
@@ -8222,15 +8248,15 @@ class TestResolveStateAxes:
         # parent group) -> sched = "grouped" without consulting
         # _unit_state.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         config = crony.load_config()
         _, sched, _ = crony._resolve_state_axes(
@@ -8243,11 +8269,11 @@ class TestResolveStateAxes:
     ) -> None:
         # Scheduled leaf -> sched read from _unit_state.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         config = crony.load_config()
         cfg_state, sched, _ = crony._resolve_state_axes(
@@ -8480,11 +8506,11 @@ class TestPerEntityConfigErrors:
         # the config and introduced a typo. The errored state
         # shouldn't block them from cleaning up the prior install.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # Now break the config -- same name, bad body.
         h.config(
@@ -9165,7 +9191,7 @@ class TestDestroyByEntityRef:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist.exists()
         sd = h.state_dir("j", cfg=cfg)
@@ -9912,7 +9938,7 @@ class TestNameCollision:
             default_target_jobs=["j"],
         )
         live_uuid = cfg.jobs["j"].uuid
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         # Plant a stray dir recovering the same name under a
         # different uuid (residue that bypassed apply's cleanup).
         stray_uuid = "99999999-8888-7777-6666-555544443333"
@@ -9929,11 +9955,11 @@ class TestNameCollision:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         stray_uuid = "99999999-8888-7777-6666-555544443333"
         self._plant_residue(h, h.full("j"), stray_uuid)
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
@@ -9966,7 +9992,7 @@ class TestNameCollision:
             default_target_jobs=["j"],
         )
         live_uuid = cfg.jobs["j"].uuid
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         stray_uuid = "99999999-8888-7777-6666-555544443333"
         stray_dir = self._plant_residue(h, h.full("j"), stray_uuid)
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
@@ -9990,7 +10016,7 @@ class TestNameCollision:
             default_target_jobs=["j"],
         )
         live_uuid = cfg.jobs["j"].uuid
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         stray_uuid = "99999999-8888-7777-6666-555544443333"
         stray_dir = self._plant_residue(h, h.full("j"), stray_uuid)
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
@@ -10061,11 +10087,11 @@ class TestStatusUnitConfigColumn:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
@@ -10113,8 +10139,7 @@ class TestStatusExcludeHealthy:
             encoding="utf-8",
         )
         # Apply so it's synced; never run -> LAST=never (healthy).
-        bundles = crony.load_all_bundles()
-        crony.apply_one(bundles.bundles[0].config, "healthy")
+        _apply("healthy")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10138,8 +10163,7 @@ class TestStatusExcludeHealthy:
             '[target.darwin]\njobs = ["j"]\n',
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
-        crony.apply_one(bundles.bundles[0].config, "j")
+        _apply("j")
         sd = crony.STATE_DIR / "default" / uuid_value
         (sd / "last-run.json").write_text(
             '{"exit_class": "fail", "exit_code": 1, '
@@ -10176,9 +10200,8 @@ class TestStatusExcludeHealthy:
             '[target.darwin]\njobs = ["g"]\n',
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
-        crony.apply_one(bundles.bundles[0].config, "leaf")
-        crony.apply_one(bundles.bundles[0].config, "g")
+        _apply("leaf")
+        _apply("g")
         leaf_sd = crony.STATE_DIR / "default" / leaf_uuid
         (leaf_sd / "last-run.json").write_text(
             '{"exit_class": "fail", "exit_code": 1, '
@@ -10215,8 +10238,7 @@ class TestStatusExcludeHealthy:
             '[target.darwin]\njobs = ["paused"]\n',
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
-        crony.apply_one(bundles.bundles[0].config, "paused")
+        _apply("paused")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10567,7 +10589,7 @@ class TestSnapshotLifecycle:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10579,7 +10601,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
         snap = _cast_dict(snap_path.read_text())
@@ -10597,11 +10619,11 @@ class TestSnapshotLifecycle:
         # registry. Verify the layout so a refactor doesn't quietly
         # split them again.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         entry_dir = h.state_dir("j")
         assert (entry_dir / "snapshot.json").is_file()
         assert not (h.state / "installed").exists()
@@ -10626,9 +10648,9 @@ class TestSnapshotLifecycle:
             default_target_jobs=["g"],
         )
         # Apply children first so the group's resolution sees them.
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "b")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("b")
+        h.apply("g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["kind"] == "group"
@@ -10670,10 +10692,10 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
+        h.apply("a")
         # `b` is masked on test-host; apply skips it via target
         # selection. The group snapshot must do the same.
-        crony.apply_one(cfg, "g")
+        h.apply("g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
@@ -10704,8 +10726,8 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
@@ -10737,8 +10759,8 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "g")
+        h.apply("a")
+        h.apply("g")
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
@@ -10748,15 +10770,15 @@ class TestSnapshotLifecycle:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg1 = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
+        h.apply("j")
         # Same schedule -- only the command changed; this must
         # land "updated" because the snapshot's `command` field
         # differs from the on-disk one.
-        cfg2 = h.config(
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10767,7 +10789,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        result = crony.apply_one(cfg2, "j")
+        result = h.apply("j")
         assert result == "updated"
 
     def test_snapshot_stable_across_os_environ_changes(
@@ -10780,12 +10802,12 @@ class TestSnapshotLifecycle:
         # subsequent apply / status from a different shell would
         # report the entry as stale despite no config change.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-A.sock")
-        first = crony.apply_one(cfg, "j")
+        first = h.apply("j")
         assert first == "added"
         # Same config, different SSH_AUTH_SOCK: should be a no-op.
         # PATH is intentionally NOT mutated -- apply needs to find
@@ -10793,7 +10815,7 @@ class TestSnapshotLifecycle:
         # realistic per-session-volatile case the regression
         # protects against.
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-B.sock")
-        second = crony.apply_one(cfg, "j")
+        second = h.apply("j")
         assert second == "unchanged"
 
     def test_snapshot_env_stores_user_literal(
@@ -10803,7 +10825,7 @@ class TestSnapshotLifecycle:
         # merged + expanded runtime env. The runner expands at fire
         # time (see TestRuntimeEnvExpansion).
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10815,7 +10837,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         snap_path = h.state_dir("j") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # Literal $PATH preserved -- expansion happens at fire time.
@@ -10825,7 +10847,7 @@ class TestSnapshotLifecycle:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg1 = h.config(
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10837,8 +10859,8 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
-        cfg2 = h.config(
+        h.apply("j")
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10850,13 +10872,13 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        assert crony.apply_one(cfg2, "j") == "updated"
+        assert h.apply("j") == "updated"
 
     def test_timeout_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg1 = h.config(
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10868,8 +10890,8 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg1, "j")
-        cfg2 = h.config(
+        h.apply("j")
+        h.config(
             {
                 "job": {
                     "j": {
@@ -10881,7 +10903,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["j"],
         )
-        assert crony.apply_one(cfg2, "j") == "updated"
+        assert h.apply("j") == "updated"
 
     def test_load_snapshot_refuses_schema_mismatch(
         self, tmp_path: Path, monkeypatch: Any
@@ -10988,11 +11010,11 @@ class TestSnapshotLifecycle:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.apply_one(cfg, "j")
+        h.apply("j")
         snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
         crony.destroy_one(h.full("j"), h.state_dir("j"))
@@ -11195,11 +11217,11 @@ class TestUnitDriftDetection:
     ) -> None:
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
-        cfg = h.config(
+        h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        result = crony.apply_one(cfg, "j")
+        result = h.apply("j")
         # Snapshot equality alone would say `unchanged`; the
         # integrity check escalates to `updated` so the unit file
         # gets re-rendered.
@@ -11281,19 +11303,22 @@ class TestUnitDriftDetection:
         # next to it (simulating a leftover from a schedule ->
         # unscheduled transition that apply didn't clean up).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        cfg = h.config(
+        h.config(
             {
                 "job": {"a": {"command": "true", "job_timeout_sec": 100}},
                 "job-group": {
-                    "transit": {
-                        "jobs": ["a"],
+                    "transit": {"jobs": ["a"]},
+                    # A scheduled parent makes the transit group a
+                    # valid schedule-less dispatch target.
+                    "root": {
+                        "jobs": ["transit"],
+                        "schedule": "*-*-* 03:00",
                     },
                 },
             },
-            default_target_jobs=["transit"],
+            default_target_jobs=["root"],
         )
-        crony.apply_one(cfg, "a")
-        crony.apply_one(cfg, "transit")
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
             crony._render_systemd_timer(h.full("transit"), "*-*-* 03:00", None)

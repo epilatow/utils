@@ -5616,21 +5616,14 @@ def _deactivate_unit(name: str, platform: str) -> None:
         )
 
 
-def apply_one(
-    config: TomlBundleConfig,
-    name: str,
-    *,
-    dry_run: bool = False,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
-    model: Config | None = None,
-) -> str:
-    """Apply a single job or group; return "added", "updated", or
-    "unchanged".
+def apply_one(config: Config, ref: EntityRef) -> str:
+    """Apply one selected entry from the loaded model; return
+    "added", "updated", or "unchanged".
 
-    `name` is the short name (as written in the bundle's TOML);
-    `bundle_name` defaults to "default". The full namespaced name
-    `<bundle_name>.<name>` is what lands on disk (plist / systemd
-    unit identifier).
+    `ref` must be a selected pending entry of `config` -- `do_apply`
+    only applies what `config.pending` selected on this host. The
+    full namespaced name `<bundle>.<short>` is what lands on disk
+    (plist / systemd unit identifier).
 
     Every entry installs a platform unit, even schedule-less ones:
     a transit group's plist sits dormant until a parent dispatches
@@ -5640,88 +5633,64 @@ def apply_one(
     apply cleans up a stale .timer if an entry transitions
     scheduled -> unscheduled.
 
-    `model` is the whole-process `Config` the calling command
-    (`do_apply`) loaded once at start: the entity's prior snapshot
-    and unit-drift verdict are read from it rather than re-scanning
-    disk per entry. The entity's own state is untouched by the
-    apply loop until this call, so the loaded view still matches
-    disk. Standalone callers (tests) that hold no `Config` pass
-    None and the prior state is read directly.
+    The entity's prior snapshot and unit-drift verdict come from
+    the loaded model (`current` / `runtime`): the entry's own state
+    is untouched by the apply loop until this call, so the loaded
+    view still matches disk.
     """
-    if name in config.jobs:
-        entry: TomlJob | TomlJobGroup = config.jobs[name]
-    elif name in config.job_groups:
-        entry = config.job_groups[name]
-    else:
-        raise PreconditionError(f"unknown job/group: {name!r}")
-    full_name = f"{bundle_name}.{name}"
+    snapshot: Job | JobGroup | None = config.pending.jobs.get(
+        ref
+    ) or config.pending.groups.get(ref)
+    if snapshot is None:
+        raise PreconditionError(f"{ref} is not a selected entry to apply")
+    full_name = snapshot.name
+    bundle_name = ref.bundle
+    schedule, interval = snapshot.schedule, snapshot.interval
+    platform = config.platform
+    snapshot_path = _snapshot_path_for(ref)
 
-    # Every uuid / full name the bundle's config currently defines.
-    # Used to keep per-entry cleanup from clobbering a *different*
-    # live entry's state when names move between entries in one
-    # edit (a rename that frees a name another entry then claims).
-    live_uuids = {e.uuid for e in config.jobs.values()} | {
-        e.uuid for e in config.job_groups.values()
-    }
-    live_full_names = {f"{bundle_name}.{s}" for s in config.jobs} | {
-        f"{bundle_name}.{s}" for s in config.job_groups
-    }
+    # Every uuid / full name the bundle's config currently defines
+    # (plus `ref` itself, defensively). Used to keep per-entry
+    # cleanup from clobbering a *different* live entry's state when
+    # names move between entries in one edit (a rename that frees a
+    # name another entry then claims).
+    bundle = config.toml_config.by_name(bundle_name)
+    bcfg = bundle.config if bundle is not None else None
+    live_uuids = {ref.uuid}
+    live_full_names: set[str] = set()
+    if bcfg is not None:
+        live_uuids |= {e.uuid for e in bcfg.jobs.values()} | {
+            e.uuid for e in bcfg.job_groups.values()
+        }
+        live_full_names = {f"{bundle_name}.{s}" for s in bcfg.jobs} | {
+            f"{bundle_name}.{s}" for s in bcfg.job_groups
+        }
 
-    schedule, interval = _entity_schedule(entry)
-    platform = current_platform()
-    entity_ref = EntityRef(bundle_name, entry.uuid)
-    snapshot_path = _snapshot_path_for(entity_ref)
-    target = resolve_target(config, current_host(), platform)
-    if isinstance(entry, TomlJob):
-        snapshot: Job | JobGroup = _resolve_job_snapshot(
-            config, target, entry, full_name, bundle_name
-        )
-    else:
-        snapshot = _resolve_group_snapshot(
-            config, target, entry, bundle_name, full_name
-        )
     # A uuid edit leaves the prior uuid's state dir behind under
     # the same name (the name-keyed unit re-points at this uuid).
     # Reclaim it before deciding "unchanged" so the residue is
     # cleaned even when the new uuid's snapshot already matches --
     # and so the full-sync orphan sweep can exclude still-selected
     # names (it trusts apply_one to have handled their residue).
-    if not dry_run:
-        _sweep_superseded_state_dirs(entity_ref, full_name, live_uuids)
+    _sweep_superseded_state_dirs(ref, full_name, live_uuids)
     # Drift detection via direct snapshot comparison: take the
-    # entity's prior on-disk snapshot (if any) and compare it to
-    # the freshly-resolved one. With both sides parsed into the
-    # same dataclass shape, equality is a single Python `==`. A
-    # missing / unparseable / wrong-schema prior snapshot is "not
-    # equal" and triggers a fresh write. Equality alone isn't
-    # enough though: the unit-install integrity check catches a
-    # hand-edited / missing / unloaded unit file whose snapshot
-    # still matches what apply would resolve, so an otherwise-clean
+    # entity's prior snapshot (if any) and compare it to the
+    # pending one. Both sides are the same dataclass shape, so
+    # equality is a single Python `==`. A missing / unparseable /
+    # wrong-schema prior snapshot is absent from `current` and so
+    # "not equal", triggering a fresh write. Equality alone isn't
+    # enough though: the unit-install integrity check (pinned on
+    # `runtime` at load) catches a hand-edited / missing / unloaded
+    # unit file whose snapshot still matches, so an otherwise-clean
     # apply still re-renders and re-bootstraps the platform side.
-    #
-    # Both come from the loaded `model` when one is supplied (the
-    # `unit_is_stale` it pinned was computed against the current
-    # snapshot, which equals the pending one in the only branch
-    # where the verdict matters); standalone callers read them
-    # directly.
-    if model is not None:
-        current_snapshot: Job | JobGroup | None = model.current.jobs.get(
-            entity_ref
-        ) or model.current.groups.get(entity_ref)
-        rt = model.runtime.get(entity_ref)
-        unit_stale = rt.unit_is_stale if rt is not None else False
-    else:
-        try:
-            current_snapshot = _load_snapshot(entity_ref)
-        except PreconditionError:
-            current_snapshot = None
-        unit_stale = _unit_is_stale(full_name, snapshot, platform)
+    current_snapshot: Job | JobGroup | None = config.current.jobs.get(
+        ref
+    ) or config.current.groups.get(ref)
+    rt = config.runtime.get(ref)
+    unit_stale = rt.unit_is_stale if rt is not None else False
     if current_snapshot == snapshot and not unit_stale:
         return "unchanged"
     is_update = current_snapshot is not None
-
-    if dry_run:
-        return "updated" if is_update else "added"
 
     # Same uuid, new name: the entry was renamed in config. The
     # state dir (uuid-keyed) is reused under the new name, but the
@@ -5745,7 +5714,7 @@ def apply_one(
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(full_name, entity_ref, schedule, interval, platform)
+    units = _render_units(full_name, ref, schedule, interval, platform)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name
@@ -6942,8 +6911,8 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
                 _oncalendar_to_plist_calendar(schedule)
 
     for full in full_names_to_apply:
-        b, short = by_full[full]
-        result = apply_one(b.config, short, bundle_name=b.name, model=config)
+        ref = config.pending.by_full_name[full]
+        result = apply_one(config, ref)
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
 
