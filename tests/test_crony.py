@@ -6897,6 +6897,62 @@ class TestStatusReport:
         )
         assert h.full("gu") not in ju_line
 
+    def test_masked_entry_shows_schedule(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Masked entries shown nested in the tree surface their
+        # config-declared SCHEDULE: a grouped one as "grouped", a
+        # scheduled one as its cron, neither with a false `*` stale
+        # marker.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    # masked grouped child (platform); `k` keeps `g`
+                    # from being an empty-cascade mask.
+                    "j": {"command": "true", "platforms": ["linux"]},
+                    "k": {"command": "true"},
+                    # masked top-level job that carries its own cron.
+                    "sched": {
+                        "command": "true",
+                        "schedule": "*-*-* 05:00",
+                        "hosts": ["other"],
+                    },
+                },
+                "job-group": {
+                    "g": {"jobs": ["j", "k"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g", "sched"],
+        )
+        crony.do_status(
+            jobs=[],
+            cols="job-or-uuid,config,schedule",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out: str = capsys.readouterr().out
+
+        def _row(name: str) -> str:
+            return next(
+                line
+                for line in out.splitlines()
+                if line.split() and line.split()[0] == name
+            )
+
+        j_row = _row(h.full("j"))
+        assert "masked" in j_row
+        assert "grouped" in j_row
+        assert not j_row.rstrip().endswith("*")
+        sched_row = _row(h.full("sched"))
+        assert "masked" in sched_row
+        assert "*-*-* 05:00" in sched_row
+        assert not sched_row.rstrip().endswith("*")
+
     def test_all_flag_with_masked_by_column_shows_reason(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:

@@ -7939,12 +7939,19 @@ def _schedule_cells(
     config: Config,
     full: str,
     config_source: str,
+    pending_fallback: TomlJob | TomlJobGroup | None = None,
 ) -> tuple[str, bool]:
     """Return (cell, is_stale) for the SCHEDULE column.
 
     Display rules mirror `_groups_cells`. `*` shows whenever the
     pending and current values disagree on this field, regardless
     of mode.
+
+    `pending_fallback` is the parsed TOML entry to read the pending
+    schedule from when the entry is absent from the pending graph (a
+    masked entry). The caller passes it only for masked rows shown
+    in the tree, so the SCHEDULE cell mirrors what a selected entry
+    of the same shape shows instead of coming up blank.
     """
     pending_disp: str | None = None
     current_disp: str | None = None
@@ -7960,6 +7967,10 @@ def _schedule_cells(
             pending_disp = _schedule_display(
                 pending_entry.schedule, pending_entry.interval
             )
+    if pending_disp is None and pending_fallback is not None:
+        pending_disp = _schedule_display(
+            pending_fallback.schedule, pending_fallback.interval
+        )
     current_ref = config.resolve_current(full)
     if current_ref is not None:
         current_entry = config.current.jobs.get(
@@ -8139,7 +8150,19 @@ def do_status(
             config, full, platform, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, full)
-        sched_cell, sched_stale = _schedule_cells(config, full, config_source)
+        # A masked entry shown nested in the tree is absent from the
+        # pending / current graphs the SCHEDULE and GROUPS columns
+        # read from, so those cells come up blank even though the
+        # tree places it under a parent. Fall back to its parsed
+        # config entry for both, gated on actual tree presence so an
+        # off-tree `unused` entry (defined but not reached by this
+        # host's target, rendered flat) doesn't borrow values it
+        # isn't shown under.
+        masked_in_tree = bool(mask_reason) and full in tree_depth
+        sched_fallback = entry if masked_in_tree else None
+        sched_cell, sched_stale = _schedule_cells(
+            config, full, config_source, pending_fallback=sched_fallback
+        )
         if config_source != "pending" and unit_state == "disabled":
             # The default and --config-current views describe
             # what the host will actually run. A disabled timer
@@ -8152,25 +8175,19 @@ def do_status(
         if sched_stale:
             any_stale = True
             sched_cell = f"{sched_cell} *"
+        # UNIT SCHEDULE is the applied (current) view; a masked entry
+        # has no installed unit, so it gets no schedule fallback here.
         unit_sched_cell, _ = _schedule_cells(config, full, "current")
-        pending_sched_cell, _ = _schedule_cells(config, full, "pending")
+        pending_sched_cell, _ = _schedule_cells(
+            config, full, "pending", pending_fallback=sched_fallback
+        )
         pending_membership = pending_groups.get(full, [])
         current_membership: list[str] | None = current_groups.get(full, [])
-        if (
-            mask_reason
-            and full in tree_depth
-            and not pending_membership
-            and not current_membership
-        ):
-            # A masked entry shown nested in the tree is absent from
-            # both graphs, so its graph-derived membership is empty
-            # even though the tree places it under a parent. Fall
-            # back to the config-declared membership, gated on actual
-            # tree presence so an off-tree `unused` entry (defined
-            # but not reached by this host's target, rendered flat)
-            # doesn't claim a parent it isn't shown under. Mark the
-            # current side "not applicable" (None) so the config-only
-            # value doesn't read as drift (a `*` stale marker).
+        if masked_in_tree and not pending_membership and not current_membership:
+            # Same fallback as SCHEDULE: surface the config-declared
+            # parent group. The current side is marked "not
+            # applicable" (None) so the config-only value doesn't read
+            # as drift (a `*` stale marker).
             pending_membership = config_groups.get(full, [])
             current_membership = None
         groups_cell, groups_stale = _groups_cells(
