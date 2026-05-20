@@ -147,9 +147,10 @@ therefore has no effect on running units, and `crony status`
 reports any divergence between live config and on-disk snapshot
 as `config=stale` via direct dataclass equality. The platform
 unit file gets the same drift treatment: a missing / hand-edited
-/ unloaded unit file (or one referencing a uv / crony binary
-that's since been removed) also surfaces as `config=stale` so
-`crony apply` re-renders and re-bootstraps it.
+unit file, one referencing a uv / crony binary that's since been
+removed, or a scheduled unit the scheduler has unloaded also
+surfaces as `config=stale` so `crony apply` re-renders and
+re-bootstraps it.
 
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
@@ -2964,7 +2965,10 @@ class RuntimeState:
     `unit_is_stale` is True when the platform install diverges
     from what the snapshot would render: missing or hand-edited
     unit file, missing uv / crony binary baked into the file, or
-    a unit the scheduler no longer has loaded. Drives the
+    a unit the scheduler no longer has loaded (a schedule-less
+    entry on linux is exempt from that last check -- its static,
+    on-demand `.service` has no timer to load, so being unknown to
+    the scheduler is its resting state, not drift). Drives the
     CONFIG=stale axis and forces apply to re-render even when
     the snapshot itself is unchanged. Set only for entries with
     a parseable snapshot; defaults False for broken / unit-only
@@ -5466,7 +5470,10 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     `_render_units` produces when called with the extracted
     paths. Additionally flags an orphaned `.timer` left over
     from a schedule -> unscheduled transition, and a unit the
-    platform scheduler has unloaded (`_unit_state == "none"`).
+    platform scheduler has unloaded (`_unit_state == "none"`) --
+    except for a schedule-less entry on linux, whose service is a
+    static, on-demand unit with no timer to load, so "none" is its
+    correct resting state rather than drift.
 
     Any divergence returns True so `crony status` reports
     `config=stale` and `crony apply` re-renders / re-bootstraps
@@ -5523,6 +5530,17 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         )
         if content != re_rendered[fname]:
             return True
+    # Scheduler-awareness probe: an unloaded unit is drift the next
+    # apply must re-bootstrap. `_unit_state` reports the timer on
+    # linux / the plist on darwin. A grouped (schedule-less) entry
+    # has no timer on linux, so it reports "none" by design -- that's
+    # its correct resting state as a static, on-demand `.service`
+    # (file presence and round-trip are already verified above), not
+    # drift. On darwin a grouped plist must still be loaded to be
+    # kickstartable, so the probe stays there.
+    grouped = snap.schedule is None and snap.interval is None
+    if grouped and platform == "linux":
+        return False
     if _unit_state(full_name, platform) == "none":
         return True
     return False
@@ -5722,9 +5740,10 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # wrong-schema prior snapshot is absent from `current` and so
     # "not equal", triggering a fresh write. Equality alone isn't
     # enough though: the unit-install integrity check (pinned on
-    # `runtime` at load) catches a hand-edited / missing / unloaded
-    # unit file whose snapshot still matches, so an otherwise-clean
-    # apply still re-renders and re-bootstraps the platform side.
+    # `runtime` at load) catches a hand-edited / missing unit file
+    # (or a scheduled unit the scheduler unloaded) whose snapshot
+    # still matches, so an otherwise-clean apply still re-renders
+    # and re-bootstraps the platform side.
     current_snapshot: Job | JobGroup | None = config.current.jobs.get(
         ref
     ) or config.current.groups.get(ref)
