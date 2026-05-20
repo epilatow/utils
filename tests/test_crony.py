@@ -6777,6 +6777,42 @@ class TestStatusReport:
         assert h.full("j") in out
         assert "masked" in out
 
+    def test_masked_entry_shows_uuid_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A masked entry is in neither the pending nor current
+        # graph, but it still has a config-declared uuid: the UUID
+        # column must show its `<bundle>:<uuid>` ref, not a blank
+        # cell.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "platforms": ["linux"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_status(
+            jobs=[],
+            cols="job,uuid",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        masked_line = next(
+            line for line in out.splitlines() if h.full("j") in line
+        )
+        assert f"default:{cfg.jobs['j'].uuid}" in masked_line
+
     def test_all_flag_with_masked_by_column_shows_reason(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
