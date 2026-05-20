@@ -5884,6 +5884,36 @@ class TestEnableDisable:
         with pytest.raises(crony.UsageError, match="grouped entries"):
             crony.do_disable(jobs=["a"], bundle=None)
 
+    def test_enable_keys_off_applied_schedule_not_pending(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `a` is applied as a grouped (schedule-less) entry, so its
+        # installed unit has no timer. A later config edit gives
+        # `a` its own schedule but is NOT applied. enable must
+        # still refuse: it arms the *installed* unit, and the
+        # applied snapshot -- not the pending edit -- decides
+        # whether there's a timer to arm.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g"],
+        )
+        crony.apply_one(cfg, "a")
+        # Pending edit: `a` gains its own schedule (still grouped
+        # under g too), not applied.
+        h.config(
+            {
+                "job": {"a": {"command": "true", "schedule": "*-*-* 05:00"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["g", "a"],
+        )
+        with pytest.raises(crony.UsageError, match="grouped entries"):
+            crony.do_enable(jobs=["a"], bundle=None)
+
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

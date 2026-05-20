@@ -3046,6 +3046,20 @@ class Config:
             | set(self.unit_only)
         )
 
+    def installed_full_names(self) -> set[str]:
+        """Full names with something installed on this host: a
+        parseable current snapshot, a leftover platform unit
+        (`unit_only`), or a broken snapshot whose name was
+        recovered. The model-side equivalent of the old
+        `stamped_names()` disk scan -- the set lifecycle commands
+        (enable / disable) can address.
+        """
+        return (
+            set(self.current.by_full_name)
+            | set(self.unit_only_by_full_name)
+            | set(self.broken_by_full_name)
+        )
+
     def config_state(self, ref: EntityRef) -> str:
         """synced | stale | broken | missing | orphan for `ref`.
 
@@ -7095,25 +7109,29 @@ def do_destroy(
         logger.info("%s: destroyed", full)
 
 
-def _entry_schedule_state(bundles: TomlConfig, full: str) -> str:
-    """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`.
+def _applied_schedule_state(config: Config, full: str) -> str:
+    """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`
+    from the APPLIED snapshot.
 
-    `unresolved` covers a name whose bundle or short doesn't
-    currently exist (a stale stamp, say). `unscheduled` is a
-    defined entry with neither schedule nor interval. `scheduled`
-    is anything with a schedule or interval.
+    enable / disable arm or disarm the installed platform unit,
+    which was rendered from the current (applied) snapshot -- so
+    whether there's a timer to act on is the applied snapshot's
+    schedule / interval, not the (possibly edited, not-yet-applied)
+    pending config. `unresolved` covers a name with no current
+    snapshot (a unit-only or broken remnant): nothing applied to
+    read a schedule from. `unscheduled` is an applied entry with
+    neither schedule nor interval (a grouped entry). `scheduled`
+    has a schedule or interval.
     """
-    bn, short = parse_full_name(full)
-    b = bundles.by_name(bn)
-    if b is None:
+    ref = config.current.by_full_name.get(full)
+    if ref is None:
         return "unresolved"
-    entry: TomlJob | TomlJobGroup | None = b.config.jobs.get(
-        short
-    ) or b.config.job_groups.get(short)
-    if entry is None:
+    snap: Job | JobGroup | None = config.current.jobs.get(
+        ref
+    ) or config.current.groups.get(ref)
+    if snap is None:
         return "unresolved"
-    sched, interval = _entity_schedule(entry)
-    if sched is None and interval is None:
+    if snap.schedule is None and snap.interval is None:
         return "unscheduled"
     return "scheduled"
 
@@ -7122,7 +7140,7 @@ def _resolve_bulk_names(
     jobs: list[str],
     bundle: str | None,
     stamped: set[str],
-    bundles: TomlConfig,
+    config: Config,
     scheduled_only: bool,
 ) -> list[str]:
     """Derive the operate-on name set for enable / disable / trigger.
@@ -7130,9 +7148,10 @@ def _resolve_bulk_names(
     With positional `jobs`, normalize each via `resolve_cli_name`
     (which honors `-b`'s bundle-scoping rules). With no positionals,
     `bundle` is required and the set expands to that bundle's
-    stamped names; `scheduled_only` drops unscheduled entries so a
-    bulk `enable -b foo` skips schedule-less group containers
-    rather than rejecting the whole call.
+    stamped names; `scheduled_only` drops unscheduled entries (by
+    their applied snapshot) so a bulk `enable -b foo` skips
+    schedule-less group containers rather than rejecting the whole
+    call.
     """
     if jobs:
         return [resolve_cli_name(arg, bundle) for arg in jobs]
@@ -7143,19 +7162,19 @@ def _resolve_bulk_names(
         expanded = [
             n
             for n in expanded
-            if _entry_schedule_state(bundles, n) == "scheduled"
+            if _applied_schedule_state(config, n) == "scheduled"
         ]
     return expanded
 
 
 def _refuse_unscheduled_full(
-    bundles: TomlConfig, full_names: list[str], verb: str
+    config: Config, full_names: list[str], verb: str
 ) -> None:
     """Reject entries with no schedule (nothing to enable/disable)."""
     unscheduled = [
         full
         for full in full_names
-        if _entry_schedule_state(bundles, full) == "unscheduled"
+        if _applied_schedule_state(config, full) == "unscheduled"
     ]
     if unscheduled:
         raise UsageError(
@@ -7179,22 +7198,21 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     positional args, bare names resolve in `<name>` and qualified
     names must match it.
     """
-    bundles = load_all_bundles()
-    require_known_bundle(bundles, bundle)
-    stamped = stamped_names()
+    config = load_config()
+    require_known_bundle(config.toml_config, bundle)
+    installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
-        jobs, bundle, stamped, bundles, scheduled_only=True
+        jobs, bundle, installed, config, scheduled_only=True
     )
-    unknown = [n for n in normalized if n not in stamped]
+    unknown = [n for n in normalized if n not in installed]
     if unknown:
         raise UsageError(
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_unscheduled_full(bundles, normalized, "enable")
-    platform = current_platform()
+    _refuse_unscheduled_full(config, normalized, "enable")
     for full in normalized:
-        _enable_unit(full, platform)
+        _enable_unit(full, config.platform)
         logger.info("%s: enabled", full)
 
 
@@ -7212,22 +7230,21 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     positional args, bare names resolve in `<name>` and qualified
     names must match it.
     """
-    bundles = load_all_bundles()
-    require_known_bundle(bundles, bundle)
-    stamped = stamped_names()
+    config = load_config()
+    require_known_bundle(config.toml_config, bundle)
+    installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
-        jobs, bundle, stamped, bundles, scheduled_only=True
+        jobs, bundle, installed, config, scheduled_only=True
     )
-    unknown = [n for n in normalized if n not in stamped]
+    unknown = [n for n in normalized if n not in installed]
     if unknown:
         raise UsageError(
             f"not stamped on this host: {sorted(unknown)} "
             f"(run `crony apply` first)"
         )
-    _refuse_unscheduled_full(bundles, normalized, "disable")
-    platform = current_platform()
+    _refuse_unscheduled_full(config, normalized, "disable")
     for full in normalized:
-        _disable_unit(full, platform)
+        _disable_unit(full, config.platform)
         logger.info("%s: disabled", full)
 
 
@@ -7303,7 +7320,7 @@ def do_trigger(
     require_known_bundle(bundles, bundle)
     stamped = stamped_names()
     normalized = _resolve_bulk_names(
-        jobs, bundle, stamped, bundles, scheduled_only=False
+        jobs, bundle, stamped, config, scheduled_only=False
     )
     unknown = [n for n in normalized if n not in stamped]
     if unknown:
