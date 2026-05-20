@@ -11505,6 +11505,42 @@ class TestUnitDriftDetection:
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
 
+    def test_grouped_entry_not_stale_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A grouped (schedule-less) entry installs only a .service on
+        # linux -- no .timer. `_unit_state` queries the timer, so a
+        # grouped entry reads "none" at the scheduler, but that is its
+        # correct resting state (a static, on-demand service), not
+        # drift. A clean apply must leave it unit_is_stale=False.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        # Faithful systemctl: a unit is "enabled" only if its file is
+        # present. The grouped child has no .timer, so its timer query
+        # returns "" -> _unit_state "none" -- the real linux behavior
+        # the harness's blanket `enabled` stub hides.
+        monkeypatch.setattr(
+            crony,
+            "_systemd_is_enabled",
+            lambda u: "enabled" if (h.sysd / u).is_file() else "",
+        )
+        config = crony.load_config()
+        a_ref = config.current.by_full_name[h.full("a")]
+        g_ref = config.current.by_full_name[h.full("g")]
+        # The scheduled group keeps its loaded timer (sanity); the
+        # grouped child must not be flagged stale for lacking one.
+        assert config.runtime[g_ref].unit_is_stale is False
+        assert config.runtime[a_ref].unit_is_stale is False
+
     def test_missing_baked_uv_path_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
