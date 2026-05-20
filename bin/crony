@@ -1309,13 +1309,14 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
 def require_known_bundle(bundles: TomlConfig, bundle: str | None) -> None:
     """Reject `--bundle <name>` if `<name>` isn't a loaded bundle.
 
-    Used by `apply` and `validate`, which parse and act on the
-    pending config: a bundle whose file failed to parse has no
-    such data, so scoping to it is an error. Subcommands that
-    address installed units (`status` / `destroy` / `enable` /
-    `disable` / `trigger`) use `require_addressable_bundle`
-    instead, which also accepts a bundle present only as on-disk
-    state.
+    Used by the subcommands that need the bundle's parsed config:
+    `apply` and `validate` act on the pending entries, and
+    `notify-test` reads the bundle's notify settings. A bundle
+    whose file failed to parse has none of that, so scoping to it
+    is an error. Subcommands that address installed units
+    (`status` / `destroy` / `enable` / `disable` / `trigger`) use
+    `require_addressable_bundle` instead, which also accepts a
+    bundle present only as on-disk state.
     """
     if bundle is not None and bundles.by_name(bundle) is None:
         raise UsageError(f"unknown bundle: {bundle!r}")
