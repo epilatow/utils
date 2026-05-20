@@ -100,7 +100,7 @@ untouched. `crony apply <errored-name>` refuses with a clear
 accepted so a prior install can still be cleaned up; the
 remaining lifecycle commands (`enable`, `disable`, `trigger`)
 operate on the installed unit as usual since they need no
-parsed TomlBundleConfig field. Several
+parsed config field. Several
 opt-in columns are available via `--cols`, including `unit`
 (scheduler-side state: enabled / disabled / grouped / none),
 `groups` (group memberships), `kind` (job vs group), `masked-by`
@@ -131,7 +131,7 @@ via an osascript dialog (Run / Delay / Cancel) before running.
 Auto-tagged `platforms = ["darwin"]` -- the dialog and idle
 detection are macOS-only. The runner waits for the user to be
 continuously active for `interactive_active` (default 10min),
-then prompts; "Delay TomlJob" sleeps `interactive_delay` (default
+then prompts; "Delay Job" sleeps `interactive_delay` (default
 1h) and re-waits. `crony status` reports such a job as
 `pending` during the wait. `crony trigger` bypasses the wait
 and runs the command immediately.
@@ -151,13 +151,13 @@ unit file gets the same drift treatment: a missing / hand-edited
 that's since been removed) also surfaces as `config=stale` so
 `crony apply` re-renders and re-bootstraps it.
 
-TomlBundleConfig bundles:
+Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
   ~/.config/crony/config/<x>.toml -> bundle name "<x>"
 
-TomlConfig are independent: each has its own [defaults], targets, and
+Bundles are independent: each has its own [defaults], targets, and
 notify config; jobs/groups defined in one bundle don't see another's.
-TomlJob and group names are namespaced as <bundle>.<short>; bare CLI
+Job and group names are namespaced as <bundle>.<short>; bare CLI
 input (`crony trigger foo`) is shorthand for `default.foo` and only
 ever resolves to the default bundle. The `-b/--bundle <name>` flag
 on multi-job subcommands (apply, destroy, status, enable, disable,
@@ -255,7 +255,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 #                                       [A-Za-z0-9][A-Za-z0-9_-]*)
 # Each bundle is independent: its [defaults], targets, groups, and
 # notify config apply only to the jobs defined in the same file.
-# TomlJob and group names are namespaced as <bundle>.<short>; on the
+# Job and group names are namespaced as <bundle>.<short>; on the
 # CLI, a bare name (`crony trigger foo`) is shorthand for
 # `default.foo` and never falls through to other bundles. The
 # `-b/--bundle <name>` flag on multi-job subcommands (apply,
@@ -385,7 +385,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # interactive        = true
 # # Optional knobs (defaults shown):
 # # interactive_active = "10min"          # required user-active window
-# # interactive_delay  = "1h"             # sleep after "Delay TomlJob"
+# # interactive_delay  = "1h"             # sleep after "Delay Job"
 
 
 # ----------------------------------------------------------------------------
@@ -632,7 +632,7 @@ class HostList:
 # override `interactive_active` / `interactive_delay`. 10 min of
 # continuous active input is conservative enough that a passing
 # wiggle of the mouse doesn't trigger the dialog; a 1h delay after
-# "Delay TomlJob" gives breathing room before crony asks again.
+# "Delay Job" gives breathing room before crony asks again.
 _INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
 _INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
 
@@ -1817,7 +1817,7 @@ def _validate_config(config: TomlBundleConfig) -> None:
     per-entity fields (chain-walk schedule discovery,
     notify_channels lookups).
     """
-    # TomlJob/group name collision -- errored names participate so a
+    # Job/group name collision -- errored names participate so a
     # typo'd `[job.x]` plus a valid `[job-group.x]` still surfaces
     # the collision. Structural / unattributable -> raise.
     all_job_names = set(config.jobs) | set(config.errored_jobs)
@@ -3546,7 +3546,7 @@ def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     child concept ("intentionally not run") that doesn't describe
     a group-level outcome, and `dispatched` records an interactive
     child the group fired async (it makes no claim about whether
-    the user later clicked Run TomlJob). Any child failure (fail /
+    the user later clicked Run Job). Any child failure (fail /
     signal / timeout) surfaces as the worst child's exit_class --
     timeout outranks fail / signal so a group with a timed-out
     child shows TIMEOUT in the status view rather than being
@@ -3945,7 +3945,7 @@ def _retrieve_secret(
 def _format_summary(result: JobRunResult, full_name: str) -> str:
     """One-line-per-field human summary for notification bodies."""
     return (
-        f"TomlJob:        {full_name}\n"
+        f"Job:        {full_name}\n"
         f"Host:       {result.host}\n"
         f"Platform:   {result.platform}\n"
         f"Started:    {result.started_at}\n"
@@ -4425,7 +4425,7 @@ def _delay_or_bypass(
     """Sleep up to `delay_sec`, polling `bypass_check` every
     `poll_sec`. Returns True if the full delay elapsed; False if
     `bypass_check` returned True mid-sleep. Used by the
-    interactive delay-then-reprompt path so a "Delay TomlJob" choice
+    interactive delay-then-reprompt path so a "Delay Job" choice
     doesn't strand the runner in an unbreakable hour-long sleep
     when the user changes their mind and triggers manually.
     """
@@ -4444,8 +4444,8 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     'run' / 'delay' / 'cancel'.
 
     Uses `osascript display dialog`. Clicking the cancel button
-    (or dismissing the dialog) maps to 'cancel'; clicking Run TomlJob
-    maps to 'run' and Delay TomlJob to 'delay'. Any subprocess
+    (or dismissing the dialog) maps to 'cancel'; clicking Run Job
+    maps to 'run' and Delay Job to 'delay'. Any subprocess
     failure (osascript missing, dialog killed) also maps to
     'cancel' -- silently running without user confirmation would
     defeat the whole point of the flag.
@@ -4466,9 +4466,9 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     script = (
         f'display dialog "{safe_message}" '
         f'with title "crony: {safe_name}" '
-        f'buttons {{"Cancel TomlJob", "Delay TomlJob", "Run TomlJob"}} '
-        f'default button "Run TomlJob" '
-        f'cancel button "Cancel TomlJob"'
+        f'buttons {{"Cancel Job", "Delay Job", "Run Job"}} '
+        f'default button "Run Job" '
+        f'cancel button "Cancel Job"'
     )
     try:
         proc = subprocess.run(
@@ -4482,9 +4482,9 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     if proc.returncode != 0:
         return "cancel"
     out = proc.stdout
-    if "Run TomlJob" in out:
+    if "Run Job" in out:
         return "run"
-    if "Delay TomlJob" in out:
+    if "Delay Job" in out:
         return "delay"
     return "cancel"
 
@@ -4897,7 +4897,7 @@ def run_group(
                         # no budget deduction). Their own runner does
                         # the user-active wait + dialog independently;
                         # the parent group's outcome doesn't depend on
-                        # whether the user ever clicked Run TomlJob.
+                        # whether the user ever clicked Run Job.
                         log_file.write(
                             (
                                 f"-> {child_full_name}: dispatched "
@@ -8995,7 +8995,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "TomlJob/group names. With no args: full sync (install "
+            "Job/group names. With no args: full sync (install "
             "missing, fix drift, remove orphans). With names: "
             "surgical update of those entries only."
         ),
@@ -9027,7 +9027,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "TomlJob/group names. With no args: factory reset. "
+            "Job/group names. With no args: factory reset. "
             "With names: surgical removal."
         ),
     )
@@ -9062,7 +9062,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "TomlJob names to enable. Omit when --bundle is given to "
+            "Job names to enable. Omit when --bundle is given to "
             "enable every scheduled stamped entry in that bundle."
         ),
     )
@@ -9087,7 +9087,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "TomlJob names to disable. Omit when --bundle is given to "
+            "Job names to disable. Omit when --bundle is given to "
             "disable every scheduled stamped entry in that bundle."
         ),
     )
@@ -9112,7 +9112,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "TomlJob names to trigger via launchd / systemctl. Omit "
+            "Job names to trigger via launchd / systemctl. Omit "
             "when --bundle is given to trigger every stamped entry "
             "in that bundle."
         ),
@@ -9225,7 +9225,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_logs.add_argument(
         "name",
-        help="TomlJob name",
+        help="Job name",
     )
     p_logs.add_argument(
         "-n",

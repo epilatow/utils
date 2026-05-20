@@ -2781,7 +2781,7 @@ class TestRuntimeEnvExpansion:
     def test_inherited_keys_not_overridden_by_unset_job_env(
         self, monkeypatch: Any
     ) -> None:
-        # TomlJob env is overlay; absent keys inherit unchanged.
+        # Job env is overlay; absent keys inherit unchanged.
         monkeypatch.setenv("HOME", "/Users/edp")
         monkeypatch.setenv("LANG", "en_US.UTF-8")
         env = crony._runtime_env({"FOO": "bar"})
@@ -3917,7 +3917,7 @@ class TestEmailNotify:
         assert sent["To"] == "you@example.com"
         assert sent["From"] == "crony@example.com"
         body = sent.get_content()
-        assert "TomlJob:        default.j" in body
+        assert "Job:        default.j" in body
         assert "fail" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
@@ -4123,7 +4123,7 @@ class TestNtfyNotify:
         # this fixture, so latest-entry extraction passes the
         # text through unchanged.)
         body = captured["data"].decode("utf-8")
-        assert "TomlJob:" in body
+        assert "Job:" in body
         assert "Exit class:" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
@@ -4201,7 +4201,7 @@ class TestNtfyNotify:
         assert len(body_bytes) <= 3 * 1024
         body = body_bytes.decode("utf-8", errors="replace")
         # Summary block intact at the top.
-        assert body.startswith("TomlJob:")
+        assert body.startswith("Job:")
         assert "Exit class:" in body
         # Log section follows the separator and shows the tail.
         assert "--- log (latest run) ---" in body
@@ -4253,7 +4253,7 @@ class TestNtfyNotify:
         )
         body = captured["data"].decode("utf-8")
         # Human summary keys are present; log content is not.
-        assert "TomlJob:" in body
+        assert "Job:" in body
         assert "Exit class:" in body
         assert "log content not in body" not in body
 
@@ -5576,7 +5576,7 @@ class TestTypeStrictness:
 
 
 class TestNameShape:
-    """TomlJob/group/host names map onto filesystem paths and unit labels.
+    """Job/group/host names map onto filesystem paths and unit labels.
 
     They must be safe filename characters; reject empty, leading
     punctuation, slashes, and spaces at parse time so later code
@@ -7504,7 +7504,7 @@ class TestStatusReport:
     def test_groups_column_shows_membership(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # TomlJob `a` belongs to group `g`. The groups column lists `g`.
+        # Job `a` belongs to group `g`. The groups column lists `g`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -7533,7 +7533,7 @@ class TestStatusReport:
     def test_groups_column_shows_active_membership_not_dead_group(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # TomlJob `a` is listed by two groups in config, but the
+        # Job `a` is listed by two groups in config, but the
         # single-parent invariant means only one can dispatch it on
         # this host: `g1` is in the target, `g2` is defined but
         # unused (no target reaches it). The GROUPS column reflects
@@ -8476,7 +8476,7 @@ class TestPerEntityConfigErrors:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # With siblings: the good job applies, the errored sibling
-        # is never selected (no parsed TomlJob to install).
+        # is never selected (no parsed job to install).
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -10318,7 +10318,7 @@ class TestResolveMethods:
 
 
 class TestBundleNamespacing:
-    """TomlJob names from different bundles get distinct namespaced
+    """Job names from different bundles get distinct namespaced
     forms; bundle-local short names can collide freely."""
 
     def test_same_short_name_in_two_bundles_ok(
@@ -11600,7 +11600,7 @@ class TestInteractiveHelpers:
     def test_dialog_run_button(self, monkeypatch: Any) -> None:
         def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Run TomlJob\n", stderr=""
+                a, 0, stdout="button returned:Run Job\n", stderr=""
             )
 
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
@@ -11609,7 +11609,7 @@ class TestInteractiveHelpers:
     def test_dialog_delay_button(self, monkeypatch: Any) -> None:
         def fake_run(*a: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Delay TomlJob\n", stderr=""
+                a, 0, stdout="button returned:Delay Job\n", stderr=""
             )
 
         monkeypatch.setattr(crony.subprocess, "run", fake_run)
@@ -11853,7 +11853,7 @@ class TestRunJobInteractive:
 class TestLastRunStateInteractive:
     """`_last_run_state` reports `pending` for an interactive job
     sitting in its wait loop, and `canceled` for a completed run
-    whose user clicked Cancel TomlJob.
+    whose user clicked Cancel Job.
     """
 
     def test_pending_when_lock_held_and_flag_present(
