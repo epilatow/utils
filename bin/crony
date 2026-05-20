@@ -2893,10 +2893,11 @@ class GroupRunResult:
 # Built once at startup by `load_config()`. The rest of crony treats
 # the result as read-only: apply / destroy plan their work against
 # the loaded Config, perform disk mutations, and exit. A caller that
-# needs the post-mutation view re-invokes `load_config()`. The
-# config-only `config validate` command -- which never builds a
-# Config -- is the lone path that still re-scans disk directly (via
-# `stamped_names()`) for its best-effort orphan warning.
+# needs the post-mutation view re-invokes `load_config()`. No
+# subcommand re-scans crony's on-disk state after load -- the model
+# is the single source. (`config validate` is config-only: it parses
+# the TOML via `load_all_bundles()` and never inspects applied
+# state.)
 
 
 @dataclass
@@ -5814,22 +5815,6 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     shutil.rmtree(state_dir)
 
 
-def _iter_state_entities() -> Iterator[tuple[str, str, Path]]:
-    """Yield `(bundle_name, entity_uuid, state_dir)` for every
-    uuid-keyed state dir present on this host. Used by the
-    recovered-name helpers and orphan sweepers.
-    """
-    if not STATE_DIR.exists():
-        return
-    for bundle_dir in STATE_DIR.iterdir():
-        if not bundle_dir.is_dir():
-            continue
-        for uuid_dir in bundle_dir.iterdir():
-            if not uuid_dir.is_dir():
-                continue
-            yield bundle_dir.name, uuid_dir.name, uuid_dir
-
-
 def _recover_full_name(state_dir: Path) -> str | None:
     """Return the full namespaced name a state dir was last
     applied under, or None when the snapshot is missing or
@@ -5906,21 +5891,6 @@ def _sweep_superseded_state_dirs(
         )
 
 
-def _state_dir_stamps() -> set[str]:
-    """Full names whose state dir contains a parseable
-    `snapshot.json`. Names are recovered from the snapshot's
-    `name` field; a state dir whose snapshot is missing or
-    unreadable is invisible to this set (it'll surface elsewhere
-    via `Config.broken`).
-    """
-    out: set[str] = set()
-    for _bundle, _uuid, state_dir in _iter_state_entities():
-        name = _recover_full_name(state_dir)
-        if name is not None:
-            out.add(name)
-    return out
-
-
 def _platform_unit_names() -> set[str]:
     """Names with a crony-managed platform unit file on this host.
 
@@ -5946,17 +5916,6 @@ def _platform_unit_names() -> set[str]:
                 if p.name.startswith(prefix) and p.name.endswith(suffix):
                     names.add(p.name[len(prefix) : -len(suffix)])
     return names
-
-
-def stamped_names() -> set[str]:
-    """Names crony has any on-disk remnant of on this host.
-
-    Union of `_state_dir_stamps()` (snapshot.json present) and
-    `_platform_unit_names()` (units lingering on disk after a
-    state wipe). Either signal is enough to treat the entry as
-    actionable.
-    """
-    return _state_dir_stamps() | _platform_unit_names()
 
 
 # =============================================================================
@@ -7434,6 +7393,17 @@ def do_trigger(
             raise UsageError(
                 f"unknown bundle for {full!r} (apply may be stale)"
             )
+        if short not in b.config.jobs and short not in b.config.job_groups:
+            # Installed on disk but no longer in the config (an
+            # orphan). A plain `trigger` still fires it, but --wait
+            # resolves per-name timeouts from the config, which no
+            # longer describes it -- refuse with a clear message
+            # rather than a raw KeyError.
+            raise UsageError(
+                f"{full!r} is installed but not in the current config "
+                f"(apply may be stale -- re-apply or `crony destroy` "
+                f"it); --wait cannot resolve its timeouts"
+            )
         b_target = resolve_target(b.config, current_host(), platform)
         if short in b.config.jobs:
             timeout = float(
@@ -8692,35 +8662,33 @@ def _validate_bundle_warnings(
 
 
 def do_validate(bundle: str | None) -> None:
-    """Lint configs; report orphans, linger status, broken secret files.
+    """Lint configs; report linger status and broken secret files.
 
     load_all_bundles already enforces per-bundle structural rules and
-    isolates failed bundles. This subcommand surfaces orphan / linger
-    / per-bundle warnings as informational output and exits WARNING
+    isolates failed bundles. This subcommand surfaces linger /
+    per-bundle warnings as informational output and exits WARNING
     (1) when any are present, CONFIG (3) when no bundles load.
+    `validate` looks only at the parsed config -- it never inspects
+    crony's applied / on-disk state. (Use `crony status` or
+    `crony destroy --orphans` to find and clean installed remnants
+    no config selects.)
 
     With --bundle <name>, restricts the per-bundle warnings to just
-    that bundle. Cross-bundle / cross-host checks (orphan detection,
-    linger status) only run in the unfiltered case -- they're about
-    the whole-host picture, not any one bundle.
+    that bundle. The host-wide linger-status check only runs in the
+    unfiltered case -- it's about the whole-host picture, not any
+    one bundle.
     """
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
     platform = current_platform()
 
     warnings: list[str] = []
-    if bundle is None:
-        _by_full, selected = _selected_full_names_per_bundle(bundles)
-        remnants = stamped_names()
-        orphans = sorted(remnants - selected)
-        if orphans:
-            warnings.append(f"orphans on this host: {orphans}")
-        if platform == "linux":
-            ling = linger_enabled()
-            if ling is False:
-                warnings.append(f"linger DISABLED for {_current_user()}")
-            elif ling is None:
-                warnings.append("linger status unknown")
+    if bundle is None and platform == "linux":
+        ling = linger_enabled()
+        if ling is False:
+            warnings.append(f"linger DISABLED for {_current_user()}")
+        elif ling is None:
+            warnings.append("linger status unknown")
 
     target_bundles = (
         [b for b in bundles.bundles if b.name == bundle]

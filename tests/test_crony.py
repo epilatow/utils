@@ -5965,6 +5965,28 @@ class TestEnableDisable:
                 jobs=["ghost"], wait=False, trigger_timeout=None, bundle=None
             )
 
+    def test_trigger_wait_refuses_config_removed_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Apply a job, then drop it from the config so it's an
+        # installed orphan. `trigger --wait` resolves timeouts from
+        # the config, which no longer describes it -- it must raise
+        # a clean UsageError, not a raw KeyError.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.apply_one(cfg, "j")
+        h.config({}, default_target_jobs=[])
+        with pytest.raises(crony.UsageError, match="not in the current config"):
+            crony.do_trigger(
+                jobs=[h.full("j")],
+                wait=True,
+                trigger_timeout=None,
+                bundle=None,
+            )
+
     def test_trigger_wait_maps_timeout_to_nonzero_exit(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -8010,17 +8032,22 @@ class TestValidate:
         out = capsys.readouterr().out
         assert "ok" in out
 
-    def test_orphan_warns(
+    def test_does_not_report_orphans(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
+        # validate is config-only: an installed orphan (on-disk
+        # state no config selects) must NOT surface here. `crony
+        # status` / `crony destroy --orphans` own that picture.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.fabricate_orphan("ghost")
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony.do_validate(bundle=None)
         out = capsys.readouterr().out
-        assert "orphans" in out
+        assert "orphans on this host" not in out
+        assert "ghost" not in out
 
     def test_warns_when_referenced_channel_secret_unresolvable(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
