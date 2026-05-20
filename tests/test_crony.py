@@ -5414,6 +5414,46 @@ class TestDestroy:
         assert (h.state_dir("j") / "snapshot.json").exists()
         assert not k_dir.exists()
 
+    def test_bundle_scoped_destroy_works_when_bundle_config_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # destroy is a read-side / on-disk operation: scoping it to
+        # a bundle whose config has since broken must still tear
+        # down that bundle's on-disk remnants. The moment you most
+        # want to scope-destroy a bundle is right after its config
+        # broke, so `require_addressable_bundle` must accept a
+        # bundle present only as on-disk state.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
+            encoding="utf-8",
+        )
+        bundles = crony.load_all_bundles()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        h.apply("k", bundle="borgadm")
+        k_dir = h.state / "borgadm" / borgadm.config.jobs["k"].uuid
+        assert k_dir.exists()
+        # Break borgadm's config after it applied. Its snapshot /
+        # unit linger on disk but its pending config no longer
+        # parses, so it's an errored bundle, not a loaded one.
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            "this is not [valid toml", encoding="utf-8"
+        )
+        crony.do_destroy(jobs=[], bundle="borgadm", orphans=False)
+        assert not k_dir.exists()
+        # default bundle's remnants are untouched.
+        assert (h.state_dir("j") / "snapshot.json").exists()
+
     def test_bundle_qualified_other_bundle_rejected(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -9906,6 +9946,39 @@ class TestStatusBrokenSurface:
         )
         out = capsys.readouterr().out
         assert f"default:{uuid_value}" in out
+        assert "broken" in out
+
+    def test_status_bundle_scoped_works_when_bundle_config_broken(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # status is read-side: scoping to a bundle whose config has
+        # since broken must surface that bundle's on-disk remnants,
+        # not be refused as an unknown bundle.
+        cfg_file = self._setup(tmp_path, monkeypatch)
+        cfg_file.write_text("", encoding="utf-8")
+        uuid_value = "33333333-3333-3333-3333-333333333333"
+        sd = crony.STATE_DIR / "borgadm" / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps({"schema": 999, "kind": "job", "name": "borgadm.k"}),
+            encoding="utf-8",
+        )
+        # borgadm's config file fails to parse: an errored bundle,
+        # not a loaded one, yet it has on-disk state.
+        (crony.CONFIG_DROPIN_DIR / "borgadm.toml").write_text(
+            "this is not [valid toml", encoding="utf-8"
+        )
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            config_current=False,
+            config_pending=False,
+            bundle="borgadm",
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "borgadm.k" in out
         assert "broken" in out
 
 

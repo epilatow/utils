@@ -1307,9 +1307,34 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
 
 
 def require_known_bundle(bundles: TomlConfig, bundle: str | None) -> None:
-    """Reject `--bundle <name>` if `<name>` isn't a loaded bundle."""
+    """Reject `--bundle <name>` if `<name>` isn't a loaded bundle.
+
+    Used by subcommands that need pending-side config data
+    (`apply` / `enable` / `disable` / `trigger` / `validate`):
+    a bundle whose file failed to parse has no such data, so
+    scoping to it is an error. Read-side subcommands that operate
+    on the on-disk picture use `require_addressable_bundle`
+    instead.
+    """
     if bundle is not None and bundles.by_name(bundle) is None:
         raise UsageError(f"unknown bundle: {bundle!r}")
+
+
+def require_addressable_bundle(config: Config, bundle: str | None) -> None:
+    """Reject `--bundle <name>` for read-side subcommands unless
+    `<name>` is addressable on this host: either a successfully
+    parsed bundle, or one with on-disk remnants. The latter lets
+    `status` and `destroy` scope to a bundle whose config has
+    since broken -- exactly when the operator most needs to
+    inspect or tear it down.
+    """
+    if bundle is None:
+        return
+    if config.toml_config.by_name(bundle) is not None:
+        return
+    if bundle in config.installed_bundle_names():
+        return
+    raise UsageError(f"unknown bundle: {bundle!r}")
 
 
 def bundle_prefix_filter(names: Iterable[str], bundle: str) -> set[str]:
@@ -3076,6 +3101,21 @@ class Config:
             | set(self.unit_only_by_full_name)
             | set(self.broken_by_full_name)
         )
+
+    def installed_bundle_names(self) -> set[str]:
+        """Bundle names with on-disk remnants -- a current or broken
+        snapshot, or a leftover platform unit. The bundle-scope
+        analogue of `installed_full_names`: read-side subcommands
+        address these even when the bundle's config has since
+        broken (shadowed losers count too, so a bundle present only
+        as collision residue stays addressable).
+        """
+        return {
+            ref.bundle
+            for ref in (
+                self.current.refs() | set(self.broken) | set(self.unit_only)
+            )
+        }
 
     def config_state(self, ref: EntityRef) -> str:
         """synced | stale | broken | missing | orphan for `ref`.
@@ -6998,7 +7038,7 @@ def do_destroy(
         )
     config = load_config()
     bundles = config.toml_config
-    require_known_bundle(bundles, bundle)
+    require_addressable_bundle(config, bundle)
     # Shadowed collision losers share a live name, so they never
     # surface in the name-keyed discovery set
     # (`Config.installed_full_names()`) -- collect them by ref.
@@ -7959,7 +7999,7 @@ def do_status(
     selected_cols = _parse_status_cols(cols)
     config = load_config()
     bundles = config.toml_config
-    require_known_bundle(bundles, bundle)
+    require_addressable_bundle(config, bundle)
     platform = config.platform
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
