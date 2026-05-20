@@ -2779,10 +2779,22 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
             f"expected {_SNAPSHOT_SCHEMA} (re-apply required)"
         )
     kind = raw.get("kind")
-    if kind == "job":
-        return Job(**raw)
-    if kind == "group":
-        return JobGroup(**raw)
+    # A schema-matched but otherwise malformed snapshot (extra /
+    # missing fields) raises TypeError from the dataclass ctor.
+    # `_build_current_graph` already treats that as a broken
+    # entity; mirror it here so the runner records a `canceled`
+    # last-run via its PreconditionError handler instead of
+    # crashing with a traceback the scheduler never sees.
+    try:
+        if kind == "job":
+            return Job(**raw)
+        if kind == "group":
+            return JobGroup(**raw)
+    except TypeError as e:
+        raise PreconditionError(
+            f"snapshot for {display!r} has malformed fields: {e} "
+            f"(re-apply required)"
+        ) from e
     raise PreconditionError(
         f"snapshot for {display!r} has unknown kind {kind!r}"
     )
@@ -2881,8 +2893,11 @@ class GroupRunResult:
 # Built once at startup by `load_config()`. The rest of crony treats
 # the result as read-only: apply / destroy plan their work against
 # the loaded Config, perform disk mutations, and exit. A caller that
-# needs the post-mutation view re-invokes `load_config()`. No code
-# path re-scans the state-dir tree after load.
+# needs the post-mutation view re-invokes `load_config()`. A few
+# discovery paths (status / trigger / destroy) still re-derive the
+# installed-name set from disk via `stamped_names()` rather than
+# `Config.installed_full_names()` -- a remaining migration, not a
+# correctness gap.
 
 
 @dataclass
@@ -2912,8 +2927,11 @@ class RuntimeState:
     None -- captured here so subcommands read it from Config
     rather than walking `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR`
     themselves. `unit_config is not None` is the "a unit file
-    exists on disk" test. Following the load_config boundary
-    rule: all platform-state queries happen here at load time.
+    exists on disk" test. The platform unit *file* presence and
+    the unit-drift check are captured here at load time; the live
+    scheduler enable/disable state is not -- status' UNIT axis
+    queries `_unit_state` on demand, since the scheduler view can
+    change between load and read.
 
     `unit_is_stale` is True when the platform install diverges
     from what the snapshot would render: missing or hand-edited
@@ -7035,6 +7053,13 @@ def do_destroy(
     config = load_config()
     bundles = config.toml_config
     require_known_bundle(bundles, bundle)
+    # Shadowed collision losers share a live name, so they never
+    # surface in the name-keyed `stamped_names()` discovery set --
+    # collect them by ref. They're always orphans (the winner holds
+    # the name), so both factory-reset and `--orphans` reclaim
+    # them; surgical `destroy <name>` doesn't (the operator can
+    # paste a `<bundle>:<UUID>` from status to target one).
+    shadowed_refs: list[EntityRef] = []
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
@@ -7068,6 +7093,14 @@ def do_destroy(
         if bundle is not None:
             names = bundle_prefix_filter(names, bundle)
         full_names_to_destroy = sorted(names)
+        shadowed_refs = sorted(
+            (
+                r
+                for r in config.shadowed
+                if bundle is None or r.bundle == bundle
+            ),
+            key=lambda r: (r.bundle, r.uuid),
+        )
 
     for full in full_names_to_destroy:
         # The state dir to wipe is the one the installed unit's
@@ -7107,6 +7140,22 @@ def do_destroy(
                 )
         destroy_one(name_for_cleanup, sd)
         logger.info("%s: destroyed", full)
+
+    # Reclaim shadowed collision residue (state dir only -- the
+    # shared name-keyed unit belongs to the surviving winner and,
+    # in a factory reset, is removed by the winner's own pass
+    # above).
+    for ref in shadowed_refs:
+        sd = _entity_state_dir(ref)
+        if not sd.is_dir():
+            continue
+        if _run_in_progress(sd):
+            logger.warning(
+                "%s: shadowed residue left in place (run in progress)", ref
+            )
+            continue
+        destroy_one(None, sd)
+        logger.info("%s: destroyed shadowed residue", ref)
 
 
 def _applied_schedule_state(config: Config, full: str) -> str:

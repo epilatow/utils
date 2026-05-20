@@ -9950,6 +9950,30 @@ class TestNameCollision:
         assert (h.state / "default" / live_uuid / "snapshot.json").is_file()
         assert plist.exists()
 
+    def test_destroy_orphans_reclaims_shadowed_residue(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A shadowed residue dir shares the live entry's name, so
+        # the name-keyed discovery set never lists it. `destroy
+        # --orphans` must still reclaim it by ref (state dir only;
+        # the shared unit belongs to the live winner).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        live_uuid = cfg.jobs["j"].uuid
+        crony.apply_one(cfg, "j")
+        stray_uuid = "99999999-8888-7777-6666-555544443333"
+        stray_dir = self._plant_residue(h, h.full("j"), stray_uuid)
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        crony.do_destroy(jobs=[], bundle=None, orphans=True)
+        # Shadowed residue reclaimed; the live entry's dir + shared
+        # unit are untouched (it's selected, not an orphan).
+        assert not stray_dir.exists()
+        assert (h.state / "default" / live_uuid / "snapshot.json").is_file()
+        assert plist.exists()
+
 
 class TestUnitOnlyOrphan:
     """A platform unit file with no corresponding state dir
@@ -10856,6 +10880,33 @@ class TestSnapshotLifecycle:
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony._load_snapshot(
                 crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid")
+            )
+
+    def test_load_snapshot_refuses_malformed_schema_match(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # schema matches but the dataclass ctor would TypeError on
+        # an unexpected field. The runner must get a clean
+        # PreconditionError (-> records `canceled`), not a raw
+        # TypeError traceback the scheduler never sees.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        uuid_value = "deadbeef-uuid"
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd.mkdir(parents=True)
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "kind": "job",
+                    "name": "default.j",
+                    "bogus_field": "unexpected",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.PreconditionError, match="malformed fields"):
+            crony._load_snapshot(
+                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
             )
 
     def test_topological_apply_propagates_leaf_edit_to_group(
