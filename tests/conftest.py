@@ -110,7 +110,23 @@ def isolate_home(
     monkeypatch.setattr(module, "INSTALLED_FILE", sentinel / installed_basename)
 
 
-class IsolateHomeFixtureBase:
+class SentinelHomeBase:
+    """Common meta-tests pinning the `Path.home()` redirection that
+    every per-tool autouse home-isolation fixture provides. All
+    tool-specific bases (dotfiles, binfiles, crony) inherit these
+    two checks so the sentinel-naming contract stays uniform.
+    """
+
+    def test_home_diverted_to_sentinel(self, tmp_path: Path) -> None:
+        """Path.home() returns a per-test sentinel, not the real home."""
+        assert Path.home() == tmp_path / "_home_sentinel_unwritten"
+
+    def test_sentinel_does_not_exist(self) -> None:
+        """The sentinel intentionally does not exist on disk."""
+        assert not Path.home().exists()
+
+
+class IsolateHomeFixtureBase(SentinelHomeBase):
     """Meta-tests pinning the autouse _isolate_home fixture in
     test_dotfiles.py and test_binfiles.py.
 
@@ -130,14 +146,6 @@ class IsolateHomeFixtureBase:
     @staticmethod
     def _make_source(path: Path) -> None:
         raise NotImplementedError
-
-    def test_home_diverted_to_sentinel(self, tmp_path: Path) -> None:
-        """Path.home() returns a per-test sentinel, not the real home."""
-        assert Path.home() == tmp_path / "_home_sentinel_unwritten"
-
-    def test_sentinel_does_not_exist(self) -> None:
-        """The sentinel intentionally does not exist on disk."""
-        assert not Path.home().exists()
 
     def test_install_lands_under_sentinel_not_real_home(
         self, tmp_path: Path
