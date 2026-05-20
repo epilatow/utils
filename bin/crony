@@ -138,11 +138,12 @@ and runs the command immediately.
 
 Apply pins each entry's runtime parameters into a JSON snapshot
 in the entry's state dir (`STATE_DIR/<bundle>/<uuid>/snapshot.json`,
-alongside `run.log`, `last-run.json`, etc.). The state
-dir is keyed on the entry's `uuid` so renaming a job in the
-config preserves its history -- only deleting the entry (or
-changing its `uuid`) loses it. The runner reads the snapshot,
-never the live config: editing the toml without `apply`
+alongside `run.log`, `last-run.json`, etc.). Apply also seeds an
+empty `run.log` so you can `tail -f` it immediately, before the
+entry's first run. The state dir is keyed on the entry's `uuid`
+so renaming a job in the config preserves its history -- only
+deleting the entry (or changing its `uuid`) loses it. The runner
+reads the snapshot, never the live config: editing the toml without `apply`
 therefore has no effect on running units, and `crony status`
 reports any divergence between live config and on-disk snapshot
 as `config=stale` via direct dataclass equality. The platform
@@ -3624,9 +3625,18 @@ def _state_dir_for(ref: EntityRef) -> Path:
     the bundle subdir) when missing. Used by apply and the runner
     -- both write files under the returned path on every call, so
     a pre-existing empty dir is the right starting state.
+
+    Also materializes an empty `run.log` when absent, so it exists
+    from apply time onward -- an operator can `tail -f` it before
+    the entity's first run instead of racing the runner to create
+    it. Only created when missing, never truncated, so an existing
+    log survives a re-apply untouched.
     """
     d = _entity_state_dir(ref)
     d.mkdir(parents=True, exist_ok=True)
+    log_path = d / "run.log"
+    if not log_path.exists():
+        log_path.touch()
     return d
 
 
@@ -5807,7 +5817,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         scheduled=schedule is not None or interval is not None,
     )
 
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    _state_dir_for(ref)
     snapshot_path.write_text(
         json.dumps(dataclasses.asdict(snapshot), indent=2, sort_keys=True)
         + "\n",
@@ -8369,9 +8379,9 @@ def do_logs(
 
     -p/--path   print the log file's path and exit (no content read).
                 Path resolution is purely structural -- prints even
-                when the file doesn't exist yet (e.g. for a job
-                that's been applied but never run), so it composes
-                with other tools: `$EDITOR "$(crony logs j -p)"`.
+                when the file doesn't exist yet (e.g. an entry that
+                hasn't been applied), so it composes with other
+                tools: `$EDITOR "$(crony logs j -p)"`.
     -l/--latest print only the most recent run's entry (from the
                 last `=== ... ===` header to EOF). Overrides -n /
                 --since; mutually exclusive with --tail.

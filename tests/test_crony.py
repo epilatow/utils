@@ -5148,6 +5148,65 @@ class TestApplyFullSync:
         assert (sd / "snapshot.json").exists()
 
 
+class TestApplyCreatesRunLog:
+    """Apply materializes an empty `run.log` in each entity's state
+    dir so an operator can `tail -f` it before the first run, rather
+    than racing the runner to create it.
+    """
+
+    def test_apply_creates_empty_run_log(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        sd = h.state_dir("j", cfg=cfg, ensure_snapshot=False)
+        h.apply("j")
+        log = sd / "run.log"
+        assert log.is_file()
+        assert log.read_text(encoding="utf-8") == ""
+
+    def test_apply_creates_run_log_for_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A grouped entry (no own schedule) gets its run.log too.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        assert (
+            h.state_dir("g", cfg=cfg, ensure_snapshot=False) / "run.log"
+        ).is_file()
+        assert (
+            h.state_dir("a", cfg=cfg, ensure_snapshot=False) / "run.log"
+        ).is_file()
+
+    def test_reapply_does_not_truncate_existing_run_log(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j", cfg=cfg, ensure_snapshot=False)
+        (sd / "run.log").write_text("prior run output\n", encoding="utf-8")
+        h.apply("j")
+        assert (sd / "run.log").read_text(
+            encoding="utf-8"
+        ) == "prior run output\n"
+
+
 class TestApplyRenamePreservesHistory:
     """The whole point of keying state by uuid: a TOML edit that
     only changes a job's short name keeps the same state dir, so
