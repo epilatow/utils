@@ -1309,24 +1309,28 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
 def require_known_bundle(bundles: TomlConfig, bundle: str | None) -> None:
     """Reject `--bundle <name>` if `<name>` isn't a loaded bundle.
 
-    Used by subcommands that need pending-side config data
-    (`apply` / `enable` / `disable` / `trigger` / `validate`):
-    a bundle whose file failed to parse has no such data, so
-    scoping to it is an error. Read-side subcommands that operate
-    on the on-disk picture use `require_addressable_bundle`
-    instead.
+    Used by `apply` and `validate`, which parse and act on the
+    pending config: a bundle whose file failed to parse has no
+    such data, so scoping to it is an error. Subcommands that
+    address installed units (`status` / `destroy` / `enable` /
+    `disable` / `trigger`) use `require_addressable_bundle`
+    instead, which also accepts a bundle present only as on-disk
+    state.
     """
     if bundle is not None and bundles.by_name(bundle) is None:
         raise UsageError(f"unknown bundle: {bundle!r}")
 
 
 def require_addressable_bundle(config: Config, bundle: str | None) -> None:
-    """Reject `--bundle <name>` for read-side subcommands unless
-    `<name>` is addressable on this host: either a successfully
-    parsed bundle, or one with on-disk remnants. The latter lets
-    `status` and `destroy` scope to a bundle whose config has
-    since broken -- exactly when the operator most needs to
-    inspect or tear it down.
+    """Reject `--bundle <name>` unless `<name>` is addressable on
+    this host: either a successfully parsed bundle, or one with
+    on-disk remnants. Used by the subcommands that address
+    installed units (`status` / `destroy` / `enable` / `disable`
+    / `trigger`); the on-disk fallback lets them scope to a bundle
+    whose config has since broken -- exactly when the operator
+    most needs to inspect, disarm, or tear it down. Commands that
+    parse the pending config (`apply` / `validate`) use
+    `require_known_bundle` instead.
     """
     if bundle is None:
         return
@@ -7234,7 +7238,7 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     names must match it.
     """
     config = load_config()
-    require_known_bundle(config.toml_config, bundle)
+    require_addressable_bundle(config, bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
@@ -7266,7 +7270,7 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     names must match it.
     """
     config = load_config()
-    require_known_bundle(config.toml_config, bundle)
+    require_addressable_bundle(config, bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
@@ -7352,7 +7356,7 @@ def do_trigger(
         )
     config = load_config()
     bundles = config.toml_config
-    require_known_bundle(bundles, bundle)
+    require_addressable_bundle(config, bundle)
     stamped = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, stamped, config, scheduled_only=False

@@ -6381,6 +6381,45 @@ class TestEnableDisable:
         assert any(h.full("a") in lbl for lbl in labels)
         assert any(h.full("g") in lbl for lbl in labels)
 
+    def test_enable_disable_trigger_scoped_when_bundle_config_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # enable / disable / trigger address installed units, not
+        # the pending config, so scoping them to a bundle whose
+        # config has since broken must still act on that bundle's
+        # installed entries rather than be refused as an unknown
+        # bundle.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config({}, default_target_jobs=[])
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            _uuid_toml(
+                '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
+                "\n"
+                '[target.darwin]\njobs = ["k"]\n',
+            ),
+            encoding="utf-8",
+        )
+        h.apply("k", bundle="borgadm")
+        # Break borgadm's config after it applied; its snapshot /
+        # unit linger but its pending config no longer parses.
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            "this is not [valid toml", encoding="utf-8"
+        )
+
+        h.calls.clear()
+        crony.do_enable(jobs=[], bundle="borgadm")
+        assert any("borgadm.k" in str(c) for c in h.calls)
+
+        h.calls.clear()
+        crony.do_disable(jobs=[], bundle="borgadm")
+        assert any("borgadm.k" in str(c) for c in h.calls)
+
+        h.calls.clear()
+        crony.do_trigger(
+            jobs=[], wait=False, trigger_timeout=None, bundle="borgadm"
+        )
+        assert any("borgadm.k" in str(c) for c in h.calls)
+
 
 class TestStatusUuidColumn:
     """`uuid` is an opt-in column rendering the `<bundle>:<UUID>`
