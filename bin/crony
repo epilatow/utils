@@ -7872,6 +7872,32 @@ def _build_group_membership(
     return pending, current
 
 
+def _build_config_group_membership(
+    toml_config: TomlConfig,
+) -> dict[str, list[str]]:
+    """Reverse-index group membership straight from the parsed TOML,
+    spanning every defined group whether or not it is selected here.
+
+    `_build_group_membership` only sees entries that survive host /
+    platform selection into the pending / current graphs, so a
+    masked entry's GROUPS cell comes up empty even though the status
+    tree still nests it under its parent. This walks the same source
+    `_build_status_tree` does -- each group's `jobs` list -- so a
+    masked entry can fall back to its config-declared membership.
+    Keyed `child_full -> sorted [parent_full]`.
+    """
+    membership: dict[str, list[str]] = {}
+    for bundle in toml_config.bundles:
+        for parent_short, group in bundle.config.job_groups.items():
+            parent_full = bundle.full_name(parent_short)
+            for child_short in group.jobs:
+                child_full = bundle.full_name(child_short)
+                membership.setdefault(child_full, []).append(parent_full)
+    for parents in membership.values():
+        parents.sort()
+    return membership
+
+
 def _diverged(pending: object, current: object) -> bool:
     """`*`-annotation predicate: the entity exists in both graphs
     AND the values disagree on this field. The annotation never
@@ -8080,6 +8106,7 @@ def do_status(
             n: d for n, d in tree_depth.items() if n.startswith(f"{bundle}.")
         }
     pending_groups, current_groups = _build_group_membership(config)
+    config_groups = _build_config_group_membership(bundles)
     rows: list[dict[str, str]] = []
     any_stale = False
     for full in full_names:
@@ -8127,9 +8154,20 @@ def do_status(
             sched_cell = f"{sched_cell} *"
         unit_sched_cell, _ = _schedule_cells(config, full, "current")
         pending_sched_cell, _ = _schedule_cells(config, full, "pending")
+        pending_membership = pending_groups.get(full, [])
+        current_membership: list[str] | None = current_groups.get(full, [])
+        if mask_reason and not pending_membership and not current_membership:
+            # A masked entry is absent from both graphs, so its
+            # graph-derived membership is empty even though the tree
+            # nests it under a parent. Fall back to the
+            # config-declared membership, and mark the current side
+            # "not applicable" (None) so the config-only value
+            # doesn't read as drift (a `*` stale marker).
+            pending_membership = config_groups.get(full, [])
+            current_membership = None
         groups_cell, groups_stale = _groups_cells(
-            pending_groups.get(full, []),
-            current_groups.get(full, []),
+            pending_membership,
+            current_membership,
             config_source,
         )
         if groups_stale:

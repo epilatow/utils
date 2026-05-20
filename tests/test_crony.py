@@ -6813,6 +6813,49 @@ class TestStatusReport:
         )
         assert f"default:{cfg.jobs['j'].uuid}" in masked_line
 
+    def test_masked_entry_shows_group_membership(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A masked entry is absent from the pending / current graphs
+        # that GROUPS is normally indexed from, but the status tree
+        # still nests it under its parent -- so GROUPS must show that
+        # config-declared parent, without a false `*` stale marker.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    # `j` is masked on darwin; `k` keeps the group
+                    # selected so it isn't an empty-cascade mask.
+                    "j": {"command": "true", "platforms": ["linux"]},
+                    "k": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["j", "k"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony.do_status(
+            jobs=[],
+            cols="job-or-uuid,config,groups",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        j_line = next(
+            line
+            for line in out.splitlines()
+            if line.split() and line.split()[0] == h.full("j")
+        )
+        assert "masked" in j_line
+        assert h.full("g") in j_line
+        # Config-only membership must not read as drift.
+        assert "*" not in j_line
+
     def test_all_flag_with_masked_by_column_shows_reason(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
