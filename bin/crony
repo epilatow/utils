@@ -2030,8 +2030,8 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
             sites = f"{', '.join(quoted[:-1])}, and {quoted[-1]}"
         msg = (
             f"duplicate uuid {uuid_str} on {sites}; "
-            f"remove one of the duplicates and run "
-            f"`crony config update` to assign a fresh uuid"
+            f"edit the config so each entry has a distinct uuid "
+            f"(`crony config uuid-generate` prints a fresh one)"
         )
         for kind, short in entries:
             where = f"[{kind}.{short}]"
@@ -6833,13 +6833,16 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     bundles = config.toml_config
     require_known_bundle(bundles, bundle)
     # Apply needs pending-side data for every entry it considers
-    # selected; if some bundles failed to parse, the no-args
+    # selected; if some bundles failed to parse, the unscoped
     # orphan-removal sweep would treat every stamped name as
-    # un-selected and wipe it. Refuse the full-sync sweep when
-    # bundles are errored; the operator must either fix the
-    # config or pass explicit names / `--bundle` so the wipe
-    # scope is intentional.
-    if not jobs and bundles.errored_bundles:
+    # un-selected and wipe it. Refuse only the unscoped full-sync
+    # sweep when bundles are errored; the operator must either fix
+    # the config or narrow scope with explicit names / `--bundle`
+    # so the wipe scope is intentional. A `--bundle` sweep is
+    # already safe: its orphan removal is scoped to that one bundle
+    # (which `require_known_bundle` has confirmed parsed cleanly),
+    # so an unrelated broken bundle can't derail it.
+    if not jobs and bundle is None and bundles.errored_bundles:
         affected = sorted(bundles.errored_bundles)
         raise UsageError(
             "refusing the full-sync apply: one or more config "

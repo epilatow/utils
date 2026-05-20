@@ -1148,7 +1148,7 @@ class TestDuplicateUuidInBundle:
             assert self.GOOD in msg
             assert "'default.a'" in msg
             assert "'default.b'" in msg
-            assert "crony config update" in msg
+            assert "crony config uuid-generate" in msg
 
     def test_duplicate_uuid_across_job_and_group_demotes_both(
         self, tmp_path: Path
@@ -5125,6 +5125,27 @@ class TestApplyFullSync:
         )
         with pytest.raises(crony.UsageError, match="refusing the full-sync"):
             crony.do_apply(jobs=[], verbose=False, bundle=None)
+
+    def test_bundle_scoped_apply_proceeds_when_sibling_bundle_errored(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The full-sync refusal is for the unscoped (bundle=None)
+        # sweep, whose orphan removal spans the broken bundle. A
+        # `--bundle` sweep is scoped to that one bundle (confirmed
+        # parsed by require_known_bundle), so a broken *sibling*
+        # bundle is out of scope and must not block it.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.cfg_dropin.mkdir(parents=True, exist_ok=True)
+        (h.cfg_dropin / "broken.toml").write_text(
+            "this is not [valid toml", encoding="utf-8"
+        )
+        sd = h.state_dir("j", cfg=cfg, ensure_snapshot=False)
+        crony.do_apply(jobs=[], verbose=False, bundle=crony.DEFAULT_BUNDLE_NAME)
+        assert (sd / "snapshot.json").exists()
 
 
 class TestApplyRenamePreservesHistory:
