@@ -10481,33 +10481,17 @@ class TestStatusExcludeHealthy:
     this is a filter on the display, not a gate.
     """
 
-    def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
-        cfg_dir = tmp_path / "config"
-        cfg_dir.mkdir()
-        cfg_file = cfg_dir / "config.toml"
-        cfg_dropin = tmp_path / "config_dropin"
-        cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
-        monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
-        monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        return cfg_file
-
     def test_healthy_row_filtered_out(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        cfg_file = self._setup(tmp_path, monkeypatch)
-        uuid_value = "11111111-1111-1111-1111-111111111111"
-        cfg_file.write_text(
-            f'[job.healthy]\nuuid = "{uuid_value}"\n'
-            'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["healthy"]\n',
-            encoding="utf-8",
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"healthy": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["healthy"],
         )
         # Apply so it's synced; never run -> LAST=never (healthy).
-        _apply("healthy")
+        h.apply("healthy")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10523,21 +10507,18 @@ class TestStatusExcludeHealthy:
     def test_unhealthy_row_kept(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        cfg_file = self._setup(tmp_path, monkeypatch)
-        uuid_value = "22222222-2222-2222-2222-222222222222"
-        cfg_file.write_text(
-            f'[job.j]\nuuid = "{uuid_value}"\n'
-            'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["j"]\n',
-            encoding="utf-8",
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
         )
-        _apply("j")
-        sd = crony.STATE_DIR / "default" / uuid_value
-        (sd / "last-run.json").write_text(
+        h.apply("j")
+        (h.state_dir("j") / "last-run.json").write_text(
             '{"exit_class": "fail", "exit_code": 1, '
             '"started_at": "2026-01-01T00:00:00-08:00"}',
             encoding="utf-8",
         )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10557,25 +10538,22 @@ class TestStatusExcludeHealthy:
         # Tree indent (two spaces per depth level) is dropped
         # under --exclude-healthy. The unhealthy row lands flat
         # against the left margin.
-        cfg_file = self._setup(tmp_path, monkeypatch)
-        leaf_uuid = "33333333-3333-3333-3333-333333333333"
-        grp_uuid = "44444444-4444-4444-4444-444444444444"
-        cfg_file.write_text(
-            f'[job.leaf]\nuuid = "{leaf_uuid}"\n'
-            'command = "true"\n'
-            f'[job-group.g]\nuuid = "{grp_uuid}"\n'
-            'jobs = ["leaf"]\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["g"]\n',
-            encoding="utf-8",
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {"leaf": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["leaf"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
         )
-        _apply("leaf")
-        _apply("g")
-        leaf_sd = crony.STATE_DIR / "default" / leaf_uuid
-        (leaf_sd / "last-run.json").write_text(
+        h.apply("leaf")
+        h.apply("g")
+        (h.state_dir("leaf") / "last-run.json").write_text(
             '{"exit_class": "fail", "exit_code": 1, '
             '"started_at": "2026-01-01T00:00:00-08:00"}',
             encoding="utf-8",
         )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10597,16 +10575,13 @@ class TestStatusExcludeHealthy:
         # A disabled unit isn't firing, so it's unhealthy and must
         # survive the --exclude-healthy filter even though its
         # snapshot is synced and it never failed a run.
-        cfg_file = self._setup(tmp_path, monkeypatch)
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
-        uuid_value = "55555555-5555-5555-5555-555555555555"
-        cfg_file.write_text(
-            f'[job.paused]\nuuid = "{uuid_value}"\n'
-            'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["paused"]\n',
-            encoding="utf-8",
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"paused": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["paused"],
         )
-        _apply("paused")
+        h.apply("paused")
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "disabled")
         crony.do_status(
             jobs=[],
             cols=None,
