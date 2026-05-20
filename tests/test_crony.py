@@ -6856,6 +6856,47 @@ class TestStatusReport:
         # Config-only membership must not read as drift.
         assert "*" not in j_line
 
+    def test_unused_offtree_entry_has_no_group_membership(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # An entry defined but not reached by this host's target is
+        # `unused` and renders flat (off-tree), not nested. The
+        # config-membership fallback is gated on tree presence, so
+        # an off-tree entry's GROUPS cell must stay empty rather than
+        # claim a parent the row isn't shown under.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        h.config(
+            {
+                "job": {
+                    "sel": {"command": "true", "schedule": "*-*-* 03:00"},
+                    # `gu` (and its child `ju`) are defined but absent
+                    # from the target -> `unused`, off-tree.
+                    "ju": {"command": "true"},
+                },
+                "job-group": {
+                    "gu": {"jobs": ["ju"], "schedule": "*-*-* 04:00"},
+                },
+            },
+            default_target_jobs=["sel"],
+        )
+        crony.do_status(
+            jobs=[],
+            cols="job-or-uuid,config,groups",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        ju_line = next(
+            line
+            for line in out.splitlines()
+            if line.split() and line.split()[0] == h.full("ju")
+        )
+        assert h.full("gu") not in ju_line
+
     def test_all_flag_with_masked_by_column_shows_reason(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:

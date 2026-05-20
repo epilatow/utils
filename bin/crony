@@ -8156,13 +8156,21 @@ def do_status(
         pending_sched_cell, _ = _schedule_cells(config, full, "pending")
         pending_membership = pending_groups.get(full, [])
         current_membership: list[str] | None = current_groups.get(full, [])
-        if mask_reason and not pending_membership and not current_membership:
-            # A masked entry is absent from both graphs, so its
-            # graph-derived membership is empty even though the tree
-            # nests it under a parent. Fall back to the
-            # config-declared membership, and mark the current side
-            # "not applicable" (None) so the config-only value
-            # doesn't read as drift (a `*` stale marker).
+        if (
+            mask_reason
+            and full in tree_depth
+            and not pending_membership
+            and not current_membership
+        ):
+            # A masked entry shown nested in the tree is absent from
+            # both graphs, so its graph-derived membership is empty
+            # even though the tree places it under a parent. Fall
+            # back to the config-declared membership, gated on actual
+            # tree presence so an off-tree `unused` entry (defined
+            # but not reached by this host's target, rendered flat)
+            # doesn't claim a parent it isn't shown under. Mark the
+            # current side "not applicable" (None) so the config-only
+            # value doesn't read as drift (a `*` stale marker).
             pending_membership = config_groups.get(full, [])
             current_membership = None
         groups_cell, groups_stale = _groups_cells(
