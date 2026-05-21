@@ -2718,11 +2718,11 @@ class TestPathFieldExpansion:
 
 class TestRuntimeEnvExpansion:
     """`_runtime_env` is called at fire time with the snapshot's
-    user_env dict. It carries forward shell-essential vars from the
-    invoking process (so wrapped commands reach the user's ssh-agent
-    via SSH_AUTH_SOCK) and expands `$VAR` / `${VAR}` references in
-    user_env values against the merged env. Called at runtime, not
-    apply time, so the inherited env stays current per fire.
+    user_env dict. It passes the inherited (scheduler-provided) env
+    through and overlays user_env, expanding `$VAR` / `${VAR}`
+    references in user_env values against the merged env. Called at
+    runtime, not apply time, so the inherited env stays current per
+    fire.
     """
 
     def test_inherits_path_when_no_env_override(self, monkeypatch: Any) -> None:
@@ -2730,17 +2730,31 @@ class TestRuntimeEnvExpansion:
         env = crony._runtime_env({})
         assert env["PATH"] == "/usr/bin:/bin"
 
-    def test_ssh_auth_sock_forwarded_when_present(
-        self, monkeypatch: Any
-    ) -> None:
+    def test_session_bus_vars_forwarded(self, monkeypatch: Any) -> None:
+        # The linux session-bus locators must reach the job so a
+        # command like `crony apply` can drive `systemctl --user`.
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+        monkeypatch.setenv(
+            "DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"
+        )
+        env = crony._runtime_env({})
+        assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+        assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+
+    def test_arbitrary_inherited_var_forwarded(self, monkeypatch: Any) -> None:
+        # The inherited env passes through wholesale: any var in the
+        # runner's environment reaches the job. SSH_AUTH_SOCK rides
+        # this path so jobs can reach the user's ssh-agent.
+        monkeypatch.setenv("CRONY_INHERIT_PROBE", "passed-through")
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
         env = crony._runtime_env({})
-        assert env.get("SSH_AUTH_SOCK") == "/tmp/agent.sock"
+        assert env["CRONY_INHERIT_PROBE"] == "passed-through"
+        assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
 
-    def test_ssh_auth_sock_absent_when_unset(self, monkeypatch: Any) -> None:
-        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    def test_unset_var_absent(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("CRONY_INHERIT_PROBE", raising=False)
         env = crony._runtime_env({})
-        assert "SSH_AUTH_SOCK" not in env
+        assert "CRONY_INHERIT_PROBE" not in env
 
     def test_dollar_var_resolves_against_inherited(
         self, monkeypatch: Any
@@ -2753,6 +2767,15 @@ class TestRuntimeEnvExpansion:
         monkeypatch.setenv("HOME", "/Users/edp")
         env = crony._runtime_env({"TMPDIR": "${HOME}/.local/tmp"})
         assert env["TMPDIR"] == "/Users/edp/.local/tmp"
+
+    def test_expansion_resolves_against_any_inherited_var(
+        self, monkeypatch: Any
+    ) -> None:
+        # Expansion sees the whole inherited env, so a value can
+        # reference any inherited var (here the session runtime dir).
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+        env = crony._runtime_env({"BUS": "$XDG_RUNTIME_DIR/bus"})
+        assert env["BUS"] == "/run/user/1000/bus"
 
     def test_unknown_var_stays_literal(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_NOPE", raising=False)

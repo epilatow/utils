@@ -2581,12 +2581,13 @@ class Job:
     final values: paths are pre-expanded (`~` and `$VAR`), timeouts
     are post-cascade. `env` is the deliberate exception -- it stores
     the user's literal toml `env` dict (no parent-process overlay,
-    no $VAR expansion). The runner merges it with the inherited
+    no $VAR expansion). The runner overlays it on the inherited
     process env at fire time. Pinning the inherited env would (a)
     make the snapshot unstable across shell sessions (every apply
     from a different shell would flip the snapshot and report
-    `config=stale`), (b) hand the runner whatever SSH_AUTH_SOCK /
-    PATH was in scope when `crony apply` happened to run.
+    `config=stale`), (b) capture whatever env was in scope when
+    `crony apply` ran rather than what the unit provides at fire
+    time.
     """
 
     schema: int
@@ -3687,39 +3688,25 @@ def _expand_env_value(raw: str, env: dict[str, str]) -> str:
 def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
-    Carries forward the small set of shell-essential vars from the
-    invoking process and overlays `user_env` (the literal dict the
-    user wrote in the toml) on top, so users can inject custom
-    settings without leaking the full parent env. SSH_AUTH_SOCK is
-    included so jobs that need to ssh out (e.g. a remote backup or
-    a git pull from a private repo) can talk to the user's running
-    ssh-agent without the user having to wire it up per-job. Each
-    user_env value is expanded against the running merged env, so a
-    job can write `PATH = "/extra:$PATH"` and have $PATH resolve to
-    the inherited PATH (or to a value an earlier user_env key set).
+    The command runs from a platform unit (launchd on darwin,
+    `systemd --user` on linux), which hands the runner an already
+    minimal, curated environment. crony passes that inherited env
+    through unchanged: setting it up is the scheduler's job, and
+    re-filtering it strips session locators a job may need --
+    notably XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS, without
+    which a job that shells out to `systemctl --user` (e.g. one
+    whose command is `crony apply`) cannot reach the user bus.
 
-    Called at runtime, not apply time: the inherited env is process-
-    contextual (SSH_AUTH_SOCK in particular is per-shell-session)
-    and pinning it would (a) make the snapshot unstable across
-    shells, (b) hand the runner a stale agent socket from whatever
-    shell happened to run `crony apply`. The snapshot stores
-    `user_env` only; this helper produces the merged + expanded
-    env at fire time.
+    `user_env` (the literal toml `env` dict) is overlaid on top and
+    each value is expanded against the running merged env, so a job
+    can write `PATH = "/extra:$PATH"` and have $PATH resolve to the
+    inherited PATH (or to a value an earlier user_env key set).
+
+    Built at fire time, not apply time, so the snapshot stores
+    `user_env` only -- pinning the inherited env would make the
+    snapshot churn across the shells an apply runs from.
     """
-    env: dict[str, str] = {}
-    for k in (
-        "HOME",
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "TZ",
-        "USER",
-        "LOGNAME",
-        "SSH_AUTH_SOCK",
-    ):
-        v = os.environ.get(k)
-        if v is not None:
-            env[k] = v
+    env: dict[str, str] = dict(os.environ)
     for k, raw in user_env.items():
         env[k] = _expand_env_value(raw, env)
     return env
@@ -4634,9 +4621,8 @@ def run_job(
 
     notify_channels, notify_defaults = _resolve_notify_at_runtime(full_name)
     job_timeout_sec = snap.job_timeout_sec
-    # snap.env stores the user-written env literally; merge with
-    # the inherited (process-contextual) env at fire time so
-    # SSH_AUTH_SOCK and friends reach the wrapped command.
+    # snap.env stores the user-written env literally; overlay it on
+    # the inherited env at fire time (see _runtime_env).
     env = _runtime_env(snap.env)
     started = time.time()
     started_iso = _now_iso()
