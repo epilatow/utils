@@ -30,4 +30,11 @@ jobs:
         run: brew install borgbackup
 
       - name: Run all tests
+        env:
+          # The borgadm e2e suite (the only suite pulling in pytest-xdist)
+          # spawns uv+python+borg per test. On the 3-vCPU macOS runner,
+          # xdist's `-n auto` oversubscribes cores hard enough that some
+          # borgadm calls cross the suite's 120s per-call timeout. Pin
+          # macOS to one worker; Linux's cheap exec runs -n auto fine.
+          PYTEST_XDIST_AUTO_NUM_WORKERS: ${{ runner.os == 'macOS' && '1' || '' }}
         run: tests/run_all.py --e2e
