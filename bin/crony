@@ -344,7 +344,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # a rename rather than a delete plus an unrelated add. Hand-edit a
 # new entry without it and run `crony config update` to fill the
 # field in place; the same `update` action works on `[job-group.*]`
-# blocks below. `crony config uuid-generate` prints one fresh UUID
+# blocks below. `crony config generate-uuid` prints one fresh UUID
 # for editor seeding when `update` can't yet parse the file.
 
 # [job.brew-update]
@@ -2063,7 +2063,7 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
         msg = (
             f"duplicate uuid {uuid_str} on {sites}; "
             f"edit the config so each entry has a distinct uuid "
-            f"(`crony config uuid-generate` prints a fresh one)"
+            f"(`crony config generate-uuid` prints a fresh one)"
         )
         for kind, short in entries:
             where = f"[{kind}.{short}]"
@@ -6575,7 +6575,7 @@ def do_init(force: bool, bundle: str | None) -> None:
     logger.info("wrote default config to %s", CONFIG_FILE)
 
 
-def do_uuid_generate() -> None:
+def do_generate_uuid() -> None:
     """Print one freshly-minted UUID to stdout.
 
     Convenience for users hand-editing a config: when adding a new
@@ -9110,7 +9110,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     config_subparsers.add_parser(
-        "uuid-generate",
+        "generate-uuid",
         help="Print one freshly-minted UUID",
     )
 
@@ -9463,7 +9463,7 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "config init": do_init,
     "config validate": do_validate,
     "config update": do_config_update,
-    "config uuid-generate": do_uuid_generate,
+    "config generate-uuid": do_generate_uuid,
     "apply": do_apply,
     "destroy": do_destroy,
     "enable": do_enable,

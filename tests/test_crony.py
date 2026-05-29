@@ -1148,7 +1148,7 @@ class TestDuplicateUuidInBundle:
             assert self.GOOD in msg
             assert "'default.a'" in msg
             assert "'default.b'" in msg
-            assert "crony config uuid-generate" in msg
+            assert "crony config generate-uuid" in msg
 
     def test_duplicate_uuid_across_job_and_group_demotes_both(
         self, tmp_path: Path
@@ -2162,15 +2162,15 @@ class TestInit:
         _parse(tomlkit.loads(text))
 
 
-class TestUuidGenerateAction:
-    """`crony config uuid-generate` prints a single canonical UUID
+class TestGenerateUuidAction:
+    """`crony config generate-uuid` prints a single canonical UUID
     on stdout. Used by users hand-editing a config before the file
     is otherwise valid (the `config update` path requires a parsable
     file).
     """
 
     def test_emits_one_canonical_uuid(self, capsys: Any) -> None:
-        crony.do_uuid_generate()
+        crony.do_generate_uuid()
         out = capsys.readouterr().out.strip()
         parsed = uuid.UUID(out)
         assert str(parsed) == out
