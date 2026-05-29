@@ -7030,7 +7030,7 @@ class TestStatusReport:
         # A masked entry is absent from the pending / current graphs
         # that GROUPS is normally indexed from, but the status tree
         # still nests it under its parent -- so GROUPS must show that
-        # config-declared parent, without a false `*` stale marker.
+        # config-declared parent, without a false `^` divergence flag.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         monkeypatch.setattr(crony, "current_host", lambda: "h")
         h.config(
@@ -7065,7 +7065,7 @@ class TestStatusReport:
         assert "masked" in j_line
         assert h.full("g") in j_line
         # Config-only membership must not read as drift.
-        assert "*" not in j_line
+        assert "^" not in j_line
 
     def test_unused_offtree_entry_has_no_group_membership(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7113,7 +7113,7 @@ class TestStatusReport:
     ) -> None:
         # Masked entries shown nested in the tree surface their
         # config-declared SCHEDULE: a grouped one as "grouped", a
-        # scheduled one as its cron, neither with a false `*` stale
+        # scheduled one as its cron, neither with a false `^` divergence
         # marker.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         monkeypatch.setattr(crony, "current_host", lambda: "h")
@@ -7158,11 +7158,11 @@ class TestStatusReport:
         j_row = _row(h.full("j"))
         assert "masked" in j_row
         assert "grouped" in j_row
-        assert not j_row.rstrip().endswith("*")
+        assert not j_row.rstrip().endswith("^")
         sched_row = _row(h.full("sched"))
         assert "masked" in sched_row
         assert "*-*-* 05:00" in sched_row
-        assert not sched_row.rstrip().endswith("*")
+        assert not sched_row.rstrip().endswith("^")
 
     def test_all_flag_with_masked_by_column_shows_reason(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7893,101 +7893,6 @@ class TestStatusReport:
             if "default.gm " in line:
                 assert f"crony-{h.full('gm')}.service" in line
 
-    def test_unit_schedule_and_pending_schedule_columns(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        # Apply, then mutate config. unit-schedule reflects the
-        # snapshot (old value); pending-schedule reflects the live
-        # config (new value); neither carries the stale asterisk.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        h.apply("j")
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
-            default_target_jobs=["j"],
-        )
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        crony.do_status(
-            jobs=[],
-            cols="job,unit-schedule,pending-schedule",
-            show_masked=False,
-            bundle=None,
-            config_current=False,
-            config_pending=False,
-            exclude_healthy=False,
-        )
-        out = capsys.readouterr().out
-        for line in out.splitlines():
-            if "default.j " in line:
-                assert "*-*-* 03:00" in line
-                assert "*-*-* 09:00" in line
-        # Neither column carries the stale-marker asterisk.
-        assert "*-*-* 03:00 *" not in out
-        assert "*-*-* 09:00 *" not in out
-
-    def test_unit_schedule_empty_when_no_snapshot(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        # Defined in config, never applied -- unit-schedule blank.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "none")
-        crony.do_status(
-            jobs=[],
-            cols="job,unit-schedule,pending-schedule",
-            show_masked=False,
-            bundle=None,
-            config_current=False,
-            config_pending=False,
-            exclude_healthy=False,
-        )
-        out = capsys.readouterr().out
-        # pending-schedule populated; unit-schedule blank for this row.
-        for line in out.splitlines():
-            if "default.j " in line:
-                assert "*-*-* 03:00" in line  # pending
-                # The row should not contain the cron expression twice.
-                assert line.count("*-*-* 03:00") == 1
-
-    def test_unit_schedule_renders_grouped_for_unscheduled_entry(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        # An applied grouped entry (no own schedule) should render
-        # `grouped` in unit-schedule, matching pending-schedule
-        # and the default schedule column.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {
-                "job": {"a": {"command": "true"}},
-                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
-            },
-            default_target_jobs=["g"],
-        )
-        h.apply("a")
-        h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
-        crony.do_status(
-            jobs=[],
-            cols="job,unit-schedule,pending-schedule",
-            show_masked=False,
-            bundle=None,
-            config_current=False,
-            config_pending=False,
-            exclude_healthy=False,
-        )
-        out = capsys.readouterr().out
-        for line in out.splitlines():
-            if "default.a " in line:
-                # Both columns show `grouped` for the unscheduled
-                # group member.
-                assert line.count("grouped") == 2
-
     def test_groups_column_shows_membership(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
@@ -8110,7 +8015,7 @@ class TestStatusReport:
         # that the applied side still records g1.
         for line in out.splitlines():
             if "default.a " in line:
-                assert "default.g2 *" in line
+                assert "default.g2^" in line
                 assert "default.g1" not in line
         assert "stale" in out
         assert "crony apply" in out
@@ -8162,14 +8067,14 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        # --config-pending shows the pending membership (g2); the `*`
+        # --config-pending shows the pending membership (g2); the `^`
         # divergence indicator fires because the applied current still
         # records a under g1.
         for line in out.splitlines():
             if "default.a " in line:
                 assert "default.g2" in line
                 assert "default.g1" not in line
-                assert "*" in line
+                assert "^" in line
 
     def test_opt_in_columns_not_in_default_set(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -8192,15 +8097,13 @@ class TestStatusReport:
         )
         header = capsys.readouterr().out.splitlines()[0]
         assert "UNIT NAME" not in header
-        assert "UNIT SCHEDULE" not in header
-        assert "PENDING SCHEDULE" not in header
         # KIND and UNIT moved to opt-in -- the schedule column
         # surfaces "disabled" inline when the unit is off, so
         # the standalone runtime axis isn't load-bearing for
         # day-to-day reading.
         assert "KIND" not in header
-        # `UNIT` is a substring of `UNIT NAME`/`UNIT SCHEDULE`;
-        # check the bare header label with surrounding whitespace.
+        # `UNIT` is a substring of `UNIT NAME`; check the bare header
+        # label with surrounding whitespace.
         assert " UNIT " not in header
         assert not header.rstrip().endswith("UNIT")
 
@@ -8228,8 +8131,6 @@ class TestStatusReport:
             "last-ran",
             "masked-by",
             "unit-name",
-            "unit-schedule",
-            "pending-schedule",
             "uuid",
         ]:
             assert col in text
@@ -8332,7 +8233,7 @@ class TestStatusReport:
     ) -> None:
         # Apply with one schedule, mutate the config (so schedule
         # would normally be stale), and disable the unit. The
-        # cell renders `disabled` with no asterisk and no footer
+        # cell renders `disabled` with no marker and no footer
         # since the cell is no longer the schedule that would
         # have been compared against pending.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -8357,15 +8258,15 @@ class TestStatusReport:
         )
         out = capsys.readouterr().out
         assert "disabled" in out
-        assert "*" not in out.replace("*-*-*", "")
+        assert "^" not in out
         assert "stale" not in out
 
-    def test_schedule_default_marks_stale_with_asterisk_and_footer(
+    def test_schedule_default_marks_stale_with_marker_and_footer(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # Apply with one schedule, then mutate config to a new
         # schedule. Default mode is pending-first, so the cell shows
-        # the pending (config) value with `*` flagging the applied
+        # the pending (config) value with `^` flagging the applied
         # value differs; footer prints.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
@@ -8389,11 +8290,11 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 09:00 *" in out
+        assert "*-*-* 09:00^" in out
         assert "stale" in out
         assert "crony apply" in out
 
-    def test_config_current_shows_applied_with_asterisk_on_diverge(
+    def test_config_current_shows_applied_with_marker_on_diverge(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # `*` is a pure divergence indicator -- it shows whenever
@@ -8423,10 +8324,10 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 03:00 *" in out
+        assert "*-*-* 03:00^" in out
         assert "*-*-* 09:00" not in out
 
-    def test_config_pending_shows_config_with_asterisk_on_diverge(
+    def test_config_pending_shows_config_with_marker_on_diverge(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -8450,7 +8351,7 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 09:00 *" in out
+        assert "*-*-* 09:00^" in out
         assert "*-*-* 03:00" not in out
 
     def test_config_current_and_pending_mutually_exclusive(
@@ -12560,6 +12461,36 @@ class TestStatusRenameUuidModel:
         for line in out.splitlines():
             if h.full("u-oss") in line:
                 assert "daily" in line
+
+    def test_rename_flags_name_and_unit_name(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Every diverging dual-source column carries the `^` marker
+        # (no leading space). On a rename the identity and unit-name
+        # diverge (config vs applied name); the uuid never does.
+        _h, group_uuid, _member_uuid = self._renamed_config(
+            tmp_path, monkeypatch
+        )
+        crony.do_status(
+            jobs=[],
+            cols="job-or-uuid,uuid,unit-name",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        grp = next(
+            line for line in out.splitlines() if "default.u-bins" in line
+        )
+        # Identity shows the config name, flagged; unit-name shows the
+        # label apply would render, flagged.
+        assert "default.u-bins^" in grp
+        assert "org.crony.default.u-bins^" in grp
+        # The uuid column (stable identity) is never flagged.
+        assert f"{group_uuid}^" not in out
+        assert "stale" in out  # footer printed
 
 
 if __name__ == "__main__":

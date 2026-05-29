@@ -7602,8 +7602,6 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "last-ran": "LAST RAN",
     "masked-by": "MASKED BY",
     "unit-name": "UNIT NAME",
-    "unit-schedule": "UNIT SCHEDULE",
-    "pending-schedule": "PENDING SCHEDULE",
     "uuid": "UUID",
     "unit-config": "UNIT CONFIG",
 }
@@ -7631,29 +7629,33 @@ Columns
   groups            Comma-separated full names of groups containing this
                     entry. Same source rules as `schedule`: default and
                     --config-pending show the pending membership,
-                    --config-current the applied one, starred when the
-                    two diverge. Empty when the entry isn't a member of
-                    any group.
+                    --config-current the applied one, flagged with `^`
+                    when the two diverge. Empty when the entry isn't a
+                    member of any group.
   job               Full namespaced name `<bundle>.<short>`. Opt-in. Always
                     the name, even for a row whose name collides with another
-                    entry's (so you can see what the name was). Empty for a
-                    broken entry with no recoverable name.
+                    entry's (so you can see what the name was). Flagged with
+                    `^` when the config and applied names differ (a not-yet-
+                    applied rename). Empty for a broken entry with no
+                    recoverable name.
   job-or-uuid       Identity column shown by default. The full namespaced
                     name when it unambiguously identifies the row; the
                     `<bundle>:<UUID>` form when the row has no recoverable
                     name (a corrupt snapshot) or its name is shadowed by a
-                    collision -- so the cell is always pasteable into
-                    `crony destroy` / `crony logs`. A rename (same uuid,
-                    new config name) is one row, shown under its config
-                    name by default / --config-pending and its applied
-                    name under --config-current. Rows in an active target's
+                    collision -- so the cell is (modulo a trailing `^`)
+                    pasteable into `crony destroy` / `crony logs`. A rename
+                    (same uuid, new config name) is one row, shown under its
+                    config name by default / --config-pending and its applied
+                    name under --config-current, flagged with `^` since the
+                    two names differ. Rows in an active target's
                     dispatch tree are indented two spaces per group-nesting
                     level and ordered by the target / group `jobs` lists
                     (execution order). Off-tree rows (orphans, names not in
                     any active target) follow below, unindented, sorted.
-  kind              "job" or "group". Falls back to the snapshot's recorded
-                    kind for rows whose live config no longer
-                    defines the entry.
+  kind              "job" or "group". Source-selected; flagged with `^` on
+                    the rare divergence (a uuid redefined from one kind to
+                    the other). Falls back to the snapshot's recorded kind
+                    for rows whose live config no longer defines the entry.
   last              Last-run outcome: ok | fail | timeout | gated | canceled
                     | running | pending | never | unknown.
   last-ran          Compact relative time of the last run, e.g. "5m ago".
@@ -7672,15 +7674,12 @@ Columns
                     whose every direct child is itself masked on
                     this host -- the reference is a no-op here,
                     so the group is masked too.
-  pending-schedule  The schedule from the live config, with no asterisk
-                    and no fallback to applied. Empty when the entry is
-                    not in any bundle.
   schedule          Default mode shows the pending (config) schedule. When
                     the applied schedule differs, the cell carries a
-                    trailing "*" and a footer prints below the table
-                    pointing at `crony apply`. --config-current shows the
-                    applied schedule, --config-pending the pending one;
-                    the "*" fires on any divergence regardless of mode.
+                    trailing `^` (no space) and a footer prints below the
+                    table pointing at `crony apply`. --config-current shows
+                    the applied schedule, --config-pending the pending one;
+                    the `^` fires on any divergence regardless of mode.
                     When the unit is disabled at the platform scheduler
                     the cell renders as `disabled` -- the cron expression
                     is misleading there since the unit won't fire. Add the
@@ -7694,11 +7693,12 @@ Columns
                     scheduler doesn't see a unit by this name.
   unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
                     `crony-<name>.timer` (scheduled) or
-                    `crony-<name>.service` (grouped) on Linux. Empty when
-                    neither config nor snapshot describes the entry.
-  unit-schedule     The applied schedule from the on-disk snapshot, with
-                    no asterisk and no fallback to pending. Empty when
-                    no snapshot exists or it predates the schedule field.
+                    `crony-<name>.service` (grouped) on Linux. Source-
+                    selected like `schedule`; flagged with `^` when the
+                    config and applied labels differ -- a not-yet-applied
+                    rename, or (on Linux) a schedule gained/lost that
+                    flips `.timer` <-> `.service`. Empty when neither
+                    config nor snapshot describes the entry.
   uuid              The entry's stable identity in `<bundle>:<UUID>` form
                     (directly pasteable into `crony destroy` / `crony logs`).
                     Sourced from the live config when the entry is still
@@ -7945,10 +7945,15 @@ def _unit_name_for(
     )
 
 
+# Trailing flag on a status cell whose pending and current values
+# diverge. `^` (not `*`) so it can't be mistaken for a schedule
+# wildcard (`*-*-* 02:00`); appended with no separating space.
+_DIVERGENCE_MARKER: str = "^"
+
 _STALE_VALUE_FOOTER: str = (
-    "* -- One or more starred cells are stale: the pending config "
-    "value (shown by default) differs from the applied one. Use "
-    "--config-current to see the applied value, or run "
+    f"{_DIVERGENCE_MARKER} -- One or more flagged cells are stale: the "
+    "pending config value (shown by default) differs from the applied "
+    "one. Use --config-current to see the applied value, or run "
     "`crony apply` to bring the applied value in sync."
 )
 
@@ -8015,7 +8020,7 @@ def _build_config_group_membership(
 
 
 def _diverged(pending: object, current: object) -> bool:
-    """`*`-annotation predicate: the entity exists in both graphs
+    """`^`-annotation predicate: the entity exists in both graphs
     AND the values disagree on this field. The annotation never
     depends on the display mode -- it just signals "the other view
     of this cell says something different."
@@ -8034,7 +8039,7 @@ def _select_sourced(
     Both values are read by uuid by the caller, so a rename (new name
     in pending, old name in current, same uuid) compares the right
     pair. `is_stale` fires only when both sides have a value and they
-    disagree -- a `*` marker meaning "the other view differs."
+    disagree -- a `^` marker meaning "the other view differs."
 
     Source selection:
       default           pending value, else current (pending-first).
@@ -8097,9 +8102,10 @@ def do_status(
     `--all` lists every defined entry, including ones masked on
     the current host (target-unused or excluded by the entry's
     `platforms` / `hosts` filters). `--config-current` and
-    `--config-pending` force the SCHEDULE and GROUPS columns to a
-    single source and suppress the stale-marker asterisk; the two
-    flags are mutually exclusive.
+    `--config-pending` force every dual-source column (name, kind,
+    schedule, groups, unit-name) to a single source; the `^`
+    divergence flag still fires whenever the two sources differ. The
+    two flags are mutually exclusive.
 
     `--exclude-healthy` drops rows where CONFIG is `synced`,
     UNIT is `enabled` (or `grouped` -- anything that fires), and
@@ -8237,6 +8243,19 @@ def do_status(
 
     def _build_row(ref: EntityRef | None, candidates: list[str]) -> None:
         nonlocal any_stale
+
+        def _mark(pending_val: str | None, current_val: str | None) -> str:
+            # A dual-source cell: pick the active source's value and
+            # append the divergence flag when the two sides differ.
+            value, diverged = _select_sourced(
+                pending_val, current_val, config_source
+            )
+            if diverged:
+                nonlocal any_stale
+                any_stale = True
+                value = f"{value}{_DIVERGENCE_MARKER}"
+            return value
+
         pending_node: Job | JobGroup | None = (
             config.pending.jobs.get(ref) or config.pending.groups.get(ref)
             if ref is not None
@@ -8278,9 +8297,22 @@ def do_status(
         # identity column; its plain name belongs to another entity.
         is_refform = ref is not None and ref in refform_refs
 
-        if pending_node is not None or current_node is not None:
-            node = pending_node or current_node
-            kind = "group" if isinstance(node, JobGroup) else "job"
+        pkind = (
+            "group"
+            if isinstance(pending_node, JobGroup)
+            else "job"
+            if pending_node is not None
+            else None
+        )
+        ckind = (
+            "group"
+            if isinstance(current_node, JobGroup)
+            else "job"
+            if current_node is not None
+            else None
+        )
+        if pkind is not None or ckind is not None:
+            kind = _mark(pkind, ckind)
         elif isinstance(entry, TomlJobGroup):
             kind = "group"
         elif entry is not None:
@@ -8312,26 +8344,19 @@ def do_status(
             if current_node is not None
             else None
         )
-        sched_cell, sched_stale = _select_sourced(
-            pending_sched, current_sched, config_source
-        )
         if config_source != "pending" and unit_state == "disabled":
             # A disabled timer won't fire on its schedule, so the cron
-            # expression is misleading -- show the runtime fact. Drop
-            # the stale marker: the cell is no longer the schedule it
-            # would compare against.
+            # expression is misleading -- show the runtime fact, with no
+            # divergence flag (the cell is no longer the schedule it
+            # would compare against).
             sched_cell = "disabled"
-            sched_stale = False
-        if sched_stale:
-            any_stale = True
-            sched_cell = f"{sched_cell} *"
-        unit_sched_cell = current_sched or ""
-        pending_sched_cell = pending_sched or ""
+        else:
+            sched_cell = _mark(pending_sched, current_sched)
 
         # A node present in a graph has a well-defined membership even
         # when it belongs to no group -- that empty value ("") still
-        # diverges from a non-empty one, so `*` fires. Only an entity
-        # absent from the graph entirely reads as None (no view).
+        # diverges from a non-empty one, so the flag fires. Only an
+        # entity absent from the graph entirely reads as None (no view).
         pending_members = pending_groups.get(ref, []) if ref is not None else []
         current_members = current_groups.get(ref, []) if ref is not None else []
         pending_groups_str: str | None = (
@@ -8347,19 +8372,36 @@ def do_status(
             cfg_members = config_groups.get(config_name, [])
             pending_groups_str = ",".join(cfg_members) if cfg_members else None
             current_groups_str = None
-        groups_cell, groups_stale = _select_sourced(
-            pending_groups_str, current_groups_str, config_source
-        )
-        if groups_stale:
-            any_stale = True
-            groups_cell = f"{groups_cell} *"
+        groups_cell = _mark(pending_groups_str, current_groups_str)
 
+        # The displayed name always falls back to the other source so
+        # identity never renders blank; the flag fires when the config
+        # and applied names diverge (a not-yet-applied rename).
         display_name = (
             _select_name(pending_name, current_name, config_source) or fallback
         )
-        unit_name = _unit_name_for(
-            current_name or config_name, entry, platform, config
+        if _diverged(pending_name, current_name):
+            any_stale = True
+            display_name = f"{display_name}{_DIVERGENCE_MARKER}"
+        # UNIT NAME is the platform label of the source-selected name,
+        # flagged when the two names give different labels.
+        pending_unit = (
+            _unit_name_for(pending_name, entry, platform, config)
+            if pending_name is not None
+            else None
         )
+        current_unit = (
+            _unit_name_for(current_name, None, platform, config)
+            if current_name is not None
+            else None
+        )
+        if config_source == "current":
+            unit_name = current_unit or pending_unit or ""
+        else:
+            unit_name = pending_unit or current_unit or ""
+        if _diverged(pending_unit, current_unit):
+            any_stale = True
+            unit_name = f"{unit_name}{_DIVERGENCE_MARKER}"
         if is_refform:
             row_ref: EntityRef | None = ref
             job_cell = (config.name_for(ref) or "") if ref is not None else ""
@@ -8388,8 +8430,6 @@ def do_status(
                     "last-ran": last_ran,
                     "masked-by": mask_reason,
                     "unit-name": unit_name,
-                    "unit-schedule": unit_sched_cell,
-                    "pending-schedule": pending_sched_cell,
                     "uuid": uuid_cell,
                     "unit-config": unit_config_cell,
                 },
@@ -8475,11 +8515,18 @@ def do_status(
     for row in rows:
         line = sep.join(f"{row[c]:<{widths[c]}}" for c in selected_cols)
         print(line.rstrip())
-    # The footer applies to any starred cell. Suppress when the
-    # user picked a column set that hides the columns that can
-    # carry the marker.
-    starred_cols = {"schedule", "groups"}
-    if any_stale and any(c in selected_cols for c in starred_cols):
+    # The footer applies to any flagged cell. Suppress when the user
+    # picked a column set that hides every column that can carry the
+    # divergence marker.
+    flaggable_cols = {
+        "job",
+        "job-or-uuid",
+        "kind",
+        "schedule",
+        "groups",
+        "unit-name",
+    }
+    if any_stale and any(c in selected_cols for c in flaggable_cols):
         print()
         print(_STALE_VALUE_FOOTER)
 
@@ -9460,16 +9507,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-current",
         action="store_true",
         help=(
-            "SCHEDULE and GROUPS columns show only currently-"
-            "active (applied) values (no asterisk on divergence)"
+            "dual-source columns (name, schedule, groups, ...) show "
+            "the currently-active (applied) value; `^` still flags "
+            "divergence from the pending config"
         ),
     )
     p_status.add_argument(
         "--config-pending",
         action="store_true",
         help=(
-            "SCHEDULE and GROUPS columns show only pending values "
-            "from the live config (no asterisk on divergence)"
+            "dual-source columns (name, schedule, groups, ...) show "
+            "the pending value from the live config; `^` still flags "
+            "divergence from the applied state"
         ),
     )
     p_status.add_argument(
