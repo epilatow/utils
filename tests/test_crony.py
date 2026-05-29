@@ -6129,7 +6129,7 @@ class TestEnableDisable:
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
-        with pytest.raises(crony.UsageError, match="not stamped"):
+        with pytest.raises(crony.UsageError, match="not runnable here"):
             crony.do_trigger(
                 jobs=["ghost"], wait=False, trigger_timeout=None, bundle=None
             )
@@ -6243,14 +6243,13 @@ class TestEnableDisable:
                 jobs=["j"], wait=False, trigger_timeout=10, bundle=None
             )
 
-    def test_trigger_targets_current_uuid_when_pending_diverges(
+    def test_trigger_rejects_ambiguous_uuid_swap(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # The installed unit's argv carries the *current* (most-
-        # recently-applied) uuid; a uuid edit in TOML before
-        # re-apply makes `pending.by_full_name` point at a fresh
-        # ref. `do_trigger` must resolve via current so the user-
-        # trigger flag lands in the dir the runner actually reads.
+        # A uuid edit is a new entity, not a rename: the name `j` now
+        # addresses one uuid on disk (the applied unit) and a different
+        # uuid in config. That's ambiguous, so `do_trigger` refuses and
+        # points at `crony apply` rather than guessing a target.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         cfg = h.config(
             {
@@ -6281,22 +6280,152 @@ class TestEnableDisable:
             },
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(
-            crony.subprocess,
-            "run",
-            lambda *a, **kw: subprocess.CompletedProcess(a, 0),
+        with pytest.raises(crony.UsageError, match="crony apply"):
+            crony.do_trigger(
+                jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+            )
+
+    def _rename_keeping_uuid(
+        self, h: "_ApplyHarness", old: str, new: str
+    ) -> str:
+        """Apply a scheduled job `old`, then rewrite config renaming it
+        to `new` (same uuid) without re-applying. Returns the uuid.
+        """
+        cfg = h.config(
+            {"job": {old: {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=[old],
         )
+        h.apply(old)
+        job_uuid: str = cfg.jobs[old].uuid
+        h.config(
+            {
+                "job": {
+                    new: {
+                        "uuid": job_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=[new],
+        )
+        return job_uuid
+
+    def test_trigger_renamed_entry_by_new_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A rename keeps the uuid; triggering by the new config name
+        # before re-apply fires the installed unit (still under the old
+        # name) and flags the uuid-keyed state dir.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        job_uuid = self._rename_keeping_uuid(h, "j", "k")
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / job_uuid
+        h.calls.clear()
         crony.do_trigger(
-            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+            jobs=["k"], wait=False, trigger_timeout=None, bundle=None
         )
-        # Flag landed in the current (installed) state dir.
-        assert (current_sd / "user-trigger.flag").exists()
-        pending_sd = (
-            h.state
-            / crony.DEFAULT_BUNDLE_NAME
-            / "22222222-2222-2222-2222-222222222222"
+        assert (sd / "user-trigger.flag").exists()
+        kick = next(
+            c for c in h.calls if c[0] == "launchctl" and c[1] == "kickstart"
         )
-        assert not (pending_sd / "user-trigger.flag").exists()
+        assert any("org.crony.default.j" in part for part in kick)
+        assert not any("org.crony.default.k" in part for part in kick)
+
+    def test_enable_renamed_entry_by_new_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # enable by the new name acts on the installed (old-name) unit.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        self._rename_keeping_uuid(h, "j", "k")
+        h.calls.clear()
+        crony.do_enable(jobs=["k"], bundle=None)
+        enable = next(
+            c for c in h.calls if c[0] == "launchctl" and c[1] == "enable"
+        )
+        assert any("org.crony.default.j" in part for part in enable)
+
+    def test_disable_renamed_entry_by_new_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # disable by the new name acts on the installed (old-name) unit.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        self._rename_keeping_uuid(h, "j", "k")
+        h.calls.clear()
+        crony.do_disable(jobs=["k"], bundle=None)
+        disable = next(
+            c for c in h.calls if c[0] == "launchctl" and c[1] == "disable"
+        )
+        assert any("org.crony.default.j" in part for part in disable)
+
+    def test_destroy_renamed_entry_by_new_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # destroy by the new name removes the installed (old-name) unit
+        # and wipes the shared uuid state dir.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        job_uuid = self._rename_keeping_uuid(h, "j", "k")
+        sd = h.state / crony.DEFAULT_BUNDLE_NAME / job_uuid
+        old_plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert old_plist.exists()
+        assert sd.exists()
+        crony.do_destroy(jobs=["k"], bundle=None, orphans=False)
+        assert not old_plist.exists()
+        assert not sd.exists()
+
+    def test_destroy_rejects_ambiguous_uuid_swap(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A uuid edit (same name, new uuid) is an identity change, not
+        # a rename: `j` addresses one uuid on disk and another in
+        # config, so destroy refuses rather than guessing which to wipe.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "uuid": "22222222-2222-2222-2222-222222222222",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(crony.UsageError, match="crony apply"):
+            crony.do_destroy(jobs=["j"], bundle=None, orphans=False)
+
+    def test_trigger_refuses_unit_only_entry(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A unit-only remnant (platform unit on disk, no parseable
+        # snapshot) is not runnable: trigger must refuse rather than
+        # fire a unit whose snapshot can't load.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # Drop the snapshot, leaving only the platform unit -> unit_only.
+        sd = h.state_dir("j", ensure_snapshot=False)
+        (sd / "snapshot.json").unlink()
+        with pytest.raises(crony.UsageError, match="crony apply"):
+            crony.do_trigger(
+                jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+            )
 
     def test_trigger_works_on_schedule_less_job(
         self, tmp_path: Path, monkeypatch: Any
@@ -10637,11 +10766,12 @@ class TestStatusExcludeHealthy:
 
 class TestResolveMethods:
     """The three named resolvers encode the operation's intent at
-    the call site: `resolve_runnable` for trigger (current only),
-    `resolve_current` for destroy (current + broken),
-    `resolve_pending` for apply / pending-side displays. Callers
-    that want a broader lookup compose explicitly so the chain
-    direction is visible at the call site instead of baked in.
+    the call site: `resolve_runnable` for the current-only snapshot
+    lookup behind the UNIT NAME guess, `resolve_current` for destroy
+    (current + broken), `resolve_pending` for apply / pending-side
+    displays. Callers that want a broader lookup compose explicitly
+    so the chain direction is visible at the call site instead of
+    baked in.
     """
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:

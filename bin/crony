@@ -3179,15 +3179,17 @@ class Config:
         return None
 
     def resolve_runnable(self, full_name: str) -> EntityRef | None:
-        """An entry that can be triggered: snapshot parseable and
-        the platform unit installable. Source: `current` only.
+        """A name with a parseable current snapshot. Source:
+        `current` only, keyed by name.
 
-        Broken / unit-only / pending-only entries are not
-        runnable -- triggering them would fire a unit whose
-        snapshot can't load, or whose unit file isn't on disk,
-        or that was never applied at all. `crony trigger`
-        checks this method first and refuses with a clear
-        `run apply` message when it returns None.
+        Broken / unit-only / pending-only entries are absent from
+        `current` and return None. `_snapshot_says_scheduled` uses
+        this to read the applied schedule shape when guessing the
+        UNIT NAME for an entry whose live config no longer describes
+        it. Action commands gate on the resolved uuid's presence in
+        the relevant graph (see `_resolve_action_targets`) rather
+        than going through this name-keyed lookup, so a rename
+        addressed by its new name still resolves.
 
         `<bundle>:<UUID>` ref-form inputs are honored only when
         the addressed entry is in `current` -- a ref-form
@@ -7047,7 +7049,11 @@ def do_destroy(
     if a name is in neither any bundle's config nor the
     discovered set; refuses if a name's run.lock is currently
     held. Under `--bundle`, bare names resolve in that bundle and
-    qualified names must match it.
+    qualified names must match it. A rename (same uuid, new config
+    name) is removable by either name -- resolution is by uuid, so
+    the installed unit and the shared state dir are cleaned up; a
+    name mapping to different uuids in config vs on disk is rejected
+    until `crony apply`.
 
     Also accepts the `<bundle>:<UUID>` input form
     so an operator can copy the JOB cell from a status row for
@@ -7115,28 +7121,34 @@ def do_destroy(
             key=lambda r: (r.bundle, r.uuid),
         )
 
+    explicit = bool(jobs)
     for full in full_names_to_destroy:
-        # The state dir to wipe is the one the installed unit's
-        # argv already addresses: the *current* (most-recently-
-        # applied) uuid. `resolve_current` consults `current`
-        # first, then `broken`; no `pending` fallback because a
-        # pending-only entry has nothing on disk to wipe. A
-        # ref-form input whose state dir exists but holds no
-        # snapshot is accepted by the upstream validation and
-        # lands here as `direct_ref` -- use it directly since
-        # neither Config source knows about it.
+        # The state dir to wipe is the one the installed unit's argv
+        # addresses: the *current* (most-recently-applied) uuid. For an
+        # explicit `destroy <name>`, resolve by uuid so a rename
+        # addressed by its new name still wipes the right entity (and a
+        # name-swap raises rather than guessing). The `--orphans` /
+        # factory-reset path iterates installed (current) names, so it
+        # stays current-only -- a pending fallback there could resolve
+        # an old-name remnant to a uuid still live under its new name
+        # and wipe shared state. A `<bundle>:<UUID>` input lands as
+        # `direct_ref` and is used directly.
         direct_ref = EntityRef.from_str(full)
-        ref = config.resolve_current(full) or direct_ref
+        if explicit:
+            ref = _resolve_addressable(config, full)
+        else:
+            ref = config.resolve_current(full) or direct_ref
         sd = _entity_state_dir(ref) if ref is not None else None
-        # Recover the entity's actual name for platform unit
-        # cleanup: a `<bundle>:<UUID>` input doesn't carry the
-        # namespaced name the unit file is keyed by, so destroy_one
-        # would leak the unit. The loaded model already recovered
-        # it (`name_for`); None when the snapshot was unparseable
-        # or absent, in which case the platform unit cleanup is
-        # dropped (no name -> no path to construct).
+        # Recover the entity's actual name for platform unit cleanup:
+        # the unit file is keyed by the installed (current) name, which
+        # a `<bundle>:<UUID>` input or a renamed entry's new name
+        # doesn't carry. `name_for` recovers it (current-first); None
+        # when the snapshot was unparseable or absent, in which case
+        # the platform unit cleanup is dropped (no name -> no path).
         if direct_ref is not None:
             name_for_cleanup: str | None = config.name_for(direct_ref)
+        elif explicit and ref is not None:
+            name_for_cleanup = config.name_for(ref) or full
         else:
             name_for_cleanup = full
         # Refuse if a run is in progress; a partial destroy would
@@ -7184,7 +7196,10 @@ def _applied_schedule_state(config: Config, full: str) -> str:
     neither schedule nor interval (a grouped entry). `scheduled`
     has a schedule or interval.
     """
-    ref = config.current.by_full_name.get(full)
+    # Resolve by uuid (current-first, pending-fallback) so a renamed-
+    # but-not-applied entry addressed by its new name still reads its
+    # applied snapshot at the unchanged uuid.
+    ref = config.resolve_current(full) or config.resolve_pending(full)
     if ref is None:
         return "unresolved"
     snap: Job | JobGroup | None = config.current.jobs.get(
@@ -7195,6 +7210,84 @@ def _applied_schedule_state(config: Config, full: str) -> str:
     if snap.schedule is None and snap.interval is None:
         return "unscheduled"
     return "scheduled"
+
+
+def _installed_refs(config: Config) -> set[EntityRef]:
+    """The uuids with on-disk presence (a current snapshot, a broken
+    snapshot, or a leftover platform unit) -- the set an action
+    command can act on. Excludes pending-only entries (never applied).
+    """
+    return config.current.refs() | set(config.broken) | set(config.unit_only)
+
+
+def _resolve_addressable(config: Config, full: str) -> EntityRef | None:
+    """Resolve a user-supplied name to the single uuid it addresses
+    for an action command (enable / disable / trigger / destroy).
+
+    A rename keeps the uuid, so a not-yet-applied new name resolves to
+    the same uuid as its installed old name; either is accepted.
+    Raises `UsageError` when the name maps to different uuids in the
+    pending and current graphs -- an unreconciled name swap that can't
+    be disambiguated until `crony apply`. Returns None when neither
+    graph knows the name (and it isn't a `<bundle>:<UUID>` address).
+    """
+    direct = EntityRef.from_str(full)
+    if direct is not None:
+        return direct
+    pending_ref = config.resolve_pending(full)
+    current_ref = config.resolve_current(full)
+    if (
+        pending_ref is not None
+        and current_ref is not None
+        and pending_ref != current_ref
+    ):
+        raise UsageError(
+            f"{full!r} addresses {current_ref} on disk but {pending_ref} "
+            f"in config; run `crony apply` to reconcile before addressing "
+            f"it by name"
+        )
+    return current_ref or pending_ref
+
+
+def _resolve_action_targets(
+    config: Config, names: list[str], *, runnable_only: bool = False
+) -> list[tuple[str, EntityRef, str]]:
+    """Map normalized names to `(input, ref, unit-name)` targets for an
+    action command, rejecting any that can't be acted on here.
+
+    Accepts a renamed entry by its new name (the uuid is stable) and
+    errors on an ambiguous name swap via `_resolve_addressable`. The
+    unit name is the entity's applied (current) name -- the label the
+    installed platform unit actually carries -- so the action targets
+    the unit that exists, while the uuid pins the state dir.
+
+    `runnable_only` narrows the acceptable set to entities with a
+    parseable current snapshot (`current.refs()`) -- the gate `trigger`
+    needs, since firing a broken or unit-only entry would launch a unit
+    whose snapshot can't load. A rename's uuid is still in `current`
+    (under its old-name snapshot), so renames pass either way. Without
+    it, the set is every on-disk remnant (`_installed_refs`), matching
+    enable / disable, which act on the platform unit by name.
+    """
+    acceptable = (
+        config.current.refs() if runnable_only else _installed_refs(config)
+    )
+    targets: list[tuple[str, EntityRef, str]] = []
+    unknown: list[str] = []
+    for full in names:
+        ref = _resolve_addressable(config, full)
+        if ref is None or ref not in acceptable:
+            unknown.append(full)
+            continue
+        targets.append((full, ref, config.name_for(ref) or full))
+    if unknown:
+        hint = (
+            "not runnable here (apply may be stale)"
+            if runnable_only
+            else "not stamped on this host"
+        )
+        raise UsageError(f"{hint}: {sorted(unknown)} (run `crony apply` first)")
+    return targets
 
 
 def _resolve_bulk_names(
@@ -7249,9 +7342,11 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     """Move the platform scheduler into `enabled` for the named jobs.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
-    shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first) and entries with no schedule (no
-    platform timer to enable / disable).
+    shorthand for `default.<short>`. A rename (same uuid, new config
+    name) is addressable by either name; a name mapping to different
+    uuids in config vs on disk is rejected until `crony apply`.
+    Refuses names not stamped on this host and ones with no
+    schedule (no platform timer to enable / disable).
 
     With `--bundle <name>` and no positional args, enables every
     scheduled stamped entry in `<name>` (unscheduled entries in
@@ -7265,15 +7360,10 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
     )
-    unknown = [n for n in normalized if n not in installed]
-    if unknown:
-        raise UsageError(
-            f"not stamped on this host: {sorted(unknown)} "
-            f"(run `crony apply` first)"
-        )
+    targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "enable")
-    for full in normalized:
-        _enable_unit(full, config.platform)
+    for full, _ref, unit_name in targets:
+        _enable_unit(unit_name, config.platform)
         logger.info("%s: enabled", full)
 
 
@@ -7281,9 +7371,11 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     """Move the platform scheduler into `disabled` for the named jobs.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
-    shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first) and entries with no schedule (no
-    platform timer to enable / disable).
+    shorthand for `default.<short>`. A rename (same uuid, new config
+    name) is addressable by either name; a name mapping to different
+    uuids in config vs on disk is rejected until `crony apply`.
+    Refuses names not stamped on this host and ones with no
+    schedule (no platform timer to enable / disable).
 
     With `--bundle <name>` and no positional args, disables every
     scheduled stamped entry in `<name>` (unscheduled entries in
@@ -7297,15 +7389,10 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
     )
-    unknown = [n for n in normalized if n not in installed]
-    if unknown:
-        raise UsageError(
-            f"not stamped on this host: {sorted(unknown)} "
-            f"(run `crony apply` first)"
-        )
+    targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "disable")
-    for full in normalized:
-        _disable_unit(full, config.platform)
+    for full, _ref, unit_name in targets:
+        _disable_unit(unit_name, config.platform)
         logger.info("%s: disabled", full)
 
 
@@ -7362,8 +7449,10 @@ def do_trigger(
     default 15s "trigger never produced a run" deadline.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
-    shorthand for `default.<short>`. Refuses names not stamped on
-    this host (run apply first).
+    shorthand for `default.<short>`. A rename (same uuid, new config
+    name) is addressable by either name; a name mapping to different
+    uuids in config vs on disk is rejected until `crony apply`.
+    Refuses names not stamped on this host (run apply first).
 
     With `--bundle <name>` and no positional args, triggers every
     stamped entry in `<name>` (including schedule-less ones, since
@@ -7383,34 +7472,18 @@ def do_trigger(
     normalized = _resolve_bulk_names(
         jobs, bundle, stamped, config, scheduled_only=False
     )
-    unknown = [n for n in normalized if n not in stamped]
-    if unknown:
-        raise UsageError(
-            f"not stamped on this host: {sorted(unknown)} "
-            f"(run `crony apply` first)"
-        )
+    targets = _resolve_action_targets(config, normalized, runnable_only=True)
     platform = current_platform()
 
-    def _state_dir_for_full(full: str) -> Path:
-        # Trigger requires a runnable entity: the installed unit's
-        # argv addresses the *current* uuid, so the user-trigger
-        # flag and the wait-watcher must too. `resolve_runnable`
-        # encodes that semantic (current only -- broken / unit-
-        # only / pending-only entries can't sensibly be triggered).
-        ref = config.resolve_runnable(full)
-        if ref is None:
-            raise UsageError(
-                f"no resolvable entity for {full!r} (apply may be stale)"
-            )
-        return _entity_state_dir(ref)
-
     if not wait:
-        for full in normalized:
+        for full, ref, unit_name in targets:
+            # Fire the unit under its installed (current) name; the
+            # user-trigger flag lands in the uuid-keyed state dir.
             _trigger_unit(
-                full,
+                unit_name,
                 platform,
                 triggered_by_user=True,
-                state_dir=_state_dir_for_full(full),
+                state_dir=_entity_state_dir(ref),
             )
             logger.info("%s: triggered", full)
         return
@@ -7419,7 +7492,7 @@ def do_trigger(
     # name's bundle; bundles can disagree about defaults so we look
     # up trigger_timeout_sec per-bundle too.
     worst_rc = 0
-    for full in normalized:
+    for full, ref, unit_name in targets:
         bn, short = parse_full_name(full)
         b = bundles.by_name(bn)
         if b is None:
@@ -7454,8 +7527,8 @@ def do_trigger(
             else float(b.config.defaults.trigger_timeout_sec)
         )
         rec = _trigger_unit_sync(
-            full,
-            state_dir=_state_dir_for_full(full),
+            unit_name,
+            state_dir=_entity_state_dir(ref),
             job_timeout=timeout,
             trigger_timeout=tt,
             triggered_by_user=True,
