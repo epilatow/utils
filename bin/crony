@@ -7712,6 +7712,15 @@ Columns
 Aliases
 -------
 {aliases_block}
+
+Color
+-----
+  When stdout is a TTY (and NO_COLOR is unset), broken / failed states
+  are red -- CONFIG `missing` / `error` / `broken` / `orphan` and LAST
+  `fail` / `timeout` / `canceled` -- and reconcilable drift is yellow --
+  a `stale` CONFIG verdict and any cell carrying the `^` divergence
+  marker (the `^` itself stays uncolored). Redirected or piped output
+  is always plain.
 """
 
 
@@ -7957,6 +7966,73 @@ _STALE_VALUE_FOOTER: str = (
     "`crony apply` to bring the applied value in sync."
 )
 
+# ANSI color for the status table, emitted only when stdout is a TTY
+# and NO_COLOR is unset (https://no-color.org/). Red flags a broken or
+# failed state; yellow flags drift the operator can reconcile with
+# `crony apply` (a `stale` config verdict, or any divergence-flagged
+# cell). The `^` marker itself is never colored.
+_ANSI_RED: str = "\033[31m"
+_ANSI_YELLOW: str = "\033[33m"
+_ANSI_RESET: str = "\033[0m"
+
+# CONFIG values worth a red flag. `last` is folded so `signal` never
+# reaches the cell (it renders as `fail`); `timeout` / `canceled` are
+# the other non-clean terminal outcomes.
+_STATUS_RED_CONFIG: frozenset[str] = frozenset(
+    {"missing", "error", "broken", "orphan"}
+)
+_STATUS_RED_LAST: frozenset[str] = frozenset({"fail", "timeout", "canceled"})
+
+
+def _color_supported() -> bool:
+    """Return True if ANSI color escape sequences should be emitted.
+
+    Color is suppressed when NO_COLOR is set in the environment or
+    when stdout isn't a TTY -- redirecting to a file or piping into
+    another process should produce plain text.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def _status_value_color(col: str, value: str) -> str | None:
+    """ANSI code for a status cell by (column, value), or None.
+
+    Only the verdict columns carry a value-based color; the
+    divergence marker is handled separately by the renderer.
+    """
+    if col == "config":
+        if value in _STATUS_RED_CONFIG:
+            return _ANSI_RED
+        if value == "stale":
+            return _ANSI_YELLOW
+    elif col == "last" and value in _STATUS_RED_LAST:
+        return _ANSI_RED
+    return None
+
+
+def _render_status_cell(
+    col: str, value: str, width: int, use_color: bool
+) -> str:
+    """Render one status cell padded to `width`, optionally colored.
+
+    Width padding is computed from the visible text and kept outside
+    the color codes so zero-width escapes never throw off column
+    alignment. A divergence-flagged value (trailing `^`) is colored
+    yellow on the value only -- the `^` and the padding stay plain.
+    """
+    pad = " " * max(0, width - len(value))
+    if not use_color:
+        return value + pad
+    if value.endswith(_DIVERGENCE_MARKER):
+        body = value[: -len(_DIVERGENCE_MARKER)]
+        return f"{_ANSI_YELLOW}{body}{_ANSI_RESET}{_DIVERGENCE_MARKER}{pad}"
+    code = _status_value_color(col, value)
+    if code is None:
+        return value + pad
+    return f"{code}{value}{_ANSI_RESET}{pad}"
+
 
 def _build_group_membership(
     config: Config,
@@ -8113,6 +8189,10 @@ def do_status(
     unhealthy (it isn't firing), so it survives the filter.
     Output is flat (no tree indent). Always exits 0 -- this is a
     filter on the display, not a gate.
+
+    On a color-capable TTY (NO_COLOR unset) broken / failed verdicts
+    render red and reconcilable drift renders yellow; see the
+    `--help` epilog's Color section. Redirected output is plain.
     """
     if config_current and config_pending:
         raise UsageError(
@@ -8512,8 +8592,12 @@ def do_status(
         f"{_STATUS_COL_HEADERS[c]:<{widths[c]}}" for c in selected_cols
     )
     print(header_line.rstrip())
+    use_color = _color_supported()
     for row in rows:
-        line = sep.join(f"{row[c]:<{widths[c]}}" for c in selected_cols)
+        line = sep.join(
+            _render_status_cell(c, row[c], widths[c], use_color)
+            for c in selected_cols
+        )
         print(line.rstrip())
     # The footer applies to any flagged cell. Suppress when the user
     # picked a column set that hides every column that can carry the

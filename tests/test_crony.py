@@ -13,6 +13,7 @@ import argparse
 import dataclasses
 import importlib.machinery
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -12491,6 +12492,156 @@ class TestStatusRenameUuidModel:
         # The uuid column (stable identity) is never flagged.
         assert f"{group_uuid}^" not in out
         assert "stale" in out  # footer printed
+
+
+class TestStatusColor:
+    """The status table colors broken / failed states red and drift
+    (a `stale` verdict or a divergence-flagged cell) yellow, but only
+    when stdout is a color-capable TTY. The `^` marker stays uncolored.
+    """
+
+    R = crony._ANSI_RED
+    Y = crony._ANSI_YELLOW
+    X = crony._ANSI_RESET
+
+    def _force_color(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        monkeypatch.setattr(crony, "_color_supported", lambda: True)
+
+    def test_stale_and_divergence_are_yellow_missing_is_red(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # j: schedule edited (stale + divergence). k: new, never applied
+        # (missing).
+        h.config(
+            {
+                "job": {
+                    "j": {"command": "true", "schedule": "*-*-* 09:00"},
+                    "k": {"command": "true", "schedule": "*-*-* 05:00"},
+                }
+            },
+            default_target_jobs=["j", "k"],
+        )
+        self._force_color(monkeypatch)
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        # `stale` verdict -> yellow.
+        assert f"{self.Y}stale{self.X}" in out
+        # Divergence-flagged schedule -> yellow value, `^` left plain.
+        assert f"{self.Y}*-*-* 09:00{self.X}^" in out
+        # `missing` verdict -> red.
+        assert f"{self.R}missing{self.X}" in out
+
+    def test_last_fail_is_red(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        (h.state_dir("j", cfg=cfg) / "last-run.json").write_text(
+            '{"exit_class": "fail", '
+            '"started_at": "2020-01-01T00:00:00-08:00", '
+            '"host": "h", "platform": "darwin", '
+            '"ended_at": "2020-01-01T00:00:01-08:00", '
+            '"duration_sec": 1.0, "exit_code": 1, '
+            '"signal": null, "gate": "none", '
+            '"log_path": "/tmp/run.log", "log_bytes_this_run": 0}',
+            encoding="utf-8",
+        )
+        self._force_color(monkeypatch)
+        crony.do_status(
+            jobs=[],
+            cols="job,last",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert f"{self.R}fail{self.X}" in out
+
+    def test_orphan_is_red(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.fabricate_orphan("ghost")
+        h.config({}, default_target_jobs=[])
+        self._force_color(monkeypatch)
+        crony.do_status(
+            jobs=[],
+            cols="job,config",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert f"{self.R}orphan{self.X}" in out
+
+    def test_no_color_when_stdout_not_tty(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # capsys replaces stdout with a non-TTY buffer, so the default
+        # path emits no escape codes even for a stale row.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "stale" in out
+        assert "\033[" not in out
+
+    def test_color_supported_respects_no_color_and_tty(
+        self, monkeypatch: Any
+    ) -> None:
+        class _Tty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.setattr(crony.sys, "stdout", _Tty())
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert crony._color_supported() is True
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert crony._color_supported() is False
+        # Non-TTY stream never colors, regardless of NO_COLOR.
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(crony.sys, "stdout", io.StringIO())
+        assert crony._color_supported() is False
 
 
 if __name__ == "__main__":
