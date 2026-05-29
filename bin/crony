@@ -6120,11 +6120,16 @@ def _last_run_state(config: Config, full_name: str) -> str:
     never run -- new install, group-only job that's never been
     triggered, etc.
 
-    The lookup goes through `resolve_current` because runtime
-    state lives at the *current* uuid's state dir; a pending-
-    only entry has no runtime and resolves to "never".
+    Resolution is current-first, pending-fallback. Runtime is
+    uuid-keyed, and a rename keeps the uuid, so the run history
+    lives at the same state dir under the new name. The current
+    graph is keyed by the applied (old) name, so a not-yet-applied
+    rename misses there; the pending graph carries the new name at
+    the unchanged uuid and recovers the record. A genuinely new
+    pending-only entry resolves to a uuid with no state dir, so
+    `runtime.get` is None and it still reports "never".
     """
-    ref = config.resolve_current(full_name)
+    ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
         return "never"
     rt = config.runtime.get(ref)
@@ -6151,11 +6156,12 @@ def _last_ran_at(config: Config, full_name: str) -> str:
     """Return a compact "when did this last run" string for status.
 
     Returns "never" when there's no last-run record and "unknown"
-    when the recorded timestamp is unreadable. The lookup goes
-    through `resolve_current` because runtime state lives at the
-    *current* uuid; a pending-only entry has no runtime record.
+    when the recorded timestamp is unreadable. Resolution is
+    current-first, pending-fallback: runtime is uuid-keyed, so a
+    not-yet-applied rename (new name, unchanged uuid) is recovered
+    via the pending graph when the applied-name lookup misses.
     """
-    ref = config.resolve_current(full_name)
+    ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
         return "never"
     rt = config.runtime.get(ref)
@@ -7550,11 +7556,11 @@ Columns
                     if any, is left untouched and `crony apply`
                     refuses the name until the config is fixed.
   groups            Comma-separated full names of groups containing this
-                    entry. Same default-vs-pending rules as `schedule`:
-                    starred when the applied membership differs from the
-                    pending config; --config-current / --config-pending
-                    force a single source. Empty when the entry isn't a
-                    member of any group.
+                    entry. Same source rules as `schedule`: default and
+                    --config-pending show the pending membership,
+                    --config-current the applied one, starred when the
+                    two diverge. Empty when the entry isn't a member of
+                    any group.
   job               Full namespaced name `<bundle>.<short>`. Opt-in. Always
                     the name, even for a row whose name collides with another
                     entry's (so you can see what the name was). Empty for a
@@ -7564,7 +7570,10 @@ Columns
                     `<bundle>:<UUID>` form when the row has no recoverable
                     name (a corrupt snapshot) or its name is shadowed by a
                     collision -- so the cell is always pasteable into
-                    `crony destroy` / `crony logs`. Rows in an active target's
+                    `crony destroy` / `crony logs`. A rename (same uuid,
+                    new config name) is one row, shown under its config
+                    name by default / --config-pending and its applied
+                    name under --config-current. Rows in an active target's
                     dispatch tree are indented two spaces per group-nesting
                     level and ordered by the target / group `jobs` lists
                     (execution order). Off-tree rows (orphans, names not in
@@ -7593,14 +7602,15 @@ Columns
   pending-schedule  The schedule from the live config, with no asterisk
                     and no fallback to applied. Empty when the entry is
                     not in any bundle.
-  schedule          Default mode shows the applied (current) schedule. When
-                    the pending schedule differs, the cell carries a
+  schedule          Default mode shows the pending (config) schedule. When
+                    the applied schedule differs, the cell carries a
                     trailing "*" and a footer prints below the table
-                    pointing at `crony apply`. --config-current and
-                    --config-pending force a single source. When the
-                    unit is disabled at the platform scheduler the cell
-                    renders as `disabled` -- the cron expression is
-                    misleading there since the unit won't fire. Add the
+                    pointing at `crony apply`. --config-current shows the
+                    applied schedule, --config-pending the pending one;
+                    the "*" fires on any divergence regardless of mode.
+                    When the unit is disabled at the platform scheduler
+                    the cell renders as `disabled` -- the cron expression
+                    is misleading there since the unit won't fire. Add the
                     opt-in `unit` column to see the platform-scheduler
                     state for the rest of the rows. --config-pending
                     suppresses this override (the pending schedule is
@@ -7755,16 +7765,46 @@ def _resolve_state_axes(
         cfg_state = _config_axis(config, full, entry, bn)
     if mask_reason and cfg_state not in ("error", "broken"):
         cfg_state = "orphan" if full in remnants else "masked"
+    # Schedule shape and the installed-unit name come from the entity
+    # by uuid, not by `full`: a rename keeps the uuid, so the grouped
+    # check reads the graph node and the platform query targets the
+    # unit installed under the *current* (applied) name -- which may
+    # differ from `full` for a not-yet-applied rename.
+    ref = (
+        EntityRef(bn, entry.uuid)
+        if entry is not None
+        else config.resolve_current(full) or config.resolve_pending(full)
+    )
+    pending_node = (
+        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
+        if ref is not None
+        else None
+    )
+    current_node = (
+        config.current.jobs.get(ref) or config.current.groups.get(ref)
+        if ref is not None
+        else None
+    )
     if cfg_state == "missing":
         unit_state = "none"
     else:
-        schedule, interval = (
-            _entity_schedule(entry) if entry is not None else (None, None)
-        )
-        if entry is not None and schedule is None and interval is None:
+        sched_node = pending_node or current_node
+        if sched_node is not None:
+            grouped = (
+                sched_node.schedule is None and sched_node.interval is None
+            )
+        elif entry is not None:
+            es, ei = _entity_schedule(entry)
+            grouped = es is None and ei is None
+        else:
+            grouped = False
+        if grouped:
             unit_state = "grouped"
         else:
-            unit_state = _unit_state(full, platform)
+            installed_name = (
+                current_node.name if current_node is not None else full
+            )
+            unit_state = _unit_state(installed_name, platform)
     last_state = _last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
@@ -7833,58 +7873,46 @@ def _unit_name_for(
 
 
 _STALE_VALUE_FOOTER: str = (
-    "* -- One or more starred cells are stale: the currently "
-    "active value differs from the pending config. Use "
-    "--config-pending to see the pending value, or run "
-    "`crony apply` to bring the active value in sync."
+    "* -- One or more starred cells are stale: the pending config "
+    "value (shown by default) differs from the applied one. Use "
+    "--config-current to see the applied value, or run "
+    "`crony apply` to bring the applied value in sync."
 )
 
 
 def _build_group_membership(
     config: Config,
-) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+) -> tuple[dict[EntityRef, list[str]], dict[EntityRef, list[str]]]:
     """Reverse-index group membership from the pending and current
     graphs.
 
-    Returns `(pending, current)` where `<table>[<child_full>]` lists
+    Returns `(pending, current)` where `<table>[<child_ref>]` lists
     the full names of every group whose `children` list contains
-    the child in that graph. Each graph's `children` lists hold
-    uuids (the apply-time edge), so we resolve each uuid back to
-    its own graph's full name before keying the table. The two
+    the child in that graph. The `children` lists hold uuids (the
+    apply-time edge), so the table is keyed by the child's
+    `EntityRef` -- a rename leaves the uuid unchanged, so the row
+    still finds its membership regardless of which name it displays
+    under. The parent names come from the same graph, so the two
     sides diverge when a group has been edited but not re-applied.
     Each value list is sorted for stable display order.
     """
 
-    def _resolve(
-        graph: Graph, parent_bundle: str, child_uuid: str
-    ) -> str | None:
-        ref = EntityRef(parent_bundle, child_uuid)
-        child_j = graph.jobs.get(ref)
-        if child_j is not None:
-            return child_j.name
-        child_g = graph.groups.get(ref)
-        if child_g is not None:
-            return child_g.name
-        return None
-
-    pending: dict[str, list[str]] = {}
-    for parent in config.pending.groups.values():
-        for child_uuid in parent.children:
-            child_full = _resolve(config.pending, parent.bundle, child_uuid)
-            if child_full is None:
-                continue
-            pending.setdefault(child_full, []).append(parent.name)
-    current: dict[str, list[str]] = {}
-    for parent in config.current.groups.values():
-        for child_uuid in parent.children:
-            child_full = _resolve(config.current, parent.bundle, child_uuid)
-            if child_full is None:
-                continue
-            current.setdefault(child_full, []).append(parent.name)
-    for table in (pending, current):
+    def _membership(graph: Graph) -> dict[EntityRef, list[str]]:
+        table: dict[EntityRef, list[str]] = {}
+        for parent in graph.groups.values():
+            for child_uuid in parent.children:
+                child_ref = EntityRef(parent.bundle, child_uuid)
+                if (
+                    child_ref not in graph.jobs
+                    and child_ref not in graph.groups
+                ):
+                    continue
+                table.setdefault(child_ref, []).append(parent.name)
         for v in table.values():
             v.sort()
-    return pending, current
+        return table
+
+    return _membership(config.pending), _membership(config.current)
 
 
 def _build_config_group_membership(
@@ -7922,87 +7950,52 @@ def _diverged(pending: object, current: object) -> bool:
     return pending is not None and current is not None and pending != current
 
 
-def _groups_cells(
-    pending: list[str] | None,
-    current: list[str] | None,
+def _select_sourced(
+    pending_val: str | None,
+    current_val: str | None,
     config_source: str,
 ) -> tuple[str, bool]:
-    """Return `(cell, is_stale)` for the GROUPS column.
+    """Pick the displayed value for a dual-source field, plus whether
+    the two sides diverge.
 
-    Display rules per mode:
-      default:          current's value if present, else pending's.
-      --config-current: current's value if present, else empty.
-      --config-pending: pending's value if present, else empty.
+    Both values are read by uuid by the caller, so a rename (new name
+    in pending, old name in current, same uuid) compares the right
+    pair. `is_stale` fires only when both sides have a value and they
+    disagree -- a `*` marker meaning "the other view differs."
 
-    The `*` annotation fires whenever both pending and current have
-    values for the field and they disagree, regardless of mode.
+    Source selection:
+      default           pending value, else current (pending-first).
+      --config-pending  pending value (else empty).
+      --config-current  current value (else empty).
     """
-    p_str = ",".join(pending) if pending is not None else None
-    c_str = ",".join(current) if current is not None else None
-    is_stale = _diverged(p_str, c_str)
+    is_stale = _diverged(pending_val, current_val)
     if config_source == "current":
-        return (c_str or "", is_stale)
+        return (current_val or "", is_stale)
     if config_source == "pending":
-        return (p_str or "", is_stale)
-    # default: prefer current, fall back to pending.
-    if c_str:
-        return (c_str, is_stale)
-    return (p_str or "", is_stale)
+        return (pending_val or "", is_stale)
+    return (
+        (pending_val if pending_val is not None else current_val) or "",
+        is_stale,
+    )
 
 
-def _schedule_cells(
-    config: Config,
-    full: str,
+def _select_name(
+    pending_name: str | None,
+    current_name: str | None,
     config_source: str,
-    pending_fallback: TomlJob | TomlJobGroup | None = None,
-) -> tuple[str, bool]:
-    """Return (cell, is_stale) for the SCHEDULE column.
+) -> str:
+    """Pick the displayed name for a row.
 
-    Display rules mirror `_groups_cells`. `*` shows whenever the
-    pending and current values disagree on this field, regardless
-    of mode.
-
-    `pending_fallback` is the parsed TOML entry to read the pending
-    schedule from when the entry is absent from the pending graph (a
-    masked entry). The caller passes it only for masked rows shown
-    in the tree, so the SCHEDULE cell mirrors what a selected entry
-    of the same shape shows instead of coming up blank.
+    Identity must never render blank, so this falls back to the other
+    side under every mode (unlike the field selector, which leaves a
+    cell empty when the chosen source has no value). `--config-current`
+    prefers the applied name; default / `--config-pending` prefer the
+    config name -- so a rename shows its new name by default and its
+    old applied name under `--config-current`.
     """
-    pending_disp: str | None = None
-    current_disp: str | None = None
-    # Look up each side by name independently so a divergent
-    # uuid (user edited `uuid =` in TOML but hasn't re-applied)
-    # still finds both entries.
-    pending_ref = config.resolve_pending(full)
-    if pending_ref is not None:
-        pending_entry = config.pending.jobs.get(
-            pending_ref
-        ) or config.pending.groups.get(pending_ref)
-        if pending_entry is not None:
-            pending_disp = _schedule_display(
-                pending_entry.schedule, pending_entry.interval
-            )
-    if pending_disp is None and pending_fallback is not None:
-        pending_disp = _schedule_display(
-            pending_fallback.schedule, pending_fallback.interval
-        )
-    current_ref = config.resolve_current(full)
-    if current_ref is not None:
-        current_entry = config.current.jobs.get(
-            current_ref
-        ) or config.current.groups.get(current_ref)
-        if current_entry is not None:
-            current_disp = _schedule_display(
-                current_entry.schedule, current_entry.interval
-            )
-    is_stale = _diverged(pending_disp, current_disp)
     if config_source == "current":
-        return (current_disp or "", is_stale)
-    if config_source == "pending":
-        return (pending_disp or "", is_stale)
-    if current_disp is not None:
-        return (current_disp, is_stale)
-    return (pending_disp or "", is_stale)
+        return current_name or pending_name or ""
+    return pending_name or current_name or ""
 
 
 def do_status(
@@ -8133,140 +8126,209 @@ def do_status(
         }
     pending_groups, current_groups = _build_group_membership(config)
     config_groups = _build_config_group_membership(bundles)
-    rows: list[dict[str, str]] = []
-    any_stale = False
+
+    # Collapse the enumerated names to one row per uuid: a rename
+    # surfaces one entity under its applied (current) name and its
+    # config (pending) name, both resolving to the same uuid, and must
+    # render as a single row shown under the name from the active
+    # source. Errored entries never parsed to a uuid and keep their
+    # own name-keyed row.
+    names_by_ref: dict[EntityRef, list[str]] = {}
+    refform_refs: set[EntityRef] = set()
+    nameless_rows: list[str] = []
     for full in full_names:
-        mask_reason = masked_by_full.get(full, "")
-        bn, short = parse_full_name(full)
+        direct = EntityRef.from_str(full)
+        if direct is not None:
+            refform_refs.add(direct)
+            names_by_ref.setdefault(direct, []).append(full)
+            continue
+        r = config.resolve_pending(full) or config.resolve_current(full)
+        if r is None:
+            bn0, short0 = parse_full_name(full)
+            bdl0 = bundles.by_name(bn0)
+            e0 = (
+                bdl0.config.jobs.get(short0)
+                or bdl0.config.job_groups.get(short0)
+                if bdl0 is not None
+                else None
+            )
+            if e0 is not None:
+                r = EntityRef(bn0, e0.uuid)
+        if r is None:
+            nameless_rows.append(full)
+        else:
+            names_by_ref.setdefault(r, []).append(full)
+
+    built: list[tuple[str, dict[str, str]]] = []
+    any_stale = False
+
+    def _build_row(ref: EntityRef | None, candidates: list[str]) -> None:
+        nonlocal any_stale
+        pending_node: Job | JobGroup | None = (
+            config.pending.jobs.get(ref) or config.pending.groups.get(ref)
+            if ref is not None
+            else None
+        )
+        current_node: Job | JobGroup | None = (
+            config.current.jobs.get(ref) or config.current.groups.get(ref)
+            if ref is not None
+            else None
+        )
+        pending_name = pending_node.name if pending_node is not None else None
+        current_name = current_node.name if current_node is not None else None
+        if current_name is None and ref is not None:
+            be = config.broken.get(ref)
+            ue = config.unit_only.get(ref)
+            current_name = (
+                be.name
+                if be is not None
+                else ue.name
+                if ue is not None
+                else None
+            )
+        fallback = sorted(candidates)[0] if candidates else ""
+        # The config (pending) name drives tree placement, masking,
+        # and the TOML-entry lookup; the displayed identity is chosen
+        # by source. A masked entry is in neither graph -- fall back to
+        # the enumerated name.
+        config_name = pending_name or fallback
+        mask_reason = masked_by_full.get(config_name, "")
+        bn, short = parse_full_name(config_name)
         bdl = bundles.by_name(bn)
-        entry = (
+        entry: TomlJob | TomlJobGroup | None = (
             bdl.config.jobs.get(short) or bdl.config.job_groups.get(short)
             if bdl is not None
             else None
         )
-        if isinstance(entry, TomlJobGroup):
+        # A ref-form row (shadowed collision loser, or a broken
+        # snapshot with no recoverable name) renders by uuid in the
+        # identity column; its plain name belongs to another entity.
+        is_refform = ref is not None and ref in refform_refs
+
+        if pending_node is not None or current_node is not None:
+            node = pending_node or current_node
+            kind = "group" if isinstance(node, JobGroup) else "job"
+        elif isinstance(entry, TomlJobGroup):
             kind = "group"
         elif entry is not None:
             kind = "job"
         else:
-            # No TOML entry: fall back to the on-disk kind label.
-            # Only `current` carries `kind_of` info; broken /
-            # unit-only orphans don't, so they render an empty
-            # kind cell.
-            ref = config.resolve_current(full)
             kind = config.current.kind_of(ref) or "" if ref is not None else ""
-        # Resolve the runtime axes up-front. The schedule cell
-        # below uses unit_state to decide whether to surface
-        # "disabled" instead of the cron expression. The mask-
-        # aware override inside `_resolve_state_axes` shows a
-        # filter-excluded entry as `orphan` if there's on-disk
-        # state to clean up, `masked` otherwise.
+
+        # CONFIG / UNIT / LAST are single-source verdicts (not flag-
+        # selected); resolve them against the config name so the
+        # TOML-entry-based grouped check and errored detection land.
         cfg_state, unit_state, last = _resolve_state_axes(
-            config, full, platform, remnants, mask_reason=mask_reason
+            config, config_name, platform, remnants, mask_reason=mask_reason
         )
-        last_ran = _last_ran_at(config, full)
-        # A masked entry shown nested in the tree is absent from the
-        # pending / current graphs the SCHEDULE and GROUPS columns
-        # read from, so those cells come up blank even though the
-        # tree places it under a parent. Fall back to its parsed
-        # config entry for both, gated on actual tree presence so an
-        # off-tree `unused` entry (defined but not reached by this
-        # host's target, rendered flat) doesn't borrow values it
-        # isn't shown under.
-        masked_in_tree = bool(mask_reason) and full in tree_depth
-        sched_fallback = entry if masked_in_tree else None
-        sched_cell, sched_stale = _schedule_cells(
-            config, full, config_source, pending_fallback=sched_fallback
+        last_ran = _last_ran_at(config, config_name)
+
+        # SCHEDULE / GROUPS / name are dual-source: read each side by
+        # uuid and let the active source pick (default pending-first).
+        masked_in_tree = bool(mask_reason) and config_name in tree_depth
+        pending_sched = (
+            _schedule_display(pending_node.schedule, pending_node.interval)
+            if pending_node is not None
+            else None
+        )
+        if pending_sched is None and masked_in_tree and entry is not None:
+            es, ei = _entity_schedule(entry)
+            pending_sched = _schedule_display(es, ei)
+        current_sched = (
+            _schedule_display(current_node.schedule, current_node.interval)
+            if current_node is not None
+            else None
+        )
+        sched_cell, sched_stale = _select_sourced(
+            pending_sched, current_sched, config_source
         )
         if config_source != "pending" and unit_state == "disabled":
-            # The default and --config-current views describe
-            # what the host will actually run. A disabled timer
-            # doesn't fire on its schedule, so the cron expression
-            # is misleading -- show the runtime fact instead.
-            # Drop the stale-marker too: the cell is no longer
-            # the schedule it would have been compared against.
+            # A disabled timer won't fire on its schedule, so the cron
+            # expression is misleading -- show the runtime fact. Drop
+            # the stale marker: the cell is no longer the schedule it
+            # would compare against.
             sched_cell = "disabled"
             sched_stale = False
         if sched_stale:
             any_stale = True
             sched_cell = f"{sched_cell} *"
-        # UNIT SCHEDULE is the applied (current) view; a masked entry
-        # has no installed unit, so it gets no schedule fallback here.
-        unit_sched_cell, _ = _schedule_cells(config, full, "current")
-        pending_sched_cell, _ = _schedule_cells(
-            config, full, "pending", pending_fallback=sched_fallback
+        unit_sched_cell = current_sched or ""
+        pending_sched_cell = pending_sched or ""
+
+        # A node present in a graph has a well-defined membership even
+        # when it belongs to no group -- that empty value ("") still
+        # diverges from a non-empty one, so `*` fires. Only an entity
+        # absent from the graph entirely reads as None (no view).
+        pending_members = pending_groups.get(ref, []) if ref is not None else []
+        current_members = current_groups.get(ref, []) if ref is not None else []
+        pending_groups_str: str | None = (
+            ",".join(pending_members) if pending_node is not None else None
         )
-        pending_membership = pending_groups.get(full, [])
-        current_membership: list[str] | None = current_groups.get(full, [])
-        if masked_in_tree and not pending_membership and not current_membership:
-            # Same fallback as SCHEDULE: surface the config-declared
-            # parent group. The current side is marked "not
-            # applicable" (None) so the config-only value doesn't read
-            # as drift (a `*` stale marker).
-            pending_membership = config_groups.get(full, [])
-            current_membership = None
-        groups_cell, groups_stale = _groups_cells(
-            pending_membership,
-            current_membership,
-            config_source,
+        current_groups_str: str | None = (
+            ",".join(current_members) if current_node is not None else None
+        )
+        if masked_in_tree and not pending_members and not current_members:
+            # Surface the config-declared parent for a masked entry
+            # absent from both graphs; the current side stays None so
+            # the config-only value doesn't read as drift.
+            cfg_members = config_groups.get(config_name, [])
+            pending_groups_str = ",".join(cfg_members) if cfg_members else None
+            current_groups_str = None
+        groups_cell, groups_stale = _select_sourced(
+            pending_groups_str, current_groups_str, config_source
         )
         if groups_stale:
             any_stale = True
             groups_cell = f"{groups_cell} *"
-        unit_name = _unit_name_for(full, entry, platform, config)
-        # Identity cells. A `<bundle>:<UUID>` ref-form key (broken
-        # entry with no recoverable name, or a shadowed collision
-        # loser) renders by ref in the JOB / UUID column; its plain
-        # name -- if it has one -- still belongs to another row, so
-        # the JOB column shows it only for the user who opts that
-        # column in. A name-keyed row shows the name in both.
-        direct_ref = EntityRef.from_str(full)
-        if direct_ref is not None:
-            row_ref: EntityRef | None = direct_ref
-            job_cell = config.name_for(direct_ref) or ""
-            job_or_uuid_cell = str(direct_ref)
+
+        display_name = (
+            _select_name(pending_name, current_name, config_source) or fallback
+        )
+        unit_name = _unit_name_for(
+            current_name or config_name, entry, platform, config
+        )
+        if is_refform:
+            row_ref: EntityRef | None = ref
+            job_cell = (config.name_for(ref) or "") if ref is not None else ""
+            job_or_uuid_cell = str(ref)
         else:
-            row_ref = config.resolve_current(full) or config.resolve_pending(
-                full
-            )
-            if row_ref is None and entry is not None:
-                # A masked entry is in neither graph -- not installed,
-                # and excluded from `pending` because it isn't selected
-                # on this host -- but it still carries its
-                # config-declared identity, so surface its uuid from
-                # the parsed TOML entry.
-                row_ref = EntityRef(bn, entry.uuid)
-            job_cell = full
-            job_or_uuid_cell = full
+            row_ref = ref
+            job_cell = display_name
+            job_or_uuid_cell = display_name
         uuid_cell = str(row_ref) if row_ref is not None else ""
-        # `unit-config`: read the platform unit path from
-        # RuntimeState rather than walking the unit dirs --
-        # `load_config` already captured it at startup. For
-        # pending-only entries (no runtime yet) the cell stays
-        # empty; the path would be `_plist_path_for(full)` etc.
-        # but it doesn't exist on disk so there's nothing to
-        # show.
+        # `unit-config`: the platform unit path captured at load time
+        # (uuid-keyed RuntimeState). Empty for entries with no runtime.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
-        rows.append(
-            {
-                "job": job_cell,
-                "job-or-uuid": job_or_uuid_cell,
-                "kind": kind,
-                "config": cfg_state,
-                "schedule": sched_cell,
-                "groups": groups_cell,
-                "unit": unit_state,
-                "last": last,
-                "last-ran": last_ran,
-                "masked-by": mask_reason,
-                "unit-name": unit_name,
-                "unit-schedule": unit_sched_cell,
-                "pending-schedule": pending_sched_cell,
-                "uuid": uuid_cell,
-                "unit-config": unit_config_cell,
-            }
+        built.append(
+            (
+                config_name,
+                {
+                    "job": job_cell,
+                    "job-or-uuid": job_or_uuid_cell,
+                    "kind": kind,
+                    "config": cfg_state,
+                    "schedule": sched_cell,
+                    "groups": groups_cell,
+                    "unit": unit_state,
+                    "last": last,
+                    "last-ran": last_ran,
+                    "masked-by": mask_reason,
+                    "unit-name": unit_name,
+                    "unit-schedule": unit_sched_cell,
+                    "pending-schedule": pending_sched_cell,
+                    "uuid": uuid_cell,
+                    "unit-config": unit_config_cell,
+                },
+            )
         )
+
+    for ref_key, candidate_names in names_by_ref.items():
+        _build_row(ref_key, candidate_names)
+    for full in nameless_rows:
+        _build_row(None, [full])
+
+    rows = [row for _, row in built]
 
     if exclude_healthy:
         # Filter to unhealthy rows and render flat -- no tree
@@ -8289,33 +8351,35 @@ def do_status(
         ]
         rows = sorted(rows, key=lambda r: r["job-or-uuid"])
     else:
-        # Order rows by tree DFS to surface execution order
-        # rather than alphabetical: roots from each active target
-        # first, then group children indented by depth, then off-
-        # tree rows (orphans, CLI args outside any tree, masked
-        # entries not in any active target) below in stable
-        # sorted order. The identity cells carry two spaces of
-        # indent per depth level so the visual nesting matches the
-        # dispatch graph. Rows are keyed by `job-or-uuid` (unique
-        # per row): a collision winner uses its name, while a
-        # shadowed loser and a broken-no-name entry use the
-        # `<bundle>:<UUID>` form, so they never collapse onto the
-        # winner's name -- and only the tree-named winner matches a
-        # `tree_order` entry.
-        rows_by_key = {r["job-or-uuid"]: r for r in rows}
+        # Order rows by tree DFS to surface execution order rather
+        # than alphabetical: roots from each active target first, then
+        # group children indented by depth, then off-tree rows
+        # (orphans, CLI args outside any tree, masked entries not in
+        # any active target) below in stable sorted order. The
+        # identity cells carry two spaces of indent per depth level so
+        # the visual nesting matches the dispatch graph. Tree placement
+        # keys on each row's config (pending) name -- the structure
+        # `_build_status_tree` walks -- even when the row displays its
+        # applied name under --config-current.
+        by_tree_key: dict[str, dict[str, str]] = {}
+        for key, row in built:
+            by_tree_key.setdefault(key, row)
         ordered: list[dict[str, str]] = []
+        consumed: set[int] = set()
         for full in tree_order:
-            r = rows_by_key.pop(full, None)
-            if r is None:
+            tree_row = by_tree_key.get(full)
+            if tree_row is None or id(tree_row) in consumed:
                 continue
-            r = dict(r)
+            consumed.add(id(tree_row))
+            tree_row = dict(tree_row)
             indent = "  " * tree_depth[full]
-            r["job-or-uuid"] = indent + r["job-or-uuid"]
-            if r["job"]:
-                r["job"] = indent + r["job"]
-            ordered.append(r)
-        for key in sorted(rows_by_key):
-            ordered.append(rows_by_key[key])
+            tree_row["job-or-uuid"] = indent + tree_row["job-or-uuid"]
+            if tree_row["job"]:
+                tree_row["job"] = indent + tree_row["job"]
+            ordered.append(tree_row)
+        off_tree = [row for _, row in built if id(row) not in consumed]
+        for row in sorted(off_tree, key=lambda r: r["job-or-uuid"]):
+            ordered.append(row)
         rows = ordered
 
     # Per-column width: max of the header label and the longest

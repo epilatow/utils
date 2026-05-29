@@ -7928,9 +7928,12 @@ class TestStatusReport:
     def test_groups_default_marks_stale_when_membership_changes(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # Apply with a in g; rewrite config so a is no longer in g
-        # (without re-applying). Default mode shows the applied
-        # membership with `*` and the shared stale-value footer.
+        # Apply with a in g1; rewrite config so a moves to g2 (without
+        # re-applying), keeping a selected in both graphs so the
+        # divergence is a genuine pending-vs-current disagreement.
+        # Default mode is pending-first: a's cell shows the pending
+        # membership (g2) starred to flag the applied side (g1)
+        # differs, plus the shared stale footer.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -7939,27 +7942,29 @@ class TestStatusReport:
                     "b": {"command": "true"},
                 },
                 "job-group": {
-                    "g": {
-                        "jobs": ["a", "b"],
-                        "schedule": "*-*-* 03:00",
-                    }
+                    "g1": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                    "g2": {"jobs": ["b"], "schedule": "*-*-* 04:00"},
                 },
             },
-            default_target_jobs=["g"],
+            default_target_jobs=["g1", "g2"],
         )
         h.apply("a")
         h.apply("b")
-        h.apply("g")
-        # Drop `a` from the group's children in pending config.
+        h.apply("g1")
+        h.apply("g2")
+        # Swap a and b between the two groups in pending config.
         h.config(
             {
                 "job": {
                     "a": {"command": "true"},
                     "b": {"command": "true"},
                 },
-                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 03:00"}},
+                "job-group": {
+                    "g1": {"jobs": ["b"], "schedule": "*-*-* 03:00"},
+                    "g2": {"jobs": ["a"], "schedule": "*-*-* 04:00"},
+                },
             },
-            default_target_jobs=["g"],
+            default_target_jobs=["g1", "g2"],
         )
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
@@ -7972,10 +7977,12 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        # `a`'s row carries the stale-marked applied membership.
+        # `a`'s row shows its pending membership (g2), starred to flag
+        # that the applied side still records g1.
         for line in out.splitlines():
             if "default.a " in line:
-                assert "default.g *" in line
+                assert "default.g2 *" in line
+                assert "default.g1" not in line
         assert "stale" in out
         assert "crony apply" in out
 
@@ -7989,22 +7996,31 @@ class TestStatusReport:
                     "a": {"command": "true"},
                     "b": {"command": "true"},
                 },
-                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
+                "job-group": {
+                    "g1": {"jobs": ["a"], "schedule": "*-*-* 03:00"},
+                    "g2": {"jobs": ["b"], "schedule": "*-*-* 04:00"},
+                },
             },
-            default_target_jobs=["g"],
+            default_target_jobs=["g1", "g2"],
         )
         h.apply("a")
-        h.apply("g")
-        # Pending: swap `a` out for `b`. `a` is no longer in any group.
+        h.apply("b")
+        h.apply("g1")
+        h.apply("g2")
+        # Pending: swap a and b between the groups (a stays selected in
+        # both graphs, so the divergence is genuine).
         h.config(
             {
                 "job": {
                     "a": {"command": "true"},
                     "b": {"command": "true"},
                 },
-                "job-group": {"g": {"jobs": ["b"], "schedule": "*-*-* 03:00"}},
+                "job-group": {
+                    "g1": {"jobs": ["b"], "schedule": "*-*-* 03:00"},
+                    "g2": {"jobs": ["a"], "schedule": "*-*-* 04:00"},
+                },
             },
-            default_target_jobs=["g"],
+            default_target_jobs=["g1", "g2"],
         )
         monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
         crony.do_status(
@@ -8017,13 +8033,13 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        # Pending says `a` is in no group; cell is empty. The `*`
-        # divergence indicator still fires because the applied
-        # current does still record `a` as a member of `default.g`,
-        # which differs from the empty pending value.
+        # --config-pending shows the pending membership (g2); the `*`
+        # divergence indicator fires because the applied current still
+        # records a under g1.
         for line in out.splitlines():
             if "default.a " in line:
-                assert "default.g" not in line
+                assert "default.g2" in line
+                assert "default.g1" not in line
                 assert "*" in line
 
     def test_opt_in_columns_not_in_default_set(
@@ -8219,8 +8235,9 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # Apply with one schedule, then mutate config to a new
-        # schedule. Default schedule cell shows the applied
-        # (current) value with `*`; footer prints.
+        # schedule. Default mode is pending-first, so the cell shows
+        # the pending (config) value with `*` flagging the applied
+        # value differs; footer prints.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -8243,7 +8260,7 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "*-*-* 03:00 *" in out
+        assert "*-*-* 09:00 *" in out
         assert "stale" in out
         assert "crony apply" in out
 
@@ -12300,6 +12317,119 @@ class TestLastRunStateInteractive:
         )
         config = crony.load_config()
         assert crony._last_run_state(config, full) == "canceled"
+
+
+class TestStatusRenameUuidModel:
+    """`status` keys rows by uuid. A rename (same uuid, new config
+    name) that hasn't been re-applied is one row, not two: the entity
+    is shown under the name from the active source -- the new config
+    name by default / --config-pending, the old applied name under
+    --config-current -- with its run history and schedule resolved by
+    uuid in both views.
+    """
+
+    def _stamp_run(self, sd: Path, started: str) -> None:
+        (sd / "last-run.json").write_text(
+            '{"exit_class": "ok", '
+            f'"started_at": "{started}", '
+            '"host": "h", "platform": "darwin", '
+            f'"ended_at": "{started}", '
+            '"duration_sec": 1.0, "exit_code": 0, '
+            '"signal": null, "gate": "none", '
+            '"log_path": "/tmp/run.log", "log_bytes_this_run": 0}',
+            encoding="utf-8",
+        )
+
+    def _renamed_config(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> tuple["_ApplyHarness", str, str]:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"oss-nvm": {"command": "true"}},
+                "job-group": {
+                    "u-oss": {"jobs": ["oss-nvm"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["u-oss"],
+        )
+        crony.do_apply(jobs=[], verbose=False, bundle=None)
+        started = "2020-01-01T00:00:00-08:00"
+        self._stamp_run(h.state_dir("u-oss", cfg=cfg), started)
+        self._stamp_run(h.state_dir("oss-nvm", cfg=cfg), started)
+        group_uuid = cfg.job_groups["u-oss"].uuid
+        member_uuid = cfg.jobs["oss-nvm"].uuid
+        # Rename group and member, keeping uuids; do NOT re-apply.
+        h.config(
+            {
+                "job": {"bins-nvm": {"uuid": member_uuid, "command": "true"}},
+                "job-group": {
+                    "u-bins": {
+                        "uuid": group_uuid,
+                        "jobs": ["bins-nvm"],
+                        "schedule": "daily",
+                    },
+                },
+            },
+            default_target_jobs=["u-bins"],
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "enabled")
+        return h, group_uuid, member_uuid
+
+    def test_default_view_shows_new_names_once_with_history(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h, group_uuid, member_uuid = self._renamed_config(tmp_path, monkeypatch)
+        crony.do_status(
+            jobs=[],
+            cols="job,uuid,schedule,last,last-ran",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        # New config names, each entity once, old names absent.
+        assert h.full("u-bins") in out
+        assert h.full("bins-nvm") in out
+        assert h.full("u-oss") not in out
+        assert h.full("oss-nvm") not in out
+        assert out.count(group_uuid) == 1
+        assert out.count(member_uuid) == 1
+        # History and schedule resolve by uuid: the group's row keeps
+        # its applied run and shows the (pending) schedule.
+        for line in out.splitlines():
+            if h.full("u-bins") in line:
+                assert "daily" in line
+                assert " ok " in f" {line} "
+                assert "4" in line and "ago" in line  # e.g. "Nd ago"
+
+    def test_config_current_shows_old_applied_names(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h, group_uuid, member_uuid = self._renamed_config(tmp_path, monkeypatch)
+        crony.do_status(
+            jobs=[],
+            cols="job,uuid,schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=True,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        # --config-current shows the applied (old) names, still one row
+        # per uuid, with the applied schedule populated (not blank).
+        assert h.full("u-oss") in out
+        assert h.full("oss-nvm") in out
+        assert h.full("u-bins") not in out
+        assert h.full("bins-nvm") not in out
+        assert out.count(group_uuid) == 1
+        assert out.count(member_uuid) == 1
+        for line in out.splitlines():
+            if h.full("u-oss") in line:
+                assert "daily" in line
 
 
 if __name__ == "__main__":
