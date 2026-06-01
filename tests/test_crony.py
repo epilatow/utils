@@ -5055,6 +5055,71 @@ class TestSystemdRendering:
             crony._uv_executable()
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("systemd-analyze") is None,
+    reason="systemd-analyze verify is Linux + systemd only",
+)
+class TestSystemdAnalyzeVerify:
+    """Validate every generated systemd unit shape against
+    `systemd-analyze verify`, so a malformed template is caught rather
+    than only surfacing on a real `systemctl` install. Linux-only; runs
+    in CI on the Linux matrix leg and is skipped elsewhere.
+    """
+
+    def test_every_unit_shape_verifies(self, tmp_path: Path) -> None:
+        ref = crony.EntityRef("default", "u-test")
+        # ExecStart's executable must resolve for verify to pass;
+        # sys.executable is a real absolute path. The argv after it is
+        # irrelevant to verify (the unit is never run).
+        real = Path(sys.executable)
+        shapes = [
+            ("cal-normal", "*-*-* 03:00", None, None),
+            ("cal-high", "Mon *-*-* 09:00", None, "high"),
+            ("cal-low", "daily", None, "low"),
+            ("interval", None, "30min", "high"),
+            ("scheduleless", None, None, "low"),
+        ]
+        written: list[Path] = []
+        for nm, sched, interval, prio in shapes:
+            units = crony._render_units(
+                nm,
+                ref,
+                sched,
+                interval,
+                "linux",
+                prio,
+                uv_path=real,
+                crony_path=real,
+            )
+            for fname, content in units.items():
+                path = tmp_path / fname
+                path.write_text(content, encoding="utf-8")
+                written.append(path)
+        assert written
+        # `systemd-analyze verify` exits non-zero on structural errors
+        # (a bad OnCalendar, a unit that won't load) but only WARNS
+        # (rc 0, "... ignoring") on an unknown / typo'd directive or an
+        # unparseable value. Gate on both the exit code and those warning
+        # markers so a bogus [Service] key is caught too.
+        markers = ("ignoring", "failed to parse")
+        for path in written:
+            proc = subprocess.run(
+                ["systemd-analyze", "verify", str(path)],
+                capture_output=True,
+                text=True,
+            )
+            output = proc.stdout + proc.stderr
+            complaints = [
+                line
+                for line in output.splitlines()
+                if any(m in line.lower() for m in markers)
+            ]
+            assert proc.returncode == 0 and not complaints, (
+                f"{path.name} failed systemd-analyze verify "
+                f"(rc={proc.returncode}):\n{output}"
+            )
+
+
 class TestJobPriority:
     """`priority` enum rendered into the platform unit (and tracked
     by the snapshot + unit-drift check)."""
