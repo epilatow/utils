@@ -4843,9 +4843,116 @@ class TestNotifyTestSubcommand:
             )
 
         monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
-        with pytest.raises(crony.CronyError, match="notify-test failed"):
+        with pytest.raises(crony.CronyError, match="notify-test failed") as exc:
             crony.do_notify_test(channel=None, bundle="borgadm")
         assert calls, "inherited ntfy channel was not attempted"
+        # The failure detail attributes the channel to where it is
+        # defined (the default bundle), not the inheriting bundle.
+        assert "borgadm.ntfy (inherited from default)" in str(exc.value)
+
+    def test_inheriting_bundle_success_attributes_default(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                }
+            },
+            default_target_jobs=[],
+        )
+        (h.cfg_dropin / "private.toml").write_text(
+            "[defaults]\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
+        )
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_notify_test(channel=None, bundle="private")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "notification sent via private.ntfy (inherited from default)" in m
+            for m in messages
+        )
+
+    def test_explicit_channel_on_inheriting_bundle_attributes_default(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # An explicit --channel against an inheriting bundle resolves
+        # through (and is attributed to) the default bundle too.
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                }
+            },
+            default_target_jobs=[],
+        )
+        (h.cfg_dropin / "private.toml").write_text(
+            "[defaults]\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
+        )
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_notify_test(channel="ntfy", bundle="private")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "notification sent via private.ntfy (inherited from default)" in m
+            for m in messages
+        )
+
+    def test_self_defined_channel_has_no_inherited_suffix(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # The default bundle sends through its own channel, so the
+        # message carries no inherited-from suffix.
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                }
+            },
+            default_target_jobs=[],
+        )
+        monkeypatch.setattr(
+            crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
+        )
+        with caplog.at_level(logging.INFO, logger="crony"):
+            crony.do_notify_test(channel=None, bundle=None)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("notification sent via default.ntfy" in m for m in messages)
+        assert not any("inherited from" in m for m in messages)
 
 
 # =============================================================================

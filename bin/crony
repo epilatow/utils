@@ -9360,8 +9360,16 @@ def do_validate(bundle: str | None) -> None:
 
 def _notify_test_one_bundle(
     bundle: TomlBundle, channel: str | None, bundles: TomlConfig
-) -> tuple[list[str], list[tuple[str, NotificationResult]]]:
-    """Run notify-test against one bundle. Returns (successes, failures)."""
+) -> tuple[list[str], list[tuple[str, NotificationResult]], str | None]:
+    """Run notify-test against one bundle.
+
+    Returns (successes, failures, inherited_from). `inherited_from` is
+    the bundle whose notify config was actually used -- the default
+    bundle -- when this bundle inherits it, or None when the bundle
+    sends through its own channels. The caller uses it to attribute an
+    inherited channel to where it is defined rather than to the bundle
+    under test (which has no definition of its own).
+    """
     config = bundle.config
     # Synthetic transient TomlJob built only to feed
     # `resolved_notify_channels`. The uuid is never persisted and
@@ -9381,9 +9389,16 @@ def _notify_test_one_bundle(
     resolved, eff_defaults = _expand_notify_inherit(
         resolved, bundle.name, bundles, config.defaults
     )
+    # `_expand_notify_inherit` swaps in the default bundle's Defaults
+    # object only when it actually expands the inherit sentinel, so an
+    # identity change means the channels (and their definitions) came
+    # from the default bundle.
+    inherited_from = (
+        DEFAULT_BUNDLE_NAME if eff_defaults is not config.defaults else None
+    )
     use_channels = [channel] if channel is not None else resolved
     if not use_channels:
-        return ([], [])
+        return ([], [], inherited_from)
     result = JobRunResult(
         host=current_host(),
         platform=current_platform(),
@@ -9412,7 +9427,7 @@ def _notify_test_one_bundle(
     failures = [
         (ch, nr) for ch, nr in result.notifications.items() if not nr.sent
     ]
-    return (successes, failures)
+    return (successes, failures, inherited_from)
 
 
 def do_notify_test(channel: str | None, bundle: str | None) -> None:
@@ -9460,11 +9475,17 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     target_bundle = bundles.by_name(bundle_name)
     assert target_bundle is not None  # require_known_bundle guarantees
 
-    successes, failures = _notify_test_one_bundle(
+    successes, failures, inherited_from = _notify_test_one_bundle(
         target_bundle, channel_short, bundles
     )
+    # An inherited channel is defined in (and dispatched through) the
+    # default bundle, not the bundle under test; surface that so the
+    # reader knows where the channel actually lives.
+    origin = f" (inherited from {inherited_from})" if inherited_from else ""
     for ch in successes:
-        logger.info("notification sent via %s.%s", target_bundle.name, ch)
+        logger.info(
+            "notification sent via %s.%s%s", target_bundle.name, ch, origin
+        )
     if not successes and not failures:
         logger.info("no notify channels configured; nothing to send")
         return
@@ -9480,7 +9501,9 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     all_config = all(
         nr.error_class == "ConfigError" for _, _, nr in all_failures
     )
-    detail = "; ".join(f"{bn}.{ch}: {nr.error}" for bn, ch, nr in all_failures)
+    detail = "; ".join(
+        f"{bn}.{ch}{origin}: {nr.error}" for bn, ch, nr in all_failures
+    )
     if all_config:
         raise ConfigError(f"notify-test failed: {detail}")
     raise CronyError(f"notify-test failed: {detail}")
