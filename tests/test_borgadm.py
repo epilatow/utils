@@ -2413,6 +2413,38 @@ class TestCli:
         finally:
             setattr(ba, "_warning_occurred", original)
 
+    @pytest.mark.parametrize(
+        "sub, sample_action",
+        [
+            ("automate", "enable"),
+            ("check", "age"),
+            ("repair", "delete-cache"),
+        ],
+    )
+    def test_subcommand_without_action_prints_help(
+        self, sub: str, sample_action: str, capsys: Any
+    ) -> None:
+        # No action -> print the subcommand's own help (stdout) and exit
+        # USAGE, not argparse's terse "required" error.
+        with patch("sys.argv", ["borgadm", sub]):
+            result = ba.cli()
+        assert result == ba.ExitCode.USAGE
+        out = capsys.readouterr().out
+        assert f"usage: borgadm {sub}" in out
+        # Full help lists the subcommand's available actions.
+        assert sample_action in out
+
+    def test_action_subcommand_still_dispatches(self) -> None:
+        # With an action, cli dispatches to main rather than printing
+        # help -- the _action_help default must not short-circuit it.
+        with (
+            patch("sys.argv", ["borgadm", "automate", "status"]),
+            patch.object(ba, "main", autospec=True) as mock_main,
+        ):
+            result = ba.cli()
+        assert result == ba.ExitCode.SUCCESS
+        mock_main.assert_called_once()
+
 
 class TestRepoRoot:
     """Test _repo_root() symlink resolution."""

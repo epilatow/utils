@@ -2220,6 +2220,18 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.register("action", "parsers", _StrictSubParsersAction)
 
 
+def _action_subparsers(
+    parent: argparse.ArgumentParser, **kwargs: Any
+) -> _SubParsersActionBase:
+    """Add an action-group subparsers to `parent`, left non-required so
+    that omitting the action prints the subcommand's own help (via the
+    `_action_help` default registered here, which `cli` invokes) rather
+    than argparse's terse "the following arguments are required" error.
+    """
+    parent.set_defaults(_action_help=parent.print_help)
+    return parent.add_subparsers(dest="action", **kwargs)
+
+
 def args_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         description="Borg backup manager",
@@ -2288,7 +2300,7 @@ def args_parser() -> argparse.ArgumentParser:
         "automate",
         help="Enable/Disable automated backups and checks",
     )
-    automate_subparsers = automate.add_subparsers(dest="action", required=True)
+    automate_subparsers = _action_subparsers(automate)
     automate_subparsers.add_parser(
         "enable",
         help="Enable automated backup creation and checks",
@@ -2308,7 +2320,7 @@ def args_parser() -> argparse.ArgumentParser:
     add_parser("break-lock", help="Break repo lock")
 
     check = add_parser("check", help="Run backup checks")
-    check_subparsers = check.add_subparsers(dest="action", required=True)
+    check_subparsers = _action_subparsers(check)
 
     check_age = check_subparsers.add_parser(
         "age",
@@ -2445,7 +2457,7 @@ def args_parser() -> argparse.ArgumentParser:
         "repair",
         help="Repair operations for the borg repository",
     )
-    repair_subparsers = repair.add_subparsers(dest="action", required=True)
+    repair_subparsers = _action_subparsers(repair)
     repair_subparsers.add_parser(
         "delete-cache",
         help="Delete the local borg cache for the repository",
@@ -2663,9 +2675,16 @@ def cli() -> int:
     args_dict = vars(args).copy()
     args_dict.pop("validate", None)
     command = args_dict.pop("command")
+    action_help = args_dict.pop("_action_help", None)
 
     if not command:
         parser.print_help()
+        return ExitCode.USAGE
+
+    # A subcommand that requires an action but got none prints its own
+    # help (like the no-command case above), not argparse's terse error.
+    if action_help is not None and not args_dict.get("action"):
+        action_help()
         return ExitCode.USAGE
 
     if command == "self-test":
