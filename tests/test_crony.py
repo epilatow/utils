@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -4986,6 +4987,24 @@ class TestPlistRendering:
         # so it can locate the state dir directly without scanning.
         assert "<string>default:u-test</string>" in plist
 
+    def test_every_shape_is_a_valid_plist(self) -> None:
+        # Cross-platform guard: each rendered plist must parse back as
+        # a well-formed plist (plutil only runs at apply on macOS, so
+        # this catches structural breakage in CI on any platform).
+        ref = crony.EntityRef("default", "u-test")
+        shapes = [
+            ("daily", None, None),
+            (None, "30min", None),
+            ("Mon *-*-* 09:00", None, "high"),
+            ("*-*-* 03:00", None, "low"),
+            (None, None, None),  # schedule-less, normal priority
+        ]
+        for schedule, interval, priority in shapes:
+            plist = crony._render_plist("j", ref, schedule, interval, priority)
+            d = plistlib.loads(plist.encode("utf-8"))
+            assert d["Label"] == "org.crony.j"
+            assert d["ProgramArguments"][1] == "run"
+
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
@@ -5067,24 +5086,31 @@ class TestJobPriority:
         plist = crony._render_plist(
             "j", crony.EntityRef("default", "u-test"), "daily", None, "high"
         )
-        assert crony._plist_priority_block("high") in plist
-        assert "<string>Interactive</string>" in plist
+        d = plistlib.loads(plist.encode("utf-8"))
+        assert d["ProcessType"] == "Interactive"
+        assert d["LowPriorityIO"] is False
+        assert d["Nice"] == 0
 
     def test_plist_low(self) -> None:
         plist = crony._render_plist(
             "j", crony.EntityRef("default", "u-test"), "daily", None, "low"
         )
-        assert crony._plist_priority_block("low") in plist
-        assert "<string>Background</string>" in plist
+        d = plistlib.loads(plist.encode("utf-8"))
+        assert d["ProcessType"] == "Background"
+        assert d["LowPriorityIO"] is True
+        assert d["Nice"] == 10
 
     def test_plist_normal_and_none_emit_nothing(self) -> None:
         for p in ("normal", None):
             plist = crony._render_plist(
                 "j", crony.EntityRef("default", "u-test"), "daily", None, p
             )
-            assert "ProcessType" not in plist
-        assert crony._plist_priority_block("normal") == ""
-        assert crony._plist_priority_block(None) == ""
+            d = plistlib.loads(plist.encode("utf-8"))
+            assert "ProcessType" not in d
+            assert "LowPriorityIO" not in d
+            assert "Nice" not in d
+        assert crony._plist_priority_keys("normal") == {}
+        assert crony._plist_priority_keys(None) == {}
 
     def test_systemd_high_records_intent(self) -> None:
         svc = crony._render_systemd_service(
@@ -12115,11 +12141,10 @@ class TestUnitDriftDetection:
         content = unit_config.read_text()
         # Flip Hour 3 -> Hour 5: snapshot still says 03:00, but the
         # on-disk plist now says 05:00. apply / load_config should
-        # notice and flag the install stale.
-        munged = content.replace(
-            "<key>Hour</key>\n        <integer>3</integer>",
-            "<key>Hour</key>\n        <integer>5</integer>",
-        )
+        # notice and flag the install stale. (Hour is the only
+        # integer 3 in the rendered plist, so this is unambiguous
+        # without depending on the serializer's indentation.)
+        munged = content.replace("<integer>3</integer>", "<integer>5</integer>")
         assert munged != content
         unit_config.write_text(munged)
         config = crony.load_config()

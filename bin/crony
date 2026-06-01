@@ -38,7 +38,6 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-import xml.sax.saxutils
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -5436,8 +5435,8 @@ def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
     )
 
 
-def _plist_priority_block(priority: str | None) -> str:
-    """LaunchAgent priority keys for a job, or '' for normal.
+def _plist_priority_keys(priority: str | None) -> dict[str, object]:
+    """LaunchAgent priority keys for a job, or {} for normal.
 
     "high" runs the job at app-like QoS with normal CPU + IO
     (ProcessType=Interactive avoids the Background QoS throttling that
@@ -5445,24 +5444,18 @@ def _plist_priority_block(priority: str | None) -> str:
     are inherited by the command the runner spawns.
     """
     if priority == "high":
-        return (
-            "    <key>ProcessType</key>\n"
-            "    <string>Interactive</string>\n"
-            "    <key>LowPriorityIO</key>\n"
-            "    <false/>\n"
-            "    <key>Nice</key>\n"
-            "    <integer>0</integer>\n"
-        )
+        return {
+            "ProcessType": "Interactive",
+            "LowPriorityIO": False,
+            "Nice": 0,
+        }
     if priority == "low":
-        return (
-            "    <key>ProcessType</key>\n"
-            "    <string>Background</string>\n"
-            "    <key>LowPriorityIO</key>\n"
-            "    <true/>\n"
-            "    <key>Nice</key>\n"
-            "    <integer>10</integer>\n"
-        )
-    return ""
+        return {
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+        }
+    return {}
 
 
 def _systemd_priority_block(priority: str | None) -> str:
@@ -5507,59 +5500,38 @@ def _render_plist(
     the paths it extracted from the on-disk file so the byte-
     comparison stays meaningful when the live PATH differs from
     what apply originally pinned.
+
+    Serialized with `plistlib` so the XML is well-formed by
+    construction (escaping, typed values, DOCTYPE); `sort_keys`
+    keeps the byte output deterministic for the drift check.
     """
     label = _label_for(name)
     uv = uv_path if uv_path is not None else _uv_executable()
     crony = crony_path if crony_path is not None else _crony_executable()
-    program_args = [
-        str(uv),
-        "run",
-        "--script",
-        str(crony),
-        "run",
-        str(ref),
-    ]
-    args_xml = "".join(
-        f"        <string>{xml.sax.saxutils.escape(a)}</string>\n"
-        for a in program_args
-    )
-    sched_block = ""
+    contents: dict[str, object] = {
+        "Label": label,
+        "ProgramArguments": [
+            str(uv),
+            "run",
+            "--script",
+            str(crony),
+            "run",
+            str(ref),
+        ],
+        "RunAtLoad": False,
+        "KeepAlive": False,
+        "AbandonProcessGroup": False,
+    }
+    contents.update(_plist_priority_keys(priority))
     if interval is not None:
-        sec = parse_interval_seconds(interval)
-        sched_block = (
-            f"    <key>StartInterval</key>\n    <integer>{sec}</integer>\n"
-        )
+        contents["StartInterval"] = parse_interval_seconds(interval)
     elif schedule is not None:
-        entry = _oncalendar_to_plist_calendar(schedule)
-        sched_block = "    <key>StartCalendarInterval</key>\n"
-        sched_block += "    <dict>\n"
-        for k, v in sorted(entry.items()):
-            sched_block += f"        <key>{k}</key>\n"
-            sched_block += f"        <integer>{v}</integer>\n"
-        sched_block += "    </dict>\n"
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n'
-        "<dict>\n"
-        f"    <key>Label</key>\n"
-        f"    <string>{label}</string>\n"
-        f"    <key>ProgramArguments</key>\n"
-        f"    <array>\n"
-        f"{args_xml}"
-        f"    </array>\n"
-        "    <key>RunAtLoad</key>\n"
-        "    <false/>\n"
-        "    <key>KeepAlive</key>\n"
-        "    <false/>\n"
-        "    <key>AbandonProcessGroup</key>\n"
-        "    <false/>\n"
-        f"{_plist_priority_block(priority)}"
-        f"{sched_block}"
-        "</dict>\n"
-        "</plist>\n"
-    )
+        contents["StartCalendarInterval"] = _oncalendar_to_plist_calendar(
+            schedule
+        )
+    return plistlib.dumps(
+        contents, fmt=plistlib.FMT_XML, sort_keys=True
+    ).decode("utf-8")
 
 
 def _render_systemd_service(
