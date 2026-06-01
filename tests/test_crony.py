@@ -4564,6 +4564,154 @@ class TestNtfyNotify:
         assert h.get("Tags") or h.get("tags")
 
 
+class TestDialogPopupNotify:
+    """The zero-config `dialog-popup` built-in channel: valid without a
+    `[defaults.notify.dialog-popup]` block, and on macOS spawns a
+    detached osascript dialog carrying the failure summary + log.
+    """
+
+    def _make_failed_result(self, channels: list[str]) -> Any:
+        return crony.JobRunResult(
+            host="h",
+            platform="darwin",
+            started_at="2026-05-02T10:00:00-07:00",
+            ended_at="2026-05-02T10:00:01-07:00",
+            duration_sec=1.0,
+            exit_class="fail",
+            exit_code=2,
+            signal=None,
+            gate="none",
+            log_path="/tmp/run.log",
+            log_bytes_this_run=42,
+            notifications={
+                ch: crony.NotificationResult(sent=False) for ch in channels
+            },
+        )
+
+    def test_validate_accepts_builtin_without_block(self) -> None:
+        # No block, no other defined channels: the built-in name is
+        # still a valid notify_channels entry.
+        assert (
+            crony._validate_notify_channels(
+                ["dialog-popup"], set(), "[defaults]", is_default=False
+            )
+            is None
+        )
+
+    def test_bundle_with_builtin_validates_clean(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"notify_channels": ["dialog-popup"]},
+                "job": {"j": _job(notify_channels=["dialog-popup"])},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        assert "j" not in cfg.errored_jobs
+        assert "j" in cfg.jobs
+
+    def test_explicit_block_parses(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {
+                    "notify_channels": ["dialog-popup"],
+                    "notify": {"dialog-popup": {"transport": "dialog-popup"}},
+                },
+                "job": {"j": _job(notify_channels=["dialog-popup"])},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        ch = cfg.defaults.notify_channel_defs["dialog-popup"]
+        assert ch.transport == "dialog-popup"
+        assert ch.email is None and ch.ntfy is None
+
+    def test_explicit_block_rejects_extra_keys(self) -> None:
+        with pytest.raises(crony.ConfigError, match="unknown key"):
+            crony._parse_notify_channel(
+                "dialog-popup",
+                {"transport": "dialog-popup", "headers": {"X": "y"}},
+            )
+
+    def test_dispatch_spawns_osascript_on_darwin(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        captured: dict[str, Any] = {}
+
+        def _fake_popen(cmd: Any, **kwargs: Any) -> Any:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return None
+
+        monkeypatch.setattr(crony.subprocess, "Popen", _fake_popen)
+        result = self._make_failed_result(["dialog-popup"])
+        crony._dispatch_notify(
+            result, "borgadm.check-repo", "boom log line", crony.Defaults()
+        )
+        assert result.notifications["dialog-popup"].sent is True
+        assert captured["cmd"][0:2] == ["osascript", "-e"]
+        script = captured["cmd"][2]
+        assert "display dialog" in script
+        assert "borgadm.check-repo" in script
+        assert "(exit 2)" in script
+        assert "boom log line" in script
+        # Detached so the modal can't stall the runner.
+        assert captured["kwargs"].get("start_new_session") is True
+
+    def test_dispatch_records_failure_off_darwin(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+
+        def _boom(*a: Any, **k: Any) -> Any:
+            raise AssertionError("osascript spawned on non-darwin")
+
+        monkeypatch.setattr(crony.subprocess, "Popen", _boom)
+        result = self._make_failed_result(["dialog-popup"])
+        crony._dispatch_notify(result, "default.j", "log", crony.Defaults())
+        nr = result.notifications["dialog-popup"]
+        assert nr.sent is False
+        assert nr.error_class == "CronyError"
+
+    def test_body_escapes_quotes_and_backslashes(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(
+            crony.subprocess,
+            "Popen",
+            lambda cmd, **k: captured.setdefault("cmd", cmd),
+        )
+        result = self._make_failed_result(["dialog-popup"])
+        crony._dispatch_notify(
+            result, "default.j", 'he said "hi" \\ bye', crony.Defaults()
+        )
+        script = captured["cmd"][2]
+        # Raw double-quotes / backslashes from the log would corrupt the
+        # AppleScript string literal; they must arrive escaped.
+        assert '\\"hi\\"' in script
+        assert "\\\\ bye" in script
+
+    def test_attach_log_false_omits_log(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(
+            crony.subprocess,
+            "Popen",
+            lambda cmd, **k: captured.setdefault("cmd", cmd),
+        )
+        result = self._make_failed_result(["dialog-popup"])
+        crony._dispatch_notify(
+            result,
+            "default.j",
+            "secret log line",
+            crony.Defaults(notify_attach_log=False),
+        )
+        script = captured["cmd"][2]
+        assert "secret log line" not in script
+        assert crony._LOG_SEPARATOR not in script
+
+
 class TestMultiChannelDispatch:
     """`_dispatch_notify` fans out across all configured channels and
     one channel's failure must not suppress the others. The
