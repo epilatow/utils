@@ -5191,6 +5191,140 @@ class TestJobPriority:
         assert config.runtime[ref].unit_is_stale is True
 
 
+class TestKeepAwake:
+    """`keep_awake` wraps the command in a power assertion at fire
+    time (caffeinate / systemd-inhibit)."""
+
+    def _snap(self, keep_awake: bool) -> Any:
+        cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
+        target = crony.resolve_target(cfg, "h", "darwin")
+        return crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+
+    def test_parse_true(self) -> None:
+        cfg = _parse({"job": {"a": _job(keep_awake=True)}})
+        assert cfg.jobs["a"].keep_awake is True
+
+    def test_parse_default_false(self) -> None:
+        cfg = _parse({"job": {"a": _job()}})
+        assert cfg.jobs["a"].keep_awake is False
+
+    def test_parse_non_bool_rejected(self) -> None:
+        _assert_errored_job(
+            {"job": {"a": _job(keep_awake="yes")}},
+            "a",
+            "keep_awake' must be bool",
+        )
+
+    def test_snapshot_carries_keep_awake(self) -> None:
+        assert self._snap(True).keep_awake is True
+
+    def test_disabled_passthrough(self) -> None:
+        argv, note = crony._keep_awake_argv(["true"], self._snap(False))
+        assert argv == ["true"]
+        assert note is None
+
+    def test_wrap_darwin(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony.shutil,
+            "which",
+            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
+        )
+        argv, note = crony._keep_awake_argv(
+            ["/bin/sh", "-c", "true"], self._snap(True)
+        )
+        assert argv == ["/x/caffeinate", "-i", "-s", "/bin/sh", "-c", "true"]
+        assert note is None
+
+    def test_wrap_linux(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(
+            crony.shutil,
+            "which",
+            lambda n: "/x/systemd-inhibit" if n == "systemd-inhibit" else None,
+        )
+        argv, note = crony._keep_awake_argv(
+            ["/bin/sh", "-c", "true"], self._snap(True)
+        )
+        assert argv[0] == "/x/systemd-inhibit"
+        assert "--what=sleep:idle" in argv
+        assert "--" in argv
+        assert argv[-3:] == ["/bin/sh", "-c", "true"]
+        assert note is None
+
+    def test_missing_tool_runs_unwrapped_with_note(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony.shutil, "which", lambda n: None)
+        argv, note = crony._keep_awake_argv(["true"], self._snap(True))
+        assert argv == ["true"]
+        assert note is not None and "caffeinate not found" in note
+
+    def test_run_job_wraps_command(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        monkeypatch.setattr(
+            crony.shutil,
+            "which",
+            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_exec(
+            argv: list[str], *, env: Any, job_timeout_sec: Any, log_file: Any
+        ) -> Any:
+            captured["argv"] = argv
+            return crony.ExitOutcome(rc=0, signal=None)
+
+        monkeypatch.setattr(crony, "_exec_with_timeout", fake_exec)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "keep_awake": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony.run_job(h.snap(cfg, "j")) == 0
+        assert captured["argv"] == [
+            "/x/caffeinate",
+            "-i",
+            "-s",
+            "/bin/sh",
+            "-c",
+            "true",
+        ]
+
+    def test_run_job_logs_note_when_tool_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        monkeypatch.setattr(crony.shutil, "which", lambda n: None)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "keep_awake": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony.run_job(h.snap(cfg, "j")) == 0
+        log = (h.state_dir("j") / "run.log").read_text(encoding="utf-8")
+        assert "caffeinate not found" in log
+
+
 class TestApplyDarwin:
     def test_writes_plist_and_activates(
         self, tmp_path: Path, monkeypatch: Any

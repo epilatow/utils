@@ -393,6 +393,11 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # #            Linux Nice 10 + idle IO scheduling.
 # #   "normal" (default) emit nothing. Applies on every fire path
 # #            (scheduled, `crony trigger`, parent-group dispatch).
+# # keep_awake = true            # hold a power assertion for the run so
+# #            an idle / on-AC machine doesn't sleep mid-job (caffeinate
+# #            on macOS, systemd-inhibit on Linux). NOTE: closing the lid
+# #            on battery still sleeps the machine -- nothing in
+# #            userspace prevents that.
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
 # # Unresolved vars stay literal; `$$` is a literal `$`.
@@ -700,6 +705,10 @@ class TomlJob:
     # (run un-throttled, app-like QoS), "low" (throttle CPU + IO), or
     # None ("normal", emit nothing). See `_VALID_PRIORITIES`.
     priority: str | None = None
+    # Hold a power assertion for the command's duration so an idle /
+    # on-AC machine doesn't sleep mid-run (caffeinate on macOS,
+    # systemd-inhibit on linux). Lid-close on battery still sleeps.
+    keep_awake: bool = False
     # `platforms`: empty list = applies to every platform. Non-empty
     # = applies only on listed platforms; otherwise the entry is
     # silently skipped at selection time. `hosts` works the same
@@ -1090,6 +1099,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "schedule",
         "interval",
         "priority",
+        "keep_awake",
         "platforms",
         "hosts",
         "job_timeout_sec",
@@ -1754,6 +1764,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         raise ConfigError(
             f"{where}: priority must be one of {sorted(_VALID_PRIORITIES)}"
         )
+    keep_awake = _typed_field(raw, "keep_awake", bool, where, default=False)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
@@ -1784,6 +1795,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         schedule=schedule,
         interval=interval,
         priority=priority,
+        keep_awake=keep_awake,
         platforms=platforms,
         hosts=hosts,
         job_timeout_sec=job_timeout_sec,
@@ -2737,6 +2749,10 @@ class Job:
     # unit on the next apply. Default-None for back-compat with
     # snapshots written before this field existed.
     priority: str | None = None
+    # Whether the runner wraps the command in a power assertion to
+    # keep the machine awake for its duration. Read at fire time;
+    # default-False for back-compat with older snapshots.
+    keep_awake: bool = False
     # Interactive runner controls. `interactive_active_sec` and
     # `interactive_delay_sec` are always resolved (non-None) in
     # the snapshot so the runner doesn't re-consult any defaults
@@ -2820,6 +2836,7 @@ def _resolve_job_snapshot(
         schedule=job.schedule,
         interval=job.interval,
         priority=job.priority,
+        keep_awake=job.keep_awake,
         interactive=job.interactive,
         interactive_active_sec=(
             job.interactive_active_sec
@@ -3884,6 +3901,48 @@ def _gate_argv(snap: Job) -> list[str] | None:
     return None
 
 
+def _keep_awake_argv(
+    argv: list[str], snap: Job
+) -> tuple[list[str], str | None]:
+    """Wrap `argv` so the machine stays awake while the command runs.
+
+    Returns (argv, note). When `snap.keep_awake` is set, the command
+    runs under `caffeinate` (macOS: prevents idle sleep always, system
+    sleep on AC) or `systemd-inhibit` (linux), both of which propagate
+    the wrapped command's exit code and tear it down when killed. A
+    missing helper binary must never fail the job, so the command runs
+    unwrapped and `note` (logged by the caller) explains why. Lid-close
+    on battery still sleeps the machine -- no userspace mechanism
+    prevents that.
+    """
+    if not snap.keep_awake:
+        return argv, None
+    platform = current_platform()
+    if platform == "darwin":
+        tool = shutil.which("caffeinate")
+        if tool is None:
+            return argv, "keep_awake: caffeinate not found; running unwrapped"
+        return [tool, "-i", "-s", *argv], None
+    tool = shutil.which("systemd-inhibit")
+    if tool is None:
+        return (
+            argv,
+            "keep_awake: systemd-inhibit not found; running unwrapped",
+        )
+    return (
+        [
+            tool,
+            "--what=sleep:idle",
+            "--who=crony",
+            f"--why=job {snap.name}",
+            "--mode=block",
+            "--",
+            *argv,
+        ],
+        None,
+    )
+
+
 def _crony_executable() -> Path:
     """Absolute path to bin/crony for re-invocation by groups.
 
@@ -4888,6 +4947,9 @@ def run_job(
                             return 0
 
                 argv = _command_argv(snap)
+                argv, keep_awake_note = _keep_awake_argv(argv, snap)
+                if keep_awake_note is not None:
+                    log_file.write(f"{keep_awake_note}\n".encode())
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
                 try:
                     rc, sig = _exec_with_timeout(
