@@ -10,6 +10,14 @@ dependencies = [
 [tool.uv.sources]
 epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "3695dbd86f9a6fbaf2d616aabb0bfb0089cbdb02" }
 
+[tool.mypy]
+# First-party shared packages live under src/ (e.g. `common`). The
+# code-quality gate runs `mypy --strict <file>` from the repo root, so
+# mypy reads this config; mypy_path lets it resolve `import common`
+# statically (the entry scripts add src/ to sys.path at runtime, which
+# mypy does not execute).
+mypy_path = ["src"]
+
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests"]
 markers = [

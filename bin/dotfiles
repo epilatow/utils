@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import (
-    Any,
     Callable,
     Dict,
     Iterable,
@@ -30,9 +29,17 @@ from typing import (
     List,
     Optional,
     Set,
-    TYPE_CHECKING,
     Tuple,
 )
+
+# First-party shared helpers live under <repo>/src. The entry script's
+# own directory (bin/) is on sys.path, but the package dir is not, so
+# prepend it. resolve() follows any symlink to the real file first, so
+# the parent walk reaches the repo root even when the entry is invoked
+# through a symlink.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from common.argparse_ext import StrictArgumentParser  # noqa: E402
 
 # =============================================================================
 # DESIGN
@@ -1331,62 +1338,6 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
 # =============================================================================
 
 
-if TYPE_CHECKING:
-    _SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
-else:
-    _SubParsersActionBase = argparse._SubParsersAction
-
-
-class _StrictSubParsersAction(_SubParsersActionBase):
-    """Subparsers action that errors on the subparser, not the root.
-
-    Stdlib's _SubParsersAction.__call__ calls parse_known_args on the
-    chosen subparser and stashes any leftover tokens on the top-level
-    namespace, so an unknown-arg error is reported by the root parser
-    -- with its program name and usage line, obscuring which
-    subcommand the user actually typed. Calling parse_args (strict)
-    on the subparser routes the error through the subparser's own
-    error(), giving "<prog> <subcommand>: error: ..." with the
-    subcommand's usage line.
-
-    Stdlib's deprecation-warning branch
-    (add_parser(deprecated=True), 3.13+) is intentionally omitted:
-    no dotfiles / binfiles subcommand uses deprecated=True, and the
-    stdlib hook (parser._warning) is private and version-gated.
-    """
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Any,
-        option_string: Optional[str] = None,
-    ) -> None:
-        parser_name = values[0]
-        arg_strings = values[1:]
-        if self.dest is not argparse.SUPPRESS:
-            setattr(namespace, self.dest, parser_name)
-        try:
-            subparser = self._name_parser_map[parser_name]
-        except KeyError as exc:
-            choices = ", ".join(self._name_parser_map)
-            raise argparse.ArgumentError(
-                self,
-                f"unknown parser {parser_name!r} (choices: {choices})",
-            ) from exc
-        subnamespace = subparser.parse_args(arg_strings)
-        for key, value in vars(subnamespace).items():
-            setattr(namespace, key, value)
-
-
-class _ArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser that installs the strict subparsers action."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.register("action", "parsers", _StrictSubParsersAction)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """
     Build and return the argument parser for the active profile.
@@ -1394,7 +1345,7 @@ def build_parser() -> argparse.ArgumentParser:
     Returns:
         Configured ArgumentParser instance
     """
-    parser = _ArgumentParser(
+    parser = StrictArgumentParser(
         prog=ACTIVE_PROFILE.name,
         description=ACTIVE_PROFILE.description,
         epilog=ExitCode.epilog(),

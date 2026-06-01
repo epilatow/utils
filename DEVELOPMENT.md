@@ -20,9 +20,17 @@ Development conventions for working in this repo are layered:
 
 This repo is a personal-utilities collection. Top-level structure:
 
-- `bin/` -- executable utilities, mostly Python with PEP 723 shebangs. Each
-  utility is a single file (or a single file plus a backup sibling like
-  `bin/borgadm~`).
+- `bin/` -- executable utility entry points, mostly Python with PEP 723
+  shebangs. An entry is usually a single file; some also import shared
+  first-party code from `src/` (see below).
+- `src/` -- first-party importable Python packages (e.g. `common`), shared
+  across utilities. These carry no shebang and are never executed directly.
+  Each `bin/` entry that uses them prepends `<repo>/src` to `sys.path` -- via
+  `Path(__file__).resolve()`, which follows any symlink to the real file so
+  the repo-root walk is correct even when the entry is invoked through a
+  symlink -- before importing `common`. `[tool.mypy] mypy_path = ["src"]` in
+  `pyproject.toml` lets the code-quality gate's `mypy --strict` resolve these
+  imports statically.
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the

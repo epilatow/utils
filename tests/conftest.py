@@ -19,6 +19,10 @@ from unittest.mock import MagicMock, create_autospec, patch
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
 
+# Make the first-party src/ packages (e.g. `common`) importable in tests,
+# the same way each bin/ entry prepends src/ at runtime.
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
 # Create a temporary directory for __pycache__ and redirect all bytecode there
 _pycache_tmpdir = tempfile.mkdtemp(prefix="pytest_pycache_")
 sys.pycache_prefix = _pycache_tmpdir
