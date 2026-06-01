@@ -198,6 +198,14 @@ CONFIG_DROPIN_DIR: Path = _env_path(
     "CONFIG_DROPIN_DIR", str(CONFIG_DIR / "config")
 )
 DEFAULT_BUNDLE_NAME: str = "default"
+# Sentinel value for a `notify_channels` list: a non-default bundle
+# whose resolved notify_channels is exactly [NOTIFY_INHERIT_TOKEN]
+# notifies as the default bundle would -- borrowing its channel list,
+# channel definitions, and attach settings. It is also the implicit
+# default for non-default bundles that omit notify config. The token
+# is the default bundle's own name, so it doubles as a reserved
+# channel name (a [defaults.notify.default] block is rejected).
+NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
 )
@@ -256,7 +264,10 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 #                                       (filename stem matches
 #                                       [A-Za-z0-9][A-Za-z0-9_-]*)
 # Each bundle is independent: its [defaults], targets, groups, and
-# notify config apply only to the jobs defined in the same file.
+# notify config apply only to the jobs defined in the same file. The
+# one cross-bundle tie is notification inheritance: a non-default
+# bundle can borrow the default bundle's notify config (see the
+# defaults section below).
 # Job and group names are namespaced as <bundle>.<short>; on the
 # CLI, a bare name (`crony trigger foo`) is shorthand for
 # `default.foo` and never falls through to other bundles. The
@@ -284,6 +295,20 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # job_timeout_sec      = 1800         # 30 min default per-job wallclock cap
 # trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
+
+# Notification inheritance. The reserved value `notify_channels =
+# ["default"]` (it must be the only entry) makes a NON-default bundle
+# notify exactly as the default bundle would -- borrowing its channel
+# list, channel definitions, and attach settings -- so the bundle can
+# omit every [defaults.notify.*] block of its own. It is also the
+# implicit default: a non-default bundle that says nothing about
+# notify config inherits the default bundle's. Opt back out with an
+# explicit `notify_channels = []` (silence). The default bundle
+# cannot inherit itself, and `default` is a reserved channel name (no
+# [defaults.notify.default] block). A non-default bundle that both
+# inherits AND defines its own [defaults.notify.*] channels leaves
+# those local channels unreferenced -- list them explicitly in
+# `notify_channels` to use them instead of inheriting.
 
 # Each notify channel is a [defaults.notify.<name>] block. The name
 # is whatever the user lists in `notify_channels`. The `transport`
@@ -357,7 +382,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
-# # notify_channels = ["email"]
+# # notify_channels = ["email"]   # or [] to silence just this job
 # # job_timeout_sec = 7200
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
@@ -595,7 +620,11 @@ class Defaults:
     # always written regardless). On non-empty, every listed channel
     # fires per failure; per-channel results are recorded
     # independently in last-run.json's `notifications` dict. Each
-    # entry must name a key in `notify_channel_defs` below.
+    # entry must name a key in `notify_channel_defs` below, with one
+    # exception: the sole-entry list [NOTIFY_INHERIT_TOKEN] inherits
+    # the default bundle's notify config (and is the implicit default
+    # for a non-default bundle that omits notify config). The default
+    # bundle itself defaults to [] and may not use the sentinel.
     notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
     # Cap on log content included in EMAIL notifications. ntfy
@@ -1614,16 +1643,29 @@ def _parse_notify_channels(
     return out
 
 
-def _parse_defaults(raw: dict[str, Any]) -> Defaults:
-    """Parse [defaults]."""
+def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
+    """Parse [defaults].
+
+    `is_default` flags the default bundle (config.toml). A non-default
+    bundle that omits `notify_channels` entirely inherits the default
+    bundle's notify config (the [NOTIFY_INHERIT_TOKEN] sentinel);
+    explicit `notify_channels = []` opts back out to silence.
+    """
     where = "[defaults]"
     _reject_unknown_keys(raw, _KNOWN_DEFAULTS, where)
     channels = _parse_notify_channels(raw, where, required=True)
+    if "notify_channels" not in raw and not is_default:
+        channels = [NOTIFY_INHERIT_TOKEN]
     notify_channel_defs: dict[str, NotifyChannel] = {}
     nested = raw.get("notify", {})
     if not isinstance(nested, dict):
         raise ConfigError(f"{where}.notify must be a table (dict)")
     for sub_key, sub_body in nested.items():
+        if sub_key == NOTIFY_INHERIT_TOKEN:
+            raise ConfigError(
+                f"[defaults.notify.{sub_key}]: {sub_key!r} is a reserved "
+                f"channel name (the notify-inherit sentinel)"
+            )
         if not isinstance(sub_body, dict):
             raise ConfigError(f"[defaults.notify.{sub_key}]: must be a table")
         notify_channel_defs[sub_key] = _parse_notify_channel(sub_key, sub_body)
@@ -1831,7 +1873,44 @@ def _collect_target_parents(
     return parents
 
 
-def _validate_config(config: TomlBundleConfig) -> None:
+def _validate_notify_channels(
+    channels: list[str],
+    defined_channels: set[str],
+    label: str,
+    *,
+    is_default: bool,
+) -> str | None:
+    """Validate one `notify_channels` list. Returns an error message
+    (for raise / demote at the call site) or None when valid.
+
+    The inherit sentinel `NOTIFY_INHERIT_TOKEN` pulls the default
+    bundle's notify config: it must stand alone and is only valid in a
+    non-default bundle (the default bundle cannot inherit itself).
+    Every other entry must name a channel defined in this bundle.
+    """
+    if NOTIFY_INHERIT_TOKEN in channels:
+        if len(channels) != 1:
+            return (
+                f"{label}: {NOTIFY_INHERIT_TOKEN!r} (notify-inherit "
+                f"sentinel) must be the only notify_channels entry"
+            )
+        if is_default:
+            return (
+                f"{label}: the default bundle cannot inherit its own "
+                f"notify config ({NOTIFY_INHERIT_TOKEN!r} sentinel)"
+            )
+        return None
+    for ch in channels:
+        if ch not in defined_channels:
+            return (
+                f"{label}: notify_channels entry {ch!r} is not "
+                f"defined; expected one of "
+                f"{sorted(defined_channels) or '[]'}"
+            )
+    return None
+
+
+def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     """Cross-cutting validation: name collisions, references, applicability.
 
     Per-entity validation failures (a single group with an
@@ -1885,26 +1964,27 @@ def _validate_config(config: TomlBundleConfig) -> None:
     # references are unattributable -> raise; per-job and per-target
     # references are per-entity -> demote.
     defined_channels = set(config.defaults.notify_channel_defs.keys())
-    for ch in config.defaults.notify_channels:
-        if ch not in defined_channels:
-            raise ConfigError(
-                f"[defaults]: notify_channels entry {ch!r} is not "
-                f"defined; expected one of "
-                f"{sorted(defined_channels) or '[]'}"
-            )
+    defaults_msg = _validate_notify_channels(
+        config.defaults.notify_channels,
+        defined_channels,
+        "[defaults]",
+        is_default=is_default,
+    )
+    if defaults_msg is not None:
+        raise ConfigError(defaults_msg)
 
     bad_job_channel: dict[str, str] = {}
     for jname, job in config.jobs.items():
         if job.notify_channels is None:
             continue
-        for ch in job.notify_channels:
-            if ch not in defined_channels:
-                bad_job_channel[jname] = (
-                    f"[job.{jname}]: notify_channels entry {ch!r} "
-                    f"is not defined; expected one of "
-                    f"{sorted(defined_channels) or '[]'}"
-                )
-                break
+        job_msg = _validate_notify_channels(
+            job.notify_channels,
+            defined_channels,
+            f"[job.{jname}]",
+            is_default=is_default,
+        )
+        if job_msg is not None:
+            bad_job_channel[jname] = job_msg
     for jname, msg in bad_job_channel.items():
         del config.jobs[jname]
         config.errored_jobs[jname] = msg
@@ -1938,13 +2018,14 @@ def _validate_config(config: TomlBundleConfig) -> None:
             if ref not in all_names:
                 return f"{label}: 'jobs' references undefined name {ref!r}"
         if target.notify_channels is not None:
-            for ch in target.notify_channels:
-                if ch not in defined_channels:
-                    return (
-                        f"{label}: notify_channels entry {ch!r} is "
-                        f"not defined; expected one of "
-                        f"{sorted(defined_channels) or '[]'}"
-                    )
+            notify_msg = _validate_notify_channels(
+                target.notify_channels,
+                defined_channels,
+                label,
+                is_default=is_default,
+            )
+            if notify_msg is not None:
+                return notify_msg
         # Chain walk: every path from the target through groups to
         # a leaf job must contain a schedule somewhere; cycles in
         # the group graph are caught on the way down. A walk into
@@ -2093,7 +2174,7 @@ def _load_one_bundle(name: str, path: Path) -> TomlBundle:
     except tomlkit.exceptions.ParseError as e:
         raise ConfigError(f"TOML parse error in {path}: {e}") from e
     try:
-        config = parse_config(raw)
+        config = parse_config(raw, bundle_name=name)
     except ConfigError as e:
         raise ConfigError(f"{path}: {e}") from e
     _demote_duplicate_uuids(config, name)
@@ -2185,16 +2266,32 @@ def load_toml_bundle_config(path: Path) -> TomlBundleConfig:
     return config
 
 
-def parse_config(raw: dict[str, Any]) -> TomlBundleConfig:
-    """Parse a top-level config dict into a validated TomlBundleConfig."""
+def parse_config(
+    raw: dict[str, Any], *, bundle_name: str = DEFAULT_BUNDLE_NAME
+) -> TomlBundleConfig:
+    """Parse a top-level config dict into a validated TomlBundleConfig.
+
+    `bundle_name` identifies the source bundle; it gates the
+    notify-inherit sentinel (only non-default bundles may inherit, and
+    they do so implicitly when notify config is omitted). Callers with
+    a single-bundle view default it to the default bundle, the
+    conservative choice (no implicit inherit, sentinel rejected).
+    """
     _reject_unknown_keys(raw, _KNOWN_TOPLEVEL, "(top level)")
+    is_default = bundle_name == DEFAULT_BUNDLE_NAME
 
     config = TomlBundleConfig()
 
     if "defaults" in raw:
         if not isinstance(raw["defaults"], dict):
             raise ConfigError("[defaults] must be a table")
-        config.defaults = _parse_defaults(raw["defaults"])
+        config.defaults = _parse_defaults(
+            raw["defaults"], is_default=is_default
+        )
+    elif not is_default:
+        # No [defaults] block at all still inherits the default
+        # bundle's notify config for a non-default bundle.
+        config.defaults = Defaults(notify_channels=[NOTIFY_INHERIT_TOKEN])
 
     job_section = raw.get("job", {})
     if not isinstance(job_section, dict):
@@ -2246,7 +2343,7 @@ def parse_config(raw: dict[str, Any]) -> TomlBundleConfig:
                 name, "platform", body
             )
 
-    _validate_config(config)
+    _validate_config(config, is_default=is_default)
     return config
 
 
@@ -4338,6 +4435,36 @@ def _dispatch_notify(
             )
 
 
+def _expand_notify_inherit(
+    channels: list[str],
+    firing_bundle: str,
+    bundles: TomlConfig,
+    local_defaults: Defaults,
+) -> tuple[list[str], Defaults]:
+    """Resolve the notify-inherit sentinel to the default bundle.
+
+    When `channels` is exactly [NOTIFY_INHERIT_TOKEN], swap in the
+    default bundle's channel list AND its Defaults (channel
+    definitions + attach settings), so dispatch behaves exactly as
+    the default bundle would. Otherwise the inputs pass through
+    unchanged. Degrades to no dispatch when the default bundle is
+    absent, and never recurses: a sentinel carried by the default
+    bundle's own list is dropped rather than re-expanded.
+    """
+    if channels != [NOTIFY_INHERIT_TOKEN]:
+        return channels, local_defaults
+    if firing_bundle == DEFAULT_BUNDLE_NAME:
+        return [], local_defaults
+    default_bundle = bundles.by_name(DEFAULT_BUNDLE_NAME)
+    if default_bundle is None:
+        return [], local_defaults
+    inherited = default_bundle.config.defaults
+    resolved = [
+        c for c in inherited.notify_channels if c != NOTIFY_INHERIT_TOKEN
+    ]
+    return resolved, inherited
+
+
 def _resolve_notify_at_runtime(
     full_name: str,
 ) -> tuple[list[str], Defaults]:
@@ -4362,11 +4489,10 @@ def _resolve_notify_at_runtime(
     target = resolve_target(config, current_host(), current_platform())
     job = config.jobs.get(short)
     if job is None:
-        return list(config.defaults.notify_channels), config.defaults
-    return (
-        resolved_notify_channels(config, target, job),
-        config.defaults,
-    )
+        channels = list(config.defaults.notify_channels)
+    else:
+        channels = resolved_notify_channels(config, target, job)
+    return _expand_notify_inherit(channels, bn, bundles, config.defaults)
 
 
 def _darwin_hid_idle_seconds() -> float:
@@ -8950,6 +9076,11 @@ def _validate_bundle_warnings(
             listed.update(t.notify_channels)
 
     for ch_name in sorted(listed):
+        if ch_name == NOTIFY_INHERIT_TOKEN:
+            # The inherit sentinel resolves to the default bundle's
+            # channels; their secrets are checked when that bundle is
+            # validated, not here.
+            continue
         channel = config.defaults.notify_channel_defs.get(ch_name)
         if channel is None:
             # Cross-cutting validation already raises on this; be
@@ -9106,24 +9237,29 @@ def do_validate(bundle: str | None) -> None:
 
 
 def _notify_test_one_bundle(
-    bundle: TomlBundle, channel: str | None
+    bundle: TomlBundle, channel: str | None, bundles: TomlConfig
 ) -> tuple[list[str], list[tuple[str, NotificationResult]]]:
     """Run notify-test against one bundle. Returns (successes, failures)."""
     config = bundle.config
-    if channel is not None:
-        use_channels = [channel]
-    else:
-        # Synthetic transient TomlJob built only to feed
-        # `resolved_notify_channels`. The uuid is never persisted
-        # and never compared against any real entry, so the
-        # all-zeros placeholder is fine.
-        synthetic_job = TomlJob(
-            name="notify-test",
-            uuid="00000000-0000-0000-0000-000000000000",
-            command="true",
-        )
-        target = resolve_target(config, current_host(), current_platform())
-        use_channels = resolved_notify_channels(config, target, synthetic_job)
+    # Synthetic transient TomlJob built only to feed
+    # `resolved_notify_channels`. The uuid is never persisted and
+    # never compared against any real entry, so the all-zeros
+    # placeholder is fine.
+    synthetic_job = TomlJob(
+        name="notify-test",
+        uuid="00000000-0000-0000-0000-000000000000",
+        command="true",
+    )
+    target = resolve_target(config, current_host(), current_platform())
+    resolved = resolved_notify_channels(config, target, synthetic_job)
+    # `eff_defaults` carries the channel defs + attach settings used
+    # for dispatch; a bundle that inherits sends through the default
+    # bundle's definitions, so an explicit --channel resolves there
+    # too.
+    resolved, eff_defaults = _expand_notify_inherit(
+        resolved, bundle.name, bundles, config.defaults
+    )
+    use_channels = [channel] if channel is not None else resolved
     if not use_channels:
         return ([], [])
     result = JobRunResult(
@@ -9148,7 +9284,7 @@ def _notify_test_one_bundle(
         "if you can read this, the channel is working end-to-end.\n"
     )
     _dispatch_notify(
-        result, f"{bundle.name}.notify-test", log_text, config.defaults
+        result, f"{bundle.name}.notify-test", log_text, eff_defaults
     )
     successes = [ch for ch, nr in result.notifications.items() if nr.sent]
     failures = [
@@ -9168,7 +9304,8 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
                          channels.
     --channel <ch>       a bare channel name resolves against the
                          selected bundle (default if --bundle is
-                         absent).
+                         absent), or against the default bundle's
+                         channels when the selected bundle inherits.
     --channel <bn>.<ch>  fully qualified; the bundle prefix wins,
                          and is required to match --bundle when both
                          are given.
@@ -9201,7 +9338,9 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     target_bundle = bundles.by_name(bundle_name)
     assert target_bundle is not None  # require_known_bundle guarantees
 
-    successes, failures = _notify_test_one_bundle(target_bundle, channel_short)
+    successes, failures = _notify_test_one_bundle(
+        target_bundle, channel_short, bundles
+    )
     for ch in successes:
         logger.info("notification sent via %s.%s", target_bundle.name, ch)
     if not successes and not failures:

@@ -1790,6 +1790,213 @@ class TestResolution:
         assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
 
 
+def _bundle_set(*pairs: tuple[str, Any]) -> Any:
+    """Wrap (name, TomlBundleConfig) pairs into a TomlConfig."""
+    tc = crony.TomlConfig()
+    for name, cfg in pairs:
+        tc.bundles.append(
+            crony.TomlBundle(
+                name=name, source=Path(f"/test/{name}.toml"), config=cfg
+            )
+        )
+    return tc
+
+
+class TestNotifyInherit:
+    """`notify_channels = ["default"]` inherit sentinel: a non-default
+    bundle notifies as the default bundle would, and inherits it
+    implicitly when it omits notify config.
+    """
+
+    def test_implicit_default_for_nondefault_bundle(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
+        )
+        assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
+
+    def test_implicit_default_with_defaults_but_no_notify(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids(
+                {"defaults": {"job_timeout_sec": 60}, "job": {"a": _job()}}
+            ),
+            bundle_name="borgadm",
+        )
+        assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
+
+    def test_default_bundle_stays_empty(self) -> None:
+        cfg = crony.parse_config(_inject_uuids({"job": {"a": _job()}}))
+        assert cfg.defaults.notify_channels == []
+
+    def test_explicit_empty_opts_out(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids(
+                {"defaults": {"notify_channels": []}, "job": {"a": _job()}}
+            ),
+            bundle_name="borgadm",
+        )
+        assert cfg.defaults.notify_channels == []
+
+    def test_explicit_token_in_nondefault_ok(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids(
+                {
+                    "defaults": {"notify_channels": ["default"]},
+                    "job": {"a": _job()},
+                }
+            ),
+            bundle_name="borgadm",
+        )
+        assert cfg.defaults.notify_channels == ["default"]
+
+    def test_token_rejected_in_default_bundle(self) -> None:
+        with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
+            crony.parse_config(
+                _inject_uuids({"defaults": {"notify_channels": ["default"]}})
+            )
+
+    def test_token_must_be_sole_entry(self) -> None:
+        with pytest.raises(crony.ConfigError, match="must be the only"):
+            crony.parse_config(
+                _inject_uuids(
+                    {
+                        "defaults": {
+                            "notify_channels": ["default", "email"],
+                            "notify": {"email": _email_block()},
+                        }
+                    }
+                ),
+                bundle_name="borgadm",
+            )
+
+    def test_reserved_channel_name_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="reserved channel name"):
+            crony.parse_config(
+                _inject_uuids(
+                    {"defaults": {"notify": {"default": _ntfy_block()}}}
+                )
+            )
+
+    def test_job_level_token_ok_in_nondefault(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids({"job": {"a": _job(notify_channels=["default"])}}),
+            bundle_name="borgadm",
+        )
+        assert "a" in cfg.jobs
+        assert cfg.jobs["a"].notify_channels == ["default"]
+
+    def test_job_level_token_demoted_in_default(self) -> None:
+        cfg = crony.parse_config(
+            _inject_uuids({"job": {"a": _job(notify_channels=["default"])}})
+        )
+        assert "a" in cfg.errored_jobs
+        assert "cannot inherit its own" in cfg.errored_jobs["a"]
+
+    def _two_bundles(self, default_notify: list[str]) -> tuple[Any, Any]:
+        default_cfg = crony.parse_config(
+            _inject_uuids(
+                {
+                    "defaults": {
+                        "notify_channels": default_notify,
+                        "notify": {
+                            "ntfy": _ntfy_block(),
+                            "email": _email_block(),
+                        },
+                    }
+                }
+            )
+        )
+        borgadm_cfg = crony.parse_config(
+            _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
+        )
+        return default_cfg, borgadm_cfg
+
+    def test_expand_pulls_default_bundle(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, defaults = crony._expand_notify_inherit(
+            ["default"], "borgadm", bundles, borgadm_cfg.defaults
+        )
+        assert channels == ["ntfy"]
+        # Dispatch sources channel defs + attach settings from the
+        # default bundle, not the inheriting one.
+        assert defaults is default_cfg.defaults
+
+    def test_expand_noop_for_non_sentinel(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, defaults = crony._expand_notify_inherit(
+            ["email"], "borgadm", bundles, borgadm_cfg.defaults
+        )
+        assert channels == ["email"]
+        assert defaults is borgadm_cfg.defaults
+
+    def test_expand_default_self_inherit_guarded(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, defaults = crony._expand_notify_inherit(
+            ["default"], "default", bundles, default_cfg.defaults
+        )
+        assert channels == []
+        assert defaults is default_cfg.defaults
+
+    def test_expand_missing_default_bundle(self) -> None:
+        _, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(("borgadm", borgadm_cfg))
+        channels, defaults = crony._expand_notify_inherit(
+            ["default"], "borgadm", bundles, borgadm_cfg.defaults
+        )
+        assert channels == []
+        assert defaults is borgadm_cfg.defaults
+
+    def test_expand_drops_recursive_token(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        # A (malformed) default bundle that itself carries the token:
+        # expansion drops it rather than recursing.
+        default_cfg.defaults.notify_channels = ["default", "ntfy"]
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, _ = crony._expand_notify_inherit(
+            ["default"], "borgadm", bundles, borgadm_cfg.defaults
+        )
+        assert channels == ["ntfy"]
+
+    def test_runtime_inherit_and_per_job_disable(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The borgadm shape: a non-default bundle inherits the default
+        # bundle's channels, while one noisy job opts out with [].
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {"ntfy": _ntfy_block()},
+                }
+            },
+            default_target_jobs=[],
+        )
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            _uuid_toml(
+                '[job.check]\ncommand = "true"\n'
+                '[job.create]\ncommand = "true"\n'
+                "notify_channels = []\n"
+            ),
+            encoding="utf-8",
+        )
+        channels, defaults = crony._resolve_notify_at_runtime("borgadm.check")
+        assert channels == ["ntfy"]
+        assert "ntfy" in defaults.notify_channel_defs
+        disabled, _ = crony._resolve_notify_at_runtime("borgadm.create")
+        assert disabled == []
+
+
 class TestSelectionFilters:
     """Per-entry `platforms` / `hosts` filters silently filter
     entries out of the selection on incompatible (host, platform).
@@ -4598,6 +4805,46 @@ class TestNotifyTestSubcommand:
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown bundle"):
             crony.do_notify_test(channel=None, bundle="ghost")
+
+    def test_inheriting_bundle_dispatches_default_channels(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An inheriting bundle's notify-test sends through the default
+        # bundle's channels. A 503 from the (only, inherited) ntfy
+        # channel proves it was resolved and attempted.
+        secret = tmp_path / "ntfy-token"
+        secret.write_text("tk_test")
+        secret.chmod(0o600)
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {
+                        "ntfy": {
+                            "url": "https://ntfy.example.com/x",
+                            "token_file": str(secret),
+                        }
+                    },
+                }
+            },
+            default_target_jobs=[],
+        )
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            "[defaults]\n", encoding="utf-8"
+        )
+        calls: list[str] = []
+
+        def _raise(req: Any, timeout: Any = None) -> Any:
+            calls.append(req.full_url)
+            raise crony.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", {}, None
+            )
+
+        monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
+        with pytest.raises(crony.CronyError, match="notify-test failed"):
+            crony.do_notify_test(channel=None, bundle="borgadm")
+        assert calls, "inherited ntfy channel was not attempted"
 
 
 # =============================================================================
