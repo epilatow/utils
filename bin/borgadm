@@ -187,7 +187,8 @@ _PRUNE_KEEP_YEARLY: int = 2
 _MACOS_EXCLUDES: list[str] = [
     # iCloud -- causes deadlocks when borg reads during active sync
     "Library/Mobile Documents",
-    # Contains root-owned files (not a TCC/FDA issue)
+    # Contains root-owned files (a root-ownership problem, not a
+    # Full Disk Access one)
     "Library/Google/GoogleSoftwareUpdate",
 ]
 
@@ -1289,7 +1290,18 @@ def _build_wrapper() -> None:
 
 
 def automation_script_path() -> str:
-    """Return the path to the BorgAdm.app wrapper binary."""
+    """Return the path to the BorgAdm.app wrapper binary.
+
+    `create` reads user files, so it needs Full Disk Access. macOS
+    grants FDA to a code-signed app bundle's Mach-O executable, never
+    to an interpreted script, so `borgadm` (a `uv run` Python script)
+    cannot hold the grant itself -- the wrapper does, and `exec`s
+    borgadm so it inherits the access. The grant is keyed to the
+    app's identity, so it applies however the wrapper is launched
+    (directly by launchd, or by a scheduler that spawns it); the
+    launcher is not part of the equation. The `check` commands read
+    only repo metadata, so they run borgadm directly with no wrapper.
+    """
     binary = _wrapper_binary_path()
     logger.debug(f"Using wrapper app: {binary}")
     return str(binary)

@@ -26,7 +26,8 @@ This repo is a personal-utilities collection. Top-level structure:
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
-  utilities (e.g. BorgAdm.app for `borgadm`'s TCC / Full Disk Access flow).
+  utilities (e.g. BorgAdm.app, the Mach-O wrapper that lets `borgadm` hold a
+  Full Disk Access grant, which a Python script cannot).
 - `ruff.toml` -- ruff config shared across all Python in the repo.
 - `tmp/` -- gitignored scratch for plans, review inputs, and other ephemeral
   working files.
