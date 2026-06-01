@@ -415,6 +415,12 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # #            on macOS, systemd-inhibit on Linux). NOTE: closing the lid
 # #            on battery still sleeps the machine -- nothing in
 # #            userspace prevents that.
+# # success_exit_codes = [1]     # non-zero exit codes to classify as
+# #            success (exit 0 is always success). A run whose code is
+# #            listed is "ok" -- not failed, no notification -- and the
+# #            unit sees a 0 exit. For commands that exit non-zero on
+# #            transient / non-fatal conditions (e.g. borg's exit 1 on
+# #            backup warnings).
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
 # # Unresolved vars stay literal; `$$` is a literal `$`.
@@ -741,6 +747,12 @@ class TomlJob:
     # job sends no external notifications even if defaults / target
     # would).
     notify_channels: list[str] | None = None
+    # Non-zero exit codes to classify as success (exit 0 is always
+    # success). A run whose code lands here is "ok" -- not failed, no
+    # notification -- and `crony run` surfaces 0 to the scheduler. For
+    # commands that exit non-zero on transient / non-fatal conditions
+    # (e.g. borg's exit 1 on backup warnings).
+    success_exit_codes: list[int] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     # Interactive jobs sit pending in the background after their
     # scheduled fire and prompt the user before running. The two
@@ -1125,6 +1137,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "hosts",
         "job_timeout_sec",
         "notify_channels",
+        "success_exit_codes",
         "env",
         "interactive",
         "interactive_active",
@@ -1756,6 +1769,27 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     )
 
 
+def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
+    """Parse a job's `success_exit_codes` list (absent -> [])."""
+    if "success_exit_codes" not in raw:
+        return []
+    val = raw["success_exit_codes"]
+    # bool is a subclass of int; reject it so `[true]` isn't read as [1].
+    if not isinstance(val, list) or not all(
+        isinstance(x, int) and not isinstance(x, bool) for x in val
+    ):
+        raise ConfigError(
+            f"{where}: 'success_exit_codes' must be a list of integers"
+        )
+    for code in val:
+        if not 0 <= code <= 255:
+            raise ConfigError(
+                f"{where}: success_exit_codes entry {code} is out of the "
+                f"valid 0-255 exit-code range"
+            )
+    return val
+
+
 def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     """Parse [job.<name>]."""
     _validate_name(name, f"[job.{name}]")
@@ -1808,6 +1842,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
+    success_exit_codes = _parse_success_exit_codes(raw, where)
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec <= 0:
         raise ConfigError(f"{where}: job_timeout_sec must be positive")
@@ -1840,6 +1875,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         hosts=hosts,
         job_timeout_sec=job_timeout_sec,
         notify_channels=channels,
+        success_exit_codes=success_exit_codes,
         env=_string_dict(raw, "env", where),
         interactive=interactive,
         interactive_active_sec=interactive_active_sec,
@@ -2791,6 +2827,9 @@ class Job:
     # keep the machine awake for its duration. Read at fire time;
     # default-False for back-compat with older snapshots.
     keep_awake: bool = False
+    # Non-zero exit codes the runner classifies as success (read at
+    # fire time). Default-empty for back-compat with older snapshots.
+    success_exit_codes: list[int] = field(default_factory=list)
     # Interactive runner controls. `interactive_active_sec` and
     # `interactive_delay_sec` are always resolved (non-None) in
     # the snapshot so the runner doesn't re-consult any defaults
@@ -2875,6 +2914,7 @@ def _resolve_job_snapshot(
         interval=job.interval,
         priority=job.priority,
         keep_awake=job.keep_awake,
+        success_exit_codes=list(job.success_exit_codes),
         interactive=job.interactive,
         interactive_active_sec=(
             job.interactive_active_sec
@@ -5097,13 +5137,19 @@ def run_job(
                     if sig is not None:
                         exit_class = "signal"
                         exit_code: int | None = None
-                    elif rc == 0:
+                        surfaced_rc = 128 + sig
+                    elif rc == 0 or rc in snap.success_exit_codes:
+                        # A code the job declares as success (exit 0, or
+                        # a configured non-zero like borg's warning exit
+                        # 1): classify "ok" and surface 0 so the platform
+                        # scheduler doesn't record the unit as failed.
                         exit_class = "ok"
-                        exit_code = 0
+                        exit_code = rc
+                        surfaced_rc = 0
                     else:
                         exit_class = "fail"
                         exit_code = rc
-                    surfaced_rc = rc if sig is None else 128 + sig
+                        surfaced_rc = rc
                 except subprocess.TimeoutExpired:
                     exit_class = "timeout"
                     exit_code = None
@@ -7784,12 +7830,19 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
 def _trigger_exit_code(rec: dict[str, Any]) -> int:
     """Map a last-run.json record to a process exit code.
 
+    A run classified "ok" maps to 0 even when its recorded `exit_code`
+    is non-zero -- a `success_exit_codes` match preserves the real code
+    but classifies the run a success, so `crony trigger --wait` exits 0
+    just like the 0 `crony run` surfaces to the scheduler.
+
     `exit_code` is None whenever the job didn't reach a normal exit
     (timeout, signal, gate refusal, lock contention). `... or 0`
     would mask all of those as success; instead, derive the
     code from the exit_class so a `crony trigger --wait` against
     a timed-out job exits non-zero.
     """
+    if rec.get("exit_class") == "ok":
+        return 0
     rc = rec.get("exit_code")
     if rc is not None:
         return int(rc)

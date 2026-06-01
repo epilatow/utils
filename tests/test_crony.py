@@ -3418,6 +3418,126 @@ class TestRunJobBasics:
         assert not (h.state_dir("ok") / "last-run.json").exists()
 
 
+class TestSuccessExitCodes:
+    """Per-job `success_exit_codes`: configured non-zero codes classify
+    as "ok" (surfacing 0 to the scheduler, no notification); everything
+    else still fails.
+    """
+
+    def test_parse_accepts_int_list(self) -> None:
+        cfg = _parse({"job": {"j": _job(success_exit_codes=[0, 1])}})
+        assert cfg.jobs["j"].success_exit_codes == [0, 1]
+
+    def test_parse_default_empty(self) -> None:
+        cfg = _parse({"job": {"j": _job()}})
+        assert cfg.jobs["j"].success_exit_codes == []
+
+    def test_parse_rejects_non_int(self) -> None:
+        _assert_errored_job(
+            {"job": {"j": _job(success_exit_codes=["x"])}},
+            "j",
+            "must be a list of integers",
+        )
+
+    def test_parse_rejects_bool(self) -> None:
+        _assert_errored_job(
+            {"job": {"j": _job(success_exit_codes=[True])}},
+            "j",
+            "must be a list of integers",
+        )
+
+    def test_parse_rejects_out_of_range(self) -> None:
+        _assert_errored_job(
+            {"job": {"j": _job(success_exit_codes=[300])}},
+            "j",
+            "out of the valid 0-255",
+        )
+
+    def test_snapshot_carries_codes(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "warn": _job(success_exit_codes=[1]),
+                }
+            },
+            default_target_jobs=["warn"],
+        )
+        assert h.snap(cfg, "warn").success_exit_codes == [1]
+
+    def test_listed_code_classified_ok(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "warn": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                        "success_exit_codes": [1],
+                    }
+                }
+            },
+            default_target_jobs=["warn"],
+        )
+        # Surfaces 0 to the scheduler even though the command exited 1.
+        rc = crony.run_job(h.snap(cfg, "warn"))
+        assert rc == 0
+        rec = h.last_run("warn")
+        assert rec["exit_class"] == "ok"
+        # The real exit code is still recorded.
+        assert rec["exit_code"] == 1
+
+    def test_unlisted_code_still_fails(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "warn": {
+                        "command": "exit 2",
+                        "schedule": "daily",
+                        "success_exit_codes": [1],
+                    }
+                }
+            },
+            default_target_jobs=["warn"],
+        )
+        rc = crony.run_job(h.snap(cfg, "warn"))
+        assert rc == 2
+        rec = h.last_run("warn")
+        assert rec["exit_class"] == "fail"
+        assert rec["exit_code"] == 2
+
+    def test_ok_classification_suppresses_notify(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "warn": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                        "success_exit_codes": [1],
+                        "notify_channels": ["dialog-popup"],
+                    }
+                }
+            },
+            default_target_jobs=["warn"],
+        )
+        called: list[int] = []
+        monkeypatch.setattr(
+            crony, "_dispatch_notify", lambda *a, **k: called.append(1)
+        )
+        crony.run_job(h.snap(cfg, "warn"))
+        assert not called  # ok -> dispatch skipped, no dialog
+
+
 class TestRunJobGate:
     def test_gate_pass_runs_command(
         self, tmp_path: Path, monkeypatch: Any
@@ -7251,6 +7371,32 @@ class TestEnableDisable:
                 jobs=["j"], wait=True, trigger_timeout=None, bundle=None
             )
         assert exc.value.code == 7
+
+    def test_trigger_wait_treats_ok_as_zero_despite_nonzero_code(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A success_exit_codes match records exit_class "ok" with a
+        # non-zero exit_code; `trigger --wait` must still exit 0, not
+        # surface the raw code.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(
+            crony,
+            "_trigger_unit_sync",
+            lambda *a, **kw: {
+                "exit_class": "ok",
+                "exit_code": 1,
+                "signal": None,
+            },
+        )
+        # rc maps to 0, so do_trigger returns without raising SystemExit.
+        crony.do_trigger(
+            jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+        )
 
     def test_trigger_timeout_requires_wait(
         self, tmp_path: Path, monkeypatch: Any
