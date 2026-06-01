@@ -248,7 +248,7 @@ class TestConfigSubcommandDispatch:
         ):
             result = crony.cli()
         assert result == 0
-        mock_cb.assert_called_once_with(bundle="foo")
+        mock_cb.assert_called_once_with(bundle="foo", file=None)
 
     def test_config_without_action_errors(self, capsys: Any) -> None:
         with (
@@ -9194,7 +9194,7 @@ class TestValidate:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_validate(bundle=None)
+        crony.do_validate(bundle=None, file=None)
         out = capsys.readouterr().out
         assert "ok" in out
 
@@ -9210,7 +9210,7 @@ class TestValidate:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_validate(bundle=None)
+        crony.do_validate(bundle=None, file=None)
         out = capsys.readouterr().out
         assert "orphans on this host" not in out
         assert "ghost" not in out
@@ -9233,7 +9233,7 @@ class TestValidate:
             default_target_jobs=["j"],
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
+            crony.do_validate(bundle=None, file=None)
         assert exc.value.code == int(crony.ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "channel 'email'" in out
@@ -9257,7 +9257,7 @@ class TestValidate:
             default_target_jobs=["j"],
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
+            crony.do_validate(bundle=None, file=None)
         assert exc.value.code == int(crony.ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "channel 'ntfy'" in out
@@ -9278,7 +9278,7 @@ class TestValidate:
             ),
             encoding="utf-8",
         )
-        crony.do_validate(bundle="borgadm")
+        crony.do_validate(bundle="borgadm", file=None)
         out = capsys.readouterr().out
         assert "ok" in out
         assert "orphans" not in out
@@ -9289,7 +9289,7 @@ class TestValidate:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config({}, default_target_jobs=[])
         with pytest.raises(crony.UsageError, match="unknown bundle"):
-            crony.do_validate(bundle="ghost")
+            crony.do_validate(bundle="ghost", file=None)
 
     def test_warns_on_errored_job_group(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -9307,7 +9307,7 @@ class TestValidate:
             encoding="utf-8",
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
+            crony.do_validate(bundle=None, file=None)
         assert exc.value.code == int(crony.ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "undefined name" in out
@@ -9325,11 +9325,107 @@ class TestValidate:
             encoding="utf-8",
         )
         with pytest.raises(SystemExit) as exc:
-            crony.do_validate(bundle=None)
+            crony.do_validate(bundle=None, file=None)
         assert exc.value.code == int(crony.ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "[target.darwin]" in out
         assert "undefined name" in out
+
+    def test_file_mode_valid(self, tmp_path: Path, capsys: Any) -> None:
+        # Mirrors a borgadm-style drop-in: a non-default bundle whose
+        # check job omits notify_channels (implicit inherit) and whose
+        # noisy job silences itself, plus priority/keep_awake. The
+        # bundle name comes from the filename stem.
+        p = tmp_path / "borgadm.toml"
+        p.write_text(
+            "[job.create]\n"
+            'uuid = "11111111-1111-5111-8111-111111111111"\n'
+            'command = "wrapper create"\n'
+            'interval = "1h"\n'
+            'priority = "high"\n'
+            "keep_awake = true\n"
+            "notify_channels = []\n"
+            "[job.check-age]\n"
+            'uuid = "22222222-2222-5222-8222-222222222222"\n'
+            'command = "borgadm check age"\n'
+            'interval = "1d"\n'
+            'priority = "high"\n'
+            "keep_awake = true\n"
+            "[target.darwin]\n"
+            'jobs = ["create", "check-age"]\n',
+            encoding="utf-8",
+        )
+        crony.do_validate(bundle=None, file=str(p))
+        out = capsys.readouterr().out
+        assert "ok" in out
+        assert "bundle 'borgadm'" in out
+
+    def test_file_mode_rejects_invalid_entry(self, tmp_path: Path) -> None:
+        p = tmp_path / "borgadm.toml"
+        p.write_text(
+            "[job.create]\n"
+            'uuid = "11111111-1111-5111-8111-111111111111"\n'
+            'command = "true"\n'
+            'interval = "1h"\n'
+            'priority = "turbo"\n'
+            "[target.darwin]\n"
+            'jobs = ["create"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.ConfigError, match="invalid config"):
+            crony.do_validate(bundle=None, file=str(p))
+
+    def test_file_mode_rejects_structural_error(self, tmp_path: Path) -> None:
+        p = tmp_path / "borgadm.toml"
+        p.write_text('[defaults]\nnotify_channels = "nope"\n', encoding="utf-8")
+        with pytest.raises(crony.ConfigError):
+            crony.do_validate(bundle=None, file=str(p))
+
+    def test_file_mode_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(crony.ConfigError, match="config not found"):
+            crony.do_validate(bundle=None, file=str(tmp_path / "nope.toml"))
+
+    def test_file_mode_bad_bundle_name_from_stem(self, tmp_path: Path) -> None:
+        # Stem "bad.name" carries a dot -> not a valid bundle name.
+        p = tmp_path / "bad.name.toml"
+        p.write_text(
+            "[job.j]\n"
+            'uuid = "11111111-1111-5111-8111-111111111111"\n'
+            'command = "true"\n'
+            'interval = "1h"\n'
+            "[target.darwin]\n"
+            'jobs = ["j"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(crony.ConfigError, match="bundle name"):
+            crony.do_validate(bundle=None, file=str(p))
+
+    def test_file_mode_default_config_uses_default_semantics(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The installed config.toml validates as the 'default' bundle,
+        # not bundle 'config' from its stem.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.j]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        crony.do_validate(bundle=None, file=str(h.cfg_file))
+        assert "bundle 'default'" in capsys.readouterr().out
+
+    def test_file_mode_default_config_rejects_inherit_sentinel(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Validated as 'default', the notify-inherit sentinel is
+        # rejected -- proving CONFIG_FILE gets default-bundle
+        # semantics, not stem-based 'config' semantics (where the
+        # sentinel would be allowed).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            '[defaults]\nnotify_channels = ["default"]\n', encoding="utf-8"
+        )
+        with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
+            crony.do_validate(bundle=None, file=str(h.cfg_file))
 
 
 class TestResolveStateAxes:
@@ -12575,7 +12671,7 @@ class TestLifecycleSmoke:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony.do_validate(bundle=None)
+        crony.do_validate(bundle=None, file=None)
         # apply -> renders + activates
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()

@@ -9279,7 +9279,51 @@ def _validate_bundle_warnings(
     return warnings
 
 
-def do_validate(bundle: str | None) -> None:
+def _validate_file(path: Path) -> None:
+    """Structurally validate a single TOML file as a bundle.
+
+    The bundle name is derived exactly as the loader would for this
+    path: the installed default config file (`CONFIG_FILE`) is the
+    `default` bundle, any other file is named after its stem (so
+    `borgadm.toml` validates as bundle `borgadm`). That keeps the
+    default-bundle-only rules (e.g. no notify-inherit sentinel) and
+    the non-default inherit semantics aligned with what `apply` will
+    later enforce. Parses the file and runs the per-entity /
+    cross-cutting schema checks, but does NOT touch the installed
+    config dir or run the secret-resolution / linger checks: a
+    not-yet-installed file has no host context, and an inheriting
+    bundle's channels live in the default bundle, which a single file
+    can't see. Lets a tool (or user) pre-flight a generated bundle
+    before installing it. Raises ConfigError (exit CONFIG) on any
+    error; prints `ok` and returns when clean.
+    """
+    if not path.exists():
+        raise ConfigError(f"config not found: {path}")
+    if path.resolve() == CONFIG_FILE.resolve():
+        name = DEFAULT_BUNDLE_NAME
+    else:
+        name = path.stem
+    _validate_bundle_name(name, str(path))
+    # _load_one_bundle logs each per-entity error and raises on a
+    # bundle-level structural failure; the errored_* counts catch the
+    # per-entity cases so this exits non-zero on either.
+    bundle = _load_one_bundle(name, path)
+    cfg = bundle.config
+    errored = (
+        len(cfg.errored_jobs)
+        + len(cfg.errored_job_groups)
+        + len(cfg.errored_platform_targets)
+        + len(cfg.errored_host_targets)
+    )
+    if errored:
+        raise ConfigError(
+            f"{path}: {errored} invalid config "
+            f"{'entry' if errored == 1 else 'entries'}"
+        )
+    print(f"ok: {path} validates as bundle {name!r}")
+
+
+def do_validate(bundle: str | None, file: str | None) -> None:
     """Lint configs; report linger status and broken secret files.
 
     load_all_bundles already enforces per-bundle structural rules and
@@ -9295,7 +9339,14 @@ def do_validate(bundle: str | None) -> None:
     that bundle. The host-wide linger-status check only runs in the
     unfiltered case -- it's about the whole-host picture, not any
     one bundle.
+
+    With --file <path> (mutually exclusive with --bundle), validates
+    that single file in isolation rather than the installed config
+    dir -- see `_validate_file`.
     """
+    if file is not None:
+        _validate_file(Path(file))
+        return
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
     platform = current_platform()
@@ -9636,7 +9687,8 @@ def build_parser() -> argparse.ArgumentParser:
         "validate",
         help="Lint config; report orphans, linger, etc",
     )
-    p_config_validate.add_argument(
+    p_config_validate_scope = p_config_validate.add_mutually_exclusive_group()
+    p_config_validate_scope.add_argument(
         "-b",
         "--bundle",
         default=None,
@@ -9644,6 +9696,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Restrict per-bundle warnings to one bundle. "
             "Cross-host checks (orphans, linger) are skipped in "
             "this mode -- run without --bundle for those."
+        ),
+    )
+    p_config_validate_scope.add_argument(
+        "--file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Structurally validate a single TOML file as a bundle "
+            "(named after its stem, or 'default' for the installed "
+            "config.toml), independent of the config dir. Exits "
+            "non-zero on any error. Lets a tool pre-flight a bundle."
         ),
     )
 
