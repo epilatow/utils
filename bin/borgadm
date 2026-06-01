@@ -1084,10 +1084,10 @@ def report_runtime() -> None:
 def _repo_root() -> Path:
     """Return the borgadm repo root.
 
-    Resolves symlinks so paths derived from this work when borgadm
-    is invoked via a symlinked launcher (e.g. ~/.local/bin/borgadm
-    -> repo/bin/borgadm); without the resolve, the launcher's
-    parent dir would be returned instead of the repo checkout.
+    Resolves symlinks so paths derived from this work when borgadm is
+    invoked through a symlinked launcher; without the resolve, the
+    launcher's parent dir would be returned instead of the repo
+    checkout.
     """
     return Path(__file__).resolve().parent.parent
 
