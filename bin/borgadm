@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["tomlkit"]
 # ///
 # This is human generated code that's been AI modified
 #
@@ -37,6 +38,9 @@ import threading
 import time
 import traceback
 import typing
+import uuid
+
+import tomlkit
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -61,8 +65,6 @@ from typing import (
     cast,
 )
 
-from xml.dom import minidom
-from xml.etree import ElementTree
 
 # -----------------------------------------------------------------------------
 # Constants and Globals
@@ -1099,85 +1101,6 @@ def report_runtime() -> None:
     logger.debug(f"Execution time (hh:mm:ss): {elapsed_time_str}")
 
 
-def create_plist_element(
-    task: str,
-    args: list[str],
-    interval: int,
-    env: dict[str, str],
-    log_path: str,
-) -> ElementTree.Element:
-    plist = ElementTree.Element("plist", version="1.0")
-    dict_elem = ElementTree.SubElement(plist, "dict")
-
-    def add_kv(key: str, value: str) -> None:
-        ElementTree.SubElement(dict_elem, "key").text = key
-        ElementTree.SubElement(dict_elem, "string").text = value
-
-    def add_bool(key: str, val: bool) -> None:
-        ElementTree.SubElement(dict_elem, "key").text = key
-        ElementTree.SubElement(dict_elem, "true" if val else "false")
-
-    def add_int(key: str, val: int) -> None:
-        ElementTree.SubElement(dict_elem, "key").text = key
-        ElementTree.SubElement(dict_elem, "integer").text = str(val)
-
-    def add_env(env_vars: dict[str, str]) -> None:
-        ElementTree.SubElement(dict_elem, "key").text = "EnvironmentVariables"
-        env_dict = ElementTree.SubElement(dict_elem, "dict")
-        for k, v in env_vars.items():
-            ElementTree.SubElement(env_dict, "key").text = k
-            ElementTree.SubElement(env_dict, "string").text = v
-
-    add_kv("Label", f"local.borgadm.{task}")
-
-    # EnvironmentVariables
-    if env:
-        add_env(env)
-
-    # ProgramArguments
-    ElementTree.SubElement(dict_elem, "key").text = "ProgramArguments"
-    arr = ElementTree.SubElement(dict_elem, "array")
-    for part in args:
-        ElementTree.SubElement(arr, "string").text = part
-
-    # Log paths
-    add_kv("StandardOutPath", log_path)
-    add_kv("StandardErrorPath", log_path)
-
-    add_int("StartInterval", interval)
-    # Interactive avoids QoS throttling that can drastically slow
-    # I/O-bound backups (4x+ slower observed with Standard).
-    add_kv("ProcessType", "Interactive")
-    add_bool("LowPriorityIO", False)
-    add_int("Nice", 0)
-    add_bool("PreventSleep", True)
-
-    return plist
-
-
-def render_plist_string(element: ElementTree.Element) -> str:
-    """Render a plist ElementTree element to a plist file string."""
-    rough_string = ElementTree.tostring(element, encoding="utf-8")
-    reparsed = minidom.parseString(rough_string)
-    pretty_xml = reparsed.toprettyxml(indent="    ")
-    xml_lines = pretty_xml.split("\n")
-    if xml_lines[0].startswith("<?xml"):
-        xml_lines = xml_lines[1:]
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n'
-        ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        + "\n".join(xml_lines)
-    )
-
-
-def create_plist_file(element: ElementTree.Element, path: Path) -> None:
-    content = render_plist_string(element)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    with os.fdopen(fd, "w") as f:
-        f.write(content)
-
-
 # -----------------------------------------------------------------------------
 # Subcommands
 # -----------------------------------------------------------------------------
@@ -1310,280 +1233,236 @@ def automation_script_path() -> str:
 def _automate_check_platform() -> None:
     if platform.system() != "Darwin":
         raise BorgadmError("automate subcommand is only supported on osx")
-
-    if not shutil.which("plutil"):
-        raise BorgadmError("plutil not found in PATH")
-
-    if not shutil.which("launchctl"):
-        raise BorgadmError("launchctl not found in PATH")
+    # Drives crony, which owns the scheduler side (launchd here).
+    _crony_path()
 
 
-_TASK_NAME_TEMPLATE = "local.borgadm.{task}"
+# Name of the crony bundle borgadm owns: drop-in file `borgadm.toml`,
+# jobs namespaced `borgadm.<op>`.
+_CRONY_BUNDLE = "borgadm"
+
+# Fixed namespace so each operation's crony-job UUID is stable across
+# enable / disable / enable cycles -- seeded by bundle + operation name
+# (e.g. "borgadm-create") rather than hard-coded per job.
+_CRONY_UUID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/epilatow/utils#borgadm-crony"
+)
 
 
 def _direct_script_path() -> str:
     """Return the path to borgadm itself (no FDA wrapper).
 
-    Resolves symlinks so a launchd plist points at the real
+    Resolves symlinks so a crony job command points at the real
     script in the repo rather than a launcher symlink that
     could later move.
     """
     return str(Path(__file__).resolve())
 
 
-def _automate_tasks() -> tuple[dict[str, dict[str, Any]], dict[str, Path]]:
-    wrapper_path = automation_script_path()
-    # Check tasks don't read user files -- run borgadm directly
-    # (least privilege: no FDA wrapper needed).
-    direct_path = _direct_script_path()
-    tasks: dict[str, dict[str, Any]] = {
-        "create": {
-            "args": [
-                wrapper_path,
-                "create",
-                "--timestamp-messages",
-            ],
-            "interval": (60 * 60),
-        },
-        "check-daily": {
-            "args": [
-                "/bin/sh",
-                "-c",
-                f"{shlex.quote(direct_path)} check age"
-                f" --enable-notifications"
-                f" --timestamp-messages"
-                f"; {shlex.quote(direct_path)} check prune"
-                f" --enable-notifications"
-                f" --timestamp-messages",
-            ],
-            "interval": (60 * 60 * 24),
-        },
-        "check-weekly": {
-            "args": [
-                "/bin/sh",
-                "-c",
-                f"{shlex.quote(direct_path)} check repo"
-                f" --enable-notifications"
-                f" --timestamp-messages"
-                f"; {shlex.quote(direct_path)} check archives"
-                f" --enable-notifications"
-                f" --timestamp-messages",
-            ],
-            "interval": (60 * 60 * 24 * 7),
-        },
-        # Legacy task names (pre-rename); kept so disable/status can
-        # find and clean them up on systems that upgraded in-place.
-        "check_age": {"legacy": True},
-        "check_all": {"legacy": True},
+def _crony_path() -> str:
+    """Path to the sibling crony tool that owns the schedule.
+
+    Raises if it isn't a usable executable so enable / disable /
+    status fail clearly rather than mid-subprocess.
+    """
+    crony = _repo_root() / "bin" / "crony"
+    if not crony.is_file() or not os.access(crony, os.X_OK):
+        raise BorgadmError(f"crony not found or not executable: {crony}")
+    return str(crony)
+
+
+def _crony_dropin_dir() -> Path:
+    """crony's drop-in config dir, resolved exactly as crony resolves
+    it (its CRONY_CONFIG_DROPIN_DIR / CRONY_CONFIG_DIR env vars, else
+    the ~/.config/crony/config default) so the bundle lands where
+    crony reads it.
+
+    crony derives that default from its own script basename, so the
+    hardcoded "crony" here holds only while the sibling tool keeps that
+    name; _crony_path() resolves the same basename.
+    """
+    dropin = os.environ.get("CRONY_CONFIG_DROPIN_DIR")
+    if dropin:
+        return Path(dropin)
+    config_dir = os.environ.get("CRONY_CONFIG_DIR") or os.path.expanduser(
+        "~/.config/crony"
+    )
+    return Path(config_dir) / "config"
+
+
+def _crony_bundle_path() -> Path:
+    return _crony_dropin_dir() / f"{_CRONY_BUNDLE}.toml"
+
+
+def _crony_job_uuid(op: str) -> str:
+    """Deterministic UUID for a crony job, stable across re-enables."""
+    return str(uuid.uuid5(_CRONY_UUID_NAMESPACE, f"{_CRONY_BUNDLE}-{op}"))
+
+
+def _crony_jobs() -> list[tuple[str, str, str]]:
+    """Return (job-name, command, interval) for each automated job.
+
+    `create` reads user files, so it runs through the FDA wrapper; the
+    `check` commands read only repo metadata and run borgadm directly.
+    Each command is a single `/bin/sh -c` string (how crony runs a
+    job's `command`), with paths shell-quoted.
+    """
+    wrapper = automation_script_path()
+    direct = _direct_script_path()
+
+    def check(op: str) -> str:
+        return (
+            f"{shlex.quote(direct)} check {op}"
+            f" --enable-notifications --timestamp-messages"
+        )
+
+    return [
+        (
+            "create",
+            f"{shlex.quote(wrapper)} create --timestamp-messages",
+            "1h",
+        ),
+        ("check-age", check("age"), "1d"),
+        ("check-prune", check("prune"), "1d"),
+        ("check-repo", check("repo"), "7d"),
+        ("check-archives", check("archives"), "7d"),
+    ]
+
+
+def _render_crony_bundle() -> str:
+    """Render the crony bundle TOML borgadm installs.
+
+    All jobs run un-throttled (`priority = high`) and hold the machine
+    awake (`keep_awake`). `create` is silenced (`notify_channels = []`)
+    -- it runs hourly and is expected to fail intermittently on a
+    laptop -- while the checks omit notify_channels to inherit the
+    default bundle's channels. `env` extends PATH with ~/.local/bin so
+    borgadm's `uv` shebang resolves under the scheduler's minimal PATH.
+    """
+    jobs: dict[str, Any] = {}
+    for name, command, interval in _crony_jobs():
+        job: dict[str, Any] = {
+            "uuid": _crony_job_uuid(name),
+            "command": command,
+            "interval": interval,
+            "priority": "high",
+            "keep_awake": True,
+        }
+        if name == "create":
+            job["notify_channels"] = []
+        job["env"] = {"PATH": "$HOME/.local/bin:$PATH"}
+        jobs[name] = job
+    doc: dict[str, Any] = {
+        "job": jobs,
+        "target": {"darwin": {"jobs": [n for n, _, _ in _crony_jobs()]}},
     }
-    task_dir: Path = Path(os.environ["HOME"]) / "Library" / "LaunchAgents"
-    task2path: dict[str, Path] = {
-        task: task_dir / (_TASK_NAME_TEMPLATE.format(task=task) + ".plist")
-        for task in tasks
-    }
-    return tasks, task2path
+    header = (
+        "# Generated by `borgadm automate enable` -- edits are\n"
+        "# overwritten on the next enable.\n\n"
+    )
+    return header + tomlkit.dumps(doc)
 
 
 def do_log_files() -> None:
     log_paths: list[str] = [str(LOGFILE)]
-    for lp in _enabled_automation_log_paths():
+    for lp in _crony_log_paths():
         if lp not in log_paths:
             log_paths.append(lp)
     for lp in log_paths:
         logger.info(lp)
 
 
-def _enabled_automation_log_paths() -> list[str]:
-    """Return log paths from launchd plists for currently loaded tasks.
-
-    Returns an empty list on non-Darwin platforms, when launchctl is
-    unavailable, or when no automation tasks are loaded.
+def _crony_log_paths() -> list[str]:
+    """Return each automated job's crony run-log path when crony is
+    managing the bundle. Empty on non-Darwin, when crony is missing, or
+    when the bundle isn't installed. Each path comes from `crony logs
+    <job> -p`, which resolves structurally from the bundle config (no
+    run required yet).
     """
-    if platform.system() != "Darwin" or not shutil.which("launchctl"):
+    if platform.system() != "Darwin" or not _crony_bundle_path().exists():
         return []
-    _tasks, task2path = _automate_tasks()
-    launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
-    paths: list[str] = []
-    for task, path in task2path.items():
-        tname = _TASK_NAME_TEMPLATE.format(task=task)
-        pattern = re.compile(r"[ \t]" + re.escape(tname) + r"$")
-        loaded = any(pattern.search(line) for line in launchctl_tasks)
-        if not loaded or not path.exists():
-            continue
-        tree = ElementTree.parse(path)
-        dict_elem = tree.find("dict")
-        if dict_elem is None:
-            continue
-        children = list(dict_elem)
-        for i, elem in enumerate(children):
-            if (
-                elem.tag == "key"
-                and elem.text
-                in (
-                    "StandardOutPath",
-                    "StandardErrorPath",
-                )
-                and i + 1 < len(children)
-                and children[i + 1].tag == "string"
-            ):
-                val = children[i + 1].text
-                if val and val not in paths:
-                    paths.append(val)
-    return paths
-
-
-def _is_task_outdated(
-    task: str,
-    cfg: dict[str, Any],
-    path: Path,
-) -> bool:
-    """Check if an installed plist differs from what would be generated."""
-    if not path.exists():
-        return False
-    expected = render_plist_string(
-        create_plist_element(
-            task,
-            cfg["args"],
-            cfg["interval"],
-            _launchd_env(),
-            _task_log_path(task),
-        )
-    )
     try:
-        current = path.read_text()
-    except OSError:
-        return False
-    return current != expected
+        crony = _crony_path()
+    except BorgadmError:
+        return []
+    paths: list[str] = []
+    for name, _command, _interval in _crony_jobs():
+        proc = run_cmd(
+            [crony, "logs", f"{_CRONY_BUNDLE}.{name}", "-p"], errok=True
+        )
+        lp = proc.stdout.strip()
+        if proc.returncode == 0 and lp:
+            paths.append(lp)
+    return paths
 
 
 def do_automate_status() -> None:
     _automate_check_platform()
-    tasks, task2path = _automate_tasks()
-
-    launchctl_tasks = run_cmd(["launchctl", "list"]).stdout.splitlines()
-    enabled_count = 0
-    needs_update = False
-    for task, path in task2path.items():
-        cfg = tasks[task]
-        is_legacy = cfg.get("legacy", False)
-        tname = _TASK_NAME_TEMPLATE.format(task=task)
-        pattern = r"[ \t]" + re.escape(tname) + r"$"
-        cpattern = re.compile(pattern)
-        loaded = any(cpattern.search(i) for i in launchctl_tasks)
-        has_plist = path.exists()
-
-        # Skip legacy tasks that have been fully cleaned up.
-        if is_legacy and not loaded and not has_plist:
-            continue
-
-        tags: list[str] = []
-        if loaded:
-            tags.append("enabled")
-            if not is_legacy:
-                enabled_count += 1
-        elif has_plist:
-            tags.append("unloaded")
-        else:
-            tags.append("disabled")
-
-        if is_legacy:
-            tags.append("legacy")
-        if not is_legacy and has_plist:
-            if _is_task_outdated(task, cfg, path):
-                tags.append("outdated")
-
-        tag_str = ", ".join(tags)
-        if has_plist or loaded:
-            msg = f"{tname}: {tag_str}: {path}"
-        else:
-            msg = f"{tname}: {tag_str}"
-
-        problematic = (tags[0] != "enabled" and tags[0] != "disabled") or len(
-            tags
-        ) > 1
-        if problematic:
-            needs_update = True
-        logger.info(msg)
-
+    crony = _crony_path()
+    # Without the bundle file crony has no addressable borgadm bundle and
+    # would just error; report the cleaner not-enabled state directly.
+    if not _crony_bundle_path().exists():
+        logger.info(
+            "Automation is not enabled (run 'borgadm automate enable')."
+        )
+        return
+    # crony owns the per-job state; show its table for the bundle.
+    run_cmd(
+        [crony, "status", "-b", _CRONY_BUNDLE], allow_output=True, errok=True
+    )
     rebuild, reason = _wrapper_needs_rebuild()
     if rebuild:
         logger.info(f"BorgAdm wrapper needs rebuilding: {reason}")
-        needs_update = True
-
-    total = len([t for t in tasks if not tasks[t].get("legacy", False)])
-    if enabled_count < total or needs_update:
-        logger.info(
-            "Run 'borgadm automate enable' to update and enable automations."
-        )
+        logger.info("Run 'borgadm automate enable' to rebuild and re-apply.")
 
 
 def do_automate_disable() -> None:
     _automate_check_platform()
-    tasks, task2path = _automate_tasks()
-
-    for task, path in task2path.items():
-        if not path.exists():
-            continue
-        is_legacy = tasks[task].get("legacy", False)
-        label = "legacy " if is_legacy else ""
-        logger.info(f"Removing {label}{task} launchd config: {str(path)}")
-        run_cmd(["launchctl", "unload", str(path)], errok=True)
-        path.unlink()
-
-
-def _launchd_env() -> dict[str, str]:
-    """Return environment variables for launchd plist configs."""
-    return {
-        "PATH": os.path.expanduser("~/.local/bin")
-        + ":/usr/bin:/bin:/usr/sbin:/sbin",
-    }
-
-
-def _task_log_path(task: str) -> str:
-    """Return the log file path for a given automation task."""
-    log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
-    return str(log_dir / f"{task}.log")
+    crony = _crony_path()
+    bundle = _crony_bundle_path()
+    # `destroy` works off crony's on-disk state, so it removes the units
+    # and logs even when the bundle file is already gone. Tolerate its
+    # failure (errok) so disabling an already-disabled borgadm -- where
+    # crony has no addressable bundle and exits nonzero -- is a no-op
+    # rather than an error. But a present bundle file means the bundle is
+    # installed, so a nonzero exit is a real failure (e.g. a running job
+    # holds the lock) and gets surfaced rather than silently swallowed.
+    proc = run_cmd(
+        [crony, "destroy", "-b", _CRONY_BUNDLE],
+        allow_output=True,
+        errok=True,
+    )
+    if proc.returncode != 0 and bundle.exists():
+        raise BorgadmError(
+            f"crony destroy failed (exit {proc.returncode}); "
+            "is a borgadm job currently running?"
+        )
+    if bundle.exists():
+        logger.info(f"Removing crony bundle: {bundle}")
+        bundle.unlink()
 
 
 def do_automate_enable() -> None:
     _automate_check_platform()
+    crony = _crony_path()
 
-    # Build wrapper before generating plists (so the plist paths
-    # point to the compiled binary, not a stale or missing one).
+    # `create` runs through the wrapper for FDA; build it first so the
+    # bundle's command points at a present binary.
     rebuild, reason = _wrapper_needs_rebuild()
     if rebuild:
         logger.info(f"Rebuilding BorgAdm wrapper: {reason}")
         _build_wrapper()
 
-    tasks, task2path = _automate_tasks()
+    bundle = _crony_bundle_path()
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    bundle.write_text(_render_crony_bundle())
+    logger.info(f"Wrote crony bundle: {bundle}")
+    # apply reconciles idempotently (deterministic UUIDs), so re-enable
+    # is a no-op update rather than a delete + re-add.
+    run_cmd([crony, "apply", "-b", _CRONY_BUNDLE], allow_output=True)
 
-    # Remove any existing configs first
-    do_automate_disable()
-
-    launchd_env = _launchd_env()
-
-    log_dir = Path(os.environ["HOME"]) / "Library" / "Logs" / "borgadm"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"Log directory: {log_dir}")
-
-    for task, cfg in tasks.items():
-        if cfg.get("legacy", False):
-            continue
-        path = task2path[task]
-        log_path = _task_log_path(task)
-        logger.info(f"Creating {task} launchd config: {str(path)}")
-        pe = create_plist_element(
-            task,
-            cfg["args"],
-            cfg["interval"],
-            launchd_env,
-            log_path,
-        )
-        create_plist_file(pe, path)
-        run_cmd(["plutil", str(path)])
-        run_cmd(["launchctl", "load", str(path)])
-
-    # Print Full Disk Access instructions
+    # Full Disk Access is granted to BorgAdm.app's identity and is what
+    # the `create` job needs to read user files.
     app = _wrapper_app_path()
     logger.info("")
     logger.info("=" * 60)
@@ -2453,7 +2332,7 @@ def args_parser() -> argparse.ArgumentParser:
     )
     automate_subparsers.add_parser(
         "status",
-        help="Show automation status and launchd file paths",
+        help="Show automation status (via crony)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

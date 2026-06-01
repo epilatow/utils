@@ -55,9 +55,9 @@ gated by platform checks.
   Linux and intermittently cross its 120s per-call timeout, while Linux runs
   the identical suite reliably in under a minute (borg is cross-platform, so
   coverage is the same). The macOS CI leg runs only the non-e2e suite -- which
-  is where the macOS-specific code lives (the BorgAdm C wrapper, the launchd
-  automate path) -- so a local `--e2e` run is the way to exercise the e2e
-  suite on macOS.
+  is where the macOS-specific code lives (the BorgAdm C wrapper, the
+  crony-backed `automate` subcommand) -- so a local `--e2e` run is the way to
+  exercise the e2e suite on macOS.
 
 ## Conventions
 

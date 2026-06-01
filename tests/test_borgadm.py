@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov", "pytest-xdist"]
+# dependencies = ["pytest", "pytest-cov", "pytest-xdist", "tomlkit"]
 # ///
 # This is human generated code that's been AI modified
 
@@ -27,12 +27,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 from unittest.mock import Mock, patch
-from xml.etree import ElementTree
 
 import pytest
 from conftest import (
@@ -1330,196 +1331,27 @@ class TestListUnknownArchives:
 
 
 class TestAutomate:
-    """Test automate subcommand."""
+    """Test the automate subcommand (crony-backed)."""
+
+    JOB_OPS = [
+        "create",
+        "check-age",
+        "check-prune",
+        "check-repo",
+        "check-archives",
+    ]
 
     @pytest.fixture
     def automate_env(
-        self, tmp_path: Path, mock_cfg: Any
+        self, tmp_path: Path, monkeypatch: Any
     ) -> Iterator[tuple[Path, Any, Any]]:
-        """Set up mocked environment for automate tests."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
-
+        """Darwin + a temp crony drop-in dir + mocked run_cmd (so crony
+        is never really invoked) + no wrapper rebuild.
+        """
+        dropin = tmp_path / "crony-config"
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "create_plist_element", autospec=True),
-            patch.object(
-                ba, "create_plist_file", autospec=True
-            ) as mock_create_file,
-            patch.object(
-                ba,
-                "_wrapper_needs_rebuild",
-                autospec=True,
-                return_value=(False, ""),
-            ),
-            patch.object(
-                ba,
-                "_build_wrapper",
-                autospec=True,
-            ),
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
-            yield task_dir, mock_run, mock_create_file
-
-    CURRENT_TASKS = {"create", "check-daily", "check-weekly"}
-
-    def _created_task_names(self, mock_create_file: Any) -> set[str]:
-        """Extract task names from create_plist_file mock calls."""
-        return {
-            Path(call.args[1]).stem.removeprefix("local.borgadm.")
-            for call in mock_create_file.call_args_list
-        }
-
-    def test_enable_creates_current_plists(self, automate_env: Any) -> None:
-        """Test that enable creates plists for current tasks."""
-        _task_dir, _mock_run, mock_create_file = automate_env
-
-        ba.do_automate_enable()
-
-        created = self._created_task_names(mock_create_file)
-        assert created == self.CURRENT_TASKS
-
-    def test_enable_skips_legacy_tasks(self, automate_env: Any) -> None:
-        """Test that enable does not create plists for legacy tasks."""
-        _task_dir, _mock_run, mock_create_file = automate_env
-
-        ba.do_automate_enable()
-
-        created = self._created_task_names(mock_create_file)
-        legacy_names = {"check_age", "check_all"}
-        assert not created & legacy_names, (
-            f"Legacy plists should not be created: {created & legacy_names}"
-        )
-
-    def test_disable_removes_current_plists(self, automate_env: Any) -> None:
-        """Test that disable removes current plist files."""
-        task_dir, _mock_run, _ = automate_env
-        for name in self.CURRENT_TASKS:
-            (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
-
-        ba.do_automate_disable()
-
-        remaining = list(task_dir.glob("*.plist"))
-        assert remaining == [], f"Plists not removed: {remaining}"
-
-    def test_disable_removes_legacy_plists(self, automate_env: Any) -> None:
-        """Test that disable removes legacy plist files."""
-        task_dir, _mock_run, _ = automate_env
-        for name in ["check_age", "check_all"]:
-            (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
-
-        ba.do_automate_disable()
-
-        remaining = list(task_dir.glob("*.plist"))
-        assert remaining == [], f"Legacy plists not removed: {remaining}"
-
-    def test_status_no_recommendation_when_all_enabled(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that status shows no recommendation when all enabled."""
-        _task_dir, mock_run, _ = automate_env
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "123\t0\tlocal.borgadm.create\n"
-                "456\t0\tlocal.borgadm.check-daily\n"
-                "789\t0\tlocal.borgadm.check-weekly\n"
-            ),
-            stderr="",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        assert not any("automate enable" in r.message for r in caplog.records)
-
-    def test_status_recommends_enable_when_disabled(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that status recommends enable when all disabled."""
-        _task_dir, _mock_run, _ = automate_env
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        assert any("automate enable" in r.message for r in caplog.records)
-
-    def test_status_recommends_enable_when_partial(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that status recommends enable when partially enabled."""
-        _task_dir, mock_run, _ = automate_env
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="123\t0\tlocal.borgadm.create\n",
-            stderr="",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        assert any("automate enable" in r.message for r in caplog.records)
-
-    def test_status_recommends_enable_on_legacy_tasks(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that status recommends enable for loaded legacy tasks."""
-        _task_dir, mock_run, _ = automate_env
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "123\t0\tlocal.borgadm.check_age\n"
-                "456\t0\tlocal.borgadm.check_all\n"
-            ),
-            stderr="",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        legacy_msgs = [
-            r for r in caplog.records if "legacy" in r.message.lower()
-        ]
-        # One message per legacy task
-        assert len(legacy_msgs) >= 2
-        # Summary should tell user to run enable
-        assert any("automate enable" in r.message for r in caplog.records)
-
-    def test_status_recommends_enable_on_unloaded_legacy(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        """Test that status recommends enable for unloaded legacy plists."""
-        task_dir, _mock_run, _ = automate_env
-        stale = task_dir / "local.borgadm.check_age.plist"
-        stale.write_text("<plist/>")
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        unloaded_msgs = [
-            r
-            for r in caplog.records
-            if "unloaded" in r.message and "legacy" in r.message
-        ]
-        assert len(unloaded_msgs) >= 1
-
-    @pytest.fixture
-    def status_env(self, tmp_path: Path, mock_cfg: Any) -> Iterator[Any]:
-        """Set up environment for status tests that need real plists."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
-
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(
                 ba,
@@ -1527,479 +1359,196 @@ class TestAutomate:
                 autospec=True,
                 return_value=(False, ""),
             ),
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+            patch.object(ba, "_build_wrapper", autospec=True) as mock_build,
         ):
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
-            yield mock_run
+            yield dropin, mock_run, mock_build
 
-    def _write_current_plist(
-        self, task: str, cfg: dict[str, Any], path: Path
-    ) -> None:
-        """Write a plist file matching current create_plist_element."""
-        elem = ba.create_plist_element(
-            task,
-            cfg["args"],
-            cfg["interval"],
-            ba._launchd_env(),
-            ba._task_log_path(task),
-        )
-        ba.create_plist_file(elem, path)
+    @staticmethod
+    def _crony_calls(mock_run: Any) -> list[list[str]]:
+        """The crony argv (after the crony path) of each run_cmd call."""
+        return [list(call.args[0][1:]) for call in mock_run.call_args_list]
 
-    def test_status_recommends_enable_on_outdated(
-        self, status_env: Any, caplog: Any
-    ) -> None:
-        """Test that status recommends enable for outdated plists."""
-        mock_run = status_env
-        tasks, task2path = ba._automate_tasks()
-
-        # Write stale plist content for all current tasks
-        for task, cfg in tasks.items():
-            if cfg.get("legacy", False):
-                continue
-            task2path[task].write_text("<plist>stale</plist>")
-
-        # All current tasks loaded in launchd
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "123\t0\tlocal.borgadm.create\n"
-                "456\t0\tlocal.borgadm.check-daily\n"
-                "789\t0\tlocal.borgadm.check-weekly\n"
-            ),
-            stderr="",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        outdated_msgs = [
-            r for r in caplog.records if "outdated" in r.message.lower()
-        ]
-        # One message per outdated task
-        assert len(outdated_msgs) >= 3
-        # Summary should tell user to run enable
-        assert any("automate enable" in r.message for r in caplog.records)
-
-    def test_status_no_recommendation_when_current(
-        self, status_env: Any, caplog: Any
-    ) -> None:
-        """Test no recommendation when plists match current config."""
-        mock_run = status_env
-        tasks, task2path = ba._automate_tasks()
-
-        # Write current plist content for all current tasks
-        for task, cfg in tasks.items():
-            if cfg.get("legacy", False):
-                continue
-            self._write_current_plist(task, cfg, task2path[task])
-
-        # All current tasks loaded in launchd
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "123\t0\tlocal.borgadm.create\n"
-                "456\t0\tlocal.borgadm.check-daily\n"
-                "789\t0\tlocal.borgadm.check-weekly\n"
-            ),
-            stderr="",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-
-        assert not any("outdated" in r.message.lower() for r in caplog.records)
-
-    def test_enable_replaces_legacy_plists(self, automate_env: Any) -> None:
-        """Test that enable removes legacy plists and creates current."""
-        task_dir, _mock_run, mock_create_file = automate_env
-        # Pre-populate legacy plists as if upgraded without disabling
-        for name in ["check_age", "check_all"]:
-            (task_dir / f"local.borgadm.{name}.plist").write_text("<plist/>")
-
+    def test_enable_writes_bundle_and_applies(self, automate_env: Any) -> None:
+        dropin, mock_run, _ = automate_env
         ba.do_automate_enable()
+        bundle = dropin / "borgadm.toml"
+        assert bundle.exists()
+        text = bundle.read_text()
+        for op in self.JOB_OPS:
+            assert f"[job.{op}]" in text
+        assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
 
-        # Legacy plists should be removed
-        for name in ["check_age", "check_all"]:
-            p = task_dir / f"local.borgadm.{name}.plist"
-            assert not p.exists(), f"Legacy plist not removed: {p}"
-        # Current plists should be created
-        created = self._created_task_names(mock_create_file)
-        assert created == self.CURRENT_TASKS
+    def test_enable_builds_wrapper_when_needed(self, automate_env: Any) -> None:
+        _dropin, _mock_run, mock_build = automate_env
+        # The fixture already patched _wrapper_needs_rebuild (so no
+        # autospec here -- can't spec an existing Mock); flip it to
+        # signal a rebuild is needed.
+        with patch.object(
+            ba,
+            "_wrapper_needs_rebuild",
+            return_value=(True, "stale source"),
+        ):
+            ba.do_automate_enable()
+        mock_build.assert_called_once()
 
-    def test_script_path_uses_wrapper_app(self) -> None:
-        """Test that automation uses wrapper app path."""
-        result = ba.automation_script_path()
-        assert result.endswith(
-            "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
+    def test_disable_destroys_and_removes_bundle(
+        self, automate_env: Any
+    ) -> None:
+        dropin, mock_run, _ = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        ba.do_automate_disable()
+        assert ["destroy", "-b", "borgadm"] in self._crony_calls(mock_run)
+        assert not bundle.exists()
+
+    def test_disable_is_noop_when_not_enabled(self, automate_env: Any) -> None:
+        # No bundle file: crony has nothing addressable and exits nonzero,
+        # but disable must treat that as a clean no-op, not an error.
+        dropin, mock_run, _ = automate_env
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="unknown bundle"
         )
+        ba.do_automate_disable()
+        assert not (dropin / "borgadm.toml").exists()
 
-    def test_enable_compiles_wrapper(
-        self, tmp_path: Path, mock_cfg: Any
+    def test_disable_surfaces_failure_when_bundle_present(
+        self, automate_env: Any
     ) -> None:
-        """Test that enable calls _build_wrapper when needed."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "create_plist_element", autospec=True),
-            patch.object(ba, "create_plist_file", autospec=True),
-            patch.object(
-                ba,
-                "_wrapper_needs_rebuild",
-                autospec=True,
-                return_value=(True, "test"),
-            ),
-            patch.object(
-                ba,
-                "_build_wrapper",
-                autospec=True,
-            ) as mock_build,
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
-            ba.do_automate_enable()
-        mock_build.assert_called()
+        # The bundle is installed (file present) but destroy fails for a
+        # real reason (a running job holds the lock); that must surface
+        # rather than silently leaving the file in place.
+        dropin, mock_run, _ = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=7, stdout="", stderr="lock held"
+        )
+        with pytest.raises(ba.BorgadmError, match="crony destroy failed"):
+            ba.do_automate_disable()
+        assert bundle.exists()
 
-    def test_status_reports_wrapper_outdated(
-        self, tmp_path: Path, mock_cfg: Any, caplog: Any
+    def test_status_shells_out_to_crony(self, automate_env: Any) -> None:
+        dropin, mock_run, _ = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        ba.do_automate_status()
+        assert ["status", "-b", "borgadm"] in self._crony_calls(mock_run)
+
+    def test_status_clean_when_not_enabled(
+        self, automate_env: Any, caplog: Any
     ) -> None:
-        """Test that status reports when wrapper needs rebuilding."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(
-                ba,
-                "_wrapper_needs_rebuild",
-                autospec=True,
-                return_value=(True, "test"),
-            ),
-            patch.object(ba, "_build_wrapper", autospec=True),
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
-            caplog.at_level(logging.INFO),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+        # No bundle file: report the not-enabled state directly instead
+        # of shelling out to crony (which would just error).
+        _dropin, mock_run, _ = automate_env
+        with caplog.at_level(logging.INFO):
             ba.do_automate_status()
-        assert any("wrapper" in r.message.lower() for r in caplog.records)
-        assert any("automate enable" in r.message for r in caplog.records)
+        assert ["status", "-b", "borgadm"] not in self._crony_calls(mock_run)
+        assert any("not enabled" in r.message for r in caplog.records)
 
-    def test_automate_exits_on_non_darwin(self, mock_cfg: Any) -> None:
-        """Test that automate raises BorgadmError on non-Darwin."""
-        with (
-            patch.object(ba.platform, "system", return_value="Linux"),
-            pytest.raises(ba.BorgadmError),
-        ):
+    def test_enable_requires_darwin(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        with pytest.raises(ba.BorgadmError, match="only supported on osx"):
             ba.do_automate_enable()
 
-    def test_automate_exits_without_plutil(self, mock_cfg: Any) -> None:
-        """Test that automate raises when plutil is not found."""
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", side_effect=lambda x: None),
-            pytest.raises(ba.BorgadmError),
-        ):
-            ba.do_automate_enable()
+    def test_deterministic_uuids(self) -> None:
+        assert ba._crony_job_uuid("create") == ba._crony_job_uuid("create")
+        assert ba._crony_job_uuid("create") != ba._crony_job_uuid("check-age")
+        # canonical lowercase UUID form (crony requires it)
+        parsed = uuid.UUID(ba._crony_job_uuid("create"))
+        assert str(parsed) == ba._crony_job_uuid("create")
 
-    def test_automate_exits_without_launchctl(self, mock_cfg: Any) -> None:
-        """Test that automate raises when launchctl is not found."""
+    def test_create_silenced_checks_inherit(self) -> None:
+        doc = tomllib.loads(ba._render_crony_bundle())
+        assert doc["job"]["create"]["notify_channels"] == []
+        assert "notify_channels" not in doc["job"]["check-age"]
+        for op in self.JOB_OPS:
+            assert doc["job"][op]["priority"] == "high"
+            assert doc["job"][op]["keep_awake"] is True
+        assert doc["target"]["darwin"]["jobs"] == self.JOB_OPS
 
-        def which_side_effect(cmd: str) -> str | None:
-            return "/usr/bin/plutil" if cmd == "plutil" else None
-
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", side_effect=which_side_effect),
-            pytest.raises(ba.BorgadmError),
-        ):
-            ba.do_automate_enable()
-
-    def test_daily_task_runs_checks_independently(
-        self, automate_env: Any
+    def test_generated_bundle_validates_against_crony(
+        self, tmp_path: Path
     ) -> None:
-        """Daily task uses ';' not '&&' so all checks run."""
-        _task_dir, _mock_run, _mock_create_file = automate_env
-        tasks, _ = ba._automate_tasks()
-        daily_args = tasks["check-daily"]["args"]
-        shell_cmd = daily_args[2]
-        assert "&&" not in shell_cmd, "Daily checks should use ';' not '&&'"
-        assert "; " in shell_cmd
-        assert "check age" in shell_cmd
-        assert "check prune" in shell_cmd
-
-    def test_weekly_task_only_runs_repo_and_archives(
-        self, automate_env: Any
-    ) -> None:
-        """Weekly task runs only repo and archives checks."""
-        _task_dir, _mock_run, _mock_create_file = automate_env
-        tasks, _ = ba._automate_tasks()
-        weekly_args = tasks["check-weekly"]["args"]
-        shell_cmd = weekly_args[2]
-        assert "check repo" in shell_cmd
-        assert "check archives" in shell_cmd
-        assert "check age" not in shell_cmd
-        assert "check prune" not in shell_cmd
-        assert "check-all" not in shell_cmd
+        # The bundle borgadm generates must be accepted by the real
+        # crony's validator, so a future crony schema change that breaks
+        # borgadm fails here rather than at install time.
+        f = tmp_path / "borgadm.toml"
+        f.write_text(ba._render_crony_bundle())
+        crony = ba._crony_path()
+        proc = subprocess.run(
+            [crony, "config", "validate", "--file", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 class TestLogFiles:
-    """Test top-level log-files subcommand."""
+    """Test the log-files subcommand (crony-backed)."""
 
-    CURRENT_TASKS = {"create", "check-daily", "check-weekly"}
+    def test_shows_default_logfile_only_without_bundle(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
+        with patch.object(
+            ba,
+            "_crony_bundle_path",
+            autospec=True,
+            return_value=Path("/nonexistent/borgadm.toml"),
+        ):
+            with caplog.at_level(logging.INFO):
+                ba.do_log_files()
+        messages = [r.message for r in caplog.records]
+        assert messages == [str(ba.LOGFILE)]
 
-    @staticmethod
-    def _launchctl_output(loaded_tasks: set[str]) -> str:
-        """Build a fake `launchctl list` stdout marking given tasks loaded."""
-        lines = ["PID\tStatus\tLabel"]
-        for task in loaded_tasks:
-            lines.append(f"123\t0\tlocal.borgadm.{task}")
-        return "\n".join(lines) + "\n"
+    def test_no_crony_paths_off_darwin(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        with caplog.at_level(logging.INFO):
+            ba.do_log_files()
+        messages = [r.message for r in caplog.records]
+        assert messages == [str(ba.LOGFILE)]
 
-    @pytest.fixture
-    def darwin_env(self, tmp_path: Path) -> Iterator[tuple[Path, Any]]:
-        """Set up a Darwin environment with all current tasks loaded."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
+    def test_shows_crony_log_paths_when_bundle_present(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
+        bundle = tmp_path / "borgadm.toml"
+        bundle.write_text("# stub\n")
+        log_paths = {
+            op: f"/state/crony/borgadm/u-{op}/run.log"
+            for op in TestAutomate.JOB_OPS
+        }
+
+        def fake_run(
+            cmd: list[str], *args: Any, **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            # cmd == [crony, "logs", "borgadm.<job>", "-p"]
+            job = cmd[2].split(".", 1)[1]
+            return subprocess.CompletedProcess(
+                cmd, 0, log_paths[job] + "\n", ""
+            )
 
         with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
+            patch.object(
+                ba, "_crony_bundle_path", autospec=True, return_value=bundle
+            ),
+            patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
         ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=self._launchctl_output(self.CURRENT_TASKS),
-                stderr="",
-            )
-            yield task_dir, mock_run
-
-    @staticmethod
-    def _write_plist(
-        path: Path, log_path: str, stderr_path: str | None = None
-    ) -> None:
-        """Write a minimal plist file with log path entries."""
-        plist = ElementTree.Element("plist", version="1.0")
-        d = ElementTree.SubElement(plist, "dict")
-        ElementTree.SubElement(d, "key").text = "Label"
-        ElementTree.SubElement(d, "string").text = "test"
-        ElementTree.SubElement(d, "key").text = "StandardOutPath"
-        ElementTree.SubElement(d, "string").text = log_path
-        ElementTree.SubElement(d, "key").text = "StandardErrorPath"
-        ElementTree.SubElement(d, "string").text = (
-            stderr_path if stderr_path else log_path
-        )
-        tree = ElementTree.ElementTree(plist)
-        tree.write(path, xml_declaration=True, encoding="UTF-8")
-
-    def test_shows_default_logfile(self, darwin_env: Any, caplog: Any) -> None:
-        """log-files always includes the default log file."""
-        _task_dir, _mock_run = darwin_env
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert str(ba.LOGFILE) in messages
-
-    def test_default_logfile_listed_first(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """The default log file is listed first."""
-        task_dir, _mock_run = darwin_env
-        plist_path = task_dir / "local.borgadm.create.plist"
-        self._write_plist(plist_path, "/tmp/logs/create.log")
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
+            with caplog.at_level(logging.INFO):
+                ba.do_log_files()
         messages = [r.message for r in caplog.records]
         assert messages[0] == str(ba.LOGFILE)
-
-    def test_default_logfile_not_duplicated(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """Default log file isn't duplicated if a plist uses it."""
-        task_dir, _mock_run = darwin_env
-        plist_path = task_dir / "local.borgadm.create.plist"
-        self._write_plist(plist_path, str(ba.LOGFILE))
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        matches = [r for r in caplog.records if r.message == str(ba.LOGFILE)]
-        assert len(matches) == 1
-
-    def test_shows_paths_from_enabled_plists(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """log-files shows paths from plists for enabled tasks."""
-        task_dir, _mock_run = darwin_env
-        for name in self.CURRENT_TASKS:
-            plist_path = task_dir / f"local.borgadm.{name}.plist"
-            log = f"/tmp/logs/{name}.log"
-            self._write_plist(plist_path, log)
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        for name in self.CURRENT_TASKS:
-            assert any(
-                f"/tmp/logs/{name}.log" in r.message for r in caplog.records
-            )
-
-    def test_skips_unloaded_tasks(self, darwin_env: Any, caplog: Any) -> None:
-        """Plists for tasks not loaded in launchctl are skipped."""
-        task_dir, mock_run = darwin_env
-        # Only "create" is loaded; "check-daily" has a plist but isn't.
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=self._launchctl_output({"create"}),
-            stderr="",
-        )
-        self._write_plist(
-            task_dir / "local.borgadm.create.plist", "/tmp/logs/create.log"
-        )
-        self._write_plist(
-            task_dir / "local.borgadm.check-daily.plist",
-            "/tmp/logs/check-daily.log",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert any("/tmp/logs/create.log" in m for m in messages)
-        assert not any("/tmp/logs/check-daily.log" in m for m in messages)
-
-    def test_no_paths_when_nothing_enabled(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """Only default log file is shown when no tasks are loaded."""
-        task_dir, mock_run = darwin_env
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=self._launchctl_output(set()),
-            stderr="",
-        )
-        # Plist exists, but task isn't loaded -- should be ignored.
-        self._write_plist(
-            task_dir / "local.borgadm.create.plist", "/tmp/logs/create.log"
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert messages == [str(ba.LOGFILE)]
-
-    def test_deduplicates_stdout_stderr(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """Identical stdout/stderr paths appear only once."""
-        task_dir, _mock_run = darwin_env
-        plist_path = task_dir / "local.borgadm.create.plist"
-        self._write_plist(plist_path, "/tmp/logs/create.log")
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        matches = [
-            r for r in caplog.records if "/tmp/logs/create.log" in r.message
-        ]
-        assert len(matches) == 1
-
-    def test_shows_distinct_stderr(self, darwin_env: Any, caplog: Any) -> None:
-        """Distinct stderr path is also shown."""
-        task_dir, _mock_run = darwin_env
-        plist_path = task_dir / "local.borgadm.create.plist"
-        self._write_plist(plist_path, "/tmp/logs/out.log", "/tmp/logs/err.log")
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert any("/tmp/logs/out.log" in m for m in messages)
-        assert any("/tmp/logs/err.log" in m for m in messages)
-
-    def test_no_plists(self, darwin_env: Any, caplog: Any) -> None:
-        """Default log file is shown even with no plists."""
-        _task_dir, _mock_run = darwin_env
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert messages == [str(ba.LOGFILE)]
-
-    def test_reads_legacy_plists_when_loaded(
-        self, darwin_env: Any, caplog: Any
-    ) -> None:
-        """Legacy plists are read when their task is still loaded."""
-        task_dir, mock_run = darwin_env
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=self._launchctl_output({"check_age"}),
-            stderr="",
-        )
-        self._write_plist(
-            task_dir / "local.borgadm.check_age.plist",
-            "/tmp/logs/check_age.log",
-        )
-
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-
-        assert any(
-            "/tmp/logs/check_age.log" in r.message for r in caplog.records
-        )
-
-    def test_non_darwin_shows_only_default(
-        self, tmp_path: Path, caplog: Any
-    ) -> None:
-        """On non-Darwin platforms, only the default log file is shown."""
-        with (
-            patch.object(ba.platform, "system", return_value="Linux"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            caplog.at_level(logging.INFO),
-        ):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert messages == [str(ba.LOGFILE)]
-        # launchctl must not be invoked off Darwin.
-        mock_run.assert_not_called()
-
-    def test_no_launchctl_shows_only_default(
-        self, tmp_path: Path, caplog: Any
-    ) -> None:
-        """If launchctl isn't on PATH, only the default log file is shown."""
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value=None),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            caplog.at_level(logging.INFO),
-        ):
-            ba.do_log_files()
-
-        messages = [r.message for r in caplog.records]
-        assert messages == [str(ba.LOGFILE)]
-        mock_run.assert_not_called()
+        for lp in log_paths.values():
+            assert lp in messages
 
 
 class TestCheck:
@@ -2667,33 +2216,11 @@ class TestStartEndMarkers:
 
 
 class TestAutomateTimestampFlag:
-    """Test that automation plists include --timestamp-messages."""
+    """Every automated job passes --timestamp-messages."""
 
-    def test_enable_includes_timestamp_messages(
-        self, tmp_path: Path, mock_cfg: Any
-    ) -> None:
-        """Test that plist args include --timestamp-messages."""
-        task_dir = tmp_path / "Library" / "LaunchAgents"
-        task_dir.mkdir(parents=True)
-        with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
-            patch.object(ba.shutil, "which", return_value="/usr/bin/tool"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "create_plist_element", autospec=True) as mock_cpe,
-            patch.object(ba, "create_plist_file", autospec=True),
-            patch.dict(os.environ, {"HOME": str(tmp_path)}),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
-            ba.do_automate_enable()
-
-        for call in mock_cpe.call_args_list:
-            task_args: list[str] = call.args[1]
-            args_str = " ".join(task_args)
-            assert "--timestamp-messages" in args_str, (
-                f"--timestamp-messages missing from: {task_args}"
-            )
+    def test_bundle_commands_include_timestamp_messages(self) -> None:
+        for _name, command, _interval in ba._crony_jobs():
+            assert "--timestamp-messages" in command, command
 
 
 class TestTimestampPruning:
@@ -2996,51 +2523,6 @@ logger.info("end-sentinel")
         acc = io.StringIO()
         ba.pump_stream(src, ExplodingSink(), acc, allow_output=False)
         assert acc.getvalue() == "a\nb\nc\n"
-
-
-class TestCreatePlistElement:
-    """Test that create_plist_element produces correct plist fields."""
-
-    def _plist_dict(
-        self, element: ElementTree.Element
-    ) -> dict[str, str | bool | int]:
-        """Parse plist element into a flat dict of key-value pairs."""
-        result: dict[str, str | bool | int] = {}
-        dict_elem = element.find("dict")
-        assert dict_elem is not None
-        keys = list(dict_elem)
-        i = 0
-        while i < len(keys):
-            if keys[i].tag == "key":
-                key_text = keys[i].text or ""
-                val_elem = keys[i + 1]
-                if val_elem.tag == "string":
-                    result[key_text] = val_elem.text or ""
-                elif val_elem.tag == "integer":
-                    result[key_text] = int(val_elem.text or "0")
-                elif val_elem.tag == "true":
-                    result[key_text] = True
-                elif val_elem.tag == "false":
-                    result[key_text] = False
-                i += 2
-            else:
-                i += 1
-        return result
-
-    def test_scheduling_fields(self) -> None:
-        """Verify ProcessType, Nice, LowPriorityIO, PreventSleep."""
-        elem = ba.create_plist_element(
-            task="test",
-            args=["/usr/bin/true"],
-            interval=3600,
-            env={},
-            log_path="/dev/null",
-        )
-        d = self._plist_dict(elem)
-        assert d["ProcessType"] == "Interactive"
-        assert d["Nice"] == 0
-        assert d["LowPriorityIO"] is False
-        assert d["PreventSleep"] is True
 
 
 class TestCli:
