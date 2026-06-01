@@ -1463,6 +1463,10 @@ class TestAutomate:
         # inheriting the bundle default above.
         assert doc["job"]["create"]["notify_channels"] == []
         assert "notify_channels" not in doc["job"]["check-age"]
+        # create treats borg's transient-warning exit 1 as success; the
+        # checks keep the default (a check warning is a real signal).
+        assert doc["job"]["create"]["success_exit_codes"] == [1]
+        assert "success_exit_codes" not in doc["job"]["check-age"]
         for op in self.JOB_OPS:
             assert doc["job"][op]["priority"] == "high"
             assert doc["job"][op]["keep_awake"] is True

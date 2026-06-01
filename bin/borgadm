@@ -1298,11 +1298,13 @@ def _render_crony_bundle() -> str:
     awake (`keep_awake`). The bundle default `notify_channels` is
     ["default", "dialog-popup"], so a failing check notifies through the
     user's default crony bundle AND pops a desktop dialog. `create`
-    overrides with `notify_channels = []` (silent) -- it runs hourly and
-    is expected to fail intermittently on a laptop -- while the checks
-    omit notify_channels to take the bundle default. `env` extends PATH
-    with ~/.local/bin so borgadm's `uv` shebang resolves under the
-    scheduler's minimal PATH.
+    overrides with `notify_channels = []` (silent) and treats borg's
+    transient-warning exit (`success_exit_codes = [1]`) as success -- it
+    runs hourly and a file changing or vanishing mid-read is noise, not
+    a failed backup -- while the checks omit notify_channels to take the
+    bundle default and keep the default exit handling (a check warning
+    is a real signal). `env` extends PATH with ~/.local/bin so borgadm's
+    `uv` shebang resolves under the scheduler's minimal PATH.
     """
     jobs: dict[str, Any] = {}
     for name, command, interval in _crony_jobs():
@@ -1315,6 +1317,7 @@ def _render_crony_bundle() -> str:
         }
         if name == "create":
             job["notify_channels"] = []
+            job["success_exit_codes"] = [1]
         job["env"] = {"PATH": "$HOME/.local/bin:$PATH"}
         jobs[name] = job
     doc: dict[str, Any] = {
