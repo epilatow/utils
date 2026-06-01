@@ -152,10 +152,8 @@ class CheckPruneError(BorgadmError):
 
 
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
-_notify_title: str = BASENAME
 _warning_occurred: bool = False
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
-_logger_buffer: io.StringIO
 _ssh_agent_pid: Optional[str] = None
 _start_time: float = time.perf_counter()
 
@@ -411,24 +409,6 @@ def get_cfg() -> Config:
     return CFG
 
 
-def has_tty() -> bool:
-    return sys.stdin.isatty() or sys.stdout.isatty() or sys.stderr.isatty()
-
-
-def osascript_notify() -> None:
-    if not has_tty() and shutil.which("osascript"):
-        logs = _logger_buffer.getvalue().strip().replace('"', '\\"')[:10000]
-        script = f'display dialog "{logs}" with title "{_notify_title} error"'
-        cmd = ["osascript", "-e", script]
-        # No timeout is needed since we don't wait for the commmand to finish.
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-
 class InfoFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return record.levelno == logging.INFO
@@ -486,7 +466,6 @@ def initialize_logger(
     logfile_path: str | Path,
     verbose: bool = False,
     timestamp_messages: bool = False,
-    enable_notifications: bool = False,
 ) -> None:
     for existing in list(logger.handlers):
         if getattr(existing, _BORGADM_HANDLER_TAG, False):
@@ -494,18 +473,6 @@ def initialize_logger(
             existing.close()
 
     logger.setLevel(logging.DEBUG)  # Capture all logs for the file
-
-    # In memory logger for notifications
-    global _logger_buffer
-    _logger_buffer = io.StringIO()
-    memory_handler = logging.StreamHandler(_logger_buffer)
-    memory_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
-    memory_handler.addFilter(WarnOrWorseFilter(verbose))
-    memory_formatter = logging.Formatter(
-        "%(asctime)s: PID %(process)d: %(levelname)s: %(message)s"
-    )
-    memory_handler.setFormatter(memory_formatter)
-    _install_handler(memory_handler)
 
     # File handler - all messages with full formatting
     file_handler = logging.FileHandler(logfile_path)
@@ -547,8 +514,6 @@ def initialize_logger(
             "Uncaught exception",
             exc_info=(exc_type, exc_value, exc_traceback),
         )
-        if enable_notifications:
-            osascript_notify()
 
     sys.excepthook = log_exceptions
 
@@ -1311,10 +1276,7 @@ def _crony_jobs() -> list[tuple[str, str, str]]:
     direct = _direct_script_path()
 
     def check(op: str) -> str:
-        return (
-            f"{shlex.quote(direct)} check {op}"
-            f" --enable-notifications --timestamp-messages"
-        )
+        return f"{shlex.quote(direct)} check {op} --timestamp-messages"
 
     return [
         (
@@ -1333,11 +1295,14 @@ def _render_crony_bundle() -> str:
     """Render the crony bundle TOML borgadm installs.
 
     All jobs run un-throttled (`priority = high`) and hold the machine
-    awake (`keep_awake`). `create` is silenced (`notify_channels = []`)
-    -- it runs hourly and is expected to fail intermittently on a
-    laptop -- while the checks omit notify_channels to inherit the
-    default bundle's channels. `env` extends PATH with ~/.local/bin so
-    borgadm's `uv` shebang resolves under the scheduler's minimal PATH.
+    awake (`keep_awake`). The bundle default `notify_channels` is
+    ["default", "dialog-popup"], so a failing check notifies through the
+    user's default crony bundle AND pops a desktop dialog. `create`
+    overrides with `notify_channels = []` (silent) -- it runs hourly and
+    is expected to fail intermittently on a laptop -- while the checks
+    omit notify_channels to take the bundle default. `env` extends PATH
+    with ~/.local/bin so borgadm's `uv` shebang resolves under the
+    scheduler's minimal PATH.
     """
     jobs: dict[str, Any] = {}
     for name, command, interval in _crony_jobs():
@@ -1353,6 +1318,7 @@ def _render_crony_bundle() -> str:
         job["env"] = {"PATH": "$HOME/.local/bin:$PATH"}
         jobs[name] = job
     doc: dict[str, Any] = {
+        "defaults": {"notify_channels": ["default", "dialog-popup"]},
         "job": jobs,
         "target": {"darwin": {"jobs": [n for n, _, _ in _crony_jobs()]}},
     }
@@ -2554,14 +2520,6 @@ def args_parser() -> argparse.ArgumentParser:
             help="borgadm config file",
         )
         p.add_argument(
-            "--enable-notifications",
-            action="store_true",
-            help=(
-                "Enable system notifications for command failures "
-                "(only supported on osx)"
-            ),
-        )
-        p.add_argument(
             "--verbose",
             action="store_true",
             help="Enable verbose output",
@@ -2573,7 +2531,7 @@ def args_parser() -> argparse.ArgumentParser:
         )
 
     for name, subparser in subparsers.choices.items():
-        # self-test doesn't need config or notification args
+        # self-test doesn't need the common config/output args
         if name == "self-test":
             continue
         has_actions = any(
@@ -2641,7 +2599,6 @@ def main(
     config: str,
     verbose: bool,
     timestamp_messages: bool,
-    enable_notifications: bool,
     args_dict: dict[str, Any],
 ) -> None:
     quick_commands = {
@@ -2654,13 +2611,9 @@ def main(
     timed = command not in quick_commands
     cmd_start = time.perf_counter()
     cmd_label = command  # tentative; refined below
-    global _notify_title
-    _notify_title = f"borgadm {command}"  # tentative; refined below
 
     try:
-        initialize_logger(
-            LOGFILE, verbose, timestamp_messages, enable_notifications
-        )
+        initialize_logger(LOGFILE, verbose, timestamp_messages)
 
         invocation = " ".join(shlex.quote(arg) for arg in sys.argv)
         logger.debug(f"Invocation: {invocation}")
@@ -2684,23 +2637,17 @@ def main(
 
         action = args_dict.pop("action", None)
         cmd_label = f"{command} {action}" if action else command
-        _notify_title = f"borgadm {cmd_label}"
         if timed:
             logger.info(f"borgadm {cmd_label}: started")
 
         COMMAND_CALLBACKS[cmd_label](**args_dict)
     except Exception as e:
         logger.error("%s", e)
-        if enable_notifications:
-            osascript_notify()
         raise
     finally:
         if timed:
             elapsed = timedelta(seconds=int(time.perf_counter() - cmd_start))
             logger.info(f"borgadm {cmd_label}: finished (elapsed: {elapsed})")
-
-    if _warning_occurred and enable_notifications:
-        osascript_notify()
 
 
 def cli() -> int:
@@ -2724,7 +2671,6 @@ def cli() -> int:
     config = args_dict.pop("config")
     verbose = args_dict.pop("verbose")
     timestamp_messages = args_dict.pop("timestamp_messages")
-    enable_notifications = args_dict.pop("enable_notifications")
 
     try:
         main(
@@ -2732,7 +2678,6 @@ def cli() -> int:
             config,
             verbose,
             timestamp_messages,
-            enable_notifications,
             args_dict,
         )
     except BorgadmError as e:

@@ -352,14 +352,12 @@ class TestArgumentParser:
 
     def test_check_legacy_rewrite_preserves_args(self) -> None:
         """Test legacy rewrite preserves trailing arguments."""
-        result = ba.rewrite_legacy_args(
-            ["borgadm", "check-age", "--enable-notifications"]
-        )
+        result = ba.rewrite_legacy_args(["borgadm", "check-age", "--verbose"])
         assert result == [
             "borgadm",
             "check",
             "age",
-            "--enable-notifications",
+            "--verbose",
         ]
 
     def test_check_legacy_rewrite_ignores_non_legacy(self) -> None:
@@ -396,7 +394,6 @@ class TestArgumentParser:
         cases = [
             ["check", "--verbose", "age"],
             ["check", "--config", "/tmp/c", "age"],
-            ["check", "--enable-notifications", "age"],
             ["automate", "--verbose", "enable"],
             ["repair", "--verbose", "delete-cache"],
         ]
@@ -412,11 +409,6 @@ class TestArgumentParser:
         parser = ba.args_parser()
         cases: list[tuple[list[str], str, object]] = [
             (["check", "age", "--verbose"], "verbose", True),
-            (
-                ["check", "age", "--enable-notifications"],
-                "enable_notifications",
-                True,
-            ),
             (
                 ["check", "age", "--config", "/tmp/c"],
                 "config",
@@ -446,8 +438,8 @@ class TestArgumentParser:
         parser = ba.args_parser()
         args = parser.parse_args(["break-lock", "--verbose"])
         assert args.verbose is True
-        args = parser.parse_args(["create", "--enable-notifications"])
-        assert args.enable_notifications is True
+        args = parser.parse_args(["create", "--timestamp-messages"])
+        assert args.timestamp_messages is True
         args = parser.parse_args(["list", "--config", "/tmp/c"])
         assert args.config == "/tmp/c"
 
@@ -530,7 +522,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
         "config",
         "verbose",
         "timestamp_messages",
-        "enable_notifications",
         "action",
         # Consumed by Config constructor:
         "seconds",
@@ -548,15 +539,12 @@ class TestCmdCallbacks(CmdCallbacksBase):
         Patches Config and initialize_borg_environment so
         main() reaches COMMAND_CALLBACKS without needing
         real config, SSH keys, or borg passphrase.
-        Saves/restores globals that main() modifies.
         """
-        saved_title = getattr(ba, "_notify_title")
         with (
             patch.object(ba, "Config", return_value=mock_cfg),
             patch.object(ba, "initialize_borg_environment"),
         ):
             yield mock_cfg
-        setattr(ba, "_notify_title", saved_title)
 
 
 class TestRepair:
@@ -1465,6 +1453,14 @@ class TestAutomate:
 
     def test_create_silenced_checks_inherit(self) -> None:
         doc = tomllib.loads(ba._render_crony_bundle())
+        # Bundle default: inherit the user's default channels AND pop a
+        # desktop dialog on failure.
+        assert doc["defaults"]["notify_channels"] == [
+            "default",
+            "dialog-popup",
+        ]
+        # create overrides to silent; the checks omit notify_channels,
+        # inheriting the bundle default above.
         assert doc["job"]["create"]["notify_channels"] == []
         assert "notify_channels" not in doc["job"]["check-age"]
         for op in self.JOB_OPS:
@@ -1568,15 +1564,13 @@ class TestCheck:
         return set()
 
     def test_check_subcommands_accept_common_args(self) -> None:
-        """Verify all check subcommands accept --enable-notifications."""
+        """Verify all check subcommands accept the common args."""
         parser = ba.args_parser()
         for action in self._check_subcommands():
             # Should parse without error
-            args = parser.parse_args(
-                ["check", action, "--enable-notifications"]
-            )
-            assert args.enable_notifications is True, (
-                f"check {action} did not accept --enable-notifications"
+            args = parser.parse_args(["check", action, "--verbose"])
+            assert args.verbose is True, (
+                f"check {action} did not accept --verbose"
             )
 
     def test_check_all_runs_all_checks(self, mock_cfg: Any) -> None:
@@ -1722,126 +1716,6 @@ class TestCheck:
             side_effect=list_backups_side_effect,
         ):
             ba.do_check_prune()  # Should not raise
-
-    def test_warning_exit_triggers_notification(self, mock_cfg: Any) -> None:
-        """Verify osascript_notify is called when _warning_occurred."""
-        original_warning = getattr(ba, "_warning_occurred")
-        original_title = getattr(ba, "_notify_title")
-        try:
-            setattr(ba, "_warning_occurred", True)
-            with (
-                patch.object(
-                    ba, "osascript_notify", autospec=True
-                ) as mock_notify,
-                patch(
-                    "sys.argv",
-                    ["borgadm", "check", "age"],
-                ),
-                patch.object(
-                    ba,
-                    "Config",
-                    side_effect=mock_config_constructor(mock_cfg),
-                ),
-                patch.object(
-                    ba,
-                    "initialize_logger",
-                    autospec=True,
-                ),
-                patch.object(
-                    ba,
-                    "initialize_borg_environment",
-                    autospec=True,
-                ),
-                patch.dict(
-                    ba.COMMAND_CALLBACKS,
-                    {"check age": lambda **_: None},
-                ),
-            ):
-                ba.main(
-                    command="check",
-                    config=str(ba.CONFIG),
-                    verbose=False,
-                    timestamp_messages=False,
-                    enable_notifications=True,
-                    args_dict={"action": "age"},
-                )
-            mock_notify.assert_called_once()
-        finally:
-            setattr(ba, "_warning_occurred", original_warning)
-            setattr(ba, "_notify_title", original_title)
-
-
-class TestNotifyTitle:
-    """Test osascript_notify uses _notify_title."""
-
-    def test_notify_title_default(self) -> None:
-        """Default _notify_title is the script basename."""
-        assert getattr(ba, "_notify_title") == ba.BASENAME
-
-    def test_notify_title_used_in_dialog(self) -> None:
-        """osascript_notify uses _notify_title in the dialog title."""
-        original_title = getattr(ba, "_notify_title")
-        original_buffer = getattr(ba, "_logger_buffer", None)
-        try:
-            setattr(ba, "_notify_title", "borgadm check repo")
-            setattr(ba, "_logger_buffer", io.StringIO("test error"))
-            with (
-                patch.object(ba, "has_tty", return_value=False),
-                patch.object(
-                    ba.shutil, "which", return_value="/usr/bin/osascript"
-                ),
-                patch.object(
-                    ba.subprocess, "Popen", autospec=True
-                ) as mock_popen,
-            ):
-                ba.osascript_notify()
-            script_arg: str = mock_popen.call_args[0][0][2]
-            assert '"borgadm check repo error"' in script_arg
-        finally:
-            setattr(ba, "_notify_title", original_title)
-            if original_buffer is not None:
-                setattr(ba, "_logger_buffer", original_buffer)
-
-    def test_main_sets_notify_title(self, mock_cfg: Any) -> None:
-        """main() sets _notify_title to 'borgadm <command>'."""
-        original_title = getattr(ba, "_notify_title")
-        try:
-            with (
-                patch(
-                    "sys.argv",
-                    ["borgadm", "check", "repo"],
-                ),
-                patch.object(
-                    ba,
-                    "Config",
-                    side_effect=mock_config_constructor(mock_cfg),
-                ),
-                patch.object(
-                    ba,
-                    "initialize_logger",
-                    autospec=True,
-                ),
-                patch.object(
-                    ba,
-                    "initialize_borg_environment",
-                    autospec=True,
-                ),
-                patch.dict(
-                    ba.COMMAND_CALLBACKS,
-                    {"check repo": lambda **_: None},
-                ),
-            ):
-                ba.main(
-                    command="check",
-                    config=str(ba.CONFIG),
-                    verbose=False,
-                    timestamp_messages=False,
-                    enable_notifications=False,
-                    args_dict={"action": "repo"},
-                )
-            assert getattr(ba, "_notify_title") == "borgadm check repo"
-        finally:
-            setattr(ba, "_notify_title", original_title)
 
 
 class TestIsRemoteRepo:
@@ -2004,7 +1878,6 @@ class TestMain:
                     config=str(ba.CONFIG),
                     verbose=False,
                     timestamp_messages=False,
-                    enable_notifications=False,
                     args_dict={},
                 )
         assert "setup-boom" in caplog.text
@@ -2108,7 +1981,6 @@ class TestStartEndMarkers:
                 config=str(ba.CONFIG),
                 verbose=False,
                 timestamp_messages=False,
-                enable_notifications=False,
                 args_dict={},
             )
 
@@ -2140,7 +2012,6 @@ class TestStartEndMarkers:
                 config=str(ba.CONFIG),
                 verbose=False,
                 timestamp_messages=False,
-                enable_notifications=False,
                 args_dict={},
             )
 
@@ -2169,7 +2040,6 @@ class TestStartEndMarkers:
                 config=str(ba.CONFIG),
                 verbose=False,
                 timestamp_messages=False,
-                enable_notifications=False,
                 args_dict={"action": "age"},
             )
 
@@ -2196,7 +2066,6 @@ class TestStartEndMarkers:
                 ba.COMMAND_CALLBACKS,
                 {"compact": Mock(side_effect=ba.BorgadmError("test error"))},
             ),
-            patch.object(ba, "osascript_notify", autospec=True),
             caplog.at_level(logging.INFO),
             pytest.raises(ba.BorgadmError),
         ):
@@ -2205,7 +2074,6 @@ class TestStartEndMarkers:
                 config=str(ba.CONFIG),
                 verbose=False,
                 timestamp_messages=False,
-                enable_notifications=False,
                 args_dict={},
             )
 
