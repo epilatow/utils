@@ -384,6 +384,15 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # # Optional per-job overrides of [defaults]:
 # # notify_channels = ["email"]   # or [] to silence just this job
 # # job_timeout_sec = 7200
+# # priority = "high"             # process-priority class for the unit:
+# #   "high"   un-throttle: macOS ProcessType=Interactive + normal CPU/IO
+# #            (avoids the QoS throttling that slows IO-bound work); on
+# #            Linux there is no such throttle to undo, so it has no
+# #            runtime effect (recorded as a unit comment).
+# #   "low"    throttle: macOS Background + low-priority IO + Nice 10;
+# #            Linux Nice 10 + idle IO scheduling.
+# #   "normal" (default) emit nothing. Applies on every fire path
+# #            (scheduled, `crony trigger`, parent-group dispatch).
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
 # # Unresolved vars stay literal; `$$` is a literal `$`.
@@ -687,6 +696,10 @@ class TomlJob:
     gate_args: list[str] = field(default_factory=list)
     schedule: str | None = None
     interval: str | None = None
+    # Process-priority class baked into the platform unit: "high"
+    # (run un-throttled, app-like QoS), "low" (throttle CPU + IO), or
+    # None ("normal", emit nothing). See `_VALID_PRIORITIES`.
+    priority: str | None = None
     # `platforms`: empty list = applies to every platform. Non-empty
     # = applies only on listed platforms; otherwise the entry is
     # silently skipped at selection time. `hosts` works the same
@@ -1076,6 +1089,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "gate_args",
         "schedule",
         "interval",
+        "priority",
         "platforms",
         "hosts",
         "job_timeout_sec",
@@ -1166,6 +1180,10 @@ _RESERVED_HEADERS_NTFY: frozenset[str] = frozenset(
 )
 
 _VALID_PLATFORMS: frozenset[str] = frozenset({"darwin", "linux"})
+# Process-priority class for a job's platform unit. "high" runs at
+# app-like priority with no throttling (launchd ProcessType=Interactive
+# + normal CPU/IO), "low" throttles CPU + IO, "normal" emits nothing.
+_VALID_PRIORITIES: frozenset[str] = frozenset({"high", "normal", "low"})
 
 
 def _reject_unknown_keys(
@@ -1731,6 +1749,11 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
+    priority = _typed_field(raw, "priority", str, where)
+    if priority is not None and priority not in _VALID_PRIORITIES:
+        raise ConfigError(
+            f"{where}: priority must be one of {sorted(_VALID_PRIORITIES)}"
+        )
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
@@ -1760,6 +1783,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         gate_args=gate_args,
         schedule=schedule,
         interval=interval,
+        priority=priority,
         platforms=platforms,
         hosts=hosts,
         job_timeout_sec=job_timeout_sec,
@@ -2708,6 +2732,11 @@ class Job:
     # rely on the dataclass default rather than a schema bump.
     schedule: str | None = None
     interval: str | None = None
+    # Process-priority class baked into the platform unit ("high" /
+    # "low" / None). Pinned in the snapshot so a change re-renders the
+    # unit on the next apply. Default-None for back-compat with
+    # snapshots written before this field existed.
+    priority: str | None = None
     # Interactive runner controls. `interactive_active_sec` and
     # `interactive_delay_sec` are always resolved (non-None) in
     # the snapshot so the runner doesn't re-consult any defaults
@@ -2790,6 +2819,7 @@ def _resolve_job_snapshot(
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
         schedule=job.schedule,
         interval=job.interval,
+        priority=job.priority,
         interactive=job.interactive,
         interactive_active_sec=(
             job.interactive_active_sec
@@ -5344,11 +5374,55 @@ def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
     )
 
 
+def _plist_priority_block(priority: str | None) -> str:
+    """LaunchAgent priority keys for a job, or '' for normal.
+
+    "high" runs the job at app-like QoS with normal CPU + IO
+    (ProcessType=Interactive avoids the Background QoS throttling that
+    can drastically slow IO-bound work); "low" throttles it. The keys
+    are inherited by the command the runner spawns.
+    """
+    if priority == "high":
+        return (
+            "    <key>ProcessType</key>\n"
+            "    <string>Interactive</string>\n"
+            "    <key>LowPriorityIO</key>\n"
+            "    <false/>\n"
+            "    <key>Nice</key>\n"
+            "    <integer>0</integer>\n"
+        )
+    if priority == "low":
+        return (
+            "    <key>ProcessType</key>\n"
+            "    <string>Background</string>\n"
+            "    <key>LowPriorityIO</key>\n"
+            "    <true/>\n"
+            "    <key>Nice</key>\n"
+            "    <integer>10</integer>\n"
+        )
+    return ""
+
+
+def _systemd_priority_block(priority: str | None) -> str:
+    """[Service] priority directives for a job, or '' for normal.
+
+    Linux has no app-vs-background QoS throttling to undo, so "high"
+    only records intent in a comment (CPU + IO stay at defaults);
+    "low" lowers both CPU and IO scheduling.
+    """
+    if priority == "high":
+        return "# crony priority=high: CPU + IO left at defaults\n"
+    if priority == "low":
+        return "Nice=10\nIOSchedulingClass=idle\n"
+    return ""
+
+
 def _render_plist(
     name: str,
     ref: EntityRef,
     schedule: str | None,
     interval: str | None,
+    priority: str | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
@@ -5419,6 +5493,7 @@ def _render_plist(
         "    <false/>\n"
         "    <key>AbandonProcessGroup</key>\n"
         "    <false/>\n"
+        f"{_plist_priority_block(priority)}"
         f"{sched_block}"
         "</dict>\n"
         "</plist>\n"
@@ -5428,6 +5503,7 @@ def _render_plist(
 def _render_systemd_service(
     name: str,
     ref: EntityRef,
+    priority: str | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
@@ -5438,7 +5514,8 @@ def _render_systemd_service(
     entity by `<bundle>:<uuid>` so the runner skips the name->uuid
     lookup -- same reason as for plist (see _render_plist's
     docstring). The unit description carries the human-readable
-    name.
+    name. `priority` adds CPU / IO scheduling directives inherited
+    by the spawned command.
 
     `uv_path` / `crony_path` override the live resolvers; see
     `_render_plist` for the rationale.
@@ -5454,6 +5531,7 @@ def _render_systemd_service(
         f"ExecStart={uv} run --script {crony} run "
         f"{ref}\n"
         "WorkingDirectory=%h\n"
+        f"{_systemd_priority_block(priority)}"
     )
 
 
@@ -5485,6 +5563,7 @@ def _render_units(
     schedule: str | None,
     interval: str | None,
     platform: str,
+    priority: str | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
@@ -5514,13 +5593,14 @@ def _render_units(
                 ref,
                 schedule,
                 interval,
+                priority,
                 uv_path=uv_path,
                 crony_path=crony_path,
             )
         }
     units = {
         f"{BASENAME}-{name}.service": _render_systemd_service(
-            name, ref, uv_path=uv_path, crony_path=crony_path
+            name, ref, priority, uv_path=uv_path, crony_path=crony_path
         ),
     }
     if schedule is not None or interval is not None:
@@ -5603,6 +5683,8 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     `config=stale` and `crony apply` re-renders / re-bootstraps
     even when the snapshot itself is unchanged.
     """
+    # Only jobs carry a priority; groups render without one.
+    snap_priority = snap.priority if isinstance(snap, Job) else None
     if platform == "darwin":
         unit_dir = LAUNCHAGENTS_DIR
     else:
@@ -5617,6 +5699,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
             snap.schedule,
             snap.interval,
             platform,
+            snap_priority,
             uv_path=Path(),
             crony_path=Path(),
         ).keys()
@@ -5649,6 +5732,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
             snap.schedule,
             snap.interval,
             platform,
+            snap_priority,
             uv_path=uv_path,
             crony_path=crony_path,
         )
@@ -5830,6 +5914,8 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     full_name = snapshot.name
     bundle_name = ref.bundle
     schedule, interval = snapshot.schedule, snapshot.interval
+    # Only jobs carry a priority; groups render without one.
+    priority = snapshot.priority if isinstance(snapshot, Job) else None
     platform = config.platform
     snapshot_path = _snapshot_path_for(ref)
 
@@ -5899,7 +5985,9 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(full_name, ref, schedule, interval, platform)
+    units = _render_units(
+        full_name, ref, schedule, interval, platform, priority
+    )
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name

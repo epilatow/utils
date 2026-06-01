@@ -5036,6 +5036,161 @@ class TestSystemdRendering:
             crony._uv_executable()
 
 
+class TestJobPriority:
+    """`priority` enum rendered into the platform unit (and tracked
+    by the snapshot + unit-drift check)."""
+
+    def test_parse_valid(self) -> None:
+        cfg = _parse({"job": {"a": _job(priority="high")}})
+        assert cfg.jobs["a"].priority == "high"
+
+    def test_parse_omitted_is_none(self) -> None:
+        cfg = _parse({"job": {"a": _job()}})
+        assert cfg.jobs["a"].priority is None
+
+    def test_parse_invalid_rejected(self) -> None:
+        _assert_errored_job(
+            {"job": {"a": _job(priority="turbo")}},
+            "a",
+            "priority must be one of",
+        )
+
+    def test_snapshot_carries_priority(self) -> None:
+        cfg = _parse({"job": {"a": _job(priority="high")}})
+        target = crony.resolve_target(cfg, "h", "darwin")
+        snap = crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+        assert snap.priority == "high"
+
+    def test_plist_high(self) -> None:
+        plist = crony._render_plist(
+            "j", crony.EntityRef("default", "u-test"), "daily", None, "high"
+        )
+        assert crony._plist_priority_block("high") in plist
+        assert "<string>Interactive</string>" in plist
+
+    def test_plist_low(self) -> None:
+        plist = crony._render_plist(
+            "j", crony.EntityRef("default", "u-test"), "daily", None, "low"
+        )
+        assert crony._plist_priority_block("low") in plist
+        assert "<string>Background</string>" in plist
+
+    def test_plist_normal_and_none_emit_nothing(self) -> None:
+        for p in ("normal", None):
+            plist = crony._render_plist(
+                "j", crony.EntityRef("default", "u-test"), "daily", None, p
+            )
+            assert "ProcessType" not in plist
+        assert crony._plist_priority_block("normal") == ""
+        assert crony._plist_priority_block(None) == ""
+
+    def test_systemd_high_records_intent(self) -> None:
+        svc = crony._render_systemd_service(
+            "j", crony.EntityRef("default", "u-test"), "high"
+        )
+        assert "# crony priority=high" in svc
+        # high leaves CPU/IO at the Linux defaults.
+        assert "Nice=" not in svc
+        assert "IOSchedulingClass" not in svc
+
+    def test_systemd_low_sets_scheduling(self) -> None:
+        svc = crony._render_systemd_service(
+            "j", crony.EntityRef("default", "u-test"), "low"
+        )
+        assert "Nice=10" in svc
+        assert "IOSchedulingClass=idle" in svc
+
+    def test_systemd_normal_emits_nothing(self) -> None:
+        svc = crony._render_systemd_service(
+            "j", crony.EntityRef("default", "u-test"), "normal"
+        )
+        assert "Nice=" not in svc
+        assert "IOSchedulingClass" not in svc
+
+    def test_apply_writes_priority_into_plist(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "priority": "high",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert h.apply("j") == "added"
+        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        assert "<string>Interactive</string>" in plist
+
+    def test_priority_change_re_renders(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "priority": "high",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "priority": "low",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert h.apply("j") == "updated"
+        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        assert "<string>Background</string>" in plist
+
+    def test_hand_edited_priority_key_flags_stale(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "priority": "high",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        unit = h.agents / f"org.crony.{h.full('j')}.plist"
+        content = unit.read_text()
+        munged = content.replace(
+            "<string>Interactive</string>", "<string>Standard</string>"
+        )
+        assert munged != content
+        unit.write_text(munged)
+        config = crony.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.runtime[ref].unit_is_stale is True
+
+
 class TestApplyDarwin:
     def test_writes_plist_and_activates(
         self, tmp_path: Path, monkeypatch: Any
