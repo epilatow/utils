@@ -1806,7 +1806,9 @@ def _bundle_set(*pairs: tuple[str, Any]) -> Any:
 class TestNotifyInherit:
     """`notify_channels = ["default"]` inherit sentinel: a non-default
     bundle notifies as the default bundle would, and inherits it
-    implicitly when it omits notify config.
+    implicitly when it omits notify config. The sentinel may also be
+    combined with explicit siblings (the resolved set is their union,
+    de-duped).
     """
 
     def test_implicit_default_for_nondefault_bundle(self) -> None:
@@ -1855,18 +1857,37 @@ class TestNotifyInherit:
                 _inject_uuids({"defaults": {"notify_channels": ["default"]}})
             )
 
-    def test_token_must_be_sole_entry(self) -> None:
-        with pytest.raises(crony.ConfigError, match="must be the only"):
+    def test_token_combines_with_siblings(self) -> None:
+        # The sentinel may now sit alongside explicit channels.
+        cfg = crony.parse_config(
+            _inject_uuids(
+                {
+                    "defaults": {
+                        "notify_channels": ["default", "email"],
+                        "notify": {"email": _email_block()},
+                    },
+                    "job": {"a": _job()},
+                }
+            ),
+            bundle_name="borgadm",
+        )
+        assert cfg.defaults.notify_channels == ["default", "email"]
+        assert "a" not in cfg.errored_jobs
+
+    def test_token_still_rejected_in_default_bundle_with_siblings(
+        self,
+    ) -> None:
+        # Even combined with siblings, the default bundle can't inherit
+        # itself.
+        with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
             crony.parse_config(
                 _inject_uuids(
                     {
                         "defaults": {
-                            "notify_channels": ["default", "email"],
-                            "notify": {"email": _email_block()},
+                            "notify_channels": ["default", "dialog-popup"]
                         }
                     }
-                ),
-                bundle_name="borgadm",
+                )
             )
 
     def test_reserved_channel_name_rejected(self) -> None:
@@ -1967,6 +1988,124 @@ class TestNotifyInherit:
             ["default"], "borgadm", bundles, borgadm_cfg.defaults
         )
         assert channels == ["ntfy"]
+
+    def test_expand_unions_with_extras(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, defaults = crony._expand_notify_inherit(
+            ["default", "dialog-popup"],
+            "borgadm",
+            bundles,
+            borgadm_cfg.defaults,
+        )
+        # Inherited channels first, then the new sibling.
+        assert channels == ["ntfy", "dialog-popup"]
+        # Inherited defs still come from the default bundle.
+        assert "ntfy" in defaults.notify_channel_defs
+
+    def test_expand_dedups_overlap(self) -> None:
+        # The default bundle ALSO has dialog-popup, and the inheriting
+        # bundle lists it again: the union must fire it once.
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy", "dialog-popup"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, _ = crony._expand_notify_inherit(
+            ["default", "dialog-popup"],
+            "borgadm",
+            bundles,
+            borgadm_cfg.defaults,
+        )
+        assert channels == ["ntfy", "dialog-popup"]
+        assert channels.count("dialog-popup") == 1
+
+    def test_expand_merges_local_def_for_new_sibling(self) -> None:
+        # A sibling defined only in the inheriting bundle must still be
+        # dispatchable: its def is merged alongside the inherited ones.
+        default_cfg = crony.parse_config(
+            _inject_uuids(
+                {
+                    "defaults": {
+                        "notify_channels": ["ntfy"],
+                        "notify": {"ntfy": _ntfy_block()},
+                    }
+                }
+            )
+        )
+        local_cfg = crony.parse_config(
+            _inject_uuids(
+                {
+                    "defaults": {
+                        "notify_channels": ["default", "myemail"],
+                        "notify": {"myemail": _email_block(transport="email")},
+                    },
+                    "job": {"a": _job()},
+                }
+            ),
+            bundle_name="borgadm",
+        )
+        bundles = _bundle_set(("default", default_cfg), ("borgadm", local_cfg))
+        channels, defaults = crony._expand_notify_inherit(
+            ["default", "myemail"], "borgadm", bundles, local_cfg.defaults
+        )
+        assert channels == ["ntfy", "myemail"]
+        assert "ntfy" in defaults.notify_channel_defs
+        assert "myemail" in defaults.notify_channel_defs
+
+    def test_expand_extras_only_without_default_bundle(self) -> None:
+        _, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(("borgadm", borgadm_cfg))
+        channels, defaults = crony._expand_notify_inherit(
+            ["default", "dialog-popup"],
+            "borgadm",
+            bundles,
+            borgadm_cfg.defaults,
+        )
+        assert channels == ["dialog-popup"]
+        assert defaults is borgadm_cfg.defaults
+
+    def test_expand_default_firing_keeps_extras(self) -> None:
+        default_cfg, borgadm_cfg = self._two_bundles(["ntfy"])
+        bundles = _bundle_set(
+            ("default", default_cfg), ("borgadm", borgadm_cfg)
+        )
+        channels, defaults = crony._expand_notify_inherit(
+            ["default", "dialog-popup"],
+            "default",
+            bundles,
+            default_cfg.defaults,
+        )
+        assert channels == ["dialog-popup"]
+        assert defaults is default_cfg.defaults
+
+    def test_runtime_union_inherit_plus_dialog(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The borgadm shape after this change: a non-default bundle
+        # inherits the default bundle's channels AND adds dialog-popup.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "notify_channels": ["ntfy"],
+                    "notify": {"ntfy": _ntfy_block()},
+                }
+            },
+            default_target_jobs=[],
+        )
+        (h.cfg_dropin / "borgadm.toml").write_text(
+            _uuid_toml(
+                "[defaults]\n"
+                'notify_channels = ["default", "dialog-popup"]\n'
+                '[job.check]\ncommand = "true"\n'
+            ),
+            encoding="utf-8",
+        )
+        channels, defaults = crony._resolve_notify_at_runtime("borgadm.check")
+        assert channels == ["ntfy", "dialog-popup"]
+        assert "ntfy" in defaults.notify_channel_defs
 
     def test_runtime_inherit_and_per_job_disable(
         self, tmp_path: Path, monkeypatch: Any

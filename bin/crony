@@ -197,13 +197,15 @@ CONFIG_DROPIN_DIR: Path = _env_path(
     "CONFIG_DROPIN_DIR", str(CONFIG_DIR / "config")
 )
 DEFAULT_BUNDLE_NAME: str = "default"
-# Sentinel value for a `notify_channels` list: a non-default bundle
-# whose resolved notify_channels is exactly [NOTIFY_INHERIT_TOKEN]
-# notifies as the default bundle would -- borrowing its channel list,
-# channel definitions, and attach settings. It is also the implicit
-# default for non-default bundles that omit notify config. The token
-# is the default bundle's own name, so it doubles as a reserved
-# channel name (a [defaults.notify.default] block is rejected).
+# Sentinel value for a `notify_channels` list: in a non-default
+# bundle it pulls in the default bundle's channels, definitions, and
+# attach settings. It may stand alone (notify exactly as the default
+# bundle would) or sit alongside explicit siblings (notify as the
+# default bundle would PLUS those channels, de-duped). It is also the
+# implicit default for non-default bundles that omit notify config.
+# The token is the default bundle's own name, so it doubles as a
+# reserved channel name (a [defaults.notify.default] block is
+# rejected).
 NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
@@ -295,19 +297,23 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
 
-# Notification inheritance. The reserved value `notify_channels =
-# ["default"]` (it must be the only entry) makes a NON-default bundle
-# notify exactly as the default bundle would -- borrowing its channel
-# list, channel definitions, and attach settings -- so the bundle can
-# omit every [defaults.notify.*] block of its own. It is also the
-# implicit default: a non-default bundle that says nothing about
-# notify config inherits the default bundle's. Opt back out with an
-# explicit `notify_channels = []` (silence). The default bundle
-# cannot inherit itself, and `default` is a reserved channel name (no
-# [defaults.notify.default] block). A non-default bundle that both
-# inherits AND defines its own [defaults.notify.*] channels leaves
-# those local channels unreferenced -- list them explicitly in
-# `notify_channels` to use them instead of inheriting.
+# Notification inheritance. The reserved channel name `default` in a
+# NON-default bundle's `notify_channels` pulls in the default bundle's
+# channel list, definitions, and attach settings. Alone
+# (`notify_channels = ["default"]`) the bundle notifies exactly as the
+# default bundle would, so it can omit every [defaults.notify.*] block
+# of its own. Combined with explicit siblings
+# (`notify_channels = ["default", "dialog-popup"]`) it notifies as the
+# default bundle would PLUS those channels -- de-duped, so a channel in
+# both fires once. Those siblings must be channels defined in THIS
+# bundle or zero-config built-ins (e.g. dialog-popup); the sentinel
+# already pulls in the whole default set, so there is no need to
+# re-list the default bundle's channels by name. `default` is also the
+# implicit default: a
+# non-default bundle that says nothing about notify config inherits the
+# default bundle's. Opt back out with an explicit `notify_channels = []`
+# (silence). The default bundle cannot inherit itself, and `default` is
+# a reserved channel name (no [defaults.notify.default] block).
 
 # Each notify channel is a [defaults.notify.<name>] block. The name
 # is whatever the user lists in `notify_channels`. The `transport`
@@ -648,11 +654,12 @@ class Defaults:
     # independently in last-run.json's `notifications` dict. Each
     # entry must name a key in `notify_channel_defs` below, or a
     # zero-config built-in channel (`_BUILTIN_NOTIFY_CHANNELS`, e.g.
-    # "dialog-popup") that needs no definition. As a further
-    # exception, the sole-entry list [NOTIFY_INHERIT_TOKEN] inherits
-    # the default bundle's notify config (and is the implicit default
-    # for a non-default bundle that omits notify config). The default
-    # bundle itself defaults to [] and may not use the sentinel.
+    # "dialog-popup") that needs no definition. The [NOTIFY_INHERIT_TOKEN]
+    # sentinel inherits the default bundle's notify config -- alone, or
+    # unioned with explicit siblings listed alongside it (and is the
+    # implicit default for a non-default bundle that omits notify
+    # config). The default bundle itself defaults to [] and may not use
+    # the sentinel.
     notify_channels: list[str] = field(default_factory=list)
     notify_attach_log: bool = True
     # Cap on log content included in EMAIL notifications. ntfy
@@ -1952,26 +1959,22 @@ def _validate_notify_channels(
     """Validate one `notify_channels` list. Returns an error message
     (for raise / demote at the call site) or None when valid.
 
-    The inherit sentinel `NOTIFY_INHERIT_TOKEN` pulls the default
-    bundle's notify config: it must stand alone and is only valid in a
+    The inherit sentinel `NOTIFY_INHERIT_TOKEN` pulls in the default
+    bundle's notify config and may be combined with explicit sibling
+    channels (the resolved set is their union); it is only valid in a
     non-default bundle (the default bundle cannot inherit itself).
-    Every other entry must name a channel defined in this bundle or a
-    zero-config built-in (`_BUILTIN_NOTIFY_CHANNELS`, e.g.
+    Every non-sentinel entry must name a channel defined in this bundle
+    or a zero-config built-in (`_BUILTIN_NOTIFY_CHANNELS`, e.g.
     "dialog-popup").
     """
-    if NOTIFY_INHERIT_TOKEN in channels:
-        if len(channels) != 1:
-            return (
-                f"{label}: {NOTIFY_INHERIT_TOKEN!r} (notify-inherit "
-                f"sentinel) must be the only notify_channels entry"
-            )
-        if is_default:
-            return (
-                f"{label}: the default bundle cannot inherit its own "
-                f"notify config ({NOTIFY_INHERIT_TOKEN!r} sentinel)"
-            )
-        return None
+    if NOTIFY_INHERIT_TOKEN in channels and is_default:
+        return (
+            f"{label}: the default bundle cannot inherit its own "
+            f"notify config ({NOTIFY_INHERIT_TOKEN!r} sentinel)"
+        )
     for ch in channels:
+        if ch == NOTIFY_INHERIT_TOKEN:
+            continue
         if ch not in defined_channels and ch not in _BUILTIN_NOTIFY_CHANNELS:
             return (
                 f"{label}: notify_channels entry {ch!r} is not "
@@ -4650,28 +4653,51 @@ def _expand_notify_inherit(
     bundles: TomlConfig,
     local_defaults: Defaults,
 ) -> tuple[list[str], Defaults]:
-    """Resolve the notify-inherit sentinel to the default bundle.
+    """Resolve the notify-inherit sentinel against the default bundle.
 
-    When `channels` is exactly [NOTIFY_INHERIT_TOKEN], swap in the
-    default bundle's channel list AND its Defaults (channel
-    definitions + attach settings), so dispatch behaves exactly as
-    the default bundle would. Otherwise the inputs pass through
-    unchanged. Degrades to no dispatch when the default bundle is
-    absent, and never recurses: a sentinel carried by the default
-    bundle's own list is dropped rather than re-expanded.
+    When [NOTIFY_INHERIT_TOKEN] appears in `channels`, it expands in
+    place to the default bundle's channel list and the result is the
+    union (inherited first) of those channels with the explicit
+    siblings listed alongside the sentinel -- de-duped, so a channel
+    both inherited and listed locally (e.g. "dialog-popup" in both
+    bundles) fires once, not twice. The returned Defaults carries the
+    default bundle's channel definitions + attach settings, with the
+    local definitions for any genuinely-new sibling channels merged in
+    so dispatch can look every resolved channel up.
+
+    Lists with no sentinel pass through unchanged. Degrades to the
+    explicit siblings alone (no inheritance) when the default bundle is
+    absent or when the firing bundle IS the default bundle, and never
+    recurses: a sentinel carried by the default bundle's own list is
+    dropped rather than re-expanded.
     """
-    if channels != [NOTIFY_INHERIT_TOKEN]:
+    if NOTIFY_INHERIT_TOKEN not in channels:
         return channels, local_defaults
+    extras = [c for c in channels if c != NOTIFY_INHERIT_TOKEN]
     if firing_bundle == DEFAULT_BUNDLE_NAME:
-        return [], local_defaults
+        return extras, local_defaults
     default_bundle = bundles.by_name(DEFAULT_BUNDLE_NAME)
     if default_bundle is None:
-        return [], local_defaults
+        return extras, local_defaults
     inherited = default_bundle.config.defaults
-    resolved = [
+    inherited_channels = [
         c for c in inherited.notify_channels if c != NOTIFY_INHERIT_TOKEN
     ]
-    return resolved, inherited
+    new_extras = [c for c in extras if c not in inherited_channels]
+    resolved = inherited_channels + new_extras
+    if not new_extras:
+        return resolved, inherited
+    # Dispatch resolves every channel through one Defaults, so the new
+    # local siblings need their definitions alongside the inherited
+    # ones. Channels already inherited keep the default bundle's
+    # definition; built-ins (e.g. dialog-popup) need none.
+    merged_defs = dict(inherited.notify_channel_defs)
+    for c in new_extras:
+        local_def = local_defaults.notify_channel_defs.get(c)
+        if local_def is not None:
+            merged_defs[c] = local_def
+    merged = dataclasses.replace(inherited, notify_channel_defs=merged_defs)
+    return resolved, merged
 
 
 def _resolve_notify_at_runtime(
