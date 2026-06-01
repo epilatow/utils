@@ -49,6 +49,14 @@ gated by platform checks.
   `tests/run_all.py --e2e` (or the individual test file with `--e2e`). When
   making changes to a utility that has an e2e suite, run with `--e2e` before
   declaring the change complete.
+- CI runs `--e2e` on the Linux leg only. GitHub's hosted macOS runners are
+  weak, throttled VMs that run this process-spawn-heavy suite ~20x slower than
+  Linux and intermittently cross its 120s per-call timeout, while Linux runs
+  the identical suite reliably in under a minute (borg is cross-platform, so
+  coverage is the same). The macOS CI leg runs only the non-e2e suite -- which
+  is where the macOS-specific code lives (the BorgAdm C wrapper, the launchd
+  automate path) -- so a local `--e2e` run is the way to exercise the e2e
+  suite on macOS.
 
 ## Conventions
 

@@ -21,20 +21,21 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Install borg (Linux)
+      # borg is needed only by the e2e suite, which runs on Linux only
+      # (see the run step below). The macOS leg runs the non-e2e suite,
+      # which mocks every borg call, so it needs no borg binary.
+      - name: Install borg
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y borgbackup
 
-      - name: Install borg (macOS)
-        if: runner.os == 'macOS'
-        run: brew install borgbackup
-
-      - name: Run all tests
-        env:
-          # The borgadm e2e suite (the only suite pulling in pytest-xdist)
-          # spawns uv+python+borg per test. On the 3-vCPU macOS runner,
-          # xdist's `-n auto` oversubscribes cores hard enough that some
-          # borgadm calls cross the suite's 120s per-call timeout. Pin
-          # macOS to one worker; Linux's cheap exec runs -n auto fine.
-          PYTEST_XDIST_AUTO_NUM_WORKERS: ${{ runner.os == 'macOS' && '1' || '' }}
-        run: tests/run_all.py --e2e
+      - name: Run tests
+        # The borgadm e2e suite forks uv+python+borgadm+borg per test --
+        # a process-spawn-heavy workload. GitHub's hosted macOS runners
+        # are weak, throttled VMs that run it ~20x slower than Linux and
+        # intermittently cross the suite's 120s per-call timeout, while
+        # Linux runs the identical suite reliably in under a minute (borg
+        # itself is cross-platform, so coverage is the same). So e2e runs
+        # on Linux only; macOS still runs the full non-e2e suite, which
+        # is where the macOS-specific code lives (the BorgAdm C wrapper
+        # and the launchd automate path).
+        run: tests/run_all.py ${{ runner.os == 'Linux' && '--e2e' || '' }}
