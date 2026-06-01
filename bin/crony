@@ -9827,6 +9827,18 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.register("action", "parsers", _StrictSubParsersAction)
 
 
+def _action_subparsers(
+    parent: argparse.ArgumentParser, **kwargs: Any
+) -> _SubParsersActionBase:
+    """Add an action-group subparsers to `parent`, left non-required so
+    that omitting the action prints the subcommand's own help (via the
+    `_action_help` default registered here, which `cli` invokes) rather
+    than argparse's terse "the following arguments are required" error.
+    """
+    parent.set_defaults(_action_help=parent.print_help)
+    return parent.add_subparsers(dest="action", **kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser."""
     parser = _ArgumentParser(
@@ -9852,10 +9864,9 @@ def build_parser() -> argparse.ArgumentParser:
         "config",
         help="Manage the config file",
     )
-    config_subparsers = p_config.add_subparsers(
-        dest="action",
+    config_subparsers = _action_subparsers(
+        p_config,
         metavar="<action>",
-        required=True,
     )
 
     p_config_init = config_subparsers.add_parser(
@@ -10295,9 +10306,16 @@ def cli() -> int:
     args_dict = vars(args)
     command = args_dict.pop("command")
     action = args_dict.pop("action", None)
+    action_help = args_dict.pop("_action_help", None)
 
     if not command:
         parser.print_help()
+        return ExitCode.USAGE
+
+    # A subcommand that requires an action but got none prints its own
+    # help (like the no-command case above), not argparse's terse error.
+    if action_help is not None and not action:
+        action_help()
         return ExitCode.USAGE
 
     if command == "self-test":

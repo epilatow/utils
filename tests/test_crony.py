@@ -220,8 +220,9 @@ class TestConfigSubcommandDispatch:
     "<command> <action>" key in COMMAND_CALLBACKS. These tests pin
     that the nested form actually reaches the right callback (a
     flat dispatch table without the join would silently do
-    nothing) and that argparse's strict-subparsers error path
-    fires for missing/unknown actions on the parent.
+    nothing), that a missing action prints the parent's help, and
+    that an unknown action fires argparse's strict-subparsers error
+    path.
     """
 
     def test_config_init_dispatches_to_do_init(self) -> None:
@@ -250,15 +251,17 @@ class TestConfigSubcommandDispatch:
         assert result == 0
         mock_cb.assert_called_once_with(bundle="foo", file=None)
 
-    def test_config_without_action_errors(self, capsys: Any) -> None:
-        with (
-            patch("sys.argv", ["prog", "config"]),
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            crony.cli()
-        assert exc_info.value.code != 0
-        err = capsys.readouterr().err
-        assert "config" in err
+    def test_config_without_action_prints_help(self, capsys: Any) -> None:
+        # No action -> print config's own help (stdout) and exit USAGE,
+        # not argparse's terse "required" error.
+        with patch("sys.argv", ["prog", "config"]):
+            result = crony.cli()
+        assert result == crony.ExitCode.USAGE
+        out = capsys.readouterr().out
+        # The subcommand's full help (usage line + the action list),
+        # not just a usage stub.
+        assert "config [-h] <action>" in out
+        assert "init" in out and "generate-uuid" in out
 
     def test_config_unknown_action_errors(self, capsys: Any) -> None:
         with (
