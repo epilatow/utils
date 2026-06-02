@@ -76,6 +76,7 @@ from common.argparse_ext import (  # noqa: E402
     StrictArgumentParser,
     action_subparsers,
 )
+from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 
 # -----------------------------------------------------------------------------
@@ -86,33 +87,18 @@ LOGFILE: Path = Path(tempfile.gettempdir()) / f"{BASENAME}.log"
 CONFIG: Path = Path(os.path.expanduser(f"~/.{BASENAME}"))
 
 
-class ExitCode(enum.IntEnum):
-    SUCCESS = 0, "Success"
-    WARNING = 1, "Warning (borg subprocess warnings)"
-    USAGE = 2, "Usage/argument error"
-    CONFIG = 3, "Configuration error"
-    ERROR = 4, "General error"
-    SUBPROCESS = 5, "Subprocess error"
-    CHECK_NO_BACKUPS = 6, "Check failed: no full backups"
-    CHECK_AGE = 7, "Check failed: backup too old"
-    CHECK_REPO = 8, "Check failed: repo metadata"
-    CHECK_ARCHIVES = 9, "Check failed: archive metadata"
-    CHECK_PRUNE = 10, "Check failed: unpruned archives"
-
-    def __new__(cls, value: int, description: str = "") -> ExitCode:
-        obj = int.__new__(cls, value)
-        obj._value_ = value
-        obj.description = description  # type: ignore[attr-defined]
-        return obj
-
-    @classmethod
-    def epilog(cls) -> str:
-        lines = ["exit codes:"]
-        for member in cls:
-            lines.append(
-                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
-            )
-        return "\n".join(lines)
+class ExitCode(ExitCodeBase):
+    SUCCESS = CommonExitCode.SUCCESS
+    WARNING = CommonExitCode.WARNING
+    USAGE = CommonExitCode.USAGE
+    CONFIG = CommonExitCode.CONFIG
+    ERROR = CommonExitCode.ERROR
+    SUBPROCESS = CommonExitCode.SUBPROCESS
+    CHECK_NO_BACKUPS = 10, "Check failed: no full backups"
+    CHECK_AGE = 11, "Check failed: backup too old"
+    CHECK_REPO = 12, "Check failed: repo metadata"
+    CHECK_ARCHIVES = 13, "Check failed: archive metadata"
+    CHECK_PRUNE = 14, "Check failed: unpruned archives"
 
 
 class BorgadmError(RuntimeError):

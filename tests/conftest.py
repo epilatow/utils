@@ -94,6 +94,43 @@ class ExceptionHierarchyBase:
         ]
         assert len(codes) == len(set(codes))
 
+    def test_common_exit_codes_match_canon(self) -> None:
+        """Common codes a utility declares match the canonical subset
+        (value + description), so they can't drift. SUCCESS..SUBPROCESS
+        are mandatory; the rest (e.g. TIMEOUT) are used where they
+        apply. Utility-specific codes start at 10."""
+        from common.exitcodes import CommonExitCode
+
+        canon = {
+            name: getattr(CommonExitCode, name)
+            for name in vars(CommonExitCode)
+            if not name.startswith("_")
+        }
+        members = self.EXIT_CODE.__members__
+        mandatory = {
+            "SUCCESS",
+            "WARNING",
+            "USAGE",
+            "CONFIG",
+            "ERROR",
+            "SUBPROCESS",
+        }
+        assert mandatory <= set(members), (
+            f"missing mandatory common codes: {mandatory - set(members)}"
+        )
+        for name, (value, description) in canon.items():
+            if name in members:
+                assert members[name].value == value
+                assert members[name].description == description
+        # Specifics live in the reserved 10+ range so a utility's own
+        # code can never collide with a later-added common code.
+        for name, member in members.items():
+            if name not in canon:
+                assert member.value >= 10, (
+                    f"{name}={member.value} must be >= 10 "
+                    "(0-9 reserved for common codes)"
+                )
+
 
 def isolate_home(
     module: Any,

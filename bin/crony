@@ -15,7 +15,6 @@ import configparser
 import contextlib
 import dataclasses
 import datetime
-import enum
 import fcntl
 import json
 import logging
@@ -62,6 +61,7 @@ from common.argparse_ext import (  # noqa: E402
     StrictArgumentParser,
     action_subparsers,
 )
+from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -524,31 +524,16 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # =============================================================================
 
 
-class ExitCode(enum.IntEnum):
-    SUCCESS = 0, "Success"
-    WARNING = 1, "Warning (non-fatal issues)"
-    USAGE = 2, "Usage/argument error"
-    CONFIG = 3, "Configuration error"
-    ERROR = 4, "General error"
-    SUBPROCESS = 5, "Subprocess command failed"
-    LOCK_BUSY = 7, "run.lock held by another instance"
-    PRECONDITION = 8, "run precondition failed before exec"
-    TIMEOUT = 9, "run killed wrapped command on timeout"
-
-    def __new__(cls, value: int, description: str = "") -> ExitCode:
-        obj = int.__new__(cls, value)
-        obj._value_ = value
-        obj.description = description  # type: ignore[attr-defined]
-        return obj
-
-    @classmethod
-    def epilog(cls) -> str:
-        lines = ["exit codes:"]
-        for member in cls:
-            lines.append(
-                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
-            )
-        return "\n".join(lines)
+class ExitCode(ExitCodeBase):
+    SUCCESS = CommonExitCode.SUCCESS
+    WARNING = CommonExitCode.WARNING
+    USAGE = CommonExitCode.USAGE
+    CONFIG = CommonExitCode.CONFIG
+    ERROR = CommonExitCode.ERROR
+    SUBPROCESS = CommonExitCode.SUBPROCESS
+    TIMEOUT = CommonExitCode.TIMEOUT
+    LOCK_BUSY = 10, "run.lock held by another instance"
+    PRECONDITION = 11, "run precondition failed before exec"
 
 
 # =============================================================================

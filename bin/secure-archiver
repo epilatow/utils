@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import enum
 import glob
 import hashlib
 import json
@@ -44,6 +43,7 @@ from typing import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 try:
     import tomllib
@@ -148,29 +148,14 @@ include = [
 # =============================================================================
 
 
-class ExitCode(enum.IntEnum):
-    SUCCESS = 0, "Success"
-    WARNING = 1, "Warning"
-    USAGE = 2, "Usage/argument error"
-    CONFIG = 3, "Configuration error"
-    ERROR = 4, "General error"
-    SUBPROCESS = 5, "Subprocess error"
-    NOT_FOUND = 6, "File not found"
-
-    def __new__(cls, value: int, description: str = "") -> ExitCode:
-        obj = int.__new__(cls, value)
-        obj._value_ = value
-        obj.description = description  # type: ignore[attr-defined]
-        return obj
-
-    @classmethod
-    def epilog(cls) -> str:
-        lines = ["exit codes:"]
-        for member in cls:
-            lines.append(
-                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
-            )
-        return "\n".join(lines)
+class ExitCode(ExitCodeBase):
+    SUCCESS = CommonExitCode.SUCCESS
+    WARNING = CommonExitCode.WARNING
+    USAGE = CommonExitCode.USAGE
+    CONFIG = CommonExitCode.CONFIG
+    ERROR = CommonExitCode.ERROR
+    SUBPROCESS = CommonExitCode.SUBPROCESS
+    NOT_FOUND = 10, "File not found"
 
 
 # =============================================================================
