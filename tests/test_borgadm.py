@@ -1467,9 +1467,14 @@ class TestAutomate:
         # checks keep the default (a check warning is a real signal).
         assert doc["job"]["create"]["success_exit_codes"] == [1]
         assert "success_exit_codes" not in doc["job"]["check-age"]
+        # Every job runs borg under borgadm's own per-command timeout,
+        # so the bundle disables crony's wallclock cap by default and no
+        # job overrides it.
+        assert doc["defaults"]["job_timeout_sec"] == 0
         for op in self.JOB_OPS:
             assert doc["job"][op]["priority"] == "high"
             assert doc["job"][op]["keep_awake"] is True
+            assert "job_timeout_sec" not in doc["job"][op]
         assert doc["target"]["darwin"]["jobs"] == self.JOB_OPS
 
     def test_generated_bundle_validates_against_crony(

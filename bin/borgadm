@@ -1310,7 +1310,11 @@ def _render_crony_bundle() -> str:
     a failed backup -- while the checks omit notify_channels to take the
     bundle default and keep the default exit handling (a check warning
     is a real signal). `env` extends PATH with ~/.local/bin so borgadm's
-    `uv` shebang resolves under the scheduler's minimal PATH.
+    `uv` shebang resolves under the scheduler's minimal PATH. The
+    default `job_timeout_sec = 0` disables crony's wallclock cap for
+    every job: borgadm caps each borg command itself (BORG_CMD_TIMEOUT,
+    default 4h), so crony's shorter default cap would only preempt a
+    legitimately long backup or check.
     """
     jobs: dict[str, Any] = {}
     for name, command, interval in _crony_jobs():
@@ -1327,7 +1331,10 @@ def _render_crony_bundle() -> str:
         job["env"] = {"PATH": "$HOME/.local/bin:$PATH"}
         jobs[name] = job
     doc: dict[str, Any] = {
-        "defaults": {"notify_channels": ["default", "dialog-popup"]},
+        "defaults": {
+            "notify_channels": ["default", "dialog-popup"],
+            "job_timeout_sec": 0,
+        },
         "job": jobs,
         "target": {"darwin": {"jobs": [n for n, _, _ in _crony_jobs()]}},
     }
