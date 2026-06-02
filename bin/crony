@@ -19,6 +19,7 @@ import enum
 import fcntl
 import json
 import logging
+import math
 import os
 import plistlib
 import re
@@ -293,7 +294,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # notify_channels      = []           # names defined below, or "dialog-popup"
 # notify_attach_log    = true         # include log content in notifications
 # notify_attach_max_kb = 256          # email-only cap (ntfy uses a 3 KB inline cap)
-# job_timeout_sec      = 1800         # 30 min default per-job wallclock cap
+# job_timeout_sec      = 1800         # default per-job wallclock cap; 0 = no cap
 # trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
 
@@ -400,7 +401,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
 # # notify_channels = ["email"]   # or [] to silence just this job
-# # job_timeout_sec = 7200
+# # job_timeout_sec = 7200        # 0 = no cap (job manages its own timeout)
 # # priority = "high"             # process-priority class for the unit:
 # #   "high"   un-throttle: macOS ProcessType=Interactive + normal CPU/IO
 # #            (avoids the QoS throttling that slows IO-bound work); on
@@ -673,6 +674,8 @@ class Defaults:
     # is 4 KB) and ignore this setting -- adjusting it here will
     # not affect ntfy.
     notify_attach_max_kb: int = 256
+    # Default per-job wallclock cap. 0 = no cap (for jobs that manage
+    # their own timeout); see TomlJob.job_timeout_sec.
     job_timeout_sec: int = 1800
     # How long `crony trigger --wait` waits for a runner to come
     # online after asking the platform scheduler to fire the unit.
@@ -743,10 +746,13 @@ class TomlJob:
     platforms: list[str] = field(default_factory=list)
     hosts: HostList = field(default_factory=HostList)
     job_timeout_sec: int | None = None
+    # None = inherit from target/defaults; 0 = no wallclock cap (the
+    # job caps itself). An uncapped job propagates up: any group that
+    # contains it is uncapped too.
+    notify_channels: list[str] | None = None
     # None = inherit from target/defaults; [] = explicit empty (this
     # job sends no external notifications even if defaults / target
     # would).
-    notify_channels: list[str] | None = None
     # Non-zero exit codes to classify as success (exit 0 is always
     # success). A run whose code lands here is "ok" -- not failed, no
     # notification -- and `crony run` surfaces 0 to the scheduler. For
@@ -782,7 +788,9 @@ class TomlJobGroup:
     1.05 * sum of children's effective timeouts) and is not a
     user-facing knob: it acts as defense-in-depth so each child
     can hit its own per-job timeout before the parent's
-    cumulative deadline fires.
+    cumulative deadline fires. A child that is itself uncapped
+    (`job_timeout_sec = 0`) makes the group uncapped too -- there is
+    no finite cumulative deadline that could bound it.
 
     `platforms` / `hosts` work the same way as on TomlJob: empty
     means "applies everywhere", non-empty restricts selection.
@@ -1693,6 +1701,18 @@ def _positive_int(
     return val
 
 
+def _nonneg_int(raw: dict[str, Any], key: str, where: str, default: int) -> int:
+    """Read a non-negative int defaulting to `default`. Reject negative.
+
+    0 is accepted: `job_timeout_sec` uses it as the "no wallclock cap"
+    sentinel, so the only invalid value is a negative one.
+    """
+    val: int = _typed_field(raw, key, int, where, default=default)
+    if val < 0:
+        raise ConfigError(f"{where}: '{key}' must be >= 0, got {val}")
+    return val
+
+
 def _parse_notify_channels(
     raw: dict[str, Any], where: str, *, required: bool
 ) -> list[str] | None:
@@ -1758,7 +1778,7 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         notify_attach_max_kb=_positive_int(
             raw, "notify_attach_max_kb", where, default=256
         ),
-        job_timeout_sec=_positive_int(
+        job_timeout_sec=_nonneg_int(
             raw, "job_timeout_sec", where, default=1800
         ),
         trigger_timeout_sec=_positive_int(
@@ -1844,8 +1864,10 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     channels = _parse_notify_channels(raw, where, required=False)
     success_exit_codes = _parse_success_exit_codes(raw, where)
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
-    if job_timeout_sec is not None and job_timeout_sec <= 0:
-        raise ConfigError(f"{where}: job_timeout_sec must be positive")
+    if job_timeout_sec is not None and job_timeout_sec < 0:
+        raise ConfigError(
+            f"{where}: 'job_timeout_sec' must be >= 0, got {job_timeout_sec}"
+        )
     interactive, interactive_active_sec, interactive_delay_sec = (
         _parse_interactive_fields(raw, where)
     )
@@ -2646,7 +2668,7 @@ def resolved_notify_channels(
 def resolved_job_timeout_sec(
     config: TomlBundleConfig, target: Target | None, job: TomlJob
 ) -> int:
-    """Cascade job_timeout_sec: job > defaults.
+    """Cascade job_timeout_sec: job > defaults. 0 means no cap.
 
     `target` is accepted for signature symmetry with
     `resolved_notify_channels` (and to keep callers unaware of the
@@ -2675,7 +2697,11 @@ def resolved_group_timeout_sec(
 
     Returns 1.05 * sum of children's effective timeouts (jobs use
     `resolved_job_timeout_sec`; sub-groups recurse into this same
-    helper). Floor at 1 second. Used by:
+    helper). Floor at 1 second. Returns 0 ("no cap") if any selected,
+    non-interactive child is itself uncapped (`job_timeout_sec = 0`, or
+    a sub-group that resolved to 0) -- an uncapped child can't be
+    bounded by a finite cumulative deadline, so the whole group goes
+    uncapped. Used by:
     - `run_group` to bound its cumulative dispatch loop.
     - The waiter in `_trigger_unit_sync` to bound its pid-watch
       when waiting for a group.
@@ -2700,10 +2726,22 @@ def resolved_group_timeout_sec(
             child_job = config.jobs[child]
             if child_job.interactive:
                 continue
-            total += resolved_job_timeout_sec(config, target, child_job)
+            child_timeout = resolved_job_timeout_sec(config, target, child_job)
         else:
-            total += resolved_group_timeout_sec(config, target, child)
+            child_timeout = resolved_group_timeout_sec(config, target, child)
+        if child_timeout == 0:
+            return 0
+        total += child_timeout
     return max(1, int(total * _GROUP_TIMEOUT_PADDING))
+
+
+def _timeout_to_wait(sec: int) -> float:
+    """Map a resolved timeout (0 = no cap) to the float the pid-watch
+    waiters take: math.inf for no cap, else the value. Used wherever a
+    resolved/snapshot timeout feeds `_trigger_unit_sync`, so the
+    uncapped sentinel reaches it as inf (which it converts to a
+    no-timeout wait) rather than as 0 (a near-instant wait)."""
+    return math.inf if sec == 0 else float(sec)
 
 
 # =============================================================================
@@ -2851,7 +2889,8 @@ class JobGroup:
     current full name via the child's own snapshot at dispatch
     time so a rename in config doesn't flip the parent's snapshot.
     `group_budget_sec` is the pre-padded cumulative deadline
-    computed once at apply time.
+    computed once at apply time. 0 means no cap (some child is
+    uncapped); the group runner treats it as an infinite deadline.
     """
 
     schema: int
@@ -4074,13 +4113,15 @@ def _exec_with_timeout(
     argv: list[str],
     *,
     env: dict[str, str],
-    job_timeout_sec: int,
+    job_timeout_sec: int | None,
     log_file: IO[bytes],
 ) -> ExitOutcome:
     """Exec argv, piping stdout+stderr into log_file.
 
     On timeout, sends SIGTERM, then SIGKILL after a grace window, and
-    re-raises subprocess.TimeoutExpired.
+    re-raises subprocess.TimeoutExpired. `job_timeout_sec=None` runs the
+    command with no wallclock cap (the caller passes None when the job's
+    resolved timeout is 0).
     """
     proc = subprocess.Popen(
         argv,
@@ -5131,7 +5172,7 @@ def run_job(
                     rc, sig = _exec_with_timeout(
                         argv,
                         env=env,
-                        job_timeout_sec=job_timeout_sec,
+                        job_timeout_sec=job_timeout_sec or None,
                         log_file=log_file,
                     )
                     if sig is not None:
@@ -5234,14 +5275,17 @@ def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     missing -- `crony status` will surface that as a broken or
     stale entry, but the trigger itself will fail fast and the
     group's group_budget_sec still bounds the wait.
+
+    Returns `math.inf` for an uncapped child (`job_timeout_sec = 0`, or
+    a group whose `group_budget_sec` is 0); the caller converts that to
+    "wait with no cap" at the pid-watch.
     """
     try:
         cs = _load_snapshot(child_ref)
     except PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
-    if isinstance(cs, Job):
-        return float(cs.job_timeout_sec)
-    return float(cs.group_budget_sec)
+    raw = cs.job_timeout_sec if isinstance(cs, Job) else cs.group_budget_sec
+    return _timeout_to_wait(raw)
 
 
 def _child_is_interactive(child_ref: EntityRef) -> bool:
@@ -5326,14 +5370,21 @@ def run_group(
                 header_children = [
                     n if n is not None else str(r) for r, n in resolved_children
                 ]
+                budget_label = (
+                    "none" if group_budget == 0 else f"{group_budget}s"
+                )
                 header = (
                     f"\n=== {started_iso} group {full_name} "
-                    f"budget={group_budget}s "
+                    f"budget={budget_label} "
                     f"children={header_children} ===\n"
                 ).encode()
                 log_file.write(header)
 
-                deadline = time.monotonic() + group_budget
+                deadline = (
+                    math.inf
+                    if group_budget == 0
+                    else time.monotonic() + group_budget
+                )
                 for child_ref, child_full_name in resolved_pairs:
                     child_sd = _entity_state_dir(child_ref)
                     if _child_is_interactive(child_ref):
@@ -5388,10 +5439,14 @@ def run_group(
                     child_timeout = _child_timeout_from_snapshot(child_ref)
                     child_wait = min(child_timeout, remaining)
 
+                    wait_label = (
+                        "none"
+                        if math.isinf(child_wait)
+                        else f"{child_wait:.0f}s"
+                    )
                     log_file.write(
                         (
-                            f"-> {child_full_name} "
-                            f"(timeout={child_wait:.0f}s)\n"
+                            f"-> {child_full_name} (timeout={wait_label})\n"
                         ).encode()
                     )
                     try:
@@ -6889,8 +6944,9 @@ def _trigger_unit_sync(
     "platform never started anything" detector (broken plist,
     stalled queue, unloaded unit). Once we've observed activity,
     the wait is bounded by `job_timeout` (the runner's own
-    wallclock cap) rather than `trigger_timeout`, so a long-
-    running job doesn't get spuriously declared a start failure.
+    wallclock cap; `math.inf` for an uncapped child) rather than
+    `trigger_timeout`, so a long-running job doesn't get spuriously
+    declared a start failure.
 
     Mechanism: a pre-trigger timestamp T is taken, the platform
     is asked to fire the unit, and the waiter watches for the
@@ -6953,11 +7009,16 @@ def _trigger_unit_sync(
         if pid is not None:
             # Activity confirmed; trigger_timeout no longer
             # applies. Block on kernel-level pid-exit, capped at
-            # the runner's own wallclock budget. After the wait,
-            # loop back to re-read last-run.json (the runner
-            # writes it just before unlinking the pid).
-            remaining_job = max(1.0, job_timeout - elapsed)
-            _wait_for_pid_exit(pid, timeout=remaining_job)
+            # the runner's own wallclock budget (None = no cap, for an
+            # uncapped child). After the wait, loop back to re-read
+            # last-run.json (the runner writes it just before unlinking
+            # the pid).
+            pid_wait = (
+                None
+                if math.isinf(job_timeout)
+                else max(1.0, job_timeout - elapsed)
+            )
+            _wait_for_pid_exit(pid, timeout=pid_wait)
             continue
         # No pid and no fresh result: still in the start window.
         # Bound this state by trigger_timeout so a broken /
@@ -7950,13 +8011,13 @@ def do_trigger(
             )
         b_target = resolve_target(b.config, current_host(), platform)
         if short in b.config.jobs:
-            timeout = float(
+            timeout = _timeout_to_wait(
                 resolved_job_timeout_sec(
                     b.config, b_target, b.config.jobs[short]
                 )
             )
         else:
-            timeout = float(
+            timeout = _timeout_to_wait(
                 resolved_group_timeout_sec(b.config, b_target, short)
             )
         tt = (

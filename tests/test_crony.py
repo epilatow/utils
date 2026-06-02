@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import logging
+import math
 import os
 import plistlib
 import re
@@ -810,12 +811,12 @@ class TestParseJob:
         )
 
     def test_negative_timeout(self) -> None:
-        _assert_errored_job(
-            self._cfg(_job(job_timeout_sec=-1)), "j", "positive"
-        )
+        _assert_errored_job(self._cfg(_job(job_timeout_sec=-1)), "j", ">= 0")
 
-    def test_zero_timeout(self) -> None:
-        _assert_errored_job(self._cfg(_job(job_timeout_sec=0)), "j", "positive")
+    def test_zero_timeout_means_no_cap(self) -> None:
+        # 0 is the "no wallclock cap" sentinel, not an error.
+        cfg = _parse(self._cfg(_job(job_timeout_sec=0)))
+        assert cfg.jobs["j"].job_timeout_sec == 0
 
     def test_env_must_be_string_dict(self) -> None:
         _assert_errored_job(
@@ -3921,6 +3922,45 @@ class TestRunGroup:
         assert rec["jobs_run"][1]["name"] == h.full("b")
         assert rec["jobs_run"][1]["exit_class"] == "timeout"
 
+    def test_group_uncapped_child_dispatched_with_no_cap(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An uncapped child (job_timeout_sec=0) makes the group budget
+        # infinite, so the child is dispatched with no wallclock cap
+        # (job_timeout=inf) instead of being budget-skipped.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 0,
+                    },
+                },
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        captured: dict[str, float] = {}
+
+        def _capture(
+            full_name: str,
+            *,
+            state_dir: Path,
+            job_timeout: float,
+            trigger_timeout: float,
+        ) -> dict[str, Any]:
+            captured[full_name] = job_timeout
+            return {"exit_code": 0, "exit_class": "ok"}
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _capture)
+        h.write_snap(cfg, "a")
+        assert crony.run_group(h.snap(cfg, "g")) == 0
+        assert math.isinf(captured[h.full("a")])
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "ok"
+
     def test_group_soft_fails_missing_child_unit(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -4140,6 +4180,50 @@ class TestRunGroupInteractive:
         # Only the non-interactive child contributes:
         # 1.05 * 100 == 105.
         assert budget == 105
+
+    def test_group_budget_zero_when_child_uncapped(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "uncapped": {"command": "true", "job_timeout_sec": 0},
+                    "regular": {"command": "true", "job_timeout_sec": 100},
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["uncapped", "regular"],
+                        "schedule": "daily",
+                    },
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        target = crony.resolve_target(cfg, "test-host", "darwin")
+        # An uncapped child makes the whole group uncapped (0 = no cap).
+        assert crony.resolved_group_timeout_sec(cfg, target, "g") == 0
+
+    def test_group_budget_zero_propagates_through_subgroup(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "uncapped": {"command": "true", "job_timeout_sec": 0},
+                },
+                "job-group": {
+                    "leaf": {"jobs": ["uncapped"]},
+                    "root": {"jobs": ["leaf"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        target = crony.resolve_target(cfg, "test-host", "darwin")
+        # 0 propagates up the group chain.
+        assert crony.resolved_group_timeout_sec(cfg, target, "leaf") == 0
+        assert crony.resolved_group_timeout_sec(cfg, target, "root") == 0
 
     def test_dispatched_does_not_poison_rollup(self) -> None:
         # `dispatched` has precedence 0 so it ties with ok / gated
@@ -5911,6 +5995,35 @@ class TestKeepAwake:
             "true",
         ]
 
+    def test_run_job_uncapped_passes_none_timeout(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        captured: dict[str, Any] = {}
+
+        def fake_exec(
+            argv: list[str], *, env: Any, job_timeout_sec: Any, log_file: Any
+        ) -> Any:
+            captured["job_timeout_sec"] = job_timeout_sec
+            return crony.ExitOutcome(rc=0, signal=None)
+
+        monkeypatch.setattr(crony, "_exec_with_timeout", fake_exec)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 0,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony.run_job(h.snap(cfg, "j")) == 0
+        # 0 (no cap) reaches the runner as None so proc.wait never caps.
+        assert captured["job_timeout_sec"] is None
+
     def test_run_job_logs_note_when_tool_missing(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -6842,12 +6955,14 @@ class TestTypeStrictness:
             _parse({"defaults": {"job_timeout_sec": True}})
 
     def test_negative_default_timeout_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="positive"):
+        with pytest.raises(crony.ConfigError, match=">= 0"):
             _parse({"defaults": {"job_timeout_sec": -5}})
 
-    def test_zero_default_timeout_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="positive"):
-            _parse({"defaults": {"job_timeout_sec": 0}})
+    def test_zero_default_timeout_means_no_cap(self) -> None:
+        # 0 is the "no wallclock cap" sentinel, valid at the defaults
+        # level so a bundle can disable the cap for all its jobs.
+        cfg = _parse({"defaults": {"job_timeout_sec": 0}})
+        assert cfg.defaults.job_timeout_sec == 0
 
     def test_negative_default_attach_max_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
@@ -7326,6 +7441,38 @@ class TestEnableDisable:
                 jobs=["j"], wait=True, trigger_timeout=None, bundle=None
             )
         assert exc.value.code == int(crony.ExitCode.TIMEOUT)
+
+    def test_trigger_wait_uncapped_job_passes_inf(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An uncapped job (job_timeout_sec=0) must reach the waiter as
+        # math.inf, not 0.0, so --wait does a single unbounded wait
+        # instead of falling back to a 1s poll.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job_timeout_sec": 0,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        captured: dict[str, Any] = {}
+
+        def _capture(*a: Any, **kw: Any) -> dict[str, Any]:
+            captured["job_timeout"] = kw["job_timeout"]
+            return {"exit_class": "ok", "exit_code": 0, "signal": None}
+
+        monkeypatch.setattr(crony, "_trigger_unit_sync", _capture)
+        crony.do_trigger(
+            jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+        )
+        assert math.isinf(captured["job_timeout"])
 
     def test_trigger_wait_maps_signal_to_128_plus_n(
         self, tmp_path: Path, monkeypatch: Any
