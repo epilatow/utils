@@ -398,82 +398,6 @@ def _assert_errored_host_target(
 
 
 # =============================================================================
-# Schedule format
-# =============================================================================
-
-
-class TestSchedule:
-    """validate_schedule and parse_interval_seconds."""
-
-    @pytest.mark.parametrize(
-        "kw",
-        ["hourly", "daily", "weekly", "monthly", "yearly", "annually"],
-    )
-    def test_keyword_accepted(self, kw: str) -> None:
-        crony.validate_schedule(kw)  # no raise
-
-    @pytest.mark.parametrize(
-        "expr",
-        [
-            "*-*-* 03:15",
-            "03:15",
-            "Mon..Fri *-*-* 09:00",
-            "Sun *-*-* 04:00",
-            "*-*-01 03:00",
-            "*:0/15",
-            "*:00,30",
-        ],
-    )
-    def test_oncalendar_accepted(self, expr: str) -> None:
-        crony.validate_schedule(expr)  # no raise
-
-    @pytest.mark.parametrize("bad", ["", "   ", "soon", "Mon", "garbage"])
-    def test_garbage_rejected(self, bad: str) -> None:
-        with pytest.raises(crony.ConfigError):
-            crony.validate_schedule(bad)
-
-    def test_multiline_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="one line"):
-            crony.validate_schedule("daily\nfoo")
-
-    @pytest.mark.parametrize(
-        "spec, expected",
-        [
-            ("30s", 30),
-            ("2m", 120),
-            ("1h", 3600),
-            ("30min", 1800),
-            ("1d", 86400),
-            ("1h30min", 5400),
-            ("90 seconds", 90),
-            ("2h 15m", 8100),
-            ("1M", 2592000),
-            ("1month", 2592000),
-            ("2months", 5184000),
-            ("1year", 31536000),
-        ],
-    )
-    def test_interval_valid(self, spec: str, expected: int) -> None:
-        assert crony.parse_interval_seconds(spec) == expected
-
-    def test_interval_capital_m_is_months_lowercase_is_minutes(
-        self,
-    ) -> None:
-        # Sanity check: 'm' != 'M'.
-        assert crony.parse_interval_seconds(
-            "1m"
-        ) != crony.parse_interval_seconds("1M")
-
-    @pytest.mark.parametrize(
-        "bad",
-        ["", "   ", "soon", "0s", "30 lightyears", "30"],
-    )
-    def test_interval_invalid(self, bad: str) -> None:
-        with pytest.raises(crony.ConfigError):
-            crony.parse_interval_seconds(bad)
-
-
-# =============================================================================
 # TomlBundleConfig parsing - structural
 # =============================================================================
 
@@ -790,8 +714,7 @@ class TestParseJob:
 
     def test_interval_form(self) -> None:
         cfg = _parse(self._cfg({"command": "x", "interval": "1h30min"}))
-        assert cfg.jobs["j"].interval == "1h30min"
-        assert cfg.jobs["j"].schedule is None
+        assert cfg.jobs["j"].timing == crony.Interval.from_str("1h30min")
 
     def test_invalid_platforms_value(self) -> None:
         _assert_errored_job(
@@ -848,8 +771,7 @@ class TestParseJob:
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
             }
         )
-        assert cfg.jobs["a"].schedule is None
-        assert cfg.jobs["a"].interval is None
+        assert cfg.jobs["a"].timing is None
 
     def test_interactive_auto_tags_platform_darwin(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True)))
@@ -915,7 +837,9 @@ class TestParseJobGroup:
             }
         )
         assert cfg.job_groups["g"].jobs == ["a"]
-        assert cfg.job_groups["g"].schedule == "*-*-* 03:00"
+        assert cfg.job_groups["g"].timing == crony.Schedule.from_str(
+            "*-*-* 03:00"
+        )
 
     def test_empty_jobs_list(self) -> None:
         _assert_errored_job_group(
@@ -935,8 +859,7 @@ class TestParseJobGroup:
                 "job-group": {"g": {"jobs": ["a"]}},
             }
         )
-        assert cfg.job_groups["g"].schedule is None
-        assert cfg.job_groups["g"].interval is None
+        assert cfg.job_groups["g"].timing is None
 
     def test_both_schedule_and_interval(self) -> None:
         _assert_errored_job_group(
@@ -1354,8 +1277,8 @@ class TestValidateConfig:
         )
         assert "leaf" in cfg.job_groups
         assert "root" in cfg.job_groups
-        assert cfg.job_groups["leaf"].schedule is None
-        assert cfg.job_groups["root"].schedule == "daily"
+        assert cfg.job_groups["leaf"].timing is None
+        assert cfg.job_groups["root"].timing == crony.Schedule.from_str("daily")
 
     def test_chain_without_schedule_rejected(self) -> None:
         # A target reaches `a` via a chain with no schedule anywhere:
@@ -1590,7 +1513,9 @@ class TestLoadConfigFromFile:
         f.write_text(cfg_text)
         cfg = crony.load_toml_bundle_config(f)
         assert "brew-update" in cfg.jobs
-        assert cfg.jobs["brew-update"].schedule == "*-*-* 03:15"
+        assert cfg.jobs["brew-update"].timing == crony.Schedule.from_str(
+            "*-*-* 03:15"
+        )
 
     def test_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(crony.ConfigError, match="not found"):
@@ -3335,7 +3260,9 @@ class TestRunJobBasics:
             f'"kind": "banana", "name": "default.j"}}',
             encoding="utf-8",
         )
-        with pytest.raises(crony.PreconditionError, match="unknown kind"):
+        with pytest.raises(
+            crony.PreconditionError, match="unknown snapshot kind"
+        ):
             crony.do_run(
                 ref=f"default:{uuid_value}",
                 dry_run=False,
@@ -5524,7 +5451,9 @@ class TestPlistRendering:
 
     def test_keyword_daily(self) -> None:
         plist = crony._render_plist(
-            "brew", crony.EntityRef("default", "u-test"), "daily", None
+            "brew",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("daily"),
         )
         assert "<key>Label</key>" in plist
         assert "<string>org.crony.brew</string>" in plist
@@ -5535,7 +5464,9 @@ class TestPlistRendering:
 
     def test_oncalendar_simple_time(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "*-*-* 03:15", None
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("*-*-* 03:15"),
         )
         assert "<key>Hour</key>" in plist
         assert "<integer>3</integer>" in plist
@@ -5543,39 +5474,30 @@ class TestPlistRendering:
 
     def test_oncalendar_dow_with_time(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "Mon *-*-* 09:00", None
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("Mon *-*-* 09:00"),
         )
         assert "<key>Weekday</key>" in plist
         assert "<integer>1</integer>" in plist  # Mon=1
 
     def test_oncalendar_first_of_month(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "*-*-01 03:00", None
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("*-*-01 03:00"),
         )
         assert "<key>Day</key>" in plist
         assert "<integer>1</integer>" in plist
 
     def test_interval(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), None, "30min"
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Interval.from_str("30min"),
         )
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
-
-    def test_step_pattern_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="step / range / list"):
-            crony._render_plist(
-                "j", crony.EntityRef("default", "u-test"), "*:0/15", None
-            )
-
-    def test_range_pattern_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="step / range / list"):
-            crony._render_plist(
-                "j",
-                crony.EntityRef("default", "u-test"),
-                "Mon..Fri *-*-* 09:00",
-                None,
-            )
 
     def test_program_args_invoke_uv_with_absolute_path(
         self, monkeypatch: Any
@@ -5590,7 +5512,9 @@ class TestPlistRendering:
             crony, "_crony_executable", lambda: Path("/abs/crony")
         )
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "daily", None
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("daily"),
         )
         assert "<string>/abs/uv</string>" in plist
         assert "<string>run</string>" in plist
@@ -5606,14 +5530,14 @@ class TestPlistRendering:
         # this catches structural breakage in CI on any platform).
         ref = crony.EntityRef("default", "u-test")
         shapes = [
-            ("daily", None, None),
-            (None, "30min", None),
-            ("Mon *-*-* 09:00", None, "high"),
-            ("*-*-* 03:00", None, "low"),
-            (None, None, None),  # schedule-less, normal priority
+            (crony.Schedule.from_str("daily"), None),
+            (crony.Interval.from_str("30min"), None),
+            (crony.Schedule.from_str("Mon *-*-* 09:00"), "high"),
+            (crony.Schedule.from_str("*-*-* 03:00"), "low"),
+            (None, None),  # on-demand, normal priority
         ]
-        for schedule, interval, priority in shapes:
-            plist = crony._render_plist("j", ref, schedule, interval, priority)
+        for timing, priority in shapes:
+            plist = crony._render_plist("j", ref, timing, priority)
             d = plistlib.loads(plist.encode("utf-8"))
             assert d["Label"] == "org.crony.j"
             assert d["ProgramArguments"][1] == "run"
@@ -5632,13 +5556,15 @@ class TestSystemdRendering:
         assert "WorkingDirectory=%h" in svc
 
     def test_timer_oncalendar(self) -> None:
-        timer = crony._render_systemd_timer("j", "*-*-* 03:00", None)
+        timer = crony._render_systemd_timer(
+            "j", crony.Schedule.from_str("*-*-* 03:00")
+        )
         assert "OnCalendar=*-*-* 03:00" in timer
         assert "Persistent=true" in timer
         assert "WantedBy=timers.target" in timer
 
     def test_timer_interval(self) -> None:
-        timer = crony._render_systemd_timer("j", None, "1h")
+        timer = crony._render_systemd_timer("j", crony.Interval.from_str("1h"))
         assert "OnUnitActiveSec=1h" in timer
 
     def test_service_invokes_uv_with_absolute_path(
@@ -5686,19 +5612,18 @@ class TestSystemdAnalyzeVerify:
         # irrelevant to verify (the unit is never run).
         real = Path(sys.executable)
         shapes = [
-            ("cal-normal", "*-*-* 03:00", None, None),
-            ("cal-high", "Mon *-*-* 09:00", None, "high"),
-            ("cal-low", "daily", None, "low"),
-            ("interval", None, "30min", "high"),
-            ("scheduleless", None, None, "low"),
+            ("cal-normal", crony.Schedule.from_str("*-*-* 03:00"), None),
+            ("cal-high", crony.Schedule.from_str("Mon *-*-* 09:00"), "high"),
+            ("cal-low", crony.Schedule.from_str("daily"), "low"),
+            ("interval", crony.Interval.from_str("30min"), "high"),
+            ("scheduleless", None, "low"),
         ]
         written: list[Path] = []
-        for nm, sched, interval, prio in shapes:
+        for nm, timing, prio in shapes:
             units = crony._render_units(
                 nm,
                 ref,
-                sched,
-                interval,
+                timing,
                 "linux",
                 prio,
                 uv_path=real,
@@ -5783,7 +5708,10 @@ class TestJobPriority:
 
     def test_plist_high(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "daily", None, "high"
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("daily"),
+            "high",
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Interactive"
@@ -5792,7 +5720,10 @@ class TestJobPriority:
 
     def test_plist_low(self) -> None:
         plist = crony._render_plist(
-            "j", crony.EntityRef("default", "u-test"), "daily", None, "low"
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.Schedule.from_str("daily"),
+            "low",
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Background"
@@ -5802,7 +5733,10 @@ class TestJobPriority:
     def test_plist_normal_and_none_emit_nothing(self) -> None:
         for p in ("normal", None):
             plist = crony._render_plist(
-                "j", crony.EntityRef("default", "u-test"), "daily", None, p
+                "j",
+                crony.EntityRef("default", "u-test"),
+                crony.Schedule.from_str("daily"),
+                p,
             )
             d = plistlib.loads(plist.encode("utf-8"))
             assert "ProcessType" not in d
@@ -7116,26 +7050,6 @@ class TestResolveCliName:
     def test_qualified_other_bundle_rejected(self) -> None:
         with pytest.raises(crony.UsageError, match="default"):
             crony.resolve_cli_name("default.k", "borgadm")
-
-
-# =============================================================================
-# Tightened schedule validation
-# =============================================================================
-
-
-class TestScheduleTightened:
-    """validate_schedule rejects strings that contain permitted chars
-    but lack a real time component. Catches typos like '*' or '1234'
-    before they reach the platform translator.
-    """
-
-    @pytest.mark.parametrize(
-        "bad",
-        ["*", "1234", "-not-a-real-schedule-", "*-*-*", "***"],
-    )
-    def test_no_time_component_rejected(self, bad: str) -> None:
-        with pytest.raises(crony.ConfigError):
-            crony.validate_schedule(bad)
 
 
 # =============================================================================
@@ -11512,7 +11426,7 @@ class TestLoadConfig:
         sd = crony.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
-            json.dumps(dataclasses.asdict(snap)), encoding="utf-8"
+            json.dumps(crony._snapshot_to_dict(snap)), encoding="utf-8"
         )
         config = crony.load_config()
         ref = crony.EntityRef("default", uuid_a)
@@ -11644,7 +11558,8 @@ class TestConfigBroken:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         self._setup(tmp_path, monkeypatch)
-        # Right schema + kind but missing required fields -> Job(**raw) raises.
+        # Right schema + kind but missing required fields -> the
+        # snapshot constructor raises.
         ref, _ = self._plant_state(
             "33333333-3333-3333-3333-333333333333",
             json.dumps(
@@ -11658,7 +11573,7 @@ class TestConfigBroken:
         config = crony.load_config()
         assert ref in config.broken
         assert config.broken[ref].name == "default.partial"
-        assert "dataclass conversion" in config.broken[ref].reason
+        assert "snapshot conversion" in config.broken[ref].reason
 
     def test_corrupt_json_recorded_as_broken_without_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -13291,7 +13206,9 @@ class TestUnitDriftDetection:
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
-            crony._render_systemd_timer(h.full("transit"), "*-*-* 03:00", None)
+            crony._render_systemd_timer(
+                h.full("transit"), crony.Schedule.from_str("*-*-* 03:00")
+            )
         )
         config = crony.load_config()
         ref = config.current.by_full_name[h.full("transit")]
@@ -13335,8 +13252,7 @@ class TestSnapshotBackwardLoad:
             crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
         )
         assert isinstance(snap, crony.Job)
-        assert snap.schedule is None
-        assert snap.interval is None
+        assert snap.timing is None
 
 
 class TestLifecycleSmoke:

@@ -62,7 +62,7 @@ from common.argparse_ext import (  # noqa: E402
     action_subparsers,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
-from crony.unit import EntityRef  # noqa: E402
+from crony.unit import EntityRef, Interval, Schedule, Timing  # noqa: E402
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -739,8 +739,7 @@ class TomlJob:
     gate: str | None = None
     gate_script: str | None = None
     gate_args: list[str] = field(default_factory=list)
-    schedule: str | None = None
-    interval: str | None = None
+    timing: Timing | None = None
     # Process-priority class baked into the platform unit: "high"
     # (run un-throttled, app-like QoS), "low" (throttle CPU + IO), or
     # None (inherit [defaults]; a None default means "normal", emit
@@ -815,8 +814,7 @@ class TomlJobGroup:
     name: str
     uuid: str
     jobs: list[str] = field(default_factory=list)
-    schedule: str | None = None
-    interval: str | None = None
+    timing: Timing | None = None
     platforms: list[str] = field(default_factory=list)
     hosts: HostList = field(default_factory=HostList)
 
@@ -983,134 +981,33 @@ def current_host() -> str:
 
 
 # =============================================================================
-# SCHEDULE FORMAT VALIDATION
+# SCHEDULE / INTERVAL PARSING
 # =============================================================================
-# Schedules use systemd OnCalendar syntax (systemd.time(7)). Intervals
-# use systemd time-span syntax. We do basic structural validation here;
-# full translation to launchd `StartCalendarInterval` happens when units
-# are rendered.
+# Schedules use systemd OnCalendar syntax; intervals use systemd
+# time-span syntax. Both are parsed and validated by the crony.unit
+# value objects (Schedule / Interval); `_parse_timing` wraps them for
+# the config loader.
 
 
-# Reserved OnCalendar keywords supported by both systemd and our darwin
-# translator. systemd accepts more (e.g. "minutely", "quarterly") but
-# we explicitly support these.
-_ONCALENDAR_KEYWORDS: frozenset[str] = frozenset(
-    {
-        "hourly",
-        "daily",
-        "weekly",
-        "monthly",
-        "yearly",
-        "annually",
-    }
-)
-
-
-_INTERVAL_TOKEN_RE = re.compile(
-    # Alternation is left-to-right; longer alternatives MUST come
-    # before any shorter alternative that's a prefix of them.
-    # `months?` precedes `minutes?` so that "1month" doesn't get
-    # consumed as a minutes-`m` followed by garbage.
-    r"\s*(\d+)\s*"
-    r"(seconds?|sec|s"
-    r"|months?"
-    r"|minutes?|min|m"
-    r"|hours?|hr|h"
-    r"|days?|d"
-    r"|weeks?|w"
-    r"|years?|y"
-    r"|M)",
-)
-
-_INTERVAL_UNIT_SECONDS: dict[str, int] = {
-    "s": 1,
-    "sec": 1,
-    "second": 1,
-    "seconds": 1,
-    "m": 60,
-    "min": 60,
-    "minute": 60,
-    "minutes": 60,
-    "h": 3600,
-    "hr": 3600,
-    "hour": 3600,
-    "hours": 3600,
-    "d": 86400,
-    "day": 86400,
-    "days": 86400,
-    "w": 604800,
-    "week": 604800,
-    "weeks": 604800,
-    "M": 2592000,
-    "month": 2592000,
-    "months": 2592000,
-    "y": 31536000,
-    "year": 31536000,
-    "years": 31536000,
-}
-
-
-def parse_interval_seconds(s: str) -> int:
-    """Parse a systemd time-span string into seconds.
-
-    Accepts forms like "30min", "2h", "1h30min", "90 seconds".
-    Raises ConfigError on unparseable input.
-    """
-    text = s.strip()
-    if not text:
-        raise ConfigError("empty interval")
-    total = 0
-    pos = 0
-    matched = False
-    while pos < len(text):
-        m = _INTERVAL_TOKEN_RE.match(text, pos)
-        if not m:
-            if text[pos].isspace():
-                pos += 1
-                continue
-            raise ConfigError(
-                f"unparseable interval at offset {pos}: {text[pos:]!r}"
-            )
-        unit = m.group(2)
-        # 'M' (capital) means months; lowercase 'm' means minutes
-        if unit != "M":
-            unit_lc = unit.lower()
-        else:
-            unit_lc = unit
-        total += int(m.group(1)) * _INTERVAL_UNIT_SECONDS[unit_lc]
-        pos = m.end()
-        matched = True
-    if not matched:
-        raise ConfigError(f"no time components in interval: {s!r}")
-    if total <= 0:
-        raise ConfigError(f"interval must be positive: {s!r}")
-    return total
-
-
-def validate_schedule(s: str) -> None:
-    """Basic OnCalendar structural validation.
-
-    Full grammar parsing happens at platform-render time. Here we
-    just reject obviously-wrong input so config loading fails fast.
-    The rule: either a known keyword by itself, or a
-    string containing at least one HH:MM-style time component
-    (digit-colon-digit). Anything else lacks the minimum shape
-    of a real OnCalendar expression.
-    """
-    text = s.strip()
-    if not text:
-        raise ConfigError("empty schedule")
-    if "\n" in text or "\r" in text:
-        raise ConfigError(f"schedule must be one line: {s!r}")
-    if text in _ONCALENDAR_KEYWORDS:
-        return
-    # Require a colon followed by a digit (a time component) so "*",
-    # "1234", and "-not-a-real-schedule-" are rejected. This accepts
-    # forms like "03:15", "*:0/15", "*:00,30", "Sun *-*-* 04:00".
-    if not re.search(r":\d", text):
+def _parse_timing(
+    schedule_str: str | None, interval_str: str | None, where: str
+) -> Timing | None:
+    """Build a unit's timing from the config's mutually-exclusive
+    `schedule` / `interval` keys, or None for an on-demand entry.
+    Surfaces the value objects' validation as a config error tied to
+    `where`."""
+    if schedule_str is not None and interval_str is not None:
         raise ConfigError(
-            f"schedule does not look like OnCalendar syntax: {s!r}"
+            f"{where}: 'schedule' and 'interval' are mutually exclusive"
         )
+    try:
+        if schedule_str is not None:
+            return Schedule.from_str(schedule_str)
+        if interval_str is not None:
+            return Interval.from_str(interval_str)
+    except ValueError as e:
+        raise ConfigError(f"{where}: {e}") from e
+    return None
 
 
 # =============================================================================
@@ -1565,10 +1462,11 @@ def _parse_interactive_timespan(
         return None
     if not interactive:
         raise ConfigError(f"{where}: {key!r} set without 'interactive = true'")
-    secs = parse_interval_seconds(text)
-    if secs <= 0:
-        raise ConfigError(f"{where}: {key!r} must be positive")
-    return secs
+    try:
+        # from_str validates the time-span and rejects non-positive.
+        return Interval.from_str(text).total_seconds
+    except ValueError as e:
+        raise ConfigError(f"{where}: {key!r} {e}") from e
 
 
 def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
@@ -1872,16 +1770,9 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         raise ConfigError(
             f"{where}: 'gate_args' is only valid with 'gate_script'"
         )
-    schedule = _typed_field(raw, "schedule", str, where)
-    interval = _typed_field(raw, "interval", str, where)
-    if schedule is not None and interval is not None:
-        raise ConfigError(
-            f"{where}: 'schedule' and 'interval' are mutually exclusive"
-        )
-    if schedule is not None:
-        validate_schedule(schedule)
-    if interval is not None:
-        parse_interval_seconds(interval)
+    schedule_str = _typed_field(raw, "schedule", str, where)
+    interval_str = _typed_field(raw, "interval", str, where)
+    timing = _parse_timing(schedule_str, interval_str, where)
     priority = _parse_priority_field(raw, where)
     keep_awake = _typed_field(raw, "keep_awake", bool, where, default=None)
     platforms = _parse_platforms_field(raw, where)
@@ -1914,8 +1805,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         gate=gate,
         gate_script=gate_script,
         gate_args=gate_args,
-        schedule=schedule,
-        interval=interval,
+        timing=timing,
         priority=priority,
         keep_awake=keep_awake,
         platforms=platforms,
@@ -1950,24 +1840,16 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     jobs = _string_list(raw, "jobs", where)
     if not jobs:
         raise ConfigError(f"{where}: 'jobs' must be a non-empty list")
-    schedule = _typed_field(raw, "schedule", str, where)
-    interval = _typed_field(raw, "interval", str, where)
-    if schedule is not None and interval is not None:
-        raise ConfigError(
-            f"{where}: 'schedule' and 'interval' are mutually exclusive"
-        )
-    if schedule is not None:
-        validate_schedule(schedule)
-    if interval is not None:
-        parse_interval_seconds(interval)
+    schedule_str = _typed_field(raw, "schedule", str, where)
+    interval_str = _typed_field(raw, "interval", str, where)
+    timing = _parse_timing(schedule_str, interval_str, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     return TomlJobGroup(
         name=name,
         uuid=group_uuid,
         jobs=jobs,
-        schedule=schedule,
-        interval=interval,
+        timing=timing,
         platforms=platforms,
         hosts=hosts,
     )
@@ -2213,7 +2095,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 return
             if ref in config.jobs:
                 job = config.jobs[ref]
-                scheduled = job.schedule is not None or job.interval is not None
+                scheduled = job.timing is not None
                 if not seen_schedule and not scheduled:
                     chain_error.append(
                         f"{label}: chain {' -> '.join(path)} has "
@@ -2222,7 +2104,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                     )
                 return
             group = config.job_groups[ref]
-            scheduled = group.schedule is not None or group.interval is not None
+            scheduled = group.timing is not None
             new_seen = seen_schedule or scheduled
             for child in group.jobs:
                 _walk_chain(child, path, new_seen)
@@ -2852,14 +2734,13 @@ class Job:
     gate_args: list[str]
     env: dict[str, str]
     job_timeout_sec: int
-    # `schedule` and `interval` capture the per-entry config that
-    # drove the rendered platform unit, so `crony status` can show
-    # the currently-active (applied) schedule independently of any
-    # later edit to the live config. Default-None for back-compat
-    # with snapshots written before these fields existed; loaders
-    # rely on the dataclass default rather than a schema bump.
-    schedule: str | None = None
-    interval: str | None = None
+    # `timing` captures the per-entry schedule / interval config that
+    # drove the rendered platform unit, so `crony status` can show the
+    # currently-active (applied) schedule independently of any later
+    # edit to the live config. Default-None (on-demand) for back-compat
+    # with snapshots written before a timing was pinned; loaders rely on
+    # the dataclass default rather than a schema bump.
+    timing: Timing | None = None
     # Process-priority class baked into the platform unit ("high" /
     # "low" / None). Pinned in the snapshot so a change re-renders the
     # unit on the next apply. Default-None for back-compat with
@@ -2905,8 +2786,7 @@ class JobGroup:
     children: list[str]
     group_budget_sec: int
     trigger_timeout_sec: int
-    schedule: str | None = None
-    interval: str | None = None
+    timing: Timing | None = None
 
     @property
     def ref(self) -> EntityRef:
@@ -2953,8 +2833,7 @@ def _resolve_job_snapshot(
         gate_args=gate_args,
         env=resolved_env(config, target, job),
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
-        schedule=job.schedule,
-        interval=job.interval,
+        timing=job.timing,
         priority=resolved_priority(config, target, job),
         keep_awake=resolved_keep_awake(config, target, job),
         success_exit_codes=list(job.success_exit_codes),
@@ -3014,8 +2893,7 @@ def _resolve_group_snapshot(
         children=children,
         group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
         trigger_timeout_sec=config.defaults.trigger_timeout_sec,
-        schedule=group.schedule,
-        interval=group.interval,
+        timing=group.timing,
     )
 
 
@@ -3041,6 +2919,42 @@ def _resolve_snapshot_for(
             config, target, config.job_groups[short], bundle_name, full_name
         )
     raise PreconditionError(f"unknown job/group: {short!r}")
+
+
+def _snapshot_to_dict(snap: Job | JobGroup) -> dict[str, Any]:
+    """Serialize a snapshot to its JSON dict. The typed value-object
+    fields render back to their source strings so snapshot.json stays
+    string-keyed (and byte-stable across this typing change)."""
+    d = dataclasses.asdict(snap)
+    timing = snap.timing
+    d.pop("timing", None)
+    d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
+    d["interval"] = str(timing) if isinstance(timing, Interval) else None
+    return d
+
+
+def _snapshot_from_raw(raw: dict[str, Any]) -> Job | JobGroup:
+    """Construct a snapshot from its JSON dict, parsing the typed
+    value-object fields back from their source strings. Raises
+    TypeError (wrong shape) or ValueError (bad typed field / unknown
+    kind); callers treat both as a broken snapshot."""
+    data = dict(raw)
+    schedule_str = data.pop("schedule", None)
+    interval_str = data.pop("interval", None)
+    timing: Timing | None
+    if schedule_str is not None:
+        timing = Schedule.from_str(schedule_str)
+    elif interval_str is not None:
+        timing = Interval.from_str(interval_str)
+    else:
+        timing = None
+    data["timing"] = timing
+    kind = data.get("kind")
+    if kind == "job":
+        return Job(**data)
+    if kind == "group":
+        return JobGroup(**data)
+    raise ValueError(f"unknown snapshot kind {kind!r}")
 
 
 def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
@@ -3074,26 +2988,20 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
             f"snapshot for {display!r} has schema {schema!r}, "
             f"expected {_SNAPSHOT_SCHEMA} (re-apply required)"
         )
-    kind = raw.get("kind")
     # A schema-matched but otherwise malformed snapshot (extra /
-    # missing fields) raises TypeError from the dataclass ctor.
-    # `_build_current_graph` already treats that as a broken
-    # entity; mirror it here so the runner records a `canceled`
-    # last-run via its PreconditionError handler instead of
-    # crashing with a traceback the scheduler never sees.
+    # missing fields, a bad schedule / interval string, or an unknown
+    # kind) raises TypeError / ValueError from _snapshot_from_raw.
+    # `_build_current_graph` already treats that as a broken entity;
+    # mirror it here so the runner records a `canceled` last-run via
+    # its PreconditionError handler instead of crashing with a
+    # traceback the scheduler never sees.
     try:
-        if kind == "job":
-            return Job(**raw)
-        if kind == "group":
-            return JobGroup(**raw)
-    except TypeError as e:
+        return _snapshot_from_raw(raw)
+    except (TypeError, ValueError) as e:
         raise PreconditionError(
             f"snapshot for {display!r} has malformed fields: {e} "
             f"(re-apply required)"
         ) from e
-    raise PreconditionError(
-        f"snapshot for {display!r} has unknown kind {kind!r}"
-    )
 
 
 # =============================================================================
@@ -3694,56 +3602,36 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            kind = raw.get("kind")
-            if kind == "job":
-                try:
-                    snap_j = Job(**raw)
-                except TypeError as exc:
-                    broken[ref] = BrokenEntity(
-                        bundle=bundle_dir.name,
-                        uuid=uuid_dir.name,
-                        name=name_hint,
-                        reason=f"job dataclass conversion failed: {exc}",
-                        source_path=snap_path,
-                    )
-                    continue
-                current.jobs[snap_j.ref] = snap_j
-                current.by_full_name[snap_j.name] = snap_j.ref
-                runtime[snap_j.ref] = _read_runtime_state(
-                    uuid_dir,
-                    "job",
-                    full_name=snap_j.name,
-                    platform=platform,
-                    snapshot=snap_j,
-                )
-            elif kind == "group":
-                try:
-                    snap_g = JobGroup(**raw)
-                except TypeError as exc:
-                    broken[ref] = BrokenEntity(
-                        bundle=bundle_dir.name,
-                        uuid=uuid_dir.name,
-                        name=name_hint,
-                        reason=f"group dataclass conversion failed: {exc}",
-                        source_path=snap_path,
-                    )
-                    continue
-                current.groups[snap_g.ref] = snap_g
-                current.by_full_name[snap_g.name] = snap_g.ref
-                runtime[snap_g.ref] = _read_runtime_state(
-                    uuid_dir,
-                    "group",
-                    full_name=snap_g.name,
-                    platform=platform,
-                    snapshot=snap_g,
-                )
-            else:
+            try:
+                snap = _snapshot_from_raw(raw)
+            except (TypeError, ValueError) as exc:
                 broken[ref] = BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
-                    reason=f"unrecognized snapshot kind {kind!r}",
+                    reason=f"snapshot conversion failed: {exc}",
                     source_path=snap_path,
+                )
+                continue
+            if isinstance(snap, Job):
+                current.jobs[snap.ref] = snap
+                current.by_full_name[snap.name] = snap.ref
+                runtime[snap.ref] = _read_runtime_state(
+                    uuid_dir,
+                    "job",
+                    full_name=snap.name,
+                    platform=platform,
+                    snapshot=snap,
+                )
+            else:
+                current.groups[snap.ref] = snap
+                current.by_full_name[snap.name] = snap.ref
+                runtime[snap.ref] = _read_runtime_state(
+                    uuid_dir,
+                    "group",
+                    full_name=snap.name,
+                    platform=platform,
+                    snapshot=snap,
                 )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
@@ -5544,16 +5432,6 @@ def run_group(
 # darwin/linux divergence in apply/destroy lives in this section.
 # Anywhere else in the file is platform-agnostic.
 
-_DOW_TO_LAUNCHD: dict[str, int] = {
-    "sun": 0,
-    "mon": 1,
-    "tue": 2,
-    "wed": 3,
-    "thu": 4,
-    "fri": 5,
-    "sat": 6,
-}
-
 
 def _label_for(name: str) -> str:
     """launchd Label for a job/group."""
@@ -5611,72 +5489,6 @@ def _dispatch_unit_path(name: str, platform: str) -> Path:
     return _plist_path_for(name)
 
 
-def _oncalendar_to_plist_calendar(spec: str) -> dict[str, int]:
-    """Translate an OnCalendar spec to a launchd StartCalendarInterval.
-
-    Supports keywords (hourly, daily, weekly, monthly, yearly), bare
-    HH:MM, and the `[DOW] *-*-* HH:MM` shape with a single concrete
-    day or month. Step values, ranges, and comma-lists are rejected
-    here -- they would require expanding to many entries that crony
-    doesn't yet generate, so the error explicitly suggests using a
-    simpler schedule form.
-    """
-    text = spec.strip()
-    keywords: dict[str, dict[str, int]] = {
-        "hourly": {"Minute": 0},
-        "daily": {"Hour": 0, "Minute": 0},
-        "weekly": {"Weekday": 1, "Hour": 0, "Minute": 0},
-        "monthly": {"Day": 1, "Hour": 0, "Minute": 0},
-        "yearly": {"Month": 1, "Day": 1, "Hour": 0, "Minute": 0},
-        "annually": {"Month": 1, "Day": 1, "Hour": 0, "Minute": 0},
-    }
-    if text in keywords:
-        return keywords[text]
-    if "/" in text or ".." in text or "," in text:
-        raise ConfigError(
-            f"OnCalendar pattern {spec!r} uses step / range / list "
-            f"features that crony does not translate to launchd. "
-            f"Use a single concrete time or weekday/day entry."
-        )
-    parts = text.split()
-    dow: int | None = None
-    if parts and parts[0].lower() in _DOW_TO_LAUNCHD:
-        dow = _DOW_TO_LAUNCHD[parts[0].lower()]
-        parts = parts[1:]
-    time_re = re.compile(r"^(\d{1,2}):(\d{2})(?::\d{2})?$")
-    if len(parts) == 1 and time_re.fullmatch(parts[0]):
-        m = time_re.fullmatch(parts[0])
-        assert m is not None
-        entry: dict[str, int] = {
-            "Hour": int(m.group(1)),
-            "Minute": int(m.group(2)),
-        }
-        if dow is not None:
-            entry["Weekday"] = dow
-        return entry
-    date_re = re.compile(r"^(\*|\d{4})-(\*|\d{1,2})-(\*|\d{1,2})$")
-    if len(parts) == 2:
-        d = date_re.fullmatch(parts[0])
-        t = time_re.fullmatch(parts[1])
-        if d and t:
-            e: dict[str, int] = {
-                "Hour": int(t.group(1)),
-                "Minute": int(t.group(2)),
-            }
-            if d.group(2) != "*":
-                e["Month"] = int(d.group(2))
-            if d.group(3) != "*":
-                e["Day"] = int(d.group(3))
-            if dow is not None:
-                e["Weekday"] = dow
-            return e
-    raise ConfigError(
-        f"crony does not yet translate OnCalendar pattern {spec!r} "
-        f"to launchd. Try a simpler form like '03:15' or "
-        f"'*-*-* 03:15' or 'Mon *-*-* 09:00'."
-    )
-
-
 def _plist_priority_keys(priority: str | None) -> dict[str, object]:
     """LaunchAgent priority keys for a job, or {} for normal.
 
@@ -5717,8 +5529,7 @@ def _systemd_priority_block(priority: str | None) -> str:
 def _render_plist(
     name: str,
     ref: EntityRef,
-    schedule: str | None,
-    interval: str | None,
+    timing: Timing | None,
     priority: str | None = None,
     *,
     uv_path: Path | None = None,
@@ -5765,12 +5576,10 @@ def _render_plist(
         "AbandonProcessGroup": False,
     }
     contents.update(_plist_priority_keys(priority))
-    if interval is not None:
-        contents["StartInterval"] = parse_interval_seconds(interval)
-    elif schedule is not None:
-        contents["StartCalendarInterval"] = _oncalendar_to_plist_calendar(
-            schedule
-        )
+    if isinstance(timing, Interval):
+        contents["StartInterval"] = timing.total_seconds
+    elif isinstance(timing, Schedule):
+        contents["StartCalendarInterval"] = timing.to_plist_calendar()
     return plistlib.dumps(
         contents, fmt=plistlib.FMT_XML, sort_keys=True
     ).decode("utf-8")
@@ -5811,15 +5620,12 @@ def _render_systemd_service(
     )
 
 
-def _render_systemd_timer(
-    name: str, schedule: str | None, interval: str | None
-) -> str:
+def _render_systemd_timer(name: str, timing: Timing) -> str:
     """Render the systemd .timer unit."""
-    if interval is not None:
-        spec_line = f"OnUnitActiveSec={interval}\n"
+    if isinstance(timing, Interval):
+        spec_line = f"OnUnitActiveSec={timing}\n"
     else:
-        assert schedule is not None
-        spec_line = f"OnCalendar={schedule}\n"
+        spec_line = f"OnCalendar={timing}\n"
     return (
         "[Unit]\n"
         f"Description=crony timer for {name}\n"
@@ -5836,8 +5642,7 @@ def _render_systemd_timer(
 def _render_units(
     name: str,
     ref: EntityRef,
-    schedule: str | None,
-    interval: str | None,
+    timing: Timing | None,
     platform: str,
     priority: str | None = None,
     *,
@@ -5867,8 +5672,7 @@ def _render_units(
             f"{_label_for(name)}.plist": _render_plist(
                 name,
                 ref,
-                schedule,
-                interval,
+                timing,
                 priority,
                 uv_path=uv_path,
                 crony_path=crony_path,
@@ -5879,10 +5683,8 @@ def _render_units(
             name, ref, priority, uv_path=uv_path, crony_path=crony_path
         ),
     }
-    if schedule is not None or interval is not None:
-        units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(
-            name, schedule, interval
-        )
+    if timing is not None:
+        units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(name, timing)
     return units
 
 
@@ -5972,8 +5774,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         _render_units(
             full_name,
             snap.ref,
-            snap.schedule,
-            snap.interval,
+            snap.timing,
             platform,
             snap_priority,
             uv_path=Path(),
@@ -5991,9 +5792,9 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         except (FileNotFoundError, OSError):
             return True
         if fname.endswith(".timer"):
-            if content != _render_systemd_timer(
-                full_name, snap.schedule, snap.interval
-            ):
+            # A .timer is only rendered for a scheduled entry.
+            assert snap.timing is not None
+            if content != _render_systemd_timer(full_name, snap.timing):
                 return True
             continue
         extracted = _extract_unit_exec_paths(content, platform)
@@ -6005,8 +5806,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         re_rendered = _render_units(
             full_name,
             snap.ref,
-            snap.schedule,
-            snap.interval,
+            snap.timing,
             platform,
             snap_priority,
             uv_path=uv_path,
@@ -6022,7 +5822,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     # (file presence and round-trip are already verified above), not
     # drift. On darwin a grouped plist must still be loaded to be
     # kickstartable, so the probe stays there.
-    grouped = snap.schedule is None and snap.interval is None
+    grouped = snap.timing is None
     if grouped and platform == "linux":
         return False
     if _unit_state(full_name, platform) == "none":
@@ -6030,25 +5830,18 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     return False
 
 
-def _entity_schedule(
-    entry: TomlJob | TomlJobGroup,
-) -> tuple[str | None, str | None]:
-    """Return (schedule, interval) for either entity kind."""
-    return entry.schedule, entry.interval
+def _schedule_display(timing: Timing | None) -> str:
+    """Render a unit's timing into one status cell value.
 
-
-def _schedule_display(schedule: str | None, interval: str | None) -> str:
-    """Render a (schedule, interval) pair into one cell value.
-
-    Schedule wins over interval when both are set (matching apply's
-    rendering precedence). An entry with neither -- a transit group
-    or a group-only job -- displays as `grouped` to mirror the
-    UNIT axis value for the same condition.
+    A Schedule shows its OnCalendar source; an Interval shows
+    `interval=<spec>`. An entry with no timing -- a transit group or a
+    group-only job -- displays as `grouped` to mirror the UNIT axis
+    value for the same condition.
     """
-    if schedule is not None:
-        return schedule
-    if interval is not None:
-        return f"interval={interval}"
+    if isinstance(timing, Schedule):
+        return str(timing)
+    if isinstance(timing, Interval):
+        return f"interval={timing}"
     return "grouped"
 
 
@@ -6189,7 +5982,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         raise PreconditionError(f"{ref} is not a selected entry to apply")
     full_name = snapshot.name
     bundle_name = ref.bundle
-    schedule, interval = snapshot.schedule, snapshot.interval
+    timing = snapshot.timing
     # Only jobs carry a priority; groups render without one.
     priority = snapshot.priority if isinstance(snapshot, Job) else None
     platform = config.platform
@@ -6261,9 +6054,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(
-        full_name, ref, schedule, interval, platform, priority
-    )
+    units = _render_units(full_name, ref, timing, platform, priority)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name
@@ -6292,12 +6083,12 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         full_name,
         platform,
         prior_disabled=prior_disabled,
-        scheduled=schedule is not None or interval is not None,
+        scheduled=timing is not None,
     )
 
     _state_dir_for(ref)
     snapshot_path.write_text(
-        json.dumps(dataclasses.asdict(snapshot), indent=2, sort_keys=True)
+        json.dumps(_snapshot_to_dict(snapshot), indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )
@@ -7458,20 +7249,6 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # landed in this apply pass.
     full_names_to_apply = _topo_apply_order(by_full, full_names_to_apply)
 
-    # Pre-pass: render every selected entry so a darwin-specific
-    # OnCalendar limitation (step / range / list) surfaces before we
-    # touch any unit files. Without this, an apply failure leaves a
-    # partial install and the user has to chase what landed.
-    if current_platform() == "darwin":
-        for full in full_names_to_apply:
-            b, short = by_full[full]
-            entry: TomlJob | TomlJobGroup = (
-                b.config.jobs.get(short) or b.config.job_groups[short]
-            )
-            schedule, _interval = _entity_schedule(entry)
-            if schedule is not None:
-                _oncalendar_to_plist_calendar(schedule)
-
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
         result = apply_one(config, ref)
@@ -7703,7 +7480,7 @@ def _applied_schedule_state(config: Config, full: str) -> str:
     ) or config.current.groups.get(ref)
     if snap is None:
         return "unresolved"
-    if snap.schedule is None and snap.interval is None:
+    if snap.timing is None:
         return "unscheduled"
     return "scheduled"
 
@@ -8375,12 +8152,9 @@ def _resolve_state_axes(
     else:
         sched_node = pending_node or current_node
         if sched_node is not None:
-            grouped = (
-                sched_node.schedule is None and sched_node.interval is None
-            )
+            grouped = sched_node.timing is None
         elif entry is not None:
-            es, ei = _entity_schedule(entry)
-            grouped = es is None and ei is None
+            grouped = entry.timing is None
         else:
             grouped = False
         if grouped:
@@ -8397,8 +8171,7 @@ def _resolve_state_axes(
 def _entry_is_scheduled(entry: TomlJob | TomlJobGroup | None) -> bool:
     if entry is None:
         return False
-    sched, interval = _entity_schedule(entry)
-    return sched is not None or interval is not None
+    return entry.timing is not None
 
 
 def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
@@ -8418,10 +8191,10 @@ def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
         return None
     snap_j = config.current.jobs.get(ref)
     if snap_j is not None:
-        return snap_j.schedule is not None or snap_j.interval is not None
+        return snap_j.timing is not None
     snap_g = config.current.groups.get(ref)
     if snap_g is not None:
-        return snap_g.schedule is not None or snap_g.interval is not None
+        return snap_g.timing is not None
     return None
 
 
@@ -8915,15 +8688,14 @@ def do_status(
         # uuid and let the active source pick (default pending-first).
         masked_in_tree = bool(mask_reason) and config_name in tree_depth
         pending_sched = (
-            _schedule_display(pending_node.schedule, pending_node.interval)
+            _schedule_display(pending_node.timing)
             if pending_node is not None
             else None
         )
         if pending_sched is None and masked_in_tree and entry is not None:
-            es, ei = _entity_schedule(entry)
-            pending_sched = _schedule_display(es, ei)
+            pending_sched = _schedule_display(entry.timing)
         current_sched = (
-            _schedule_display(current_node.schedule, current_node.interval)
+            _schedule_display(current_node.timing)
             if current_node is not None
             else None
         )
