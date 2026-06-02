@@ -934,16 +934,6 @@ class TomlConfig:
                 return b
         return None
 
-    def find_for_short(self, bundle_name: str, short: str) -> TomlBundle | None:
-        """Return the bundle defining `<bundle_name>.<short>` (job or
-        group), or None if no such name exists in that bundle."""
-        b = self.by_name(bundle_name)
-        if b is None:
-            return None
-        if short in b.config.jobs or short in b.config.job_groups:
-            return b
-        return None
-
     def all_full_names(self) -> set[str]:
         """Return every defined `<bundle>.<short>` (jobs + groups).
 
