@@ -27,7 +27,9 @@ This repo is a personal-utilities collection. Top-level structure:
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
   utilities (e.g. BorgAdm.app, the Mach-O wrapper that lets `borgadm` hold a
-  Full Disk Access grant, which a Python script cannot).
+  Full Disk Access grant, which a Python script cannot; its `BorgAdm.c`
+  documents the TCC responsible-process handling that keeps the grant working
+  when a scheduler such as crony runs the wrapper).
 - `ruff.toml` -- ruff config shared across all Python in the repo.
 - `tmp/` -- gitignored scratch for plans, review inputs, and other ephemeral
   working files.

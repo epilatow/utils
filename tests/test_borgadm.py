@@ -2670,8 +2670,15 @@ class TestWrapperBinary:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         mock_borgadm = bin_dir / "borgadm"
+        # args.txt records the forwarded args; calls.txt appends the
+        # disclaim marker once per invocation, so tests can count runs
+        # (re-spawn must not loop) and confirm the disclaimed instance
+        # is the one that reaches borgadm.
         mock_borgadm.write_text(
-            '#!/bin/bash\necho "$@" > "$(dirname "$0")/../args.txt"\n'
+            "#!/bin/bash\n"
+            'echo "$@" > "$(dirname "$0")/../args.txt"\n'
+            'echo "${BORGADM_FDA_DISCLAIMED:-unset}" >> '
+            '"$(dirname "$0")/../calls.txt"\n'
         )
         mock_borgadm.chmod(0o755)
 
@@ -2745,6 +2752,99 @@ class TestWrapperBinary:
         assert args_file.exists()
         # No args -> empty line
         assert args_file.read_text().strip() == ""
+
+    def test_disclaim_respawn_runs_borgadm_once(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """Wrapper re-spawns itself once, disclaimed, before exec.
+
+        The disclaimed instance carries the DISCLAIM marker, so the
+        single borgadm invocation must see it set -- proving borgadm
+        runs inside the re-spawn -- and the marker must break the loop,
+        so borgadm runs exactly once.
+        """
+        binary, _, fake_home = wrapper_tree
+        calls_file = binary.parent.parent.parent.parent.parent / "calls.txt"
+        result = subprocess.run(
+            [str(binary)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(fake_home)},
+        )
+        assert result.returncode == 0, result.stderr
+        runs = calls_file.read_text().splitlines()
+        assert runs == ["1"], f"expected one disclaimed run, got {runs}"
+
+    def test_disclaim_marker_skips_respawn(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """An already-disclaimed instance does not re-spawn again.
+
+        With the marker pre-set (as the re-spawned instance sees it),
+        the wrapper skips the re-spawn and execs borgadm directly --
+        still exactly once.
+        """
+        binary, _, fake_home = wrapper_tree
+        calls_file = binary.parent.parent.parent.parent.parent / "calls.txt"
+        result = subprocess.run(
+            [str(binary)],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "HOME": str(fake_home),
+                "BORGADM_FDA_DISCLAIMED": "1",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        runs = calls_file.read_text().splitlines()
+        assert runs == ["1"], f"expected one direct run, got {runs}"
+
+    def test_forwards_termination_signal_to_borgadm(
+        self, wrapper_tree: tuple[Path, Path, Path]
+    ) -> None:
+        """SIGTERM to the wrapper reaches borgadm through the re-spawn.
+
+        A scheduler timeout sends a single-PID SIGTERM; borgadm now runs
+        one process below this instance, so the wrapper must forward the
+        signal or borgadm/borg would outlive the timeout. The mock traps
+        SIGTERM and exits 42, so a forwarded signal shows up as both the
+        marker file and the propagated exit code.
+        """
+        binary, mock_borgadm, fake_home = wrapper_tree
+        tmp_root = mock_borgadm.parent.parent
+        started = tmp_root / "borgadm_started"
+        got_term = tmp_root / "borgadm_got_term"
+        # Background the sleep and wait on it: a bare foreground sleep
+        # would defer the trap until it finished, masking forwarding.
+        mock_borgadm.write_text(
+            "#!/bin/bash\n"
+            f'trap \'echo term > "{got_term}"; kill "$SP" 2>/dev/null;'
+            " exit 42' TERM\n"
+            f'touch "{started}"\n'
+            "sleep 30 & SP=$!\n"
+            'wait "$SP"\n'
+        )
+        mock_borgadm.chmod(0o755)
+        proc = subprocess.Popen(
+            [str(binary)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "HOME": str(fake_home)},
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert started.exists(), "mock borgadm never started"
+            proc.terminate()
+            rc = proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        assert got_term.exists(), "SIGTERM did not reach borgadm (orphaned)"
+        assert rc == 42, f"wrapper did not propagate borgadm exit: {rc}"
 
     def test_fda_check_denied_exits(
         self, wrapper_tree: tuple[Path, Path, Path]

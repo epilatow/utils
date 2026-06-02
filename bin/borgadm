@@ -1184,11 +1184,17 @@ def automation_script_path() -> str:
     grants FDA to a code-signed app bundle's Mach-O executable, never
     to an interpreted script, so `borgadm` (a `uv run` Python script)
     cannot hold the grant itself -- the wrapper does, and `exec`s
-    borgadm so it inherits the access. The grant is keyed to the
-    app's identity, so it applies however the wrapper is launched
-    (directly by launchd, or by a scheduler that spawns it); the
-    launcher is not part of the equation. The `check` commands read
-    only repo metadata, so they run borgadm directly with no wrapper.
+    borgadm so it inherits the access.
+
+    macOS keys FDA to the TCC *responsible process*, not whatever
+    process is reading files. Under a scheduler the wrapper runs as a
+    descendant (crony -> /bin/sh -> wrapper), which would make the
+    scheduler the responsible process, and it has no FDA. The wrapper
+    re-spawns itself with TCC responsibility disclaimed so BorgAdm.app
+    becomes its own responsible process regardless of launcher; see
+    Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c for the
+    mechanism. The `check` commands read only repo metadata, so they
+    run borgadm directly with no wrapper.
     """
     binary = _wrapper_binary_path()
     logger.debug(f"Using wrapper app: {binary}")
