@@ -452,7 +452,7 @@ class TestParseDefaults:
         assert cfg.defaults.notify_attach_max_kb == 512
         assert cfg.defaults.job_timeout_sec == 3600
         assert cfg.defaults.log_keep_runs == 50
-        assert cfg.defaults.priority == "high"
+        assert cfg.defaults.priority == crony.PriorityClass.HIGH
         assert cfg.defaults.keep_awake is True
         assert cfg.defaults.env == {"PATH": "$HOME/.local/bin:$PATH"}
         assert "ntfy" in cfg.defaults.notify_channel_defs
@@ -5532,8 +5532,11 @@ class TestPlistRendering:
         shapes = [
             (crony.Schedule.from_str("daily"), None),
             (crony.Interval.from_str("30min"), None),
-            (crony.Schedule.from_str("Mon *-*-* 09:00"), "high"),
-            (crony.Schedule.from_str("*-*-* 03:00"), "low"),
+            (
+                crony.Schedule.from_str("Mon *-*-* 09:00"),
+                crony.PriorityClass.HIGH,
+            ),
+            (crony.Schedule.from_str("*-*-* 03:00"), crony.PriorityClass.LOW),
             (None, None),  # on-demand, normal priority
         ]
         for timing, priority in shapes:
@@ -5613,10 +5616,22 @@ class TestSystemdAnalyzeVerify:
         real = Path(sys.executable)
         shapes = [
             ("cal-normal", crony.Schedule.from_str("*-*-* 03:00"), None),
-            ("cal-high", crony.Schedule.from_str("Mon *-*-* 09:00"), "high"),
-            ("cal-low", crony.Schedule.from_str("daily"), "low"),
-            ("interval", crony.Interval.from_str("30min"), "high"),
-            ("scheduleless", None, "low"),
+            (
+                "cal-high",
+                crony.Schedule.from_str("Mon *-*-* 09:00"),
+                crony.PriorityClass.HIGH,
+            ),
+            (
+                "cal-low",
+                crony.Schedule.from_str("daily"),
+                crony.PriorityClass.LOW,
+            ),
+            (
+                "interval",
+                crony.Interval.from_str("30min"),
+                crony.PriorityClass.HIGH,
+            ),
+            ("scheduleless", None, crony.PriorityClass.LOW),
         ]
         written: list[Path] = []
         for nm, timing, prio in shapes:
@@ -5664,7 +5679,7 @@ class TestJobPriority:
 
     def test_parse_valid(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        assert cfg.jobs["a"].priority == "high"
+        assert cfg.jobs["a"].priority is crony.PriorityClass.HIGH
 
     def test_parse_omitted_is_none(self) -> None:
         cfg = _parse({"job": {"a": _job()}})
@@ -5674,7 +5689,7 @@ class TestJobPriority:
         _assert_errored_job(
             {"job": {"a": _job(priority="turbo")}},
             "a",
-            "priority must be one of",
+            "invalid priority",
         )
 
     def test_snapshot_carries_priority(self) -> None:
@@ -5683,7 +5698,7 @@ class TestJobPriority:
         snap = crony._resolve_job_snapshot(
             cfg, target, cfg.jobs["a"], "default.a"
         )
-        assert snap.priority == "high"
+        assert snap.priority is crony.PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
@@ -5691,7 +5706,7 @@ class TestJobPriority:
         snap = crony._resolve_job_snapshot(
             cfg, target, cfg.jobs["a"], "default.a"
         )
-        assert snap.priority == "high"
+        assert snap.priority == crony.PriorityClass.HIGH
 
     def test_job_overrides_default(self) -> None:
         cfg = _parse(
@@ -5704,14 +5719,14 @@ class TestJobPriority:
         snap = crony._resolve_job_snapshot(
             cfg, target, cfg.jobs["a"], "default.a"
         )
-        assert snap.priority == "low"
+        assert snap.priority == crony.PriorityClass.LOW
 
     def test_plist_high(self) -> None:
         plist = crony._render_plist(
             "j",
             crony.EntityRef("default", "u-test"),
             crony.Schedule.from_str("daily"),
-            "high",
+            crony.PriorityClass.HIGH,
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Interactive"
@@ -5723,7 +5738,7 @@ class TestJobPriority:
             "j",
             crony.EntityRef("default", "u-test"),
             crony.Schedule.from_str("daily"),
-            "low",
+            crony.PriorityClass.LOW,
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Background"
@@ -5731,7 +5746,7 @@ class TestJobPriority:
         assert d["Nice"] == 10
 
     def test_plist_normal_and_none_emit_nothing(self) -> None:
-        for p in ("normal", None):
+        for p in (crony.PriorityClass.NORMAL, None):
             plist = crony._render_plist(
                 "j",
                 crony.EntityRef("default", "u-test"),
@@ -5742,12 +5757,12 @@ class TestJobPriority:
             assert "ProcessType" not in d
             assert "LowPriorityIO" not in d
             assert "Nice" not in d
-        assert crony._plist_priority_keys("normal") == {}
+        assert crony._plist_priority_keys(crony.PriorityClass.NORMAL) == {}
         assert crony._plist_priority_keys(None) == {}
 
     def test_systemd_high_records_intent(self) -> None:
         svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test"), "high"
+            "j", crony.EntityRef("default", "u-test"), crony.PriorityClass.HIGH
         )
         assert "# crony priority=high" in svc
         # high leaves CPU/IO at the Linux defaults.
@@ -5756,14 +5771,16 @@ class TestJobPriority:
 
     def test_systemd_low_sets_scheduling(self) -> None:
         svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test"), "low"
+            "j", crony.EntityRef("default", "u-test"), crony.PriorityClass.LOW
         )
         assert "Nice=10" in svc
         assert "IOSchedulingClass=idle" in svc
 
     def test_systemd_normal_emits_nothing(self) -> None:
         svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test"), "normal"
+            "j",
+            crony.EntityRef("default", "u-test"),
+            crony.PriorityClass.NORMAL,
         )
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
@@ -6963,7 +6980,7 @@ class TestTypeStrictness:
             _parse({"defaults": {"log_keep_runs": 0}})
 
     def test_invalid_default_priority_rejected(self) -> None:
-        with pytest.raises(crony.ConfigError, match="priority must be one of"):
+        with pytest.raises(crony.ConfigError, match="invalid priority"):
             _parse({"defaults": {"priority": "turbo"}})
 
     def test_non_bool_default_keep_awake_rejected(self) -> None:

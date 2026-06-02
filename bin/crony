@@ -62,7 +62,13 @@ from common.argparse_ext import (  # noqa: E402
     action_subparsers,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
-from crony.unit import EntityRef, Interval, Schedule, Timing  # noqa: E402
+from crony.unit import (  # noqa: E402
+    EntityRef,
+    Interval,
+    PriorityClass,
+    Schedule,
+    Timing,
+)
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -688,7 +694,7 @@ class Defaults:
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior
     # when a bundle sets no default.
-    priority: str | None = None
+    priority: PriorityClass | None = None
     keep_awake: bool = False
     # Base env merged under every job's own `env` (job keys win); see
     # resolved_env. Values are expanded at fire time like a job's env.
@@ -740,11 +746,10 @@ class TomlJob:
     gate_script: str | None = None
     gate_args: list[str] = field(default_factory=list)
     timing: Timing | None = None
-    # Process-priority class baked into the platform unit: "high"
-    # (run un-throttled, app-like QoS), "low" (throttle CPU + IO), or
-    # None (inherit [defaults]; a None default means "normal", emit
-    # nothing). See `_VALID_PRIORITIES`.
-    priority: str | None = None
+    # Process-priority class baked into the platform unit: HIGH (run
+    # un-throttled, app-like QoS), LOW (throttle CPU + IO), or NORMAL /
+    # None (emit nothing). None inherits the bundle [defaults].
+    priority: PriorityClass | None = None
     # Hold a power assertion for the command's duration so an idle /
     # on-AC machine doesn't sleep mid-run (caffeinate on macOS,
     # systemd-inhibit on linux). Lid-close on battery still sleeps.
@@ -1010,6 +1015,17 @@ def _parse_timing(
     return None
 
 
+def _parse_priority(text: str | None, where: str) -> PriorityClass | None:
+    """Build a PriorityClass from a config string, or None. Surfaces
+    the value object's validation as a config error tied to `where`."""
+    if text is None:
+        return None
+    try:
+        return PriorityClass.from_str(text)
+    except ValueError as e:
+        raise ConfigError(f"{where}: {e}") from e
+
+
 # =============================================================================
 # CONFIG LOADING
 # =============================================================================
@@ -1155,10 +1171,6 @@ _RESERVED_HEADERS_NTFY: frozenset[str] = frozenset(
 )
 
 _VALID_PLATFORMS: frozenset[str] = frozenset({"darwin", "linux"})
-# Process-priority class for a job's platform unit. "high" runs at
-# app-like priority with no throttling (launchd ProcessType=Interactive
-# + normal CPU/IO), "low" throttles CPU + IO, "normal" emits nothing.
-_VALID_PRIORITIES: frozenset[str] = frozenset({"high", "normal", "low"})
 
 
 def _reject_unknown_keys(
@@ -1727,14 +1739,11 @@ def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
     return val
 
 
-def _parse_priority_field(raw: dict[str, Any], where: str) -> str | None:
+def _parse_priority_field(
+    raw: dict[str, Any], where: str
+) -> PriorityClass | None:
     """Parse + validate a `priority` field (None if absent)."""
-    priority: str | None = _typed_field(raw, "priority", str, where)
-    if priority is not None and priority not in _VALID_PRIORITIES:
-        raise ConfigError(
-            f"{where}: priority must be one of {sorted(_VALID_PRIORITIES)}"
-        )
-    return priority
+    return _parse_priority(_typed_field(raw, "priority", str, where), where)
 
 
 def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
@@ -2591,7 +2600,7 @@ def resolved_job_timeout_sec(
 
 def resolved_priority(
     config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> str | None:
+) -> PriorityClass | None:
     """Cascade priority: job > defaults. `target` is ignored (kept for
     call-site symmetry with the other resolvers); targets carry no
     priority."""
@@ -2741,11 +2750,11 @@ class Job:
     # with snapshots written before a timing was pinned; loaders rely on
     # the dataclass default rather than a schema bump.
     timing: Timing | None = None
-    # Process-priority class baked into the platform unit ("high" /
-    # "low" / None). Pinned in the snapshot so a change re-renders the
+    # Process-priority class baked into the platform unit (HIGH / LOW /
+    # NORMAL / None). Pinned in the snapshot so a change re-renders the
     # unit on the next apply. Default-None for back-compat with
     # snapshots written before this field existed.
-    priority: str | None = None
+    priority: PriorityClass | None = None
     # Whether the runner wraps the command in a power assertion to
     # keep the machine awake for its duration. Read at fire time;
     # default-False for back-compat with older snapshots.
@@ -2930,6 +2939,10 @@ def _snapshot_to_dict(snap: Job | JobGroup) -> dict[str, Any]:
     d.pop("timing", None)
     d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
     d["interval"] = str(timing) if isinstance(timing, Interval) else None
+    if isinstance(snap, Job):
+        d["priority"] = (
+            str(snap.priority) if snap.priority is not None else None
+        )
     return d
 
 
@@ -2949,6 +2962,8 @@ def _snapshot_from_raw(raw: dict[str, Any]) -> Job | JobGroup:
     else:
         timing = None
     data["timing"] = timing
+    if data.get("priority") is not None:
+        data["priority"] = PriorityClass.from_str(data["priority"])
     kind = data.get("kind")
     if kind == "job":
         return Job(**data)
@@ -5489,21 +5504,21 @@ def _dispatch_unit_path(name: str, platform: str) -> Path:
     return _plist_path_for(name)
 
 
-def _plist_priority_keys(priority: str | None) -> dict[str, object]:
+def _plist_priority_keys(priority: PriorityClass | None) -> dict[str, object]:
     """LaunchAgent priority keys for a job, or {} for normal.
 
-    "high" runs the job at app-like QoS with normal CPU + IO
+    HIGH runs the job at app-like QoS with normal CPU + IO
     (ProcessType=Interactive avoids the Background QoS throttling that
-    can drastically slow IO-bound work); "low" throttles it. The keys
+    can drastically slow IO-bound work); LOW throttles it. The keys
     are inherited by the command the runner spawns.
     """
-    if priority == "high":
+    if priority is PriorityClass.HIGH:
         return {
             "ProcessType": "Interactive",
             "LowPriorityIO": False,
             "Nice": 0,
         }
-    if priority == "low":
+    if priority is PriorityClass.LOW:
         return {
             "ProcessType": "Background",
             "LowPriorityIO": True,
@@ -5512,16 +5527,16 @@ def _plist_priority_keys(priority: str | None) -> dict[str, object]:
     return {}
 
 
-def _systemd_priority_block(priority: str | None) -> str:
+def _systemd_priority_block(priority: PriorityClass | None) -> str:
     """[Service] priority directives for a job, or '' for normal.
 
-    Linux has no app-vs-background QoS throttling to undo, so "high"
+    Linux has no app-vs-background QoS throttling to undo, so HIGH
     only records intent in a comment (CPU + IO stay at defaults);
-    "low" lowers both CPU and IO scheduling.
+    LOW lowers both CPU and IO scheduling.
     """
-    if priority == "high":
+    if priority is PriorityClass.HIGH:
         return "# crony priority=high: CPU + IO left at defaults\n"
-    if priority == "low":
+    if priority is PriorityClass.LOW:
         return "Nice=10\nIOSchedulingClass=idle\n"
     return ""
 
@@ -5530,7 +5545,7 @@ def _render_plist(
     name: str,
     ref: EntityRef,
     timing: Timing | None,
-    priority: str | None = None,
+    priority: PriorityClass | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
@@ -5588,7 +5603,7 @@ def _render_plist(
 def _render_systemd_service(
     name: str,
     ref: EntityRef,
-    priority: str | None = None,
+    priority: PriorityClass | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
@@ -5644,7 +5659,7 @@ def _render_units(
     ref: EntityRef,
     timing: Timing | None,
     platform: str,
-    priority: str | None = None,
+    priority: PriorityClass | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
