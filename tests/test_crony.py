@@ -41,15 +41,18 @@ from conftest import (
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
 
-# Import crony module from bin/ (works with or without .py extension)
+# Load the bin/crony script under a module name other than "crony" so
+# the "crony" import name stays bound to the src/crony package that
+# bin/crony imports from (crony.unit, ...). Tests reach the loaded
+# script through the `crony` variable below.
 _script_path = REPO_ROOT / "bin" / "crony"
 if not _script_path.exists():
     _script_path = REPO_ROOT / "bin" / "crony.py"
-_loader = importlib.machinery.SourceFileLoader("crony", str(_script_path))
-_spec = importlib.util.spec_from_loader("crony", _loader)
+_loader = importlib.machinery.SourceFileLoader("crony_app", str(_script_path))
+_spec = importlib.util.spec_from_loader("crony_app", _loader)
 assert _spec and _spec.loader
 crony = importlib.util.module_from_spec(_spec)
-sys.modules["crony"] = crony
+sys.modules["crony_app"] = crony
 _spec.loader.exec_module(crony)
 
 
@@ -5380,7 +5383,7 @@ class TestNotifyTestSubcommand:
         monkeypatch.setattr(
             crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
         )
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel=None, bundle="private")
         messages = [r.getMessage() for r in caplog.records]
         assert any(
@@ -5417,7 +5420,7 @@ class TestNotifyTestSubcommand:
         monkeypatch.setattr(
             crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
         )
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel="ntfy", bundle="private")
         messages = [r.getMessage() for r in caplog.records]
         assert any(
@@ -5451,7 +5454,7 @@ class TestNotifyTestSubcommand:
         monkeypatch.setattr(
             crony.urllib.request, "urlopen", lambda *a, **k: MagicMock()
         )
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel=None, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert any("notification sent via default.ntfy" in m for m in messages)
@@ -6337,7 +6340,7 @@ class TestApplyFullSync:
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         # Re-apply with no changes: nothing to print.
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_apply(jobs=[], verbose=False, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert not any("unchanged" in m for m in messages), messages
@@ -6382,7 +6385,7 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_apply(jobs=[], verbose=True, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert any("unchanged" in m for m in messages), messages
@@ -13205,7 +13208,7 @@ class TestUnitDriftDetection:
         # re-renders it.
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
-        with caplog.at_level(logging.INFO, logger="crony"):
+        with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert unit_config.exists()
         msgs = [r.getMessage() for r in caplog.records]

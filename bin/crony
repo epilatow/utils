@@ -62,6 +62,7 @@ from common.argparse_ext import (  # noqa: E402
     action_subparsers,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from crony.unit import EntityRef  # noqa: E402
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -2821,62 +2822,6 @@ def _timeout_to_wait(sec: int) -> float:
 
 
 _SNAPSHOT_SCHEMA: int = 4
-
-
-@dataclass(frozen=True)
-class EntityRef:
-    """Stable per-(bundle, uuid) identity for a Job or JobGroup.
-
-    Bundle-scoped because UUIDs are unique within a bundle but
-    can repeat across bundles (uuid4 collision is astronomically
-    unlikely; the bundle prefix makes it a non-concern). Frozen
-    so it can key dicts and live in sets.
-
-    `str(ref)` renders the `<bundle>:<UUID>` input/display form
-    and `from_str` parses it back; the two round-trip. Status
-    output uses this form for refs with no recoverable name
-    (corrupt snapshots, broken entries, unit-only orphans) so an
-    operator can paste the JOB cell back into `crony destroy`,
-    `crony logs`, etc. The same form is `crony run`'s positional
-    argv: the platform unit hands the runner a `<bundle>:<UUID>`
-    it can address `_entity_state_dir` with directly. The colon
-    separator distinguishes the uuid form from the dot-separated
-    `<bundle>.<short>` name form (a name can't contain a colon).
-    """
-
-    bundle: str
-    uuid: str
-
-    def __str__(self) -> str:
-        return f"{self.bundle}:{self.uuid}"
-
-    @classmethod
-    def from_str(cls, arg: str) -> EntityRef | None:
-        """Parse `<bundle>:<UUID>` form into an `EntityRef`, or
-        return None when `arg` isn't that shape.
-
-        Both pieces are validated -- `bundle` must match
-        `_BUNDLE_NAME_RE` and `UUID` must be a canonical
-        8-4-4-4-12 `uuid.UUID()`-parseable string -- because the
-        parsed ref flows into an `_entity_state_dir(ref)` path
-        composition that `shutil.rmtree` later trusts. An
-        unvalidated `../../etc` would point at a path outside
-        `STATE_DIR/<bundle>/`.
-        """
-        if ":" not in arg:
-            return None
-        bundle, _, entity_uuid = arg.partition(":")
-        if not bundle or not entity_uuid:
-            return None
-        if not _BUNDLE_NAME_RE.match(bundle):
-            return None
-        try:
-            parsed = uuid.UUID(entity_uuid)
-        except ValueError:
-            return None
-        if entity_uuid != str(parsed):
-            return None
-        return cls(bundle, entity_uuid)
 
 
 @dataclass
