@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import importlib.machinery
 import importlib.util
 import io
@@ -2828,11 +2827,12 @@ class _RunnerHarness:
         sd = self.state_dir(short, cfg=cfg)
         p = sd / "snapshot.json"
         p.parent.mkdir(parents=True, exist_ok=True)
-        import dataclasses as _dc
         import json as _json
 
         p.write_text(
-            _json.dumps(_dc.asdict(snap), sort_keys=True, indent=2),
+            _json.dumps(
+                crony._snapshot_to_dict(snap), sort_keys=True, indent=2
+            ),
             encoding="utf-8",
         )
 
@@ -2971,7 +2971,10 @@ class TestPathFieldExpansion:
             args=["~/data", "$HOME/cache", "--flag"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.TomlBundleConfig(), None, job, "default.j"
+            crony.TomlBundleConfig(),
+            None,
+            job,
+            crony.EntityName.from_str("default.j"),
         )
         assert snap.script == "/abs/path.sh"
         assert snap.args == [
@@ -2998,7 +3001,10 @@ class TestPathFieldExpansion:
             gate_args=["$HOME/state"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.TomlBundleConfig(), None, job, "default.j"
+            crony.TomlBundleConfig(),
+            None,
+            job,
+            crony.EntityName.from_str("default.j"),
         )
         assert snap.gate_script == "/abs/gate.sh"
         assert snap.gate_args == ["/home/user/state"]
@@ -5696,7 +5702,7 @@ class TestJobPriority:
         cfg = _parse({"job": {"a": _job(priority="high")}})
         target = crony.resolve_target(cfg, "h", "darwin")
         snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
+            cfg, target, cfg.jobs["a"], crony.EntityName.from_str("default.a")
         )
         assert snap.priority is crony.PriorityClass.HIGH
 
@@ -5875,7 +5881,7 @@ class TestKeepAwake:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
         target = crony.resolve_target(cfg, "h", "darwin")
         return crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
+            cfg, target, cfg.jobs["a"], crony.EntityName.from_str("default.a")
         )
 
     def test_parse_true(self) -> None:
@@ -11372,7 +11378,9 @@ class TestLoadConfig:
         config = crony.load_config()
         ref = crony.EntityRef("default", uuid_a)
         assert ref in config.pending.jobs
-        assert config.pending.jobs[ref].name == "default.a"
+        assert config.pending.jobs[ref].name == crony.EntityName.from_str(
+            "default.a"
+        )
         # No on-disk snapshot yet -> nothing in current.
         assert ref not in config.current.jobs
         assert config.config_state(ref) == "missing"
@@ -11437,8 +11445,7 @@ class TestLoadConfig:
             bundles.bundles[0].config,
             target,
             bundles.bundles[0].config.jobs["a"],
-            "default.a",
-            "default",
+            crony.EntityName.from_str("default.a"),
         )
         sd = crony.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
@@ -11468,14 +11475,13 @@ class TestLoadConfig:
             bundles.bundles[0].config,
             target,
             bundles.bundles[0].config.jobs["a"],
-            "default.a",
-            "default",
+            crony.EntityName.from_str("default.a"),
         )
         sd = crony.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
         # Persist a snapshot with a divergent command vs what TOML
         # currently says ("true" vs "stale-command").
-        diverged = dataclasses.asdict(snap)
+        diverged = crony._snapshot_to_dict(snap)
         diverged["command"] = "stale-command"
         (sd / "snapshot.json").write_text(
             json.dumps(diverged), encoding="utf-8"

@@ -63,6 +63,7 @@ from common.argparse_ext import (  # noqa: E402
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 from crony.unit import (  # noqa: E402
+    EntityName,
     EntityRef,
     Interval,
     PriorityClass,
@@ -2732,8 +2733,7 @@ class Job:
 
     schema: int
     kind: str  # "job"
-    name: str  # full namespaced name `<bundle>.<short>`
-    bundle: str  # the bundle this entry lives in (matches state-dir parent)
+    name: EntityName  # full namespaced name `<bundle>.<short>`
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
     command: str | None
     script: str | None
@@ -2773,7 +2773,7 @@ class Job:
 
     @property
     def ref(self) -> EntityRef:
-        return EntityRef(self.bundle, self.uuid)
+        return EntityRef(self.name.bundle, self.uuid)
 
 
 @dataclass
@@ -2789,8 +2789,7 @@ class JobGroup:
 
     schema: int
     kind: str  # "group"
-    name: str  # full namespaced name `<bundle>.<short>`
-    bundle: str
+    name: EntityName  # full namespaced name `<bundle>.<short>`
     uuid: str
     children: list[str]
     group_budget_sec: int
@@ -2799,7 +2798,7 @@ class JobGroup:
 
     @property
     def ref(self) -> EntityRef:
-        return EntityRef(self.bundle, self.uuid)
+        return EntityRef(self.name.bundle, self.uuid)
 
 
 def _entity_state_dir(ref: EntityRef) -> Path:
@@ -2814,8 +2813,7 @@ def _resolve_job_snapshot(
     config: TomlBundleConfig,
     target: Target | None,
     job: TomlJob,
-    full_name: str,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
+    name: EntityName,
 ) -> Job:
     """Build a Job by applying every cascade once."""
     args = [_expand_path_field(a) for a in job.args]
@@ -2831,8 +2829,7 @@ def _resolve_job_snapshot(
     return Job(
         schema=_SNAPSHOT_SCHEMA,
         kind="job",
-        name=full_name,
-        bundle=bundle_name,
+        name=name,
         uuid=job.uuid,
         command=job.command,
         script=script,
@@ -2864,8 +2861,7 @@ def _resolve_group_snapshot(
     config: TomlBundleConfig,
     target: Target | None,
     group: TomlJobGroup,
-    bundle_name: str,
-    full_name: str,
+    name: EntityName,
 ) -> JobGroup:
     """Build a JobGroup. `group_budget_sec` is recomputed from
     the live config (not from children's pinned snapshots), so an
@@ -2896,8 +2892,7 @@ def _resolve_group_snapshot(
     return JobGroup(
         schema=_SNAPSHOT_SCHEMA,
         kind="group",
-        name=full_name,
-        bundle=bundle_name,
+        name=name,
         uuid=group.uuid,
         children=children,
         group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
@@ -2917,24 +2912,23 @@ def _resolve_snapshot_for(
     want the resolved snapshot in one step (apply pipeline + tests
     that exercise the runner without going through full apply).
     """
-    full_name = f"{bundle_name}.{short}"
+    name = EntityName(bundle_name, short)
     target = resolve_target(config, current_host(), current_platform())
     if short in config.jobs:
-        return _resolve_job_snapshot(
-            config, target, config.jobs[short], full_name, bundle_name
-        )
+        return _resolve_job_snapshot(config, target, config.jobs[short], name)
     if short in config.job_groups:
         return _resolve_group_snapshot(
-            config, target, config.job_groups[short], bundle_name, full_name
+            config, target, config.job_groups[short], name
         )
     raise PreconditionError(f"unknown job/group: {short!r}")
 
 
 def _snapshot_to_dict(snap: Job | JobGroup) -> dict[str, Any]:
     """Serialize a snapshot to its JSON dict. The typed value-object
-    fields render back to their source strings so snapshot.json stays
-    string-keyed (and byte-stable across this typing change)."""
+    fields render back to their source strings, so snapshot.json stays
+    string-keyed regardless of the in-memory types."""
     d = dataclasses.asdict(snap)
+    d["name"] = str(snap.name)
     timing = snap.timing
     d.pop("timing", None)
     d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
@@ -2952,6 +2946,11 @@ def _snapshot_from_raw(raw: dict[str, Any]) -> Job | JobGroup:
     TypeError (wrong shape) or ValueError (bad typed field / unknown
     kind); callers treat both as a broken snapshot."""
     data = dict(raw)
+    # `bundle` is redundant with the name's bundle; drop it so a
+    # snapshot written before it was removed still loads.
+    data.pop("bundle", None)
+    if isinstance(data.get("name"), str):
+        data["name"] = EntityName.from_str(data["name"])
     schedule_str = data.pop("schedule", None)
     interval_str = data.pop("interval", None)
     timing: Timing | None
@@ -3354,10 +3353,10 @@ class Config:
         for graph in (self.current, self.pending):
             j = graph.jobs.get(ref)
             if j is not None:
-                return j.name
+                return str(j.name)
             g = graph.groups.get(ref)
             if g is not None:
-                return g.name
+                return str(g.name)
         broken = self.broken.get(ref)
         if broken is not None:
             return broken.name
@@ -3535,22 +3534,22 @@ def _build_pending_graph(
             toml_job = bundle.config.jobs.get(short)
             if toml_job is None:
                 continue
-            full_name = bundle.full_name(short)
+            name = EntityName(bundle.name, short)
             snap_j = _resolve_job_snapshot(
-                bundle.config, target, toml_job, full_name, bundle.name
+                bundle.config, target, toml_job, name
             )
             pending.jobs[snap_j.ref] = snap_j
-            pending.by_full_name[full_name] = snap_j.ref
+            pending.by_full_name[str(name)] = snap_j.ref
         for short in sel_groups:
             toml_group = bundle.config.job_groups.get(short)
             if toml_group is None:
                 continue
-            full_name = bundle.full_name(short)
+            name = EntityName(bundle.name, short)
             snap_g = _resolve_group_snapshot(
-                bundle.config, target, toml_group, bundle.name, full_name
+                bundle.config, target, toml_group, name
             )
             pending.groups[snap_g.ref] = snap_g
-            pending.by_full_name[full_name] = snap_g.ref
+            pending.by_full_name[str(name)] = snap_g.ref
     return pending
 
 
@@ -3628,23 +3627,24 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
+            full = str(snap.name)
             if isinstance(snap, Job):
                 current.jobs[snap.ref] = snap
-                current.by_full_name[snap.name] = snap.ref
+                current.by_full_name[full] = snap.ref
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
                     "job",
-                    full_name=snap.name,
+                    full_name=full,
                     platform=platform,
                     snapshot=snap,
                 )
             else:
                 current.groups[snap.ref] = snap
-                current.by_full_name[snap.name] = snap.ref
+                current.by_full_name[full] = snap.ref
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
                     "group",
-                    full_name=snap.name,
+                    full_name=full,
                     platform=platform,
                     snapshot=snap,
                 )
@@ -3689,7 +3689,7 @@ def load_config() -> Config:
     for ref in current.refs():
         snap = current.jobs.get(ref) or current.groups.get(ref)
         assert snap is not None  # ref came from current.refs()
-        name_to_refs.setdefault(snap.name, []).append(ref)
+        name_to_refs.setdefault(str(snap.name), []).append(ref)
     pending_refs = pending.refs()
     for name, refs in name_to_refs.items():
         if len(refs) < 2:
@@ -4911,7 +4911,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
             return "run"
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
-            snap.name,
+            str(snap.name),
             f"crony wants to run '{snap.name}'. Now?",
         )
         log_file.write(f"interactive: user chose {choice}\n".encode())
@@ -4945,7 +4945,7 @@ def run_job(
     signalled by raising PreconditionError -- cli() maps that to
     ExitCode.PRECONDITION.
     """
-    full_name = snap.name
+    full_name = str(snap.name)
 
     if snap.script is not None:
         sp = Path(snap.script)
@@ -5233,7 +5233,7 @@ def run_group(
     agree. A group never applies a run-gate of its own -- each
     child's runner reads its own snapshot and gates itself.
     """
-    full_name = snap.name
+    full_name = str(snap.name)
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
@@ -5264,9 +5264,9 @@ def run_group(
                 # so the group rollup catches it.
                 resolved_children: list[tuple[EntityRef, str | None]] = [
                     (
-                        EntityRef(snap.bundle, child_uuid),
+                        EntityRef(snap.name.bundle, child_uuid),
                         _child_full_name_from_uuid(
-                            EntityRef(snap.bundle, child_uuid)
+                            EntityRef(snap.name.bundle, child_uuid)
                         ),
                     )
                     for child_uuid in snap.children
@@ -5995,7 +5995,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     ) or config.pending.groups.get(ref)
     if snapshot is None:
         raise PreconditionError(f"{ref} is not a selected entry to apply")
-    full_name = snapshot.name
+    full_name = str(snapshot.name)
     bundle_name = ref.bundle
     timing = snapshot.timing
     # Only jobs carry a priority; groups render without one.
@@ -6057,10 +6057,10 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # would unlink a unit a live entry is firing from.
     if (
         current_snapshot is not None
-        and current_snapshot.name != full_name
-        and current_snapshot.name not in live_full_names
+        and str(current_snapshot.name) != full_name
+        and str(current_snapshot.name) not in live_full_names
     ):
-        destroy_one(current_snapshot.name, None)
+        destroy_one(str(current_snapshot.name), None)
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
@@ -8176,7 +8176,7 @@ def _resolve_state_axes(
             unit_state = "grouped"
         else:
             installed_name = (
-                current_node.name if current_node is not None else full
+                str(current_node.name) if current_node is not None else full
             )
             unit_state = _unit_state(installed_name, platform)
     last_state = _last_run_state(config, full)
@@ -8346,13 +8346,13 @@ def _build_group_membership(
         table: dict[EntityRef, list[str]] = {}
         for parent in graph.groups.values():
             for child_uuid in parent.children:
-                child_ref = EntityRef(parent.bundle, child_uuid)
+                child_ref = EntityRef(parent.name.bundle, child_uuid)
                 if (
                     child_ref not in graph.jobs
                     and child_ref not in graph.groups
                 ):
                     continue
-                table.setdefault(child_ref, []).append(parent.name)
+                table.setdefault(child_ref, []).append(str(parent.name))
         for v in table.values():
             v.sort()
         return table
@@ -8637,8 +8637,12 @@ def do_status(
             if ref is not None
             else None
         )
-        pending_name = pending_node.name if pending_node is not None else None
-        current_name = current_node.name if current_node is not None else None
+        pending_name = (
+            str(pending_node.name) if pending_node is not None else None
+        )
+        current_name = (
+            str(current_node.name) if current_node is not None else None
+        )
         if current_name is None and ref is not None:
             be = config.broken.get(ref)
             ue = config.unit_only.get(ref)
