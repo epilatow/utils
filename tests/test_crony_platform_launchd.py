@@ -33,6 +33,8 @@ _REF = EntityRef("default", "u-test")
 # take them as explicit args, so the tests pin deterministic values.
 _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
+# render() / dispatch don't read the unit dir; pin a placeholder.
+_DIR = Path("/unused")
 
 
 class TestPlistRendering:
@@ -193,10 +195,21 @@ class TestLaunchdScheduler:
             timing=Schedule.from_str("daily"),
             priority=None,
         )
-        units = get_scheduler("darwin").render(
+        units = get_scheduler("darwin", _DIR).render(
             spec, uv_path=_UV, crony_path=_CRONY
         )
         assert list(units) == ["org.crony.default.brew.plist"]
+
+    def test_installed_names_includes_non_namespaced(
+        self, tmp_path: Path
+    ) -> None:
+        # installed_names keys on the unit name, not entity identity:
+        # a stray whose name isn't <bundle>.<short> is still returned
+        # so destroy can reach a hand-created / legacy unit.
+        (tmp_path / "org.crony.default.real.plist").write_text("x")
+        (tmp_path / "org.crony.bogus.plist").write_text("x")  # no dot
+        sched = get_scheduler("darwin", tmp_path)
+        assert sched.installed_names() == {"default.real", "bogus"}
 
 
 if __name__ == "__main__":

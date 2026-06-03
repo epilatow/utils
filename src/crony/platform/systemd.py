@@ -9,10 +9,24 @@ which sits dormant until `crony trigger` or a parent group fires it.
 
 from __future__ import annotations
 
+import configparser
+import shlex
+import subprocess
 from pathlib import Path
 
-from crony.platform.scheduler import UNIT_PREFIX, Scheduler
-from crony.unit import EntityRef, Interval, PriorityClass, Timing, UnitSpec
+from crony.platform.scheduler import (
+    UNIT_PREFIX,
+    Scheduler,
+    UnitState,
+    exec_paths_from_argv,
+)
+from crony.unit import (
+    EntityRef,
+    Interval,
+    PriorityClass,
+    Timing,
+    UnitSpec,
+)
 
 
 def service_filename(name: str) -> str:
@@ -88,6 +102,40 @@ def render_timer(name: str, timing: Timing) -> str:
     )
 
 
+def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
+    """Recover the `(uv, crony)` paths from a `.service`'s ExecStart, or
+    None when it isn't a crony-shaped service."""
+    parser = configparser.ConfigParser(
+        interpolation=None, delimiters=("=",), strict=False
+    )
+    try:
+        parser.read_string(content)
+    except configparser.Error:
+        return None
+    exec_start = parser.get("Service", "ExecStart", fallback=None)
+    if not isinstance(exec_start, str):
+        return None
+    try:
+        argv = shlex.split(exec_start)
+    except ValueError:
+        return None
+    return exec_paths_from_argv(argv)
+
+
+def _is_enabled(unit: str) -> str:
+    """Return `systemctl --user is-enabled <unit>` output, '' on failure."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-enabled", unit],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip()
+
+
 class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
@@ -108,3 +156,75 @@ class SystemdScheduler(Scheduler):
         if spec.timing is not None:
             units[timer_filename(name)] = render_timer(name, spec.timing)
         return units
+
+    def unit_config_path(self, name: str) -> Path | None:
+        # The .timer for a scheduled entry, else the .service for a
+        # group-only / transit entry.
+        timer = self.unit_dir / timer_filename(name)
+        if timer.is_file():
+            return timer
+        service = self.unit_dir / service_filename(name)
+        return service if service.is_file() else None
+
+    def dispatch_unit_path(self, name: str) -> Path:
+        # `systemctl --user start crony-<name>.service` fires the
+        # service, not the timer (the scheduler-arm side).
+        return self.unit_dir / service_filename(name)
+
+    def installed_names(self) -> set[str]:
+        names: set[str] = set()
+        if not self.unit_dir.exists():
+            return names
+        prefix = f"{UNIT_PREFIX}-"
+        for suffix in (".service", ".timer"):
+            for p in self.unit_dir.iterdir():
+                if p.name.startswith(prefix) and p.name.endswith(suffix):
+                    names.add(p.name[len(prefix) : -len(suffix)])
+        return names
+
+    def state(self, name: str) -> UnitState:
+        st = _is_enabled(timer_filename(name))
+        if st == "enabled":
+            return UnitState.ENABLED
+        if st in ("disabled", "masked"):
+            return UnitState.DISABLED
+        # A schedule-less entry has only a static `.service` (no timer to
+        # enable); systemd reports it `static`, which counts as known.
+        if st == "static":
+            return UnitState.ENABLED
+        return UnitState.NONE
+
+    def is_stale(self, spec: UnitSpec) -> bool:
+        name = str(spec.name)
+        expected = set(self.render(spec, uv_path=Path(), crony_path=Path()))
+        # An orphaned .timer left over from a schedule -> unscheduled
+        # transition is drift even though it's not in `expected`.
+        timer = self.unit_dir / timer_filename(name)
+        if timer.is_file() and timer.name not in expected:
+            return True
+        for fname in expected:
+            path = self.unit_dir / fname
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                return True
+            if fname.endswith(".timer"):
+                assert spec.timing is not None
+                if content != render_timer(name, spec.timing):
+                    return True
+                continue
+            extracted = _extract_exec_paths(content)
+            if extracted is None:
+                return True
+            uv_path, crony_path = extracted
+            if not uv_path.is_file() or not crony_path.is_file():
+                return True
+            rendered = self.render(spec, uv_path=uv_path, crony_path=crony_path)
+            if content != rendered[fname]:
+                return True
+        # A grouped (schedule-less) entry is a static, on-demand
+        # `.service` with no timer to load, so an unloaded scheduler
+        # state is its correct resting state, not drift.
+        if spec.timing is None:
+            return False
+        return self.state(name) == UnitState.NONE

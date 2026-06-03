@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import argparse
-import configparser
 import contextlib
 import dataclasses
 import datetime
@@ -20,7 +19,6 @@ import json
 import logging
 import math
 import os
-import plistlib
 import re
 import shlex
 import shutil
@@ -72,7 +70,7 @@ from crony.unit import (  # noqa: E402
     UnitSpec,
 )
 from crony.platform import (  # noqa: E402
-    UNIT_PREFIX,
+    Scheduler,
     get_scheduler,
     launchd,
     systemd,
@@ -3519,7 +3517,7 @@ def _read_runtime_state(
     if full_name is not None:
         unit_config = _platform_unit_config_path(full_name, platform)
         if snapshot is not None:
-            unit_is_stale = _unit_is_stale(full_name, snapshot, platform)
+            unit_is_stale = _unit_is_stale(snapshot, platform)
 
     return RuntimeState(
         state_dir=state_dir,
@@ -5482,23 +5480,9 @@ def _timer_path_for(name: str) -> Path:
 
 
 def _platform_unit_config_path(name: str, platform: str) -> Path | None:
-    """Path of the on-disk platform unit config file for `name`,
-    or None when no file is present. The status `unit-config`
-    column reads this from `RuntimeState`; the load_config
-    boundary rule means no caller walks the unit dirs ad-hoc.
-
-    On darwin: the launchd plist. On linux: the `.timer` if
-    present (scheduled entries), else the `.service` (group-only
-    / transit entries).
-    """
-    if platform == "darwin":
-        p = _plist_path_for(name)
-        return p if p.is_file() else None
-    timer = _timer_path_for(name)
-    if timer.is_file():
-        return timer
-    service = _service_path_for(name)
-    return service if service.is_file() else None
+    """The on-disk platform unit file backing `name`, or None. The
+    status `unit-config` column reads this from `RuntimeState`."""
+    return _scheduler(platform).unit_config_path(name)
 
 
 def _systemd_unit_name(name: str) -> str:
@@ -5506,177 +5490,38 @@ def _systemd_unit_name(name: str) -> str:
 
 
 def _dispatch_unit_path(name: str, platform: str) -> Path:
-    """File the dispatcher reaches for when firing `name`.
-
-    On linux, `systemctl --user start crony-<name>.service` -- so
-    the .service file, not the .timer (which is the scheduler-arm
-    side, not the dispatch side). On darwin, `launchctl kickstart`
-    targets the loaded plist by label. Used by `_trigger_unit` to
-    refuse early when the unit was never installed (or was
-    destroyed since the parent group's snapshot was pinned).
-    """
-    if platform == "linux":
-        return _service_path_for(name)
-    return _plist_path_for(name)
+    """File `_trigger_unit` fires for `name` (may not exist). Used to
+    refuse early when the unit was never installed."""
+    return _scheduler(platform).dispatch_unit_path(name)
 
 
-def _render_units(
-    snap: Job | JobGroup,
-    platform: str,
-    *,
-    uv_path: Path | None = None,
-    crony_path: Path | None = None,
-) -> dict[str, str]:
+def _scheduler(platform: str) -> Scheduler:
+    """The platform Scheduler bound to the host's unit dir. Built per
+    call so it honors test redirection of LAUNCHAGENTS_DIR /
+    SYSTEMD_USER_DIR (which bin/crony owns)."""
+    unit_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
+    return get_scheduler(platform, unit_dir)
+
+
+def _render_units(snap: Job | JobGroup, platform: str) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
-    Delegates to the platform Scheduler. `uv_path` / `crony_path`
-    are baked into the unit argv; left None they resolve to the live
-    `_uv_executable()` / `_crony_executable()`, and the unit-drift
-    integrity check supplies the paths it recovered from the on-disk
-    file so the byte comparison stays meaningful when the live PATH
-    differs from what apply originally pinned.
+    Delegates to the platform Scheduler with the live `_uv_executable()`
+    / `_crony_executable()` paths baked into the unit argv. (The drift
+    check re-renders inside the scheduler using the paths it recovers
+    from the on-disk unit, so it does not go through here.)
     """
-    return get_scheduler(platform).render(
+    return _scheduler(platform).render(
         snap.unit_spec(),
-        uv_path=uv_path if uv_path is not None else _uv_executable(),
-        crony_path=(
-            crony_path if crony_path is not None else _crony_executable()
-        ),
+        uv_path=_uv_executable(),
+        crony_path=_crony_executable(),
     )
 
 
-def _extract_unit_exec_paths(
-    content: str, platform: str
-) -> tuple[Path, Path] | None:
-    """Recover the `(uv_path, crony_path)` baked into a rendered
-    unit file. Returns None when the file isn't a crony-shaped
-    unit (parse failure, missing expected keys, or argv shape
-    that doesn't match `[uv, "run", "--script", crony, "run",
-    "<bundle>:<uuid>"]`).
-
-    Used by the unit-drift integrity check so it can re-render
-    the expected unit content using the same paths the file was
-    originally rendered with; without that the byte-comparison
-    would false-positive whenever the live `_uv_executable()` /
-    `_crony_executable()` resolution returned a different path
-    than apply originally pinned (e.g. a new shell with a
-    different PATH, or a worktree's crony script running against
-    state dirs apply'd from a different checkout).
-    """
-    argv: list[str]
-    if platform == "darwin":
-        try:
-            data = plistlib.loads(content.encode("utf-8"))
-        except (plistlib.InvalidFileException, ValueError, OSError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        args = data.get("ProgramArguments")
-        if not isinstance(args, list) or len(args) != 6:
-            return None
-        if not all(isinstance(a, str) for a in args):
-            return None
-        argv = list(args)
-    else:
-        parser = configparser.ConfigParser(
-            interpolation=None, delimiters=("=",), strict=False
-        )
-        try:
-            parser.read_string(content)
-        except configparser.Error:
-            return None
-        exec_start = parser.get("Service", "ExecStart", fallback=None)
-        if not isinstance(exec_start, str):
-            return None
-        try:
-            argv = shlex.split(exec_start)
-        except ValueError:
-            return None
-        if len(argv) != 6:
-            return None
-    if argv[1] != "run" or argv[2] != "--script" or argv[4] != "run":
-        return None
-    return Path(argv[0]), Path(argv[3])
-
-
-def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
-    """True when the platform install diverges from the snapshot.
-
-    Verifies, for each unit file `_render_units` would create:
-    the file exists; its content parses out the `(uv, crony)`
-    exec paths in the expected argv shape; those paths still
-    resolve to files on disk; and the content matches what
-    `_render_units` produces when called with the extracted
-    paths. Additionally flags an orphaned `.timer` left over
-    from a schedule -> unscheduled transition, and a unit the
-    platform scheduler has unloaded (`_unit_state == "none"`) --
-    except for a schedule-less entry on linux, whose service is a
-    static, on-demand unit with no timer to load, so "none" is its
-    correct resting state rather than drift.
-
-    Any divergence returns True so `crony status` reports
-    `config=stale` and `crony apply` re-renders / re-bootstraps
-    even when the snapshot itself is unchanged.
-    """
-    if platform == "darwin":
-        unit_dir = LAUNCHAGENTS_DIR
-    else:
-        unit_dir = SYSTEMD_USER_DIR
-    # Filename set is path-independent -- placeholders below
-    # never bleed into the byte comparison, which always
-    # re-renders using paths extracted from the on-disk file.
-    expected_filenames = set(
-        _render_units(
-            snap,
-            platform,
-            uv_path=Path(),
-            crony_path=Path(),
-        ).keys()
-    )
-    if platform == "linux":
-        timer_path = _timer_path_for(full_name)
-        if timer_path.is_file() and timer_path.name not in expected_filenames:
-            return True
-    for fname in expected_filenames:
-        path = unit_dir / fname
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
-            return True
-        if fname.endswith(".timer"):
-            # A .timer is only rendered for a scheduled entry.
-            assert snap.timing is not None
-            if content != systemd.render_timer(full_name, snap.timing):
-                return True
-            continue
-        extracted = _extract_unit_exec_paths(content, platform)
-        if extracted is None:
-            return True
-        uv_path, crony_path = extracted
-        if not uv_path.is_file() or not crony_path.is_file():
-            return True
-        re_rendered = _render_units(
-            snap,
-            platform,
-            uv_path=uv_path,
-            crony_path=crony_path,
-        )
-        if content != re_rendered[fname]:
-            return True
-    # Scheduler-awareness probe: an unloaded unit is drift the next
-    # apply must re-bootstrap. `_unit_state` reports the timer on
-    # linux / the plist on darwin. A grouped (schedule-less) entry
-    # has no timer on linux, so it reports "none" by design -- that's
-    # its correct resting state as a static, on-demand `.service`
-    # (file presence and round-trip are already verified above), not
-    # drift. On darwin a grouped plist must still be loaded to be
-    # kickstartable, so the probe stays there.
-    grouped = snap.timing is None
-    if grouped and platform == "linux":
-        return False
-    if _unit_state(full_name, platform) == "none":
-        return True
-    return False
+def _unit_is_stale(snap: Job | JobGroup, platform: str) -> bool:
+    """True when the platform install diverges from the snapshot --
+    delegates to the scheduler's drift check."""
+    return _scheduler(platform).is_stale(snap.unit_spec())
 
 
 def _schedule_display(timing: Timing | None) -> str:
@@ -6050,28 +5895,17 @@ def _sweep_superseded_state_dirs(
 def _platform_unit_names() -> set[str]:
     """Names with a crony-managed platform unit file on this host.
 
-    Walks the platform's user-unit directory and returns every
-    full-namespaced name encoded in a crony-shaped filename. Used
-    to discover entries whose unit landed on disk but whose state
-    dir is missing -- e.g. a state wipe (rm -rf
-    ~/.local/state/crony/) without `crony destroy` first. Without
-    this, those units would be invisible to status / destroy
-    and the user would have to track them down manually.
+    Walks the platform's user-unit directory and returns the name
+    encoded in every crony-shaped filename -- including a stray whose
+    name isn't a valid `<bundle>.<short>` (a hand-created or legacy
+    unit), so `crony destroy` can still reach it. Used to discover
+    entries whose unit landed on disk but whose state dir is missing
+    -- e.g. a state wipe (rm -rf ~/.local/state/crony/) without
+    `crony destroy` first. Without this, those units would be
+    invisible to status / destroy and the user would have to track
+    them down manually.
     """
-    names: set[str] = set()
-    if LAUNCHAGENTS_DIR.exists():
-        prefix = f"org.{UNIT_PREFIX}."
-        suffix = ".plist"
-        for p in LAUNCHAGENTS_DIR.iterdir():
-            if p.name.startswith(prefix) and p.name.endswith(suffix):
-                names.add(p.name[len(prefix) : -len(suffix)])
-    if SYSTEMD_USER_DIR.exists():
-        prefix = f"{UNIT_PREFIX}-"
-        for suffix in (".service", ".timer"):
-            for p in SYSTEMD_USER_DIR.iterdir():
-                if p.name.startswith(prefix) and p.name.endswith(suffix):
-                    names.add(p.name[len(prefix) : -len(suffix)])
-    return names
+    return _scheduler(current_platform()).installed_names()
 
 
 # =============================================================================
@@ -6145,98 +5979,17 @@ def linger_enabled(user: str | None = None) -> bool | None:
     return None
 
 
-def _systemd_is_enabled(unit: str) -> str:
-    """Return systemctl --user is-enabled output, or '' on failure."""
-    try:
-        r = subprocess.run(
-            ["systemctl", "--user", "is-enabled", unit],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout.strip()
-
-
-def _launchctl_print_disabled() -> str:
-    """Stdout of `launchctl print-disabled gui/<uid>`; empty on failure."""
-    try:
-        r = subprocess.run(
-            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout
-
-
-def _launchctl_list() -> str:
-    """Stdout of `launchctl list`; empty on failure."""
-    try:
-        r = subprocess.run(
-            ["launchctl", "list"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout
-
-
 def _unit_state(name: str, platform: str) -> str:
-    """Return UNIT axis value for a stamped entity.
+    """The platform scheduler's enable state for a stamped entity:
+    `enabled`, `disabled`, or `none`.
 
     Distinct from CONFIG: a unit can be configured-and-stamped while
-    being disabled at the platform scheduler. Group-only entries
-    (no schedule, no interval) report `grouped`; their callers fire
-    them via subprocess invocation rather than the scheduler.
-    `none` means the platform scheduler doesn't know about a unit
-    by this name -- nothing instantiated to flip on or off.
+    being disabled at the platform scheduler. `none` means the
+    scheduler doesn't know a unit by this name -- nothing instantiated
+    to flip on or off. (The `grouped` UNIT-axis value, for an entry
+    with no own unit to enable, is set by the status caller, not here.)
     """
-    if platform == "linux":
-        unit = _systemd_unit_name(name)
-        state = _systemd_is_enabled(unit)
-        if state == "enabled":
-            return "enabled"
-        if state in ("disabled", "masked"):
-            return "disabled"
-        if state == "static":
-            return "enabled"
-        return "none"
-    # darwin
-    label = _label_for(name)
-    if _is_launchd_disabled(label):
-        return "disabled"
-    if _is_launchd_loaded(label):
-        return "enabled"
-    return "none"
-
-
-def _is_launchd_disabled(label: str) -> bool:
-    """True if `launchctl print-disabled` reports `label` disabled."""
-    out = _launchctl_print_disabled()
-    return f'"{label}" => disabled' in out or f'"{label}" => true' in out
-
-
-def _is_launchd_loaded(label: str) -> bool:
-    """True if `launchctl list` shows the label as loaded.
-
-    `launchctl list` lines have the form `<pid>\\t<exit>\\t<label>`.
-    A pid of `-` means loaded-but-idle (the normal between-fires state
-    for a calendar-scheduled agent), so we don't filter on pid here.
-    Trailing whitespace is tolerated for forward-compat with future
-    launchctl output formats.
-    """
-    out = _launchctl_list()
-    for raw in out.splitlines():
-        line = raw.rstrip()
-        if "\t" in line and line.split("\t")[-1] == label:
-            return True
-    return False
+    return _scheduler(platform).state(name).value
 
 
 def _last_run_state(config: Config, full_name: str) -> str:

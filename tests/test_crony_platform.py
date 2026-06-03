@@ -27,7 +27,7 @@ _script_path = REPO_ROOT / "src" / "crony" / "platform" / "__init__.py"
 class TestGetScheduler:
     def test_unsupported_platform_rejected(self) -> None:
         with pytest.raises(ValueError, match="unsupported platform"):
-            get_scheduler("plan9")
+            get_scheduler("plan9", Path("/unused"))
 
 
 if __name__ == "__main__":

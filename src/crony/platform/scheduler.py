@@ -13,6 +13,7 @@ the running host.
 from __future__ import annotations
 
 import abc
+import enum
 from pathlib import Path
 
 from crony.unit import UnitSpec
@@ -25,8 +26,45 @@ from crony.unit import UnitSpec
 UNIT_PREFIX = "crony"
 
 
+class UnitState(enum.Enum):
+    """The platform scheduler's enable/disable view of a unit by name.
+
+    ENABLED: the scheduler will fire it (loaded on launchd; `enabled` or
+    `static` on systemd). DISABLED: instantiated but held off. NONE: the
+    scheduler knows no unit by that name -- nothing to flip on or off.
+    (Group-only entries, which have no own unit to enable, are the
+    caller's concern, not a value this reports.)
+    """
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    NONE = "none"
+
+
+def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
+    """Validate a crony unit's argv and return its `(uv, crony)` paths.
+
+    Returns None unless `argv` is the expected
+    `[uv, "run", "--script", crony, "run", "<bundle>:<uuid>"]` shape.
+    The backends recover `argv` from their own file format (plist
+    ProgramArguments / systemd ExecStart) and share this check.
+    """
+    if len(argv) != 6:
+        return None
+    if argv[1] != "run" or argv[2] != "--script" or argv[4] != "run":
+        return None
+    return Path(argv[0]), Path(argv[3])
+
+
 class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
+
+    def __init__(self, unit_dir: Path) -> None:
+        # Directory the host's units live in (LAUNCHAGENTS_DIR /
+        # SYSTEMD_USER_DIR). Passed in by the caller -- which owns the
+        # env-overridable value and redirects it in tests -- rather than
+        # recomputed here, so the scheduler honors that redirection.
+        self.unit_dir = unit_dir
 
     @abc.abstractmethod
     def render(
@@ -40,3 +78,32 @@ class Scheduler(abc.ABC):
         the live paths (or, for the drift check, the paths recovered from
         the installed unit) and passes them in.
         """
+
+    @abc.abstractmethod
+    def unit_config_path(self, name: str) -> Path | None:
+        """The on-disk unit file backing `name`, or None if absent."""
+
+    @abc.abstractmethod
+    def dispatch_unit_path(self, name: str) -> Path:
+        """The unit file `trigger` fires for `name` (may not exist)."""
+
+    @abc.abstractmethod
+    def installed_names(self) -> set[str]:
+        """Every full name with a crony-shaped unit file in `unit_dir`.
+
+        The name is the raw string embedded in the filename. A name
+        that isn't a valid `<bundle>.<short>` (a hand-created or
+        legacy stray) is still returned so status / destroy can reach
+        and clean it up -- the scheduler keys on the unit name, not on
+        entity identity.
+        """
+
+    @abc.abstractmethod
+    def state(self, name: str) -> UnitState:
+        """The scheduler's enable/disable state for the unit `name`."""
+
+    @abc.abstractmethod
+    def is_stale(self, spec: UnitSpec) -> bool:
+        """True when the installed units diverge from `spec` -- a file
+        missing or not matching what `render` would produce, or a unit
+        the scheduler has unloaded."""

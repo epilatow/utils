@@ -5445,10 +5445,10 @@ class _ApplyHarness(_RunnerHarness):
         # underlying primitives so a freshly-applied unit reads
         # back as `enabled`. Tests that assert a specific
         # scheduler state override these at the same level (e.g.
-        # `_systemd_is_enabled` -> "disabled").
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "enabled")
-        monkeypatch.setattr(crony, "_is_launchd_loaded", lambda label: True)
-        monkeypatch.setattr(crony, "_is_launchd_disabled", lambda label: False)
+        # `systemd._is_enabled` -> "disabled").
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "enabled")
+        monkeypatch.setattr(launchd, "_is_loaded", lambda label: True)
+        monkeypatch.setattr(launchd, "_is_disabled", lambda label: False)
         self.platform = platform
         self.agents = agents
         self.sysd = sysd
@@ -6440,6 +6440,21 @@ class TestDestroy:
         crony.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not plist.exists()
 
+    def test_destroy_finds_non_namespaced_unit(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A leftover crony unit whose name isn't <bundle>.<short>
+        # (hand-created, or from an older crony) must still be reachable
+        # by `crony destroy`: the scheduler keys on the unit name, not on
+        # a parsed entity identity, so discovery + removal don't require
+        # the name to be a valid EntityName.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        stray = h.agents / "org.crony.bogus.plist"
+        stray.write_text("x")
+        crony.do_destroy(jobs=[], bundle=None, orphans=False)
+        assert not stray.exists()
+
     def test_bundle_unknown_rejected(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -6860,43 +6875,70 @@ class TestLingerDetection:
 
 class TestUnitStateDarwin:
     def test_loaded_label_is_enabled(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
+        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
         monkeypatch.setattr(
-            crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
+            launchd, "_launchctl_list", lambda: "-\t0\torg.crony.default.j\n"
         )
-        assert crony._unit_state("j", "darwin") == "enabled"
+        assert crony._unit_state("default.j", "darwin") == "enabled"
 
     def test_disabled_record_takes_precedence(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(
-            crony,
+            launchd,
             "_launchctl_print_disabled",
-            lambda: '"org.crony.j" => disabled',
+            lambda: '"org.crony.default.j" => disabled',
         )
         monkeypatch.setattr(
-            crony, "_launchctl_list", lambda: "-\t0\torg.crony.j\n"
+            launchd, "_launchctl_list", lambda: "-\t0\torg.crony.default.j\n"
         )
-        assert crony._unit_state("j", "darwin") == "disabled"
+        assert crony._unit_state("default.j", "darwin") == "disabled"
 
     def test_none_when_neither_loaded_nor_disabled(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "_launchctl_print_disabled", lambda: "")
-        monkeypatch.setattr(crony, "_launchctl_list", lambda: "")
-        assert crony._unit_state("j", "darwin") == "none"
+        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
+        assert crony._unit_state("default.j", "darwin") == "none"
 
 
 class TestUnitStateLinux:
     def test_enabled(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "enabled")
-        assert crony._unit_state("j", "linux") == "enabled"
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "enabled")
+        assert crony._unit_state("default.j", "linux") == "enabled"
 
     def test_disabled(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
-        assert crony._unit_state("j", "linux") == "disabled"
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "disabled")
+        assert crony._unit_state("default.j", "linux") == "disabled"
 
     def test_none_on_empty(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "")
-        assert crony._unit_state("j", "linux") == "none"
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "")
+        assert crony._unit_state("default.j", "linux") == "none"
+
+
+class TestUnitNameDelegatesTolerateRefForm:
+    """A broken entity whose snapshot can't be read has no recoverable
+    `<bundle>.<short>` name, so the status path probes it by its
+    ref-form `<bundle>:<uuid>`. The scheduler keys on the unit name as
+    a plain string, so the query delegates report not-installed for it
+    rather than raising on a name that isn't a valid entity."""
+
+    _REF_FORM = "default:11111111-1111-1111-1111-111111111111"
+
+    def test_unit_state_none_for_ref_form(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "")
+        assert crony._unit_state(self._REF_FORM, "darwin") == "none"
+        assert crony._unit_state(self._REF_FORM, "linux") == "none"
+
+    def test_unit_config_path_none_for_ref_form(self) -> None:
+        for platform in ("darwin", "linux"):
+            got = crony._platform_unit_config_path(self._REF_FORM, platform)
+            assert got is None
+
+    def test_dispatch_unit_path_absent_for_ref_form(self) -> None:
+        for platform in ("darwin", "linux"):
+            path = crony._dispatch_unit_path(self._REF_FORM, platform)
+            assert not path.exists()
 
 
 class TestUvExecutable:
@@ -7504,7 +7546,7 @@ class TestEnableDisable:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "disabled")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
@@ -7542,7 +7584,7 @@ class TestEnableDisable:
         assert timer.exists()
         # Scheduler reports the unit as disabled (user disabled it
         # by hand before the state wipe).
-        monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "disabled")
+        monkeypatch.setattr(systemd, "_is_enabled", lambda u: "disabled")
         h.calls.clear()
         h.apply("j")
         verbs = [
@@ -12643,11 +12685,11 @@ class TestSnapshotLifecycle:
 
 
 class TestExtractUnitExecPaths:
-    """`_extract_unit_exec_paths` parses the on-disk unit file
-    to recover the `(uv, crony)` paths apply baked in. Anything
-    that doesn't match the expected argv shape returns None so
-    the drift check treats the file as stale (apply will
-    re-render it from the snapshot).
+    """`launchd._extract_exec_paths` / `systemd._extract_exec_paths`
+    parse the on-disk unit file to recover the `(uv, crony)` paths
+    apply baked in. Anything that doesn't match the expected argv
+    shape returns None so the drift check treats the file as stale
+    (apply will re-render it from the snapshot).
     """
 
     def test_extracts_paths_from_plist(self) -> None:
@@ -12658,7 +12700,7 @@ class TestExtractUnitExecPaths:
             uv_path=Path("/abs/uv"),
             crony_path=Path("/abs/crony"),
         )
-        assert crony._extract_unit_exec_paths(plist, "darwin") == (
+        assert launchd._extract_exec_paths(plist) == (
             Path("/abs/uv"),
             Path("/abs/crony"),
         )
@@ -12670,20 +12712,19 @@ class TestExtractUnitExecPaths:
             uv_path=Path("/abs/uv"),
             crony_path=Path("/abs/crony"),
         )
-        assert crony._extract_unit_exec_paths(svc, "linux") == (
+        assert systemd._extract_exec_paths(svc) == (
             Path("/abs/uv"),
             Path("/abs/crony"),
         )
 
     def test_returns_none_for_malformed_plist(self) -> None:
-        assert crony._extract_unit_exec_paths("not xml", "darwin") is None
+        assert launchd._extract_exec_paths("not xml") is None
 
     def test_returns_none_for_plist_missing_program_arguments(self) -> None:
         assert (
-            crony._extract_unit_exec_paths(
+            launchd._extract_exec_paths(
                 '<?xml version="1.0"?><plist><dict>'
                 "<key>Label</key><string>x</string></dict></plist>",
-                "darwin",
             )
             is None
         )
@@ -12697,18 +12738,17 @@ class TestExtractUnitExecPaths:
             "<string>run</string><string>x:y</string>"
             "</array></dict></plist>"
         )
-        assert crony._extract_unit_exec_paths(bogus, "darwin") is None
+        assert launchd._extract_exec_paths(bogus) is None
 
     def test_returns_none_for_systemd_missing_exec_start(self) -> None:
         no_exec = "[Service]\nType=oneshot\n"
-        assert crony._extract_unit_exec_paths(no_exec, "linux") is None
+        assert systemd._extract_exec_paths(no_exec) is None
 
     def test_returns_none_for_systemd_unparseable_ini(self) -> None:
         # Leading non-section content trips configparser.
         assert (
-            crony._extract_unit_exec_paths(
+            systemd._extract_exec_paths(
                 "ExecStart=/abs/uv run --script /abs/crony run x:y\n",
-                "linux",
             )
             is None
         )
@@ -12717,7 +12757,7 @@ class TestExtractUnitExecPaths:
         bogus = (
             "[Service]\nExecStart=/abs/uv weird --script /abs/crony run x:y\n"
         )
-        assert crony._extract_unit_exec_paths(bogus, "linux") is None
+        assert systemd._extract_exec_paths(bogus) is None
 
 
 class TestUnitDriftDetection:
@@ -12786,8 +12826,9 @@ class TestUnitDriftDetection:
         h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
         # Simulate the scheduler having unloaded the unit (e.g.
         # the user ran `launchctl bootout` directly). File on
-        # disk still intact but `_unit_state` reports "none".
-        monkeypatch.setattr(crony, "_unit_state", lambda n, p: "none")
+        # disk still intact but the launchd probe reports the unit
+        # as not loaded, so the drift check reads "none".
+        monkeypatch.setattr(launchd, "_is_loaded", lambda label: False)
         config = crony.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
@@ -12816,8 +12857,8 @@ class TestUnitDriftDetection:
         # returns "" -> _unit_state "none" -- the real linux behavior
         # the harness's blanket `enabled` stub hides.
         monkeypatch.setattr(
-            crony,
-            "_systemd_is_enabled",
+            systemd,
+            "_is_enabled",
             lambda u: "enabled" if (h.sysd / u).is_file() else "",
         )
         config = crony.load_config()

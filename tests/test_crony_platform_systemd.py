@@ -36,6 +36,8 @@ _REF = EntityRef("default", "u-test")
 # take them as explicit args, so the tests pin deterministic values.
 _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
+# render() / dispatch don't read the unit dir; pin a placeholder.
+_DIR = Path("/unused")
 
 
 class TestSystemdRendering:
@@ -107,7 +109,7 @@ class TestSystemdScheduler:
         )
 
     def test_service_and_timer_when_scheduled(self) -> None:
-        units = get_scheduler("linux").render(
+        units = get_scheduler("linux", _DIR).render(
             self._spec(Interval.from_str("1h")),
             uv_path=_UV,
             crony_path=_CRONY,
@@ -118,7 +120,7 @@ class TestSystemdScheduler:
         }
 
     def test_service_only_when_scheduleless(self) -> None:
-        units = get_scheduler("linux").render(
+        units = get_scheduler("linux", _DIR).render(
             self._spec(None), uv_path=_UV, crony_path=_CRONY
         )
         assert list(units) == ["crony-default.brew.service"]
@@ -140,7 +142,7 @@ class TestSystemdAnalyzeVerify:
         # sys.executable is a real absolute path. The argv after it is
         # irrelevant to verify (the unit is never run).
         real = Path(sys.executable)
-        sched = get_scheduler("linux")
+        sched = get_scheduler("linux", tmp_path)
         shapes: list[
             tuple[str, Schedule | Interval | None, PriorityClass | None]
         ] = [
