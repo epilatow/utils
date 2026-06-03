@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import plistlib
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -210,6 +212,25 @@ class TestLaunchdScheduler:
         (tmp_path / "org.crony.bogus.plist").write_text("x")  # no dot
         sched = get_scheduler("darwin", tmp_path)
         assert sched.installed_names() == {"default.real", "bogus"}
+
+    def test_remove_files_unlinks_plist(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # deactivate would shell out to launchctl; stub it so the test
+        # exercises only the unlink and runs on any platform.
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        plist = tmp_path / "org.crony.default.brew.plist"
+        plist.write_text("x")
+        get_scheduler("darwin", tmp_path).remove_files("default.brew")
+        assert not plist.exists()
+
+    def test_remove_files_tolerates_absent(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        # No file on disk: a partial / never-installed entity must not
+        # raise when destroyed.
+        get_scheduler("darwin", tmp_path).remove_files("default.absent")
 
 
 if __name__ == "__main__":

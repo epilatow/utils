@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -124,6 +125,28 @@ class TestSystemdScheduler:
             self._spec(None), uv_path=_UV, crony_path=_CRONY
         )
         assert list(units) == ["crony-default.brew.service"]
+
+    def test_remove_files_unlinks_service_and_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # deactivate would shell out to systemctl; stub it so the test
+        # exercises only the unlinks and runs on any platform.
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        service = tmp_path / "crony-default.brew.service"
+        timer = tmp_path / "crony-default.brew.timer"
+        service.write_text("x")
+        timer.write_text("x")
+        get_scheduler("linux", tmp_path).remove_files("default.brew")
+        assert not service.exists()
+        assert not timer.exists()
+
+    def test_remove_files_tolerates_absent(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        # A schedule-less entry has no .timer; remove_files tolerates the
+        # missing file rather than failing the destroy.
+        get_scheduler("linux", tmp_path).remove_files("default.absent")
 
 
 @pytest.mark.skipif(

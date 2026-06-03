@@ -123,6 +123,12 @@ class Scheduler(abc.ABC):
         already-absent unit so destroy never fails on a missing one."""
 
     @abc.abstractmethod
+    def remove_files(self, name: str) -> None:
+        """Deactivate `name` and unlink every unit file backing it.
+        Tolerant of an already-absent unit / missing files so destroy
+        never fails on a partial install."""
+
+    @abc.abstractmethod
     def enable(self, name: str) -> None:
         """Move the scheduler to the `enabled` state for `name`."""
 

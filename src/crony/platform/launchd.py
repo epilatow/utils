@@ -272,6 +272,10 @@ class LaunchdScheduler(Scheduler):
                 ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
             )
 
+    def remove_files(self, name: str) -> None:
+        self.deactivate(name)
+        (self.unit_dir / plist_filename(name)).unlink(missing_ok=True)
+
     def enable(self, name: str) -> None:
         plist = self.unit_dir / plist_filename(name)
         subprocess.run(["launchctl", "enable", self._gui(name)], check=True)

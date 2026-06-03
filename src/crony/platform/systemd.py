@@ -259,6 +259,11 @@ class SystemdScheduler(Scheduler):
             stderr=subprocess.DEVNULL,
         )
 
+    def remove_files(self, name: str) -> None:
+        self.deactivate(name)
+        (self.unit_dir / service_filename(name)).unlink(missing_ok=True)
+        (self.unit_dir / timer_filename(name)).unlink(missing_ok=True)
+
     def enable(self, name: str) -> None:
         subprocess.run(_SYSTEMCTL_ENABLE + [timer_filename(name)], check=True)
 

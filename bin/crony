@@ -5457,17 +5457,12 @@ def run_group(
 # Render and (un)load platform-native scheduler units. The launchd /
 # systemd divergence lives in the crony.platform backends; the functions
 # here are thin delegates via _scheduler(platform). The only residual
-# platform branches are picking the unit dir (_scheduler) and
-# destroy_one's best-effort unlink.
+# platform branch is picking the unit dir (_scheduler).
 
 
 def _label_for(name: str) -> str:
     """launchd Label for a job/group."""
     return launchd.label(name)
-
-
-def _plist_path_for(name: str) -> Path:
-    return LAUNCHAGENTS_DIR / launchd.plist_filename(name)
 
 
 def _service_path_for(name: str) -> Path:
@@ -5561,11 +5556,6 @@ def _activate_unit(
         prior_disabled=prior_disabled,
         scheduled=scheduled,
     )
-
-
-def _deactivate_unit(name: str, platform: str) -> None:
-    """Remove the unit from the platform scheduler (delegates)."""
-    _scheduler(platform).deactivate(name)
 
 
 def apply_one(config: Config, ref: EntityRef) -> str:
@@ -5710,13 +5700,7 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     state dir to clean up.
     """
     if name is not None:
-        platform = current_platform()
-        _deactivate_unit(name, platform)
-        if platform == "darwin":
-            _plist_path_for(name).unlink(missing_ok=True)
-        else:
-            _service_path_for(name).unlink(missing_ok=True)
-            _timer_path_for(name).unlink(missing_ok=True)
+        _scheduler(current_platform()).remove_files(name)
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
