@@ -1311,11 +1311,13 @@ def _crony_jobs() -> list[tuple[str, str, str]]:
 def _render_crony_bundle() -> str:
     """Render the crony bundle TOML borgadm installs.
 
-    priority, keep_awake, and the wallclock cap are identical for every
-    job, so they live in `[defaults]` (no job overrides them) rather
-    than being repeated per job. The defaults run all jobs un-throttled
-    (`priority = high`) and hold the machine awake (`keep_awake`). The
-    bundle default `notify_channels` is
+    priority, keep_awake, env, and the wallclock cap are identical for
+    every job, so they live in `[defaults]` (no job overrides them)
+    rather than being repeated per job. The defaults run all jobs
+    un-throttled (`priority = high`), hold the machine awake
+    (`keep_awake`), and extend PATH with ~/.local/bin (`env`) so
+    borgadm's `uv` shebang resolves under the scheduler's minimal PATH.
+    The bundle default `notify_channels` is
     ["default", "dialog-popup"], so a failing check notifies through the
     user's default crony bundle AND pops a desktop dialog. `create`
     overrides with `notify_channels = []` (silent) and treats borg's
@@ -1323,12 +1325,10 @@ def _render_crony_bundle() -> str:
     runs hourly and a file changing or vanishing mid-read is noise, not
     a failed backup -- while the checks omit notify_channels to take the
     bundle default and keep the default exit handling (a check warning
-    is a real signal). `env` extends PATH with ~/.local/bin so borgadm's
-    `uv` shebang resolves under the scheduler's minimal PATH. The
-    default `job_timeout_sec = 0` disables crony's wallclock cap for
-    every job: borgadm caps each borg command itself (BORG_CMD_TIMEOUT,
-    default 4h), so crony's shorter default cap would only preempt a
-    legitimately long backup or check.
+    is a real signal). The default `job_timeout_sec = 0` disables
+    crony's wallclock cap for every job: borgadm caps each borg command
+    itself (BORG_CMD_TIMEOUT, default 4h), so crony's shorter default
+    cap would only preempt a legitimately long backup or check.
 
     The target keys on this host (`[target.host.<this-host>]`); the
     repo and backup paths it runs against come from this machine's
@@ -1344,7 +1344,6 @@ def _render_crony_bundle() -> str:
         if name == "create":
             job["notify_channels"] = []
             job["success_exit_codes"] = [1]
-        job["env"] = {"PATH": "$HOME/.local/bin:$PATH"}
         jobs[name] = job
     doc: dict[str, Any] = {
         "defaults": {
@@ -1352,6 +1351,7 @@ def _render_crony_bundle() -> str:
             "job_timeout_sec": 0,
             "priority": "high",
             "keep_awake": True,
+            "env": {"PATH": "$HOME/.local/bin:$PATH"},
         },
         "job": jobs,
         "target": {

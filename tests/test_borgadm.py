@@ -1467,17 +1467,19 @@ class TestAutomate:
         # checks keep the default (a check warning is a real signal).
         assert doc["job"]["create"]["success_exit_codes"] == [1]
         assert "success_exit_codes" not in doc["job"]["check-age"]
-        # priority, keep_awake, and the disabled wallclock cap are the
-        # same for every job, so they live in [defaults] and no job
+        # priority, keep_awake, env, and the disabled wallclock cap are
+        # the same for every job, so they live in [defaults] and no job
         # overrides them. (borgadm caps each borg command itself, so
         # job_timeout_sec = 0 leaves that timeout the sole authority.)
         assert doc["defaults"]["priority"] == "high"
         assert doc["defaults"]["keep_awake"] is True
         assert doc["defaults"]["job_timeout_sec"] == 0
+        assert doc["defaults"]["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
         for op in self.JOB_OPS:
             assert "priority" not in doc["job"][op]
             assert "keep_awake" not in doc["job"][op]
             assert "job_timeout_sec" not in doc["job"][op]
+            assert "env" not in doc["job"][op]
         # Target keys on this host.
         host = ba._current_host()
         assert "darwin" not in doc["target"]
