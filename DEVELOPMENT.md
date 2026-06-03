@@ -68,6 +68,16 @@ gated by platform checks.
   is where the macOS-specific code lives (the BorgAdm C wrapper, the
   crony-backed `automate` subcommand) -- so a local `--e2e` run is the way to
   exercise the e2e suite on macOS.
+- `tests/linux-docker-test.sh` reproduces the CI Linux leg from a non-Linux
+  host: it runs the full suite (extra args pass through to `run_all.py`, e.g.
+  `--e2e`) in a throwaway Linux container. It is a manual tool -- `run_all.py`
+  discovers only `test_*.py` and CI invokes `run_all.py` directly, so it never
+  runs automatically. The container adds what the GitHub runner supplies
+  implicitly -- Node 20+ (the markdownlint gate), systemd-analyze (the
+  systemd-unit verify test), borg (the e2e suite), and git (uv builds the
+  repo-shared gate from a git source) -- and runs as a non-root user (the
+  secure_archiver permission test); the script header maps each dep to the
+  test that needs it. It tests the committed HEAD, not the working tree.
 
 ## Conventions
 
