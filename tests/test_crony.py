@@ -40,6 +40,20 @@ from conftest import (
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
 
+# The value objects live in the importable crony.unit package (bin/crony
+# imports them from there too). Importing them directly gives the tests
+# real mypy types; attribute access on the dynamically loaded script
+# module below only ever yields Any.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from crony.unit import (  # noqa: E402
+    EntityName,
+    EntityRef,
+    Interval,
+    PriorityClass,
+    Schedule,
+)
+
 # Load the bin/crony script under a module name other than "crony" so
 # the "crony" import name stays bound to the src/crony package that
 # bin/crony imports from (crony.unit, ...). Tests reach the loaded
@@ -451,7 +465,7 @@ class TestParseDefaults:
         assert cfg.defaults.notify_attach_max_kb == 512
         assert cfg.defaults.job_timeout_sec == 3600
         assert cfg.defaults.log_keep_runs == 50
-        assert cfg.defaults.priority == crony.PriorityClass.HIGH
+        assert cfg.defaults.priority == PriorityClass.HIGH
         assert cfg.defaults.keep_awake is True
         assert cfg.defaults.env == {"PATH": "$HOME/.local/bin:$PATH"}
         assert "ntfy" in cfg.defaults.notify_channel_defs
@@ -713,7 +727,7 @@ class TestParseJob:
 
     def test_interval_form(self) -> None:
         cfg = _parse(self._cfg({"command": "x", "interval": "1h30min"}))
-        assert cfg.jobs["j"].timing == crony.Interval.from_str("1h30min")
+        assert cfg.jobs["j"].timing == Interval.from_str("1h30min")
 
     def test_invalid_platforms_value(self) -> None:
         _assert_errored_job(
@@ -836,9 +850,7 @@ class TestParseJobGroup:
             }
         )
         assert cfg.job_groups["g"].jobs == ["a"]
-        assert cfg.job_groups["g"].timing == crony.Schedule.from_str(
-            "*-*-* 03:00"
-        )
+        assert cfg.job_groups["g"].timing == Schedule.from_str("*-*-* 03:00")
 
     def test_empty_jobs_list(self) -> None:
         _assert_errored_job_group(
@@ -1277,7 +1289,7 @@ class TestValidateConfig:
         assert "leaf" in cfg.job_groups
         assert "root" in cfg.job_groups
         assert cfg.job_groups["leaf"].timing is None
-        assert cfg.job_groups["root"].timing == crony.Schedule.from_str("daily")
+        assert cfg.job_groups["root"].timing == Schedule.from_str("daily")
 
     def test_chain_without_schedule_rejected(self) -> None:
         # A target reaches `a` via a chain with no schedule anywhere:
@@ -1512,7 +1524,7 @@ class TestLoadConfigFromFile:
         f.write_text(cfg_text)
         cfg = crony.load_toml_bundle_config(f)
         assert "brew-update" in cfg.jobs
-        assert cfg.jobs["brew-update"].timing == crony.Schedule.from_str(
+        assert cfg.jobs["brew-update"].timing == Schedule.from_str(
             "*-*-* 03:15"
         )
 
@@ -2974,7 +2986,7 @@ class TestPathFieldExpansion:
             crony.TomlBundleConfig(),
             None,
             job,
-            crony.EntityName.from_str("default.j"),
+            EntityName.from_str("default.j"),
         )
         assert snap.script == "/abs/path.sh"
         assert snap.args == [
@@ -3004,7 +3016,7 @@ class TestPathFieldExpansion:
             crony.TomlBundleConfig(),
             None,
             job,
-            crony.EntityName.from_str("default.j"),
+            EntityName.from_str("default.j"),
         )
         assert snap.gate_script == "/abs/gate.sh"
         assert snap.gate_args == ["/home/user/state"]
@@ -5458,8 +5470,8 @@ class TestPlistRendering:
     def test_keyword_daily(self) -> None:
         plist = crony._render_plist(
             "brew",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("daily"),
+            EntityRef("default", "u-test"),
+            Schedule.from_str("daily"),
         )
         assert "<key>Label</key>" in plist
         assert "<string>org.crony.brew</string>" in plist
@@ -5471,8 +5483,8 @@ class TestPlistRendering:
     def test_oncalendar_simple_time(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("*-*-* 03:15"),
+            EntityRef("default", "u-test"),
+            Schedule.from_str("*-*-* 03:15"),
         )
         assert "<key>Hour</key>" in plist
         assert "<integer>3</integer>" in plist
@@ -5481,8 +5493,8 @@ class TestPlistRendering:
     def test_oncalendar_dow_with_time(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("Mon *-*-* 09:00"),
+            EntityRef("default", "u-test"),
+            Schedule.from_str("Mon *-*-* 09:00"),
         )
         assert "<key>Weekday</key>" in plist
         assert "<integer>1</integer>" in plist  # Mon=1
@@ -5490,8 +5502,8 @@ class TestPlistRendering:
     def test_oncalendar_first_of_month(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("*-*-01 03:00"),
+            EntityRef("default", "u-test"),
+            Schedule.from_str("*-*-01 03:00"),
         )
         assert "<key>Day</key>" in plist
         assert "<integer>1</integer>" in plist
@@ -5499,8 +5511,8 @@ class TestPlistRendering:
     def test_interval(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Interval.from_str("30min"),
+            EntityRef("default", "u-test"),
+            Interval.from_str("30min"),
         )
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
@@ -5519,8 +5531,8 @@ class TestPlistRendering:
         )
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("daily"),
+            EntityRef("default", "u-test"),
+            Schedule.from_str("daily"),
         )
         assert "<string>/abs/uv</string>" in plist
         assert "<string>run</string>" in plist
@@ -5534,15 +5546,15 @@ class TestPlistRendering:
         # Cross-platform guard: each rendered plist must parse back as
         # a well-formed plist (plutil only runs at apply on macOS, so
         # this catches structural breakage in CI on any platform).
-        ref = crony.EntityRef("default", "u-test")
+        ref = EntityRef("default", "u-test")
         shapes = [
-            (crony.Schedule.from_str("daily"), None),
-            (crony.Interval.from_str("30min"), None),
+            (Schedule.from_str("daily"), None),
+            (Interval.from_str("30min"), None),
             (
-                crony.Schedule.from_str("Mon *-*-* 09:00"),
-                crony.PriorityClass.HIGH,
+                Schedule.from_str("Mon *-*-* 09:00"),
+                PriorityClass.HIGH,
             ),
-            (crony.Schedule.from_str("*-*-* 03:00"), crony.PriorityClass.LOW),
+            (Schedule.from_str("*-*-* 03:00"), PriorityClass.LOW),
             (None, None),  # on-demand, normal priority
         ]
         for timing, priority in shapes:
@@ -5555,7 +5567,7 @@ class TestPlistRendering:
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
         svc = crony._render_systemd_service(
-            "brew", crony.EntityRef("default", "u-test")
+            "brew", EntityRef("default", "u-test")
         )
         assert "[Unit]" in svc
         assert "[Service]" in svc
@@ -5566,14 +5578,14 @@ class TestSystemdRendering:
 
     def test_timer_oncalendar(self) -> None:
         timer = crony._render_systemd_timer(
-            "j", crony.Schedule.from_str("*-*-* 03:00")
+            "j", Schedule.from_str("*-*-* 03:00")
         )
         assert "OnCalendar=*-*-* 03:00" in timer
         assert "Persistent=true" in timer
         assert "WantedBy=timers.target" in timer
 
     def test_timer_interval(self) -> None:
-        timer = crony._render_systemd_timer("j", crony.Interval.from_str("1h"))
+        timer = crony._render_systemd_timer("j", Interval.from_str("1h"))
         assert "OnUnitActiveSec=1h" in timer
 
     def test_service_invokes_uv_with_absolute_path(
@@ -5587,9 +5599,7 @@ class TestSystemdRendering:
         monkeypatch.setattr(
             crony, "_crony_executable", lambda: Path("/abs/crony")
         )
-        svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test")
-        )
+        svc = crony._render_systemd_service("j", EntityRef("default", "u-test"))
         assert (
             "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
             in svc
@@ -5615,29 +5625,29 @@ class TestSystemdAnalyzeVerify:
     """
 
     def test_every_unit_shape_verifies(self, tmp_path: Path) -> None:
-        ref = crony.EntityRef("default", "u-test")
+        ref = EntityRef("default", "u-test")
         # ExecStart's executable must resolve for verify to pass;
         # sys.executable is a real absolute path. The argv after it is
         # irrelevant to verify (the unit is never run).
         real = Path(sys.executable)
         shapes = [
-            ("cal-normal", crony.Schedule.from_str("*-*-* 03:00"), None),
+            ("cal-normal", Schedule.from_str("*-*-* 03:00"), None),
             (
                 "cal-high",
-                crony.Schedule.from_str("Mon *-*-* 09:00"),
-                crony.PriorityClass.HIGH,
+                Schedule.from_str("Mon *-*-* 09:00"),
+                PriorityClass.HIGH,
             ),
             (
                 "cal-low",
-                crony.Schedule.from_str("daily"),
-                crony.PriorityClass.LOW,
+                Schedule.from_str("daily"),
+                PriorityClass.LOW,
             ),
             (
                 "interval",
-                crony.Interval.from_str("30min"),
-                crony.PriorityClass.HIGH,
+                Interval.from_str("30min"),
+                PriorityClass.HIGH,
             ),
-            ("scheduleless", None, crony.PriorityClass.LOW),
+            ("scheduleless", None, PriorityClass.LOW),
         ]
         written: list[Path] = []
         for nm, timing, prio in shapes:
@@ -5685,7 +5695,7 @@ class TestJobPriority:
 
     def test_parse_valid(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        assert cfg.jobs["a"].priority is crony.PriorityClass.HIGH
+        assert cfg.jobs["a"].priority is PriorityClass.HIGH
 
     def test_parse_omitted_is_none(self) -> None:
         cfg = _parse({"job": {"a": _job()}})
@@ -5702,9 +5712,9 @@ class TestJobPriority:
         cfg = _parse({"job": {"a": _job(priority="high")}})
         target = crony.resolve_target(cfg, "h", "darwin")
         snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], crony.EntityName.from_str("default.a")
+            cfg, target, cfg.jobs["a"], EntityName.from_str("default.a")
         )
-        assert snap.priority is crony.PriorityClass.HIGH
+        assert snap.priority is PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
@@ -5712,7 +5722,7 @@ class TestJobPriority:
         snap = crony._resolve_job_snapshot(
             cfg, target, cfg.jobs["a"], "default.a"
         )
-        assert snap.priority == crony.PriorityClass.HIGH
+        assert snap.priority == PriorityClass.HIGH
 
     def test_job_overrides_default(self) -> None:
         cfg = _parse(
@@ -5725,14 +5735,14 @@ class TestJobPriority:
         snap = crony._resolve_job_snapshot(
             cfg, target, cfg.jobs["a"], "default.a"
         )
-        assert snap.priority == crony.PriorityClass.LOW
+        assert snap.priority == PriorityClass.LOW
 
     def test_plist_high(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("daily"),
-            crony.PriorityClass.HIGH,
+            EntityRef("default", "u-test"),
+            Schedule.from_str("daily"),
+            PriorityClass.HIGH,
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Interactive"
@@ -5742,9 +5752,9 @@ class TestJobPriority:
     def test_plist_low(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.Schedule.from_str("daily"),
-            crony.PriorityClass.LOW,
+            EntityRef("default", "u-test"),
+            Schedule.from_str("daily"),
+            PriorityClass.LOW,
         )
         d = plistlib.loads(plist.encode("utf-8"))
         assert d["ProcessType"] == "Background"
@@ -5752,23 +5762,23 @@ class TestJobPriority:
         assert d["Nice"] == 10
 
     def test_plist_normal_and_none_emit_nothing(self) -> None:
-        for p in (crony.PriorityClass.NORMAL, None):
+        for p in (PriorityClass.NORMAL, None):
             plist = crony._render_plist(
                 "j",
-                crony.EntityRef("default", "u-test"),
-                crony.Schedule.from_str("daily"),
+                EntityRef("default", "u-test"),
+                Schedule.from_str("daily"),
                 p,
             )
             d = plistlib.loads(plist.encode("utf-8"))
             assert "ProcessType" not in d
             assert "LowPriorityIO" not in d
             assert "Nice" not in d
-        assert crony._plist_priority_keys(crony.PriorityClass.NORMAL) == {}
+        assert crony._plist_priority_keys(PriorityClass.NORMAL) == {}
         assert crony._plist_priority_keys(None) == {}
 
     def test_systemd_high_records_intent(self) -> None:
         svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test"), crony.PriorityClass.HIGH
+            "j", EntityRef("default", "u-test"), PriorityClass.HIGH
         )
         assert "# crony priority=high" in svc
         # high leaves CPU/IO at the Linux defaults.
@@ -5777,7 +5787,7 @@ class TestJobPriority:
 
     def test_systemd_low_sets_scheduling(self) -> None:
         svc = crony._render_systemd_service(
-            "j", crony.EntityRef("default", "u-test"), crony.PriorityClass.LOW
+            "j", EntityRef("default", "u-test"), PriorityClass.LOW
         )
         assert "Nice=10" in svc
         assert "IOSchedulingClass=idle" in svc
@@ -5785,8 +5795,8 @@ class TestJobPriority:
     def test_systemd_normal_emits_nothing(self) -> None:
         svc = crony._render_systemd_service(
             "j",
-            crony.EntityRef("default", "u-test"),
-            crony.PriorityClass.NORMAL,
+            EntityRef("default", "u-test"),
+            PriorityClass.NORMAL,
         )
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
@@ -5881,7 +5891,7 @@ class TestKeepAwake:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
         target = crony.resolve_target(cfg, "h", "darwin")
         return crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], crony.EntityName.from_str("default.a")
+            cfg, target, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 
     def test_parse_true(self) -> None:
@@ -10881,43 +10891,43 @@ class TestEntityRefInput:
     _CANONICAL_UUID = "11111111-2222-3333-4444-555555555555"
 
     def test_parse_round_trips(self) -> None:
-        ref = crony.EntityRef("default", self._CANONICAL_UUID)
+        ref = EntityRef("default", self._CANONICAL_UUID)
         rendered = str(ref)
         assert rendered == f"default:{self._CANONICAL_UUID}"
-        assert crony.EntityRef.from_str(rendered) == ref
+        assert EntityRef.from_str(rendered) == ref
 
     def test_parse_with_non_default_bundle(self) -> None:
-        ref = crony.EntityRef("borgadm", self._CANONICAL_UUID)
+        ref = EntityRef("borgadm", self._CANONICAL_UUID)
         rendered = str(ref)
-        assert crony.EntityRef.from_str(rendered) == ref
+        assert EntityRef.from_str(rendered) == ref
 
     def test_parse_non_ref_returns_none(self) -> None:
         # Dot-separated names aren't entity refs.
-        assert crony.EntityRef.from_str("default.foo") is None
+        assert EntityRef.from_str("default.foo") is None
         # Bare names aren't entity refs either.
-        assert crony.EntityRef.from_str("foo") is None
+        assert EntityRef.from_str("foo") is None
         # Bundle-only (no uuid body).
-        assert crony.EntityRef.from_str("default:") is None
+        assert EntityRef.from_str("default:") is None
         # No bundle.
-        assert crony.EntityRef.from_str(f":{self._CANONICAL_UUID}") is None
+        assert EntityRef.from_str(f":{self._CANONICAL_UUID}") is None
 
     def test_parse_rejects_non_canonical_uuid(self) -> None:
         # Validation runs because the parsed ref flows into a
         # path that `shutil.rmtree` later trusts -- a malformed
         # uuid must fail at parse time, not at filesystem time.
-        assert crony.EntityRef.from_str("default:not-a-uuid") is None
-        assert crony.EntityRef.from_str("default:abc123") is None
+        assert EntityRef.from_str("default:not-a-uuid") is None
+        assert EntityRef.from_str("default:abc123") is None
         # Path-traversal-shaped uuid bodies must be rejected so
         # `crony destroy` can't be tricked into `rmtree`-ing
         # `STATE_DIR/default/../../etc`.
-        assert crony.EntityRef.from_str("default:../../etc") is None
+        assert EntityRef.from_str("default:../../etc") is None
 
     def test_parse_rejects_invalid_bundle_name(self) -> None:
         # Bundle names are constrained by `_BUNDLE_NAME_RE`; an
         # invalid bundle prevents the path composition from
         # walking outside `STATE_DIR`.
         bad = f"../etc:{self._CANONICAL_UUID}"
-        assert crony.EntityRef.from_str(bad) is None
+        assert EntityRef.from_str(bad) is None
 
 
 class TestConfigResolveEntityRef:
@@ -10940,7 +10950,7 @@ class TestConfigResolveEntityRef:
         # for the ref since the ref doesn't appear in their
         # backing source. The ref-form parser still gives the
         # caller a way to construct an EntityRef explicitly:
-        assert crony.EntityRef.from_str(ref_input) == crony.EntityRef(
+        assert EntityRef.from_str(ref_input) == EntityRef(
             "default", "11111111-2222-3333-4444-555555555555"
         )
         assert cfg.resolve_runnable(ref_input) is None
@@ -11376,11 +11386,9 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         config = crony.load_config()
-        ref = crony.EntityRef("default", uuid_a)
+        ref = EntityRef("default", uuid_a)
         assert ref in config.pending.jobs
-        assert config.pending.jobs[ref].name == crony.EntityName.from_str(
-            "default.a"
-        )
+        assert config.pending.jobs[ref].name == EntityName.from_str("default.a")
         # No on-disk snapshot yet -> nothing in current.
         assert ref not in config.current.jobs
         assert config.config_state(ref) == "missing"
@@ -11421,7 +11429,7 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         config = crony.load_config()
-        ref = crony.EntityRef("default", uuid_g)
+        ref = EntityRef("default", uuid_g)
         assert config.config_state(ref) == "orphan"
         assert ref in config.runtime
 
@@ -11445,7 +11453,7 @@ class TestLoadConfig:
             bundles.bundles[0].config,
             target,
             bundles.bundles[0].config.jobs["a"],
-            crony.EntityName.from_str("default.a"),
+            EntityName.from_str("default.a"),
         )
         sd = crony.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
@@ -11453,7 +11461,7 @@ class TestLoadConfig:
             json.dumps(crony._snapshot_to_dict(snap)), encoding="utf-8"
         )
         config = crony.load_config()
-        ref = crony.EntityRef("default", uuid_a)
+        ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "synced"
 
     def test_stale_when_pending_differs(
@@ -11475,7 +11483,7 @@ class TestLoadConfig:
             bundles.bundles[0].config,
             target,
             bundles.bundles[0].config.jobs["a"],
-            crony.EntityName.from_str("default.a"),
+            EntityName.from_str("default.a"),
         )
         sd = crony.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
@@ -11487,7 +11495,7 @@ class TestLoadConfig:
             json.dumps(diverged), encoding="utf-8"
         )
         config = crony.load_config()
-        ref = crony.EntityRef("default", uuid_a)
+        ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "stale"
 
     def test_resolve_finds_by_pending_name(
@@ -11533,7 +11541,7 @@ class TestConfigBroken:
         sd = crony.STATE_DIR / "default" / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(contents, encoding="utf-8")
-        return crony.EntityRef("default", uuid_value), sd
+        return EntityRef("default", uuid_value), sd
 
     def test_wrong_schema_recorded_as_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -11798,8 +11806,8 @@ class TestNameCollision:
         stray_uuid = "99999999-8888-7777-6666-555544443333"
         self._plant_residue(h, h.full("j"), stray_uuid)
         config = crony.load_config()
-        live_ref = crony.EntityRef("default", live_uuid)
-        stray_ref = crony.EntityRef("default", stray_uuid)
+        live_ref = EntityRef("default", live_uuid)
+        stray_ref = EntityRef("default", stray_uuid)
         # The live (config-matching) ref keeps the name; the stray
         # is shadowed.
         assert config.current.by_full_name[h.full("j")] == live_ref
@@ -12141,7 +12149,7 @@ class TestResolveMethods:
             encoding="utf-8",
         )
         config = crony.load_config()
-        ref = crony.EntityRef("default", uuid_b)
+        ref = EntityRef("default", uuid_b)
         assert config.resolve_runnable("default.legacy") is None
         assert config.resolve_current("default.legacy") == ref
         assert config.resolve_pending("default.legacy") is None
@@ -12792,7 +12800,7 @@ class TestSnapshotLifecycle:
         )
         with pytest.raises(crony.PreconditionError, match="schema 999"):
             crony._load_snapshot(
-                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
+                EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
             )
 
     def test_load_snapshot_refuses_missing(
@@ -12801,7 +12809,7 @@ class TestSnapshotLifecycle:
         _ = _RunnerHarness(tmp_path, monkeypatch)
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony._load_snapshot(
-                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid")
+                EntityRef(crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid")
             )
 
     def test_load_snapshot_refuses_malformed_schema_match(
@@ -12828,7 +12836,7 @@ class TestSnapshotLifecycle:
         )
         with pytest.raises(crony.PreconditionError, match="malformed fields"):
             crony._load_snapshot(
-                crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
+                EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
             )
 
     def test_topological_apply_propagates_leaf_edit_to_group(
@@ -12928,7 +12936,7 @@ class TestExtractUnitExecPaths:
     def test_extracts_paths_from_plist(self) -> None:
         plist = crony._render_plist(
             "j",
-            crony.EntityRef("default", "u-test"),
+            EntityRef("default", "u-test"),
             "*-*-* 03:00",
             None,
             uv_path=Path("/abs/uv"),
@@ -12942,7 +12950,7 @@ class TestExtractUnitExecPaths:
     def test_extracts_paths_from_systemd_service(self) -> None:
         svc = crony._render_systemd_service(
             "j",
-            crony.EntityRef("default", "u-test"),
+            EntityRef("default", "u-test"),
             uv_path=Path("/abs/uv"),
             crony_path=Path("/abs/crony"),
         )
@@ -13230,7 +13238,7 @@ class TestUnitDriftDetection:
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
             crony._render_systemd_timer(
-                h.full("transit"), crony.Schedule.from_str("*-*-* 03:00")
+                h.full("transit"), Schedule.from_str("*-*-* 03:00")
             )
         )
         config = crony.load_config()
@@ -13272,7 +13280,7 @@ class TestSnapshotBackwardLoad:
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
         _ = full
         snap = crony._load_snapshot(
-            crony.EntityRef(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
+            EntityRef(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
         )
         assert isinstance(snap, crony.Job)
         assert snap.timing is None
