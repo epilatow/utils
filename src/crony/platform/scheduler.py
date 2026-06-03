@@ -107,3 +107,37 @@ class Scheduler(abc.ABC):
         """True when the installed units diverge from `spec` -- a file
         missing or not matching what `render` would produce, or a unit
         the scheduler has unloaded."""
+
+    @abc.abstractmethod
+    def activate(
+        self, name: str, *, prior_disabled: bool, scheduled: bool
+    ) -> None:
+        """Load the unit (whose files the caller has already written)
+        into the scheduler. `prior_disabled` restores a hand-disabled
+        state across the reload; `scheduled` is False for a
+        schedule-less entry that registers but does not arm."""
+
+    @abc.abstractmethod
+    def deactivate(self, name: str) -> None:
+        """Remove the unit from the scheduler. Tolerant of an
+        already-absent unit so destroy never fails on a missing one."""
+
+    @abc.abstractmethod
+    def enable(self, name: str) -> None:
+        """Move the scheduler to the `enabled` state for `name`."""
+
+    @abc.abstractmethod
+    def disable(self, name: str) -> None:
+        """Move the scheduler to the `disabled` state for `name`."""
+
+    @abc.abstractmethod
+    def trigger(self, name: str) -> None:
+        """Fire `name` immediately (no-op if a run is already in
+        flight)."""
+
+    @abc.abstractmethod
+    def prune_units(self, name: str, keep: set[str]) -> None:
+        """Remove `name`'s installed unit files not in `keep` (disabling
+        them first) -- e.g. an orphaned `.timer` after a scheduled ->
+        unscheduled transition. `keep` is the filename set `render`
+        currently produces."""

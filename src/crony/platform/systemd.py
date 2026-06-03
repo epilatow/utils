@@ -28,6 +28,11 @@ from crony.unit import (
     UnitSpec,
 )
 
+# --now enables/disables the unit and starts/stops it in one call;
+# --quiet drops the success-path symlink chatter.
+_SYSTEMCTL_ENABLE = ["systemctl", "--user", "--quiet", "enable", "--now"]
+_SYSTEMCTL_DISABLE = ["systemctl", "--user", "--quiet", "disable", "--now"]
+
 
 def service_filename(name: str) -> str:
     """Basename of the systemd `.service` unit for `name`."""
@@ -228,3 +233,51 @@ class SystemdScheduler(Scheduler):
         if spec.timing is None:
             return False
         return self.state(name) == UnitState.NONE
+
+    def activate(
+        self, name: str, *, prior_disabled: bool, scheduled: bool
+    ) -> None:
+        # --quiet suppresses systemctl's success-path "Created symlink"
+        # chatter; real errors still print.
+        subprocess.run(
+            ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
+        )
+        # enable --now only applies to the .timer, rendered only for
+        # scheduled entries; a schedule-less .service sits dormant.
+        if scheduled and not prior_disabled:
+            subprocess.run(
+                _SYSTEMCTL_ENABLE + [timer_filename(name)], check=True
+            )
+
+    def deactivate(self, name: str) -> None:
+        subprocess.run(
+            _SYSTEMCTL_DISABLE + [timer_filename(name)],
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "--quiet", "daemon-reload"],
+            stderr=subprocess.DEVNULL,
+        )
+
+    def enable(self, name: str) -> None:
+        subprocess.run(_SYSTEMCTL_ENABLE + [timer_filename(name)], check=True)
+
+    def disable(self, name: str) -> None:
+        subprocess.run(_SYSTEMCTL_DISABLE + [timer_filename(name)], check=True)
+
+    def trigger(self, name: str) -> None:
+        # The timer's job is to fire the .service; start it directly.
+        subprocess.run(
+            ["systemctl", "--user", "start", service_filename(name)],
+            check=True,
+        )
+
+    def prune_units(self, name: str, keep: set[str]) -> None:
+        # The .service is always kept; an orphaned .timer (scheduled ->
+        # unscheduled) is disabled in the scheduler before unlinking.
+        timer = self.unit_dir / timer_filename(name)
+        if timer.name not in keep and timer.is_file():
+            subprocess.run(
+                _SYSTEMCTL_DISABLE + [timer.name], stderr=subprocess.DEVNULL
+            )
+            timer.unlink()

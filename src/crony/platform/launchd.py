@@ -241,3 +241,62 @@ class LaunchdScheduler(Scheduler):
         # A grouped (schedule-less) plist must still be loaded to be
         # kickstartable, so an unloaded unit is drift here too.
         return self.state(name) == UnitState.NONE
+
+    def _gui(self, name: str) -> str:
+        return f"gui/{os.getuid()}/{label(name)}"
+
+    def activate(
+        self, name: str, *, prior_disabled: bool, scheduled: bool
+    ) -> None:
+        del scheduled  # a plist with no Start* keys loads fine, dormant
+        plist = self.unit_dir / plist_filename(name)
+        # Validate before asking launchd to load (`-s` keeps stdout
+        # quiet on success). unload-then-load tolerates "not loaded".
+        subprocess.run(["plutil", "-s", str(plist)], check=True)
+        subprocess.run(
+            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
+        )
+        subprocess.run(["launchctl", "load", str(plist)], check=True)
+        if prior_disabled:
+            subprocess.run(
+                ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
+            )
+            subprocess.run(
+                ["launchctl", "disable", self._gui(name)], check=True
+            )
+
+    def deactivate(self, name: str) -> None:
+        plist = self.unit_dir / plist_filename(name)
+        if plist.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
+            )
+
+    def enable(self, name: str) -> None:
+        plist = self.unit_dir / plist_filename(name)
+        subprocess.run(["launchctl", "enable", self._gui(name)], check=True)
+        subprocess.run(
+            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
+        )
+        subprocess.run(["launchctl", "load", str(plist)], check=True)
+
+    def disable(self, name: str) -> None:
+        plist = self.unit_dir / plist_filename(name)
+        # Unload first so the persistent disable record takes effect;
+        # otherwise the still-loaded plist keeps firing.
+        subprocess.run(
+            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
+        )
+        subprocess.run(["launchctl", "disable", self._gui(name)], check=True)
+
+    def trigger(self, name: str) -> None:
+        # kickstart invokes now; `start` only queues the next fire.
+        subprocess.run(["launchctl", "kickstart", self._gui(name)], check=True)
+
+    def prune_units(self, name: str, keep: set[str]) -> None:
+        # One plist per name, which render always produces, so there is
+        # normally nothing to prune.
+        fn = plist_filename(name)
+        if fn not in keep:
+            self.deactivate(name)
+            (self.unit_dir / fn).unlink(missing_ok=True)

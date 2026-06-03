@@ -5456,10 +5456,11 @@ def run_group(
 # =============================================================================
 # PLATFORM UNITS
 # =============================================================================
-# Render and (un)load platform-native scheduler units. crony's
-# "behaves the same on both platforms" promise is concentrated here:
-# darwin/linux divergence in apply/destroy lives in this section.
-# Anywhere else in the file is platform-agnostic.
+# Render and (un)load platform-native scheduler units. The launchd /
+# systemd divergence lives in the crony.platform backends; the functions
+# here are thin delegates via _scheduler(platform). The only residual
+# platform branches are picking the unit dir (_scheduler) and
+# destroy_one's best-effort unlink.
 
 
 def _label_for(name: str) -> str:
@@ -5483,10 +5484,6 @@ def _platform_unit_config_path(name: str, platform: str) -> Path | None:
     """The on-disk platform unit file backing `name`, or None. The
     status `unit-config` column reads this from `RuntimeState`."""
     return _scheduler(platform).unit_config_path(name)
-
-
-def _systemd_unit_name(name: str) -> str:
-    return systemd.timer_filename(name)
 
 
 def _dispatch_unit_path(name: str, platform: str) -> Path:
@@ -5561,90 +5558,16 @@ def _activate_unit(
     starts it). The plist analog is the same -- a plist with no
     Start* keys loads fine and just doesn't auto-fire.
     """
-    if platform == "darwin":
-        plist = _plist_path_for(name)
-        # Validate the plist before asking launchd to load it -- a
-        # parseable failure here is much clearer than launchd's
-        # silent error path. `-s` keeps stdout quiet on success
-        # (default plutil prints `<path>: OK` per file, which
-        # would clutter `apply`'s per-entry output).
-        subprocess.run(["plutil", "-s", str(plist)], check=True)
-        # unload-then-load: tolerates "not loaded" (errok) so a clean
-        # re-apply over a previously-installed unit just works.
-        subprocess.run(
-            ["launchctl", "unload", str(plist)],
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(["launchctl", "load", str(plist)], check=True)
-        if prior_disabled:
-            label = _label_for(name)
-            subprocess.run(
-                ["launchctl", "unload", str(plist)],
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                [
-                    "launchctl",
-                    "disable",
-                    f"gui/{os.getuid()}/{label}",
-                ],
-                check=True,
-            )
-        return
-    # linux: daemon-reload picks up the new content. `enable --now`
-    # only applies to the .timer, which we only render for scheduled
-    # entries; for schedule-less entries the .service alone is
-    # enough (it sits in the unit catalog, ready for `systemctl
-    # start` to fire it).
-    # `--quiet` suppresses systemctl's "Created symlink ..."
-    # informational chatter on enable/disable so `crony apply`
-    # output stays focused on the apply-level summary lines.
-    # Real errors still print to stderr; --quiet only suppresses
-    # the success-path notices.
-    subprocess.run(
-        ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
+    _scheduler(platform).activate(
+        name,
+        prior_disabled=prior_disabled,
+        scheduled=scheduled,
     )
-    if scheduled and not prior_disabled:
-        subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "--quiet",
-                "enable",
-                "--now",
-                _systemd_unit_name(name),
-            ],
-            check=True,
-        )
 
 
 def _deactivate_unit(name: str, platform: str) -> None:
-    """Remove the unit from the platform scheduler. Errok throughout
-    so destroy never fails just because the unit was already gone.
-    """
-    if platform == "darwin":
-        plist = _plist_path_for(name)
-        if plist.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist)],
-                stderr=subprocess.DEVNULL,
-            )
-    else:
-        subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "--quiet",
-                "disable",
-                "--now",
-                _systemd_unit_name(name),
-            ],
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["systemctl", "--user", "--quiet", "daemon-reload"],
-            stderr=subprocess.DEVNULL,
-        )
+    """Remove the unit from the platform scheduler (delegates)."""
+    _scheduler(platform).deactivate(name)
 
 
 def apply_one(config: Config, ref: EntityRef) -> str:
@@ -5747,28 +5670,13 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
     units = _render_units(snapshot, platform)
-    target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
+    sched = _scheduler(platform)
+    target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
-    # Clean up any previously-installed unit files for this name
-    # that aren't in the current render set (handles a scheduled
-    # -> unscheduled transition where the .timer should be removed).
-    if platform == "linux":
-        timer_path = _timer_path_for(full_name)
-        if timer_path.name not in units and timer_path.exists():
-            # Disable the orphaned timer in the scheduler's view
-            # before unlinking the file.
-            subprocess.run(
-                [
-                    "systemctl",
-                    "--user",
-                    "--quiet",
-                    "disable",
-                    "--now",
-                    timer_path.name,
-                ],
-                stderr=subprocess.DEVNULL,
-            )
-            timer_path.unlink()
+    # Clean up any previously-installed unit files for this name that
+    # aren't in the current render set (handles a scheduled ->
+    # unscheduled transition where the .timer should be removed).
+    sched.prune_units(full_name, set(units))
     for fname, content in units.items():
         (target_dir / fname).write_text(content, encoding="utf-8")
     _activate_unit(
@@ -6124,63 +6032,13 @@ def _config_axis(
 
 
 def _enable_unit(name: str, platform: str) -> None:
-    """Move the platform scheduler into the `enabled` state for `name`."""
-    if platform == "linux":
-        subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "--quiet",
-                "enable",
-                "--now",
-                _systemd_unit_name(name),
-            ],
-            check=True,
-        )
-        return
-    label = _label_for(name)
-    plist = _plist_path_for(name)
-    subprocess.run(
-        ["launchctl", "enable", f"gui/{os.getuid()}/{label}"],
-        check=True,
-    )
-    # unload-then-load -- mirrors apply, tolerates a stale loaded
-    # plist from before the enable.
-    subprocess.run(
-        ["launchctl", "unload", str(plist)],
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(["launchctl", "load", str(plist)], check=True)
+    """Move the scheduler to the `enabled` state for `name` (delegates)."""
+    _scheduler(platform).enable(name)
 
 
 def _disable_unit(name: str, platform: str) -> None:
-    """Move the platform scheduler into the `disabled` state for `name`."""
-    if platform == "linux":
-        subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "--quiet",
-                "disable",
-                "--now",
-                _systemd_unit_name(name),
-            ],
-            check=True,
-        )
-        return
-    label = _label_for(name)
-    plist = _plist_path_for(name)
-    # Unload first so the persistent disable record actually takes
-    # effect; otherwise the still-loaded plist would keep firing
-    # until the next launchd restart.
-    subprocess.run(
-        ["launchctl", "unload", str(plist)],
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["launchctl", "disable", f"gui/{os.getuid()}/{label}"],
-        check=True,
-    )
+    """Move the scheduler to the `disabled` state for `name` (delegates)."""
+    _scheduler(platform).disable(name)
 
 
 def _trigger_unit(
@@ -6239,20 +6097,7 @@ def _trigger_unit(
         _write_user_trigger_flag(state_dir)
     succeeded = False
     try:
-        if platform == "linux":
-            # The timer's job is to fire the .service; trigger
-            # by starting the service directly.
-            service_unit = systemd.service_filename(name)
-            subprocess.run(
-                ["systemctl", "--user", "start", service_unit],
-                check=True,
-            )
-        else:
-            label = _label_for(name)
-            subprocess.run(
-                ["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
-                check=True,
-            )
+        _scheduler(platform).trigger(name)
         succeeded = True
     finally:
         if triggered_by_user and state_dir is not None and not succeeded:
