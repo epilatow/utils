@@ -1300,8 +1300,11 @@ def _crony_jobs() -> list[tuple[str, str, str]]:
 def _render_crony_bundle() -> str:
     """Render the crony bundle TOML borgadm installs.
 
-    All jobs run un-throttled (`priority = high`) and hold the machine
-    awake (`keep_awake`). The bundle default `notify_channels` is
+    priority, keep_awake, and the wallclock cap are identical for every
+    job, so they live in `[defaults]` (no job overrides them) rather
+    than being repeated per job. The defaults run all jobs un-throttled
+    (`priority = high`) and hold the machine awake (`keep_awake`). The
+    bundle default `notify_channels` is
     ["default", "dialog-popup"], so a failing check notifies through the
     user's default crony bundle AND pops a desktop dialog. `create`
     overrides with `notify_channels = []` (silent) and treats borg's
@@ -1322,8 +1325,6 @@ def _render_crony_bundle() -> str:
             "uuid": _crony_job_uuid(name),
             "command": command,
             "interval": interval,
-            "priority": "high",
-            "keep_awake": True,
         }
         if name == "create":
             job["notify_channels"] = []
@@ -1334,6 +1335,8 @@ def _render_crony_bundle() -> str:
         "defaults": {
             "notify_channels": ["default", "dialog-popup"],
             "job_timeout_sec": 0,
+            "priority": "high",
+            "keep_awake": True,
         },
         "job": jobs,
         "target": {"darwin": {"jobs": [n for n, _, _ in _crony_jobs()]}},
