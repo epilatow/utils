@@ -500,6 +500,8 @@ class TestParseDefaults:
         assert cfg.defaults.job_timeout_sec == 1800
         assert cfg.defaults.notify_attach_log is True
         assert cfg.defaults.notify_channel_defs == {}
+        assert cfg.defaults.priority is None
+        assert cfg.defaults.keep_awake is False
 
     def test_override_defaults(self) -> None:
         cfg = _parse(
@@ -510,6 +512,8 @@ class TestParseDefaults:
                     "notify_attach_max_kb": 512,
                     "job_timeout_sec": 3600,
                     "log_keep_runs": 50,
+                    "priority": "high",
+                    "keep_awake": True,
                     "notify": {"ntfy": _ntfy_block()},
                 }
             }
@@ -519,6 +523,8 @@ class TestParseDefaults:
         assert cfg.defaults.notify_attach_max_kb == 512
         assert cfg.defaults.job_timeout_sec == 3600
         assert cfg.defaults.log_keep_runs == 50
+        assert cfg.defaults.priority == "high"
+        assert cfg.defaults.keep_awake is True
         assert "ntfy" in cfg.defaults.notify_channel_defs
 
     def test_listed_channel_must_be_defined(self) -> None:
@@ -5748,6 +5754,27 @@ class TestJobPriority:
         )
         assert snap.priority == "high"
 
+    def test_default_cascades_to_unset_job(self) -> None:
+        cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
+        target = crony.resolve_target(cfg, "h", "darwin")
+        snap = crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+        assert snap.priority == "high"
+
+    def test_job_overrides_default(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"priority": "high"},
+                "job": {"a": _job(priority="low")},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "darwin")
+        snap = crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+        assert snap.priority == "low"
+
     def test_plist_high(self) -> None:
         plist = crony._render_plist(
             "j", crony.EntityRef("default", "u-test"), "daily", None, "high"
@@ -5898,9 +5925,32 @@ class TestKeepAwake:
         cfg = _parse({"job": {"a": _job(keep_awake=True)}})
         assert cfg.jobs["a"].keep_awake is True
 
-    def test_parse_default_false(self) -> None:
+    def test_parse_default_none(self) -> None:
+        # Omitting keep_awake leaves it None (inherit [defaults]); it
+        # resolves to the default's False when no default is set.
         cfg = _parse({"job": {"a": _job()}})
-        assert cfg.jobs["a"].keep_awake is False
+        assert cfg.jobs["a"].keep_awake is None
+
+    def test_default_cascades_to_unset_job(self) -> None:
+        cfg = _parse({"defaults": {"keep_awake": True}, "job": {"a": _job()}})
+        target = crony.resolve_target(cfg, "h", "darwin")
+        snap = crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+        assert snap.keep_awake is True
+
+    def test_job_false_overrides_true_default(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"keep_awake": True},
+                "job": {"a": _job(keep_awake=False)},
+            }
+        )
+        target = crony.resolve_target(cfg, "h", "darwin")
+        snap = crony._resolve_job_snapshot(
+            cfg, target, cfg.jobs["a"], "default.a"
+        )
+        assert snap.keep_awake is False
 
     def test_parse_non_bool_rejected(self) -> None:
         _assert_errored_job(
@@ -6971,6 +7021,14 @@ class TestTypeStrictness:
     def test_negative_default_log_keep_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="positive"):
             _parse({"defaults": {"log_keep_runs": 0}})
+
+    def test_invalid_default_priority_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="priority must be one of"):
+            _parse({"defaults": {"priority": "turbo"}})
+
+    def test_non_bool_default_keep_awake_rejected(self) -> None:
+        with pytest.raises(crony.ConfigError, match="keep_awake' must be bool"):
+            _parse({"defaults": {"keep_awake": "yes"}})
 
 
 # =============================================================================

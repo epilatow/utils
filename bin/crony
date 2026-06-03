@@ -297,6 +297,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # job_timeout_sec      = 1800         # default per-job wallclock cap; 0 = no cap
 # trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
 # log_keep_runs        = 30
+# priority             = "high"       # default priority class; jobs may override
+# keep_awake           = true         # default; jobs may override with true/false
 
 # Notification inheritance. The reserved channel name `default` in a
 # NON-default bundle's `notify_channels` pulls in the default bundle's
@@ -683,6 +685,11 @@ class Defaults:
     # cases (broken plist, queue stalled, etc.).
     trigger_timeout_sec: int = 15
     log_keep_runs: int = 30
+    # Cascaded to jobs that don't set their own; see TomlJob.priority /
+    # TomlJob.keep_awake. None / False keep today's per-job behavior
+    # when a bundle sets no default.
+    priority: str | None = None
+    keep_awake: bool = False
     # Per-bundle channel definitions: { name -> NotifyChannel }.
     notify_channel_defs: dict[str, NotifyChannel] = field(default_factory=dict)
 
@@ -733,12 +740,14 @@ class TomlJob:
     interval: str | None = None
     # Process-priority class baked into the platform unit: "high"
     # (run un-throttled, app-like QoS), "low" (throttle CPU + IO), or
-    # None ("normal", emit nothing). See `_VALID_PRIORITIES`.
+    # None (inherit [defaults]; a None default means "normal", emit
+    # nothing). See `_VALID_PRIORITIES`.
     priority: str | None = None
     # Hold a power assertion for the command's duration so an idle /
     # on-AC machine doesn't sleep mid-run (caffeinate on macOS,
     # systemd-inhibit on linux). Lid-close on battery still sleeps.
-    keep_awake: bool = False
+    # None = inherit [defaults]; True / False explicitly override.
+    keep_awake: bool | None = None
     # `platforms`: empty list = applies to every platform. Non-empty
     # = applies only on listed platforms; otherwise the entry is
     # silently skipped at selection time. `hosts` works the same
@@ -1124,6 +1133,8 @@ _KNOWN_DEFAULTS: frozenset[str] = frozenset(
         "job_timeout_sec",
         "trigger_timeout_sec",
         "log_keep_runs",
+        "priority",
+        "keep_awake",
         "notify",
     }
 )
@@ -1785,6 +1796,8 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
             raw, "trigger_timeout_sec", where, default=15
         ),
         log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
+        priority=_parse_priority_field(raw, where),
+        keep_awake=_typed_field(raw, "keep_awake", bool, where, default=False),
         notify_channel_defs=notify_channel_defs,
     )
 
@@ -1808,6 +1821,16 @@ def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
                 f"valid 0-255 exit-code range"
             )
     return val
+
+
+def _parse_priority_field(raw: dict[str, Any], where: str) -> str | None:
+    """Parse + validate a `priority` field (None if absent)."""
+    priority: str | None = _typed_field(raw, "priority", str, where)
+    if priority is not None and priority not in _VALID_PRIORITIES:
+        raise ConfigError(
+            f"{where}: priority must be one of {sorted(_VALID_PRIORITIES)}"
+        )
+    return priority
 
 
 def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
@@ -1853,12 +1876,8 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         validate_schedule(schedule)
     if interval is not None:
         parse_interval_seconds(interval)
-    priority = _typed_field(raw, "priority", str, where)
-    if priority is not None and priority not in _VALID_PRIORITIES:
-        raise ConfigError(
-            f"{where}: priority must be one of {sorted(_VALID_PRIORITIES)}"
-        )
-    keep_awake = _typed_field(raw, "keep_awake", bool, where, default=False)
+    priority = _parse_priority_field(raw, where)
+    keep_awake = _typed_field(raw, "keep_awake", bool, where, default=None)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
@@ -2682,6 +2701,30 @@ def resolved_job_timeout_sec(
     return config.defaults.job_timeout_sec
 
 
+def resolved_priority(
+    config: TomlBundleConfig, target: Target | None, job: TomlJob
+) -> str | None:
+    """Cascade priority: job > defaults. `target` is ignored (kept for
+    call-site symmetry with the other resolvers); targets carry no
+    priority."""
+    del target
+    if job.priority is not None:
+        return job.priority
+    return config.defaults.priority
+
+
+def resolved_keep_awake(
+    config: TomlBundleConfig, target: Target | None, job: TomlJob
+) -> bool:
+    """Cascade keep_awake: job > defaults. `target` is ignored (kept
+    for call-site symmetry with the other resolvers); targets carry no
+    keep_awake."""
+    del target
+    if job.keep_awake is not None:
+        return job.keep_awake
+    return config.defaults.keep_awake
+
+
 # Padding factor applied to a group's effective timeout. The 5%
 # slack lets a leaf job hit its own timeout (and propagate the
 # error up through last-run.json) before the parent group's own
@@ -2951,8 +2994,8 @@ def _resolve_job_snapshot(
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
         schedule=job.schedule,
         interval=job.interval,
-        priority=job.priority,
-        keep_awake=job.keep_awake,
+        priority=resolved_priority(config, target, job),
+        keep_awake=resolved_keep_awake(config, target, job),
         success_exit_codes=list(job.success_exit_codes),
         interactive=job.interactive,
         interactive_active_sec=(
