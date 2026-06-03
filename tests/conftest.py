@@ -10,11 +10,12 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, ClassVar
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
-from pathlib import Path
-from typing import Any, ClassVar, Iterator
-from unittest.mock import MagicMock, create_autospec, patch
 
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
@@ -50,10 +51,7 @@ def _cleanup_all_caches() -> None:
 atexit.register(_cleanup_all_caches)
 
 
-def pytest_sessionfinish(
-    session: pytest.Session,
-    exitstatus: int,
-) -> None:
+def pytest_sessionfinish() -> None:
     """Clean up pycache directories after test session."""
     _cleanup_all_caches()
 
@@ -261,7 +259,7 @@ class CmdCallbacksBase:
         self,
     ) -> None:
         """Dispatch handlers don't define default values."""
-        for cmd, fn in self.CALLBACKS.items():
+        for _cmd, fn in self.CALLBACKS.items():
             sig = inspect.signature(fn)
             for name, param in sig.parameters.items():
                 assert param.default is inspect.Parameter.empty, (

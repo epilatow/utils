@@ -18,13 +18,11 @@ import shutil
 import sqlite3
 import struct
 import sys
-
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import lz4.block  # type: ignore[import-untyped]
-
 import pytest
 from conftest import (
     CmdCallbacksBase,
@@ -599,10 +597,10 @@ Path=Profiles/abc123.default
 class TestLoadContainers:
     """Test containers.json loading."""
 
+    @pytest.mark.usefixtures("containers_json")
     def test_load_containers(
         self,
         profile_dir: Path,
-        containers_json: Path,
     ) -> None:
         """Load containers from containers.json."""
         containers = fc.load_containers(profile_dir)
@@ -619,10 +617,10 @@ class TestLoadContainers:
         containers = fc.load_containers(profile_dir)
         assert containers == []
 
+    @pytest.mark.usefixtures("containers_json")
     def test_builtin_container_names(
         self,
         profile_dir: Path,
-        containers_json: Path,
     ) -> None:
         """Built-in containers derive name from l10nID."""
         containers = fc.load_containers(profile_dir)
@@ -630,10 +628,10 @@ class TestLoadContainers:
         assert "Personal" in names
         assert "Work" in names
 
+    @pytest.mark.usefixtures("containers_json")
     def test_custom_container_names(
         self,
         profile_dir: Path,
-        containers_json: Path,
     ) -> None:
         """Custom containers use name field directly."""
         containers = fc.load_containers(profile_dir)
@@ -641,10 +639,10 @@ class TestLoadContainers:
         assert len(custom) == 1
         assert custom[0].name == "My Custom"
 
+    @pytest.mark.usefixtures("containers_json")
     def test_hidden_containers_excluded(
         self,
         profile_dir: Path,
-        containers_json: Path,
     ) -> None:
         """Containers with public=false are excluded."""
         containers = fc.load_containers(profile_dir)
@@ -947,7 +945,8 @@ class TestFormatJson:
 class TestSafeCopyDb:
     """Test safe database copy."""
 
-    def test_copies_db(self, cookies_db: Path, profile_dir: Path) -> None:
+    @pytest.mark.usefixtures("cookies_db")
+    def test_copies_db(self, profile_dir: Path) -> None:
         """Database file is copied to temp location."""
         tmp_db = fc.safe_copy_db(profile_dir)
         try:
@@ -957,9 +956,8 @@ class TestSafeCopyDb:
         finally:
             shutil.rmtree(tmp_db.parent, ignore_errors=True)
 
-    def test_copies_wal_files(
-        self, cookies_db: Path, profile_dir: Path
-    ) -> None:
+    @pytest.mark.usefixtures("cookies_db")
+    def test_copies_wal_files(self, profile_dir: Path) -> None:
         """WAL and SHM files are copied if present."""
         # Create mock WAL/SHM files
         (profile_dir / "cookies.sqlite-wal").write_text("wal")
@@ -1089,12 +1087,10 @@ class TestDoListProfiles:
 class TestDoListContainers:
     """Test list-containers subcommand."""
 
+    @pytest.mark.usefixtures("profile_dir", "containers_json", "cookies_db")
     def test_lists_containers(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        containers_json: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List containers with cookie counts."""
@@ -1110,11 +1106,10 @@ class TestDoListContainers:
         assert "Work" in captured.out
         assert "My Custom" in captured.out
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_no_containers(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
     ) -> None:
         """Handle no containers gracefully."""
         with patch.object(
@@ -1129,11 +1124,10 @@ class TestDoListContainers:
 class TestDoListDomains:
     """Test list-domains subcommand."""
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_lists_domains(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List domains with counts."""
@@ -1148,11 +1142,10 @@ class TestDoListDomains:
         assert "example.com" in captured.out
         assert "other.org" in captured.out
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_includes_container_id_column(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """Output includes container ID column."""
@@ -1173,11 +1166,10 @@ class TestDoListDomains:
             assert parts[0].isdigit()
             assert parts[1].isdigit()
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_different_containers_separate_rows(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """Same domain in different containers = separate rows."""
@@ -1198,12 +1190,10 @@ class TestDoListDomains:
         ]
         assert len(example_lines) == 3
 
+    @pytest.mark.usefixtures("profile_dir", "containers_json", "cookies_db")
     def test_filter_by_container(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        containers_json: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List domains filtered by container."""
@@ -1222,11 +1212,10 @@ class TestDoListDomains:
 class TestDoList:
     """Test list subcommand."""
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_list_netscape(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List cookies in Netscape format."""
@@ -1247,11 +1236,10 @@ class TestDoList:
         assert "# Netscape HTTP Cookie File" in captured.out
         assert ".example.com" in captured.out
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_list_json(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List cookies in JSON format."""
@@ -1272,11 +1260,10 @@ class TestDoList:
         data = json.loads(captured.out)
         assert len(data) == 6
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_list_filter_domain(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List cookies filtered by domain."""
@@ -1298,12 +1285,10 @@ class TestDoList:
         assert len(data) == 1
         assert data[0]["host"] == ".other.org"
 
+    @pytest.mark.usefixtures("profile_dir", "containers_json", "cookies_db")
     def test_list_filter_container(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        containers_json: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """List cookies filtered by container."""
@@ -1416,7 +1401,7 @@ class TestDecompressMozlz4:
 
     def test_empty_after_magic(self) -> None:
         """Handle truncated data after magic."""
-        with pytest.raises(Exception):
+        with pytest.raises(struct.error):
             fc.decompress_mozlz4(b"mozLz40\0")
 
 
@@ -1428,10 +1413,10 @@ class TestDecompressMozlz4:
 class TestLoadSessionCookies:
     """Test session cookie loading from recovery.jsonlz4."""
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_load_all(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Load all session cookies."""
         cookies = fc.load_session_cookies(profile_dir)
@@ -1441,10 +1426,10 @@ class TestLoadSessionCookies:
         assert "session_only" in names
         assert "container_sess" in names
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_filter_by_domain(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Filter session cookies by domain."""
         cookies = fc.load_session_cookies(
@@ -1453,10 +1438,10 @@ class TestLoadSessionCookies:
         assert len(cookies) == 1
         assert cookies[0].name == "wp_session"
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_filter_by_container(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Filter session cookies by container ID."""
         cookies = fc.load_session_cookies(profile_dir, container_id=5)
@@ -1464,10 +1449,10 @@ class TestLoadSessionCookies:
         assert cookies[0].name == "container_sess"
         assert cookies[0].origin_attributes == "^userContextId=5"
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_filter_default_container(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Filter to default container (id=0)."""
         cookies = fc.load_session_cookies(profile_dir, container_id=0)
@@ -1480,20 +1465,20 @@ class TestLoadSessionCookies:
         cookies = fc.load_session_cookies(profile_dir)
         assert cookies == []
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_sorted_output(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Session cookies are sorted by host, name."""
         cookies = fc.load_session_cookies(profile_dir)
         pairs = [(c.host, c.name) for c in cookies]
         assert pairs == sorted(pairs)
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_cookie_fields(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Verify cookie field mapping from JSON."""
         cookies = fc.load_session_cookies(
@@ -1510,10 +1495,10 @@ class TestLoadSessionCookies:
         assert c.same_site == 0
         assert c.origin_attributes == ""
 
+    @pytest.mark.usefixtures("recovery_jsonlz4")
     def test_origin_attributes_dict_converted(
         self,
         profile_dir: Path,
-        recovery_jsonlz4: Path,
     ) -> None:
         """Dict originAttributes converted to string."""
         cookies = fc.load_session_cookies(profile_dir, container_id=5)
@@ -1869,12 +1854,10 @@ class TestConflictOutput:
 class TestDoListWithSessionCookies:
     """Test list subcommand with session cookies."""
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db", "recovery_jsonlz4")
     def test_includes_session_cookies(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """Session cookies are included in output."""
@@ -1897,12 +1880,10 @@ class TestDoListWithSessionCookies:
         assert "wp_session" in names
         assert "session_only" in names
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db", "recovery_jsonlz4")
     def test_dedup_prefers_sqlite(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """Duplicate cookies use sqlite value."""
@@ -1925,12 +1906,10 @@ class TestDoListWithSessionCookies:
         assert len(session_cookies) == 1
         assert session_cookies[0]["value"] == "abc123"
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db", "recovery_jsonlz4")
     def test_src_db_only(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """--src db excludes session cookies."""
@@ -1952,12 +1931,10 @@ class TestDoListWithSessionCookies:
         names = {c["name"] for c in data}
         assert "wp_session" not in names
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db", "recovery_jsonlz4")
     def test_src_recovery_only(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """--src recovery excludes sqlite cookies."""
@@ -1981,11 +1958,10 @@ class TestDoListWithSessionCookies:
         # sqlite-only cookies should be absent
         assert "pref" not in names
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
     def test_without_recovery_file(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
         capsys: Any,
     ) -> None:
         """Works fine without recovery.jsonlz4."""
@@ -2006,13 +1982,12 @@ class TestDoListWithSessionCookies:
         data = json.loads(captured.out)
         assert len(data) == 6
 
+    @pytest.mark.usefixtures(
+        "profile_dir", "cookies_db", "containers_json", "recovery_jsonlz4"
+    )
     def test_container_filter_with_session(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        containers_json: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """Container filter works with session cookies."""
@@ -2101,12 +2076,10 @@ class TestDoSelfTest:
 class TestDoListDomainsWithSession:
     """Test list-domains with session cookies."""
 
+    @pytest.mark.usefixtures("profile_dir", "cookies_db", "recovery_jsonlz4")
     def test_includes_session_cookie_domains(
         self,
         firefox_dir: Path,
-        profile_dir: Path,
-        cookies_db: Path,
-        recovery_jsonlz4: Path,
         capsys: Any,
     ) -> None:
         """Session cookie domains appear in domain list."""

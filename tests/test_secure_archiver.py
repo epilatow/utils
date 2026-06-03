@@ -16,7 +16,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -138,7 +138,7 @@ class TestFilePatternExpansion:
         result = sa.expand_pattern(str(tmp_path / "**/*.txt"))
         assert len(result) == 2
 
-    def test_expand_with_tilde(self, monkeypatch: Any) -> None:
+    def test_expand_with_tilde(self) -> None:
         """Test expansion of ~ in path."""
         result = sa.expand_pattern("~/test*.txt")
         # Result should be absolute paths starting from home
@@ -510,7 +510,7 @@ class TestManifestGeneration:
 
     def test_write_manifest(self, tmp_path: Path) -> None:
         """Test writing manifest to file."""
-        manifest: Dict[str, Any] = {
+        manifest: dict[str, Any] = {
             "version": 1,
             "entries": [{"name": "test.txt", "size": 10, "sha256": "abc123"}],
         }
@@ -938,10 +938,7 @@ class TestPublish:
 
         # Mock make_archive_with_7zz to actually create the archive file
         def mock_make_archive(
-            staging_dir: Path,
-            out_archive: Path,
-            password: str,
-            filenames: list[str],
+            _staging_dir: Path, out_archive: Path, **_kwargs: object
         ) -> None:
             out_archive.write_text("archive content")
 
@@ -1005,10 +1002,7 @@ class TestPublish:
 
         # Mock make_archive_with_7zz to actually create the archive file
         def mock_make_archive(
-            staging_dir: Path,
-            out_archive: Path,
-            password: str,
-            filenames: list[str],
+            _staging_dir: Path, out_archive: Path, **_kwargs: object
         ) -> None:
             out_archive.write_text("dummy archive")
 
@@ -1036,7 +1030,7 @@ class TestPublish:
     def test_publish_dry_run(
         self,
         mock_extract: MagicMock,
-        mock_make: MagicMock,
+        _mock_make: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Test dry run mode."""
@@ -1094,10 +1088,7 @@ class TestPublish:
 
         # Mock make_archive_with_7zz to actually create the archive file
         def mock_make_archive(
-            staging_dir: Path,
-            out_archive: Path,
-            password: str,
-            filenames: list[str],
+            _staging_dir: Path, out_archive: Path, **_kwargs: object
         ) -> None:
             out_archive.write_text("dummy archive")
 
@@ -2039,7 +2030,7 @@ class TestConfigFromDict:
 
     def test_negative_keep_revisions(self, tmp_path: Path) -> None:
         """Test that negative keep_revisions is caught."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {"output_dir": "~/archives", "keep_revisions": -1},
             "archive": {
                 "Test": {
@@ -2054,7 +2045,7 @@ class TestConfigFromDict:
 
     def test_multiple_errors_reported(self, tmp_path: Path) -> None:
         """Test that multiple validation errors are all reported."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {},  # missing output_dir
             "archive": {
                 "Test": {
@@ -2127,7 +2118,7 @@ class TestGeneralConfigReadme:
 
     def test_readme_field_parsed(self, tmp_path: Path) -> None:
         """Test that readme field is correctly parsed."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {
                 "output_dir": "~/archives",
                 "readme": "Test readme content",
@@ -2145,7 +2136,7 @@ class TestGeneralConfigReadme:
 
     def test_readme_field_optional(self, tmp_path: Path) -> None:
         """Test that readme field is optional."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {
                 "output_dir": "~/archives",
             },
@@ -2162,7 +2153,7 @@ class TestGeneralConfigReadme:
 
     def test_readme_multiline(self, tmp_path: Path) -> None:
         """Test that multi-line readme is parsed correctly."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {
                 "output_dir": "~/archives",
                 "readme": "Line 1\nLine 2\nLine 3",
@@ -2180,7 +2171,7 @@ class TestGeneralConfigReadme:
 
     def test_readme_must_be_string(self, tmp_path: Path) -> None:
         """Test that non-string readme raises error."""
-        cfg_dict: Dict[str, Any] = {
+        cfg_dict: dict[str, Any] = {
             "general": {
                 "output_dir": "~/archives",
                 "readme": 123,  # Invalid: not a string

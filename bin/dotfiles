@@ -17,19 +17,10 @@ import os
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import (
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -319,12 +310,12 @@ class OperationResult:
 # =============================================================================
 
 
-def load_installed_directories() -> List[Path]:
+def load_installed_directories() -> list[Path]:
     """Load list of installed dotfile directories."""
     if not INSTALLED_FILE.exists():
         return []
 
-    directories: List[Path] = []
+    directories: list[Path] = []
     content = INSTALLED_FILE.read_text(encoding="utf-8")
     for line in content.strip().split("\n"):
         line = line.strip()
@@ -333,7 +324,7 @@ def load_installed_directories() -> List[Path]:
     return directories
 
 
-def save_installed_directories(directories: List[Path]) -> None:
+def save_installed_directories(directories: list[Path]) -> None:
     """Save list of installed dotfile directories."""
     content = "\n".join(str(d) for d in directories)
     if content:
@@ -399,7 +390,7 @@ def _is_repo_root(path: Path) -> bool:
     return (path / ".git").exists() or (path / ".hg").exists()
 
 
-def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
+def _ignore_search_dirs(dotfile_dir: Path) -> list[Path]:
     """Return dotfile_dir plus ancestors up to the enclosing repo root.
 
     The walk consumes dotfile_dir and continues upward until it hits
@@ -436,7 +427,7 @@ def _ignore_search_dirs(dotfile_dir: Path) -> List[Path]:
     return dirs
 
 
-def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
+def load_ignore_patterns(dotfile_dir: Path) -> set[str]:
     """
     Load ignore patterns from .gitignore, .hgignore, and
     .dotfilesignore files.
@@ -475,7 +466,7 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     Returns:
         Set of glob patterns to ignore.
     """
-    patterns: Set[str] = set(HARDCODED_IGNORE_PATTERNS)
+    patterns: set[str] = set(HARDCODED_IGNORE_PATTERNS)
 
     for directory in _ignore_search_dirs(dotfile_dir):
         for ignore_file in IGNORE_FILES:
@@ -512,7 +503,7 @@ def load_ignore_patterns(dotfile_dir: Path) -> Set[str]:
     return patterns
 
 
-def matches_ignore_pattern(path: Path, patterns: Set[str]) -> bool:
+def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
     """
     Check if a path matches any of the ignore patterns.
 
@@ -580,8 +571,8 @@ def _is_executable(path: Path) -> bool:
 
 
 def discover_dotfiles(
-    dotfile_dir: Path, *, profile: Optional[Profile] = None
-) -> List[DotfileEntry]:
+    dotfile_dir: Path, *, profile: Profile | None = None
+) -> list[DotfileEntry]:
     """
     Discover entries in a source directory.
 
@@ -613,7 +604,7 @@ def discover_dotfiles(
         raise MissingDotfilesDirectory(f"Not a directory: {dotfile_dir}")
 
     abs_dotfile_dir = dotfile_dir.resolve()
-    entries: List[DotfileEntry] = []
+    entries: list[DotfileEntry] = []
 
     ignore_patterns = load_ignore_patterns(abs_dotfile_dir)
 
@@ -691,7 +682,7 @@ def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
     return DotfileStatus.FILE_CONFLICT
 
 
-def _resolve_link_target(symlink: Path) -> Optional[Path]:
+def _resolve_link_target(symlink: Path) -> Path | None:
     """Compute the symlink's immediate target as an absolute path.
 
     The symlink's parent directory is resolved (so paths like
@@ -725,8 +716,8 @@ def _resolve_link_target(symlink: Path) -> Optional[Path]:
 
 
 def _link_source_dir(
-    symlink: Path, source_dirs: List[Path]
-) -> Optional[Tuple[Path, Path]]:
+    symlink: Path, source_dirs: list[Path]
+) -> tuple[Path, Path] | None:
     """If symlink resolves into one of source_dirs, return
     (matching_source_dir, relative_path_within_it).
 
@@ -747,9 +738,9 @@ def _link_source_dir(
 
 
 def _stale_managed_links(
-    sources: Dict[Path, Set[Path]],
+    sources: dict[Path, set[Path]],
     scan_dirs: Iterable[Path],
-) -> List[Tuple[Path, Path, Path]]:
+) -> list[tuple[Path, Path, Path]]:
     """Find managed-but-stale symlinks under scan_dirs.
 
     A managed link is one whose resolved target lies inside a key of
@@ -762,7 +753,7 @@ def _stale_managed_links(
     Returns a list of (symlink, source_dir, relative_path) tuples.
     """
     src_list = list(sources.keys())
-    found: List[Tuple[Path, Path, Path]] = []
+    found: list[tuple[Path, Path, Path]] = []
     for scan_dir in sorted(set(scan_dirs)):
         if not scan_dir.is_dir():
             continue
@@ -779,12 +770,12 @@ def _stale_managed_links(
 
 
 def _scan_dirs_for_entries(
-    entries: List[DotfileEntry], profile: Profile
-) -> Set[Path]:
+    entries: list[DotfileEntry], profile: Profile
+) -> set[Path]:
     """Return the directory set to scan for symlinks managed by the
     given entries: target_root plus the parent directory of each
     entry's target_path."""
-    scan_dirs: Set[Path] = {profile.target_root()}
+    scan_dirs: set[Path] = {profile.target_root()}
     for entry in entries:
         scan_dirs.add(entry.target_path.parent)
     return scan_dirs
@@ -899,14 +890,14 @@ def audit_dotfile(entry: DotfileEntry) -> OperationResult:
 
 
 def _process_entries(
-    entries: List[DotfileEntry],
+    entries: list[DotfileEntry],
     operation: str,
     *,
     dry_run: bool = False,
     force: bool = False,
-) -> List[OperationResult]:
+) -> list[OperationResult]:
     """Apply operation to each entry and return the results."""
-    results: List[OperationResult] = []
+    results: list[OperationResult] = []
     for entry in entries:
         if operation == "install":
             result = install_dotfile(entry, dry_run=dry_run, force=force)
@@ -926,8 +917,8 @@ def process_directory(
     *,
     dry_run: bool = False,
     force: bool = False,
-    profile: Optional[Profile] = None,
-) -> List[OperationResult]:
+    profile: Profile | None = None,
+) -> list[OperationResult]:
     """
     Process all entries in a source directory.
 
@@ -977,7 +968,7 @@ def _format_status(
 
 def log_results(
     dotfile_dir: Path,
-    results: List[OperationResult],
+    results: list[OperationResult],
     *,
     verbose: bool = False,
     problem_statuses: frozenset[DotfileStatus] = frozenset(),
@@ -1030,7 +1021,7 @@ def log_results(
         )
 
 
-def has_conflicts(results: List[OperationResult]) -> bool:
+def has_conflicts(results: list[OperationResult]) -> bool:
     """Check if any results indicate a conflict."""
     conflict_statuses = {
         DotfileStatus.FILE_CONFLICT,
@@ -1039,21 +1030,21 @@ def has_conflicts(results: List[OperationResult]) -> bool:
     return any(r.status in conflict_statuses for r in results)
 
 
-def has_missing(results: List[OperationResult]) -> bool:
+def has_missing(results: list[OperationResult]) -> bool:
     """Check if any results indicate missing entries."""
     return any(r.status == DotfileStatus.MISSING for r in results)
 
 
-def has_stale(results: List[OperationResult]) -> bool:
+def has_stale(results: list[OperationResult]) -> bool:
     """Check if any results indicate a stale managed symlink."""
     return any(r.status == DotfileStatus.STALE for r in results)
 
 
 def _find_stale_for_dir(
     dotfile_dir: Path,
-    entries: List[DotfileEntry],
+    entries: list[DotfileEntry],
     profile: Profile,
-) -> List[Tuple[Path, DotfileEntry]]:
+) -> list[tuple[Path, DotfileEntry]]:
     """Find managed-but-stale symlinks for one source dir.
 
     Returns (symlink, synthesized DotfileEntry) tuples. The
@@ -1066,7 +1057,7 @@ def _find_stale_for_dir(
     sources = {src_resolved: discovered_rels}
     scan_dirs = _scan_dirs_for_entries(entries, profile)
 
-    stale: List[Tuple[Path, DotfileEntry]] = []
+    stale: list[tuple[Path, DotfileEntry]] = []
     for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
         synth_entry = DotfileEntry(
             relative_path=rel,
@@ -1083,7 +1074,7 @@ def _find_stale_for_dir(
 
 
 def do_install(
-    directory: Optional[Path],
+    directory: Path | None,
     *,
     dry_run: bool,
     force: bool,
@@ -1156,7 +1147,7 @@ def do_install(
 
 
 def do_remove(
-    directory: Optional[Path],
+    directory: Path | None,
     *,
     dry_run: bool,
     verbose: bool,
@@ -1196,7 +1187,7 @@ def do_remove(
             remove_installed_directory(dotfile_dir)
 
 
-def do_audit(directory: Optional[Path], *, verbose: bool) -> None:
+def do_audit(directory: Path | None, *, verbose: bool) -> None:
     """Audit entries for one or all source directories.
 
     Reports the status of each discovered entry plus any STALE
@@ -1269,13 +1260,13 @@ def do_cleanup(*, dry_run: bool) -> None:
         dry_run: If True, log what would be removed without removing it.
     """
     profile = ACTIVE_PROFILE
-    scan_dirs: Set[Path] = {profile.target_root()}
-    sources: Dict[Path, Set[Path]] = {}
+    scan_dirs: set[Path] = {profile.target_root()}
+    sources: dict[Path, set[Path]] = {}
 
     for src_dir in load_installed_directories():
         if not src_dir.exists():
             continue
-        rels: Set[Path] = set()
+        rels: set[Path] = set()
         for entry in discover_dotfiles(src_dir, profile=profile):
             rels.add(entry.relative_path)
             scan_dirs.add(entry.target_path.parent)
@@ -1483,7 +1474,7 @@ def cli() -> int:
     try:
         COMMAND_CALLBACKS[command](**args_dict)
     except KeyError:
-        raise UsageError(f"Unknown command '{command}'")
+        raise UsageError(f"Unknown command '{command}'") from None
     except DotfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code

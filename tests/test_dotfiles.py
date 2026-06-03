@@ -2309,7 +2309,7 @@ class TestStaleLinkDetection:
         assert (home / ".vimrc").is_symlink()
         assert (home / ".bashrc").is_symlink()
 
-    def test_install_keeps_link_when_source_is_internal_symlink_to_excluded_path(
+    def test_install_keeps_link_when_source_is_symlink_to_excluded(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         """A discovered entry that is itself a symlink within the

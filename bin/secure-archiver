@@ -22,18 +22,10 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Union,
-)
+from typing import Any
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -47,8 +39,10 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 try:
     import tomllib
-except Exception:
-    raise RuntimeError("Python 3.11+ required (tomllib not available).")
+except ImportError:
+    raise RuntimeError(
+        "Python 3.11+ required (tomllib not available)."
+    ) from None
 
 
 # =============================================================================
@@ -213,10 +207,10 @@ class GeneralConfig:
 
     output_dir: str
     keep_revisions: int = 3
-    readme: Optional[str] = None
+    readme: str | None = None
 
     @classmethod
-    def from_dict(cls, d: Any, errors: List[str]) -> Optional["GeneralConfig"]:
+    def from_dict(cls, d: Any, errors: list[str]) -> GeneralConfig | None:
         """Parse and validate [general] section from dict."""
         if d is None:
             errors.append("[general] section is required")
@@ -255,12 +249,12 @@ class PathIncludeEntry:
     path: str
     recurse: bool = False
     latest: bool = False
-    dir: Optional[str] = None
+    dir: str | None = None
 
     @classmethod
     def from_dict(
-        cls, d: Dict[str, Any], prefix: str, errors: List[str]
-    ) -> Optional["PathIncludeEntry"]:
+        cls, d: dict[str, Any], prefix: str, errors: list[str]
+    ) -> PathIncludeEntry | None:
         """Parse and validate a path include entry."""
         valid_keys = {"path", "recurse", "latest", "dir"}
         invalid_keys = set(d.keys()) - valid_keys
@@ -297,12 +291,12 @@ class OpRefIncludeEntry:
 
     op_ref: str
     filename: str
-    dir: Optional[str] = None
+    dir: str | None = None
 
     @classmethod
     def from_dict(
-        cls, d: Dict[str, Any], prefix: str, errors: List[str]
-    ) -> Optional["OpRefIncludeEntry"]:
+        cls, d: dict[str, Any], prefix: str, errors: list[str]
+    ) -> OpRefIncludeEntry | None:
         """Parse and validate an op_ref include entry."""
         valid_keys = {"op_ref", "filename", "dir"}
         invalid_keys = set(d.keys()) - valid_keys
@@ -333,7 +327,7 @@ class OpRefIncludeEntry:
         return cls(op_ref=op_ref_val, filename=filename_val, dir=dir_val)
 
 
-IncludeEntry = Union[PathIncludeEntry, OpRefIncludeEntry]
+IncludeEntry = PathIncludeEntry | OpRefIncludeEntry
 
 
 @dataclass
@@ -342,12 +336,12 @@ class ArchiveConfig:
 
     op_password: str
     description: str
-    include: List[IncludeEntry]
+    include: list[IncludeEntry]
 
     @classmethod
     def from_dict(
-        cls, d: Dict[str, Any], name: str, errors: List[str]
-    ) -> Optional["ArchiveConfig"]:
+        cls, d: dict[str, Any], name: str, errors: list[str]
+    ) -> ArchiveConfig | None:
         """Parse and validate an archive section."""
         prefix = f"[archive.{name}]"
 
@@ -370,7 +364,7 @@ class ArchiveConfig:
             errors.append(f"{prefix} include must not be empty")
             return None
 
-        include: List[IncludeEntry] = []
+        include: list[IncludeEntry] = []
         for i, entry in enumerate(include_list):
             entry_prefix = f"{prefix} include[{i}]"
             if not isinstance(entry, dict):
@@ -413,23 +407,23 @@ class Config:
     """Top-level configuration."""
 
     general: GeneralConfig
-    archives: Dict[str, ArchiveConfig]
+    archives: dict[str, ArchiveConfig]
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any], config_path: Path) -> "Config":
+    def from_dict(cls, d: dict[str, Any], config_path: Path) -> Config:
         """
         Parse and validate config from dict.
 
         Raises ConfigError if validation fails.
         """
-        errors: List[str] = []
+        errors: list[str] = []
 
         general = GeneralConfig.from_dict(d.get("general"), errors)
 
         archives_dict = d.get("archive")
         if archives_dict is None or len(archives_dict) == 0:
             errors.append("At least one [archive.<NAME>] section is required")
-            archives: Dict[str, ArchiveConfig] = {}
+            archives: dict[str, ArchiveConfig] = {}
         elif not isinstance(archives_dict, dict):
             errors.append("[archive] must contain sub-tables")
             archives = {}
@@ -468,16 +462,15 @@ def require(cond: bool, msg: str) -> None:
 def run_cmd(
     cmd: Sequence[str],
     *,
-    cwd: Optional[Path] = None,
+    cwd: Path | None = None,
     check: bool = True,
-    env: Optional[Dict[str, str]] = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             list(cmd),
             cwd=str(cwd) if cwd else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=check,
             env=env,
@@ -505,7 +498,7 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def find_config(explicit_path: Optional[Path] = None) -> Path:
+def find_config(explicit_path: Path | None = None) -> Path:
     """
     Find config file with priority: explicit > CWD > home dotfile.
 
@@ -541,7 +534,7 @@ def find_config(explicit_path: Optional[Path] = None) -> Path:
     )
 
 
-def load_config(path: Optional[Path]) -> Config:
+def load_config(path: Path | None) -> Config:
     """
     Load and validate a config file.
 
@@ -560,7 +553,7 @@ def load_config(path: Optional[Path]) -> Config:
     try:
         cfg_dict = tomllib.loads(config_path.read_text("utf-8"))
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"Invalid TOML in {config_path}: {e}")
+        raise ConfigError(f"Invalid TOML in {config_path}: {e}") from e
     return Config.from_dict(cfg_dict, config_path)
 
 
@@ -572,7 +565,7 @@ def ensure_out_dir_exists_writable(out_dir: Path) -> None:
     )
 
 
-def expand_pattern(pattern: str) -> List[Path]:
+def expand_pattern(pattern: str) -> list[Path]:
     """
     Expand env vars + ~ and then glob. Returns Paths.
     We pass recursive=True to support ** patterns.
@@ -599,9 +592,9 @@ def stage_flat_copy(
     sources: Iterable[Path],
     *,
     seen_names: set[str],
-    target_dir: Optional[str] = None,
-) -> List[str]:
-    staged: List[str] = []
+    target_dir: str | None = None,
+) -> list[str]:
+    staged: list[str] = []
 
     # Create subdirectory if specified
     if target_dir:
@@ -636,7 +629,7 @@ def stage_op_ref(
     op_ref: str,
     *,
     seen_names: set[str],
-    target_dir: Optional[str] = None,
+    target_dir: str | None = None,
 ) -> str:
     """Stage a file by fetching its content from 1Password."""
     # Use full relative path for collision detection
@@ -665,7 +658,7 @@ def stage_op_ref(
     return rel_path
 
 
-def build_manifest(staging_dir: Path, names: Iterable[str]) -> Dict[str, Any]:
+def build_manifest(staging_dir: Path, names: Iterable[str]) -> dict[str, Any]:
     entries = []
     for name in sorted(names):
         p = staging_dir / name
@@ -679,7 +672,7 @@ def build_manifest(staging_dir: Path, names: Iterable[str]) -> Dict[str, Any]:
     return {"version": 1, "entries": entries}
 
 
-def write_manifest(staging_dir: Path, manifest: Dict[str, Any]) -> None:
+def write_manifest(staging_dir: Path, manifest: dict[str, Any]) -> None:
     out = staging_dir / "manifest.json"
     out.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -689,7 +682,7 @@ def write_manifest(staging_dir: Path, manifest: Dict[str, Any]) -> None:
 
 def extract_manifest_from_archive(
     archive_path: Path, password: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     if not archive_path.exists():
         return None
 
@@ -726,7 +719,7 @@ def make_archive_with_7zz(
     staging_dir: Path,
     out_archive: Path,
     password: str,
-    filenames: List[str],
+    filenames: list[str],
 ) -> None:
     listfile = staging_dir / ".filelist.txt"
     listfile.write_text("\n".join(filenames) + "\n", encoding="utf-8")
@@ -758,7 +751,7 @@ def timestamp_now() -> str:
     return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def list_archives(out_dir: Path, archive_name: str) -> List[Path]:
+def list_archives(out_dir: Path, archive_name: str) -> list[Path]:
     """List all timestamped archives for a given name, sorted by time."""
     archives = []
     for p in out_dir.glob(f"{archive_name}.*.7z"):
@@ -775,7 +768,7 @@ def list_archives(out_dir: Path, archive_name: str) -> List[Path]:
     return archives
 
 
-def find_latest_archive(out_dir: Path, archive_name: str) -> Optional[Path]:
+def find_latest_archive(out_dir: Path, archive_name: str) -> Path | None:
     """Find the most recent timestamped archive, or None if none exist."""
     archives = list_archives(out_dir, archive_name)
     return archives[-1] if archives else None
@@ -843,7 +836,7 @@ ARCHIVE_README_TEMPLATE = """\
 ---
 ## Windows
 * Download [official 7-Zip installer](https://www.7-zip.org/download.html).
-* Right-click the `.7z` file -> **7-Zip** -> **Extract Here** or **Extract to...**
+* Right-click the `.7z` file -> **7-Zip** -> **Extract Here**/**Extract to**
 * Enter the password when prompted.
 """
 
@@ -938,13 +931,13 @@ def write_output_readme(
     return True
 
 
-def locale_sorted_paths(paths: List[Path]) -> List[Path]:
+def locale_sorted_paths(paths: list[Path]) -> list[Path]:
     # Use current locale collation rules
     key = locale.strxfrm
     return sorted(paths, key=lambda p: key(str(p)))
 
 
-def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
+def include_entry_to_sources(entry: PathIncludeEntry) -> list[Path]:
     """
     Convert a path include entry into a list of source FILE paths to include.
 
@@ -966,7 +959,7 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
         matches = locale_sorted_paths(matches)
         matches = [matches[-1]]
 
-    sources: List[Path] = []
+    sources: list[Path] = []
     for m in matches:
         if m.is_file():
             sources.append(m)
@@ -989,7 +982,7 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> List[Path]:
 def build_staging_for_archive(
     archive_cfg: ArchiveConfig,
     staging_dir: Path,
-) -> List[str]:
+) -> list[str]:
     """
     Stage files for an archive based on the include config.
 
@@ -1002,7 +995,7 @@ def build_staging_for_archive(
     Returns staged filenames (excluding manifest.json).
     """
     seen: set[str] = set()
-    staged_names: List[str] = []
+    staged_names: list[str] = []
 
     for entry in archive_cfg.include:
         if isinstance(entry, OpRefIncludeEntry):
@@ -1029,7 +1022,7 @@ def publish(
     out_dir: Path,
     password: str,
     staging_dir: Path,
-    staged_names: List[str],
+    staged_names: list[str],
     *,
     timestamp: str,
     op_password_uri: str,
@@ -1229,7 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def do_update(
-    config: Optional[Path],
+    config: Path | None,
     *,
     dry_run: bool,
     force_update: bool,
@@ -1314,7 +1307,7 @@ def do_write_example_config(output_file: Path) -> None:
     eprint(f"Wrote example config to: {output_file}")
 
 
-def do_check_config(config: Optional[Path]) -> None:
+def do_check_config(config: Path | None) -> None:
     """
     Check if a config file is valid.
 
@@ -1357,7 +1350,7 @@ def cli() -> int:
     try:
         COMMAND_CALLBACKS[command](**args_dict)
     except KeyError:
-        raise UsageError(f"Unknown command '{command}'")
+        raise UsageError(f"Unknown command '{command}'") from None
     except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
         return e.exit_code

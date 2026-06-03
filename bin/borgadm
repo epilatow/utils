@@ -53,14 +53,12 @@ import tomlkit
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
     Any,
-    Callable,
-    Optional,
-    OrderedDict,
-    Tuple,
     TextIO,
     cast,
 )
@@ -77,7 +75,6 @@ from common.argparse_ext import (  # noqa: E402
     action_subparsers,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
-
 
 # -----------------------------------------------------------------------------
 # Constants and Globals
@@ -152,10 +149,10 @@ class CheckPruneError(BorgadmError):
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _warning_occurred: bool = False
 _hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
-_ssh_agent_pid: Optional[str] = None
+_ssh_agent_pid: str | None = None
 _start_time: float = time.perf_counter()
 
-CFG: Optional[Config] = None
+CFG: Config | None = None
 
 logger = logging.getLogger()
 
@@ -588,7 +585,7 @@ def check_permissions(path: Path, name: str) -> None:
         if (st.st_mode & (stat.S_IRWXG | stat.S_IRWXO)) != 0:
             raise ConfigError(f"Permissions on {name} ({path}) are too open.")
     except FileNotFoundError:
-        raise ConfigError(f"{name} not found at: {path}")
+        raise ConfigError(f"{name} not found at: {path}") from None
 
 
 def pump_stream(
@@ -740,7 +737,7 @@ def load_passphrase() -> str:
     cfg = get_cfg()
 
     check_permissions(cfg.BORG_PASSPHRASE_FILE, "BORG_PASSPHRASE file")
-    with open(cfg.BORG_PASSPHRASE_FILE, "r") as f:
+    with open(cfg.BORG_PASSPHRASE_FILE) as f:
         return f.read().strip()
 
 
@@ -794,7 +791,7 @@ class _ArchiveName:
             return NotImplemented
         return self._order_key() < other._order_key()
 
-    def _order_key(self) -> Tuple[str, str, int, str, int]:
+    def _order_key(self) -> tuple[str, str, int, str, int]:
         return (
             self.backup_name,
             self.timestamp,
@@ -804,7 +801,7 @@ class _ArchiveName:
         )
 
     @classmethod
-    def from_str(cls, backup_name: str, name: str) -> Optional[_ArchiveName]:
+    def from_str(cls, backup_name: str, name: str) -> _ArchiveName | None:
         """Parse a borg archive name into an _ArchiveName.
 
         Returns None when `name` does not match the expected
@@ -956,8 +953,8 @@ def check_sudo() -> bool:
 
 
 def backup_set_paths(
-    set_name: Optional[str] = None,
-) -> Tuple[set[Path], set[Path]]:
+    set_name: str | None = None,
+) -> tuple[set[Path], set[Path]]:
     """
     Return sets of directories and files from BACKUP_SETS paths.
     Directories end in a "/", all other entries are considered files.
@@ -1010,8 +1007,8 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
     ts_keep: OrderedDict[str, str] = collections.OrderedDict()
 
     def keep_by_interval(interval: Interval) -> None:
-        last: Optional[datetime] = None
-        ts: Optional[str] = None
+        last: datetime | None = None
+        ts: str | None = None
         ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
         for ts in sorted(timestamps - set(ts_keep.keys())):
             assert ts not in ts_keep
@@ -1552,7 +1549,7 @@ def do_check_prune() -> None:
 
     partial_backups = list_backups(partial=True)
     if partial_backups:
-        for ts, archives in partial_backups.items():
+        for _ts, archives in partial_backups.items():
             names = [a.removeprefix(f"{cfg.BORG_REPO}::") for a in archives]
             problems.append(f"Partial archive(s): {', '.join(names)}")
 
@@ -1655,7 +1652,9 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         if platform.system() == "Darwin":
             backup_paths = [Path(p.rstrip("/")) for p in set_cfg["paths"]]
 
-            def is_under_backup_path(exclude: str) -> bool:
+            def is_under_backup_path(
+                exclude: str, backup_paths: list[Path] = backup_paths
+            ) -> bool:
                 exc_path = Path(exclude)
                 return any(exc_path.is_relative_to(bp) for bp in backup_paths)
 
@@ -1697,7 +1696,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
 
 
 def do_delete(
-    archive: Optional[str],
+    archive: str | None,
     dry_run: bool,
     latest: bool,
     progress: bool,
@@ -1868,7 +1867,7 @@ def do_extract(
         except BlockingIOError:
             raise BorgadmError(
                 "Another extract process is already running for this path."
-            )
+            ) from None
 
         for archive in archives:
             logger.info(f"Extracting: {archive} to {target_dir}")
@@ -2034,7 +2033,7 @@ def do_rsync(
         except BlockingIOError:
             raise BorgadmError(
                 "Another extract process is already running for this path."
-            )
+            ) from None
 
         cleanup_mounts: list[Path] = []
         cleanup_dirs: list[Path] = []

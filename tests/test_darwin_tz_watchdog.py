@@ -13,7 +13,6 @@ import importlib.machinery
 import importlib.util
 import subprocess
 import sys
-
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec, patch
@@ -327,8 +326,9 @@ def test_main_exits_zero_on_non_darwin_without_parsing_args(
     sentinel.assert_not_called()
 
 
+@pytest.mark.usefixtures("fake_darwin")
 def test_main_propagates_watchdog_error_to_exit_code(
-    fake_darwin: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _raise(**_kw: Any) -> int:
         raise dtw.WatchdogError("kaboom")
@@ -337,8 +337,9 @@ def test_main_propagates_watchdog_error_to_exit_code(
     assert dtw.main([]) == dtw.EXIT_ERROR
 
 
+@pytest.mark.usefixtures("fake_darwin")
 def test_main_propagates_unexpected_exception(
-    fake_darwin: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _raise(**_kw: Any) -> int:
         raise RuntimeError("surprise")
@@ -347,8 +348,9 @@ def test_main_propagates_unexpected_exception(
     assert dtw.main([]) == dtw.EXIT_ERROR
 
 
+@pytest.mark.usefixtures("fake_darwin")
 def test_main_dispatches_args(
-    fake_darwin: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
 

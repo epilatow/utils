@@ -30,9 +30,10 @@ import traceback
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -1136,7 +1137,7 @@ def cli() -> int:
     try:
         COMMAND_CALLBACKS[command](**args_dict)
     except KeyError:
-        raise UsageError(f"Unknown command: {command}")
+        raise UsageError(f"Unknown command: {command}") from None
     except FirefoxCookiesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code

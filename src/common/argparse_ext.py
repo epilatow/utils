@@ -9,7 +9,7 @@ argparse's terse "the following arguments are required" error.
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -37,10 +37,10 @@ class StrictSubParsersAction(SubParsersActionBase):
 
     def __call__(
         self,
-        parser: argparse.ArgumentParser,
+        _parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
         values: Any,
-        option_string: Optional[str] = None,
+        _option_string: str | None = None,
     ) -> None:
         parser_name = values[0]
         arg_strings = values[1:]

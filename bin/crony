@@ -30,23 +30,22 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomlkit
-import tomlkit.exceptions
 import traceback
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
 from typing import (
     IO,
     Any,
-    Callable,
-    Iterable,
-    Iterator,
     NamedTuple,
 )
+
+import tomlkit
+import tomlkit.exceptions
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -60,6 +59,12 @@ from common.argparse_ext import (  # noqa: E402
     action_subparsers,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from crony.platform import (  # noqa: E402
+    Scheduler,
+    get_scheduler,
+    launchd,
+    systemd,
+)
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
@@ -68,12 +73,6 @@ from crony.unit import (  # noqa: E402
     Schedule,
     Timing,
     UnitSpec,
-)
-from crony.platform import (  # noqa: E402
-    Scheduler,
-    get_scheduler,
-    launchd,
-    systemd,
 )
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
@@ -316,12 +315,12 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # [defaults]
 # notify_channels      = []           # names defined below, or "dialog-popup"
 # notify_attach_log    = true         # include log content in notifications
-# notify_attach_max_kb = 256          # email-only cap (ntfy uses a 3 KB inline cap)
-# job_timeout_sec      = 1800         # default per-job wallclock cap; 0 = no cap
-# trigger_timeout_sec  = 15           # `crony trigger --wait` start-deadline
+# notify_attach_max_kb = 256          # email cap (ntfy uses a 3 KB cap)
+# job_timeout_sec      = 1800         # per-job wallclock cap; 0 = no cap
+# trigger_timeout_sec  = 15           # `crony trigger --wait` deadline
 # log_keep_runs        = 30
-# priority             = "high"       # default priority class; jobs may override
-# keep_awake           = true         # default; jobs may override with true/false
+# priority             = "high"       # priority class; jobs may override
+# keep_awake           = true         # default; jobs may override
 #
 # [defaults.env]
 # PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
@@ -454,7 +453,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
 # # Unresolved vars stay literal; `$$` is a literal `$`. Merges over
 # # [defaults.env] -- a key set here wins for this job.
-# # env             = { "PATH" = "$HOME/.local/bin:$PATH", "RUST_BACKTRACE" = "1" }
+# # env = { "PATH" = "$HOME/.local/bin:$PATH", "RUST_BACKTRACE" = "1" }
 
 # [job.git-pull-utils]
 # script   = "scripts/git-pull.sh"     # path under the dotfiles repo
@@ -740,9 +739,9 @@ class TomlJob:
 
     name: str
     # Stable per-bundle identity, decoupled from `name`. Every live
-    # TomlJob in `TomlBundleConfig.jobs` carries one; `_parse_job` rejects bodies
-    # without `uuid` into `errored_jobs`. `crony config update`
-    # populates the field in place via tomlkit round-trip for
+    # TomlJob in `TomlBundleConfig.jobs` carries one; `_parse_job`
+    # rejects bodies without `uuid` into `errored_jobs`. `crony config
+    # update` populates the field in place via tomlkit round-trip for
     # configs that don't yet have one.
     uuid: str
     command: str | None = None
@@ -3040,15 +3039,15 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
 # The argv carries the entity's uuid so the runner addresses its
 # state dir directly via `_entity_state_dir` and loads the pinned
 # applied snapshot without scanning. The shim dispatches to the
-# per-job pipeline or the group pipeline. The per-job pipeline acquires a per-job flock,
-# runs the optional gate, execs the main command with a wallclock
-# cap, writes a structured last-run.json record, and dispatches a
-# notification on non-ok exits via the configured channel (log-only,
-# email, or ntfy). The group pipeline acquires a group-level lock
-# and triggers each named child through its own platform unit
-# (launchctl kickstart / systemctl start), waiting synchronously for
-# each to exit via a kqueue or pidfd watcher; per-job notifications
-# happen inside each child's own run.
+# per-job pipeline or the group pipeline. The per-job pipeline
+# acquires a per-job flock, runs the optional gate, execs the main
+# command with a wallclock cap, writes a structured last-run.json
+# record, and dispatches a notification on non-ok exits via the
+# configured channel (log-only, email, or ntfy). The group pipeline
+# acquires a group-level lock and triggers each named child through
+# its own platform unit (launchctl kickstart / systemctl start),
+# waiting synchronously for each to exit via a kqueue or pidfd
+# watcher; per-job notifications happen inside each child's own run.
 
 
 @dataclass
@@ -3473,7 +3472,6 @@ def _parse_last_run(raw: dict[str, Any]) -> LastRun:
 
 def _read_runtime_state(
     state_dir: Path,
-    kind: str,
     *,
     full_name: str | None,
     platform: str,
@@ -3647,7 +3645,6 @@ def _build_current_graph(
                 current.by_full_name[full] = snap.ref
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
-                    "job",
                     full_name=full,
                     platform=platform,
                     snapshot=snap,
@@ -3657,7 +3654,6 @@ def _build_current_graph(
                 current.by_full_name[full] = snap.ref
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
-                    "group",
                     full_name=full,
                     platform=platform,
                     snapshot=snap,
@@ -3672,7 +3668,6 @@ def _build_current_graph(
         state_dir = _entity_state_dir(ref)
         runtime[ref] = _read_runtime_state(
             state_dir,
-            kind="",
             full_name=broken_entry.name,
             platform=platform,
         )
@@ -3828,7 +3823,7 @@ def _state_dir_for(ref: EntityRef) -> Path:
 def _now_iso() -> str:
     """Current local time in ISO 8601 format with timezone offset."""
     return (
-        datetime.datetime.now(datetime.timezone.utc)
+        datetime.datetime.now(datetime.UTC)
         .astimezone()
         .isoformat(timespec="seconds")
     )
@@ -4471,7 +4466,7 @@ def _send_ntfy_for(
     log_text: str,
     defaults: Defaults,
 ) -> None:
-    """Send the failure ntfy POST through the given channel. Raises on any error."""
+    """Send the failure ntfy POST through the channel. Raises on error."""
     if channel.ntfy is None:
         raise ConfigError(
             f"channel {channel.name!r} has no ntfy transport config"
@@ -4932,7 +4927,8 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
         if choice in ("run", "cancel"):
             return choice
         log_file.write(
-            f"interactive: delaying for {snap.interactive_delay_sec}s\n".encode()
+            f"interactive: delaying for "
+            f"{snap.interactive_delay_sec}s\n".encode()
         )
         if not _delay_or_bypass(
             snap.interactive_delay_sec, bypass_check=_bypass
@@ -5162,7 +5158,8 @@ def run_job(
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{_now_iso()}] LOCK_BUSY: skipping (already running)\n".encode()
+                f"[{_now_iso()}] LOCK_BUSY: skipping "
+                f"(already running)\n".encode()
             )
         return int(ExitCode.LOCK_BUSY)
 
@@ -5448,7 +5445,8 @@ def run_group(
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{_now_iso()}] LOCK_BUSY: skipping (already running)\n".encode()
+                f"[{_now_iso()}] LOCK_BUSY: skipping "
+                f"(already running)\n".encode()
             )
         return int(ExitCode.LOCK_BUSY)
 
@@ -5965,7 +5963,7 @@ def _last_ran_at(config: Config, full_name: str) -> str:
         dt = datetime.datetime.fromisoformat(started)
     except ValueError:
         return "unknown"
-    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+    now = datetime.datetime.now(datetime.UTC).astimezone()
     secs = int((now - dt).total_seconds())
     if secs < 0:
         # Clock skew or a future-dated record; surface explicitly
@@ -6879,7 +6877,7 @@ def do_destroy(
             except LockBusyError:
                 raise LockBusyError(
                     f"{full}: run in progress; will not destroy"
-                )
+                ) from None
         destroy_one(name_for_cleanup, sd)
         logger.info("%s: destroyed", full)
 
@@ -8501,7 +8499,7 @@ def _parse_since(spec: str) -> datetime.datetime:
         delta = datetime.timedelta(
             seconds=n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
         )
-        return datetime.datetime.now(datetime.timezone.utc).astimezone() - delta
+        return datetime.datetime.now(datetime.UTC).astimezone() - delta
     try:
         ts = datetime.datetime.fromisoformat(text)
     except ValueError as e:

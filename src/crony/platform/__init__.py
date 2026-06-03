@@ -14,8 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from crony.platform import launchd, systemd
-from crony.platform.scheduler import UNIT_PREFIX, Scheduler, UnitState
 from crony.platform.launchd import LaunchdScheduler
+from crony.platform.scheduler import UNIT_PREFIX, Scheduler, UnitState
 from crony.platform.systemd import SystemdScheduler
 
 __all__ = [

@@ -15,8 +15,8 @@ import argparse
 import collections
 import contextlib
 import importlib.machinery
-import io
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -29,10 +29,11 @@ import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -79,14 +80,17 @@ def _isolate_home(tmp_path: Path) -> Iterator[Path]:
     fake_home.mkdir()
     old_home = os.environ.get("HOME")
     old_tempdir = tempfile.tempdir
-    basename: str = getattr(ba, "BASENAME")
-    old_config = getattr(ba, "CONFIG")
-    old_logfile = getattr(ba, "LOGFILE")
+    basename: str = ba.BASENAME
+    old_config = ba.CONFIG
+    old_logfile = ba.LOGFILE
 
     os.environ["HOME"] = str(fake_home)
     tempfile.tempdir = str(tmp_path)
-    setattr(ba, "CONFIG", Path(fake_home / f".{basename}"))
-    setattr(
+    # ba is a dynamically loaded module typed as ModuleType; a direct
+    # attribute write fails mypy --strict (attr-defined), so setattr
+    # stays.
+    setattr(ba, "CONFIG", Path(fake_home / f".{basename}"))  # noqa: B010
+    setattr(  # noqa: B010
         ba,
         "LOGFILE",
         Path(tempfile.gettempdir()) / f"{basename}.log",
@@ -100,8 +104,8 @@ def _isolate_home(tmp_path: Path) -> Iterator[Path]:
         else:
             del os.environ["HOME"]
         tempfile.tempdir = old_tempdir
-        setattr(ba, "CONFIG", old_config)
-        setattr(ba, "LOGFILE", old_logfile)
+        setattr(ba, "CONFIG", old_config)  # noqa: B010
+        setattr(ba, "LOGFILE", old_logfile)  # noqa: B010
 
 
 _CONFIG_CONSUMED_KEYS = (
@@ -136,10 +140,13 @@ def mock_cfg() -> Any:
     config_file.flush()
 
     cfg = ba.Config(config_file.name, {"command": "test"})
-    original_cfg = getattr(ba, "CFG")
-    setattr(ba, "CFG", cfg)
+    original_cfg = ba.CFG
+    # ba is a dynamically loaded module typed as ModuleType; a direct
+    # attribute write fails mypy --strict (attr-defined), so setattr
+    # stays.
+    setattr(ba, "CFG", cfg)  # noqa: B010
     yield cfg
-    setattr(ba, "CFG", original_cfg)
+    setattr(ba, "CFG", original_cfg)  # noqa: B010
 
 
 # -----------------------------------------------------------------------------
@@ -571,7 +578,8 @@ class TestRepair:
                 ]
             )
 
-    def test_repair_repo_without_yes_exits(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_repair_repo_without_yes_exits(self) -> None:
         """Test that repair repo without --yes raises BorgadmError."""
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
@@ -692,8 +700,7 @@ class TestDelete:
         }
 
         def list_backups_side_effect(
-            latest: bool = False,
-            partial: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             return backups
 
@@ -729,7 +736,8 @@ class TestDelete:
                 allow_output=False,
             )
 
-    def test_delete_latest_no_backups(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_delete_latest_no_backups(self) -> None:
         """Test --latest with no backups raises BorgadmError."""
         with (
             patch.object(
@@ -753,7 +761,7 @@ class TestDelete:
 
         def list_backups_side_effect(
             partial: bool = False,
-            latest: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 return {}
@@ -795,12 +803,12 @@ class TestDelete:
                 allow_output=False,
             )
 
-    def test_delete_by_timestamp_not_found(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_delete_by_timestamp_not_found(self) -> None:
         """Test deleting a nonexistent timestamp exits with error."""
 
         def list_backups_side_effect(
-            partial: bool = False,
-            latest: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             return {}
 
@@ -861,7 +869,8 @@ class TestDelete:
                 allow_output=False,
             )
 
-    def test_delete_by_archive_name_not_found(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_delete_by_archive_name_not_found(self) -> None:
         """Test deleting a nonexistent archive name exits with error."""
         raw_result = subprocess.CompletedProcess(
             args=[],
@@ -974,7 +983,7 @@ class TestDelete:
 
         def list_backups_side_effect(
             partial: bool = False,
-            latest: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 return {
@@ -1022,7 +1031,7 @@ class TestDelete:
 
         def list_backups_side_effect(
             partial: bool = False,
-            latest: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 # Partial archive exists at the same timestamp
@@ -1148,7 +1157,8 @@ class TestList:
             )
         return [r.message for r in caplog.records]
 
-    def test_list_defaults(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_defaults(self, caplog: Any) -> None:
         """Default list shows full + partial with keep tags."""
         msgs = self._run_list(caplog)
         # All timestamps present (3 full + 1 partial)
@@ -1161,40 +1171,44 @@ class TestList:
         assert any("(day)" in m for m in msgs)
         assert any("(prune)" in m for m in msgs)
 
-    def test_list_no_keep_tags(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_no_keep_tags(self, caplog: Any) -> None:
         """--no-keep-tags omits keep tags."""
         msgs = self._run_list(caplog, keep_tags=False)
         assert any("20250103_120000" in m for m in msgs)
         assert not any("(hour)" in m for m in msgs)
         assert not any("(prune)" in m for m in msgs)
 
-    def test_list_no_include_partial(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_no_include_partial(self, caplog: Any) -> None:
         """--no-include-partial excludes partial backups."""
         msgs = self._run_list(caplog, include_partial=False)
         assert any("20250103_120000" in m for m in msgs)
         assert not any("20250104_060000" in m for m in msgs)
 
-    def test_list_only_partial(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_only_partial(self, caplog: Any) -> None:
         """--only-partial shows only partial backups."""
         msgs = self._run_list(caplog, only_partial=True)
         assert any("20250104_060000" in m for m in msgs)
         assert not any("20250103_120000" in m for m in msgs)
 
-    def test_list_full_names(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_full_names(self, caplog: Any) -> None:
         """--full-names shows full archive names."""
         msgs = self._run_list(caplog, full_names=True)
         assert any("foobar::home-set1-20250103_120000" in m for m in msgs)
 
-    def test_list_latest(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_latest(self, caplog: Any) -> None:
         """--latest shows only the most recent backup."""
         msgs = self._run_list(caplog, latest=True)
         assert any("20250103_120000" in m for m in msgs)
         assert not any("20250102_120000" in m for m in msgs)
         assert not any("20250101_120000" in m for m in msgs)
 
-    def test_list_warns_per_unknown_archive(
-        self, mock_cfg: Any, caplog: Any
-    ) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_warns_per_unknown_archive(self, caplog: Any) -> None:
         """Each archive whose name starts with BACKUP_NAME- but
         doesn't parse becomes one WARNING log record, so a future
         grep or summary can act on each name independently."""
@@ -1208,9 +1222,8 @@ class TestList:
         assert any("home-garbage" in m for m in warnings)
         assert any("home-stale-archive" in m for m in warnings)
 
-    def test_list_no_warning_when_no_unknowns(
-        self, mock_cfg: Any, caplog: Any
-    ) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_list_no_warning_when_no_unknowns(self, caplog: Any) -> None:
         """A clean repo (no unknown archives) emits no WARNING records
         from the unknown-archive surface."""
         self._run_list(caplog)
@@ -1235,7 +1248,7 @@ class TestListUnknownArchives:
             stderr="",
         )
 
-    def _run(self, mock_cfg: Any, lines: list[str]) -> list[str]:
+    def _run(self, lines: list[str]) -> list[str]:
         # list_backups_raw is functools.cache-d, so clear before each
         # mock injection to avoid cross-test contamination.
         ba.list_backups_raw.cache_clear()
@@ -1248,13 +1261,14 @@ class TestListUnknownArchives:
             result: list[str] = ba.list_unknown_archives()
             return result
 
-    def test_empty_repo_returns_empty(self, mock_cfg: Any) -> None:
-        assert self._run(mock_cfg, []) == []
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_empty_repo_returns_empty(self) -> None:
+        assert self._run([]) == []
 
-    def test_well_formed_archives_are_silent(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_well_formed_archives_are_silent(self) -> None:
         """Archives that parse cleanly are not unknown."""
         result = self._run(
-            mock_cfg,
             [
                 "home-set1-20260101_120000_1of2",
                 "home-set1-20260101_120000_2of2",
@@ -1262,25 +1276,25 @@ class TestListUnknownArchives:
         )
         assert result == []
 
-    def test_foreign_prefix_is_silent(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_foreign_prefix_is_silent(self) -> None:
         """A name that doesn't start with BACKUP_NAME- isn't ours
         and stays out of the unknown list."""
-        assert self._run(mock_cfg, ["manual-backup-keep-this"]) == []
+        assert self._run(["manual-backup-keep-this"]) == []
 
-    def test_home_prefix_malformed_is_unknown(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_home_prefix_malformed_is_unknown(self) -> None:
         """Anything that looks like ours but doesn't parse surfaces."""
-        result = self._run(
-            mock_cfg, ["home-garbage", "home-set1-not-a-timestamp"]
-        )
+        result = self._run(["home-garbage", "home-set1-not-a-timestamp"])
         assert result == ["home-garbage", "home-set1-not-a-timestamp"]
 
-    def test_borg_checkpoint_is_silent(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_borg_checkpoint_is_silent(self) -> None:
         """`.checkpoint` and `.checkpoint.N` on a full archive shape
         (timestamp + NofM) are borg-managed intermediate state and
         are filtered out before the unknown-archive check so borg's
         own cleanup remains in charge."""
         result = self._run(
-            mock_cfg,
             [
                 "home-set1-20260101_120000_1of2.checkpoint",
                 "home-set1-20260101_120000_1of2.checkpoint.42",
@@ -1288,9 +1302,8 @@ class TestListUnknownArchives:
         )
         assert result == []
 
-    def test_checkpoint_filter_requires_full_archive_shape(
-        self, mock_cfg: Any
-    ) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_checkpoint_filter_requires_full_archive_shape(self) -> None:
         """A `.checkpoint` not preceded by the full archive shape
         (timestamp + NofM) is not a real borg checkpoint -- it's a
         malformed artifact and surfaces as unknown. Covers both a
@@ -1298,7 +1311,6 @@ class TestListUnknownArchives:
         archive (which is itself an unknown shape per the same
         rule)."""
         result = self._run(
-            mock_cfg,
             [
                 "home-stale.checkpoint",
                 "home-set1-20260101_120000.checkpoint",
@@ -1309,10 +1321,10 @@ class TestListUnknownArchives:
             "home-stale.checkpoint",
         ]
 
-    def test_sorted_output(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_sorted_output(self) -> None:
         """Order is deterministic regardless of borg's emission order."""
         result = self._run(
-            mock_cfg,
             ["home-zzz", "home-aaa", "home-mmm"],
         )
         assert result == ["home-aaa", "home-mmm", "home-zzz"]
@@ -1542,7 +1554,7 @@ class TestLogFiles:
         }
 
         def fake_run(
-            cmd: list[str], *args: Any, **kwargs: Any
+            cmd: list[str], *_args: object, **_kwargs: object
         ) -> subprocess.CompletedProcess[str]:
             # cmd == [crony, "logs", "borgadm.<job>", "-p"]
             job = cmd[2].split(".", 1)[1]
@@ -1590,7 +1602,8 @@ class TestCheck:
                 f"check {action} did not accept --verbose"
             )
 
-    def test_check_all_runs_all_checks(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_all_runs_all_checks(self) -> None:
         """Verify do_check_all calls every individual check function."""
         actions = self._check_subcommands() - {"all"}
         assert actions, "No individual check subcommands found"
@@ -1613,7 +1626,8 @@ class TestCheck:
                 f"do_check_all did not call do_check_{action}"
             )
 
-    def test_check_age_no_backups(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_age_no_backups(self) -> None:
         """Test check age raises CheckNoBackupsError."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
@@ -1621,7 +1635,8 @@ class TestCheck:
         ):
             ba.do_check_age()
 
-    def test_check_age_too_old(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_age_too_old(self) -> None:
         """Test check age raises CheckAgeError."""
         old_ts = (datetime.now() - timedelta(hours=48)).strftime(
             "%Y%m%d_%H%M%S"
@@ -1637,7 +1652,8 @@ class TestCheck:
         ):
             ba.do_check_age()
 
-    def test_check_age_ok(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_age_ok(self) -> None:
         """Test check age succeeds when backup is recent."""
         recent_ts = (datetime.now() - timedelta(hours=1)).strftime(
             "%Y%m%d_%H%M%S"
@@ -1650,7 +1666,8 @@ class TestCheck:
         ):
             ba.do_check_age()  # Should not raise
 
-    def test_check_archives_no_backups(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_archives_no_backups(self) -> None:
         """Test check archives raises CheckNoBackupsError."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
@@ -1658,7 +1675,8 @@ class TestCheck:
         ):
             ba.do_check_archives(progress=False)
 
-    def test_check_prune_partial_archives(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_prune_partial_archives(self) -> None:
         """Test check prune fails on partial archives."""
 
         def list_backups_side_effect(
@@ -1809,7 +1827,8 @@ class TestInitializeBorgEnvironmentSshGating:
 class TestDoEnvironment:
     """do_environment prints ssh-add only for remote BORG_REPO."""
 
-    def test_local_repo_omits_ssh_add(self, mock_cfg: Any, caplog: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_local_repo_omits_ssh_add(self, caplog: Any) -> None:
         with patch.object(ba.CFG, "BORG_REPO", "/var/backups/borg"):
             with caplog.at_level(logging.INFO):
                 ba.do_environment()
@@ -1818,9 +1837,8 @@ class TestDoEnvironment:
         assert any("export BORG_PASSPHRASE=" in m for m in messages)
         assert any("export BORG_REPO=" in m for m in messages)
 
-    def test_remote_repo_emits_ssh_add(
-        self, mock_cfg: Any, caplog: Any
-    ) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_remote_repo_emits_ssh_add(self, caplog: Any) -> None:
         with patch.object(ba.CFG, "BORG_REPO", "user@host:/srv/borg"):
             with caplog.at_level(logging.INFO):
                 ba.do_environment()
@@ -2413,18 +2431,22 @@ logger.info("end-sentinel")
 class TestCli:
     """Test cli() entry point."""
 
-    def test_cli_returns_warning(self, mock_cfg: Any) -> None:
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_cli_returns_warning(self) -> None:
         """cli() returns WARNING when _warning_occurred is set."""
-        original = getattr(ba, "_warning_occurred")
+        original = ba._warning_occurred
         try:
             with (
                 patch("sys.argv", ["borgadm", "environment"]),
                 patch.object(ba, "main", autospec=True),
             ):
-                setattr(ba, "_warning_occurred", True)
+                # ba is a dynamically loaded module typed as ModuleType;
+                # a direct attribute write fails mypy --strict
+                # (attr-defined), so setattr stays.
+                setattr(ba, "_warning_occurred", True)  # noqa: B010
                 assert ba.cli() == ba.ExitCode.WARNING
         finally:
-            setattr(ba, "_warning_occurred", original)
+            setattr(ba, "_warning_occurred", original)  # noqa: B010
 
     @pytest.mark.parametrize(
         "sub, sample_action",
