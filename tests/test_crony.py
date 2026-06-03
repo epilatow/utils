@@ -502,6 +502,7 @@ class TestParseDefaults:
         assert cfg.defaults.notify_channel_defs == {}
         assert cfg.defaults.priority is None
         assert cfg.defaults.keep_awake is False
+        assert cfg.defaults.env == {}
 
     def test_override_defaults(self) -> None:
         cfg = _parse(
@@ -514,6 +515,7 @@ class TestParseDefaults:
                     "log_keep_runs": 50,
                     "priority": "high",
                     "keep_awake": True,
+                    "env": {"PATH": "$HOME/.local/bin:$PATH"},
                     "notify": {"ntfy": _ntfy_block()},
                 }
             }
@@ -525,6 +527,7 @@ class TestParseDefaults:
         assert cfg.defaults.log_keep_runs == 50
         assert cfg.defaults.priority == "high"
         assert cfg.defaults.keep_awake is True
+        assert cfg.defaults.env == {"PATH": "$HOME/.local/bin:$PATH"}
         assert "ntfy" in cfg.defaults.notify_channel_defs
 
     def test_listed_channel_must_be_defined(self) -> None:
@@ -12728,6 +12731,49 @@ class TestSnapshotLifecycle:
         snap = _cast_dict(snap_path.read_text())
         # Literal $PATH preserved -- expansion happens at fire time.
         assert snap["env"] == {"PATH": "/extra:$PATH"}
+
+    def test_snapshot_env_merges_defaults(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # [defaults.env] is merged under each job's env; a job key wins.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {
+                    "env": {"PATH": "$HOME/.local/bin:$PATH", "BASE": "1"}
+                },
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "env": {"PATH": "/job:$PATH", "JOBVAR": "x"},
+                    }
+                },
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        snap = _cast_dict((h.state_dir("j") / "snapshot.json").read_text())
+        assert snap["env"] == {
+            "PATH": "/job:$PATH",  # job key wins over the default
+            "BASE": "1",  # default-only key inherited
+            "JOBVAR": "x",  # job-only key kept
+        }
+
+    def test_snapshot_env_inherits_defaults_when_job_has_none(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "defaults": {"env": {"PATH": "$HOME/.local/bin:$PATH"}},
+                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        snap = _cast_dict((h.state_dir("j") / "snapshot.json").read_text())
+        assert snap["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
 
     def test_env_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any

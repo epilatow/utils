@@ -299,6 +299,9 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # log_keep_runs        = 30
 # priority             = "high"       # default priority class; jobs may override
 # keep_awake           = true         # default; jobs may override with true/false
+#
+# [defaults.env]
+# PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
 
 # Notification inheritance. The reserved channel name `default` in a
 # NON-default bundle's `notify_channels` pulls in the default bundle's
@@ -426,7 +429,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # #            backup warnings).
 # # env supports $VAR / ${VAR} expansion against the running env, so
 # # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
-# # Unresolved vars stay literal; `$$` is a literal `$`.
+# # Unresolved vars stay literal; `$$` is a literal `$`. Merges over
+# # [defaults.env] -- a key set here wins for this job.
 # # env             = { "PATH" = "$HOME/.local/bin:$PATH", "RUST_BACKTRACE" = "1" }
 
 # [job.git-pull-utils]
@@ -690,6 +694,9 @@ class Defaults:
     # when a bundle sets no default.
     priority: str | None = None
     keep_awake: bool = False
+    # Base env merged under every job's own `env` (job keys win); see
+    # resolved_env. Values are expanded at fire time like a job's env.
+    env: dict[str, str] = field(default_factory=dict)
     # Per-bundle channel definitions: { name -> NotifyChannel }.
     notify_channel_defs: dict[str, NotifyChannel] = field(default_factory=dict)
 
@@ -768,6 +775,7 @@ class TomlJob:
     # commands that exit non-zero on transient / non-fatal conditions
     # (e.g. borg's exit 1 on backup warnings).
     success_exit_codes: list[int] = field(default_factory=list)
+    # Merged over [defaults.env] (a key here wins) by resolved_env.
     env: dict[str, str] = field(default_factory=dict)
     # Interactive jobs sit pending in the background after their
     # scheduled fire and prompt the user before running. The two
@@ -1135,6 +1143,7 @@ _KNOWN_DEFAULTS: frozenset[str] = frozenset(
         "log_keep_runs",
         "priority",
         "keep_awake",
+        "env",
         "notify",
     }
 )
@@ -1798,6 +1807,7 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
         priority=_parse_priority_field(raw, where),
         keep_awake=_typed_field(raw, "keep_awake", bool, where, default=False),
+        env=_string_dict(raw, "env", where),
         notify_channel_defs=notify_channel_defs,
     )
 
@@ -2725,6 +2735,17 @@ def resolved_keep_awake(
     return config.defaults.keep_awake
 
 
+def resolved_env(
+    config: TomlBundleConfig, target: Target | None, job: TomlJob
+) -> dict[str, str]:
+    """Merge env: defaults under job (a job's own key wins). `target`
+    is ignored (kept for call-site symmetry with the other resolvers);
+    targets carry no env. Values stay literal here -- `$VAR` expansion
+    happens at fire time in `_runtime_env`."""
+    del target
+    return {**config.defaults.env, **job.env}
+
+
 # Padding factor applied to a group's effective timeout. The 5%
 # slack lets a leaf job hit its own timeout (and propagate the
 # error up through last-run.json) before the parent group's own
@@ -2990,7 +3011,7 @@ def _resolve_job_snapshot(
         gate=job.gate,
         gate_script=gate_script,
         gate_args=gate_args,
-        env=dict(job.env),
+        env=resolved_env(config, target, job),
         job_timeout_sec=resolved_job_timeout_sec(config, target, job),
         schedule=job.schedule,
         interval=job.interval,
