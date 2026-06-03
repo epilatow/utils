@@ -17,7 +17,6 @@ import json
 import logging
 import math
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -53,6 +52,7 @@ from crony.unit import (  # noqa: E402
     PriorityClass,
     Schedule,
 )
+from crony.platform import launchd, systemd  # noqa: E402
 
 # Load the bin/crony script under a module name other than "crony" so
 # the "crony" import name stays bound to the src/crony package that
@@ -5461,234 +5461,6 @@ class _ApplyHarness(_RunnerHarness):
         return _apply(short, bundle=bundle)
 
 
-_REF = "default:u-test"
-
-
-class TestPlistRendering:
-    """_render_plist produces well-formed launchd plists."""
-
-    def test_keyword_daily(self) -> None:
-        plist = crony._render_plist(
-            "brew",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("daily"),
-        )
-        assert "<key>Label</key>" in plist
-        assert "<string>org.crony.brew</string>" in plist
-        assert "<key>StartCalendarInterval</key>" in plist
-        # daily -> 00:00
-        assert "<key>Hour</key>" in plist
-        assert "<integer>0</integer>" in plist
-
-    def test_oncalendar_simple_time(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("*-*-* 03:15"),
-        )
-        assert "<key>Hour</key>" in plist
-        assert "<integer>3</integer>" in plist
-        assert "<integer>15</integer>" in plist
-
-    def test_oncalendar_dow_with_time(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("Mon *-*-* 09:00"),
-        )
-        assert "<key>Weekday</key>" in plist
-        assert "<integer>1</integer>" in plist  # Mon=1
-
-    def test_oncalendar_first_of_month(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("*-*-01 03:00"),
-        )
-        assert "<key>Day</key>" in plist
-        assert "<integer>1</integer>" in plist
-
-    def test_interval(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Interval.from_str("30min"),
-        )
-        assert "<key>StartInterval</key>" in plist
-        assert "<integer>1800</integer>" in plist
-
-    def test_program_args_invoke_uv_with_absolute_path(
-        self, monkeypatch: Any
-    ) -> None:
-        # launchd's per-agent PATH is /usr/bin:/bin:/usr/sbin:/sbin
-        # which doesn't contain ~/.local/bin or homebrew's bin dir,
-        # so the script's `env -S uv run --script` shebang fails to
-        # find uv (exit 127). Render the absolute uv path into
-        # ProgramArguments so the unit doesn't depend on PATH.
-        monkeypatch.setattr(crony, "_uv_executable", lambda: Path("/abs/uv"))
-        monkeypatch.setattr(
-            crony, "_crony_executable", lambda: Path("/abs/crony")
-        )
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("daily"),
-        )
-        assert "<string>/abs/uv</string>" in plist
-        assert "<string>run</string>" in plist
-        assert "<string>--script</string>" in plist
-        assert "<string>/abs/crony</string>" in plist
-        # The runner argv carries the bundle:uuid ref, not the name,
-        # so it can locate the state dir directly without scanning.
-        assert "<string>default:u-test</string>" in plist
-
-    def test_every_shape_is_a_valid_plist(self) -> None:
-        # Cross-platform guard: each rendered plist must parse back as
-        # a well-formed plist (plutil only runs at apply on macOS, so
-        # this catches structural breakage in CI on any platform).
-        ref = EntityRef("default", "u-test")
-        shapes = [
-            (Schedule.from_str("daily"), None),
-            (Interval.from_str("30min"), None),
-            (
-                Schedule.from_str("Mon *-*-* 09:00"),
-                PriorityClass.HIGH,
-            ),
-            (Schedule.from_str("*-*-* 03:00"), PriorityClass.LOW),
-            (None, None),  # on-demand, normal priority
-        ]
-        for timing, priority in shapes:
-            plist = crony._render_plist("j", ref, timing, priority)
-            d = plistlib.loads(plist.encode("utf-8"))
-            assert d["Label"] == "org.crony.j"
-            assert d["ProgramArguments"][1] == "run"
-
-
-class TestSystemdRendering:
-    def test_service_unit(self) -> None:
-        svc = crony._render_systemd_service(
-            "brew", EntityRef("default", "u-test")
-        )
-        assert "[Unit]" in svc
-        assert "[Service]" in svc
-        assert "Type=oneshot" in svc
-        assert "ExecStart=" in svc
-        assert " run default:u-test" in svc
-        assert "WorkingDirectory=%h" in svc
-
-    def test_timer_oncalendar(self) -> None:
-        timer = crony._render_systemd_timer(
-            "j", Schedule.from_str("*-*-* 03:00")
-        )
-        assert "OnCalendar=*-*-* 03:00" in timer
-        assert "Persistent=true" in timer
-        assert "WantedBy=timers.target" in timer
-
-    def test_timer_interval(self) -> None:
-        timer = crony._render_systemd_timer("j", Interval.from_str("1h"))
-        assert "OnUnitActiveSec=1h" in timer
-
-    def test_service_invokes_uv_with_absolute_path(
-        self, monkeypatch: Any
-    ) -> None:
-        # systemd user services run with a minimal default PATH;
-        # render uv's absolute path so the unit doesn't depend on
-        # whoever's PATH happens to contain it (same reason as the
-        # launchd plist case).
-        monkeypatch.setattr(crony, "_uv_executable", lambda: Path("/abs/uv"))
-        monkeypatch.setattr(
-            crony, "_crony_executable", lambda: Path("/abs/crony")
-        )
-        svc = crony._render_systemd_service("j", EntityRef("default", "u-test"))
-        assert (
-            "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
-            in svc
-        )
-
-    def test_uv_executable_errors_when_uv_not_on_path(
-        self, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setattr(crony.shutil, "which", lambda name: None)
-        with pytest.raises(crony.PreconditionError, match="uv not found"):
-            crony._uv_executable()
-
-
-@pytest.mark.skipif(
-    sys.platform != "linux" or shutil.which("systemd-analyze") is None,
-    reason="systemd-analyze verify is Linux + systemd only",
-)
-class TestSystemdAnalyzeVerify:
-    """Validate every generated systemd unit shape against
-    `systemd-analyze verify`, so a malformed template is caught rather
-    than only surfacing on a real `systemctl` install. Linux-only; runs
-    in CI on the Linux matrix leg and is skipped elsewhere.
-    """
-
-    def test_every_unit_shape_verifies(self, tmp_path: Path) -> None:
-        ref = EntityRef("default", "u-test")
-        # ExecStart's executable must resolve for verify to pass;
-        # sys.executable is a real absolute path. The argv after it is
-        # irrelevant to verify (the unit is never run).
-        real = Path(sys.executable)
-        shapes = [
-            ("cal-normal", Schedule.from_str("*-*-* 03:00"), None),
-            (
-                "cal-high",
-                Schedule.from_str("Mon *-*-* 09:00"),
-                PriorityClass.HIGH,
-            ),
-            (
-                "cal-low",
-                Schedule.from_str("daily"),
-                PriorityClass.LOW,
-            ),
-            (
-                "interval",
-                Interval.from_str("30min"),
-                PriorityClass.HIGH,
-            ),
-            ("scheduleless", None, PriorityClass.LOW),
-        ]
-        written: list[Path] = []
-        for nm, timing, prio in shapes:
-            units = crony._render_units(
-                nm,
-                ref,
-                timing,
-                "linux",
-                prio,
-                uv_path=real,
-                crony_path=real,
-            )
-            for fname, content in units.items():
-                path = tmp_path / fname
-                path.write_text(content, encoding="utf-8")
-                written.append(path)
-        assert written
-        # `systemd-analyze verify` exits non-zero on structural errors
-        # (a bad OnCalendar, a unit that won't load) but only WARNS
-        # (rc 0, "... ignoring") on an unknown / typo'd directive or an
-        # unparseable value. Gate on both the exit code and those warning
-        # markers so a bogus [Service] key is caught too.
-        markers = ("ignoring", "failed to parse")
-        for path in written:
-            proc = subprocess.run(
-                ["systemd-analyze", "verify", str(path)],
-                capture_output=True,
-                text=True,
-            )
-            output = proc.stdout + proc.stderr
-            complaints = [
-                line
-                for line in output.splitlines()
-                if any(m in line.lower() for m in markers)
-            ]
-            assert proc.returncode == 0 and not complaints, (
-                f"{path.name} failed systemd-analyze verify "
-                f"(rc={proc.returncode}):\n{output}"
-            )
-
-
 class TestJobPriority:
     """`priority` enum rendered into the platform unit (and tracked
     by the snapshot + unit-drift check)."""
@@ -5736,70 +5508,6 @@ class TestJobPriority:
             cfg, target, cfg.jobs["a"], "default.a"
         )
         assert snap.priority == PriorityClass.LOW
-
-    def test_plist_high(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("daily"),
-            PriorityClass.HIGH,
-        )
-        d = plistlib.loads(plist.encode("utf-8"))
-        assert d["ProcessType"] == "Interactive"
-        assert d["LowPriorityIO"] is False
-        assert d["Nice"] == 0
-
-    def test_plist_low(self) -> None:
-        plist = crony._render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            Schedule.from_str("daily"),
-            PriorityClass.LOW,
-        )
-        d = plistlib.loads(plist.encode("utf-8"))
-        assert d["ProcessType"] == "Background"
-        assert d["LowPriorityIO"] is True
-        assert d["Nice"] == 10
-
-    def test_plist_normal_and_none_emit_nothing(self) -> None:
-        for p in (PriorityClass.NORMAL, None):
-            plist = crony._render_plist(
-                "j",
-                EntityRef("default", "u-test"),
-                Schedule.from_str("daily"),
-                p,
-            )
-            d = plistlib.loads(plist.encode("utf-8"))
-            assert "ProcessType" not in d
-            assert "LowPriorityIO" not in d
-            assert "Nice" not in d
-        assert crony._plist_priority_keys(PriorityClass.NORMAL) == {}
-        assert crony._plist_priority_keys(None) == {}
-
-    def test_systemd_high_records_intent(self) -> None:
-        svc = crony._render_systemd_service(
-            "j", EntityRef("default", "u-test"), PriorityClass.HIGH
-        )
-        assert "# crony priority=high" in svc
-        # high leaves CPU/IO at the Linux defaults.
-        assert "Nice=" not in svc
-        assert "IOSchedulingClass" not in svc
-
-    def test_systemd_low_sets_scheduling(self) -> None:
-        svc = crony._render_systemd_service(
-            "j", EntityRef("default", "u-test"), PriorityClass.LOW
-        )
-        assert "Nice=10" in svc
-        assert "IOSchedulingClass=idle" in svc
-
-    def test_systemd_normal_emits_nothing(self) -> None:
-        svc = crony._render_systemd_service(
-            "j",
-            EntityRef("default", "u-test"),
-            PriorityClass.NORMAL,
-        )
-        assert "Nice=" not in svc
-        assert "IOSchedulingClass" not in svc
 
     def test_apply_writes_priority_into_plist(
         self, tmp_path: Path, monkeypatch: Any
@@ -7189,6 +6897,15 @@ class TestUnitStateLinux:
     def test_none_on_empty(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony, "_systemd_is_enabled", lambda u: "")
         assert crony._unit_state("j", "linux") == "none"
+
+
+class TestUvExecutable:
+    def test_uv_executable_errors_when_uv_not_on_path(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(crony.shutil, "which", lambda name: None)
+        with pytest.raises(crony.PreconditionError, match="uv not found"):
+            crony._uv_executable()
 
 
 class TestConfigState:
@@ -12934,10 +12651,9 @@ class TestExtractUnitExecPaths:
     """
 
     def test_extracts_paths_from_plist(self) -> None:
-        plist = crony._render_plist(
+        plist = launchd.render_plist(
             "j",
             EntityRef("default", "u-test"),
-            "*-*-* 03:00",
             None,
             uv_path=Path("/abs/uv"),
             crony_path=Path("/abs/crony"),
@@ -12948,7 +12664,7 @@ class TestExtractUnitExecPaths:
         )
 
     def test_extracts_paths_from_systemd_service(self) -> None:
-        svc = crony._render_systemd_service(
+        svc = systemd.render_service(
             "j",
             EntityRef("default", "u-test"),
             uv_path=Path("/abs/uv"),
@@ -13237,7 +12953,7 @@ class TestUnitDriftDetection:
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
-            crony._render_systemd_timer(
+            systemd.render_timer(
                 h.full("transit"), Schedule.from_str("*-*-* 03:00")
             )
         )

@@ -69,6 +69,13 @@ from crony.unit import (  # noqa: E402
     PriorityClass,
     Schedule,
     Timing,
+    UnitSpec,
+)
+from crony.platform import (  # noqa: E402
+    UNIT_PREFIX,
+    get_scheduler,
+    launchd,
+    systemd,
 )
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
@@ -2765,6 +2772,15 @@ class Job:
     def ref(self) -> EntityRef:
         return EntityRef(self.name.bundle, self.uuid)
 
+    def unit_spec(self) -> UnitSpec:
+        """The platform UnitSpec the scheduler renders / drift-checks."""
+        return UnitSpec(
+            name=self.name,
+            ref=self.ref,
+            timing=self.timing,
+            priority=self.priority,
+        )
+
 
 @dataclass
 class JobGroup:
@@ -2789,6 +2805,16 @@ class JobGroup:
     @property
     def ref(self) -> EntityRef:
         return EntityRef(self.name.bundle, self.uuid)
+
+    def unit_spec(self) -> UnitSpec:
+        """The platform UnitSpec the scheduler renders / drift-checks.
+        Groups render without a priority."""
+        return UnitSpec(
+            name=self.name,
+            ref=self.ref,
+            timing=self.timing,
+            priority=None,
+        )
 
 
 def _entity_state_dir(ref: EntityRef) -> Path:
@@ -5440,19 +5466,19 @@ def run_group(
 
 def _label_for(name: str) -> str:
     """launchd Label for a job/group."""
-    return f"org.{BASENAME}.{name}"
+    return launchd.label(name)
 
 
 def _plist_path_for(name: str) -> Path:
-    return LAUNCHAGENTS_DIR / f"{_label_for(name)}.plist"
+    return LAUNCHAGENTS_DIR / launchd.plist_filename(name)
 
 
 def _service_path_for(name: str) -> Path:
-    return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.service"
+    return SYSTEMD_USER_DIR / systemd.service_filename(name)
 
 
 def _timer_path_for(name: str) -> Path:
-    return SYSTEMD_USER_DIR / f"{BASENAME}-{name}.timer"
+    return SYSTEMD_USER_DIR / systemd.timer_filename(name)
 
 
 def _platform_unit_config_path(name: str, platform: str) -> Path | None:
@@ -5476,7 +5502,7 @@ def _platform_unit_config_path(name: str, platform: str) -> Path | None:
 
 
 def _systemd_unit_name(name: str) -> str:
-    return f"{BASENAME}-{name}.timer"
+    return systemd.timer_filename(name)
 
 
 def _dispatch_unit_path(name: str, platform: str) -> Path:
@@ -5494,203 +5520,29 @@ def _dispatch_unit_path(name: str, platform: str) -> Path:
     return _plist_path_for(name)
 
 
-def _plist_priority_keys(priority: PriorityClass | None) -> dict[str, object]:
-    """LaunchAgent priority keys for a job, or {} for normal.
-
-    HIGH runs the job at app-like QoS with normal CPU + IO
-    (ProcessType=Interactive avoids the Background QoS throttling that
-    can drastically slow IO-bound work); LOW throttles it. The keys
-    are inherited by the command the runner spawns.
-    """
-    if priority is PriorityClass.HIGH:
-        return {
-            "ProcessType": "Interactive",
-            "LowPriorityIO": False,
-            "Nice": 0,
-        }
-    if priority is PriorityClass.LOW:
-        return {
-            "ProcessType": "Background",
-            "LowPriorityIO": True,
-            "Nice": 10,
-        }
-    return {}
-
-
-def _systemd_priority_block(priority: PriorityClass | None) -> str:
-    """[Service] priority directives for a job, or '' for normal.
-
-    Linux has no app-vs-background QoS throttling to undo, so HIGH
-    only records intent in a comment (CPU + IO stay at defaults);
-    LOW lowers both CPU and IO scheduling.
-    """
-    if priority is PriorityClass.HIGH:
-        return "# crony priority=high: CPU + IO left at defaults\n"
-    if priority is PriorityClass.LOW:
-        return "Nice=10\nIOSchedulingClass=idle\n"
-    return ""
-
-
-def _render_plist(
-    name: str,
-    ref: EntityRef,
-    timing: Timing | None,
-    priority: PriorityClass | None = None,
-    *,
-    uv_path: Path | None = None,
-    crony_path: Path | None = None,
-) -> str:
-    """Render the LaunchAgent plist XML for a job or group.
-
-    The Label uses the full namespaced name for human readability;
-    the runner gets the entity's `<bundle>:<uuid>` ref so it can
-    locate the state dir directly without scanning.
-
-    ProgramArguments invokes uv with absolute paths rather than
-    relying on the script's `env -S uv run --script` shebang.
-    launchd's per-agent PATH is `/usr/bin:/bin:/usr/sbin:/sbin`,
-    which doesn't contain uv, so the shebang's `env` lookup fails
-    with exit 127 before crony can run at all.
-
-    `uv_path` / `crony_path` override the live `_uv_executable()`
-    / `_crony_executable()` resolution: apply leaves them None
-    (use the live paths), the unit-drift integrity check passes
-    the paths it extracted from the on-disk file so the byte-
-    comparison stays meaningful when the live PATH differs from
-    what apply originally pinned.
-
-    Serialized with `plistlib` so the XML is well-formed by
-    construction (escaping, typed values, DOCTYPE); `sort_keys`
-    keeps the byte output deterministic for the drift check.
-    """
-    label = _label_for(name)
-    uv = uv_path if uv_path is not None else _uv_executable()
-    crony = crony_path if crony_path is not None else _crony_executable()
-    contents: dict[str, object] = {
-        "Label": label,
-        "ProgramArguments": [
-            str(uv),
-            "run",
-            "--script",
-            str(crony),
-            "run",
-            str(ref),
-        ],
-        "RunAtLoad": False,
-        "KeepAlive": False,
-        "AbandonProcessGroup": False,
-    }
-    contents.update(_plist_priority_keys(priority))
-    if isinstance(timing, Interval):
-        contents["StartInterval"] = timing.total_seconds
-    elif isinstance(timing, Schedule):
-        contents["StartCalendarInterval"] = timing.to_plist_calendar()
-    return plistlib.dumps(
-        contents, fmt=plistlib.FMT_XML, sort_keys=True
-    ).decode("utf-8")
-
-
-def _render_systemd_service(
-    name: str,
-    ref: EntityRef,
-    priority: PriorityClass | None = None,
-    *,
-    uv_path: Path | None = None,
-    crony_path: Path | None = None,
-) -> str:
-    """Render the systemd .service unit. Independent of schedule.
-
-    ExecStart invokes uv with absolute paths and addresses the
-    entity by `<bundle>:<uuid>` so the runner skips the name->uuid
-    lookup -- same reason as for plist (see _render_plist's
-    docstring). The unit description carries the human-readable
-    name. `priority` adds CPU / IO scheduling directives inherited
-    by the spawned command.
-
-    `uv_path` / `crony_path` override the live resolvers; see
-    `_render_plist` for the rationale.
-    """
-    uv = uv_path if uv_path is not None else _uv_executable()
-    crony = crony_path if crony_path is not None else _crony_executable()
-    return (
-        "[Unit]\n"
-        f"Description=crony job {name}\n"
-        "\n"
-        "[Service]\n"
-        "Type=oneshot\n"
-        f"ExecStart={uv} run --script {crony} run "
-        f"{ref}\n"
-        "WorkingDirectory=%h\n"
-        f"{_systemd_priority_block(priority)}"
-    )
-
-
-def _render_systemd_timer(name: str, timing: Timing) -> str:
-    """Render the systemd .timer unit."""
-    if isinstance(timing, Interval):
-        spec_line = f"OnUnitActiveSec={timing}\n"
-    else:
-        spec_line = f"OnCalendar={timing}\n"
-    return (
-        "[Unit]\n"
-        f"Description=crony timer for {name}\n"
-        "\n"
-        "[Timer]\n"
-        f"{spec_line}"
-        "Persistent=true\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=timers.target\n"
-    )
-
-
 def _render_units(
-    name: str,
-    ref: EntityRef,
-    timing: Timing | None,
+    snap: Job | JobGroup,
     platform: str,
-    priority: PriorityClass | None = None,
     *,
     uv_path: Path | None = None,
     crony_path: Path | None = None,
 ) -> dict[str, str]:
-    """Return {filename: content} for the platform units of (name, schedule).
+    """Return {filename: content} for `snap`'s platform units.
 
-    Every job and group gets a unit so it's individually triggerable
-    via the platform scheduler, regardless of whether it has its own
-    schedule. Schedule-less entries (transit groups, group-only jobs)
-    install a unit that just sits dormant until something fires it
-    -- either `crony trigger` or a parent group dispatching it.
-
-    On darwin, that's a plist with no Start* keys (RunAtLoad=false,
-    so loading doesn't auto-fire). On linux, only the .service file
-    is rendered for schedule-less entries; the .timer is omitted
-    because a timer with no triggering condition is dead weight.
-
-    `uv_path` / `crony_path` thread through to the per-platform
-    renderers; left None for apply (live resolution) and supplied
-    by the unit-drift integrity check with paths extracted from
-    the existing file.
+    Delegates to the platform Scheduler. `uv_path` / `crony_path`
+    are baked into the unit argv; left None they resolve to the live
+    `_uv_executable()` / `_crony_executable()`, and the unit-drift
+    integrity check supplies the paths it recovered from the on-disk
+    file so the byte comparison stays meaningful when the live PATH
+    differs from what apply originally pinned.
     """
-    if platform == "darwin":
-        return {
-            f"{_label_for(name)}.plist": _render_plist(
-                name,
-                ref,
-                timing,
-                priority,
-                uv_path=uv_path,
-                crony_path=crony_path,
-            )
-        }
-    units = {
-        f"{BASENAME}-{name}.service": _render_systemd_service(
-            name, ref, priority, uv_path=uv_path, crony_path=crony_path
+    return get_scheduler(platform).render(
+        snap.unit_spec(),
+        uv_path=uv_path if uv_path is not None else _uv_executable(),
+        crony_path=(
+            crony_path if crony_path is not None else _crony_executable()
         ),
-    }
-    if timing is not None:
-        units[f"{BASENAME}-{name}.timer"] = _render_systemd_timer(name, timing)
-    return units
+    )
 
 
 def _extract_unit_exec_paths(
@@ -5766,8 +5618,6 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     `config=stale` and `crony apply` re-renders / re-bootstraps
     even when the snapshot itself is unchanged.
     """
-    # Only jobs carry a priority; groups render without one.
-    snap_priority = snap.priority if isinstance(snap, Job) else None
     if platform == "darwin":
         unit_dir = LAUNCHAGENTS_DIR
     else:
@@ -5777,11 +5627,8 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
     # re-renders using paths extracted from the on-disk file.
     expected_filenames = set(
         _render_units(
-            full_name,
-            snap.ref,
-            snap.timing,
+            snap,
             platform,
-            snap_priority,
             uv_path=Path(),
             crony_path=Path(),
         ).keys()
@@ -5799,7 +5646,7 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         if fname.endswith(".timer"):
             # A .timer is only rendered for a scheduled entry.
             assert snap.timing is not None
-            if content != _render_systemd_timer(full_name, snap.timing):
+            if content != systemd.render_timer(full_name, snap.timing):
                 return True
             continue
         extracted = _extract_unit_exec_paths(content, platform)
@@ -5809,11 +5656,8 @@ def _unit_is_stale(full_name: str, snap: Job | JobGroup, platform: str) -> bool:
         if not uv_path.is_file() or not crony_path.is_file():
             return True
         re_rendered = _render_units(
-            full_name,
-            snap.ref,
-            snap.timing,
+            snap,
             platform,
-            snap_priority,
             uv_path=uv_path,
             crony_path=crony_path,
         )
@@ -5988,8 +5832,6 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     full_name = str(snapshot.name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    # Only jobs carry a priority; groups render without one.
-    priority = snapshot.priority if isinstance(snapshot, Job) else None
     platform = config.platform
     snapshot_path = _snapshot_path_for(ref)
 
@@ -6059,7 +5901,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
     prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(full_name, ref, timing, platform, priority)
+    units = _render_units(snapshot, platform)
     target_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name
@@ -6218,13 +6060,13 @@ def _platform_unit_names() -> set[str]:
     """
     names: set[str] = set()
     if LAUNCHAGENTS_DIR.exists():
-        prefix = f"org.{BASENAME}."
+        prefix = f"org.{UNIT_PREFIX}."
         suffix = ".plist"
         for p in LAUNCHAGENTS_DIR.iterdir():
             if p.name.startswith(prefix) and p.name.endswith(suffix):
                 names.add(p.name[len(prefix) : -len(suffix)])
     if SYSTEMD_USER_DIR.exists():
-        prefix = f"{BASENAME}-"
+        prefix = f"{UNIT_PREFIX}-"
         for suffix in (".service", ".timer"):
             for p in SYSTEMD_USER_DIR.iterdir():
                 if p.name.startswith(prefix) and p.name.endswith(suffix):
@@ -6647,7 +6489,7 @@ def _trigger_unit(
         if platform == "linux":
             # The timer's job is to fire the .service; trigger
             # by starting the service directly.
-            service_unit = f"{BASENAME}-{name}.service"
+            service_unit = systemd.service_filename(name)
             subprocess.run(
                 ["systemctl", "--user", "start", service_unit],
                 check=True,
