@@ -1478,7 +1478,10 @@ class TestAutomate:
             assert "priority" not in doc["job"][op]
             assert "keep_awake" not in doc["job"][op]
             assert "job_timeout_sec" not in doc["job"][op]
-        assert doc["target"]["darwin"]["jobs"] == self.JOB_OPS
+        # Target keys on this host.
+        host = ba._current_host()
+        assert "darwin" not in doc["target"]
+        assert doc["target"]["host"][host]["jobs"] == self.JOB_OPS
 
     def test_generated_bundle_validates_against_crony(
         self, tmp_path: Path
