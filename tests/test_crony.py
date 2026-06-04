@@ -21,7 +21,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -45,7 +44,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from crony.platform import launchd, systemd  # noqa: E402
+from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
@@ -11905,48 +11904,6 @@ class TestBundleNamespacing:
         assert "borgadm.daily-update" in full_names
 
 
-class TestWaitForPidExit:
-    """Kernel-level pid-exit wait primitive (kqueue / pidfd).
-
-    These are the building block for `_trigger_unit_sync`; they
-    must be reliable on both darwin and linux without polling.
-    """
-
-    def test_live_pid_exits_during_wait(self) -> None:
-        proc = subprocess.Popen(["sleep", "0.3"])
-        try:
-            t0 = time.monotonic()
-            reason = crony._wait_for_pid_exit(proc.pid, timeout=5.0)
-            dt = time.monotonic() - t0
-            assert reason == "exit"
-            assert 0.2 < dt < 2.0, f"unexpected wait duration: {dt}"
-        finally:
-            proc.wait()
-
-    def test_already_dead_pid_returns_exit(self) -> None:
-        proc = subprocess.Popen(["true"])
-        proc.wait()
-        # Either the kernel still has zombie info (kqueue/pidfd
-        # returns immediately) or the pid has been recycled
-        # (we wait for a new process to exit, possibly hitting
-        # timeout). Both are acceptable; the call must not hang
-        # past the timeout.
-        reason = crony._wait_for_pid_exit(proc.pid, timeout=2.0)
-        assert reason in {"exit", "timeout"}
-
-    def test_long_running_pid_hits_timeout(self) -> None:
-        proc = subprocess.Popen(["sleep", "5"])
-        try:
-            t0 = time.monotonic()
-            reason = crony._wait_for_pid_exit(proc.pid, timeout=0.2)
-            dt = time.monotonic() - t0
-            assert reason == "timeout"
-            assert 0.15 < dt < 0.6, f"unexpected wait duration: {dt}"
-        finally:
-            proc.terminate()
-            proc.wait()
-
-
 class TestTriggerUnitSync:
     """`_trigger_unit_sync` wraps the kickstart + pid-watch +
     last-run.json cross-check. Stub the platform trigger and
@@ -12060,7 +12017,7 @@ class TestTriggerUnitSync:
         (sd / "run.pid").write_text(f"{os.getpid()}\n")
         wait_calls: list[float] = []
 
-        def _stub_wait(_pid: int, timeout: float) -> str:
+        def _stub_wait(_pid: int, timeout: float) -> PidWait:
             wait_calls.append(timeout)
             # Simulate the runner completing now: write a fresh
             # last-run.json and unlink the pid.
@@ -12070,7 +12027,7 @@ class TestTriggerUnitSync:
                 encoding="utf-8",
             )
             (sd / "run.pid").unlink(missing_ok=True)
-            return "exit"
+            return PidWait.EXITED
 
         monkeypatch.setattr(crony, "_trigger_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony, "_wait_for_pid_exit", _stub_wait)

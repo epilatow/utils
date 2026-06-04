@@ -60,7 +60,10 @@ from common.argparse_ext import (  # noqa: E402
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 from crony.platform import (  # noqa: E402
+    HostPlatform,
+    PidWait,
     Scheduler,
+    get_host,
     get_scheduler,
     launchd,
     systemd,
@@ -142,10 +145,10 @@ immediately, the same path a scheduled fire would take. To run a
 job ad-hoc, use `crony trigger <name>` -- this guarantees the run
 uses the same execution context (env, gate, timeout, working dir)
 as a scheduled fire. `trigger --wait` blocks until the next
-completion via kernel-level pid-exit notification (kqueue on
-darwin, pidfd_open on linux) -- no polling. Groups dispatch each
-child through the same mechanism, with a cumulative deadline
-pinned at apply time as 1.05 * sum-of-children's-timeouts.
+completion via kernel-level pid-exit notification -- no polling.
+Groups dispatch each child through the same mechanism, with a
+cumulative deadline pinned at apply time as 1.05 *
+sum-of-children's-timeouts.
 
 Interactive jobs (`interactive = true` on `[job.<name>]`) sit
 pending in the background after their fire and prompt the user
@@ -3045,9 +3048,9 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
 # record, and dispatches a notification on non-ok exits via the
 # configured channel (log-only, email, or ntfy). The group pipeline
 # acquires a group-level lock and triggers each named child through
-# its own platform unit (launchctl kickstart / systemctl start),
-# waiting synchronously for each to exit via a kqueue or pidfd
-# watcher; per-job notifications happen inside each child's own run.
+# its own platform unit, waiting synchronously for each to exit via a
+# kernel-level pid-exit notification; per-job notifications happen
+# inside each child's own run.
 
 
 @dataclass
@@ -3831,10 +3834,23 @@ def _now_iso() -> str:
 
 @contextlib.contextmanager
 def _acquire_lock(lock_path: Path) -> Iterator[None]:
-    """Hold an exclusive non-blocking flock on lock_path.
+    """Hold an exclusive non-blocking flock on lock_path for a run.
 
-    Raises LockBusyError if another holder has the lock. The lock
-    file is left in place across runs; flock guards mutual exclusion.
+    The lock is a run-liveness signal: a held lock means a run is in
+    flight, which `_run_in_progress` (and status / apply / destroy
+    through it) reads by probing whether the lock is acquirable. flock
+    is used rather than the sibling run.pid because the kernel releases
+    it when the runner dies, so a crashed run never reads as still
+    running.
+
+    Acquisition is non-blocking and raises LockBusyError when the lock
+    is already held. In normal operation that does not happen: jobs run
+    only via their platform unit, and a second fire of an
+    already-running unit is coalesced into a no-op, so a given run.lock
+    has a single contender. The raise is therefore incidental
+    single-flight defense against a stray direct `crony run`, not the
+    mechanism that prevents concurrent scheduled fires. The lock file is
+    left in place across runs.
     """
     fd = open(lock_path, "w")
     try:
@@ -4060,71 +4076,11 @@ def _exec_with_timeout(
     return ExitOutcome(rc=rc, signal=None)
 
 
-def _wait_for_pid_exit(pid: int, timeout: float | None) -> str:
-    """Block until `pid` exits, using kernel-level notification.
-
-    Returns "exit" if the pid is gone (exited, never existed, or
-    raced into reuse); "timeout" if `timeout` seconds elapsed
-    without an exit notification. No polling: darwin uses
-    kqueue + EVFILT_PROC + NOTE_EXIT; linux uses
-    `os.pidfd_open` + `select.poll`.
-
-    `timeout=None` waits indefinitely. The race-safe path -- pid
-    already gone before we register -- is the same on both
-    platforms: kqueue.control raises ProcessLookupError, pidfd_open
-    raises ProcessLookupError; both translate to "exit".
-    """
-    if sys.platform == "darwin":
-        return _wait_for_pid_exit_kqueue(pid, timeout)
-    if sys.platform.startswith("linux"):
-        return _wait_for_pid_exit_pidfd(pid, timeout)
-    raise CronyError(f"unsupported platform: {sys.platform}")
-
-
-def _wait_for_pid_exit_kqueue(pid: int, timeout: float | None) -> str:
-    # mypy's stubs for `select` are platform-specific: kqueue,
-    # kevent, and the KQ_* constants are absent from the Linux
-    # stubs. wait_for_pid_exit only dispatches here when
-    # sys.platform == "darwin", so the runtime contract is fine;
-    # silence the static-checker on each macOS-only attribute.
-    import select as _select
-
-    kq = _select.kqueue()  # type: ignore[attr-defined, unused-ignore]
-    try:
-        ev = _select.kevent(  # type: ignore[attr-defined, unused-ignore]
-            pid,
-            filter=_select.KQ_FILTER_PROC,  # type: ignore[attr-defined, unused-ignore]
-            flags=(
-                _select.KQ_EV_ADD  # type: ignore[attr-defined, unused-ignore]
-                | _select.KQ_EV_ENABLE  # type: ignore[attr-defined, unused-ignore]
-            ),
-            fflags=_select.KQ_NOTE_EXIT,  # type: ignore[attr-defined, unused-ignore]
-        )
-        try:
-            kq.control([ev], 0, 0)
-        except ProcessLookupError:
-            return "exit"
-        events = kq.control([], 1, timeout)
-        return "exit" if events else "timeout"
-    finally:
-        kq.close()
-
-
-def _wait_for_pid_exit_pidfd(pid: int, timeout: float | None) -> str:
-    import select as _select
-
-    try:
-        fd = os.pidfd_open(pid)  # type: ignore[attr-defined, unused-ignore]
-    except ProcessLookupError:
-        return "exit"
-    try:
-        poll = _select.poll()
-        poll.register(fd, _select.POLLIN)
-        ms = -1 if timeout is None else int(timeout * 1000)
-        events = poll.poll(ms)
-        return "exit" if events else "timeout"
-    finally:
-        os.close(fd)
+def _wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
+    """Block until `pid` exits via the host's kernel-level pid-exit
+    notification; delegates to the HostPlatform backend. `timeout=None`
+    waits indefinitely."""
+    return _host().wait_for_pid_exit(pid, timeout)
 
 
 def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
@@ -4892,10 +4848,12 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
 
     Polls `_consume_user_trigger_flag` inside both the active-
     wait and the delay-sleep so a `crony trigger` arriving while
-    the runner holds the lock (and the kickstarted second runner
-    is exiting LockBusy) breaks the waiter out and runs the
-    command. Without the poll, that flag would sit on disk until
-    the next scheduled fire and silently bypass *that* wait.
+    this run is pending breaks the waiter out and runs the
+    command. `crony trigger` writes that flag in its own process
+    (its fire of the already-running unit is a no-op), so polling
+    is how the pending run learns of it. Without the poll, the
+    flag would sit on disk until the next scheduled fire and
+    silently bypass *that* wait.
     """
 
     sd = _entity_state_dir(snap.ref)
@@ -4985,9 +4943,9 @@ def run_job(
             if dry_run:
                 return 0
             # Publish our pid for waiters (parent groups, `crony
-            # trigger --wait`) to watch via kqueue / pidfd. The
-            # pid file lives only for the duration of the lock-
-            # holding run; cleaned up in `finally`.
+            # trigger --wait`) to watch for exit. The pid file lives
+            # only for the duration of the lock-holding run; cleaned
+            # up in `finally`.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_size_before = (
@@ -5491,6 +5449,12 @@ def _scheduler(platform: str) -> Scheduler:
     SYSTEMD_USER_DIR (which bin/crony owns)."""
     unit_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
     return get_scheduler(platform, unit_dir)
+
+
+def _host() -> HostPlatform:
+    """The HostPlatform backend for the running host. Built per call via
+    current_platform() so tests can redirect the platform."""
+    return get_host(current_platform())
 
 
 def _render_units(snap: Job | JobGroup, platform: str) -> dict[str, str]:
@@ -6173,7 +6137,7 @@ def _trigger_unit_sync(
     Mechanism: a pre-trigger timestamp T is taken, the platform
     is asked to fire the unit, and the waiter watches for the
     runner's pid (published via `<state>/<bundle>/<uuid>/run.pid`) to
-    exit via kqueue / pidfd kernel-level notification. When the
+    exit via kernel-level pid-exit notification. When the
     pid is gone, last-run.json is read; if its `ended_at` is at
     or after T, the run is "ours" (semantics: the next completion
     after the trigger). Otherwise we sleep briefly, re-read the
