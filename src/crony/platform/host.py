@@ -8,9 +8,9 @@ crony reaches for host-OS services that diverge by platform.
 the same platform string via `get_host` (in the package `__init__`), and
 `crony.platform.darwin` and `crony.platform.linux` implement it. The
 services it exposes are the runner's wait on a spawned job's pid, the OS
-keychain secret lookup, and the desktop-interaction primitives
-interactive jobs use (idle / screen-lock probes and the approval /
-failure dialogs).
+keychain secret lookup, the sleep-inhibitor wrap for keep-awake jobs,
+and the desktop-interaction primitives interactive jobs use (idle /
+screen-lock probes and the approval / failure dialogs).
 
 This is the host-services analog of `scheduler.Scheduler`: where the
 scheduler renders and manages units, the host platform brokers the
@@ -65,6 +65,19 @@ class HostPlatform(abc.ABC):
         item matches. `account` disambiguates when several items share a
         service name. The credential resolver tries this before its env
         / file fallback, so None simply means "fall through"."""
+
+    @abc.abstractmethod
+    def keep_awake_argv(
+        self, argv: list[str], label: str
+    ) -> tuple[list[str], str | None]:
+        """Wrap `argv` in the host's sleep-inhibitor so the machine
+        stays awake while the command runs, returning (wrapped_argv,
+        note). The wrapper propagates the command's exit code and tears
+        down when killed. When the inhibitor binary is unavailable,
+        return `argv` unwrapped with a `note` explaining why -- a
+        missing inhibitor must never fail the job. `label` names the job
+        for the inhibitor's bookkeeping. (Lid-close on battery still
+        sleeps the machine; no userspace mechanism prevents that.)"""
 
     @abc.abstractmethod
     def hid_idle_seconds(self) -> float:

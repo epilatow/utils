@@ -14,10 +14,12 @@ with a Linux skipif.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -75,6 +77,35 @@ class TestLinuxKeychain:
         # Linux has no keychain integration; the resolver falls through
         # to its env / file path.
         assert LinuxHost().keychain_secret("svc", "acct") is None
+
+
+class TestLinuxKeepAwake:
+    """LinuxHost.keep_awake_argv wraps the command in `systemd-inhibit`;
+    shutil.which (which the backend uses) is stubbed."""
+
+    def test_wraps_with_systemd_inhibit(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda n: "/x/systemd-inhibit" if n == "systemd-inhibit" else None,
+        )
+        argv, note = LinuxHost().keep_awake_argv(
+            ["/bin/sh", "-c", "true"], "default.a"
+        )
+        assert argv[0] == "/x/systemd-inhibit"
+        assert "--what=sleep:idle" in argv
+        assert "--why=job default.a" in argv
+        assert "--" in argv
+        assert argv[-3:] == ["/bin/sh", "-c", "true"]
+        assert note is None
+
+    def test_missing_systemd_inhibit_runs_unwrapped(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        argv, note = LinuxHost().keep_awake_argv(["true"], "default.a")
+        assert argv == ["true"]
+        assert note is not None and "systemd-inhibit not found" in note
 
 
 class TestLinuxNoDesktop:

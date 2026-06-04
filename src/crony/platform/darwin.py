@@ -3,14 +3,16 @@
 """macOS (`darwin`) host-platform backend.
 
 Implements the `HostPlatform` services on darwin: a kqueue-based
-pid-exit wait, a Keychain-backed secret lookup, and the
-desktop-interaction primitives (HID idle / screen-lock probes via
-`ioreg`, approval and failure dialogs via `osascript`).
+pid-exit wait, a Keychain-backed secret lookup, a `caffeinate`
+sleep-inhibitor wrap, and the desktop-interaction primitives (HID idle
+/ screen-lock probes via `ioreg`, approval and failure dialogs via
+`osascript`).
 """
 
 from __future__ import annotations
 
 import select
+import shutil
 import subprocess
 
 from crony.platform.host import HostPlatform, PidWait
@@ -73,6 +75,16 @@ class DarwinHost(HostPlatform):
         if r.returncode == 0:
             return r.stdout.rstrip("\n")
         return None
+
+    def keep_awake_argv(
+        self, argv: list[str], _label: str
+    ) -> tuple[list[str], str | None]:
+        # caffeinate -i -s prevents idle sleep always and system sleep
+        # on AC; it has no job-label field, so _label is unused.
+        tool = shutil.which("caffeinate")
+        if tool is None:
+            return argv, "keep_awake: caffeinate not found; running unwrapped"
+        return [tool, "-i", "-s", *argv], None
 
     def hid_idle_seconds(self) -> float:
         # Reads HIDIdleTime (nanoseconds) from IOHIDSystem. Returns 0.0

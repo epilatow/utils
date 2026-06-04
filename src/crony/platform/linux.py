@@ -3,16 +3,18 @@
 """Linux host-platform backend.
 
 Implements the `HostPlatform` services on Linux: a pidfd-based pid-exit
-wait. Linux has no keychain integration, so `keychain_secret` reports
-None and the credential resolver falls through to its env / file path.
-Desktop interaction is unsupported (`supports_interactive` is False):
-the idle / lock probes and dialogs raise.
+wait and a `systemd-inhibit` sleep-inhibitor wrap. Linux has no keychain
+integration, so `keychain_secret` reports None and the credential
+resolver falls through to its env / file path. Desktop interaction is
+unsupported (`supports_interactive` is False): the idle / lock probes
+and dialogs raise.
 """
 
 from __future__ import annotations
 
 import os
 import select
+import shutil
 
 from crony.platform.host import HostPlatform, PidWait
 
@@ -46,6 +48,28 @@ class LinuxHost(HostPlatform):
         # No OS keychain integration on Linux; the resolver's env / file
         # fallback owns the secret here.
         return None
+
+    def keep_awake_argv(
+        self, argv: list[str], label: str
+    ) -> tuple[list[str], str | None]:
+        tool = shutil.which("systemd-inhibit")
+        if tool is None:
+            return (
+                argv,
+                "keep_awake: systemd-inhibit not found; running unwrapped",
+            )
+        return (
+            [
+                tool,
+                "--what=sleep:idle",
+                "--who=crony",
+                f"--why=job {label}",
+                "--mode=block",
+                "--",
+                *argv,
+            ],
+            None,
+        )
 
     def hid_idle_seconds(self) -> float:
         raise NotImplementedError(_NO_INTERACTIVE)

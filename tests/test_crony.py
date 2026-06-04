@@ -5592,43 +5592,25 @@ class TestKeepAwake:
         assert argv == ["true"]
         assert note is None
 
-    def test_wrap_darwin(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
-        monkeypatch.setattr(
-            crony.shutil,
-            "which",
-            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
-        )
-        argv, note = crony._keep_awake_argv(
-            ["/bin/sh", "-c", "true"], self._snap(True)
-        )
-        assert argv == ["/x/caffeinate", "-i", "-s", "/bin/sh", "-c", "true"]
-        assert note is None
+    def test_enabled_delegates_to_host(self, monkeypatch: Any) -> None:
+        # When keep_awake is set, _keep_awake_argv hands the command and
+        # the job label to the host wrapper and returns its result. The
+        # per-host inhibitor command is covered by the backend tests.
+        seen: dict[str, Any] = {}
 
-    def test_wrap_linux(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
-        monkeypatch.setattr(
-            crony.shutil,
-            "which",
-            lambda n: "/x/systemd-inhibit" if n == "systemd-inhibit" else None,
-        )
-        argv, note = crony._keep_awake_argv(
-            ["/bin/sh", "-c", "true"], self._snap(True)
-        )
-        assert argv[0] == "/x/systemd-inhibit"
-        assert "--what=sleep:idle" in argv
-        assert "--" in argv
-        assert argv[-3:] == ["/bin/sh", "-c", "true"]
-        assert note is None
+        class _FakeHost:
+            def keep_awake_argv(
+                self, argv: list[str], label: str
+            ) -> tuple[list[str], str | None]:
+                seen["args"] = (argv, label)
+                return ["wrap", *argv], None
 
-    def test_missing_tool_runs_unwrapped_with_note(
-        self, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
-        monkeypatch.setattr(crony.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(crony, "_host", lambda: _FakeHost())
         argv, note = crony._keep_awake_argv(["true"], self._snap(True))
-        assert argv == ["true"]
-        assert note is not None and "caffeinate not found" in note
+        assert argv == ["wrap", "true"]
+        assert note is None
+        # The job's full name is passed through as the label.
+        assert seen["args"] == (["true"], "default.a")
 
     def test_run_job_wraps_command(
         self, tmp_path: Path, monkeypatch: Any

@@ -14,6 +14,7 @@ guarded with a darwin skipif.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import time
@@ -115,6 +116,29 @@ class TestDarwinKeychain:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         assert DarwinHost().keychain_secret("svc", None) is None
+
+
+class TestDarwinKeepAwake:
+    """DarwinHost.keep_awake_argv wraps the command in `caffeinate`;
+    shutil.which (which the backend uses) is stubbed."""
+
+    def test_wraps_with_caffeinate(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
+        )
+        argv, note = DarwinHost().keep_awake_argv(
+            ["/bin/sh", "-c", "true"], "default.a"
+        )
+        assert argv == ["/x/caffeinate", "-i", "-s", "/bin/sh", "-c", "true"]
+        assert note is None
+
+    def test_missing_caffeinate_runs_unwrapped(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        argv, note = DarwinHost().keep_awake_argv(["true"], "default.a")
+        assert argv == ["true"]
+        assert note is not None and "caffeinate not found" in note
 
 
 class TestDarwinInteractive:
