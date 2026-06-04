@@ -293,6 +293,35 @@ class TestSystemdUnitName:
         assert get_scheduler("linux", _DIR).unit_name("default.j", None) == ""
 
 
+class TestSystemdUnitPaths:
+    """unit_config_path is the `.service` (defines / runs the job);
+    unit_timer_path is the separate `.timer` (the schedule arm)."""
+
+    def test_scheduled_splits_service_and_timer(self, tmp_path: Path) -> None:
+        (tmp_path / "crony-default.j.service").write_text("x")
+        (tmp_path / "crony-default.j.timer").write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        assert sched.unit_config_path("default.j") == (
+            tmp_path / "crony-default.j.service"
+        )
+        assert sched.unit_timer_path("default.j") == (
+            tmp_path / "crony-default.j.timer"
+        )
+
+    def test_grouped_has_service_but_no_timer(self, tmp_path: Path) -> None:
+        (tmp_path / "crony-default.g.service").write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        assert sched.unit_config_path("default.g") == (
+            tmp_path / "crony-default.g.service"
+        )
+        assert sched.unit_timer_path("default.g") is None
+
+    def test_absent_paths_are_none(self, tmp_path: Path) -> None:
+        sched = get_scheduler("linux", tmp_path)
+        assert sched.unit_config_path("default.x") is None
+        assert sched.unit_timer_path("default.x") is None
+
+
 class TestSystemdDefaultUnitDir:
     """get_scheduler with no dir resolves the backend default under the
     user's home; an explicit dir overrides it."""

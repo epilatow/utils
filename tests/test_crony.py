@@ -8519,6 +8519,33 @@ class TestStatusReport:
         aliased = capsys.readouterr().out
         assert baseline == aliased
 
+    def test_cols_unit_files_alias_expands_to_config_and_timer(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `unit-files` is shorthand for both unit path columns; on Linux
+        # a scheduled job has a .service (config) and a .timer.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-files",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "UNIT CONFIG" in out
+        assert "UNIT TIMER" in out
+        assert "crony-default.j.service" in out
+        assert "crony-default.j.timer" in out
+
     def test_cols_default_combined_with_extra_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
@@ -9176,6 +9203,9 @@ class TestStatusReport:
             assert col in text
         # `all` is rendered as a label rather than the full list.
         assert "  all       all" in text
+        # `unit-files` expands to the two unit-path columns.
+        assert "unit-files" in text
+        assert "unit-config, unit-timer" in text
 
     def test_schedule_column_renders_cron_interval_and_grouped(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -11642,12 +11672,47 @@ class TestUnitOnlyOrphan:
         crony.do_destroy(jobs=["default.ghost"], bundle=None, orphans=False)
         assert not plist.exists()
 
+    def test_stray_timer_only_lands_in_unit_only(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A leftover `.timer` with no `.service` and no state dir (e.g.
+        # a botched manual cleanup) must still surface as an orphan with
+        # a synthetic ref the user can destroy -- the scheduler walks
+        # both unit kinds for installed_names.
+        h = self._setup(tmp_path, monkeypatch, platform="linux")
+        h.config({}, default_target_jobs=[])
+        timer = h.sysd / "crony-default.ghost.timer"
+        timer.parent.mkdir(parents=True, exist_ok=True)
+        timer.write_text("", encoding="utf-8")
+        config = crony.load_config()
+        ref = config.unit_only_by_full_name.get("default.ghost")
+        assert ref is not None
+        assert config.config_state(ref) == "orphan"
+        rt = config.runtime[ref]
+        # The orphan is the timer with no config unit on disk.
+        assert rt.unit_timer == timer
+        assert rt.unit_config is None
+
+    def test_destroy_wipes_stray_timer_by_name(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # status surfaces the orphan under its recoverable name, so the
+        # operator destroys it by name; remove_files unlinks the timer
+        # (and the absent service, tolerantly).
+        h = self._setup(tmp_path, monkeypatch, platform="linux")
+        h.config({}, default_target_jobs=[])
+        timer = h.sysd / "crony-default.ghost.timer"
+        timer.parent.mkdir(parents=True, exist_ok=True)
+        timer.write_text("", encoding="utf-8")
+        crony.do_destroy(jobs=["default.ghost"], bundle=None, orphans=False)
+        assert not timer.exists()
+
 
 class TestStatusUnitConfigColumn:
-    """`crony status --cols ...,unit-config` shows the on-disk
-    path of the platform unit file. The cell value comes from
-    `RuntimeState.unit_config` so subcommands don't re-walk the
-    unit dirs themselves.
+    """`crony status --cols ...,unit-config,unit-timer` shows the on-disk
+    paths of the platform config / timer units. The cell values come
+    from `RuntimeState.unit_config` / `unit_timer` so subcommands don't
+    re-walk the unit dirs themselves.
     """
 
     def test_unit_config_renders_plist_path(
@@ -11662,7 +11727,7 @@ class TestStatusUnitConfigColumn:
         monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
         crony.do_status(
             jobs=[],
-            cols="job,unit-config",
+            cols="job,unit-config,unit-timer",
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -11672,6 +11737,34 @@ class TestStatusUnitConfigColumn:
         out = capsys.readouterr().out
         assert "UNIT CONFIG" in out
         assert "org.crony.default.j.plist" in out
+        # launchd has no separate timer unit: the column renders empty.
+        assert "UNIT TIMER" in out
+        assert ".timer" not in out
+
+    def test_unit_config_and_timer_render_on_linux(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        crony.do_status(
+            jobs=[],
+            cols="job,unit-config,unit-timer",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        # The config unit is the .service; the schedule arm is the
+        # separate .timer.
+        assert "crony-default.j.service" in out
+        assert "crony-default.j.timer" in out
 
 
 class TestStatusExcludeHealthy:

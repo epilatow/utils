@@ -3148,16 +3148,18 @@ class RuntimeState:
     pending-only entities don't have one. Built once at load and
     never re-read.
 
-    `unit_config` is the path of the platform unit file (launchd
-    plist / systemd .service or .timer) when one is present, else
-    None -- captured here so subcommands read it from Config
-    rather than walking the platform unit directory themselves.
-    `unit_config is not None` is the "a unit file exists on disk"
-    test. The platform unit *file* presence and
-    the unit-drift check are captured here at load time; the live
-    scheduler enable/disable state is not -- status' UNIT axis
-    queries `_unit_state` on demand, since the scheduler view can
-    change between load and read.
+    `unit_config` is the path of the platform config unit -- the unit
+    that defines and runs the job -- when present, else None.
+    `unit_timer` is the path of the separate schedule-arming timer unit
+    when the platform has one, else None (None too on a platform whose
+    config unit carries its own schedule, and for an unscheduled entry).
+    Both are captured here so subcommands read them from Config rather
+    than walking the platform unit directory themselves; `unit_config is
+    not None` is the "a config unit exists on disk" test. The platform
+    unit *file* presence and the unit-drift check are captured here at
+    load time; the live scheduler enable/disable state is not -- status'
+    UNIT axis queries `_unit_state` on demand, since the scheduler view
+    can change between load and read.
 
     `unit_is_stale` is True when the platform install diverges
     from what the snapshot would render: missing or hand-edited
@@ -3178,6 +3180,7 @@ class RuntimeState:
     is_pending: bool
     has_user_trigger_flag: bool
     unit_config: Path | None = None
+    unit_timer: Path | None = None
     unit_is_stale: bool = False
 
 
@@ -3506,9 +3509,11 @@ def _read_runtime_state(
             is_running = True
 
     unit_config: Path | None = None
+    unit_timer: Path | None = None
     unit_is_stale = False
     if full_name is not None:
         unit_config = _platform_unit_config_path(full_name, platform)
+        unit_timer = _platform_unit_timer_path(full_name, platform)
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(snapshot, platform)
 
@@ -3519,6 +3524,7 @@ def _read_runtime_state(
         is_pending=(state_dir / "pending.flag").is_file(),
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
         unit_config=unit_config,
+        unit_timer=unit_timer,
         unit_is_stale=unit_is_stale,
     )
 
@@ -3734,9 +3740,11 @@ def load_config() -> Config:
             has_unit_file=True,
         )
         unit_only_by_full_name[full_name] = ref
-        # Make the platform path available through RuntimeState so
-        # status's unit-config column doesn't re-walk the unit dirs.
+        # Make the platform paths available through RuntimeState so
+        # status's unit-config / unit-timer columns don't re-walk the
+        # unit dirs.
         unit_config = _platform_unit_config_path(full_name, platform)
+        unit_timer = _platform_unit_timer_path(full_name, platform)
         runtime[ref] = RuntimeState(
             state_dir=_entity_state_dir(ref),
             last_run=None,
@@ -3744,6 +3752,7 @@ def load_config() -> Config:
             is_pending=False,
             has_user_trigger_flag=False,
             unit_config=unit_config,
+            unit_timer=unit_timer,
         )
 
     return Config(
@@ -5271,6 +5280,13 @@ def _platform_unit_config_path(name: str, platform: str) -> Path | None:
     """The on-disk platform config unit file backing `name`, or None.
     The status `unit-config` column reads this from `RuntimeState`."""
     return _scheduler(platform).unit_config_path(name)
+
+
+def _platform_unit_timer_path(name: str, platform: str) -> Path | None:
+    """The on-disk timer unit arming `name`'s schedule, or None when the
+    platform has no separate timer unit or the entry is unscheduled. The
+    status `unit-timer` column reads this from `RuntimeState`."""
+    return _scheduler(platform).unit_timer_path(name)
 
 
 def _dispatch_unit_path(name: str, platform: str) -> Path:
@@ -7049,6 +7065,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-name": "UNIT NAME",
     "uuid": "UUID",
     "unit-config": "UNIT CONFIG",
+    "unit-timer": "UNIT TIMER",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
@@ -7060,6 +7077,7 @@ _DEFAULT_STATUS_COLS: tuple[str, ...] = (
 _STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
     "default": _DEFAULT_STATUS_COLS,
     "all": tuple(_STATUS_COL_HEADERS.keys()),
+    "unit-files": ("unit-config", "unit-timer"),
 }
 
 
@@ -7149,10 +7167,15 @@ Columns
                     Sourced from the live config when the entry is still
                     defined, else from the on-disk snapshot for orphan rows.
                     Empty when neither side has a uuid to report.
-  unit-config       Filesystem path of the platform unit file
+  unit-config       Filesystem path of the platform config unit -- the
+                    unit that defines and runs the job
                     (`org.crony.<name>.plist` on macOS;
-                    `crony-<name>.{{timer,service}}` on Linux).
-                    Empty when no file exists on disk.
+                    `crony-<name>.service` on Linux). Empty when no
+                    config unit exists on disk.
+  unit-timer        Filesystem path of the schedule-arming timer unit
+                    (`crony-<name>.timer` on Linux). Always empty on
+                    macOS (the plist carries its own schedule) and for
+                    an unscheduled / grouped entry.
 
 Aliases
 -------
@@ -7919,10 +7942,13 @@ def do_status(
             job_cell = display_name
             job_or_uuid_cell = display_name
         uuid_cell = str(row_ref) if row_ref is not None else ""
-        # `unit-config`: the platform unit path captured at load time
-        # (uuid-keyed RuntimeState). Empty for entries with no runtime.
+        # `unit-config` / `unit-timer`: the platform unit paths captured
+        # at load time (uuid-keyed RuntimeState). Empty for entries with
+        # no runtime, and unit-timer is empty where the platform has no
+        # separate timer unit / for an unscheduled entry.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
+        unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
         built.append(
             (
                 config_name,
@@ -7940,6 +7966,7 @@ def do_status(
                     "unit-name": unit_name,
                     "uuid": uuid_cell,
                     "unit-config": unit_config_cell,
+                    "unit-timer": unit_timer_cell,
                 },
             )
         )

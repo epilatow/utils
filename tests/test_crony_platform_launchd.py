@@ -250,6 +250,24 @@ class TestLaunchdUnitName:
             )
 
 
+class TestLaunchdUnitPaths:
+    """unit_config_path is the plist; launchd has no separate timer
+    unit, so unit_timer_path is always None."""
+
+    def test_config_is_plist_timer_is_none(self, tmp_path: Path) -> None:
+        (tmp_path / "org.crony.default.j.plist").write_text("x")
+        sched = get_scheduler("darwin", tmp_path)
+        assert sched.unit_config_path("default.j") == (
+            tmp_path / "org.crony.default.j.plist"
+        )
+        assert sched.unit_timer_path("default.j") is None
+
+    def test_absent_config_is_none(self, tmp_path: Path) -> None:
+        sched = get_scheduler("darwin", tmp_path)
+        assert sched.unit_config_path("default.x") is None
+        assert sched.unit_timer_path("default.x") is None
+
+
 class TestLaunchdDefaultUnitDir:
     """get_scheduler with no dir resolves the backend default under the
     user's home; an explicit dir overrides it."""

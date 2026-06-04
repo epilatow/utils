@@ -214,13 +214,15 @@ class SystemdScheduler(Scheduler):
         return units
 
     def unit_config_path(self, name: str) -> Path | None:
-        # The .timer for a scheduled entry, else the .service for a
-        # group-only / transit entry.
-        timer = self.unit_dir / timer_filename(name)
-        if timer.is_file():
-            return timer
+        # The `.service` defines and runs the job (every entry has one,
+        # scheduled or grouped); the schedule lives in the separate
+        # `.timer` reported by unit_timer_path.
         service = self.unit_dir / service_filename(name)
         return service if service.is_file() else None
+
+    def unit_timer_path(self, name: str) -> Path | None:
+        timer = self.unit_dir / timer_filename(name)
+        return timer if timer.is_file() else None
 
     def dispatch_unit_path(self, name: str) -> Path:
         # `systemctl --user start crony-<name>.service` fires the

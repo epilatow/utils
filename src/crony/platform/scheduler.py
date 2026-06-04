@@ -96,7 +96,15 @@ class Scheduler(abc.ABC):
 
     @abc.abstractmethod
     def unit_config_path(self, name: str) -> Path | None:
-        """The on-disk unit file backing `name`, or None if absent."""
+        """The on-disk config unit file backing `name` -- the unit that
+        defines and runs the job (systemd `.service`, launchd plist) --
+        or None if absent."""
+
+    @abc.abstractmethod
+    def unit_timer_path(self, name: str) -> Path | None:
+        """The on-disk timer unit that arms `name`'s schedule (systemd
+        `.timer`), or None when the backend has no separate timer
+        (launchd) or the entry is unscheduled."""
 
     @abc.abstractmethod
     def dispatch_unit_path(self, name: str) -> Path:

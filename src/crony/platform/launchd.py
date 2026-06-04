@@ -204,6 +204,11 @@ class LaunchdScheduler(Scheduler):
         p = self.unit_dir / plist_filename(name)
         return p if p.is_file() else None
 
+    def unit_timer_path(self, _name: str) -> Path | None:
+        # A LaunchAgent carries its own schedule keys; there is no
+        # separate timer unit.
+        return None
+
     def dispatch_unit_path(self, name: str) -> Path:
         # launchctl kickstart targets the loaded plist by label.
         return self.unit_dir / plist_filename(name)
