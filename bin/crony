@@ -139,7 +139,7 @@ Subcommands fall into two categories:
 Plus operational subcommands: status, logs, trigger,
 notify-test, config, self-test.
 
-`trigger` asks the platform (launchd / systemd) to fire the unit
+`trigger` asks the platform scheduler to fire the unit
 immediately, the same path a scheduled fire would take. To run a
 job ad-hoc, use `crony trigger <name>` -- this guarantees the run
 uses the same execution context (env, gate, timeout, working dir)
@@ -567,7 +567,7 @@ class ConfigError(CronyError):
 
 
 class SubprocessError(subprocess.CalledProcessError, CronyError):
-    """Subprocess (launchctl, systemctl, etc) failed."""
+    """Subprocess (a scheduler / host command) failed."""
 
     exit_code = ExitCode.SUBPROCESS
 
@@ -901,7 +901,7 @@ class TomlBundle:
     The bundle name namespaces the bundle's job and group names: a
     short name `daily-update` defined in bundle `borgadm` has the
     full name `borgadm.daily-update` everywhere on disk
-    (state dir, launchd label, systemd unit).
+    (state dir, platform unit).
     """
 
     name: str
@@ -3213,8 +3213,7 @@ class Graph:
 class UnitOnlyOrphan:
     """A platform-side entity with no corresponding state dir.
 
-    Populated by `load_config` for any platform unit file
-    (launchd plist / systemd .service or .timer) whose
+    Populated by `load_config` for any platform unit file whose
     `<bundle>.<short>` doesn't match a current or broken entity.
     The synthetic uuid is `uuid.uuid5(NAMESPACE_DNS,
     "crony.unit-only/<full_name>")` -- deterministic so repeat
@@ -3884,10 +3883,10 @@ def _expand_env_value(raw: str, env: dict[str, str]) -> str:
 def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
-    The command runs from a platform unit (launchd on darwin,
-    `systemd --user` on linux), which hands the runner an already
-    minimal, curated environment. crony passes that inherited env
-    through unchanged: setting it up is the scheduler's job, and
+    The command runs from the platform scheduler's unit, which hands
+    the runner an already minimal, curated environment. crony passes
+    that inherited env through unchanged: setting it up is the
+    scheduler's job, and
     re-filtering it strips session locators a job may need --
     notably XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS, without
     which a job that shells out to `systemctl --user` (e.g. one
@@ -3983,7 +3982,7 @@ def _crony_executable() -> Path:
 def _uv_executable() -> Path:
     """Absolute path to `uv`, baked into platform unit files.
 
-    Platform schedulers (launchd, systemd) start a unit's program
+    The platform scheduler starts a unit's program
     with a minimal PATH that does not include $HOME/.local/bin or
     /opt/homebrew/bin. Crony's PEP 723 shebang `env -S uv run
     --script` therefore can't find uv and exits 127 before the
@@ -4000,8 +3999,8 @@ def _uv_executable() -> Path:
         raise PreconditionError(
             "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
             "before running `crony apply`. Platform units bake uv's "
-            "absolute path so launchd / systemd don't have to find it "
-            "on their minimal PATH."
+            "absolute path so the scheduler doesn't have to find it "
+            "on its minimal PATH."
         )
     return Path(path).resolve()
 
@@ -5380,7 +5379,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     `ref` must be a selected pending entry of `config` -- `do_apply`
     only applies what `config.pending` selected on this host. The
     full namespaced name `<bundle>.<short>` is what lands on disk
-    (plist / systemd unit identifier).
+    (the platform unit identifier).
 
     Every entry installs a platform unit, even schedule-less ones:
     a transit group's plist sits dormant until a parent dispatches
@@ -5786,10 +5785,8 @@ def _trigger_unit(
 ) -> None:
     """Ask the platform scheduler to fire `name` immediately.
 
-    On darwin, `launchctl kickstart` invokes the agent now (rather
-    than `launchctl start` which only queues the next scheduled
-    fire). On linux, `systemctl --user start <unit>.service` runs
-    the timer's underlying service directly.
+    Runs the unit now -- the scheduler's run-immediately path, as
+    opposed to queuing the next scheduled fire.
 
     Both platforms treat "trigger an already-running unit" as a
     no-op -- the in-flight run continues and there is no fresh
@@ -5813,8 +5810,8 @@ def _trigger_unit(
     Raises `UnitNotInstalledError` if the platform unit file
     doesn't exist. Refusing early matters for the group-dispatch
     path: a parent's snapshot can name a child whose unit was
-    destroyed (or never applied here), and we don't want
-    `systemctl start` to either traceback at the CLI or leave
+    destroyed (or never applied here), and we don't want the
+    scheduler's fire to either traceback at the CLI or leave
     side-effects (a created state dir, a hung waiter) before the
     caller can decide to soft-fail.
     """
@@ -6890,7 +6887,7 @@ def do_trigger(
 ) -> None:
     """Ask the platform scheduler to fire the named jobs.
 
-    `trigger` exercises the same launchd / systemd path a
+    `trigger` exercises the same platform-scheduler path a
     scheduled fire would, so the run uses the exact execution
     context (env, working dir, signal handling) the next
     scheduled invocation would use. This is the user-facing way
@@ -6900,11 +6897,11 @@ def do_trigger(
     only jobs (every entry installs a platform unit; schedule-
     less entries' units just sit dormant until kickstarted).
 
-    Default mode is async (matches `launchctl kickstart` /
-    `systemctl start`): the trigger returns as soon as the
-    platform has accepted it. With `--wait`, blocks until each
-    named entry's next completion and exits with that exit code
-    (the worst exit code across multiple names if more than one).
+    Default mode is async (the scheduler fires and returns): the
+    trigger returns as soon as the platform has accepted it. With
+    `--wait`, blocks until each named entry's next completion and exits
+    with that exit code (the worst exit code across multiple names if
+    more than one).
 
     `--trigger-timeout <sec>` (only with `--wait`) overrides the
     default 15s "trigger never produced a run" deadline.
@@ -8278,8 +8275,8 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     locates the state dir directly via `_entity_state_dir`,
     loads the pinned snapshot, and dispatches to the per-job or
     per-group pipeline. The wrapped command's exit code is
-    surfaced via SystemExit so it propagates to launchd /
-    systemd; cli() converts that into the process exit.
+    surfaced via SystemExit so it propagates to the platform
+    scheduler; cli() converts that into the process exit.
 
     When the pinned snapshot can't be loaded (missing, unreadable,
     wrong schema, unknown kind), the runner records a
@@ -9008,7 +9005,7 @@ def build_parser() -> argparse.ArgumentParser:
         "jobs",
         nargs="*",
         help=(
-            "Job names to trigger via launchd / systemctl. Omit "
+            "Job names to trigger via the platform scheduler. Omit "
             "when --bundle is given to trigger every stamped entry "
             "in that bundle."
         ),
