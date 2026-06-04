@@ -276,6 +276,11 @@ class LaunchdScheduler(Scheduler):
         self.deactivate(name)
         (self.unit_dir / plist_filename(name)).unlink(missing_ok=True)
 
+    def verify(self) -> None:
+        # launchd loads a logged-in user's agents automatically; there is
+        # no logout-survival toggle to check, so nothing to warn about.
+        return
+
     def enable(self, name: str) -> None:
         plist = self.unit_dir / plist_filename(name)
         subprocess.run(["launchctl", "enable", self._gui(name)], check=True)

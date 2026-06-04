@@ -10,6 +10,7 @@ which sits dormant until `crony trigger` or a parent group fires it.
 from __future__ import annotations
 
 import configparser
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 from crony.platform.scheduler import (
     UNIT_PREFIX,
     Scheduler,
+    SchedulerWarning,
     UnitState,
     exec_paths_from_argv,
 )
@@ -141,6 +143,51 @@ def _is_enabled(unit: str) -> str:
     return r.stdout.strip()
 
 
+def _current_user() -> str:
+    """Best-effort resolution of the invoking user's name, for the
+    linger check. Falls back through env vars and getpwuid so the
+    typical Unix shell environment is enough; '' when none answers."""
+    for env_key in ("USER", "LOGNAME"):
+        v = os.environ.get(env_key)
+        if v:
+            return v
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return ""
+
+
+def _linger_enabled(user: str) -> bool | None:
+    """True / False / None for "is linger enabled for `user`?"
+
+    Checks the world-readable sentinel file first so the common case is
+    a single stat() with no subprocess, then falls back to `loginctl
+    show-user --property=Linger`. None when neither path can answer (no
+    logind, command missing, etc.)."""
+    sentinel = Path(f"/var/lib/systemd/linger/{user}")
+    if sentinel.exists():
+        return True
+    try:
+        result = subprocess.run(
+            ["loginctl", "show-user", user, "--property=Linger"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip()
+    if line.endswith("=yes"):
+        return True
+    if line.endswith("=no"):
+        return False
+    return None
+
+
 class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
@@ -263,6 +310,27 @@ class SystemdScheduler(Scheduler):
         self.deactivate(name)
         (self.unit_dir / service_filename(name)).unlink(missing_ok=True)
         (self.unit_dir / timer_filename(name)).unlink(missing_ok=True)
+
+    def verify(self) -> None:
+        # Linger is what keeps the user's systemd manager running across
+        # logouts; without it a scheduled timer only fires while the
+        # user is logged in, so a "daily 03:00" job silently no-ops.
+        user = _current_user()
+        enabled = _linger_enabled(user) if user else None
+        if enabled is True:
+            return
+        if enabled is False:
+            raise SchedulerWarning(
+                f"linger is disabled for {user!r} -- scheduled jobs only "
+                "fire while you have an active login session. "
+                f"Fix: sudo loginctl enable-linger {user}"
+            )
+        who = repr(user) if user else "the current user"
+        raise SchedulerWarning(
+            f"could not determine whether linger is enabled for {who}; "
+            "scheduled jobs may only fire while you have an active login "
+            "session"
+        )
 
     def enable(self, name: str) -> None:
         subprocess.run(_SYSTEMCTL_ENABLE + [timer_filename(name)], check=True)

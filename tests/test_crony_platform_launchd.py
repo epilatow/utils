@@ -232,6 +232,11 @@ class TestLaunchdScheduler:
         # raise when destroyed.
         get_scheduler("darwin", tmp_path).remove_files("default.absent")
 
+    def test_verify_is_noop(self) -> None:
+        # launchd auto-loads a logged-in user's agents; there is no
+        # logout-survival toggle to warn about, so verify never raises.
+        assert get_scheduler("darwin", _DIR).verify() is None
+
 
 if __name__ == "__main__":
     from conftest import run_tests

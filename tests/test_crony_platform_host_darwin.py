@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -68,6 +69,52 @@ class TestDarwinWaitForPidExit:
         finally:
             proc.terminate()
             proc.wait()
+
+
+class TestDarwinKeychain:
+    """DarwinHost.keychain_secret shells out to `security`; the stdlib
+    subprocess (which the backend imports) is stubbed so these run on
+    any platform."""
+
+    def test_returns_secret_on_success(self, monkeypatch: Any) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv: list[str], **_k: object) -> Any:
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="sekret\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().keychain_secret("svc", "acct") == "sekret"
+        # `-s svc` precedes `-a acct`, and `-w` is the trailing flag.
+        argv = captured["argv"]
+        assert argv[argv.index("-s") + 1] == "svc"
+        assert argv[argv.index("-a") + 1] == "acct"
+        assert argv[-1] == "-w"
+
+    def test_omits_account_when_none(self, monkeypatch: Any) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv: list[str], **_k: object) -> Any:
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="x\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        DarwinHost().keychain_secret("svc", None)
+        assert "-a" not in captured["argv"]
+
+    def test_missing_item_returns_none(self, monkeypatch: Any) -> None:
+        def fake_run(argv: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(argv, 44, stdout="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().keychain_secret("svc", None) is None
+
+    def test_security_missing_returns_none(self, monkeypatch: Any) -> None:
+        def fake_run(*_a: object, **_k: object) -> Any:
+            raise FileNotFoundError("security not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().keychain_secret("svc", None) is None
 
 
 if __name__ == "__main__":

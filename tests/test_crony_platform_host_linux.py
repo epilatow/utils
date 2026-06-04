@@ -70,6 +70,13 @@ class TestLinuxWaitForPidExit:
             proc.wait()
 
 
+class TestLinuxKeychain:
+    def test_no_keychain_returns_none(self) -> None:
+        # Linux has no keychain integration; the resolver falls through
+        # to its env / file path.
+        assert LinuxHost().keychain_secret("svc", "acct") is None
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

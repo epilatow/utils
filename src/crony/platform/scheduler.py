@@ -41,6 +41,13 @@ class UnitState(enum.Enum):
     NONE = "none"
 
 
+class SchedulerWarning(Exception):
+    """A non-fatal scheduler-health problem worth surfacing to the
+    operator. Raised by `Scheduler.verify`; its message is operator-
+    facing and includes any recommended fix command, so a caller can
+    emit `str(exc)` verbatim."""
+
+
 def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
     """Validate a crony unit's argv and return its `(uv, crony)` paths.
 
@@ -127,6 +134,14 @@ class Scheduler(abc.ABC):
         """Deactivate `name` and unlink every unit file backing it.
         Tolerant of an already-absent unit / missing files so destroy
         never fails on a partial install."""
+
+    @abc.abstractmethod
+    def verify(self) -> None:
+        """Check host-level scheduler health. Returns None when healthy;
+        raises `SchedulerWarning` (carrying an operator-facing message,
+        with any recommended fix) for a non-fatal problem that would let
+        scheduled jobs silently misbehave. Status / validate call this
+        and surface the message."""
 
     @abc.abstractmethod
     def enable(self, name: str) -> None:

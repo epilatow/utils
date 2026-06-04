@@ -63,6 +63,7 @@ from crony.platform import (  # noqa: E402
     HostPlatform,
     PidWait,
     Scheduler,
+    SchedulerWarning,
     get_host,
     get_scheduler,
     launchd,
@@ -4105,41 +4106,21 @@ def _retrieve_secret(
     keychain_account: str | None = None,
     file_path: str | None,
 ) -> str | None:
-    """Look up a secret value from macOS Keychain or a 0600 file.
+    """Look up a secret value from the OS keychain or a 0600 file.
 
-    Tries `security find-generic-password` first when a keychain
-    service is configured and the host is darwin; falls back to
-    reading file_path if the file exists. `keychain_account` is
-    optional and disambiguates when multiple keychain items share the
-    same service name (the (service, account) pair is the keychain's
-    composite identity for generic-password items). Returns None if
-    no source is configured or the keychain lookup fails on a darwin
-    host. Raises PreconditionError if a secrets file exists but its
-    mode allows group / world access -- a config-time check that
-    surfaces leaked-credential risk before the runtime path tries to
-    use it.
+    Tries the host keychain first when a keychain service is configured,
+    then falls back to reading file_path if the file exists.
+    `keychain_account` is optional and disambiguates when multiple
+    keychain items share the same service name. Returns None if no
+    source is configured or yields a value. Raises PreconditionError if
+    a secrets file exists but its mode allows group / world access -- a
+    config-time check that surfaces leaked-credential risk before the
+    runtime path tries to use it.
     """
-    if keychain_service is not None and sys.platform == "darwin":
-        argv = [
-            "security",
-            "find-generic-password",
-            "-s",
-            keychain_service,
-        ]
-        if keychain_account is not None:
-            argv.extend(["-a", keychain_account])
-        argv.append("-w")
-        try:
-            r = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if r.returncode == 0:
-                return r.stdout.rstrip("\n")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+    if keychain_service is not None:
+        secret = _host().keychain_secret(keychain_service, keychain_account)
+        if secret is not None:
+            return secret
     if file_path is not None:
         p = Path(os.path.expanduser(file_path))
         if p.exists():
@@ -5770,67 +5751,6 @@ def _platform_unit_names() -> set[str]:
 # config but `disabled` at runtime because the user paused it. apply
 # preserves this state across re-renders so a hand-disabled job stays
 # off when the user runs `crony apply` to push other changes.
-
-
-def _current_user() -> str:
-    """Best-effort resolution of the invoking user's name.
-
-    Used for linger lookup. Falls back through env vars and getpwuid
-    in turn so the typical Unix shell environment is enough.
-    """
-    for env_key in ("USER", "LOGNAME"):
-        v = os.environ.get(env_key)
-        if v:
-            return v
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except (ImportError, KeyError):
-        return ""
-
-
-def linger_enabled(user: str | None = None) -> bool | None:
-    """Return True/False/None for "is linger enabled for this user?"
-
-    Linger keeps a user's systemd manager running across logouts, which
-    is what allows scheduled timers to fire when the user isn't logged
-    in. Without it, a "daily 03:00" job silently no-ops.
-
-    Order of operations: check the world-readable sentinel file first
-    so the common case is a single stat() with no subprocess. Fall
-    back to `loginctl show-user --property=Linger` for systems that
-    expose linger differently. Returns None when neither path can
-    answer (no logind, command missing, etc.).
-    """
-    name = user or _current_user()
-    if not name:
-        return None
-    sentinel = Path(f"/var/lib/systemd/linger/{name}")
-    if sentinel.exists():
-        return True
-    try:
-        result = subprocess.run(
-            [
-                "loginctl",
-                "show-user",
-                name,
-                "--property=Linger",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    line = result.stdout.strip()
-    if line.endswith("=yes"):
-        return True
-    if line.endswith("=no"):
-        return False
-    return None
 
 
 def _unit_state(name: str, platform: str) -> str:
@@ -7890,15 +7810,10 @@ def do_status(
             if n.startswith(f"{bundle}.")
         }
 
-    if platform == "linux":
-        ling = linger_enabled()
-        if ling is False:
-            user = _current_user()
-            logger.warning(
-                "linger DISABLED -- jobs only fire while you have "
-                "an active session. Fix: sudo loginctl enable-linger %s",
-                user,
-            )
+    try:
+        _scheduler(platform).verify()
+    except SchedulerWarning as warn:
+        logger.warning("%s", warn)
 
     # Surface bundle parse failures at the top of the report so
     # the operator sees them before scanning the table. The table
@@ -8778,12 +8693,11 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     platform = current_platform()
 
     warnings: list[str] = []
-    if bundle is None and platform == "linux":
-        ling = linger_enabled()
-        if ling is False:
-            warnings.append(f"linger DISABLED for {_current_user()}")
-        elif ling is None:
-            warnings.append("linger status unknown")
+    if bundle is None:
+        try:
+            _scheduler(platform).verify()
+        except SchedulerWarning as warn:
+            warnings.append(str(warn))
 
     target_bundles = (
         [b for b in bundles.bundles if b.name == bundle]

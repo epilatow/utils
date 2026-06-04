@@ -19,7 +19,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.platform import get_scheduler, systemd  # noqa: E402
+from crony.platform import (  # noqa: E402
+    SchedulerWarning,
+    get_scheduler,
+    systemd,
+)
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
@@ -147,6 +151,58 @@ class TestSystemdScheduler:
         # A schedule-less entry has no .timer; remove_files tolerates the
         # missing file rather than failing the destroy.
         get_scheduler("linux", tmp_path).remove_files("default.absent")
+
+
+class TestSystemdVerify:
+    """verify() reports linger health: silent when enabled, a
+    SchedulerWarning (with the enable-linger fix) when disabled, and a
+    SchedulerWarning when it can't be determined. The linger probe and
+    user resolution are stubbed."""
+
+    def test_enabled_is_silent(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(systemd, "_current_user", lambda: "bob")
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: True)
+        assert get_scheduler("linux", _DIR).verify() is None
+
+    def test_disabled_warns_with_fix(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(systemd, "_current_user", lambda: "bob")
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: False)
+        with pytest.raises(SchedulerWarning) as exc:
+            get_scheduler("linux", _DIR).verify()
+        assert "sudo loginctl enable-linger bob" in str(exc.value)
+
+    def test_unknown_warns(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(systemd, "_current_user", lambda: "bob")
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: None)
+        with pytest.raises(SchedulerWarning, match="could not determine"):
+            get_scheduler("linux", _DIR).verify()
+
+    def test_linger_probe_reads_sentinel(self, monkeypatch: Any) -> None:
+        # The probe checks the world-readable sentinel first.
+        monkeypatch.setattr(
+            Path,
+            "exists",
+            lambda self: str(self) == "/var/lib/systemd/linger/bob",
+        )
+        assert systemd._linger_enabled("bob") is True
+
+    def test_linger_probe_loginctl_no(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(Path, "exists", lambda _self: False)
+
+        def fake_run(*_a: object, **_k: object) -> Any:
+            return subprocess.CompletedProcess([], 0, stdout="Linger=no\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert systemd._linger_enabled("bob") is False
+
+    def test_linger_probe_loginctl_missing(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(Path, "exists", lambda _self: False)
+
+        def fake_run(*_a: object, **_k: object) -> Any:
+            raise FileNotFoundError("loginctl not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert systemd._linger_enabled("bob") is None
 
 
 @pytest.mark.skipif(

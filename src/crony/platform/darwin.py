@@ -3,12 +3,13 @@
 """macOS (`darwin`) host-platform backend.
 
 Implements the `HostPlatform` services on darwin: a kqueue-based
-pid-exit wait.
+pid-exit wait and a Keychain-backed secret lookup.
 """
 
 from __future__ import annotations
 
 import select
+import subprocess
 
 from crony.platform.host import HostPlatform, PidWait
 
@@ -41,3 +42,16 @@ class DarwinHost(HostPlatform):
             return PidWait.EXITED if events else PidWait.TIMED_OUT
         finally:
             kq.close()
+
+    def keychain_secret(self, service: str, account: str | None) -> str | None:
+        argv = ["security", "find-generic-password", "-s", service]
+        if account is not None:
+            argv.extend(["-a", account])
+        argv.append("-w")
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode == 0:
+            return r.stdout.rstrip("\n")
+        return None

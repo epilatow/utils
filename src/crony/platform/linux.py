@@ -3,7 +3,8 @@
 """Linux host-platform backend.
 
 Implements the `HostPlatform` services on Linux: a pidfd-based pid-exit
-wait.
+wait. Linux has no keychain integration, so `keychain_secret` reports
+None and the credential resolver falls through to its env / file path.
 """
 
 from __future__ import annotations
@@ -30,3 +31,10 @@ class LinuxHost(HostPlatform):
             return PidWait.EXITED if events else PidWait.TIMED_OUT
         finally:
             os.close(fd)
+
+    def keychain_secret(
+        self, _service: str, _account: str | None
+    ) -> str | None:
+        # No OS keychain integration on Linux; the resolver's env / file
+        # fallback owns the secret here.
+        return None

@@ -6,10 +6,11 @@ Two sibling interfaces, each selected by the same platform string (as
 produced by the entry script's platform detection):
 
 - `Scheduler` (get_scheduler) renders and manages the per-host scheduler
-  units, bound to the unit directory the caller manages.
+  units, bound to the unit directory the caller manages, and verifies
+  host-level scheduler health (raising `SchedulerWarning`).
 - `HostPlatform` (get_host) brokers the non-unit host-OS services the
-  runner and config tooling reach for (currently the runner's pid-exit
-  wait).
+  runner and config tooling reach for (the runner's pid-exit wait and
+  the keychain secret lookup).
 
 The launchd / systemd modules are re-exported so callers can reach their
 pure filename helpers without importing the submodules directly; the
@@ -26,7 +27,12 @@ from crony.platform.darwin import DarwinHost
 from crony.platform.host import HostPlatform, PidWait
 from crony.platform.launchd import LaunchdScheduler
 from crony.platform.linux import LinuxHost
-from crony.platform.scheduler import UNIT_PREFIX, Scheduler, UnitState
+from crony.platform.scheduler import (
+    UNIT_PREFIX,
+    Scheduler,
+    SchedulerWarning,
+    UnitState,
+)
 from crony.platform.systemd import SystemdScheduler
 
 __all__ = [
@@ -37,6 +43,7 @@ __all__ = [
     "LinuxHost",
     "PidWait",
     "Scheduler",
+    "SchedulerWarning",
     "SystemdScheduler",
     "UnitState",
     "get_host",

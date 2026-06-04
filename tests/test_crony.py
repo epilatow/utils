@@ -4237,7 +4237,7 @@ class TestTriggerUnitNotInstalled:
 
 
 class TestSecretRetrieval:
-    """_retrieve_secret reads from Keychain (mac) or 0600 file."""
+    """_retrieve_secret reads from the host keychain or a 0600 file."""
 
     def test_returns_none_when_no_source(self) -> None:
         assert (
@@ -4272,69 +4272,51 @@ class TestSecretRetrieval:
         with pytest.raises(crony.PreconditionError, match="secret directory"):
             crony._retrieve_secret(keychain_service=None, file_path=str(f))
 
-    def test_keychain_falls_back_to_file_on_failure(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # When the keychain lookup fails (non-darwin or item missing),
-        # the function should try the file_path as a fallback.
-        f = tmp_path / "secret"
-        f.write_text("from-file")
-        f.chmod(0o600)
-        # Pretend we're on linux so the keychain branch is skipped
-        # entirely.
-        monkeypatch.setattr(crony.sys, "platform", "linux")
-        assert (
-            crony._retrieve_secret(
-                keychain_service="missing-item", file_path=str(f)
-            )
-            == "from-file"
-        )
+    def test_keychain_hit_returns_secret(self, monkeypatch: Any) -> None:
+        # _retrieve_secret returns the host keychain value, passing the
+        # (service, account) pair through verbatim and not consulting
+        # file_path. (The per-host keychain command is covered by the
+        # backend tests in test_crony_platform_host_darwin.py.)
+        seen: dict[str, Any] = {}
 
-    def test_account_passed_as_dash_a(self, monkeypatch: Any) -> None:
-        # When keychain_account is set, `security` is invoked with
-        # `-a <account>` after `-s <service>` so the lookup picks the
-        # right item among multiple sharing a service name.
-        captured: dict[str, Any] = {}
+        class _FakeHost:
+            def keychain_secret(
+                self, service: str, account: str | None
+            ) -> str | None:
+                seen["args"] = (service, account)
+                return "thesecret"
 
-        def _fake_run(argv: list[str], **_kwargs: object) -> Any:
-            captured["argv"] = argv
-            import subprocess as _sp
-
-            return _sp.CompletedProcess(
-                args=argv, returncode=0, stdout="thesecret\n", stderr=""
-            )
-
-        monkeypatch.setattr(crony.sys, "platform", "darwin")
-        monkeypatch.setattr(crony.subprocess, "run", _fake_run)
+        monkeypatch.setattr(crony, "_host", lambda: _FakeHost())
         secret = crony._retrieve_secret(
             keychain_service="svc",
             keychain_account="acct",
             file_path=None,
         )
         assert secret == "thesecret"
-        # `-s svc` precedes `-a acct`, and `-w` is the trailing flag.
-        argv = captured["argv"]
-        assert "-s" in argv and argv[argv.index("-s") + 1] == "svc"
-        assert "-a" in argv and argv[argv.index("-a") + 1] == "acct"
-        assert argv[-1] == "-w"
+        assert seen["args"] == ("svc", "acct")
 
-    def test_no_account_omits_dash_a(self, monkeypatch: Any) -> None:
-        # Without keychain_account, no `-a` is passed -- preserves
-        # the prior behavior for users who don't need to disambiguate.
-        captured: dict[str, Any] = {}
+    def test_keychain_falls_back_to_file_on_miss(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # When the host keychain yields nothing (no item, or a host with
+        # no keychain), _retrieve_secret falls back to file_path.
+        f = tmp_path / "secret"
+        f.write_text("from-file")
+        f.chmod(0o600)
 
-        def _fake_run(argv: list[str], **_kwargs: object) -> Any:
-            captured["argv"] = argv
-            import subprocess as _sp
+        class _NoKeychainHost:
+            def keychain_secret(
+                self, _service: str, _account: str | None
+            ) -> str | None:
+                return None
 
-            return _sp.CompletedProcess(
-                args=argv, returncode=0, stdout="x\n", stderr=""
+        monkeypatch.setattr(crony, "_host", lambda: _NoKeychainHost())
+        assert (
+            crony._retrieve_secret(
+                keychain_service="missing-item", file_path=str(f)
             )
-
-        monkeypatch.setattr(crony.sys, "platform", "darwin")
-        monkeypatch.setattr(crony.subprocess, "run", _fake_run)
-        crony._retrieve_secret(keychain_service="svc", file_path=None)
-        assert "-a" not in captured["argv"]
+            == "from-file"
+        )
 
 
 class TestEmailNotify:
@@ -6808,27 +6790,48 @@ class TestBrokenPipeHandler:
 # =============================================================================
 
 
-class TestLingerDetection:
-    def test_returns_none_no_user(self, monkeypatch: Any) -> None:
-        monkeypatch.delenv("USER", raising=False)
-        monkeypatch.delenv("LOGNAME", raising=False)
-        monkeypatch.setattr(crony.os, "getuid", lambda: -1)
-        assert crony.linger_enabled(user=None) is None
+class TestSchedulerVerifyEmission:
+    """status / validate run Scheduler.verify and surface its
+    SchedulerWarning -- here the systemd linger-disabled case. The
+    per-backend verify logic itself lives in
+    test_crony_platform_{launchd,systemd}.py."""
 
-    def test_sentinel_file_present(
-        self, tmp_path: Path, monkeypatch: Any
+    def test_validate_surfaces_warning(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        sentinel = tmp_path / "edp"
-        sentinel.touch()
-        real_path = crony.Path
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: False)
+        with pytest.raises(SystemExit) as exc:
+            crony.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(crony.ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "linger is disabled" in out
+        assert "enable-linger" in out
 
-        def fake_path(p: Any) -> Path:
-            if str(p) == "/var/lib/systemd/linger/edp":
-                return sentinel
-            return Path(real_path(p))
-
-        monkeypatch.setattr(crony, "Path", fake_path)
-        assert crony.linger_enabled(user="edp") is True
+    def test_status_logs_warning(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: False)
+        with caplog.at_level(logging.WARNING):
+            crony.do_status(
+                jobs=[],
+                cols=None,
+                show_masked=False,
+                bundle=None,
+                config_current=False,
+                config_pending=False,
+                exclude_healthy=False,
+            )
+        assert "enable-linger" in caplog.text
 
 
 class TestUnitStateDarwin:
