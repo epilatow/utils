@@ -2,9 +2,14 @@
 
 """crony's importable library code.
 
-`bin/crony` is the entry script; the reusable pieces it composes live
-here as importable modules -- the exit codes and exception hierarchy
-(`crony.errors`), the platform-neutral unit value objects
-(`crony.unit`), and the per-host scheduler / host backends
-(`crony.platform`).
+The package root defines `BASENAME`, the tool's identity string (its env
+prefix and default config / state paths derive from it). The reusable
+pieces `bin/crony` composes live here as importable modules -- the path
+foundation (`crony.paths`), the exit codes and exception hierarchy
+(`crony.errors`), the platform-neutral unit value objects (`crony.unit`),
+and the per-host scheduler / host backends (`crony.platform`).
 """
+
+from __future__ import annotations
+
+BASENAME: str = "crony"
