@@ -55,7 +55,16 @@ import tomlkit.exceptions
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from crony.errors import (  # noqa: E402
+    ConfigError,
+    CronyError,
+    ExitCode,
+    LockBusyError,
+    PreconditionError,
+    TriggerStartTimeout,
+    UnitNotInstalledError,
+    UsageError,
+)
 from crony.platform import (  # noqa: E402
     HostPlatform,
     PidWait,
@@ -521,88 +530,6 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # jobs            = ["brew-update", "git-pull-utils"]
 # notify_channels = []   # no external dispatch (run.log + last-run.json only)
 """
-
-
-# =============================================================================
-# EXIT CODES
-# =============================================================================
-
-
-class ExitCode(ExitCodeBase):
-    SUCCESS = CommonExitCode.SUCCESS
-    WARNING = CommonExitCode.WARNING
-    USAGE = CommonExitCode.USAGE
-    CONFIG = CommonExitCode.CONFIG
-    ERROR = CommonExitCode.ERROR
-    SUBPROCESS = CommonExitCode.SUBPROCESS
-    TIMEOUT = CommonExitCode.TIMEOUT
-    LOCK_BUSY = 10, "run.lock held by another instance"
-    PRECONDITION = 11, "run precondition failed before exec"
-
-
-# =============================================================================
-# EXCEPTIONS
-# =============================================================================
-
-
-class CronyError(RuntimeError):
-    """Base exception for crony errors."""
-
-    exit_code: ExitCode = ExitCode.ERROR
-
-
-class UsageError(CronyError):
-    """Bad argument or unknown subcommand."""
-
-    exit_code = ExitCode.USAGE
-
-
-class ConfigError(CronyError):
-    """Unparseable or invalid config."""
-
-    exit_code = ExitCode.CONFIG
-
-
-class SubprocessError(subprocess.CalledProcessError, CronyError):
-    """Subprocess (a scheduler / host command) failed."""
-
-    exit_code = ExitCode.SUBPROCESS
-
-
-class LockBusyError(CronyError):
-    """`crony run` could not acquire the per-job lock."""
-
-    exit_code = ExitCode.LOCK_BUSY
-
-
-class PreconditionError(CronyError):
-    """`crony run` precondition failed before exec."""
-
-    exit_code = ExitCode.PRECONDITION
-
-
-class JobTimeoutError(CronyError):
-    """`crony run` killed the wrapped command on timeout."""
-
-    exit_code = ExitCode.TIMEOUT
-
-
-class UnitNotInstalledError(PreconditionError):
-    """A dispatcher was asked to fire a unit that isn't installed
-    on this host.
-
-    Surfaces from `_trigger_unit` when the platform unit file the
-    dispatcher would reach for doesn't exist. The typical cause
-    is a parent group whose snapshot still references a child
-    that was destroyed (or never applied here): `crony apply`
-    re-pins the parent's snapshot to drop the stale reference.
-    Caught and soft-failed by `run_group` so a single missing
-    child doesn't take down a whole group run. Inherits
-    `PreconditionError`'s `PRECONDITION` exit code so the
-    "precondition failed before exec" framing is consistent at
-    the exit-code level even though the specialization carries
-    the more specific message.
-    """
 
 
 # =============================================================================
@@ -5864,18 +5791,6 @@ def _consume_user_trigger_flag(state_dir: Path) -> bool:
     except FileNotFoundError:
         return False
     return True
-
-
-class TriggerStartTimeout(JobTimeoutError):
-    """The platform never produced a runner within
-    `trigger_timeout_sec` after we asked it to fire the unit.
-    Suggests a broken plist / unit, a stalled scheduler queue, or
-    the unit not being loaded (run `crony apply` first).
-
-    Subclass of `JobTimeoutError` so it shares the TIMEOUT exit
-    code; the specialization conveys 'the trigger never started'
-    rather than 'the runner exceeded its timeout'.
-    """
 
 
 def _read_pid_file(pid_path: Path) -> int | None:

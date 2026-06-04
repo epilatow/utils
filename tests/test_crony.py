@@ -32,7 +32,6 @@ import pytest
 import tomlkit
 from conftest import (
     CmdCallbacksBase,
-    ExceptionHierarchyBase,
     SentinelHomeBase,
     UnknownArgRoutedToSubparserBase,
 )
@@ -46,6 +45,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
@@ -177,17 +177,6 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
             )
 
 
-class TestExceptionHierarchy(ExceptionHierarchyBase):
-    """Verify every non-excluded ExitCode has a matching exception."""
-
-    BASE_ERROR = crony.CronyError
-    EXIT_CODE = crony.ExitCode
-    EXCLUDED_CODES = {
-        crony.ExitCode.SUCCESS,
-        crony.ExitCode.WARNING,
-    }
-
-
 class TestHelpOutput:
     """`crony --help` surfaces the design block appended to the epilog."""
 
@@ -230,7 +219,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
         (crony.UsageError("t"), crony.ExitCode.USAGE),
         (crony.ConfigError("t"), crony.ExitCode.CONFIG),
         (
-            crony.SubprocessError(1, ["bogus"]),
+            SubprocessError(1, ["bogus"]),
             crony.ExitCode.SUBPROCESS,
         ),
         (crony.LockBusyError("t"), crony.ExitCode.LOCK_BUSY),
@@ -239,7 +228,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             crony.ExitCode.PRECONDITION,
         ),
         (
-            crony.JobTimeoutError("t"),
+            JobTimeoutError("t"),
             crony.ExitCode.TIMEOUT,
         ),
         (RuntimeError("t"), crony.ExitCode.ERROR),

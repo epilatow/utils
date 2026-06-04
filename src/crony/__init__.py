@@ -2,8 +2,9 @@
 
 """crony's importable library code.
 
-The crony CLI itself lives in the bin/crony script, which owns the
-domain model (Job, JobGroup, Config) and the command handlers. This
-package holds the pieces bin/crony imports, starting with the
-platform-neutral unit model (`crony.unit`).
+`bin/crony` is the entry script; the reusable pieces it composes live
+here as importable modules -- the exit codes and exception hierarchy
+(`crony.errors`), the platform-neutral unit value objects
+(`crony.unit`), and the per-host scheduler / host backends
+(`crony.platform`).
 """
