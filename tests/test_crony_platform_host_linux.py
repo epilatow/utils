@@ -77,6 +77,31 @@ class TestLinuxKeychain:
         assert LinuxHost().keychain_secret("svc", "acct") is None
 
 
+class TestLinuxNoDesktop:
+    """Desktop interaction is unsupported on Linux: supports_interactive
+    is False and the idle / lock / dialog ops raise rather than silently
+    no-op."""
+
+    def test_does_not_support_interactive(self) -> None:
+        assert LinuxHost().supports_interactive is False
+
+    def test_hid_idle_raises(self) -> None:
+        with pytest.raises(NotImplementedError):
+            LinuxHost().hid_idle_seconds()
+
+    def test_screen_locked_raises(self) -> None:
+        with pytest.raises(NotImplementedError):
+            LinuxHost().screen_locked()
+
+    def test_show_dialog_raises(self) -> None:
+        with pytest.raises(NotImplementedError):
+            LinuxHost().show_dialog("t", "b", ["No", "Yes"])
+
+    def test_show_failure_dialog_raises(self) -> None:
+        with pytest.raises(NotImplementedError):
+            LinuxHost().show_failure_dialog("t", "b")
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

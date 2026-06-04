@@ -117,6 +117,137 @@ class TestDarwinKeychain:
         assert DarwinHost().keychain_secret("svc", None) is None
 
 
+class TestDarwinInteractive:
+    """The desktop-interaction primitives. supports_interactive is True;
+    the idle / lock / dialog ops build ioreg / osascript invocations,
+    with the stdlib subprocess stubbed so these run on any platform."""
+
+    def test_supports_interactive(self) -> None:
+        assert DarwinHost().supports_interactive is True
+
+    def test_hid_idle_parses_nanoseconds(self, monkeypatch: Any) -> None:
+        sample = (
+            '  | |   "HIDIdleTime" = 7500000000\n'
+            '  | |   "HIDKeyboardCapsLockOn" = No\n'
+        )
+
+        def fake_run(*a: Any, **_k: object) -> Any:
+            return subprocess.CompletedProcess(a, 0, stdout=sample, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().hid_idle_seconds() == 7.5
+
+    def test_hid_idle_missing_field_returns_zero(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*a: Any, **_k: object) -> Any:
+            return subprocess.CompletedProcess(a, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().hid_idle_seconds() == 0.0
+
+    def test_hid_idle_subprocess_failure_returns_zero(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*_a: object, **_k: object) -> Any:
+            raise FileNotFoundError("ioreg not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().hid_idle_seconds() == 0.0
+
+    def test_screen_locked_yes(self, monkeypatch: Any) -> None:
+        out = (
+            "IOConsoleUsers = "
+            '({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserNameKey"="me"})'
+        )
+
+        def fake_run(*a: Any, **_k: object) -> Any:
+            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().screen_locked() is True
+
+    def test_screen_locked_no(self, monkeypatch: Any) -> None:
+        out = 'IOConsoleUsers = ({"kCGSSessionUserNameKey"="me"})'
+
+        def fake_run(*a: Any, **_k: object) -> Any:
+            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().screen_locked() is False
+
+    def test_show_dialog_returns_clicked_button(self, monkeypatch: Any) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="button returned:Run Job\n", stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        clicked = DarwinHost().show_dialog(
+            "crony: j", "go?", ["Cancel Job", "Delay Job", "Run Job"]
+        )
+        assert clicked == "Run Job"
+        script = captured["cmd"][2]
+        # The last button is the AppleScript default, the first the
+        # cancel button.
+        assert 'default button "Run Job"' in script
+        assert 'cancel button "Cancel Job"' in script
+
+    def test_show_dialog_exact_match_not_substring(
+        self, monkeypatch: Any
+    ) -> None:
+        # A button label that is a substring of another must not shadow
+        # it: clicking "Run" returns "Run", not "Run Job".
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="button returned:Run\n", stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().show_dialog("t", "b", ["Run Job", "Run"]) == "Run"
+
+    def test_show_dialog_nonzero_returns_empty(self, monkeypatch: Any) -> None:
+        # osascript exits non-zero when the cancel button is clicked.
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().show_dialog("t", "b", ["No", "Yes"]) == ""
+
+    def test_show_dialog_osascript_missing_returns_empty(
+        self, monkeypatch: Any
+    ) -> None:
+        def fake_run(*_a: object, **_k: object) -> Any:
+            raise FileNotFoundError("osascript not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().show_dialog("t", "b", ["No", "Yes"]) == ""
+
+    def test_failure_dialog_escapes_and_detaches(
+        self, monkeypatch: Any
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_popen(cmd: list[str], **kwargs: object) -> Any:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return None
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        DarwinHost().show_failure_dialog("crony: boom", 'a "q" \\ b')
+        assert captured["cmd"][0:2] == ["osascript", "-e"]
+        script = captured["cmd"][2]
+        assert "display dialog" in script
+        # Raw quotes / backslashes from the body arrive escaped.
+        assert '\\"q\\"' in script
+        assert "\\\\ b" in script
+        # Detached so the modal can't stall the runner.
+        assert captured["kwargs"].get("start_new_session") is True
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

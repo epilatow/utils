@@ -9,8 +9,9 @@ produced by the entry script's platform detection):
   units, bound to the unit directory the caller manages, and verifies
   host-level scheduler health (raising `SchedulerWarning`).
 - `HostPlatform` (get_host) brokers the non-unit host-OS services the
-  runner and config tooling reach for (the runner's pid-exit wait and
-  the keychain secret lookup).
+  runner and config tooling reach for (the runner's pid-exit wait, the
+  keychain secret lookup, and the desktop-interaction primitives for
+  interactive jobs).
 
 The launchd / systemd modules are re-exported so callers can reach their
 pure filename helpers without importing the submodules directly; the

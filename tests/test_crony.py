@@ -22,7 +22,9 @@ import shutil
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, create_autospec, patch
 
@@ -13002,69 +13004,21 @@ class TestLifecycleSmoke:
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
+def _idle_lock_host(
+    *,
+    idle: Callable[[], float],
+    locked: Callable[[], bool],
+) -> SimpleNamespace:
+    """A stand-in HostPlatform exposing just the idle / lock probes the
+    interactive wait reads."""
+    return SimpleNamespace(hid_idle_seconds=idle, screen_locked=locked)
+
+
 class TestInteractiveHelpers:
-    """Unit tests for the darwin idle / lock / dialog helpers."""
-
-    def test_hid_idle_parses_nanoseconds(self, monkeypatch: Any) -> None:
-        sample = (
-            '  | |   "HIDIdleTime" = 7500000000\n'
-            '  | |   "HIDKeyboardCapsLockOn" = No\n'
-        )
-
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(a, 0, stdout=sample, stderr="")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._darwin_hid_idle_seconds() == 7.5
-
-    def test_hid_idle_missing_field_returns_zero(
-        self, monkeypatch: Any
-    ) -> None:
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(a, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._darwin_hid_idle_seconds() == 0.0
-
-    def test_hid_idle_subprocess_failure_returns_zero(
-        self, monkeypatch: Any
-    ) -> None:
-        def fake_run(
-            *_args: object, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            raise FileNotFoundError("ioreg not found")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._darwin_hid_idle_seconds() == 0.0
-
-    def test_screen_locked_yes(self, monkeypatch: Any) -> None:
-        out = (
-            "IOConsoleUsers = "
-            '({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserNameKey"="me"})'
-        )
-
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._darwin_screen_locked() is True
-
-    def test_screen_locked_no(self, monkeypatch: Any) -> None:
-        out = 'IOConsoleUsers = ({"kCGSSessionUserNameKey"="me"})'
-
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._darwin_screen_locked() is False
+    """The interactive wait / delay / dialog-mapping orchestration in
+    bin/crony, driven against a stubbed HostPlatform. The backend idle /
+    lock / dialog primitives are covered in
+    test_crony_platform_host_darwin.py."""
 
     def test_wait_returns_after_continuous_active(
         self, monkeypatch: Any
@@ -13076,10 +13030,10 @@ class TestInteractiveHelpers:
         # active poll records active_since = (30 - 10) = 20s; the
         # accumulator hits 120s when monotonic reaches 140 (poll 5).
         idle_values = iter([100.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
-        monkeypatch.setattr(
-            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        host = _idle_lock_host(
+            idle=lambda: next(idle_values), locked=lambda: False
         )
-        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        monkeypatch.setattr(crony, "_host", lambda: host)
         now = [0.0]
         monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
         monkeypatch.setattr(
@@ -13096,10 +13050,10 @@ class TestInteractiveHelpers:
         idle_values = iter(
             [10.0, 10.0, 200.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
         )
-        monkeypatch.setattr(
-            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        host = _idle_lock_host(
+            idle=lambda: next(idle_values), locked=lambda: False
         )
-        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        monkeypatch.setattr(crony, "_host", lambda: host)
         now = [0.0]
         monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
         monkeypatch.setattr(
@@ -13111,10 +13065,10 @@ class TestInteractiveHelpers:
         # Even with idle == 0, a locked screen prevents the active
         # accumulator from advancing.
         locked_values = iter([True, True, False, False, False, False, False])
-        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 0.0)
-        monkeypatch.setattr(
-            crony, "_darwin_screen_locked", lambda: next(locked_values)
+        host = _idle_lock_host(
+            idle=lambda: 0.0, locked=lambda: next(locked_values)
         )
+        monkeypatch.setattr(crony, "_host", lambda: host)
         now = [0.0]
         monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
         monkeypatch.setattr(
@@ -13123,8 +13077,8 @@ class TestInteractiveHelpers:
         crony._wait_for_user_active(60, poll_sec=30, idle_break_sec=60)
 
     def test_wait_bypass_check_short_circuits(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 0.0)
-        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        host = _idle_lock_host(idle=lambda: 0.0, locked=lambda: False)
+        monkeypatch.setattr(crony, "_host", lambda: host)
         # Trip the bypass on the first poll; idle / lock checks are
         # never consulted.
         assert (
@@ -13141,10 +13095,10 @@ class TestInteractiveHelpers:
         # bypass_check that always returns False -- the wait should
         # complete normally and return True.
         idle_values = iter([100.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
-        monkeypatch.setattr(
-            crony, "_darwin_hid_idle_seconds", lambda: next(idle_values)
+        host = _idle_lock_host(
+            idle=lambda: next(idle_values), locked=lambda: False
         )
-        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: False)
+        monkeypatch.setattr(crony, "_host", lambda: host)
         now = [0.0]
         monkeypatch.setattr(crony.time, "monotonic", lambda: now[0])
         monkeypatch.setattr(
@@ -13195,48 +13149,37 @@ class TestInteractiveHelpers:
         # before the third check fired.
         assert sleeps == [30, 30]
 
-    def test_dialog_run_button(self, monkeypatch: Any) -> None:
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Run Job\n", stderr=""
-            )
+    def _dialog_host(self, clicked: str) -> SimpleNamespace:
+        captured: dict[str, Any] = {}
 
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        def show_dialog(_title: str, _body: str, buttons: list[str]) -> str:
+            captured["buttons"] = buttons
+            return clicked
+
+        return SimpleNamespace(show_dialog=show_dialog, captured=captured)
+
+    def test_dialog_run_button(self, monkeypatch: Any) -> None:
+        host = self._dialog_host("Run Job")
+        monkeypatch.setattr(crony, "_host", lambda: host)
         assert crony._show_interactive_dialog("foo", "msg") == "run"
 
     def test_dialog_delay_button(self, monkeypatch: Any) -> None:
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(
-                a, 0, stdout="button returned:Delay Job\n", stderr=""
-            )
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+        host = self._dialog_host("Delay Job")
+        monkeypatch.setattr(crony, "_host", lambda: host)
         assert crony._show_interactive_dialog("foo", "msg") == "delay"
+        # The cancel button is first and the run button last, so the
+        # backend uses them as the AppleScript cancel / default buttons.
+        assert host.captured["buttons"] == [
+            "Cancel Job",
+            "Delay Job",
+            "Run Job",
+        ]
 
-    def test_dialog_cancel_button(self, monkeypatch: Any) -> None:
-        # osascript exits non-zero when the cancel button is the
-        # bound cancel.
-        def fake_run(
-            *a: Any, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(a, 1, stdout="", stderr="")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
-        assert crony._show_interactive_dialog("foo", "msg") == "cancel"
-
-    def test_dialog_osascript_missing_maps_to_cancel(
-        self, monkeypatch: Any
-    ) -> None:
-        def fake_run(
-            *_args: object, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
-            raise FileNotFoundError("osascript not found")
-
-        monkeypatch.setattr(crony.subprocess, "run", fake_run)
+    def test_dialog_no_choice_maps_to_cancel(self, monkeypatch: Any) -> None:
+        # The backend returns "" for a cancel-button click, a dismissed
+        # dialog, or an unavailable osascript; all map to 'cancel'.
+        host = self._dialog_host("")
+        monkeypatch.setattr(crony, "_host", lambda: host)
         assert crony._show_interactive_dialog("foo", "msg") == "cancel"
 
 
@@ -13443,8 +13386,10 @@ class TestRunJobInteractive:
         # high (idle break), screen is locked -- no natural
         # accumulation -- but on the second poll a `crony trigger`
         # writes the bypass flag and the wait short-circuits.
-        monkeypatch.setattr(crony, "_darwin_hid_idle_seconds", lambda: 999.0)
-        monkeypatch.setattr(crony, "_darwin_screen_locked", lambda: True)
+        host = SimpleNamespace(
+            hid_idle_seconds=lambda: 999.0, screen_locked=lambda: True
+        )
+        monkeypatch.setattr(crony, "_host", lambda: host)
         sleeps = [0]
 
         def fake_sleep(_s: float) -> None:

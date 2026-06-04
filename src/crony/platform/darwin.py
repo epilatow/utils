@@ -3,7 +3,9 @@
 """macOS (`darwin`) host-platform backend.
 
 Implements the `HostPlatform` services on darwin: a kqueue-based
-pid-exit wait and a Keychain-backed secret lookup.
+pid-exit wait, a Keychain-backed secret lookup, and the
+desktop-interaction primitives (HID idle / screen-lock probes via
+`ioreg`, approval and failure dialogs via `osascript`).
 """
 
 from __future__ import annotations
@@ -14,8 +16,24 @@ import subprocess
 from crony.platform.host import HostPlatform, PidWait
 
 
+def _applescript_escape(s: str) -> str:
+    """Escape `s` for inclusion in an AppleScript "..." literal.
+
+    Backslash and double-quote are the only specials inside such a
+    literal. This is NOT shell escaping -- the script is passed as a
+    single argv entry to `osascript -e`, so no shell parser sees it;
+    `shlex.quote` would emit POSIX single-quoted bytes that AppleScript
+    would parse as something else entirely.
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class DarwinHost(HostPlatform):
     """darwin host services."""
+
+    @property
+    def supports_interactive(self) -> bool:
+        return True
 
     def wait_for_pid_exit(self, pid: int, timeout: float | None) -> PidWait:
         # mypy's `select` stubs are platform-specific: kqueue, kevent,
@@ -55,3 +73,93 @@ class DarwinHost(HostPlatform):
         if r.returncode == 0:
             return r.stdout.rstrip("\n")
         return None
+
+    def hid_idle_seconds(self) -> float:
+        # Reads HIDIdleTime (nanoseconds) from IOHIDSystem. Returns 0.0
+        # when ioreg is unavailable or unparseable -- treating an unknown
+        # idle state as "user is active now" is the safer default for the
+        # wait loop (err toward prompting sooner, not never).
+        try:
+            proc = subprocess.run(
+                ["ioreg", "-c", "IOHIDSystem"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return 0.0
+        for line in proc.stdout.splitlines():
+            if '"HIDIdleTime"' not in line:
+                continue
+            _, _, rhs = line.partition("=")
+            try:
+                return int(rhs.strip()) / 1_000_000_000
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def screen_locked(self) -> bool:
+        # Reads CGSSessionScreenIsLocked from IOConsoleUsers. Returns
+        # False on any failure -- assuming unlocked on infrastructure
+        # error matches "user is present" and delegates the final
+        # present-check to HIDIdleTime, the primary signal.
+        try:
+            proc = subprocess.run(
+                ["ioreg", "-n", "Root", "-d", "1"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        return '"CGSSessionScreenIsLocked"=Yes' in proc.stdout
+
+    def show_dialog(self, title: str, body: str, buttons: list[str]) -> str:
+        btn_list = ", ".join(f'"{_applescript_escape(b)}"' for b in buttons)
+        script = (
+            f'display dialog "{_applescript_escape(body)}" '
+            f'with title "{_applescript_escape(title)}" '
+            f"buttons {{{btn_list}}} "
+            f'default button "{_applescript_escape(buttons[-1])}" '
+            f'cancel button "{_applescript_escape(buttons[0])}"'
+        )
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return ""
+        # Clicking the cancel button exits osascript non-zero (the
+        # AppleScript "User canceled" error); a dismissed or unshowable
+        # dialog lands here too. All map to "" (no choice).
+        if proc.returncode != 0:
+            return ""
+        # osascript prints `button returned:<label>` for a click. Match
+        # the label exactly (not a substring of stdout) so a button
+        # whose name is a substring of another can't shadow it.
+        marker = "button returned:"
+        idx = proc.stdout.find(marker)
+        if idx == -1:
+            return ""
+        label = proc.stdout[idx + len(marker) :].splitlines()[0].strip()
+        return label if label in buttons else ""
+
+    def show_failure_dialog(self, title: str, body: str) -> None:
+        script = (
+            f'display dialog "{_applescript_escape(body)}" '
+            f'with title "{_applescript_escape(title)}" '
+            f'buttons {{"OK"}} default button "OK" with icon stop'
+        )
+        # start_new_session detaches the modal so it survives the runner
+        # exiting; Popen returns as soon as osascript is launched.
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )

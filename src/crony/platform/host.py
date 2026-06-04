@@ -7,8 +7,10 @@ crony reaches for host-OS services that diverge by platform.
 `HostPlatform` is the seam those services live behind: it is selected by
 the same platform string via `get_host` (in the package `__init__`), and
 `crony.platform.darwin` and `crony.platform.linux` implement it. The
-services it exposes are the runner's wait on a spawned job's pid and the
-OS keychain secret lookup.
+services it exposes are the runner's wait on a spawned job's pid, the OS
+keychain secret lookup, and the desktop-interaction primitives
+interactive jobs use (idle / screen-lock probes and the approval /
+failure dialogs).
 
 This is the host-services analog of `scheduler.Scheduler`: where the
 scheduler renders and manages units, the host platform brokers the
@@ -37,6 +39,14 @@ class PidWait(enum.Enum):
 class HostPlatform(abc.ABC):
     """Host-OS services crony needs that diverge by platform."""
 
+    @property
+    @abc.abstractmethod
+    def supports_interactive(self) -> bool:
+        """True when the host has a desktop session crony can pop modal
+        dialogs on -- gating both the interactive-job approval prompt
+        and the dialog-popup notify channel. Where it is False, the idle
+        / lock probes and the dialog methods are unavailable and raise."""
+
     @abc.abstractmethod
     def wait_for_pid_exit(self, pid: int, timeout: float | None) -> PidWait:
         """Block until `pid` exits, via a kernel-level exit notification
@@ -55,3 +65,30 @@ class HostPlatform(abc.ABC):
         item matches. `account` disambiguates when several items share a
         service name. The credential resolver tries this before its env
         / file fallback, so None simply means "fall through"."""
+
+    @abc.abstractmethod
+    def hid_idle_seconds(self) -> float:
+        """Seconds since the last user input event -- the interactive
+        wait's presence signal. Only meaningful where
+        `supports_interactive` (raises otherwise)."""
+
+    @abc.abstractmethod
+    def screen_locked(self) -> bool:
+        """True when the login session is screen-locked. Only meaningful
+        where `supports_interactive` (raises otherwise)."""
+
+    @abc.abstractmethod
+    def show_dialog(self, title: str, body: str, buttons: list[str]) -> str:
+        """Pop a modal dialog and block for the user's choice. `buttons`
+        is ordered first..last; the last is the default and the first is
+        the cancel button. Returns the clicked button's label, or ""
+        when the dialog is canceled, dismissed, or cannot be shown.
+        Only meaningful where `supports_interactive` (raises
+        otherwise)."""
+
+    @abc.abstractmethod
+    def show_failure_dialog(self, title: str, body: str) -> None:
+        """Pop a detached one-button failure dialog and return at once,
+        without waiting for dismissal, so notifying never stalls the
+        runner. Only meaningful where `supports_interactive` (raises
+        otherwise)."""
