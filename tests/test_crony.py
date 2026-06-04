@@ -45,6 +45,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from crony import platform as crony_platform  # noqa: E402
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
@@ -1489,8 +1490,8 @@ class TestValidateConfig:
         # time so a single bundle can describe entries for
         # multiple platforms and each host picks up only its
         # applicable subset.
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
-        monkeypatch.setattr(crony, "current_host", lambda: "host-l")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "host-l")
         cfg = _parse(
             {
                 "job": {
@@ -2109,8 +2110,10 @@ class TestSelectionFilters:
     def test_job_with_matching_platform_selected(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         cfg = self._cfg(
             {
                 "job": {"a": _job(platforms=["darwin"])},
@@ -2124,8 +2127,8 @@ class TestSelectionFilters:
     def test_job_with_excluding_platform_filtered_out(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
                 "job": {"a": _job(platforms=["darwin"])},
@@ -2144,13 +2147,15 @@ class TestSelectionFilters:
             }
         )
         # On a listed host: selected.
-        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         target = crony.resolve_target(cfg, "alpha", "darwin")
         sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
         assert "a" in sel_jobs
         # On a non-listed host: filtered out.
-        monkeypatch.setattr(crony, "current_host", lambda: "gamma")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "gamma")
         target = crony.resolve_target(cfg, "gamma", "darwin")
         sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
         assert "a" not in sel_jobs
@@ -2160,8 +2165,8 @@ class TestSelectionFilters:
         # platform, the walk does not recurse into its children
         # via that group. A child reachable only through the
         # filtered group is therefore not selected.
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
                 "job": {"a": _job()},
@@ -2195,14 +2200,16 @@ class TestSelectionFilters:
             }
         )
         # On the listed host: group + child selected.
-        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         target = crony.resolve_target(cfg, "alpha", "darwin")
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" in sel_groups
         assert "a" in sel_jobs
         # On a different host: group filtered, child not reached.
-        monkeypatch.setattr(crony, "current_host", lambda: "beta")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "beta")
         target = crony.resolve_target(cfg, "beta", "darwin")
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" not in sel_groups
@@ -2217,14 +2224,16 @@ class TestSelectionFilters:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         # On a non-listed host: selected.
-        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
         target = crony.resolve_target(cfg, "alpha", "darwin")
         sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
         assert "a" in sel_jobs
         # On the listed (denied) host: filtered out.
-        monkeypatch.setattr(crony, "current_host", lambda: "squee")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "squee")
         target = crony.resolve_target(cfg, "squee", "darwin")
         sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
         assert "a" not in sel_jobs
@@ -2243,15 +2252,17 @@ class TestSelectionFilters:
                 "target": {"darwin": {"jobs": ["g"]}},
             }
         )
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         # On a non-denied host: group + child selected.
-        monkeypatch.setattr(crony, "current_host", lambda: "alpha")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
         target = crony.resolve_target(cfg, "alpha", "darwin")
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" in sel_groups
         assert "a" in sel_jobs
         # On the denied host: group filtered, child not reached.
-        monkeypatch.setattr(crony, "current_host", lambda: "squee")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "squee")
         target = crony.resolve_target(cfg, "squee", "darwin")
         sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
         assert "g" not in sel_groups
@@ -2263,8 +2274,8 @@ class TestSelectionFilters:
         # A group whose every direct child is itself masked on
         # this host has nothing to dispatch -- the reference is a
         # no-op and the group joins masked with reason "empty".
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
                 "job": {
@@ -2292,8 +2303,8 @@ class TestSelectionFilters:
         # P references only G, and G's only child is masked.
         # G becomes "empty"; the cascade then demotes P, whose
         # only remaining child is now masked.
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
                 "job": {"a": _job(hosts=["other"])},
@@ -2319,8 +2330,8 @@ class TestSelectionFilters:
         # If at least one direct child is unmasked, the group is
         # NOT empty -- it remains selected and its snapshot will
         # reference that one child.
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
                 "job": {
@@ -2659,8 +2670,10 @@ class _RunnerHarness:
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         self.state = state
         self.cfg_file = cfg_file
         self.cfg_dropin = cfg_dropin
@@ -2866,7 +2879,7 @@ class _RunnerHarness:
         simulated platform so the entries are actually selected when
         a later `load_config()` resolves the host's target.
         """
-        plat = crony.current_platform()
+        plat = crony_platform.current_platform()
         full = dict(raw)
         full.setdefault("target", {})
         target_section = full["target"]
@@ -3317,7 +3330,7 @@ class TestRunJobBasics:
             '"reason": "snapshot has schema 3 expected 4"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -3350,7 +3363,7 @@ class TestRunJobBasics:
             '"2026-01-01T00:00:00-08:00", "exit_code": 64}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -4197,7 +4210,7 @@ class TestTriggerUnitNotInstalled:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("ghost")
-        platform = crony.current_platform()
+        platform = crony_platform.current_platform()
         with pytest.raises(crony.UnitNotInstalledError, match="not installed"):
             crony._trigger_unit(full, platform)
         # No state dir leaked: the bundle subdir for default
@@ -4875,7 +4888,9 @@ class TestDialogPopupNotify:
     def test_dispatch_spawns_osascript_on_darwin(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         captured: dict[str, Any] = {}
 
         def _fake_popen(cmd: Any, **kwargs: Any) -> Any:
@@ -4901,7 +4916,7 @@ class TestDialogPopupNotify:
     def test_dispatch_records_failure_off_darwin(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
 
         def _boom(*_args: object, **_kwargs: object) -> Any:
             raise AssertionError("osascript spawned on non-darwin")
@@ -4916,7 +4931,9 @@ class TestDialogPopupNotify:
     def test_body_escapes_quotes_and_backslashes(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         captured: dict[str, Any] = {}
         monkeypatch.setattr(
             crony.subprocess,
@@ -4934,7 +4951,9 @@ class TestDialogPopupNotify:
         assert "\\\\ bye" in script
 
     def test_attach_log_false_omits_log(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         captured: dict[str, Any] = {}
         monkeypatch.setattr(
             crony.subprocess,
@@ -5368,7 +5387,9 @@ class _ApplyHarness(_RunnerHarness):
         agents.mkdir(parents=True)
         sysd = home / ".config" / "systemd" / "user"
         sysd.mkdir(parents=True)
-        monkeypatch.setattr(crony, "current_platform", lambda: platform)
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: platform
+        )
         # Capture subprocess.run calls so apply/destroy don't actually
         # invoke launchctl or systemctl.
         self.calls: list[list[str]] = []
@@ -5953,7 +5974,7 @@ class TestApplyFullSync:
         # this host" from "elsewhere"; the test pins that the
         # gate honors the masked-vs-selected distinction.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -6589,23 +6610,6 @@ class TestDestroy:
         crony.do_destroy(jobs=[], bundle=None, orphans=True)
         assert (h.state_dir("j") / "snapshot.json").exists()
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-
-
-# =============================================================================
-# Platform/host detection
-# =============================================================================
-
-
-class TestPlatformDetection:
-    def test_current_platform(self) -> None:
-        p = crony.current_platform()
-        assert p in ("darwin", "linux")
-
-    def test_current_host(self) -> None:
-        h = crony.current_host()
-        assert isinstance(h, str)
-        assert len(h) > 0
-        assert "." not in h
 
 
 # =============================================================================
@@ -7679,7 +7683,7 @@ class TestStatusUuidColumn:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,uuid",
@@ -7702,7 +7706,7 @@ class TestStatusUuidColumn:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -7728,7 +7732,7 @@ class TestStatusUuidColumn:
         sd = h.fabricate_orphan("ghost")
         ghost_uuid = sd.name
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,uuid,config",
@@ -7753,7 +7757,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -7777,7 +7781,7 @@ class TestStatusReport:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -7808,7 +7812,7 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         shutil.rmtree(h.state)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -7831,7 +7835,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,last,last-ran",
@@ -7891,7 +7895,7 @@ class TestStatusReport:
             ' "exit_code": 0, "exit_class": "ok"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,last-ran",
@@ -7917,7 +7921,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,last-ran",
@@ -7950,7 +7954,7 @@ class TestStatusReport:
             default_target_jobs=[long_name],
         )
         h.apply(long_name)
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -7979,7 +7983,7 @@ class TestStatusReport:
         # the target but excluded by its own platforms filter; with
         # --all it should surface as config=masked.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8024,7 +8028,7 @@ class TestStatusReport:
         # column must show its `<bundle>:<uuid>` ref, not a blank
         # cell.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         cfg = h.config(
             {
                 "job": {
@@ -8060,7 +8064,7 @@ class TestStatusReport:
         # still nests it under its parent -- so GROUPS must show that
         # config-declared parent, without a false `^` divergence flag.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8104,7 +8108,7 @@ class TestStatusReport:
         # an off-tree entry's GROUPS cell must stay empty rather than
         # claim a parent the row isn't shown under.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8144,7 +8148,7 @@ class TestStatusReport:
         # scheduled one as its cron, neither with a false `^` divergence
         # marker.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8198,7 +8202,7 @@ class TestStatusReport:
         # Three jobs: host-only-other, platform-other, both-other.
         # Each should report its masking axis in MASKED BY.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8248,7 +8252,7 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        monkeypatch.setattr(crony, "current_host", lambda: "h")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
         h.config(
             {
                 "job": {
@@ -8303,7 +8307,7 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="default,masked-by",
@@ -8397,7 +8401,7 @@ class TestStatusReport:
             },
             default_target_jobs=["g"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="default,masked-by",
@@ -8432,7 +8436,7 @@ class TestStatusReport:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=[],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="default,masked-by",
@@ -8458,7 +8462,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="all",
@@ -8488,7 +8492,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -8522,7 +8526,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,unit-files",
@@ -8549,7 +8553,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="default,masked-by",
@@ -8613,7 +8617,7 @@ class TestStatusReport:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -8652,7 +8656,7 @@ class TestStatusReport:
         )
         for short in ("zzz-first", "aaa-second", "mmm-third", "inner", "root"):
             h.apply(short)
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job-or-uuid",
@@ -8715,7 +8719,7 @@ class TestStatusReport:
             },
             default_target_jobs=["tree-job"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job-or-uuid",
@@ -8739,7 +8743,7 @@ class TestStatusReport:
         # its row appears at its configured depth (indented), not
         # banished to the off-tree section below.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        monkeypatch.setattr(crony, "current_host", lambda: "this-host")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "this-host")
         h.config(
             {
                 "job": {
@@ -8758,7 +8762,7 @@ class TestStatusReport:
             },
             default_target_jobs=["root"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job-or-uuid",
@@ -8809,7 +8813,7 @@ class TestStatusReport:
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job-or-uuid",
@@ -8839,7 +8843,7 @@ class TestStatusReport:
         )
         h.apply("j")
         h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,kind",
@@ -8869,7 +8873,7 @@ class TestStatusReport:
         )
         h.apply("j")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,kind,config",
@@ -8894,7 +8898,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,unit-name",
@@ -8931,7 +8935,7 @@ class TestStatusReport:
         h.apply("sched")
         h.apply("gm")
         h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,unit-name",
@@ -8962,7 +8966,7 @@ class TestStatusReport:
         )
         h.apply("a")
         h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,groups",
@@ -8998,7 +9002,7 @@ class TestStatusReport:
             default_target_jobs=["g1"],
         )
         crony.do_apply(jobs=[], verbose=False, bundle=None)
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,groups",
@@ -9055,7 +9059,7 @@ class TestStatusReport:
             },
             default_target_jobs=["g1", "g2"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,groups",
@@ -9111,7 +9115,7 @@ class TestStatusReport:
             },
             default_target_jobs=["g1", "g2"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,groups",
@@ -9140,7 +9144,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -9223,7 +9227,7 @@ class TestStatusReport:
         h.apply("iv-job")
         h.apply("child")
         h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9254,7 +9258,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "disabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9304,7 +9308,7 @@ class TestStatusReport:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "disabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9337,7 +9341,7 @@ class TestStatusReport:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9371,7 +9375,7 @@ class TestStatusReport:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9398,7 +9402,7 @@ class TestStatusReport:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,schedule",
@@ -9447,7 +9451,7 @@ class TestStatusReport:
             },
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,config,masked-by",
@@ -9486,7 +9490,7 @@ class TestStatusReport:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "none")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "none")
         crony.do_status(
             jobs=[],
             cols="job,unit",
@@ -9768,10 +9772,10 @@ class TestResolveStateAxes:
         ghost = h.full("ghost")
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         config = crony.load_config()
         cfg, sched, last = crony._resolve_state_axes(
-            config, ghost, "darwin", config.installed_full_names()
+            config, ghost, config.installed_full_names()
         )
         assert cfg == "orphan"
         assert sched == "enabled"
@@ -9793,7 +9797,7 @@ class TestResolveStateAxes:
         monkeypatch.setattr(crony, "_unit_state", _stub_sched)
         config = crony.load_config()
         cfg, unit_state, last = crony._resolve_state_axes(
-            config, h.full("ghost"), "darwin", set()
+            config, h.full("ghost"), set()
         )
         assert cfg == "missing"
         assert unit_state == "none"
@@ -9816,10 +9820,10 @@ class TestResolveStateAxes:
         )
         h.apply("a")
         h.apply("g")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         config = crony.load_config()
         _, sched, _ = crony._resolve_state_axes(
-            config, h.full("a"), "darwin", config.installed_full_names()
+            config, h.full("a"), config.installed_full_names()
         )
         assert sched == "grouped"
 
@@ -9833,10 +9837,10 @@ class TestResolveStateAxes:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "disabled")
         config = crony.load_config()
         cfg_state, sched, _ = crony._resolve_state_axes(
-            config, h.full("j"), "darwin", config.installed_full_names()
+            config, h.full("j"), config.installed_full_names()
         )
         assert cfg_state == "synced"
         assert sched == "disabled"
@@ -9991,7 +9995,7 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=["good"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10107,7 +10111,7 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=[],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -10139,7 +10143,7 @@ class TestPerEntityConfigErrors:
         )
         config = crony.load_config()
         cfg_state, _unit_state, _last_state = crony._resolve_state_axes(
-            config, h.full("bad"), "darwin", config.installed_full_names()
+            config, h.full("bad"), config.installed_full_names()
         )
         assert cfg_state == "error"
 
@@ -11097,8 +11101,10 @@ class TestLoadConfig:
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         return cfg_file
 
     def test_pending_graph_built_from_toml(
@@ -11259,8 +11265,10 @@ class TestConfigBroken:
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         cfg_file.write_text("", encoding="utf-8")
         return cfg_file
 
@@ -11384,9 +11392,11 @@ class TestStatusBrokenSurface:
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         return cfg_file
 
     def test_status_renders_broken_for_schema_mismatch(
@@ -11551,7 +11561,7 @@ class TestNameCollision:
         h.apply("j")
         stray_uuid = "99999999-8888-7777-6666-555544443333"
         self._plant_residue(h, h.full("j"), stray_uuid)
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -11716,7 +11726,7 @@ class TestStatusUnitConfigColumn:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,unit-config,unit-timer",
@@ -11742,7 +11752,7 @@ class TestStatusUnitConfigColumn:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols="job,unit-config,unit-timer",
@@ -11775,7 +11785,7 @@ class TestStatusExcludeHealthy:
         )
         # Apply so it's synced; never run -> LAST=never (healthy).
         h.apply("healthy")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -11802,7 +11812,7 @@ class TestStatusExcludeHealthy:
             '"started_at": "2026-01-01T00:00:00-08:00"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -11837,7 +11847,7 @@ class TestStatusExcludeHealthy:
             '"started_at": "2026-01-01T00:00:00-08:00"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -11865,7 +11875,7 @@ class TestStatusExcludeHealthy:
             default_target_jobs=["paused"],
         )
         h.apply("paused")
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "disabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "disabled")
         crony.do_status(
             jobs=[],
             cols=None,
@@ -11898,8 +11908,10 @@ class TestResolveMethods:
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony, "CONFIG_DROPIN_DIR", cfg_dropin)
-        monkeypatch.setattr(crony, "current_host", lambda: "test-host")
-        monkeypatch.setattr(crony, "current_platform", lambda: "darwin")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
         return cfg_file
 
     def test_pending_only_resolves_via_pending_not_runnable_or_current(
@@ -13059,7 +13071,7 @@ class TestLifecycleSmoke:
         crony.do_apply(jobs=[], verbose=False, bundle=None)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # status -> prints the synced/enabled tuple (sched stub)
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         capsys.readouterr()  # drop earlier output
         crony.do_status(
             jobs=[],
@@ -13584,7 +13596,7 @@ class TestStatusRenameUuidModel:
             },
             default_target_jobs=["u-bins"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         return h, group_uuid, member_uuid
 
     def test_default_view_shows_new_names_once_with_history(
@@ -13684,7 +13696,7 @@ class TestStatusColor:
     X = crony._ANSI_RESET
 
     def _force_color(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         monkeypatch.setattr(crony, "_color_supported", lambda: True)
 
     def test_stale_and_divergence_are_yellow_missing_is_red(
@@ -13791,7 +13803,7 @@ class TestStatusColor:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
             default_target_jobs=["j"],
         )
-        monkeypatch.setattr(crony, "_unit_state", lambda _n, _p: "enabled")
+        monkeypatch.setattr(crony, "_unit_state", lambda _n: "enabled")
         crony.do_status(
             jobs=[],
             cols=None,

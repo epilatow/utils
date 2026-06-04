@@ -24,7 +24,6 @@ import shlex
 import shutil
 import signal
 import smtplib
-import socket
 import string
 import subprocess
 import sys
@@ -54,6 +53,7 @@ import tomlkit.exceptions
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import crony.platform  # noqa: E402
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -877,26 +877,6 @@ class TomlConfig:
             for short in b.config.errored_job_groups:
                 out.add(b.full_name(short))
         return out
-
-
-# =============================================================================
-# PLATFORM & HOST DETECTION
-# =============================================================================
-
-
-def current_platform() -> str:
-    """Return 'darwin' or 'linux'. Raise on anything else."""
-    s = sys.platform
-    if s == "darwin":
-        return "darwin"
-    if s.startswith("linux"):
-        return "linux"
-    raise CronyError(f"unsupported platform: {s}")
-
-
-def current_host() -> str:
-    """Return the short hostname (everything before the first dot)."""
-    return socket.gethostname().split(".")[0]
 
 
 # =============================================================================
@@ -2422,8 +2402,8 @@ def selected_and_masked_jobs_and_groups(
     masked: dict[str, str] = {}
     if target is None:
         return jobs, groups, masked
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
 
     def _walk(name: str, parent_mask: str | None, seen: set[str]) -> None:
         if name in seen:
@@ -2845,7 +2825,9 @@ def _resolve_snapshot_for(
     that exercise the runner without going through full apply).
     """
     name = EntityName(bundle_name, short)
-    target = resolve_target(config, current_host(), current_platform())
+    target = resolve_target(
+        config, crony.platform.current_host(), crony.platform.current_platform()
+    )
     if short in config.jobs:
         return _resolve_job_snapshot(config, target, config.jobs[short], name)
     if short in config.job_groups:
@@ -3395,7 +3377,6 @@ def _read_runtime_state(
     state_dir: Path,
     *,
     full_name: str | None,
-    platform: str,
     snapshot: Job | JobGroup | None = None,
 ) -> RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
@@ -3435,10 +3416,10 @@ def _read_runtime_state(
     unit_timer: Path | None = None
     unit_is_stale = False
     if full_name is not None:
-        unit_config = _platform_unit_config_path(full_name, platform)
-        unit_timer = _platform_unit_timer_path(full_name, platform)
+        unit_config = _platform_unit_config_path(full_name)
+        unit_timer = _platform_unit_timer_path(full_name)
         if snapshot is not None:
-            unit_is_stale = _unit_is_stale(snapshot, platform)
+            unit_is_stale = _unit_is_stale(snapshot)
 
     return RuntimeState(
         state_dir=state_dir,
@@ -3491,7 +3472,6 @@ def _build_pending_graph(
 
 def _build_current_graph(
     state_root: Path,
-    platform: str,
 ) -> tuple[Graph, dict[EntityRef, BrokenEntity], dict[EntityRef, RuntimeState]]:
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
     with a parseable schema-matched `snapshot.json` becomes a
@@ -3570,7 +3550,6 @@ def _build_current_graph(
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
                     full_name=full,
-                    platform=platform,
                     snapshot=snap,
                 )
             else:
@@ -3579,7 +3558,6 @@ def _build_current_graph(
                 runtime[snap.ref] = _read_runtime_state(
                     uuid_dir,
                     full_name=full,
-                    platform=platform,
                     snapshot=snap,
                 )
     # Broken entries get a runtime entry too -- the state dir
@@ -3593,7 +3571,6 @@ def _build_current_graph(
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=broken_entry.name,
-            platform=platform,
         )
     return current, broken, runtime
 
@@ -3603,12 +3580,12 @@ def load_config() -> Config:
     walk the state-dir tree once, build pending + current graphs +
     runtime state in memory, and detect platform-unit-only orphans.
     """
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
 
     toml_config = load_all_bundles()
     pending = _build_pending_graph(toml_config, host, platform)
-    current, broken, runtime = _build_current_graph(STATE_DIR, platform)
+    current, broken, runtime = _build_current_graph(STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -3666,8 +3643,8 @@ def load_config() -> Config:
         # Make the platform paths available through RuntimeState so
         # status's unit-config / unit-timer columns don't re-walk the
         # unit dirs.
-        unit_config = _platform_unit_config_path(full_name, platform)
-        unit_timer = _platform_unit_timer_path(full_name, platform)
+        unit_config = _platform_unit_config_path(full_name)
+        unit_timer = _platform_unit_timer_path(full_name)
         runtime[ref] = RuntimeState(
             state_dir=_entity_state_dir(ref),
             last_run=None,
@@ -4359,7 +4336,7 @@ def _send_dialog_popup_for(
     if not host.supports_interactive:
         raise CronyError(
             "dialog-popup notify channel not implemented on "
-            f"{current_platform()!r}"
+            f"{crony.platform.current_platform()!r}"
         )
     title = f"crony: {full_name} {result.exit_class} (exit {result.exit_code})"
     body = _format_summary(result, full_name)
@@ -4523,7 +4500,9 @@ def _resolve_notify_at_runtime(
     if bundle is None:
         return [], Defaults()
     config = bundle.config
-    target = resolve_target(config, current_host(), current_platform())
+    target = resolve_target(
+        config, crony.platform.current_host(), crony.platform.current_platform()
+    )
     job = config.jobs.get(short)
     if job is None:
         channels = list(config.defaults.notify_channels)
@@ -4716,8 +4695,8 @@ def run_job(
     env = _runtime_env(snap.env)
     started = time.time()
     started_iso = _now_iso()
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
 
     try:
         with _acquire_lock(lock_path):
@@ -4995,8 +4974,8 @@ def run_group(
 
     started = time.time()
     started_iso = _now_iso()
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
 
     try:
         with _acquire_lock(lock_path):
@@ -5057,7 +5036,7 @@ def run_group(
                             ).encode()
                         )
                         try:
-                            _trigger_unit(child_full_name, platform)
+                            _trigger_unit(child_full_name)
                             children.append(
                                 GroupChildResult(
                                     name=child_full_name,
@@ -5195,43 +5174,53 @@ def run_group(
 # =============================================================================
 # Render and (un)load platform-native scheduler units. The per-platform
 # divergence lives entirely in the crony.platform backends; the
-# functions here are thin delegates via _scheduler(platform), which
-# carries no platform branch -- the backend owns its own unit directory.
+# functions here are thin delegates via _scheduler(), which carries no
+# platform branch -- the backend owns its own unit directory.
 
 
-def _platform_unit_config_path(name: str, platform: str) -> Path | None:
+def _platform_unit_config_path(
+    name: str, platform: str | None = None
+) -> Path | None:
     """The on-disk platform config unit file backing `name`, or None.
     The status `unit-config` column reads this from `RuntimeState`."""
     return _scheduler(platform).unit_config_path(name)
 
 
-def _platform_unit_timer_path(name: str, platform: str) -> Path | None:
+def _platform_unit_timer_path(
+    name: str, platform: str | None = None
+) -> Path | None:
     """The on-disk timer unit arming `name`'s schedule, or None when the
     platform has no separate timer unit or the entry is unscheduled. The
     status `unit-timer` column reads this from `RuntimeState`."""
     return _scheduler(platform).unit_timer_path(name)
 
 
-def _dispatch_unit_path(name: str, platform: str) -> Path:
+def _dispatch_unit_path(name: str, platform: str | None = None) -> Path:
     """File `_trigger_unit` fires for `name` (may not exist). Used to
     refuse early when the unit was never installed."""
     return _scheduler(platform).dispatch_unit_path(name)
 
 
-def _scheduler(platform: str) -> Scheduler:
-    """The platform Scheduler for the host. Built per call; the backend
-    resolves its own unit directory (honoring its CRONY_*_DIR env
-    override), so tests that redirect that env are picked up."""
+def _scheduler(platform: str | None = None) -> Scheduler:
+    """The platform Scheduler for the host. `platform` defaults to the
+    running host's `crony.platform.current_platform()`; tests pass it
+    explicitly to exercise a specific backend. Built per call; the
+    backend resolves its own unit directory (honoring its CRONY_*_DIR
+    env override), so tests that redirect that env are picked up."""
+    if platform is None:
+        platform = crony.platform.current_platform()
     return get_scheduler(platform)
 
 
 def _host() -> HostPlatform:
     """The HostPlatform backend for the running host. Built per call via
-    current_platform() so tests can redirect the platform."""
-    return get_host(current_platform())
+    crony.platform.current_platform() so tests can redirect the platform."""
+    return get_host(crony.platform.current_platform())
 
 
-def _render_units(snap: Job | JobGroup, platform: str) -> dict[str, str]:
+def _render_units(
+    snap: Job | JobGroup, platform: str | None = None
+) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
     Delegates to the platform Scheduler with the live `_uv_executable()`
@@ -5246,7 +5235,7 @@ def _render_units(snap: Job | JobGroup, platform: str) -> dict[str, str]:
     )
 
 
-def _unit_is_stale(snap: Job | JobGroup, platform: str) -> bool:
+def _unit_is_stale(snap: Job | JobGroup, platform: str | None = None) -> bool:
     """True when the platform install diverges from the snapshot --
     delegates to the scheduler's drift check."""
     return _scheduler(platform).is_stale(snap.unit_spec())
@@ -5269,7 +5258,7 @@ def _schedule_display(timing: Timing | None) -> str:
 
 def _activate_unit(
     name: str,
-    platform: str,
+    platform: str | None = None,
     *,
     prior_disabled: bool,
     scheduled: bool,
@@ -5326,7 +5315,6 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     full_name = str(snapshot.name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    platform = config.platform
     snapshot_path = _snapshot_path_for(ref)
 
     # Every uuid / full name the bundle's config currently defines
@@ -5394,9 +5382,9 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # the state-dir snapshot); _unit_state returns "none" for a
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
-    prior_disabled = _unit_state(full_name, platform) == "disabled"
-    units = _render_units(snapshot, platform)
-    sched = _scheduler(platform)
+    prior_disabled = _unit_state(full_name) == "disabled"
+    units = _render_units(snapshot)
+    sched = _scheduler()
     target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name that
@@ -5407,7 +5395,6 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         (target_dir / fname).write_text(content, encoding="utf-8")
     _activate_unit(
         full_name,
-        platform,
         prior_disabled=prior_disabled,
         scheduled=timing is not None,
     )
@@ -5438,7 +5425,7 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     state dir to clean up.
     """
     if name is not None:
-        _scheduler(current_platform()).remove_files(name)
+        _scheduler().remove_files(name)
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
@@ -5533,7 +5520,7 @@ def _platform_unit_names() -> set[str]:
     invisible to status / destroy and the user would have to track
     them down manually.
     """
-    return _scheduler(current_platform()).installed_names()
+    return _scheduler().installed_names()
 
 
 # =============================================================================
@@ -5546,7 +5533,7 @@ def _platform_unit_names() -> set[str]:
 # off when the user runs `crony apply` to push other changes.
 
 
-def _unit_state(name: str, platform: str) -> str:
+def _unit_state(name: str, platform: str | None = None) -> str:
     """The platform scheduler's enable state for a stamped entity:
     `enabled`, `disabled`, or `none`.
 
@@ -5690,19 +5677,19 @@ def _config_axis(
     return state
 
 
-def _enable_unit(name: str, platform: str) -> None:
+def _enable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `enabled` state for `name` (delegates)."""
     _scheduler(platform).enable(name)
 
 
-def _disable_unit(name: str, platform: str) -> None:
+def _disable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `disabled` state for `name` (delegates)."""
     _scheduler(platform).disable(name)
 
 
 def _trigger_unit(
     name: str,
-    platform: str,
+    platform: str | None = None,
     *,
     triggered_by_user: bool = False,
     state_dir: Path | None = None,
@@ -5856,11 +5843,9 @@ def _trigger_unit_sync(
     pre_trigger_dt = datetime.datetime.fromisoformat(_now_iso())
     pid_path = state_dir / "run.pid"
     last_run_path = state_dir / "last-run.json"
-    platform = current_platform()
 
     _trigger_unit(
         full_name,
-        platform,
         triggered_by_user=triggered_by_user,
         state_dir=state_dir if triggered_by_user else None,
     )
@@ -6108,8 +6093,8 @@ def _selected_full_names_per_bundle(
     "everything else".  Callers that also need to inspect masked
     entries use `_selected_and_masked_full_names_per_bundle`.
     """
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
     by_full: dict[str, tuple[TomlBundle, str]] = {}
     for b in bundles.bundles:
         target = resolve_target(b.config, host, platform)
@@ -6135,8 +6120,8 @@ def _selected_and_masked_full_names_per_bundle(
     a bundle's config but not reached by the host's resolved
     target get the literal reason `unused`.
     """
-    host = current_host()
-    platform = current_platform()
+    host = crony.platform.current_host()
+    platform = crony.platform.current_platform()
     by_full: dict[str, tuple[TomlBundle, str]] = {}
     selected: set[str] = set()
     masked_by_full: dict[str, str] = {}
@@ -6726,7 +6711,7 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "enable")
     for full, _ref, unit_name in targets:
-        _enable_unit(unit_name, config.platform)
+        _enable_unit(unit_name)
         logger.info("%s: enabled", full)
 
 
@@ -6755,7 +6740,7 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "disable")
     for full, _ref, unit_name in targets:
-        _disable_unit(unit_name, config.platform)
+        _disable_unit(unit_name)
         logger.info("%s: disabled", full)
 
 
@@ -6843,7 +6828,7 @@ def do_trigger(
         jobs, bundle, stamped, config, scheduled_only=False
     )
     targets = _resolve_action_targets(config, normalized, runnable_only=True)
-    platform = current_platform()
+    platform = crony.platform.current_platform()
 
     if not wait:
         for full, ref, unit_name in targets:
@@ -6851,7 +6836,6 @@ def do_trigger(
             # user-trigger flag lands in the uuid-keyed state dir.
             _trigger_unit(
                 unit_name,
-                platform,
                 triggered_by_user=True,
                 state_dir=_entity_state_dir(ref),
             )
@@ -6880,7 +6864,9 @@ def do_trigger(
                 f"(apply may be stale -- re-apply or `crony destroy` "
                 f"it); --wait cannot resolve its timeouts"
             )
-        b_target = resolve_target(b.config, current_host(), platform)
+        b_target = resolve_target(
+            b.config, crony.platform.current_host(), platform
+        )
         if short in b.config.jobs:
             timeout = _timeout_to_wait(
                 resolved_job_timeout_sec(
@@ -7171,7 +7157,6 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 def _resolve_state_axes(
     config: Config,
     full: str,
-    platform: str,
     remnants: set[str],
     *,
     mask_reason: str = "",
@@ -7260,7 +7245,7 @@ def _resolve_state_axes(
             installed_name = (
                 str(current_node.name) if current_node is not None else full
             )
-            unit_state = _unit_state(installed_name, platform)
+            unit_state = _unit_state(installed_name)
     last_state = _last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
@@ -7298,8 +7283,8 @@ def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
 def _unit_name_for(
     full: str,
     entry: TomlJob | TomlJobGroup | None,
-    platform: str,
     config: Config,
+    platform: str | None = None,
 ) -> str:
     """Platform unit identifier for the UNIT NAME column.
 
@@ -7586,7 +7571,7 @@ def do_status(
         }
 
     try:
-        _scheduler(platform).verify()
+        _scheduler().verify()
     except SchedulerWarning as warn:
         logger.warning("%s", warn)
 
@@ -7765,7 +7750,7 @@ def do_status(
         # selected); resolve them against the config name so the
         # TOML-entry-based grouped check and errored detection land.
         cfg_state, unit_state, last = _resolve_state_axes(
-            config, config_name, platform, remnants, mask_reason=mask_reason
+            config, config_name, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, config_name)
 
@@ -7826,12 +7811,12 @@ def do_status(
         # UNIT NAME is the platform label of the source-selected name,
         # flagged when the two names give different labels.
         pending_unit = (
-            _unit_name_for(pending_name, entry, platform, config)
+            _unit_name_for(pending_name, entry, config)
             if pending_name is not None
             else None
         )
         current_unit = (
-            _unit_name_for(current_name, None, platform, config)
+            _unit_name_for(current_name, None, config)
             if current_name is not None
             else None
         )
@@ -8247,8 +8232,8 @@ def _record_snapshot_load_failure(
         return
     now = _now_iso()
     payload: dict[str, Any] = {
-        "host": current_host(),
-        "platform": current_platform(),
+        "host": crony.platform.current_host(),
+        "platform": crony.platform.current_platform(),
         "started_at": now,
         "ended_at": now,
         "duration_sec": 0.0,
@@ -8469,12 +8454,11 @@ def do_validate(bundle: str | None, file: str | None) -> None:
         return
     bundles = load_all_bundles()
     require_known_bundle(bundles, bundle)
-    platform = current_platform()
 
     warnings: list[str] = []
     if bundle is None:
         try:
-            _scheduler(platform).verify()
+            _scheduler().verify()
         except SchedulerWarning as warn:
             warnings.append(str(warn))
 
@@ -8550,7 +8534,9 @@ def _notify_test_one_bundle(
         uuid="00000000-0000-0000-0000-000000000000",
         command="true",
     )
-    target = resolve_target(config, current_host(), current_platform())
+    target = resolve_target(
+        config, crony.platform.current_host(), crony.platform.current_platform()
+    )
     resolved = resolved_notify_channels(config, target, synthetic_job)
     # `eff_defaults` carries the channel defs + attach settings used
     # for dispatch; a bundle that inherits sends through the default
@@ -8570,8 +8556,8 @@ def _notify_test_one_bundle(
     if not use_channels:
         return ([], [], inherited_from)
     result = JobRunResult(
-        host=current_host(),
-        platform=current_platform(),
+        host=crony.platform.current_host(),
+        platform=crony.platform.current_platform(),
         started_at=_now_iso(),
         ended_at=_now_iso(),
         duration_sec=0.0,

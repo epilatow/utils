@@ -24,6 +24,8 @@ from crony.platform import (  # noqa: E402
     LaunchdScheduler,
     LinuxHost,
     SystemdScheduler,
+    current_host,
+    current_platform,
     get_host,
     get_scheduler,
 )
@@ -58,6 +60,17 @@ class TestGetHost:
 
     def test_linux_returns_linux_host(self) -> None:
         assert isinstance(get_host("linux"), LinuxHost)
+
+
+class TestPlatformDetection:
+    def test_current_platform(self) -> None:
+        assert current_platform() in ("darwin", "linux")
+
+    def test_current_host(self) -> None:
+        h = current_host()
+        assert isinstance(h, str)
+        assert len(h) > 0
+        assert "." not in h
 
 
 if __name__ == "__main__":

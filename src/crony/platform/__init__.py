@@ -3,7 +3,7 @@
 """Per-host platform backends for crony.
 
 Two sibling interfaces, each selected by the same platform string (as
-produced by the entry script's platform detection):
+produced by `current_platform()`):
 
 - `Scheduler` (get_scheduler) renders and manages the per-host scheduler
   units in a unit directory the backend resolves itself (or one the
@@ -18,12 +18,20 @@ The launchd / systemd modules are re-exported so callers can reach their
 pure filename helpers without importing the submodules directly; the
 host backends are reached only through `get_host`, so they are exported
 by class, not module.
+
+`current_platform()` / `current_host()` detect the running host's
+platform string and short hostname. Every caller routes host / platform
+identity through them, so the tests redirect identity by patching them
+here.
 """
 
 from __future__ import annotations
 
+import socket
+import sys
 from pathlib import Path
 
+from crony.errors import CronyError
 from crony.platform import launchd, systemd
 from crony.platform.darwin import DarwinHost
 from crony.platform.host import HostPlatform, PidWait
@@ -48,11 +56,28 @@ __all__ = [
     "SchedulerWarning",
     "SystemdScheduler",
     "UnitState",
+    "current_host",
+    "current_platform",
     "get_host",
     "get_scheduler",
     "launchd",
     "systemd",
 ]
+
+
+def current_platform() -> str:
+    """Return 'darwin' or 'linux'. Raise on anything else."""
+    s = sys.platform
+    if s == "darwin":
+        return "darwin"
+    if s.startswith("linux"):
+        return "linux"
+    raise CronyError(f"unsupported platform: {s}")
+
+
+def current_host() -> str:
+    """Return the short hostname (everything before the first dot)."""
+    return socket.gethostname().split(".")[0]
 
 
 def get_scheduler(platform: str, unit_dir: Path | None = None) -> Scheduler:
