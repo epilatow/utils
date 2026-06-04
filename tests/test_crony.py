@@ -107,16 +107,19 @@ def isolate_crony_home(
     layers cleanly atop this fixture.
     """
     sentinel = tmp_path / "_home_sentinel_unwritten"
+    # The scheduler backends resolve their unit directory under
+    # Path.home(), so patching it sandboxes those too -- no separate
+    # redirect needed.
     monkeypatch.setattr(Path, "home", lambda: sentinel)
-    layout = {
+    # bin/crony module constants: redirect both the attribute and the
+    # CRONY_* env it was resolved from.
+    module_dirs = {
         "CONFIG_DIR": sentinel / ".config" / "crony",
         "CONFIG_FILE": sentinel / ".config" / "crony" / "config.toml",
         "CONFIG_DROPIN_DIR": sentinel / ".config" / "crony" / "config",
         "STATE_DIR": sentinel / ".local" / "state" / "crony",
-        "LAUNCHAGENTS_DIR": sentinel / "Library" / "LaunchAgents",
-        "SYSTEMD_USER_DIR": sentinel / ".config" / "systemd" / "user",
     }
-    for attr, path in layout.items():
+    for attr, path in module_dirs.items():
         monkeypatch.setattr(module, attr, path)
         monkeypatch.setenv(f"CRONY_{attr}", str(path))
 
@@ -134,14 +137,15 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
     """
 
     def test_all_attributes_under_sentinel(self) -> None:
+        # The platform unit dirs are no longer bin/crony attributes (the
+        # scheduler backend resolves them under Path.home(), checked
+        # below), so only the config / state dirs are attributes here.
         sentinel = Path.home()
         for attr in (
             "CONFIG_DIR",
             "CONFIG_FILE",
             "CONFIG_DROPIN_DIR",
             "STATE_DIR",
-            "LAUNCHAGENTS_DIR",
-            "SYSTEMD_USER_DIR",
         ):
             value = getattr(crony, attr)
             assert str(value).startswith(str(sentinel)), (
@@ -155,12 +159,21 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
             "CONFIG_FILE",
             "CONFIG_DROPIN_DIR",
             "STATE_DIR",
-            "LAUNCHAGENTS_DIR",
-            "SYSTEMD_USER_DIR",
         ):
             value = os.environ[f"CRONY_{attr}"]
             assert value.startswith(str(sentinel)), (
                 f"CRONY_{attr}={value!r} escaped the sentinel"
+            )
+
+    def test_scheduler_unit_dirs_under_sentinel(self) -> None:
+        # The scheduler backends resolve their default unit dir under
+        # Path.home(), so the autouse Path.home patch sandboxes them
+        # with no separate redirect.
+        sentinel = Path.home()
+        for plat in ("darwin", "linux"):
+            unit_dir = crony.get_scheduler(plat).unit_dir
+            assert str(unit_dir).startswith(str(sentinel)), (
+                f"{plat} unit dir {unit_dir!r} escaped the sentinel"
             )
 
 
@@ -4182,25 +4195,15 @@ class TestTriggerUnitNotInstalled:
     state dir for a never-installed name.
     """
 
-    def _isolate_unit_dirs(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """Redirect LAUNCHAGENTS_DIR / SYSTEMD_USER_DIR at empty
-        tmp dirs so a missing `org.crony.<name>.plist` /
-        `crony-<name>.service` lookup gives a deterministic answer
-        regardless of what's in the test host's real ~/Library or
-        ~/.config/systemd/user.
-        """
-        agents = tmp_path / "LaunchAgents"
-        agents.mkdir()
-        sysd = tmp_path / "systemd-user"
-        sysd.mkdir()
-        monkeypatch.setattr(crony, "LAUNCHAGENTS_DIR", agents)
-        monkeypatch.setattr(crony, "SYSTEMD_USER_DIR", sysd)
+    # The autouse home-isolation fixture points Path.home() at a
+    # never-created sentinel, so the scheduler's default unit dir
+    # doesn't exist and a unit lookup deterministically reads "absent"
+    # -- no per-test unit-dir setup needed.
 
     def test_trigger_unit_raises_when_unit_file_missing(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
-        self._isolate_unit_dirs(tmp_path, monkeypatch)
         full = h.full("ghost")
         platform = crony.current_platform()
         with pytest.raises(crony.UnitNotInstalledError, match="not installed"):
@@ -4218,7 +4221,6 @@ class TestTriggerUnitNotInstalled:
         # unit must not leave a phantom state-dir-only remnant
         # behind (which `crony status` would then surface).
         h = _RunnerHarness(tmp_path, monkeypatch)
-        self._isolate_unit_dirs(tmp_path, monkeypatch)
         full = h.full("ghost")
         ghost_sd = h.state / crony.DEFAULT_BUNDLE_NAME / "u-ghost"
         with pytest.raises(crony.UnitNotInstalledError):
@@ -5364,12 +5366,16 @@ class _ApplyHarness(_RunnerHarness):
         self, tmp_path: Path, monkeypatch: Any, *, platform: str = "darwin"
     ) -> None:
         super().__init__(tmp_path, monkeypatch)
-        agents = tmp_path / "LaunchAgents"
-        agents.mkdir()
-        sysd = tmp_path / "systemd-user"
-        sysd.mkdir()
-        monkeypatch.setattr(crony, "LAUNCHAGENTS_DIR", agents)
-        monkeypatch.setattr(crony, "SYSTEMD_USER_DIR", sysd)
+        # The scheduler backends resolve their unit dir under
+        # Path.home(); point Path.home() at a writable tmp home
+        # (overriding the autouse non-writable sentinel) and pre-create
+        # the per-backend unit dirs so apply / destroy can write there.
+        home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", lambda: home)
+        agents = home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        sysd = home / ".config" / "systemd" / "user"
+        sysd.mkdir(parents=True)
         monkeypatch.setattr(crony, "current_platform", lambda: platform)
         # Capture subprocess.run calls so apply/destroy don't actually
         # invoke launchctl or systemctl.

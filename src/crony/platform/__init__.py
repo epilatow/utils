@@ -6,8 +6,9 @@ Two sibling interfaces, each selected by the same platform string (as
 produced by the entry script's platform detection):
 
 - `Scheduler` (get_scheduler) renders and manages the per-host scheduler
-  units, bound to the unit directory the caller manages, and verifies
-  host-level scheduler health (raising `SchedulerWarning`).
+  units in a unit directory the backend resolves itself (or one the
+  caller overrides), and verifies host-level scheduler health (raising
+  `SchedulerWarning`).
 - `HostPlatform` (get_host) brokers the non-unit host-OS services the
   runner and config tooling reach for (the runner's pid-exit wait, the
   keychain secret lookup, the keep-awake sleep-inhibitor wrap, and the
@@ -54,9 +55,13 @@ __all__ = [
 ]
 
 
-def get_scheduler(platform: str, unit_dir: Path) -> Scheduler:
-    """Return the `Scheduler` backend for `platform` ('darwin' / 'linux'),
-    managing units under `unit_dir`."""
+def get_scheduler(platform: str, unit_dir: Path | None = None) -> Scheduler:
+    """Return the `Scheduler` backend for `platform` ('darwin' / 'linux').
+
+    `unit_dir` is the directory its units live in; omit it to use the
+    backend's own default (its standard per-OS location under the user's
+    home). Callers pass an explicit dir to redirect it -- which the
+    tests do, so they never touch the real unit directory."""
     if platform == "darwin":
         return LaunchdScheduler(unit_dir)
     if platform == "linux":

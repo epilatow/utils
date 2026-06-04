@@ -181,6 +181,10 @@ def _is_loaded(lbl: str) -> bool:
 class LaunchdScheduler(Scheduler):
     """launchd backend: one LaunchAgent plist per entity."""
 
+    @staticmethod
+    def default_unit_dir() -> Path:
+        return Path.home() / "Library" / "LaunchAgents"
+
     def render(
         self, spec: UnitSpec, *, uv_path: Path, crony_path: Path
     ) -> dict[str, str]:
@@ -203,6 +207,10 @@ class LaunchdScheduler(Scheduler):
     def dispatch_unit_path(self, name: str) -> Path:
         # launchctl kickstart targets the loaded plist by label.
         return self.unit_dir / plist_filename(name)
+
+    def unit_name(self, name: str, _scheduled: bool | None, /) -> str:
+        # One label per entity, regardless of schedule.
+        return label(name)
 
     def installed_names(self) -> set[str]:
         names: set[str] = set()

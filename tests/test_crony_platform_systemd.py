@@ -276,6 +276,39 @@ class TestSystemdAnalyzeVerify:
             )
 
 
+class TestSystemdUnitName:
+    """The UNIT NAME identifier: the `.timer` for a scheduled entry, the
+    `.service` for a grouped one, and "" when scheduled-ness is
+    unknown."""
+
+    def test_scheduled_is_timer(self) -> None:
+        sched = get_scheduler("linux", _DIR)
+        assert sched.unit_name("default.j", True) == "crony-default.j.timer"
+
+    def test_unscheduled_is_service(self) -> None:
+        sched = get_scheduler("linux", _DIR)
+        assert sched.unit_name("default.j", False) == "crony-default.j.service"
+
+    def test_unknown_is_empty(self) -> None:
+        assert get_scheduler("linux", _DIR).unit_name("default.j", None) == ""
+
+
+class TestSystemdDefaultUnitDir:
+    """get_scheduler with no dir resolves the backend default under the
+    user's home; an explicit dir overrides it."""
+
+    def test_default_under_home(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(Path, "home", lambda: Path("/tmp/x/home"))
+        assert get_scheduler("linux").unit_dir == Path(
+            "/tmp/x/home/.config/systemd/user"
+        )
+
+    def test_explicit_dir_overrides(self) -> None:
+        assert get_scheduler("linux", Path("/unit/dir")).unit_dir == Path(
+            "/unit/dir"
+        )
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

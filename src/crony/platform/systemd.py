@@ -192,6 +192,10 @@ class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
 
+    @staticmethod
+    def default_unit_dir() -> Path:
+        return Path.home() / ".config" / "systemd" / "user"
+
     def render(
         self, spec: UnitSpec, *, uv_path: Path, crony_path: Path
     ) -> dict[str, str]:
@@ -222,6 +226,15 @@ class SystemdScheduler(Scheduler):
         # `systemctl --user start crony-<name>.service` fires the
         # service, not the timer (the scheduler-arm side).
         return self.unit_dir / service_filename(name)
+
+    def unit_name(self, name: str, scheduled: bool | None, /) -> str:
+        # A scheduled entry is driven by its `.timer`; a grouped /
+        # transit entry installs only the `.service`. None means the
+        # caller can't decide which, so there is no name to report.
+        if scheduled is None:
+            return ""
+        fn = timer_filename if scheduled else service_filename
+        return fn(name)
 
     def installed_names(self) -> set[str]:
         names: set[str] = set()

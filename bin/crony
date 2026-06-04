@@ -66,8 +66,6 @@ from crony.platform import (  # noqa: E402
     SchedulerWarning,
     get_host,
     get_scheduler,
-    launchd,
-    systemd,
 )
 from crony.unit import (  # noqa: E402
     EntityName,
@@ -205,8 +203,8 @@ State (logs, locks, last-run records, applied snapshots) lives at
 BASENAME: str = os.path.splitext(os.path.basename(__file__))[0]
 LOGFILE: Path = Path(tempfile.gettempdir()) / f"{BASENAME}.log"
 
-# Path overrides via env so platform-mediated invocations (launchd /
-# systemd starting `crony run <bundle>:<uuid>`) and tests can redirect
+# Path overrides via env so platform-mediated invocations (the
+# scheduler starting `crony run <bundle>:<uuid>`) and tests can redirect
 # config and state without filesystem games. Names follow the
 # convention CRONY_<KEY>.
 _ENV_PREFIX: str = BASENAME.upper()
@@ -236,12 +234,6 @@ DEFAULT_BUNDLE_NAME: str = "default"
 NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 STATE_DIR: Path = _env_path(
     "STATE_DIR", os.path.expanduser(f"~/.local/state/{BASENAME}")
-)
-LAUNCHAGENTS_DIR: Path = _env_path(
-    "LAUNCHAGENTS_DIR", os.path.expanduser("~/Library/LaunchAgents")
-)
-SYSTEMD_USER_DIR: Path = _env_path(
-    "SYSTEMD_USER_DIR", os.path.expanduser("~/.config/systemd/user")
 )
 
 logger = logging.getLogger(__name__)
@@ -3038,7 +3030,7 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
 # RUNNER
 # =============================================================================
 # `crony run <bundle>:<uuid>` is the platform unit's entry point --
-# launchd / systemd invoke it; it is not a user-facing subcommand.
+# the scheduler invokes it; it is not a user-facing subcommand.
 # The argv carries the entity's uuid so the runner addresses its
 # state dir directly via `_entity_state_dir` and loads the pinned
 # applied snapshot without scanning. The shim dispatches to the
@@ -3159,9 +3151,9 @@ class RuntimeState:
     `unit_config` is the path of the platform unit file (launchd
     plist / systemd .service or .timer) when one is present, else
     None -- captured here so subcommands read it from Config
-    rather than walking `LAUNCHAGENTS_DIR` / `SYSTEMD_USER_DIR`
-    themselves. `unit_config is not None` is the "a unit file
-    exists on disk" test. The platform unit *file* presence and
+    rather than walking the platform unit directory themselves.
+    `unit_config is not None` is the "a unit file exists on disk"
+    test. The platform unit *file* presence and
     the unit-drift check are captured here at load time; the live
     scheduler enable/disable state is not -- status' UNIT axis
     queries `_unit_state` on demand, since the scheduler view can
@@ -5269,28 +5261,15 @@ def run_group(
 # =============================================================================
 # PLATFORM UNITS
 # =============================================================================
-# Render and (un)load platform-native scheduler units. The launchd /
-# systemd divergence lives in the crony.platform backends; the functions
-# here are thin delegates via _scheduler(platform). The only residual
-# platform branch is picking the unit dir (_scheduler).
-
-
-def _label_for(name: str) -> str:
-    """launchd Label for a job/group."""
-    return launchd.label(name)
-
-
-def _service_path_for(name: str) -> Path:
-    return SYSTEMD_USER_DIR / systemd.service_filename(name)
-
-
-def _timer_path_for(name: str) -> Path:
-    return SYSTEMD_USER_DIR / systemd.timer_filename(name)
+# Render and (un)load platform-native scheduler units. The per-platform
+# divergence lives entirely in the crony.platform backends; the
+# functions here are thin delegates via _scheduler(platform), which
+# carries no platform branch -- the backend owns its own unit directory.
 
 
 def _platform_unit_config_path(name: str, platform: str) -> Path | None:
-    """The on-disk platform unit file backing `name`, or None. The
-    status `unit-config` column reads this from `RuntimeState`."""
+    """The on-disk platform config unit file backing `name`, or None.
+    The status `unit-config` column reads this from `RuntimeState`."""
     return _scheduler(platform).unit_config_path(name)
 
 
@@ -5301,11 +5280,10 @@ def _dispatch_unit_path(name: str, platform: str) -> Path:
 
 
 def _scheduler(platform: str) -> Scheduler:
-    """The platform Scheduler bound to the host's unit dir. Built per
-    call so it honors test redirection of LAUNCHAGENTS_DIR /
-    SYSTEMD_USER_DIR (which bin/crony owns)."""
-    unit_dir = LAUNCHAGENTS_DIR if platform == "darwin" else SYSTEMD_USER_DIR
-    return get_scheduler(platform, unit_dir)
+    """The platform Scheduler for the host. Built per call; the backend
+    resolves its own unit directory (honoring its CRONY_*_DIR env
+    override), so tests that redirect that env are picked up."""
+    return get_scheduler(platform)
 
 
 def _host() -> HostPlatform:
@@ -7393,28 +7371,17 @@ def _unit_name_for(
 ) -> str:
     """Platform unit identifier for the UNIT NAME column.
 
-    On macOS, every entry is a launchd plist with the same label
-    shape regardless of schedule. On Linux, scheduled entries are
-    driven by a `<name>.timer`; grouped (no-schedule) entries
-    install only `<name>.service`. Falls back to the current-graph
-    snapshot's schedule fields when the live config no longer
-    describes the entry; returns "" when nothing on disk or in
-    config can decide.
+    Resolves the entry's scheduled-ness -- from the live config entry,
+    else the current-graph snapshot -- and hands it to the scheduler,
+    which names the unit. `None` scheduled-ness (neither config nor
+    snapshot can decide) lets a backend whose name is schedule-
+    independent still answer, and one that needs it return "".
     """
-    if platform == "darwin":
-        return _label_for(full)
     if entry is not None:
-        scheduled = _entry_is_scheduled(entry)
+        scheduled: bool | None = _entry_is_scheduled(entry)
     else:
-        snap_says = _snapshot_says_scheduled(config, full)
-        if snap_says is None:
-            return ""
-        scheduled = snap_says
-    return (
-        _timer_path_for(full).name
-        if scheduled
-        else _service_path_for(full).name
-    )
+        scheduled = _snapshot_says_scheduled(config, full)
+    return _scheduler(platform).unit_name(full, scheduled)
 
 
 # Trailing flag on a status cell whose pending and current values

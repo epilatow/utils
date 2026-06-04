@@ -238,6 +238,34 @@ class TestLaunchdScheduler:
         assert get_scheduler("darwin", _DIR).verify() is None
 
 
+class TestLaunchdUnitName:
+    """The UNIT NAME identifier is the launchd label, independent of
+    whether the entry is scheduled (one plist per entity)."""
+
+    def test_label_regardless_of_schedule(self) -> None:
+        sched = get_scheduler("darwin", _DIR)
+        for scheduled in (True, False, None):
+            assert sched.unit_name("default.j", scheduled) == (
+                "org.crony.default.j"
+            )
+
+
+class TestLaunchdDefaultUnitDir:
+    """get_scheduler with no dir resolves the backend default under the
+    user's home; an explicit dir overrides it."""
+
+    def test_default_under_home(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(Path, "home", lambda: Path("/tmp/x/home"))
+        assert get_scheduler("darwin").unit_dir == Path(
+            "/tmp/x/home/Library/LaunchAgents"
+        )
+
+    def test_explicit_dir_overrides(self) -> None:
+        assert get_scheduler("darwin", Path("/unit/dir")).unit_dir == Path(
+            "/unit/dir"
+        )
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

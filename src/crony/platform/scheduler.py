@@ -66,12 +66,20 @@ def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
 class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
 
-    def __init__(self, unit_dir: Path) -> None:
-        # Directory the host's units live in (LAUNCHAGENTS_DIR /
-        # SYSTEMD_USER_DIR). Passed in by the caller -- which owns the
-        # env-overridable value and redirects it in tests -- rather than
-        # recomputed here, so the scheduler honors that redirection.
-        self.unit_dir = unit_dir
+    def __init__(self, unit_dir: Path | None = None) -> None:
+        # Directory the host's units live in. Defaults to the backend's
+        # `default_unit_dir()` (its standard per-OS location); a caller
+        # may pass an explicit dir to redirect it -- which the tests do,
+        # so they never touch the real unit directory.
+        self.unit_dir = (
+            unit_dir if unit_dir is not None else self.default_unit_dir()
+        )
+
+    @staticmethod
+    @abc.abstractmethod
+    def default_unit_dir() -> Path:
+        """The backend's standard on-disk unit directory under the
+        user's home. Used when no explicit dir is given."""
 
     @abc.abstractmethod
     def render(
@@ -93,6 +101,16 @@ class Scheduler(abc.ABC):
     @abc.abstractmethod
     def dispatch_unit_path(self, name: str) -> Path:
         """The unit file `trigger` fires for `name` (may not exist)."""
+
+    @abc.abstractmethod
+    def unit_name(self, name: str, scheduled: bool | None, /) -> str:
+        """The unit identifier shown in status' UNIT NAME column -- the
+        scheduler's own naming for `name`, independent of whether a file
+        is on disk. `scheduled` selects the schedule-bearing unit where
+        a backend installs more than one (systemd `.timer` vs
+        `.service`); None means the caller couldn't determine it, so a
+        backend that needs it to choose returns "" while one whose name
+        is schedule-independent ignores it."""
 
     @abc.abstractmethod
     def installed_names(self) -> set[str]:
