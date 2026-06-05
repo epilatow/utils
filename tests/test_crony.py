@@ -127,8 +127,8 @@ def isolate_crony_home(
     # redirect needed.
     monkeypatch.setattr(Path, "home", lambda: sentinel)
     # Redirect each path constant and the CRONY_* env it resolved from.
-    # CONFIG_DIR / STATE_DIR are re-imported into the bin/crony module;
-    # CONFIG_FILE / CONFIG_DROPIN_DIR are read through crony.paths -- so
+    # CONFIG_DIR is re-imported into the bin/crony module; CONFIG_FILE /
+    # CONFIG_DROPIN_DIR / STATE_DIR are read through crony.paths -- so
     # each is patched on the module its readers resolve it through.
     cfg = sentinel / ".config" / "crony"
     state = sentinel / ".local" / "state" / "crony"
@@ -136,7 +136,7 @@ def isolate_crony_home(
         "CONFIG_DIR": (module, cfg),
         "CONFIG_FILE": (crony_paths, cfg / "config.toml"),
         "CONFIG_DROPIN_DIR": (crony_paths, cfg / "config"),
-        "STATE_DIR": (module, state),
+        "STATE_DIR": (crony_paths, state),
     }
     for attr, (target, path) in dirs.items():
         monkeypatch.setattr(target, attr, path)
@@ -156,13 +156,13 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
     """
 
     def test_all_attributes_under_sentinel(self) -> None:
-        # CONFIG_DIR / STATE_DIR are bin/crony attributes; CONFIG_FILE /
-        # CONFIG_DROPIN_DIR are read through crony.paths. (The platform
-        # unit dirs are resolved under Path.home(), checked below.)
+        # CONFIG_DIR is a bin/crony attribute; CONFIG_FILE /
+        # CONFIG_DROPIN_DIR / STATE_DIR are read through crony.paths.
+        # (The platform unit dirs resolve under Path.home(), below.)
         sentinel = Path.home()
         targets = {
             "CONFIG_DIR": crony,
-            "STATE_DIR": crony,
+            "STATE_DIR": crony_paths,
             "CONFIG_FILE": crony_paths,
             "CONFIG_DROPIN_DIR": crony_paths,
         }
@@ -2675,7 +2675,7 @@ class _RunnerHarness:
         monkeypatch.setenv("CRONY_CONFIG_DIR", str(cfg_dir))
         monkeypatch.setenv("CRONY_CONFIG_FILE", str(cfg_file))
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(cfg_dropin))
-        monkeypatch.setattr(crony, "STATE_DIR", state)
+        monkeypatch.setattr(crony_paths, "STATE_DIR", state)
         monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
@@ -11132,7 +11132,7 @@ class TestLoadConfig:
         # Plant a state dir + snapshot for an entry that no TOML
         # defines. (Empty config file = no jobs.)
         crony_paths.CONFIG_FILE.write_text("", encoding="utf-8")
-        sd = crony.STATE_DIR / "default" / uuid_g
+        sd = crony_paths.STATE_DIR / "default" / uuid_g
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps(
@@ -11182,7 +11182,7 @@ class TestLoadConfig:
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
         )
-        sd = crony.STATE_DIR / "default" / uuid_a
+        sd = crony_paths.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps(crony._snapshot_to_dict(snap)), encoding="utf-8"
@@ -11208,7 +11208,7 @@ class TestLoadConfig:
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
         )
-        sd = crony.STATE_DIR / "default" / uuid_a
+        sd = crony_paths.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
         # Persist a snapshot with a divergent command vs what TOML
         # currently says ("true" vs "stale-command").
@@ -11263,7 +11263,7 @@ class TestConfigBroken:
         return cfg_file
 
     def _plant_state(self, uuid_value: str, contents: str) -> tuple[Any, Path]:
-        sd = crony.STATE_DIR / "default" / uuid_value
+        sd = crony_paths.STATE_DIR / "default" / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(contents, encoding="utf-8")
         return EntityRef("default", uuid_value), sd
@@ -11400,7 +11400,7 @@ class TestStatusBrokenSurface:
             '[target.darwin]\njobs = ["j"]\n',
             encoding="utf-8",
         )
-        sd = crony.STATE_DIR / "default" / uuid_value
+        sd = crony_paths.STATE_DIR / "default" / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps({"schema": 999, "kind": "job", "name": "default.j"}),
@@ -11425,7 +11425,7 @@ class TestStatusBrokenSurface:
         cfg_file = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text("", encoding="utf-8")
         uuid_value = "22222222-2222-2222-2222-222222222222"
-        sd = crony.STATE_DIR / "default" / uuid_value
+        sd = crony_paths.STATE_DIR / "default" / uuid_value
         sd.mkdir(parents=True)
         # Corrupt JSON: the `name` field can't be recovered, so the
         # broken entry is addressable only by ref.
@@ -11452,7 +11452,7 @@ class TestStatusBrokenSurface:
         cfg_file = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text("", encoding="utf-8")
         uuid_value = "33333333-3333-3333-3333-333333333333"
-        sd = crony.STATE_DIR / "borgadm" / uuid_value
+        sd = crony_paths.STATE_DIR / "borgadm" / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps({"schema": 999, "kind": "job", "name": "borgadm.k"}),
@@ -11932,7 +11932,7 @@ class TestResolveMethods:
         cfg_file = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text("", encoding="utf-8")
         uuid_b = "22222222-aaaa-bbbb-cccc-dddddddddddd"
-        sd = crony.STATE_DIR / "default" / uuid_b
+        sd = crony_paths.STATE_DIR / "default" / uuid_b
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps(

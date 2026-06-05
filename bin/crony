@@ -88,10 +88,7 @@ from crony.errors import (  # noqa: E402
     UnitNotInstalledError,
     UsageError,
 )
-from crony.paths import (  # noqa: E402
-    CONFIG_DIR,
-    STATE_DIR,
-)
+from crony.paths import CONFIG_DIR  # noqa: E402
 from crony.platform import (  # noqa: E402
     HostPlatform,
     PidWait,
@@ -686,7 +683,7 @@ class JobGroup:
 
 
 def _entity_state_dir(ref: EntityRef) -> Path:
-    return STATE_DIR / ref.bundle / ref.uuid
+    return crony.paths.STATE_DIR / ref.bundle / ref.uuid
 
 
 def _snapshot_path_for(ref: EntityRef) -> Path:
@@ -1552,7 +1549,7 @@ def load_config() -> Config:
 
     toml_config = TomlConfig.load_all()
     pending = _build_pending_graph(toml_config, host, platform)
-    current, broken, runtime = _build_current_graph(STATE_DIR)
+    current, broken, runtime = _build_current_graph(crony.paths.STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -3448,7 +3445,7 @@ def _sweep_superseded_state_dirs(
     is left in place (logged); the next apply or an explicit
     `crony destroy <bundle>:<uuid>` reclaims it.
     """
-    bundle_root = STATE_DIR / keep.bundle
+    bundle_root = crony.paths.STATE_DIR / keep.bundle
     if not bundle_root.is_dir():
         return
     for uuid_dir in sorted(bundle_root.iterdir()):
