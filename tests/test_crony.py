@@ -285,9 +285,12 @@ class TestConfigSubcommandDispatch:
     def test_config_without_action_prints_help(self, capsys: Any) -> None:
         # No action -> print config's own help (stdout) and exit USAGE,
         # not argparse's terse "required" error.
-        with patch("sys.argv", ["prog", "config"]):
-            result = crony.cli()
-        assert result == crony.ExitCode.USAGE
+        with (
+            patch("sys.argv", ["prog", "config"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            crony.cli()
+        assert exc_info.value.code == crony.ExitCode.USAGE
         out = capsys.readouterr().out
         # The subcommand's full help (usage line + the action list),
         # not just a usage stub.

@@ -65,42 +65,42 @@ class TestArgumentParser:
     def test_install_parses_directory(self) -> None:
         """Test install subcommand parses directory argument."""
         parser = df.build_parser()
-        args = parser.parse_args(["install", "/path/to/dotfiles"])
+        args = parser.parse_command(["install", "/path/to/dotfiles"])
         assert args.command == "install"
         assert args.directory == Path("/path/to/dotfiles")
 
     def test_install_parses_flags(self) -> None:
         """Test install subcommand parses flags."""
         parser = df.build_parser()
-        args = parser.parse_args(["install", "--dry-run", "-f", "/path"])
+        args = parser.parse_command(["install", "--dry-run", "-f", "/path"])
         assert args.dry_run is True
         assert args.force is True
 
     def test_install_without_directory(self) -> None:
         """Test install subcommand without directory."""
         parser = df.build_parser()
-        args = parser.parse_args(["install"])
+        args = parser.parse_command(["install"])
         assert args.command == "install"
         assert args.directory is None
 
     def test_remove_parses_directory(self) -> None:
         """Test remove subcommand parses directory argument."""
         parser = df.build_parser()
-        args = parser.parse_args(["remove", "/path/to/dotfiles"])
+        args = parser.parse_command(["remove", "/path/to/dotfiles"])
         assert args.command == "remove"
         assert args.directory == Path("/path/to/dotfiles")
 
     def test_audit_parses_directory(self) -> None:
         """Test audit subcommand parses directory argument."""
         parser = df.build_parser()
-        args = parser.parse_args(["audit", "/path/to/dotfiles"])
+        args = parser.parse_command(["audit", "/path/to/dotfiles"])
         assert args.command == "audit"
         assert args.directory == Path("/path/to/dotfiles")
 
     def test_cleanup_parses(self) -> None:
         """Test cleanup subcommand parses --dry-run."""
         parser = df.build_parser()
-        args = parser.parse_args(["cleanup", "--dry-run"])
+        args = parser.parse_command(["cleanup", "--dry-run"])
         assert args.command == "cleanup"
         assert args.dry_run is True
 

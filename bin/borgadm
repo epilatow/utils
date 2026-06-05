@@ -70,10 +70,7 @@ from typing import (
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
-    StrictArgumentParser,
-    action_subparsers,
-)
+from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # -----------------------------------------------------------------------------
@@ -2190,16 +2187,16 @@ class HelpFormatter(
     pass
 
 
-def args_parser() -> argparse.ArgumentParser:
+def args_parser() -> StrictArgumentParser:
     parser = StrictArgumentParser(
         description="Borg backup manager",
         formatter_class=HelpFormatter,
         epilog=ExitCode.epilog(),
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_command_subparsers()
 
     # Always set formatter_class so that we display default values.
-    def add_parser(name: str, **kwargs: Any) -> argparse.ArgumentParser:
+    def add_parser(name: str, **kwargs: Any) -> StrictArgumentParser:
         kwargs["formatter_class"] = HelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
@@ -2258,7 +2255,7 @@ def args_parser() -> argparse.ArgumentParser:
         "automate",
         help="Enable/Disable automated backups and checks",
     )
-    automate_subparsers = action_subparsers(automate)
+    automate_subparsers = automate.add_command_subparsers()
     automate_subparsers.add_parser(
         "enable",
         help="Enable automated backup creation and checks",
@@ -2278,7 +2275,7 @@ def args_parser() -> argparse.ArgumentParser:
     add_parser("break-lock", help="Break repo lock")
 
     check = add_parser("check", help="Run backup checks")
-    check_subparsers = action_subparsers(check)
+    check_subparsers = check.add_command_subparsers()
 
     check_age = check_subparsers.add_parser(
         "age",
@@ -2415,7 +2412,7 @@ def args_parser() -> argparse.ArgumentParser:
         "repair",
         help="Repair operations for the borg repository",
     )
-    repair_subparsers = action_subparsers(repair)
+    repair_subparsers = repair.add_command_subparsers()
     repair_subparsers.add_parser(
         "delete-cache",
         help="Delete the local borg cache for the repository",
@@ -2574,6 +2571,9 @@ def main(
     timestamp_messages: bool,
     args_dict: dict[str, Any],
 ) -> None:
+    # ``command`` is the full path (e.g. "automate enable"); the timing
+    # and backup-set checks key off the top-level word.
+    top_command = command.split(" ", 1)[0]
     quick_commands = {
         "automate",
         "environment",
@@ -2581,9 +2581,9 @@ def main(
         "log-files",
         "self-test",
     }
-    timed = command not in quick_commands
+    timed = top_command not in quick_commands
     cmd_start = time.perf_counter()
-    cmd_label = command  # tentative; refined below
+    cmd_label = command
 
     try:
         initialize_logger(LOGFILE, verbose, timestamp_messages)
@@ -2605,11 +2605,9 @@ def main(
             "prune",
             "rsync",
         }
-        if command in backup_set_commands:
+        if top_command in backup_set_commands:
             logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
-        action = args_dict.pop("action", None)
-        cmd_label = f"{command} {action}" if action else command
         if timed:
             logger.info(f"borgadm {cmd_label}: started")
 
@@ -2626,24 +2624,13 @@ def main(
 def cli() -> int:
     sys.argv = rewrite_legacy_args(sys.argv)
     parser = args_parser()
-    args = parser.parse_args()
+    args = parser.parse_command()
     validate = getattr(args, "validate", None)
     if validate:
         validate(args)
     args_dict = vars(args).copy()
     args_dict.pop("validate", None)
     command = args_dict.pop("command")
-    action_help = args_dict.pop("_action_help", None)
-
-    if not command:
-        parser.print_help()
-        return ExitCode.USAGE
-
-    # A subcommand that requires an action but got none prints its own
-    # help (like the no-command case above), not argparse's terse error.
-    if action_help is not None and not args_dict.get("action"):
-        action_help()
-        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(**args_dict)

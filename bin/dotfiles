@@ -1314,7 +1314,7 @@ def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
 # =============================================================================
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> StrictArgumentParser:
     """
     Build and return the argument parser for the active profile.
 
@@ -1327,7 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+    subparsers = parser.add_command_subparsers(help="Subcommands")
 
     # Install subcommand
     install_parser = subparsers.add_parser(
@@ -1456,14 +1456,8 @@ def cli() -> int:
     _activate_profile(select_profile(sys.argv[0]))
 
     parser = build_parser()
-    args = parser.parse_args()
-
-    args_dict = vars(args)
+    args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
-
-    if not command:
-        parser.print_help()
-        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(

@@ -345,7 +345,7 @@ class TestArgumentParser:
     def test_list_parses_all_options(self) -> None:
         """Test list subcommand parses all options."""
         parser = fc.build_parser()
-        args = parser.parse_args(
+        args = parser.parse_command(
             [
                 "list",
                 "-p",
@@ -367,7 +367,7 @@ class TestArgumentParser:
     def test_list_defaults(self) -> None:
         """Test list subcommand defaults."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list"])
+        args = parser.parse_command(["list"])
         assert args.command == "list"
         assert args.profile is None
         assert args.domains is None
@@ -377,7 +377,7 @@ class TestArgumentParser:
     def test_list_domains_parses_options(self) -> None:
         """Test list-domains subcommand."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list-domains", "-p", "prof", "-c", "2"])
+        args = parser.parse_command(["list-domains", "-p", "prof", "-c", "2"])
         assert args.command == "list-domains"
         assert args.profile == "prof"
         assert args.container == "2"
@@ -385,21 +385,21 @@ class TestArgumentParser:
     def test_list_profiles_no_extra_args(self) -> None:
         """Test list-profiles has no profile arg."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list-profiles"])
+        args = parser.parse_command(["list-profiles"])
         assert args.command == "list-profiles"
         assert not hasattr(args, "profile")
 
     def test_list_containers_parses_profile(self) -> None:
         """Test list-containers accepts --profile."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list-containers", "-p", "myprof"])
+        args = parser.parse_command(["list-containers", "-p", "myprof"])
         assert args.command == "list-containers"
         assert args.profile == "myprof"
 
     def test_multiple_domains(self) -> None:
         """Test -d can be repeated for multiple domains."""
         parser = fc.build_parser()
-        args = parser.parse_args(
+        args = parser.parse_command(
             [
                 "list",
                 "-d",
@@ -414,19 +414,19 @@ class TestArgumentParser:
         """Test -p cannot be specified twice."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["list", "-p", "a", "-p", "b"])
+            parser.parse_command(["list", "-p", "a", "-p", "b"])
 
     def test_duplicate_container_errors(self) -> None:
         """Test -c cannot be specified twice."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["list", "-c", "1", "-c", "2"])
+            parser.parse_command(["list", "-c", "1", "-c", "2"])
 
     def test_duplicate_format_errors(self) -> None:
         """Test --format cannot be specified twice."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(
+            parser.parse_command(
                 [
                     "list",
                     "--format",
@@ -1742,19 +1742,19 @@ class TestSrcArgParser:
     def test_src_db(self) -> None:
         """Parse --src db."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list", "--source", "db"])
+        args = parser.parse_command(["list", "--source", "db"])
         assert args.sources == ["db"]
 
     def test_src_recovery(self) -> None:
         """Parse --src recovery."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list", "--source", "recovery"])
+        args = parser.parse_command(["list", "--source", "recovery"])
         assert args.sources == ["recovery"]
 
     def test_src_both(self) -> None:
         """Parse --src db --src recovery."""
         parser = fc.build_parser()
-        args = parser.parse_args(
+        args = parser.parse_command(
             ["list", "--source", "db", "--source", "recovery"]
         )
         assert set(args.sources) == {"db", "recovery"}
@@ -1762,25 +1762,25 @@ class TestSrcArgParser:
     def test_src_default_none(self) -> None:
         """No --src defaults to None."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list"])
+        args = parser.parse_command(["list"])
         assert args.sources is None
 
     def test_src_invalid_rejected(self) -> None:
         """Invalid source value is rejected."""
         parser = fc.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["list", "--source", "invalid"])
+            parser.parse_command(["list", "--source", "invalid"])
 
     def test_src_on_list_domains(self) -> None:
         """--src works on list-domains."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list-domains", "--source", "recovery"])
+        args = parser.parse_command(["list-domains", "--source", "recovery"])
         assert args.sources == ["recovery"]
 
     def test_src_on_list_containers(self) -> None:
         """--src works on list-containers."""
         parser = fc.build_parser()
-        args = parser.parse_args(["list-containers", "--source", "db"])
+        args = parser.parse_command(["list-containers", "--source", "db"])
         assert args.sources == ["db"]
 
 

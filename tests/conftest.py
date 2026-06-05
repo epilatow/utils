@@ -333,7 +333,7 @@ class CmdCallbacksBase:
         """self-test subcommand parses common -v/--coverage flags."""
         parser = type(self).PARSER_FUNC()
         cmd = type(self).SELF_TEST_CMD
-        args = parser.parse_args([cmd, "-v", "--coverage"])
+        args = parser.parse_command([cmd, "-v", "--coverage"])
         assert args.command == cmd
         assert args.verbose is True
         assert args.coverage is True
@@ -344,22 +344,27 @@ class CmdCallbacksBase:
         assertion stay correct as utilities add self-test flags."""
         parser = type(self).PARSER_FUNC()
         kwargs: dict[str, Any] = vars(
-            parser.parse_args([type(self).SELF_TEST_CMD])
+            parser.parse_command([type(self).SELF_TEST_CMD])
         )
         kwargs.pop("command", None)
         return kwargs
 
-    def test_no_args_parses_without_error(self) -> None:
-        """parse_args([]) succeeds with command=None."""
+    def test_no_args_leaves_top_level_unset(self) -> None:
+        """The top-level command group is non-required, so parse_args([])
+        leaves its dest at None -- the state parse_command turns into a
+        help-and-exit rather than argparse's terse required error."""
         parser = type(self).PARSER_FUNC()
         args = parser.parse_args([])
-        assert args.command is None
+        assert args.cmd1 is None
 
     def test_no_args_shows_help(self, capsys: Any) -> None:
-        """No arguments prints help and returns USAGE."""
-        with patch("sys.argv", ["prog"]):
-            result = type(self).CLI_FUNC()
-        assert result == type(self).EXIT_CODE_USAGE
+        """No arguments prints help and exits USAGE."""
+        with (
+            patch("sys.argv", ["prog"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            type(self).CLI_FUNC()
+        assert exc_info.value.code == type(self).EXIT_CODE_USAGE
         captured = capsys.readouterr()
         assert "usage:" in captured.out.lower()
 

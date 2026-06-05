@@ -375,24 +375,21 @@ class TestArgumentParser:
     def test_repair_subcommand_parses(self) -> None:
         """Test repair delete-cache subcommand parses."""
         parser = ba.args_parser()
-        args = parser.parse_args(["repair", "delete-cache"])
-        assert args.command == "repair"
-        assert args.action == "delete-cache"
+        args = parser.parse_command(["repair", "delete-cache"])
+        assert args.command == "repair delete-cache"
 
     def test_repair_repo_yes_parses(self) -> None:
         """Test repair repo --yes parses."""
         parser = ba.args_parser()
-        args = parser.parse_args(["repair", "repo", "--yes"])
-        assert args.command == "repair"
-        assert args.action == "repo"
+        args = parser.parse_command(["repair", "repo", "--yes"])
+        assert args.command == "repair repo"
         assert args.yes is True
 
     def test_repair_repo_no_yes_parses(self) -> None:
         """Test repair repo without --yes defaults to False."""
         parser = ba.args_parser()
-        args = parser.parse_args(["repair", "repo"])
-        assert args.command == "repair"
-        assert args.action == "repo"
+        args = parser.parse_command(["repair", "repo"])
+        assert args.command == "repair repo"
         assert args.yes is False
 
     def test_common_args_rejected_before_action(self) -> None:
@@ -529,7 +526,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
         "config",
         "verbose",
         "timestamp_messages",
-        "action",
         # Consumed by Config constructor:
         "seconds",
         "keep_hourly",
@@ -654,7 +650,7 @@ class TestDelete:
     def test_delete_parses_timestamp(self) -> None:
         """Test delete subcommand parses a timestamp argument."""
         parser = ba.args_parser()
-        args = parser.parse_args(["delete", "20250101_120000"])
+        args = parser.parse_command(["delete", "20250101_120000"])
         assert args.command == "delete"
         assert args.archive == "20250101_120000"
         assert args.latest is False
@@ -662,7 +658,7 @@ class TestDelete:
     def test_delete_parses_latest(self) -> None:
         """Test delete subcommand parses --latest flag."""
         parser = ba.args_parser()
-        args = parser.parse_args(["delete", "--latest"])
+        args = parser.parse_command(["delete", "--latest"])
         assert args.command == "delete"
         assert args.archive is None
         assert args.latest is True
@@ -670,14 +666,14 @@ class TestDelete:
     def test_delete_parses_archive_name(self) -> None:
         """Test delete subcommand parses a full archive name."""
         parser = ba.args_parser()
-        args = parser.parse_args(["delete", "home-local-20250101_120000"])
+        args = parser.parse_command(["delete", "home-local-20250101_120000"])
         assert args.command == "delete"
         assert args.archive == "home-local-20250101_120000"
 
     def test_delete_latest_and_archive_errors(self) -> None:
         """Test that --latest with an archive is a parser error."""
         parser = ba.args_parser()
-        args = parser.parse_args(["delete", "--latest", "20250101_120000"])
+        args = parser.parse_command(["delete", "--latest", "20250101_120000"])
         with pytest.raises(SystemExit) as exc_info:
             args.validate(args)
         assert exc_info.value.code == 2
@@ -2071,11 +2067,11 @@ class TestStartEndMarkers:
             caplog.at_level(logging.INFO),
         ):
             ba.main(
-                command="check",
+                command="check age",
                 config=str(ba.CONFIG),
                 verbose=False,
                 timestamp_messages=False,
-                args_dict={"action": "age"},
+                args_dict={},
             )
 
         assert any(
@@ -2461,9 +2457,12 @@ class TestCli:
     ) -> None:
         # No action -> print the subcommand's own help (stdout) and exit
         # USAGE, not argparse's terse "required" error.
-        with patch("sys.argv", ["borgadm", sub]):
-            result = ba.cli()
-        assert result == ba.ExitCode.USAGE
+        with (
+            patch("sys.argv", ["borgadm", sub]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            ba.cli()
+        assert exc_info.value.code == ba.ExitCode.USAGE
         out = capsys.readouterr().out
         assert f"usage: borgadm {sub}" in out
         # Full help lists the subcommand's available actions.

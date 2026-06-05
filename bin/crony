@@ -54,10 +54,7 @@ import tomlkit.exceptions
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
-    StrictArgumentParser,
-    action_subparsers,
-)
+from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 from crony.platform import (  # noqa: E402
     HostPlatform,
@@ -8784,7 +8781,7 @@ def do_self_test(*, verbose: bool, coverage: bool) -> int:
 # =============================================================================
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> StrictArgumentParser:
     """Build and return the argument parser."""
     parser = StrictArgumentParser(
         description=(
@@ -8798,8 +8795,7 @@ def build_parser() -> argparse.ArgumentParser:
     # choices summary so internal subcommands like `run` (the
     # platform unit's entry point, not user-facing) don't leak
     # into the top-level help.
-    subparsers = parser.add_subparsers(
-        dest="command",
+    subparsers = parser.add_command_subparsers(
         metavar="<command>",
         help="Subcommands",
     )
@@ -8809,8 +8805,7 @@ def build_parser() -> argparse.ArgumentParser:
         "config",
         help="Manage the config file",
     )
-    config_subparsers = action_subparsers(
-        p_config,
+    config_subparsers = p_config.add_command_subparsers(
         metavar="<action>",
     )
 
@@ -9245,23 +9240,8 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 
 def cli() -> int:
     """CLI entry point with exception handling."""
-    parser = build_parser()
-    args = parser.parse_args()
-
-    args_dict = vars(args)
+    args_dict = vars(build_parser().parse_command())
     command = args_dict.pop("command")
-    action = args_dict.pop("action", None)
-    action_help = args_dict.pop("_action_help", None)
-
-    if not command:
-        parser.print_help()
-        return ExitCode.USAGE
-
-    # A subcommand that requires an action but got none prints its own
-    # help (like the no-command case above), not argparse's terse error.
-    if action_help is not None and not action:
-        action_help()
-        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(
@@ -9269,10 +9249,8 @@ def cli() -> int:
             coverage=args_dict.pop("coverage"),
         )
 
-    dispatch_key = f"{command} {action}" if action else command
-
     try:
-        COMMAND_CALLBACKS[dispatch_key](**args_dict)
+        COMMAND_CALLBACKS[command](**args_dict)
     except SystemExit as e:
         # `crony run` raises SystemExit(<wrapped-rc>) so an
         # arbitrary exit code from the executed job (0-255) reaches

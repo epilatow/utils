@@ -964,14 +964,14 @@ class _SingleUseAction(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> StrictArgumentParser:
     """Build and return the argument parser."""
     parser = StrictArgumentParser(
         description="Firefox cookie extraction utility",
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_command_subparsers()
 
     def add_profile_arg(
         p: argparse.ArgumentParser,
@@ -1118,15 +1118,9 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 def cli() -> int:
     """CLI entry point with exception handling."""
     parser = build_parser()
-    args = parser.parse_args()
-
-    args_dict = vars(args)
+    args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
     args_dict.pop("_seen_flags", None)
-
-    if not command:
-        parser.print_help()
-        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(

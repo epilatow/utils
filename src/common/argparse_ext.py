@@ -1,15 +1,18 @@
 """Shared argparse helpers for the repo's CLI utilities.
 
 ``StrictArgumentParser`` routes a subparser's argument errors through
-that subparser (not the root), and ``action_subparsers`` makes an
-omitted required action print the subcommand's own help instead of
-argparse's terse "the following arguments are required" error.
+that subparser (not the root). Build a command tree with
+``add_command_subparsers`` at each level and dispatch with
+``parse_command``, which collapses the tree into a single space-joined
+``command`` path (e.g. ``"config init"``) and prints the deepest
+entered subparser's own help when a required level is omitted, instead
+of argparse's terse "the following arguments are required" error.
 """
 
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -35,6 +38,12 @@ class StrictSubParsersAction(SubParsersActionBase):
     (parser._warning) is private and version-gated.
     """
 
+    # Command-tree depth assigned to parsers this action creates.
+    # ``add_command_subparsers`` sets it to its own level + 1; the
+    # class default covers a raw ``add_subparsers`` group that does not
+    # take part in ``parse_command`` dispatch.
+    _child_command_level: int = 1
+
     def __call__(
         self,
         _parser: argparse.ArgumentParser,
@@ -58,6 +67,17 @@ class StrictSubParsersAction(SubParsersActionBase):
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
 
+    def add_parser(self, name: str, **kwargs: Any) -> StrictArgumentParser:
+        # add_subparsers builds children from the owning parser's
+        # class (StrictArgumentParser), so stamp the child's
+        # command-tree depth here -- that is what lets a child know its
+        # own level when it later calls add_command_subparsers.
+        parser = cast(
+            "StrictArgumentParser", super().add_parser(name, **kwargs)
+        )
+        parser._command_level = self._child_command_level
+        return parser
+
 
 class StrictArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that installs the strict subparsers action.
@@ -67,19 +87,58 @@ class StrictArgumentParser(argparse.ArgumentParser):
     wiring.
     """
 
+    # Depth of this parser in the command tree; the root is level 1.
+    # add_command_subparsers numbers its dest from this and stamps
+    # children one deeper.
+    _command_level: int = 1
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.register("action", "parsers", StrictSubParsersAction)
 
+    def add_command_subparsers(self, **kwargs: Any) -> StrictSubParsersAction:
+        """Add a command-tree subparsers group to this parser.
 
-def action_subparsers(
-    parent: argparse.ArgumentParser, **kwargs: Any
-) -> SubParsersActionBase:
-    """Add an action-group subparsers to ``parent``, left non-required
-    so that omitting the action prints the subcommand's own help (via
-    the ``_action_help`` default registered here, which the consumer's
-    ``cli`` invokes) rather than argparse's terse "the following
-    arguments are required" error.
-    """
-    parent.set_defaults(_action_help=parent.print_help)
-    return parent.add_subparsers(dest="action", **kwargs)
+        The group is non-required, so omitting its subcommand leaves
+        its numbered dest at ``None`` and records this parser's
+        ``print_help`` as the ``_action_help`` default; ``parse_command``
+        prints that help and exits 2 rather than raising argparse's
+        terse required-argument error. Levels are numbered automatically
+        (``cmd1``, ``cmd2``, ...), so nesting to any depth needs no
+        per-level dest name.
+        """
+        self.set_defaults(_action_help=self.print_help)
+        action = cast(
+            StrictSubParsersAction,
+            self.add_subparsers(dest=f"cmd{self._command_level}", **kwargs),
+        )
+        action._child_command_level = self._command_level + 1
+        return action
+
+    def parse_command(
+        self, argv: list[str] | None = None
+    ) -> argparse.Namespace:
+        """Parse argv and collapse the numbered ``cmd<level>`` dests
+        into a single space-joined ``command`` path, leaving only the
+        leaf's own options on the namespace.
+
+        A path that stops at a command-tree group without choosing its
+        subcommand prints the deepest entered parser's help and exits 2
+        -- the same exit code argparse uses for ``-h`` or a usage
+        error, but with that subcommand's full help rather than a terse
+        usage line. Invalid arguments / subcommands are still
+        ``parse_args``'s usual usage error.
+        """
+        data = vars(self.parse_args(argv))
+        action_help = data.pop("_action_help", None)
+        path: list[str] = []
+        level = 1
+        while f"cmd{level}" in data:
+            chosen = data.pop(f"cmd{level}")
+            if chosen is None:
+                help_fn = action_help or self.print_help
+                help_fn()
+                raise SystemExit(2)
+            path.append(chosen)
+            level += 1
+        return argparse.Namespace(command=" ".join(path), **data)

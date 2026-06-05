@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from common.argparse_ext import (  # noqa: E402
     StrictArgumentParser,
     StrictSubParsersAction,
-    action_subparsers,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -71,33 +70,60 @@ class TestStrictArgumentParser:
         assert "tool group do:" in capsys.readouterr().err
 
 
-class TestActionSubparsers:
+class TestCommandSubparsers:
     @staticmethod
-    def _parser() -> StrictArgumentParser:
+    def _three_level() -> StrictArgumentParser:
+        # `tool single` and `tool group do [--flag]`.
         p = StrictArgumentParser(prog="tool")
-        sub = p.add_subparsers(dest="command")
-        grp = sub.add_parser("group")
-        nested = action_subparsers(grp)
-        nested.add_parser("do")
+        top = p.add_command_subparsers()
+        top.add_parser("single")
+        grp = top.add_parser("group")
+        mid = grp.add_command_subparsers()
+        leaf = mid.add_parser("do")
+        leaf.add_argument("--flag", action="store_true")
         return p
 
-    def test_missing_action_registers_help(self) -> None:
-        # Omitting the action leaves action=None and a callable
-        # _action_help (the subcommand's print_help) for cli to invoke.
-        p = self._parser()
-        args = p.parse_args(["group"])
-        assert getattr(args, "action", None) is None
-        assert callable(getattr(args, "_action_help", None))
+    def test_numbered_dests_auto_increment(self) -> None:
+        # Each add_command_subparsers level lands under its own
+        # cmd<level> dest without the consumer numbering anything.
+        p = self._three_level()
+        raw = p.parse_args(["group", "do"])
+        assert raw.cmd1 == "group"
+        assert raw.cmd2 == "do"
 
-    def test_present_action_dispatches(self) -> None:
-        p = self._parser()
-        args = p.parse_args(["group", "do"])
-        assert args.action == "do"
+    def test_parse_command_collapses_single_level(self) -> None:
+        p = self._three_level()
+        args = p.parse_command(["single"])
+        assert args.command == "single"
+        assert not hasattr(args, "cmd1")
 
-    def test_unknown_action_errors(self, capsys: Any) -> None:
-        p = self._parser()
+    def test_parse_command_collapses_three_levels(self) -> None:
+        p = self._three_level()
+        args = p.parse_command(["group", "do", "--flag"])
+        assert args.command == "group do"
+        assert args.flag is True
+        assert not hasattr(args, "_action_help")
+
+    def test_missing_command_prints_root_help(self, capsys: Any) -> None:
+        p = self._three_level()
+        with pytest.raises(SystemExit) as exc:
+            p.parse_command([])
+        assert exc.value.code == 2
+        assert "usage: tool" in capsys.readouterr().out
+
+    def test_missing_action_prints_subcommand_help(self, capsys: Any) -> None:
+        # Entering `group` without its action prints group's own help,
+        # not the root's.
+        p = self._three_level()
+        with pytest.raises(SystemExit) as exc:
+            p.parse_command(["group"])
+        assert exc.value.code == 2
+        assert "usage: tool group" in capsys.readouterr().out
+
+    def test_unknown_subcommand_errors(self, capsys: Any) -> None:
+        p = self._three_level()
         with pytest.raises(SystemExit):
-            p.parse_args(["group", "bogus"])
+            p.parse_command(["bogus"])
         assert "bogus" in capsys.readouterr().err
 
 

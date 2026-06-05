@@ -1144,7 +1144,7 @@ def publish(
     return True
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> StrictArgumentParser:
     """
     Build and return the argument parser.
 
@@ -1168,7 +1168,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+    subparsers = parser.add_command_subparsers(help="Subcommands")
 
     # Create subcommand
     create_parser = subparsers.add_parser(
@@ -1332,14 +1332,8 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 def cli() -> int:
     """CLI entry point with exception handling."""
     parser = build_parser()
-    args = parser.parse_args()
-
-    args_dict = vars(args)
+    args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
-
-    if not command:
-        parser.print_help()
-        return ExitCode.USAGE
 
     if command == "self-test":
         return do_self_test(
