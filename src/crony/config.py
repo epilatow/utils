@@ -848,7 +848,7 @@ class TomlConfig:
         whose file failed to parse has none of that, so scoping to it
         is an error. Subcommands that address installed units
         (`status` / `destroy` / `enable` / `disable` / `trigger`) use
-        `require_addressable_bundle` instead, which also accepts a
+        `Config.require_addressable` instead, which also accepts a
         bundle present only as on-disk state.
         """
         if bundle is not None and self.by_name(bundle) is None:

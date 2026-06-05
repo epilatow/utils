@@ -43,27 +43,6 @@ from crony.unit import (
     UnitSpec,
 )
 
-
-def require_addressable_bundle(config: Config, bundle: str | None) -> None:
-    """Reject `--bundle <name>` unless `<name>` is addressable on
-    this host: either a successfully parsed bundle, or one with
-    on-disk remnants. Used by the subcommands that address
-    installed units (`status` / `destroy` / `enable` / `disable`
-    / `trigger`); the on-disk fallback lets them scope to a bundle
-    whose config has since broken -- exactly when the operator
-    most needs to inspect, disarm, or tear it down. Commands that
-    parse the pending config (`apply` / `validate`) use
-    `TomlConfig.require_known` instead.
-    """
-    if bundle is None:
-        return
-    if config.toml_config.by_name(bundle) is not None:
-        return
-    if bundle in config.installed_bundle_names():
-        return
-    raise UsageError(f"unknown bundle: {bundle!r}")
-
-
 # =============================================================================
 # APPLIED SNAPSHOT
 # =============================================================================
@@ -81,7 +60,7 @@ def require_addressable_bundle(config: Config, bundle: str | None) -> None:
 # at fire time.
 
 
-_SNAPSHOT_SCHEMA: int = 4
+SNAPSHOT_SCHEMA: int = 4
 
 
 @dataclass
@@ -152,6 +131,64 @@ class Job:
             priority=self.priority,
         )
 
+    @classmethod
+    def from_config(
+        cls,
+        config: TomlBundleConfig,
+        job: TomlJob,
+        name: EntityName,
+    ) -> Job:
+        """Build a Job by applying every cascade once."""
+        args = [_expand_path_field(a) for a in job.args]
+        gate_args = [_expand_path_field(a) for a in job.gate_args]
+        script = (
+            str(resolve_script(job.script)) if job.script is not None else None
+        )
+        gate_script = (
+            str(resolve_script(job.gate_script))
+            if job.gate_script is not None
+            else None
+        )
+        return cls(
+            schema=SNAPSHOT_SCHEMA,
+            kind="job",
+            name=name,
+            uuid=job.uuid,
+            command=job.command,
+            script=script,
+            args=args,
+            gate=job.gate,
+            gate_script=gate_script,
+            gate_args=gate_args,
+            env=config.resolved_env(job),
+            job_timeout_sec=config.resolved_job_timeout_sec(job),
+            timing=job.timing,
+            priority=config.resolved_priority(job),
+            keep_awake=config.resolved_keep_awake(job),
+            success_exit_codes=list(job.success_exit_codes),
+            interactive=job.interactive,
+            interactive_active_sec=(
+                job.interactive_active_sec
+                if job.interactive_active_sec is not None
+                else INTERACTIVE_ACTIVE_DEFAULT_SEC
+            ),
+            interactive_delay_sec=(
+                job.interactive_delay_sec
+                if job.interactive_delay_sec is not None
+                else INTERACTIVE_DELAY_DEFAULT_SEC
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this job to its JSON dict. The typed value-object
+        fields render back to their source strings, so snapshot.json
+        stays string-keyed regardless of the in-memory types."""
+        d = _snapshot_base_dict(self)
+        d["priority"] = (
+            str(self.priority) if self.priority is not None else None
+        )
+        return d
+
 
 @dataclass
 class JobGroup:
@@ -187,13 +224,79 @@ class JobGroup:
             priority=None,
         )
 
+    @classmethod
+    def from_config(
+        cls,
+        config: TomlBundleConfig,
+        target: Target | None,
+        group: TomlJobGroup,
+        name: EntityName,
+    ) -> JobGroup:
+        """Build a JobGroup. `group_budget_sec` is recomputed from
+        the live config (not from children's pinned snapshots), so an
+        apply pass that walks topologically still produces the right
+        parent budget regardless of children's prior applied state.
 
-def _entity_state_dir(ref: EntityRef) -> Path:
+        Children that aren't selected on this host are dropped from
+        `children`. That covers both own-filter masks (the child's
+        own `platforms` / `hosts` exclude this host) and the
+        empty-group cascade (a child group whose own children are all
+        masked here). The reference becomes a no-op on this host, so
+        a shared bundle can list a host-restricted child from a
+        parent group that runs everywhere without the parent
+        dispatcher trying to trigger a unit that wasn't installed.
+        """
+        sel_jobs, sel_groups = config.selected_jobs_and_groups(target)
+        # Children are stored as uuids (not full names) so renaming a
+        # child in config doesn't flip the parent's snapshot -- the
+        # uuid edge is unchanged. The runner resolves each child uuid
+        # to its current full name by reading the child's snapshot at
+        # dispatch time.
+        children: list[str] = []
+        for c in group.jobs:
+            if c in sel_jobs:
+                children.append(config.jobs[c].uuid)
+            elif c in sel_groups:
+                children.append(config.job_groups[c].uuid)
+        return cls(
+            schema=SNAPSHOT_SCHEMA,
+            kind="group",
+            name=name,
+            uuid=group.uuid,
+            children=children,
+            group_budget_sec=config.resolved_group_timeout_sec(
+                target, group.name
+            ),
+            trigger_timeout_sec=config.defaults.trigger_timeout_sec,
+            timing=group.timing,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this group to its JSON dict. The typed value-object
+        fields render back to their source strings, so snapshot.json
+        stays string-keyed regardless of the in-memory types."""
+        return _snapshot_base_dict(self)
+
+
+def _snapshot_base_dict(snap: Job | JobGroup) -> dict[str, Any]:
+    """Serialize the fields Job and JobGroup share to a JSON dict,
+    rendering the typed value-object fields back to their source
+    strings. `Job.to_dict` layers the job-only `priority` on top."""
+    d = dataclasses.asdict(snap)
+    d["name"] = str(snap.name)
+    timing = snap.timing
+    d.pop("timing", None)
+    d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
+    d["interval"] = str(timing) if isinstance(timing, Interval) else None
+    return d
+
+
+def entity_state_dir(ref: EntityRef) -> Path:
     return crony.paths.STATE_DIR / ref.bundle / ref.uuid
 
 
-def _snapshot_path_for(ref: EntityRef) -> Path:
-    return _entity_state_dir(ref) / "snapshot.json"
+def snapshot_path_for(ref: EntityRef) -> Path:
+    return entity_state_dir(ref) / "snapshot.json"
 
 
 def _expand_path_field(value: str) -> str:
@@ -209,7 +312,7 @@ def _expand_path_field(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
-def _resolve_script(script: str) -> Path:
+def resolve_script(script: str) -> Path:
     """Resolve a `script` field to an absolute path."""
     p = Path(_expand_path_field(script))
     if not p.is_absolute():
@@ -217,98 +320,7 @@ def _resolve_script(script: str) -> Path:
     return p
 
 
-def _resolve_job_snapshot(
-    config: TomlBundleConfig,
-    job: TomlJob,
-    name: EntityName,
-) -> Job:
-    """Build a Job by applying every cascade once."""
-    args = [_expand_path_field(a) for a in job.args]
-    gate_args = [_expand_path_field(a) for a in job.gate_args]
-    script = (
-        str(_resolve_script(job.script)) if job.script is not None else None
-    )
-    gate_script = (
-        str(_resolve_script(job.gate_script))
-        if job.gate_script is not None
-        else None
-    )
-    return Job(
-        schema=_SNAPSHOT_SCHEMA,
-        kind="job",
-        name=name,
-        uuid=job.uuid,
-        command=job.command,
-        script=script,
-        args=args,
-        gate=job.gate,
-        gate_script=gate_script,
-        gate_args=gate_args,
-        env=config.resolved_env(job),
-        job_timeout_sec=config.resolved_job_timeout_sec(job),
-        timing=job.timing,
-        priority=config.resolved_priority(job),
-        keep_awake=config.resolved_keep_awake(job),
-        success_exit_codes=list(job.success_exit_codes),
-        interactive=job.interactive,
-        interactive_active_sec=(
-            job.interactive_active_sec
-            if job.interactive_active_sec is not None
-            else INTERACTIVE_ACTIVE_DEFAULT_SEC
-        ),
-        interactive_delay_sec=(
-            job.interactive_delay_sec
-            if job.interactive_delay_sec is not None
-            else INTERACTIVE_DELAY_DEFAULT_SEC
-        ),
-    )
-
-
-def _resolve_group_snapshot(
-    config: TomlBundleConfig,
-    target: Target | None,
-    group: TomlJobGroup,
-    name: EntityName,
-) -> JobGroup:
-    """Build a JobGroup. `group_budget_sec` is recomputed from
-    the live config (not from children's pinned snapshots), so an
-    apply pass that walks topologically still produces the right
-    parent budget regardless of children's prior applied state.
-
-    Children that aren't selected on this host are dropped from
-    `children`. That covers both own-filter masks (the child's
-    own `platforms` / `hosts` exclude this host) and the
-    empty-group cascade (a child group whose own children are all
-    masked here). The reference becomes a no-op on this host, so
-    a shared bundle can list a host-restricted child from a
-    parent group that runs everywhere without the parent
-    dispatcher trying to trigger a unit that wasn't installed.
-    """
-    sel_jobs, sel_groups = config.selected_jobs_and_groups(target)
-    # Children are stored as uuids (not full names) so renaming a
-    # child in config doesn't flip the parent's snapshot -- the
-    # uuid edge is unchanged. The runner resolves each child uuid
-    # to its current full name by reading the child's snapshot at
-    # dispatch time.
-    children: list[str] = []
-    for c in group.jobs:
-        if c in sel_jobs:
-            children.append(config.jobs[c].uuid)
-        elif c in sel_groups:
-            children.append(config.job_groups[c].uuid)
-    return JobGroup(
-        schema=_SNAPSHOT_SCHEMA,
-        kind="group",
-        name=name,
-        uuid=group.uuid,
-        children=children,
-        group_budget_sec=config.resolved_group_timeout_sec(target, group.name),
-        trigger_timeout_sec=config.defaults.trigger_timeout_sec,
-        timing=group.timing,
-    )
-
-
-def _resolve_snapshot_for(
+def resolve_snapshot_for(
     config: TomlBundleConfig,
     short: str,
     bundle_name: str = DEFAULT_BUNDLE_NAME,
@@ -322,32 +334,15 @@ def _resolve_snapshot_for(
     name = EntityName(bundle_name, short)
     target = config.resolve_target()
     if short in config.jobs:
-        return _resolve_job_snapshot(config, config.jobs[short], name)
+        return Job.from_config(config, config.jobs[short], name)
     if short in config.job_groups:
-        return _resolve_group_snapshot(
+        return JobGroup.from_config(
             config, target, config.job_groups[short], name
         )
     raise PreconditionError(f"unknown job/group: {short!r}")
 
 
-def _snapshot_to_dict(snap: Job | JobGroup) -> dict[str, Any]:
-    """Serialize a snapshot to its JSON dict. The typed value-object
-    fields render back to their source strings, so snapshot.json stays
-    string-keyed regardless of the in-memory types."""
-    d = dataclasses.asdict(snap)
-    d["name"] = str(snap.name)
-    timing = snap.timing
-    d.pop("timing", None)
-    d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
-    d["interval"] = str(timing) if isinstance(timing, Interval) else None
-    if isinstance(snap, Job):
-        d["priority"] = (
-            str(snap.priority) if snap.priority is not None else None
-        )
-    return d
-
-
-def _snapshot_from_raw(raw: dict[str, Any]) -> Job | JobGroup:
+def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
     """Construct a snapshot from its JSON dict, parsing the typed
     value-object fields back from their source strings. Raises
     TypeError (wrong shape) or ValueError (bad typed field / unknown
@@ -391,6 +386,24 @@ class LastRun:
 
     exit_class: str | None
     started_at: str | None
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> LastRun:
+        """Extract the display-relevant subset of `last-run.json`.
+
+        The full `JobRunResult` / `GroupRunResult` shapes are the
+        on-disk serialization; status only consumes `exit_class` and
+        `started_at`, so we pull those out tolerantly. A partial /
+        corrupt last-run.json still produces a LastRun with whatever
+        fields landed, rather than disqualifying the entity from
+        runtime state altogether.
+        """
+        exit_class = raw.get("exit_class")
+        started_at = raw.get("started_at")
+        return cls(
+            exit_class=exit_class if isinstance(exit_class, str) else None,
+            started_at=started_at if isinstance(started_at, str) else None,
+        )
 
 
 @dataclass
@@ -459,6 +472,50 @@ class Graph:
         if ref in self.groups:
             return "group"
         return None
+
+    @classmethod
+    def build_pending(
+        cls,
+        toml_config: TomlConfig,
+        host: str | None = None,
+        platform: str | None = None,
+    ) -> Graph:
+        """Walk every bundle's TomlConfig, run cascade resolution +
+        host/platform selection, and produce the pending graph. Entries
+        masked out for this host don't appear in the graph -- they're
+        not "what apply would install here", and they pair via the
+        orphan path when their on-disk remnants outlive a host-filter
+        edit.
+
+        `host` / `platform` default to the current machine when
+        omitted -- `resolve_target` self-resolves them. Tests pass
+        explicit values to force selection for another host.
+        """
+        pending = cls()
+        for bundle in toml_config.bundles:
+            target = bundle.config.resolve_target(host, platform)
+            sel_jobs, sel_groups = bundle.config.selected_jobs_and_groups(
+                target
+            )
+            for short in sel_jobs:
+                toml_job = bundle.config.jobs.get(short)
+                if toml_job is None:
+                    continue
+                name = EntityName(bundle.name, short)
+                snap_j = Job.from_config(bundle.config, toml_job, name)
+                pending.jobs[snap_j.ref] = snap_j
+                pending.by_full_name[str(name)] = snap_j.ref
+            for short in sel_groups:
+                toml_group = bundle.config.job_groups.get(short)
+                if toml_group is None:
+                    continue
+                name = EntityName(bundle.name, short)
+                snap_g = JobGroup.from_config(
+                    bundle.config, target, toml_group, name
+                )
+                pending.groups[snap_g.ref] = snap_g
+                pending.by_full_name[str(name)] = snap_g.ref
+        return pending
 
 
 @dataclass(frozen=True)
@@ -576,6 +633,25 @@ class Config:
                 self.current.refs() | set(self.broken) | set(self.unit_only)
             )
         }
+
+    def require_addressable(self, bundle: str | None) -> None:
+        """Reject `--bundle <name>` unless `<name>` is addressable on
+        this host: either a successfully parsed bundle, or one with
+        on-disk remnants. Used by the subcommands that address
+        installed units (`status` / `destroy` / `enable` / `disable`
+        / `trigger`); the on-disk fallback lets them scope to a bundle
+        whose config has since broken -- exactly when the operator
+        most needs to inspect, disarm, or tear it down. Commands that
+        parse the pending config (`apply` / `validate`) use
+        `TomlConfig.require_known` instead.
+        """
+        if bundle is None:
+            return
+        if self.toml_config.by_name(bundle) is not None:
+            return
+        if bundle in self.installed_bundle_names():
+            return
+        raise UsageError(f"unknown bundle: {bundle!r}")
 
     def config_state(self, ref: EntityRef) -> str:
         """synced | stale | broken | missing | orphan for `ref`.
@@ -699,56 +775,3 @@ class Config:
         if ref is not None:
             return ref if ref in self.pending.refs() else None
         return self.pending.by_full_name.get(full_name)
-
-
-def _parse_last_run(raw: dict[str, Any]) -> LastRun:
-    """Extract the display-relevant subset of `last-run.json`.
-
-    The full `JobRunResult` / `GroupRunResult` shapes are the on-disk
-    serialization; status only consumes `exit_class` and
-    `started_at`, so we pull those out tolerantly. A partial /
-    corrupt last-run.json still produces a LastRun with whatever
-    fields landed, rather than disqualifying the entity from
-    runtime state altogether.
-    """
-    exit_class = raw.get("exit_class")
-    started_at = raw.get("started_at")
-    return LastRun(
-        exit_class=exit_class if isinstance(exit_class, str) else None,
-        started_at=started_at if isinstance(started_at, str) else None,
-    )
-
-
-def _build_pending_graph(
-    toml_config: TomlConfig, host: str, platform: str
-) -> Graph:
-    """Walk every bundle's TomlConfig, run cascade resolution +
-    host/platform selection, and produce the pending graph. Entries
-    masked out for this host don't appear in the graph -- they're
-    not "what apply would install here", and they pair via the
-    orphan path when their on-disk remnants outlive a host-filter
-    edit.
-    """
-    pending = Graph()
-    for bundle in toml_config.bundles:
-        target = bundle.config.resolve_target(host, platform)
-        sel_jobs, sel_groups = bundle.config.selected_jobs_and_groups(target)
-        for short in sel_jobs:
-            toml_job = bundle.config.jobs.get(short)
-            if toml_job is None:
-                continue
-            name = EntityName(bundle.name, short)
-            snap_j = _resolve_job_snapshot(bundle.config, toml_job, name)
-            pending.jobs[snap_j.ref] = snap_j
-            pending.by_full_name[str(name)] = snap_j.ref
-        for short in sel_groups:
-            toml_group = bundle.config.job_groups.get(short)
-            if toml_group is None:
-                continue
-            name = EntityName(bundle.name, short)
-            snap_g = _resolve_group_snapshot(
-                bundle.config, target, toml_group, name
-            )
-            pending.groups[snap_g.ref] = snap_g
-            pending.by_full_name[str(name)] = snap_g.ref
-    return pending

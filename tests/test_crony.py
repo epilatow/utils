@@ -62,9 +62,9 @@ from crony.config import (  # noqa: E402
 )
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
 from crony.model import (  # noqa: E402
-    _resolve_job_snapshot,
-    _resolve_script,
-    _resolve_snapshot_for,
+    Job,
+    resolve_script,
+    resolve_snapshot_for,
 )
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
@@ -2729,7 +2729,7 @@ class _RunnerHarness:
         # fields (TypeError from Job(**raw)); incomplete fixtures
         # would silently fall out of the current graph.
         snapshot: dict[str, Any] = {
-            "schema": crony._SNAPSHOT_SCHEMA,
+            "schema": crony.SNAPSHOT_SCHEMA,
             "kind": kind,
             "name": f"{bundle}.{short}",
             "bundle": bundle,
@@ -2815,7 +2815,7 @@ class _RunnerHarness:
                 # the entity's runtime state; a partial dict would
                 # be skipped by Job(**raw) / JobGroup(**raw).
                 payload: dict[str, Any] = {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": kind,
                     "name": f"{bundle}.{short}",
                     "bundle": bundle,
@@ -2857,7 +2857,7 @@ class _RunnerHarness:
         for runner tests that build a TomlBundleConfig and call run_job /
         run_group directly without going through full apply.
         """
-        return _resolve_snapshot_for(cfg, short)
+        return resolve_snapshot_for(cfg, short)
 
     def write_snap(self, cfg: Any, short: str) -> None:
         """Write a snapshot to disk so `_load_snapshot` finds it.
@@ -2870,9 +2870,7 @@ class _RunnerHarness:
         import json as _json
 
         p.write_text(
-            _json.dumps(
-                crony._snapshot_to_dict(snap), sort_keys=True, indent=2
-            ),
+            _json.dumps(snap.to_dict(), sort_keys=True, indent=2),
             encoding="utf-8",
         )
 
@@ -2977,17 +2975,17 @@ class TestPathFieldExpansion:
 
     def test_resolve_script_expands_tilde(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = _resolve_script("~/bin/foo.sh")
+        p = resolve_script("~/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_dollar_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = _resolve_script("$HOME/bin/foo.sh")
+        p = resolve_script("$HOME/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_braced_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = _resolve_script("${HOME}/bin/foo.sh")
+        p = resolve_script("${HOME}/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_unresolved_var_stays_literal(
@@ -2996,7 +2994,7 @@ class TestPathFieldExpansion:
         monkeypatch.delenv("CRONY_NO_SUCH_VAR", raising=False)
         # When no expansion applies, the value falls under CONFIG_DIR
         # as a relative path. The literal `$VAR` is preserved.
-        p = _resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
+        p = resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
         assert "$CRONY_NO_SUCH_VAR" in str(p)
 
     def test_snapshot_resolves_expanded_args(self, monkeypatch: Any) -> None:
@@ -3010,7 +3008,7 @@ class TestPathFieldExpansion:
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -3039,7 +3037,7 @@ class TestPathFieldExpansion:
             gate_script="/abs/gate.sh",
             gate_args=["$HOME/state"],
         )
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -3205,7 +3203,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config({}, default_target_jobs=[])
         with pytest.raises(crony.PreconditionError, match="unknown"):
-            _resolve_snapshot_for(cfg, "ghost")
+            resolve_snapshot_for(cfg, "ghost")
 
     def test_run_without_snapshot_raises_precondition(
         self, tmp_path: Path, monkeypatch: Any
@@ -3300,7 +3298,7 @@ class TestRunJobBasics:
         sd.mkdir(parents=True)
         # Schema matches, but `kind` is neither "job" nor "group".
         (sd / "snapshot.json").write_text(
-            f'{{"schema": {crony._SNAPSHOT_SCHEMA}, '
+            f'{{"schema": {crony.SNAPSHOT_SCHEMA}, '
             f'"kind": "banana", "name": "default.j"}}',
             encoding="utf-8",
         )
@@ -5450,14 +5448,14 @@ class TestJobPriority:
 
     def test_snapshot_carries_priority(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority is PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority == PriorityClass.HIGH
@@ -5469,7 +5467,7 @@ class TestJobPriority:
                 "job": {"a": _job(priority="low")},
             }
         )
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority == PriorityClass.LOW
@@ -5562,7 +5560,7 @@ class TestKeepAwake:
 
     def _snap(self, keep_awake: bool) -> Any:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
-        return _resolve_job_snapshot(
+        return Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 
@@ -5578,7 +5576,7 @@ class TestKeepAwake:
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"keep_awake": True}, "job": {"a": _job()}})
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.keep_awake is True
@@ -5590,7 +5588,7 @@ class TestKeepAwake:
                 "job": {"a": _job(keep_awake=False)},
             }
         )
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.keep_awake is False
@@ -6451,7 +6449,7 @@ class TestDestroy:
         # a bundle whose config has since broken must still tear
         # down that bundle's on-disk remnants. The moment you most
         # want to scope-destroy a bundle is right after its config
-        # broke, so `require_addressable_bundle` must accept a
+        # broke, so `Config.require_addressable` must accept a
         # bundle present only as on-disk state.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
@@ -11145,7 +11143,7 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.gone",
                     "bundle": "default",
@@ -11185,7 +11183,7 @@ class TestLoadConfig:
         )
         # Build a snapshot that matches what apply would write.
         bundles = TomlConfig.load_all()
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
@@ -11193,7 +11191,7 @@ class TestLoadConfig:
         sd = crony_paths.STATE_DIR / "default" / uuid_a
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
-            json.dumps(crony._snapshot_to_dict(snap)), encoding="utf-8"
+            json.dumps(snap.to_dict()), encoding="utf-8"
         )
         config = crony.load_config()
         ref = EntityRef("default", uuid_a)
@@ -11211,7 +11209,7 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         bundles = TomlConfig.load_all()
-        snap = _resolve_job_snapshot(
+        snap = Job.from_config(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
@@ -11220,7 +11218,7 @@ class TestLoadConfig:
         sd.mkdir(parents=True)
         # Persist a snapshot with a divergent command vs what TOML
         # currently says ("true" vs "stale-command").
-        diverged = crony._snapshot_to_dict(snap)
+        diverged = snap.to_dict()
         diverged["command"] = "stale-command"
         (sd / "snapshot.json").write_text(
             json.dumps(diverged), encoding="utf-8"
@@ -11307,7 +11305,7 @@ class TestConfigBroken:
             "22222222-2222-2222-2222-222222222222",
             json.dumps(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": "banana",
                     "name": "default.j",
                 }
@@ -11328,7 +11326,7 @@ class TestConfigBroken:
             "33333333-3333-3333-3333-333333333333",
             json.dumps(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.partial",
                 }
@@ -11502,7 +11500,7 @@ class TestNameCollision:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": full,
                     "bundle": bundle,
@@ -12205,7 +12203,7 @@ class TestSnapshotLifecycle:
         assert snap["name"] == h.full("j")
         assert snap["command"] == "true"
         assert snap["job_timeout_sec"] == 600
-        assert snap["schema"] == crony._SNAPSHOT_SCHEMA
+        assert snap["schema"] == crony.SNAPSHOT_SCHEMA
 
     def test_apply_state_is_co_located_in_entry_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -12582,7 +12580,7 @@ class TestSnapshotLifecycle:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": crony._SNAPSHOT_SCHEMA,
+                    "schema": crony.SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.j",
                     "bogus_field": "unexpected",
@@ -13015,7 +13013,7 @@ class TestSnapshotBackwardLoad:
         snap_dir.mkdir(parents=True)
         # Pre-existing snapshot lacking schedule / interval keys.
         legacy = {
-            "schema": crony._SNAPSHOT_SCHEMA,
+            "schema": crony.SNAPSHOT_SCHEMA,
             "kind": "job",
             "name": full,
             "bundle": DEFAULT_BUNDLE_NAME,

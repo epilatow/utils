@@ -85,7 +85,7 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
-    _SNAPSHOT_SCHEMA,
+    SNAPSHOT_SCHEMA,
     BrokenEntity,
     Config,
     Graph,
@@ -94,13 +94,9 @@ from crony.model import (  # noqa: E402
     LastRun,
     RuntimeState,
     UnitOnlyOrphan,
-    _build_pending_graph,
-    _entity_state_dir,
-    _parse_last_run,
-    _snapshot_from_raw,
-    _snapshot_path_for,
-    _snapshot_to_dict,
-    require_addressable_bundle,
+    entity_state_dir,
+    snapshot_from_dict,
+    snapshot_path_for,
 )
 from crony.platform import (  # noqa: E402
     HostPlatform,
@@ -565,12 +561,12 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
     mismatch (re-apply required).
 
     The platform unit's argv carries `bundle:uuid` so the runner
-    addresses the snapshot directly via `_entity_state_dir`
+    addresses the snapshot directly via `entity_state_dir`
     without scanning the bundle's state dirs. The error messages
     use the recovered `name` field when available so the operator
     sees the human-readable identity.
     """
-    state_dir = _entity_state_dir(ref)
+    state_dir = entity_state_dir(ref)
     ref_str = str(ref)
     p = state_dir / "snapshot.json"
     if not p.is_file():
@@ -585,20 +581,20 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
     name_hint = raw.get("name") if isinstance(raw, dict) else None
     display = name_hint if isinstance(name_hint, str) else ref_str
     schema = raw.get("schema") if isinstance(raw, dict) else None
-    if schema != _SNAPSHOT_SCHEMA:
+    if schema != SNAPSHOT_SCHEMA:
         raise PreconditionError(
             f"snapshot for {display!r} has schema {schema!r}, "
-            f"expected {_SNAPSHOT_SCHEMA} (re-apply required)"
+            f"expected {SNAPSHOT_SCHEMA} (re-apply required)"
         )
     # A schema-matched but otherwise malformed snapshot (extra /
     # missing fields, a bad schedule / interval string, or an unknown
-    # kind) raises TypeError / ValueError from _snapshot_from_raw.
+    # kind) raises TypeError / ValueError from snapshot_from_dict.
     # `_build_current_graph` already treats that as a broken entity;
     # mirror it here so the runner records a `canceled` last-run via
     # its PreconditionError handler instead of crashing with a
     # traceback the scheduler never sees.
     try:
-        return _snapshot_from_raw(raw)
+        return snapshot_from_dict(raw)
     except (TypeError, ValueError) as e:
         raise PreconditionError(
             f"snapshot for {display!r} has malformed fields: {e} "
@@ -612,7 +608,7 @@ def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
 # `crony run <bundle>:<uuid>` is the platform unit's entry point --
 # the scheduler invokes it; it is not a user-facing subcommand.
 # The argv carries the entity's uuid so the runner addresses its
-# state dir directly via `_entity_state_dir` and loads the pinned
+# state dir directly via `entity_state_dir` and loads the pinned
 # applied snapshot without scanning. The shim dispatches to the
 # per-job pipeline or the group pipeline. The per-job pipeline
 # acquires a per-job flock, runs the optional gate, execs the main
@@ -734,7 +730,7 @@ def _read_runtime_state(
         except (OSError, json.JSONDecodeError):
             raw = None
         if isinstance(raw, dict):
-            last_run = _parse_last_run(raw)
+            last_run = LastRun.from_raw(raw)
 
     is_running = False
     lock_path = state_dir / "run.lock"
@@ -816,20 +812,20 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            if raw.get("schema") != _SNAPSHOT_SCHEMA:
+            if raw.get("schema") != SNAPSHOT_SCHEMA:
                 broken[ref] = BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
                     reason=(
                         f"snapshot schema {raw.get('schema')!r} "
-                        f"(expected {_SNAPSHOT_SCHEMA})"
+                        f"(expected {SNAPSHOT_SCHEMA})"
                     ),
                     source_path=snap_path,
                 )
                 continue
             try:
-                snap = _snapshot_from_raw(raw)
+                snap = snapshot_from_dict(raw)
             except (TypeError, ValueError) as exc:
                 broken[ref] = BrokenEntity(
                     bundle=bundle_dir.name,
@@ -863,7 +859,7 @@ def _build_current_graph(
     # the unit-config / last / last-ran columns render empty
     # for broken rows even when those files are on disk.
     for ref, broken_entry in broken.items():
-        state_dir = _entity_state_dir(ref)
+        state_dir = entity_state_dir(ref)
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=broken_entry.name,
@@ -880,7 +876,7 @@ def load_config() -> Config:
     platform = crony.platform.current_platform()
 
     toml_config = TomlConfig.load_all()
-    pending = _build_pending_graph(toml_config, host, platform)
+    pending = Graph.build_pending(toml_config)
     current, broken, runtime = _build_current_graph(crony.paths.STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
@@ -942,7 +938,7 @@ def load_config() -> Config:
         unit_config = _platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         runtime[ref] = RuntimeState(
-            state_dir=_entity_state_dir(ref),
+            state_dir=entity_state_dir(ref),
             last_run=None,
             is_running=False,
             is_pending=False,
@@ -1012,7 +1008,7 @@ def _state_dir_for(ref: EntityRef) -> Path:
     it. Only created when missing, never truncated, so an existing
     log survives a re-apply untouched.
     """
-    d = _entity_state_dir(ref)
+    d = entity_state_dir(ref)
     d.mkdir(parents=True, exist_ok=True)
     log_path = d / "run.log"
     if not log_path.exists():
@@ -1889,7 +1885,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     silently bypass *that* wait.
     """
 
-    sd = _entity_state_dir(snap.ref)
+    sd = entity_state_dir(snap.ref)
 
     def _bypass() -> bool:
         return _consume_user_trigger_flag(sd)
@@ -2165,7 +2161,7 @@ def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
     at the cost of one snapshot read per child at dispatch time.
     Returns None when the child snapshot is missing or unreadable.
     """
-    snap_p = _entity_state_dir(child_ref) / "snapshot.json"
+    snap_p = entity_state_dir(child_ref) / "snapshot.json"
     if not snap_p.is_file():
         return None
     try:
@@ -2295,7 +2291,7 @@ def run_group(
                     else time.monotonic() + group_budget
                 )
                 for child_ref, child_full_name in resolved_pairs:
-                    child_sd = _entity_state_dir(child_ref)
+                    child_sd = entity_state_dir(child_ref)
                     if _child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
@@ -2588,7 +2584,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     full_name = str(snapshot.name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    snapshot_path = _snapshot_path_for(ref)
+    snapshot_path = snapshot_path_for(ref)
 
     # Every uuid / full name the bundle's config currently defines
     # (plus `ref` itself, defensively). Used to keep per-entry
@@ -2674,8 +2670,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
 
     _state_dir_for(ref)
     snapshot_path.write_text(
-        json.dumps(_snapshot_to_dict(snapshot), indent=2, sort_keys=True)
-        + "\n",
+        json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return "updated" if is_update else "added"
@@ -3076,7 +3071,7 @@ def _trigger_unit_sync(
 
     `state_dir` is the entity's uuid-keyed state directory,
     resolved by the caller (via `Config.current` or
-    `_entity_state_dir(ref)` for a group parent's child). The
+    `entity_state_dir(ref)` for a group parent's child). The
     path may not exist yet at call time (first
     fire); the watcher polls run.pid / last-run.json under it
     without pre-creating the dir, so a unit that fails to load
@@ -3634,7 +3629,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         )
         for ref in orphan_refs:
             name = config.name_for(ref)
-            sd = _entity_state_dir(ref)
+            sd = entity_state_dir(ref)
             label = name if name is not None else str(ref)
             if sd.is_dir() and _run_in_progress(sd):
                 logger.warning(
@@ -3690,7 +3685,7 @@ def do_destroy(
         )
     config = load_config()
     bundles = config.toml_config
-    require_addressable_bundle(config, bundle)
+    config.require_addressable(bundle)
     # Shadowed collision losers share a live name, so they never
     # surface in the name-keyed discovery set
     # (`Config.installed_full_names()`) -- collect them by ref.
@@ -3718,7 +3713,7 @@ def do_destroy(
             if n in known:
                 continue
             syn = EntityRef.from_str(n)
-            if syn is not None and _entity_state_dir(syn).is_dir():
+            if syn is not None and entity_state_dir(syn).is_dir():
                 continue
             unknown.append(n)
         if unknown:
@@ -3758,7 +3753,7 @@ def do_destroy(
             ref = _resolve_addressable(config, full)
         else:
             ref = config.resolve_current(full) or direct_ref
-        sd = _entity_state_dir(ref) if ref is not None else None
+        sd = entity_state_dir(ref) if ref is not None else None
         # Recover the entity's actual name for platform unit cleanup:
         # the unit file is keyed by the installed (current) name, which
         # a `<bundle>:<UUID>` input or a renamed entry's new name
@@ -3790,7 +3785,7 @@ def do_destroy(
     # in a factory reset, is removed by the winner's own pass
     # above).
     for ref in shadowed_refs:
-        sd = _entity_state_dir(ref)
+        sd = entity_state_dir(ref)
         if not sd.is_dir():
             continue
         if _run_in_progress(sd):
@@ -3975,7 +3970,7 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     names must match it.
     """
     config = load_config()
-    require_addressable_bundle(config, bundle)
+    config.require_addressable(bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
@@ -4004,7 +3999,7 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     names must match it.
     """
     config = load_config()
-    require_addressable_bundle(config, bundle)
+    config.require_addressable(bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, installed, config, scheduled_only=True
@@ -4094,7 +4089,7 @@ def do_trigger(
         )
     config = load_config()
     bundles = config.toml_config
-    require_addressable_bundle(config, bundle)
+    config.require_addressable(bundle)
     stamped = config.installed_full_names()
     normalized = _resolve_bulk_names(
         jobs, bundle, stamped, config, scheduled_only=False
@@ -4108,7 +4103,7 @@ def do_trigger(
             _trigger_unit(
                 unit_name,
                 triggered_by_user=True,
-                state_dir=_entity_state_dir(ref),
+                state_dir=entity_state_dir(ref),
             )
             logger.info("%s: triggered", full)
         return
@@ -4151,7 +4146,7 @@ def do_trigger(
         )
         rec = _trigger_unit_sync(
             unit_name,
-            state_dir=_entity_state_dir(ref),
+            state_dir=entity_state_dir(ref),
             job_timeout=timeout,
             trigger_timeout=tt,
             triggered_by_user=True,
@@ -4822,7 +4817,7 @@ def do_status(
     selected_cols = _parse_status_cols(cols)
     config = load_config()
     bundles = config.toml_config
-    require_addressable_bundle(config, bundle)
+    config.require_addressable(bundle)
     platform = config.platform
     _by_full, selected, masked_by_full = (
         _selected_and_masked_full_names_per_bundle(bundles)
@@ -5296,7 +5291,7 @@ def do_logs(
             # unit-only orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
-            sd = _entity_state_dir(ref)
+            sd = entity_state_dir(ref)
     if sd is None:
         raise UsageError(f"no log for {full!r} (no applied state on this host)")
     log_path = sd / "run.log"
@@ -5436,7 +5431,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
 
     `ref` is the entity's `<bundle>:<uuid>` address, the form
     `apply` writes into the platform unit's argv. The runner
-    locates the state dir directly via `_entity_state_dir`,
+    locates the state dir directly via `entity_state_dir`,
     loads the pinned snapshot, and dispatches to the per-job or
     per-group pipeline. The wrapped command's exit code is
     surfaced via SystemExit so it propagates to the platform
@@ -5489,12 +5484,12 @@ def _record_snapshot_load_failure(
 
     A run.log line accompanies the JSON so `crony logs` shows
     the underlying reason -- the JSON keeps the schema flat
-    (just enough for `_parse_last_run` to surface
+    (just enough for `LastRun.from_raw` to surface
     `exit_class="canceled"`) rather than extending the
     `JobRunResult` / `GroupRunResult` dataclasses with a new
     error variant.
     """
-    state_dir = _entity_state_dir(ref)
+    state_dir = entity_state_dir(ref)
     if not state_dir.is_dir():
         return
     now = _now_iso()
