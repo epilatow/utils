@@ -1588,7 +1588,7 @@ _DIALOG_POPUP_LOG_KB: int = 8
 
 
 def _send_dialog_popup_for(
-    channel: NotifyChannel,
+    _channel: NotifyChannel,
     result: JobRunResult,
     full_name: str,
     log_text: str,
@@ -1600,9 +1600,10 @@ def _send_dialog_popup_for(
     host with a desktop session. Where `supports_interactive` is False
     it raises, and dispatch records the channel as unsent -- the seam
     where a Linux backend (notify-send / zenity) slots in later. The
-    channel is zero-config; only the run result + log feed the dialog.
+    channel is zero-config: `_channel` is unused, kept only to match the
+    `_NOTIFY_DISPATCH` sender signature; only the run result + log feed
+    the dialog.
     """
-    del channel
     host = _host()
     if not host.supports_interactive:
         raise CronyError(

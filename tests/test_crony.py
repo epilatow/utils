@@ -9789,7 +9789,7 @@ class TestResolveStateAxes:
         h.config({}, default_target_jobs=[])
         called: list[str] = []
 
-        def _stub_sched(n: str, _p: str) -> str:
+        def _stub_sched(n: str) -> str:
             called.append(n)
             return "enabled"
 
