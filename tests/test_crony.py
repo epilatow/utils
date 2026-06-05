@@ -48,8 +48,16 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony.config import (  # noqa: E402
+    DEFAULT_BUNDLE_NAME,
+    NOTIFY_INHERIT_TOKEN,
+    Defaults,
     NotifyChannel,
+    TomlBundle,
     TomlBundleConfig,
+    TomlConfig,
+    TomlJob,
+    parse_full_name,
+    resolve_cli_name,
     validate_notify_channels,
 )
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
@@ -77,7 +85,7 @@ sys.modules["crony_app"] = crony
 _spec.loader.exec_module(crony)
 
 
-def _apply(short: str, *, bundle: str = crony.DEFAULT_BUNDLE_NAME) -> str:
+def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     """Apply one entry through the production path: build the
     `Config` model (one disk pass) and call `apply_one` with the
     resolved ref -- mirroring what `do_apply` does per entry, so
@@ -1097,7 +1105,7 @@ class TestDuplicateUuidInBundle:
     def _write_and_load(self, tmp_path: Path, body: str) -> Any:
         path = tmp_path / "bundle.toml"
         path.write_text(body, encoding="utf-8")
-        return crony.TomlBundle.load("default", path)
+        return TomlBundle.load("default", path)
 
     def test_duplicate_uuid_on_two_jobs_demotes_both(
         self, tmp_path: Path
@@ -1755,12 +1763,10 @@ class TestResolution:
 
 def _bundle_set(*pairs: tuple[str, Any]) -> Any:
     """Wrap (name, TomlBundleConfig) pairs into a TomlConfig."""
-    tc = crony.TomlConfig()
+    tc = TomlConfig()
     for name, cfg in pairs:
         tc.bundles.append(
-            crony.TomlBundle(
-                name=name, source=Path(f"/test/{name}.toml"), config=cfg
-            )
+            TomlBundle(name=name, source=Path(f"/test/{name}.toml"), config=cfg)
         )
     return tc
 
@@ -1777,7 +1783,7 @@ class TestNotifyInherit:
         cfg = TomlBundleConfig.from_raw(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
-        assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
+        assert cfg.defaults.notify_channels == [NOTIFY_INHERIT_TOKEN]
 
     def test_implicit_default_with_defaults_but_no_notify(self) -> None:
         cfg = TomlBundleConfig.from_raw(
@@ -1786,7 +1792,7 @@ class TestNotifyInherit:
             ),
             bundle_name="borgadm",
         )
-        assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
+        assert cfg.defaults.notify_channels == [NOTIFY_INHERIT_TOKEN]
 
     def test_default_bundle_stays_empty(self) -> None:
         cfg = TomlBundleConfig.from_raw(_inject_uuids({"job": {"a": _job()}}))
@@ -2692,13 +2698,13 @@ class _RunnerHarness:
         default bundle, used for unit-label assertions and CLI
         argument construction.
         """
-        return f"{crony.DEFAULT_BUNDLE_NAME}.{short}"
+        return f"{DEFAULT_BUNDLE_NAME}.{short}"
 
     def fabricate_orphan(
         self,
         short: str,
         *,
-        bundle: str = crony.DEFAULT_BUNDLE_NAME,
+        bundle: str = DEFAULT_BUNDLE_NAME,
         kind: str = "job",
     ) -> Path:
         """Plant a state dir whose snapshot records a name that no
@@ -2775,7 +2781,7 @@ class _RunnerHarness:
         short: str,
         cfg: Any | None = None,
         *,
-        bundle: str = crony.DEFAULT_BUNDLE_NAME,
+        bundle: str = DEFAULT_BUNDLE_NAME,
         ensure_snapshot: bool = True,
     ) -> Path:
         """uuid-keyed state directory for `<bundle>.<short>`.
@@ -2926,7 +2932,7 @@ def _last_run(state: Path, name: str) -> dict[str, Any]:
     looks up that exact path.
     """
     if "." not in name:
-        name = f"{crony.DEFAULT_BUNDLE_NAME}.{name}"
+        name = f"{DEFAULT_BUNDLE_NAME}.{name}"
     # State dirs are uuid-keyed under the bundle subdir; resolve
     # the path via the snapshot file rather than reconstructing
     # from the full name (which is no longer the on-disk key).
@@ -2998,14 +3004,14 @@ class TestPathFieldExpansion:
         # (apply); the runner then pulls already-expanded argv from
         # the snapshot.
         monkeypatch.setenv("HOME", "/home/user")
-        job = crony.TomlJob(
+        job = TomlJob(
             name="j",
             uuid=str(uuid.uuid4()),
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.TomlBundleConfig(),
+            TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
         )
@@ -3026,7 +3032,7 @@ class TestPathFieldExpansion:
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        job = crony.TomlJob(
+        job = TomlJob(
             name="j",
             uuid=str(uuid.uuid4()),
             command="true",
@@ -3034,7 +3040,7 @@ class TestPathFieldExpansion:
             gate_args=["$HOME/state"],
         )
         snap = crony._resolve_job_snapshot(
-            crony.TomlBundleConfig(),
+            TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
         )
@@ -3226,7 +3232,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         uuid_value = "11112222-3333-4444-5555-666677778888"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             '{"schema": 999, "kind": "job", "name": "default.j"}',
@@ -3255,7 +3261,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         uuid_value = "11112222-3333-4444-5555-eeeeffff0000"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         assert not sd.exists()
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony.do_run(
@@ -3271,7 +3277,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         uuid_value = "11112222-3333-4444-5555-aaaabbbbcccc"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         # Corrupt JSON: parser bails before schema / kind checks.
         (sd / "snapshot.json").write_text("{not valid json", encoding="utf-8")
@@ -3290,7 +3296,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         uuid_value = "11112222-3333-4444-5555-bbbbccccdddd"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         # Schema matches, but `kind` is neither "job" nor "group".
         (sd / "snapshot.json").write_text(
@@ -4216,7 +4222,7 @@ class TestTriggerUnitNotInstalled:
             crony._trigger_unit(full, platform)
         # No state dir leaked: the bundle subdir for default
         # should not have any uuid-keyed entries.
-        bundle_dir = h.state / crony.DEFAULT_BUNDLE_NAME
+        bundle_dir = h.state / DEFAULT_BUNDLE_NAME
         assert not bundle_dir.exists() or not any(bundle_dir.iterdir())
 
     def test_trigger_unit_sync_does_not_create_state_dir(
@@ -4228,7 +4234,7 @@ class TestTriggerUnitNotInstalled:
         # behind (which `crony status` would then surface).
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("ghost")
-        ghost_sd = h.state / crony.DEFAULT_BUNDLE_NAME / "u-ghost"
+        ghost_sd = h.state / DEFAULT_BUNDLE_NAME / "u-ghost"
         with pytest.raises(crony.UnitNotInstalledError):
             crony._trigger_unit_sync(
                 full,
@@ -4902,7 +4908,7 @@ class TestDialogPopupNotify:
         monkeypatch.setattr(crony.subprocess, "Popen", _fake_popen)
         result = self._make_failed_result(["dialog-popup"])
         crony._dispatch_notify(
-            result, "borgadm.check-repo", "boom log line", crony.Defaults()
+            result, "borgadm.check-repo", "boom log line", Defaults()
         )
         assert result.notifications["dialog-popup"].sent is True
         assert captured["cmd"][0:2] == ["osascript", "-e"]
@@ -4924,7 +4930,7 @@ class TestDialogPopupNotify:
 
         monkeypatch.setattr(crony.subprocess, "Popen", _boom)
         result = self._make_failed_result(["dialog-popup"])
-        crony._dispatch_notify(result, "default.j", "log", crony.Defaults())
+        crony._dispatch_notify(result, "default.j", "log", Defaults())
         nr = result.notifications["dialog-popup"]
         assert nr.sent is False
         assert nr.error_class == "CronyError"
@@ -4943,7 +4949,7 @@ class TestDialogPopupNotify:
         )
         result = self._make_failed_result(["dialog-popup"])
         crony._dispatch_notify(
-            result, "default.j", 'he said "hi" \\ bye', crony.Defaults()
+            result, "default.j", 'he said "hi" \\ bye', Defaults()
         )
         script = captured["cmd"][2]
         # Raw double-quotes / backslashes from the log would corrupt the
@@ -4966,7 +4972,7 @@ class TestDialogPopupNotify:
             result,
             "default.j",
             "secret log line",
-            crony.Defaults(notify_attach_log=False),
+            Defaults(notify_attach_log=False),
         )
         script = captured["cmd"][2]
         assert "secret log line" not in script
@@ -5417,9 +5423,7 @@ class _ApplyHarness(_RunnerHarness):
         self.agents = agents
         self.sysd = sysd
 
-    def apply(
-        self, short: str, *, bundle: str = crony.DEFAULT_BUNDLE_NAME
-    ) -> str:
+    def apply(self, short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
         """Apply one entry through the production path (see the
         module-level `_apply`)."""
         return _apply(short, bundle=bundle)
@@ -6041,8 +6045,10 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         crony.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
-        bundles = crony.TomlConfig.load_all()
-        borgadm_cfg = bundles.by_name("borgadm").config
+        bundles = TomlConfig.load_all()
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        borgadm_cfg = borgadm.config
         k_uuid = borgadm_cfg.jobs["k"].uuid
         assert (h.state / "borgadm" / k_uuid / "snapshot.json").exists()
 
@@ -6086,7 +6092,7 @@ class TestApplyFullSync:
             "this is not [valid toml", encoding="utf-8"
         )
         sd = h.state_dir("j", cfg=cfg, ensure_snapshot=False)
-        crony.do_apply(jobs=[], verbose=False, bundle=crony.DEFAULT_BUNDLE_NAME)
+        crony.do_apply(jobs=[], verbose=False, bundle=DEFAULT_BUNDLE_NAME)
         assert (sd / "snapshot.json").exists()
 
 
@@ -6416,7 +6422,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -6453,7 +6459,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -6549,7 +6555,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("old_b", bundle="borgadm")
@@ -6705,20 +6711,20 @@ class TestResolveCliName:
     """
 
     def test_bare_resolves_to_default_without_scope(self) -> None:
-        assert crony.resolve_cli_name("foo", None) == "default.foo"
+        assert resolve_cli_name("foo", None) == "default.foo"
 
     def test_qualified_round_trips_without_scope(self) -> None:
-        assert crony.resolve_cli_name("borgadm.k", None) == "borgadm.k"
+        assert resolve_cli_name("borgadm.k", None) == "borgadm.k"
 
     def test_bare_resolves_in_scope_bundle(self) -> None:
-        assert crony.resolve_cli_name("foo", "borgadm") == "borgadm.foo"
+        assert resolve_cli_name("foo", "borgadm") == "borgadm.foo"
 
     def test_qualified_in_scope_round_trips(self) -> None:
-        assert crony.resolve_cli_name("borgadm.k", "borgadm") == "borgadm.k"
+        assert resolve_cli_name("borgadm.k", "borgadm") == "borgadm.k"
 
     def test_qualified_other_bundle_rejected(self) -> None:
         with pytest.raises(crony.UsageError, match="default"):
-            crony.resolve_cli_name("default.k", "borgadm")
+            resolve_cli_name("default.k", "borgadm")
 
 
 # =============================================================================
@@ -7339,7 +7345,7 @@ class TestEnableDisable:
         # name) and flags the uuid-keyed state dir.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         job_uuid = self._rename_keeping_uuid(h, "j", "k")
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / job_uuid
+        sd = h.state / DEFAULT_BUNDLE_NAME / job_uuid
         h.calls.clear()
         crony.do_trigger(
             jobs=["k"], wait=False, trigger_timeout=None, bundle=None
@@ -7384,7 +7390,7 @@ class TestEnableDisable:
         # and wipes the shared uuid state dir.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         job_uuid = self._rename_keeping_uuid(h, "j", "k")
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / job_uuid
+        sd = h.state / DEFAULT_BUNDLE_NAME / job_uuid
         old_plist = h.agents / f"org.crony.{h.full('j')}.plist"
         assert old_plist.exists()
         assert sd.exists()
@@ -8600,7 +8606,7 @@ class TestStatusReport:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -8796,7 +8802,7 @@ class TestStatusReport:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -9950,7 +9956,7 @@ class TestPerEntityConfigErrors:
         import logging
 
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         # `path: [job.bad]: unknown key(s) ['surprise']`
         assert any(
             "[job.bad]" in r.message and "unknown key" in r.message
@@ -10572,28 +10578,28 @@ class TestParseFullName:
     """`parse_full_name` turns CLI input into (bundle, short)."""
 
     def test_bare_name_is_default_bundle(self) -> None:
-        assert crony.parse_full_name("foo") == (
-            crony.DEFAULT_BUNDLE_NAME,
+        assert parse_full_name("foo") == (
+            DEFAULT_BUNDLE_NAME,
             "foo",
         )
 
     def test_namespaced_form(self) -> None:
-        assert crony.parse_full_name("borgadm.foo") == ("borgadm", "foo")
+        assert parse_full_name("borgadm.foo") == ("borgadm", "foo")
 
     def test_multi_dot_short_name(self) -> None:
         # Splits on the FIRST dot; remaining dots stay in the short.
-        assert crony.parse_full_name("default.foo.bar") == (
+        assert parse_full_name("default.foo.bar") == (
             "default",
             "foo.bar",
         )
 
     def test_empty_bundle_rejected(self) -> None:
         with pytest.raises(crony.UsageError):
-            crony.parse_full_name(".foo")
+            parse_full_name(".foo")
 
     def test_empty_short_rejected(self) -> None:
         with pytest.raises(crony.UsageError):
-            crony.parse_full_name("default.")
+            parse_full_name("default.")
 
 
 class TestEntityRefInput:
@@ -10691,11 +10697,11 @@ class TestDestroyByEntityRef:
         # state-dir presence is what makes destroy accept the
         # ref input.
         ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd = h.state / DEFAULT_BUNDLE_NAME / ghost_uuid
         sd.mkdir(parents=True)
         (sd / "run.log").write_text("stale\n", encoding="utf-8")
         h.config({}, default_target_jobs=[])
-        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
         assert not sd.exists()
 
@@ -10708,7 +10714,7 @@ class TestDestroyByEntityRef:
         # exist is rejected -- destroy refuses to act on a ref
         # input that addresses nothing.
         ghost_uuid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
-        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         with pytest.raises(crony.UsageError, match="unknown name"):
             crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
 
@@ -10721,7 +10727,7 @@ class TestDestroyByEntityRef:
         # `STATE_DIR/default/../../etc` target is never composed.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
-        attack = f"{crony.DEFAULT_BUNDLE_NAME}:../../etc"
+        attack = f"{DEFAULT_BUNDLE_NAME}:../../etc"
         with pytest.raises(crony.UsageError, match="unknown name"):
             crony.do_destroy(jobs=[attack], bundle=None, orphans=False)
 
@@ -10743,7 +10749,7 @@ class TestDestroyByEntityRef:
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist.exists()
         sd = h.state_dir("j", cfg=cfg)
-        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{cfg.jobs['j'].uuid}"
+        ref_input = f"{DEFAULT_BUNDLE_NAME}:{cfg.jobs['j'].uuid}"
         crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
         # Both the state dir AND the platform unit are gone.
         assert not sd.exists()
@@ -10759,14 +10765,14 @@ class TestDestroyByEntityRef:
 
         h = _ApplyHarness(tmp_path, monkeypatch)
         ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd = h.state / DEFAULT_BUNDLE_NAME / ghost_uuid
         sd.mkdir(parents=True)
         lock = sd / "run.lock"
         held = open(lock, "w")
         _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         try:
             h.config({}, default_target_jobs=[])
-            ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+            ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
             with pytest.raises(crony.LockBusyError, match="run in progress"):
                 crony.do_destroy(jobs=[ref_input], bundle=None, orphans=False)
         finally:
@@ -10789,10 +10795,10 @@ class TestLogsByEntityRef:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         ghost_uuid = "deadbeef-0000-0000-0000-deadbeef0000"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / ghost_uuid
+        sd = h.state / DEFAULT_BUNDLE_NAME / ghost_uuid
         sd.mkdir(parents=True)
         (sd / "run.log").write_text("hello\n", encoding="utf-8")
-        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         crony.do_logs(
             name=ref_input,
             n=200,
@@ -10810,7 +10816,7 @@ class TestLogsByEntityRef:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         ghost_uuid = "deadbeef-1111-1111-1111-deadbeef1111"
-        ref_input = f"{crony.DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+        ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         crony.do_logs(
             name=ref_input,
             n=None,
@@ -10846,7 +10852,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         assert "j" in bundles.bundles[0].config.jobs
 
@@ -10866,11 +10872,12 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["borgadm", "default"]
-        assert bundles.by_name("borgadm") is not None
-        assert "prune" in bundles.by_name("borgadm").config.jobs
+        borgadm = bundles.by_name("borgadm")
+        assert borgadm is not None
+        assert "prune" in borgadm.config.jobs
 
     def test_dropin_only_no_default(
         self, tmp_path: Path, monkeypatch: Any
@@ -10884,7 +10891,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["private"]
 
     def test_no_configs_at_all_returns_empty(
@@ -10895,7 +10902,7 @@ class TestBundleLoading:
         # state alone. `apply` is the only caller that enforces
         # "must have a config" -- it needs pending data.
         self._setup(tmp_path, monkeypatch)
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         assert bundles.bundles == []
         assert bundles.errored_bundles == {}
 
@@ -10911,7 +10918,7 @@ class TestBundleLoading:
                 ),
                 encoding="utf-8",
             )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         # default first, then config/*.toml lex-sorted
         assert [b.name for b in bundles.bundles] == [
             "default",
@@ -10942,7 +10949,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["default", "ok"]
         # The broken bundle's path is in errored_bundles and in
@@ -10961,7 +10968,7 @@ class TestBundleLoading:
         cfg_file.write_text("this is not [valid toml", encoding="utf-8")
         (dropin / "alpha.toml").write_text("also broken (", encoding="utf-8")
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         assert bundles.bundles == []
         assert len(bundles.errored_bundles) == 2
 
@@ -10982,9 +10989,11 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
-        config = bundles.by_name("default").config
+        default = bundles.by_name("default")
+        assert default is not None
+        config = default.config
         assert "good" in config.jobs
         assert "bad" in config.errored_job_groups
         assert any(
@@ -11008,9 +11017,11 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
-        config = bundles.by_name("default").config
+        default = bundles.by_name("default")
+        assert default is not None
+        config = default.config
         assert "darwin" in config.errored_platform_targets
         assert "squee" in config.host_targets
         assert any(
@@ -11037,7 +11048,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
         assert any(
@@ -11064,7 +11075,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.TomlConfig.load_all()
+            bundles = TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
         # The colliding dropin is referenced in the error.
@@ -11165,7 +11176,7 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         # Build a snapshot that matches what apply would write.
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         snap = crony._resolve_job_snapshot(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
@@ -11191,7 +11202,7 @@ class TestLoadConfig:
             '[target.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         snap = crony._resolve_job_snapshot(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
@@ -11964,7 +11975,7 @@ class TestBundleNamespacing:
             ),
             encoding="utf-8",
         )
-        bundles = crony.TomlConfig.load_all()
+        bundles = TomlConfig.load_all()
         # Both bundles loaded successfully despite identical short.
         assert {b.name for b in bundles.bundles} == {"default", "borgadm"}
         # Full names are distinct.
@@ -12530,7 +12541,7 @@ class TestSnapshotLifecycle:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         uuid_value = "deadbeef-uuid"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         # schema=999 simulates a future version we don't support.
         (sd / "snapshot.json").write_text(
@@ -12538,9 +12549,7 @@ class TestSnapshotLifecycle:
             encoding="utf-8",
         )
         with pytest.raises(crony.PreconditionError, match="schema 999"):
-            crony._load_snapshot(
-                EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
-            )
+            crony._load_snapshot(EntityRef(DEFAULT_BUNDLE_NAME, uuid_value))
 
     def test_load_snapshot_refuses_missing(
         self, tmp_path: Path, monkeypatch: Any
@@ -12548,7 +12557,7 @@ class TestSnapshotLifecycle:
         _ = _RunnerHarness(tmp_path, monkeypatch)
         with pytest.raises(crony.PreconditionError, match="no snapshot"):
             crony._load_snapshot(
-                EntityRef(crony.DEFAULT_BUNDLE_NAME, "never-applied-uuid")
+                EntityRef(DEFAULT_BUNDLE_NAME, "never-applied-uuid")
             )
 
     def test_load_snapshot_refuses_malformed_schema_match(
@@ -12560,7 +12569,7 @@ class TestSnapshotLifecycle:
         # TypeError traceback the scheduler never sees.
         h = _RunnerHarness(tmp_path, monkeypatch)
         uuid_value = "deadbeef-uuid"
-        sd = h.state / crony.DEFAULT_BUNDLE_NAME / uuid_value
+        sd = h.state / DEFAULT_BUNDLE_NAME / uuid_value
         sd.mkdir(parents=True)
         (sd / "snapshot.json").write_text(
             json.dumps(
@@ -12574,9 +12583,7 @@ class TestSnapshotLifecycle:
             encoding="utf-8",
         )
         with pytest.raises(crony.PreconditionError, match="malformed fields"):
-            crony._load_snapshot(
-                EntityRef(crony.DEFAULT_BUNDLE_NAME, uuid_value)
-            )
+            crony._load_snapshot(EntityRef(DEFAULT_BUNDLE_NAME, uuid_value))
 
     def test_topological_apply_propagates_leaf_edit_to_group(
         self, tmp_path: Path, monkeypatch: Any
@@ -12996,14 +13003,14 @@ class TestSnapshotBackwardLoad:
         h = _ApplyHarness(tmp_path, monkeypatch)
         full = h.full("j")
         legacy_uuid = "11112222-3333-4444-5555-666677778888"
-        snap_dir = h.state / crony.DEFAULT_BUNDLE_NAME / legacy_uuid
+        snap_dir = h.state / DEFAULT_BUNDLE_NAME / legacy_uuid
         snap_dir.mkdir(parents=True)
         # Pre-existing snapshot lacking schedule / interval keys.
         legacy = {
             "schema": crony._SNAPSHOT_SCHEMA,
             "kind": "job",
             "name": full,
-            "bundle": crony.DEFAULT_BUNDLE_NAME,
+            "bundle": DEFAULT_BUNDLE_NAME,
             "uuid": legacy_uuid,
             "command": "true",
             "script": None,
@@ -13016,9 +13023,7 @@ class TestSnapshotBackwardLoad:
         }
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
         _ = full
-        snap = crony._load_snapshot(
-            EntityRef(crony.DEFAULT_BUNDLE_NAME, legacy_uuid)
-        )
+        snap = crony._load_snapshot(EntityRef(DEFAULT_BUNDLE_NAME, legacy_uuid))
         assert isinstance(snap, crony.Job)
         assert snap.timing is None
 
