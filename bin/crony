@@ -88,7 +88,6 @@ from crony.errors import (  # noqa: E402
     UnitNotInstalledError,
     UsageError,
 )
-from crony.paths import CONFIG_DIR  # noqa: E402
 from crony.platform import (  # noqa: E402
     HostPlatform,
     PidWait,
@@ -1789,7 +1788,7 @@ def _resolve_script(script: str) -> Path:
     """Resolve a `script` field to an absolute path."""
     p = Path(_expand_path_field(script))
     if not p.is_absolute():
-        p = (CONFIG_DIR / p).resolve()
+        p = (crony.paths.CONFIG_DIR / p).resolve()
     return p
 
 
@@ -3903,7 +3902,7 @@ def do_init(force: bool, bundle: str | None) -> None:
             f"{crony.paths.CONFIG_FILE} already exists; "
             "pass --force to overwrite"
         )
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    crony.paths.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     crony.paths.CONFIG_FILE.write_text(
         _DEFAULT_CONFIG_TEMPLATE, encoding="utf-8"
     )

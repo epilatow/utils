@@ -101,7 +101,6 @@ def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
 
 
 def isolate_crony_home(
-    module: Any,
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -126,26 +125,24 @@ def isolate_crony_home(
     # Path.home(), so patching it sandboxes those too -- no separate
     # redirect needed.
     monkeypatch.setattr(Path, "home", lambda: sentinel)
-    # Redirect each path constant and the CRONY_* env it resolved from.
-    # CONFIG_DIR is re-imported into the bin/crony module; CONFIG_FILE /
-    # CONFIG_DROPIN_DIR / STATE_DIR are read through crony.paths -- so
-    # each is patched on the module its readers resolve it through.
+    # Every path constant is read through crony.paths, so redirect each
+    # on that module, plus its matching CRONY_* env var.
     cfg = sentinel / ".config" / "crony"
     state = sentinel / ".local" / "state" / "crony"
     dirs = {
-        "CONFIG_DIR": (module, cfg),
-        "CONFIG_FILE": (crony_paths, cfg / "config.toml"),
-        "CONFIG_DROPIN_DIR": (crony_paths, cfg / "config"),
-        "STATE_DIR": (crony_paths, state),
+        "CONFIG_DIR": cfg,
+        "CONFIG_FILE": cfg / "config.toml",
+        "CONFIG_DROPIN_DIR": cfg / "config",
+        "STATE_DIR": state,
     }
-    for attr, (target, path) in dirs.items():
-        monkeypatch.setattr(target, attr, path)
+    for attr, path in dirs.items():
+        monkeypatch.setattr(crony_paths, attr, path)
         monkeypatch.setenv(f"CRONY_{attr}", str(path))
 
 
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
-    isolate_crony_home(crony, tmp_path, monkeypatch)
+    isolate_crony_home(tmp_path, monkeypatch)
 
 
 class TestIsolateCronyHomeFixture(SentinelHomeBase):
@@ -156,20 +153,18 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
     """
 
     def test_all_attributes_under_sentinel(self) -> None:
-        # CONFIG_DIR is a bin/crony attribute; CONFIG_FILE /
-        # CONFIG_DROPIN_DIR / STATE_DIR are read through crony.paths.
-        # (The platform unit dirs resolve under Path.home(), below.)
+        # All four path constants are read through crony.paths. (The
+        # platform unit dirs resolve under Path.home(), checked below.)
         sentinel = Path.home()
-        targets = {
-            "CONFIG_DIR": crony,
-            "STATE_DIR": crony_paths,
-            "CONFIG_FILE": crony_paths,
-            "CONFIG_DROPIN_DIR": crony_paths,
-        }
-        for attr, module in targets.items():
-            value = getattr(module, attr)
+        for attr in (
+            "CONFIG_DIR",
+            "CONFIG_FILE",
+            "CONFIG_DROPIN_DIR",
+            "STATE_DIR",
+        ):
+            value = getattr(crony_paths, attr)
             assert str(value).startswith(str(sentinel)), (
-                f"{module.__name__}.{attr}={value!r} escaped the sentinel"
+                f"crony.paths.{attr}={value!r} escaped the sentinel"
             )
 
     def test_all_env_vars_under_sentinel(self) -> None:
@@ -2377,7 +2372,7 @@ class TestInit:
         """
         cfg_dir = tmp_path / "crony"
         cfg_file = cfg_dir / "config.toml"
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         return cfg_file
 
@@ -2435,7 +2430,7 @@ class TestInit:
         cfg_dir = tmp_path / "crony"
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = cfg_dir / "config"
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         crony.do_init(force=False, bundle="borgadm")
@@ -2451,7 +2446,7 @@ class TestInit:
         cfg_dir = tmp_path / "crony"
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = cfg_dir / "config"
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         with pytest.raises(crony.UsageError, match="default"):
@@ -2463,7 +2458,7 @@ class TestInit:
         cfg_dir = tmp_path / "crony"
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = cfg_dir / "config"
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         with pytest.raises(crony.UsageError, match="bundle name"):
@@ -2513,7 +2508,7 @@ class TestConfigUpdateAction:
         cfg_dir = tmp_path / "crony"
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = cfg_dir / "config"
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         return cfg_file, cfg_dropin
@@ -2676,7 +2671,7 @@ class _RunnerHarness:
         monkeypatch.setenv("CRONY_CONFIG_FILE", str(cfg_file))
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(cfg_dropin))
         monkeypatch.setattr(crony_paths, "STATE_DIR", state)
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
@@ -10839,7 +10834,7 @@ class TestBundleLoading:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         return cfg_file, cfg_dropin
@@ -11096,7 +11091,7 @@ class TestLoadConfig:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
@@ -11252,7 +11247,7 @@ class TestConfigBroken:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
@@ -11379,7 +11374,7 @@ class TestStatusBrokenSurface:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
@@ -11895,7 +11890,7 @@ class TestResolveMethods:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
         monkeypatch.setattr(crony_platform, "current_host", lambda: "test-host")
@@ -11959,7 +11954,7 @@ class TestBundleNamespacing:
         cfg_file = cfg_dir / "config.toml"
         cfg_dropin = tmp_path / "config_dropin"
         cfg_dropin.mkdir()
-        monkeypatch.setattr(crony, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
         monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
 
