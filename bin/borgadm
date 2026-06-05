@@ -563,12 +563,23 @@ def initialize_borg_environment() -> None:
     if _is_remote_repo(cfg.BORG_REPO):
         _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
         _hostkey_file.flush()
-        # Use -F /dev/null to ignore user's ~/.ssh/config which may
-        # contain settings (like IdentityAgent) that conflict with our
-        # ssh-agent setup.
+        # -F /dev/null ignores the user's ~/.ssh/config, whose settings
+        # (like IdentityAgent) can conflict with our ssh-agent setup --
+        # which also means our keepalive options below are the only ones
+        # in effect. A `borg mount` of a remote repo holds its ssh
+        # session open for the whole rsync (hours for a full set), with
+        # idle gaps while rsync reads the other archive's mount or scans
+        # the target. ServerAlive probes are answered by the remote sshd
+        # (not the busy `borg serve`), so they keep NAT/firewall state
+        # warm across those gaps; without them an evicted-but-undetected
+        # connection leaves the FUSE mount returning ENOTCONN and every
+        # subsequent read fails. CountMax x Interval bounds how long a
+        # genuinely dead link hangs before ssh tears it down.
         os.environ["BORG_RSH"] = (
             f"ssh -F /dev/null "
             f"-o StrictHostKeyChecking=yes "
+            f"-o ServerAliveInterval=15 "
+            f"-o ServerAliveCountMax=30 "
             f"-o UserKnownHostsFile={_hostkey_file.name}"
         )
         logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
@@ -928,6 +939,62 @@ def is_mountpoint(path: Path) -> bool:
     except subprocess.CalledProcessError:
         pass
     return False
+
+
+def _mounts_under(root: Path) -> list[tuple[Path, str]]:
+    """Return (mountpoint, fstype) for every mount at or under `root`.
+
+    Parses `mount` output rather than /proc/mounts: the borgadm user
+    inside the extract container may lack read permission on the latter.
+    """
+    try:
+        output = subprocess.check_output(["mount"], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    root_str = root.as_posix()
+    found: list[tuple[Path, str]] = []
+    for line in output.splitlines():
+        m = re.match(r"\S+ on (.+) type (\S+)", line)
+        if not m:
+            continue
+        mp = m.group(1)
+        if mp == root_str or mp.startswith(root_str + "/"):
+            found.append((Path(mp), m.group(2)))
+    return found
+
+
+def _umount_tree(root: Path) -> None:
+    """Force-unmount every mount at or under `root`, overlay mounts first.
+
+    A rsync run's overlay 'merged' mount stacks on the per-archive fuse
+    mounts, so it has to come down before them or the fuse umount is
+    blocked.
+    """
+    mounts = _mounts_under(root)
+    mounts.sort(key=lambda mt: 0 if mt[1] == "overlay" else 1)
+    for mp, _fstype in mounts:
+        run_cmd(["umount", "-f", mp.as_posix()], sudo=True, errok=True)
+
+
+def _reclaim_stale_run_dirs(parent: Path, prefix: str, keep: Path) -> None:
+    """Unmount and remove tmp dirs left by dead rsync runs.
+
+    A run killed by SIGKILL (e.g. the extract container restarting) never
+    reaches its cleanup, leaking its tmp dir and any mounts beneath it.
+    Both the tmp-dir prefix and the lockfile are derived from the target
+    basename and live in the target's parent, and the caller holds the
+    per-target flock -- so every sibling matching `prefix` other than the
+    live `keep` dir belongs to a dead run of this same target and is safe
+    to reclaim. Runs against other targets use a different prefix and/or
+    parent, so they are never touched.
+    """
+    keep_str = keep.as_posix()
+    for entry in sorted(parent.glob(prefix + "*")):
+        if not entry.is_dir() or entry.as_posix() == keep_str:
+            continue
+        logger.info(f"Reclaiming stale rsync dir: {entry}")
+        _umount_tree(entry)
+        run_cmd(["rm", "-rf", entry.as_posix()], sudo=True, errok=True)
 
 
 def check_sudo() -> bool:
@@ -2017,14 +2084,7 @@ def do_rsync(
     tdir_basename = target_dir.name
     lockfile = tdir_dirname / f".{BASENAME}_{tdir_basename}.lock"
     tmpdir_prefix = f".{BASENAME}_{tdir_basename}.tmp."
-    with (
-        open(lockfile, "w") as lf,
-        tempfile.TemporaryDirectory(
-            dir=tdir_dirname,
-            prefix=tmpdir_prefix,
-        ) as tdir,
-    ):
-        tmpdir = Path(tdir)
+    with open(lockfile, "w") as lf:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2032,9 +2092,20 @@ def do_rsync(
                 "Another extract process is already running for this path."
             ) from None
 
+        # Create the workspace only once the flock is held: a concurrent
+        # loser for this same target must not leave a tmp dir on disk for
+        # the lock holder's reclaim to glob and remove.
+        tmpdir_ctx = tempfile.TemporaryDirectory(
+            dir=tdir_dirname, prefix=tmpdir_prefix
+        )
+        tmpdir = Path(tmpdir_ctx.name)
         cleanup_mounts: list[Path] = []
         cleanup_dirs: list[Path] = []
         try:
+            # Reclaim tmp dirs orphaned by a previously SIGKILLed run of
+            # this same target.
+            _reclaim_stale_run_dirs(tdir_dirname, tmpdir_prefix, tmpdir)
+
             archive_mounts: list[Path] = []
             for archive in archives:
                 archive_name = archive.split("::", 1)[1]
@@ -2100,11 +2171,16 @@ def do_rsync(
 
             logger.info(f"Finished rsync to: {target_dir}")
         finally:
-            # Cleanup root owned resources
-            for m in cleanup_mounts:
+            # Cleanup root owned resources. merged is appended last, so
+            # reversed() tears down the overlay before the fuse mounts it
+            # stacks on. The overlay workdir is root-owned and must be
+            # removed with sudo before the TemporaryDirectory context can
+            # clear the rest.
+            for m in reversed(cleanup_mounts):
                 run_cmd(["umount", "-f", m.as_posix()], sudo=True, errok=True)
             for d in cleanup_dirs:
                 run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
+            tmpdir_ctx.cleanup()
 
 
 def do_repair_delete_cache() -> None:

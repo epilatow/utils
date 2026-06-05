@@ -1819,6 +1819,125 @@ class TestInitializeBorgEnvironmentSshGating:
             assert mock_agent.called is True
         assert "BORG_RSH" in os.environ
 
+    def test_borg_rsh_sets_ssh_keepalive(self) -> None:
+        """Remote BORG_RSH carries ServerAlive keepalive so a long
+        FUSE-backed rsync's ssh session survives idle gaps."""
+        with self._patch_externals("user@host:/srv/borg"):
+            ba.initialize_borg_environment()
+        rsh = os.environ["BORG_RSH"]
+        assert "-o ServerAliveInterval=15" in rsh
+        assert "-o ServerAliveCountMax=30" in rsh
+
+
+class TestRsyncMountCleanup:
+    """Mount discovery, unmount ordering, and stale-run reclamation."""
+
+    _MOUNT_OUTPUT = (
+        "sysfs on /sys type sysfs (rw,nosuid,nodev)\n"
+        "borgfs on /t/.borgadm_borg-rsync.tmp.aaa/home-fuse-1of2"
+        " type fuse (ro,allow_other)\n"
+        "borgfs on /t/.borgadm_borg-rsync.tmp.aaa/home-local-2of2"
+        " type fuse (ro,allow_other)\n"
+        "overlay on /t/.borgadm_borg-rsync.tmp.aaa/merged"
+        " type overlay (rw,relatime)\n"
+        "tmpfs on /run type tmpfs (rw)\n"
+    )
+
+    def test_mounts_under_filters_to_subtree(self) -> None:
+        """Only mounts at or under the run dir are returned; unrelated
+        system mounts are ignored."""
+        with patch.object(
+            ba.subprocess,
+            "check_output",
+            autospec=True,
+            return_value=self._MOUNT_OUTPUT,
+        ):
+            found = ba._mounts_under(Path("/t/.borgadm_borg-rsync.tmp.aaa"))
+        assert [(p.as_posix(), fs) for p, fs in found] == [
+            ("/t/.borgadm_borg-rsync.tmp.aaa/home-fuse-1of2", "fuse"),
+            ("/t/.borgadm_borg-rsync.tmp.aaa/home-local-2of2", "fuse"),
+            ("/t/.borgadm_borg-rsync.tmp.aaa/merged", "overlay"),
+        ]
+
+    def test_umount_tree_unmounts_overlay_first(self) -> None:
+        """The overlay 'merged' mount must be torn down before the fuse
+        mounts it stacks on."""
+        with (
+            patch.object(
+                ba.subprocess,
+                "check_output",
+                autospec=True,
+                return_value=self._MOUNT_OUTPUT,
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba._umount_tree(Path("/t/.borgadm_borg-rsync.tmp.aaa"))
+        umounted = [c.args[0][2] for c in mock_run.call_args_list]
+        assert len(umounted) == 3
+        assert umounted[0].endswith("/merged")
+        for c in mock_run.call_args_list:
+            assert c.args[0][:2] == ["umount", "-f"]
+            assert c.kwargs == {"sudo": True, "errok": True}
+
+    def test_reclaim_removes_stale_keeps_live_and_other_targets(
+        self, tmp_path: Path
+    ) -> None:
+        """Reclamation removes dead-run dirs for this target only,
+        leaving the live dir, other targets' dirs, and stray files."""
+        prefix = ".borgadm_borg-rsync.tmp."
+        keep = tmp_path / (prefix + "live")
+        stale1 = tmp_path / (prefix + "dead1")
+        stale2 = tmp_path / (prefix + "dead2")
+        other_target = tmp_path / ".borgadm_other.tmp.x"
+        for d in (keep, stale1, stale2, other_target):
+            d.mkdir()
+        stray = tmp_path / (prefix + "stray")
+        stray.write_text("")
+        with (
+            patch.object(ba, "_umount_tree", autospec=True) as mock_um,
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba._reclaim_stale_run_dirs(tmp_path, prefix, keep)
+        assert {c.args[0] for c in mock_um.call_args_list} == {
+            stale1,
+            stale2,
+        }
+        removed = {c.args[0][2] for c in mock_run.call_args_list}
+        assert removed == {stale1.as_posix(), stale2.as_posix()}
+        for c in mock_run.call_args_list:
+            assert c.args[0][:2] == ["rm", "-rf"]
+            assert c.kwargs == {"sudo": True, "errok": True}
+
+    def test_do_rsync_unmounts_overlay_before_fuse(
+        self, tmp_path: Path
+    ) -> None:
+        """The live cleanup tears the overlay 'merged' mount down before
+        the per-archive fuse mounts it stacks on."""
+        target = tmp_path / "borg-rsync"
+        target.mkdir()
+        archives = ["repo::home-fuse-1of2", "repo::home-local-2of2"]
+        with (
+            patch.object(ba.platform, "system", return_value="Linux"),
+            patch.object(ba, "check_sudo", autospec=True, return_value=True),
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                return_value={"20260101_000000": archives},
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba.os, "listdir", return_value=["x"]),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+        ):
+            ba.do_rsync(target, dry_run=False, delete=True, progress=False)
+        umounts = [
+            Path(c.args[0][2]).name
+            for c in mock_run.call_args_list
+            if c.args[0][0] == "umount"
+        ]
+        assert umounts == ["merged", "home-local-2of2", "home-fuse-1of2"]
+        assert any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
+
 
 class TestDoEnvironment:
     """do_environment prints ssh-add only for remote BORG_REPO."""
