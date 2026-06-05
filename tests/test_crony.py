@@ -61,6 +61,11 @@ from crony.config import (  # noqa: E402
     validate_notify_channels,
 )
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
+from crony.model import (  # noqa: E402
+    _resolve_job_snapshot,
+    _resolve_script,
+    _resolve_snapshot_for,
+)
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
@@ -2852,7 +2857,7 @@ class _RunnerHarness:
         for runner tests that build a TomlBundleConfig and call run_job /
         run_group directly without going through full apply.
         """
-        return crony._resolve_snapshot_for(cfg, short)
+        return _resolve_snapshot_for(cfg, short)
 
     def write_snap(self, cfg: Any, short: str) -> None:
         """Write a snapshot to disk so `_load_snapshot` finds it.
@@ -2972,17 +2977,17 @@ class TestPathFieldExpansion:
 
     def test_resolve_script_expands_tilde(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = crony._resolve_script("~/bin/foo.sh")
+        p = _resolve_script("~/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_dollar_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = crony._resolve_script("$HOME/bin/foo.sh")
+        p = _resolve_script("$HOME/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_braced_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = crony._resolve_script("${HOME}/bin/foo.sh")
+        p = _resolve_script("${HOME}/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_unresolved_var_stays_literal(
@@ -2991,7 +2996,7 @@ class TestPathFieldExpansion:
         monkeypatch.delenv("CRONY_NO_SUCH_VAR", raising=False)
         # When no expansion applies, the value falls under CONFIG_DIR
         # as a relative path. The literal `$VAR` is preserved.
-        p = crony._resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
+        p = _resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
         assert "$CRONY_NO_SUCH_VAR" in str(p)
 
     def test_snapshot_resolves_expanded_args(self, monkeypatch: Any) -> None:
@@ -3005,7 +3010,7 @@ class TestPathFieldExpansion:
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
-        snap = crony._resolve_job_snapshot(
+        snap = _resolve_job_snapshot(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -3034,7 +3039,7 @@ class TestPathFieldExpansion:
             gate_script="/abs/gate.sh",
             gate_args=["$HOME/state"],
         )
-        snap = crony._resolve_job_snapshot(
+        snap = _resolve_job_snapshot(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -3200,7 +3205,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config({}, default_target_jobs=[])
         with pytest.raises(crony.PreconditionError, match="unknown"):
-            crony._resolve_snapshot_for(cfg, "ghost")
+            _resolve_snapshot_for(cfg, "ghost")
 
     def test_run_without_snapshot_raises_precondition(
         self, tmp_path: Path, monkeypatch: Any
@@ -5445,14 +5450,16 @@ class TestJobPriority:
 
     def test_snapshot_carries_priority(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        snap = crony._resolve_job_snapshot(
+        snap = _resolve_job_snapshot(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority is PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
-        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
+        snap = _resolve_job_snapshot(
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+        )
         assert snap.priority == PriorityClass.HIGH
 
     def test_job_overrides_default(self) -> None:
@@ -5462,7 +5469,9 @@ class TestJobPriority:
                 "job": {"a": _job(priority="low")},
             }
         )
-        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
+        snap = _resolve_job_snapshot(
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+        )
         assert snap.priority == PriorityClass.LOW
 
     def test_apply_writes_priority_into_plist(
@@ -5553,7 +5562,7 @@ class TestKeepAwake:
 
     def _snap(self, keep_awake: bool) -> Any:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
-        return crony._resolve_job_snapshot(
+        return _resolve_job_snapshot(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 
@@ -5569,7 +5578,9 @@ class TestKeepAwake:
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"keep_awake": True}, "job": {"a": _job()}})
-        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
+        snap = _resolve_job_snapshot(
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+        )
         assert snap.keep_awake is True
 
     def test_job_false_overrides_true_default(self) -> None:
@@ -5579,7 +5590,9 @@ class TestKeepAwake:
                 "job": {"a": _job(keep_awake=False)},
             }
         )
-        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
+        snap = _resolve_job_snapshot(
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+        )
         assert snap.keep_awake is False
 
     def test_parse_non_bool_rejected(self) -> None:
@@ -11172,7 +11185,7 @@ class TestLoadConfig:
         )
         # Build a snapshot that matches what apply would write.
         bundles = TomlConfig.load_all()
-        snap = crony._resolve_job_snapshot(
+        snap = _resolve_job_snapshot(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
@@ -11198,7 +11211,7 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         bundles = TomlConfig.load_all()
-        snap = crony._resolve_job_snapshot(
+        snap = _resolve_job_snapshot(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
