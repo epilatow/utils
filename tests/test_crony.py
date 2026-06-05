@@ -47,6 +47,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
+from crony.config import (  # noqa: E402
+    _parse_notify_channel,
+    _validate_notify_channels,
+    load_toml_bundle_config,
+    parse_config,
+)
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
 from crony.unit import (  # noqa: E402
@@ -338,7 +344,7 @@ def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _parse(raw: dict[str, Any]) -> Any:
     """Auto-stamp missing uuids and parse. The dominant test path."""
-    return crony.parse_config(_inject_uuids(raw))
+    return parse_config(_inject_uuids(raw))
 
 
 def _uuid_toml(text: str) -> str:
@@ -984,14 +990,14 @@ class TestUuidField:
     def test_job_missing_uuid_is_errored(self) -> None:
         # Bypass `_parse` so `_inject_uuids` doesn't paper over the
         # condition we're verifying.
-        cfg = crony.parse_config({"job": {"j": _job()}})
+        cfg = parse_config({"job": {"j": _job()}})
         assert "j" in cfg.errored_jobs
         assert "uuid" in cfg.errored_jobs["j"]
         assert "crony config update" in cfg.errored_jobs["j"]
         assert "j" not in cfg.jobs
 
     def test_group_missing_uuid_is_errored(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             {
                 "job": {
                     "a": {"command": "true", "uuid": self.GOOD},
@@ -1535,7 +1541,7 @@ class TestLoadConfigFromFile:
         )
         f = tmp_path / "config.toml"
         f.write_text(cfg_text)
-        cfg = crony.load_toml_bundle_config(f)
+        cfg = load_toml_bundle_config(f)
         assert "brew-update" in cfg.jobs
         assert cfg.jobs["brew-update"].timing == Schedule.from_str(
             "*-*-* 03:15"
@@ -1543,13 +1549,13 @@ class TestLoadConfigFromFile:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(crony.ConfigError, match="not found"):
-            crony.load_toml_bundle_config(tmp_path / "absent.toml")
+            load_toml_bundle_config(tmp_path / "absent.toml")
 
     def test_bad_toml(self, tmp_path: Path) -> None:
         f = tmp_path / "config.toml"
         f.write_text("this is not [toml")
         with pytest.raises(crony.ConfigError, match="TOML parse error"):
-            crony.load_toml_bundle_config(f)
+            load_toml_bundle_config(f)
 
 
 # =============================================================================
@@ -1777,13 +1783,13 @@ class TestNotifyInherit:
     """
 
     def test_implicit_default_for_nondefault_bundle(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
 
     def test_implicit_default_with_defaults_but_no_notify(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids(
                 {"defaults": {"job_timeout_sec": 60}, "job": {"a": _job()}}
             ),
@@ -1792,11 +1798,11 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
 
     def test_default_bundle_stays_empty(self) -> None:
-        cfg = crony.parse_config(_inject_uuids({"job": {"a": _job()}}))
+        cfg = parse_config(_inject_uuids({"job": {"a": _job()}}))
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_empty_opts_out(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids(
                 {"defaults": {"notify_channels": []}, "job": {"a": _job()}}
             ),
@@ -1805,7 +1811,7 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_token_in_nondefault_ok(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids(
                 {
                     "defaults": {"notify_channels": ["default"]},
@@ -1818,13 +1824,13 @@ class TestNotifyInherit:
 
     def test_token_rejected_in_default_bundle(self) -> None:
         with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
-            crony.parse_config(
+            parse_config(
                 _inject_uuids({"defaults": {"notify_channels": ["default"]}})
             )
 
     def test_token_combines_with_siblings(self) -> None:
         # The sentinel may now sit alongside explicit channels.
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1845,7 +1851,7 @@ class TestNotifyInherit:
         # Even combined with siblings, the default bundle can't inherit
         # itself.
         with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
-            crony.parse_config(
+            parse_config(
                 _inject_uuids(
                     {
                         "defaults": {
@@ -1857,14 +1863,14 @@ class TestNotifyInherit:
 
     def test_reserved_channel_name_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="reserved channel name"):
-            crony.parse_config(
+            parse_config(
                 _inject_uuids(
                     {"defaults": {"notify": {"default": _ntfy_block()}}}
                 )
             )
 
     def test_job_level_token_ok_in_nondefault(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}}),
             bundle_name="borgadm",
         )
@@ -1872,14 +1878,14 @@ class TestNotifyInherit:
         assert cfg.jobs["a"].notify_channels == ["default"]
 
     def test_job_level_token_demoted_in_default(self) -> None:
-        cfg = crony.parse_config(
+        cfg = parse_config(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}})
         )
         assert "a" in cfg.errored_jobs
         assert "cannot inherit its own" in cfg.errored_jobs["a"]
 
     def _two_bundles(self, default_notify: list[str]) -> tuple[Any, Any]:
-        default_cfg = crony.parse_config(
+        default_cfg = parse_config(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1892,7 +1898,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        borgadm_cfg = crony.parse_config(
+        borgadm_cfg = parse_config(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         return default_cfg, borgadm_cfg
@@ -1989,7 +1995,7 @@ class TestNotifyInherit:
     def test_expand_merges_local_def_for_new_sibling(self) -> None:
         # A sibling defined only in the inheriting bundle must still be
         # dispatchable: its def is merged alongside the inherited ones.
-        default_cfg = crony.parse_config(
+        default_cfg = parse_config(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1999,7 +2005,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        local_cfg = crony.parse_config(
+        local_cfg = parse_config(
             _inject_uuids(
                 {
                     "defaults": {
@@ -2916,7 +2922,7 @@ class _RunnerHarness:
                 if isinstance(body, dict) and isinstance(body.get("uuid"), str):
                     self._uuid_pins[(section, short)] = body["uuid"]
         self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
-        cfg = crony.parse_config(full)
+        cfg = parse_config(full)
         self._last_cfg = cfg
         return cfg
 
@@ -4852,7 +4858,7 @@ class TestDialogPopupNotify:
         # No block, no other defined channels: the built-in name is
         # still a valid notify_channels entry.
         assert (
-            crony._validate_notify_channels(
+            _validate_notify_channels(
                 ["dialog-popup"], set(), "[defaults]", is_default=False
             )
             is None
@@ -4886,7 +4892,7 @@ class TestDialogPopupNotify:
 
     def test_explicit_block_rejects_extra_keys(self) -> None:
         with pytest.raises(crony.ConfigError, match="unknown key"):
-            crony._parse_notify_channel(
+            _parse_notify_channel(
                 "dialog-popup",
                 {"transport": "dialog-popup", "headers": {"X": "y"}},
             )
