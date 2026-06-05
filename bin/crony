@@ -56,12 +56,12 @@ import crony.paths  # noqa: E402
 import crony.platform  # noqa: E402
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from crony.config import (  # noqa: E402
-    _BUILTIN_NOTIFY_CHANNELS,
-    _INTERACTIVE_ACTIVE_DEFAULT_SEC,
-    _INTERACTIVE_DELAY_DEFAULT_SEC,
-    _VALID_NOTIFY_TRANSPORTS,
+    BUILTIN_NOTIFY_CHANNELS,
     DEFAULT_BUNDLE_NAME,
+    INTERACTIVE_ACTIVE_DEFAULT_SEC,
+    INTERACTIVE_DELAY_DEFAULT_SEC,
     NOTIFY_INHERIT_TOKEN,
+    VALID_NOTIFY_TRANSPORTS,
     Defaults,
     NotifyChannel,
     NotifyEmail,
@@ -72,23 +72,11 @@ from crony.config import (  # noqa: E402
     TomlConfig,
     TomlJob,
     TomlJobGroup,
-    _load_one_bundle,
-    _validate_bundle_name,
     bundle_prefix_filter,
-    load_all_bundles,
     normalize_full_name,
     parse_full_name,
-    require_known_bundle,
     resolve_cli_name,
-    resolve_target,
-    resolved_env,
-    resolved_group_timeout_sec,
-    resolved_job_timeout_sec,
-    resolved_keep_awake,
-    resolved_notify_channels,
-    resolved_priority,
-    selected_and_masked_jobs_and_groups,
-    selected_jobs_and_groups,
+    validate_bundle_name,
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -553,7 +541,7 @@ def require_addressable_bundle(config: Config, bundle: str | None) -> None:
     whose config has since broken -- exactly when the operator
     most needs to inspect, disarm, or tear it down. Commands that
     parse the pending config (`apply` / `validate`) use
-    `require_known_bundle` instead.
+    `TomlConfig.require_known` instead.
     """
     if bundle is None:
         return
@@ -645,8 +633,8 @@ class Job:
     # table; the per-job `_sec` knobs cascade through the resolver
     # to the baked defaults defined alongside the TomlJob dataclass.
     interactive: bool = False
-    interactive_active_sec: int = _INTERACTIVE_ACTIVE_DEFAULT_SEC
-    interactive_delay_sec: int = _INTERACTIVE_DELAY_DEFAULT_SEC
+    interactive_active_sec: int = INTERACTIVE_ACTIVE_DEFAULT_SEC
+    interactive_delay_sec: int = INTERACTIVE_DELAY_DEFAULT_SEC
 
     @property
     def ref(self) -> EntityRef:
@@ -707,7 +695,6 @@ def _snapshot_path_for(ref: EntityRef) -> Path:
 
 def _resolve_job_snapshot(
     config: TomlBundleConfig,
-    target: Target | None,
     job: TomlJob,
     name: EntityName,
 ) -> Job:
@@ -733,22 +720,22 @@ def _resolve_job_snapshot(
         gate=job.gate,
         gate_script=gate_script,
         gate_args=gate_args,
-        env=resolved_env(config, target, job),
-        job_timeout_sec=resolved_job_timeout_sec(config, target, job),
+        env=config.resolved_env(job),
+        job_timeout_sec=config.resolved_job_timeout_sec(job),
         timing=job.timing,
-        priority=resolved_priority(config, target, job),
-        keep_awake=resolved_keep_awake(config, target, job),
+        priority=config.resolved_priority(job),
+        keep_awake=config.resolved_keep_awake(job),
         success_exit_codes=list(job.success_exit_codes),
         interactive=job.interactive,
         interactive_active_sec=(
             job.interactive_active_sec
             if job.interactive_active_sec is not None
-            else _INTERACTIVE_ACTIVE_DEFAULT_SEC
+            else INTERACTIVE_ACTIVE_DEFAULT_SEC
         ),
         interactive_delay_sec=(
             job.interactive_delay_sec
             if job.interactive_delay_sec is not None
-            else _INTERACTIVE_DELAY_DEFAULT_SEC
+            else INTERACTIVE_DELAY_DEFAULT_SEC
         ),
     )
 
@@ -773,7 +760,7 @@ def _resolve_group_snapshot(
     parent group that runs everywhere without the parent
     dispatcher trying to trigger a unit that wasn't installed.
     """
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
+    sel_jobs, sel_groups = config.selected_jobs_and_groups(target)
     # Children are stored as uuids (not full names) so renaming a
     # child in config doesn't flip the parent's snapshot -- the
     # uuid edge is unchanged. The runner resolves each child uuid
@@ -791,7 +778,7 @@ def _resolve_group_snapshot(
         name=name,
         uuid=group.uuid,
         children=children,
-        group_budget_sec=resolved_group_timeout_sec(config, target, group.name),
+        group_budget_sec=config.resolved_group_timeout_sec(target, group.name),
         trigger_timeout_sec=config.defaults.trigger_timeout_sec,
         timing=group.timing,
     )
@@ -809,11 +796,9 @@ def _resolve_snapshot_for(
     that exercise the runner without going through full apply).
     """
     name = EntityName(bundle_name, short)
-    target = resolve_target(
-        config, crony.platform.current_host(), crony.platform.current_platform()
-    )
+    target = config.resolve_target()
     if short in config.jobs:
-        return _resolve_job_snapshot(config, target, config.jobs[short], name)
+        return _resolve_job_snapshot(config, config.jobs[short], name)
     if short in config.job_groups:
         return _resolve_group_snapshot(
             config, target, config.job_groups[short], name
@@ -1012,7 +997,7 @@ class GroupRunResult:
 # needs the post-mutation view re-invokes `load_config()`. No
 # subcommand re-scans crony's on-disk state after load -- the model
 # is the single source. (`config validate` is config-only: it parses
-# the TOML via `load_all_bundles()` and never inspects applied
+# the TOML via `TomlConfig.load_all()` and never inspects applied
 # state.)
 
 
@@ -1429,16 +1414,14 @@ def _build_pending_graph(
     """
     pending = Graph()
     for bundle in toml_config.bundles:
-        target = resolve_target(bundle.config, host, platform)
-        sel_jobs, sel_groups = selected_jobs_and_groups(bundle.config, target)
+        target = bundle.config.resolve_target(host, platform)
+        sel_jobs, sel_groups = bundle.config.selected_jobs_and_groups(target)
         for short in sel_jobs:
             toml_job = bundle.config.jobs.get(short)
             if toml_job is None:
                 continue
             name = EntityName(bundle.name, short)
-            snap_j = _resolve_job_snapshot(
-                bundle.config, target, toml_job, name
-            )
+            snap_j = _resolve_job_snapshot(bundle.config, toml_job, name)
             pending.jobs[snap_j.ref] = snap_j
             pending.by_full_name[str(name)] = snap_j.ref
         for short in sel_groups:
@@ -1567,7 +1550,7 @@ def load_config() -> Config:
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
-    toml_config = load_all_bundles()
+    toml_config = TomlConfig.load_all()
     pending = _build_pending_graph(toml_config, host, platform)
     current, broken, runtime = _build_current_graph(STATE_DIR)
 
@@ -2334,7 +2317,7 @@ def _send_dialog_popup_for(
 # Per-transport sender table. Each entry takes (channel, result,
 # full_name, log_text, defaults) and raises on failure. Adding a new
 # transport is one new function plus one entry here plus a name in
-# _VALID_NOTIFY_TRANSPORTS.
+# VALID_NOTIFY_TRANSPORTS.
 _NOTIFY_DISPATCH: dict[
     str,
     Callable[[NotifyChannel, JobRunResult, str, str, Defaults], None],
@@ -2347,21 +2330,21 @@ _NOTIFY_DISPATCH: dict[
 # Pin parser-side and dispatcher-side enumerations together so a
 # new transport can never be accepted by the parser but unknown to
 # dispatch (or vice versa).
-assert set(_NOTIFY_DISPATCH.keys()) == _VALID_NOTIFY_TRANSPORTS, (
-    "_NOTIFY_DISPATCH and _VALID_NOTIFY_TRANSPORTS have drifted"
+assert set(_NOTIFY_DISPATCH.keys()) == VALID_NOTIFY_TRANSPORTS, (
+    "_NOTIFY_DISPATCH and VALID_NOTIFY_TRANSPORTS have drifted"
 )
 
 
 def _builtin_notify_channel(name: str) -> NotifyChannel | None:
     """Synthesize a zero-config built-in channel def for `name`.
 
-    Built-ins (`_BUILTIN_NOTIFY_CHANNELS`) carry no per-channel
+    Built-ins (`BUILTIN_NOTIFY_CHANNELS`) carry no per-channel
     settings, so a notify_channels list may name one with no
     `[defaults.notify.<name>]` block; dispatch builds the channel here
     instead of erroring. A built-in's name equals its transport.
     Returns None for non-built-in names.
     """
-    if name in _BUILTIN_NOTIFY_CHANNELS:
+    if name in BUILTIN_NOTIFY_CHANNELS:
         return NotifyChannel(name=name, transport=name)
     return None
 
@@ -2477,21 +2460,19 @@ def _resolve_notify_at_runtime(
     """
     bn, short = parse_full_name(full_name)
     try:
-        bundles = load_all_bundles()
+        bundles = TomlConfig.load_all()
     except (OSError, ConfigError, UsageError):
         return [], Defaults()
     bundle = bundles.by_name(bn)
     if bundle is None:
         return [], Defaults()
     config = bundle.config
-    target = resolve_target(
-        config, crony.platform.current_host(), crony.platform.current_platform()
-    )
+    target = config.resolve_target()
     job = config.jobs.get(short)
     if job is None:
         channels = list(config.defaults.notify_channels)
     else:
-        channels = resolved_notify_channels(config, target, job)
+        channels = config.resolved_notify_channels(target, job)
     return _expand_notify_inherit(channels, bn, bundles, config.defaults)
 
 
@@ -3908,7 +3889,7 @@ def do_init(force: bool, bundle: str | None) -> None:
                 f"--bundle) for the default bundle"
             )
         try:
-            _validate_bundle_name(bundle, "--bundle")
+            validate_bundle_name(bundle, "--bundle")
         except ConfigError as e:
             raise UsageError(str(e)) from e
         target = crony.paths.CONFIG_DROPIN_DIR / f"{bundle}.toml"
@@ -3951,8 +3932,8 @@ def _bundle_files_for_update(
     """Enumerate the (bundle_name, path) pairs that `config update`
     should scan, honoring `--bundle` scoping.
 
-    Mirrors `load_all_bundles` so the same files reachable to apply
-    are reachable to update. Returns paths even when the file is
+    Mirrors `TomlConfig.load_all` so the same files reachable to
+    apply are reachable to update. Returns paths even when the file is
     syntactically broken -- the caller surfaces parse failures
     per-file rather than aborting the whole pass.
     """
@@ -4008,7 +3989,7 @@ def do_config_update(bundle: str | None) -> None:
     """
     if bundle is not None:
         try:
-            _validate_bundle_name(bundle, "--bundle")
+            validate_bundle_name(bundle, "--bundle")
         except ConfigError as e:
             raise UsageError(str(e)) from e
     files = _bundle_files_for_update(bundle)
@@ -4080,12 +4061,10 @@ def _selected_full_names_per_bundle(
     "everything else".  Callers that also need to inspect masked
     entries use `_selected_and_masked_full_names_per_bundle`.
     """
-    host = crony.platform.current_host()
-    platform = crony.platform.current_platform()
     by_full: dict[str, tuple[TomlBundle, str]] = {}
     for b in bundles.bundles:
-        target = resolve_target(b.config, host, platform)
-        sel_jobs, sel_groups = selected_jobs_and_groups(b.config, target)
+        target = b.config.resolve_target()
+        sel_jobs, sel_groups = b.config.selected_jobs_and_groups(target)
         for short in sel_jobs | sel_groups:
             by_full[b.full_name(short)] = (b, short)
     return by_full, set(by_full.keys())
@@ -4107,15 +4086,13 @@ def _selected_and_masked_full_names_per_bundle(
     a bundle's config but not reached by the host's resolved
     target get the literal reason `unused`.
     """
-    host = crony.platform.current_host()
-    platform = crony.platform.current_platform()
     by_full: dict[str, tuple[TomlBundle, str]] = {}
     selected: set[str] = set()
     masked_by_full: dict[str, str] = {}
     for b in bundles.bundles:
-        target = resolve_target(b.config, host, platform)
-        sel_jobs, sel_groups, masked = selected_and_masked_jobs_and_groups(
-            b.config, target
+        target = b.config.resolve_target()
+        sel_jobs, sel_groups, masked = (
+            b.config.selected_and_masked_jobs_and_groups(target)
         )
         for short in sel_jobs | sel_groups:
             full = b.full_name(short)
@@ -4248,7 +4225,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # load -- no second `load_config()` after the apply loop.
     config = load_config()
     bundles = config.toml_config
-    require_known_bundle(bundles, bundle)
+    bundles.require_known(bundle)
     # Apply needs pending-side data for every entry it considers
     # selected; if some bundles failed to parse, the unscoped
     # orphan-removal sweep would treat every stamped name as
@@ -4257,7 +4234,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # the config or narrow scope with explicit names / `--bundle`
     # so the wipe scope is intentional. A `--bundle` sweep is
     # already safe: its orphan removal is scoped to that one bundle
-    # (which `require_known_bundle` has confirmed parsed cleanly),
+    # (which `require_known` has confirmed parsed cleanly),
     # so an unrelated broken bundle can't derail it.
     if not jobs and bundle is None and bundles.errored_bundles:
         affected = sorted(bundles.errored_bundles)
@@ -4815,7 +4792,6 @@ def do_trigger(
         jobs, bundle, stamped, config, scheduled_only=False
     )
     targets = _resolve_action_targets(config, normalized, runnable_only=True)
-    platform = crony.platform.current_platform()
 
     if not wait:
         for full, ref, unit_name in targets:
@@ -4851,18 +4827,14 @@ def do_trigger(
                 f"(apply may be stale -- re-apply or `crony destroy` "
                 f"it); --wait cannot resolve its timeouts"
             )
-        b_target = resolve_target(
-            b.config, crony.platform.current_host(), platform
-        )
+        b_target = b.config.resolve_target()
         if short in b.config.jobs:
             timeout = _timeout_to_wait(
-                resolved_job_timeout_sec(
-                    b.config, b_target, b.config.jobs[short]
-                )
+                b.config.resolved_job_timeout_sec(b.config.jobs[short])
             )
         else:
             timeout = _timeout_to_wait(
-                resolved_group_timeout_sec(b.config, b_target, short)
+                b.config.resolved_group_timeout_sec(b_target, short)
             )
         tt = (
             float(trigger_timeout)
@@ -4899,8 +4871,8 @@ def _build_status_tree(
     visited-set bounds the walk if a malformed config somehow
     bypasses `crony.config._validate_config` (e.g. tests building
     TomlBundleConfig directly without going through
-    `crony.config.parse_config`); under the single-parent invariant
-    from validation it never deduplicates a real traversal.
+    `crony.config.TomlBundleConfig.from_raw`); under the single-parent
+    invariant from validation it never deduplicates a real traversal.
     """
     order: list[str] = []
     depth: dict[str, int] = {}
@@ -4924,7 +4896,7 @@ def _build_status_tree(
             _walk(bundle, child, d + 1, seen)
 
     for b in bundles.bundles:
-        target = resolve_target(b.config, host, platform)
+        target = b.config.resolve_target(host, platform)
         if target is None:
             continue
         seen: set[str] = set()
@@ -6291,7 +6263,7 @@ def _validate_bundle_warnings(
             # channels; their secrets are checked when that bundle is
             # validated, not here.
             continue
-        if ch_name in _BUILTIN_NOTIFY_CHANNELS:
+        if ch_name in BUILTIN_NOTIFY_CHANNELS:
             # Zero-config built-in (e.g. dialog-popup): no block and no
             # secrets to resolve, so there is nothing to warn about.
             continue
@@ -6395,11 +6367,11 @@ def _validate_file(path: Path) -> None:
         name = DEFAULT_BUNDLE_NAME
     else:
         name = path.stem
-    _validate_bundle_name(name, str(path))
-    # _load_one_bundle logs each per-entity error and raises on a
+    validate_bundle_name(name, str(path))
+    # TomlBundle.load logs each per-entity error and raises on a
     # bundle-level structural failure; the errored_* counts catch the
     # per-entity cases so this exits non-zero on either.
-    bundle = _load_one_bundle(name, path)
+    bundle = TomlBundle.load(name, path)
     cfg = bundle.config
     errored = (
         len(cfg.errored_jobs)
@@ -6418,8 +6390,8 @@ def _validate_file(path: Path) -> None:
 def do_validate(bundle: str | None, file: str | None) -> None:
     """Lint configs; report linger status and broken secret files.
 
-    load_all_bundles already enforces per-bundle structural rules and
-    isolates failed bundles. This subcommand surfaces linger /
+    TomlConfig.load_all already enforces per-bundle structural rules
+    and isolates failed bundles. This subcommand surfaces linger /
     per-bundle warnings as informational output and exits WARNING
     (1) when any are present, CONFIG (3) when no bundles load.
     `validate` looks only at the parsed config -- it never inspects
@@ -6439,8 +6411,8 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     if file is not None:
         _validate_file(Path(file))
         return
-    bundles = load_all_bundles()
-    require_known_bundle(bundles, bundle)
+    bundles = TomlConfig.load_all()
+    bundles.require_known(bundle)
 
     warnings: list[str] = []
     if bundle is None:
@@ -6521,10 +6493,8 @@ def _notify_test_one_bundle(
         uuid="00000000-0000-0000-0000-000000000000",
         command="true",
     )
-    target = resolve_target(
-        config, crony.platform.current_host(), crony.platform.current_platform()
-    )
-    resolved = resolved_notify_channels(config, target, synthetic_job)
+    target = config.resolve_target()
+    resolved = config.resolved_notify_channels(target, synthetic_job)
     # `eff_defaults` carries the channel defs + attach settings used
     # for dispatch; a bundle that inherits sends through the default
     # bundle's definitions, so an explicit --channel resolves there
@@ -6595,7 +6565,7 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     per-channel failure surfaces as CONFIG (config-shaped) or ERROR
     (transport-shaped), preserving the original failure category.
     """
-    bundles = load_all_bundles()
+    bundles = TomlConfig.load_all()
 
     # Resolve --channel into (bundle_from_channel, channel_or_None).
     channel_bundle: str | None = None
@@ -6614,9 +6584,9 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
                 f"{channel!r} (bundle {channel_bundle!r}); pick one"
             )
     bundle_name = channel_bundle or bundle or DEFAULT_BUNDLE_NAME
-    require_known_bundle(bundles, bundle_name)
+    bundles.require_known(bundle_name)
     target_bundle = bundles.by_name(bundle_name)
-    assert target_bundle is not None  # require_known_bundle guarantees
+    assert target_bundle is not None  # require_known guarantees
 
     successes, failures, inherited_from = _notify_test_one_bundle(
         target_bundle, channel_short, bundles

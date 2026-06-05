@@ -100,6 +100,79 @@ class NotifyChannel:
     email: NotifyEmail | None = None
     ntfy: NotifyNtfy | None = None
 
+    @classmethod
+    def from_raw(cls, name: str, raw: dict[str, Any]) -> NotifyChannel:
+        """Parse a single [defaults.notify.<name>] block.
+
+        Channel-level keys: `transport` (defaults to the channel name
+        when name matches a built-in transport; required otherwise) and
+        `headers` (optional dict of user-supplied headers).
+        Transport-specific keys live alongside. The zero-config
+        `dialog-popup` transport takes only `transport` -- no headers,
+        no endpoint -- and is usually listed by name without a block at
+        all.
+        """
+        where = f"[defaults.notify.{name}]"
+        _validate_name(name, where)
+
+        transport = _typed_field(raw, "transport", str, where)
+        if transport is None:
+            if name in VALID_NOTIFY_TRANSPORTS:
+                transport = name
+            else:
+                raise ConfigError(
+                    f"{where}: 'transport' required for channel "
+                    f"{name!r} (only "
+                    f"{sorted(VALID_NOTIFY_TRANSPORTS)} can omit it)"
+                )
+        if transport not in VALID_NOTIFY_TRANSPORTS:
+            raise ConfigError(
+                f"{where}: transport {transport!r} not in "
+                f"{sorted(VALID_NOTIFY_TRANSPORTS)}"
+            )
+
+        if transport == "dialog-popup":
+            # Zero-config built-in: only `transport` is permitted -- no
+            # headers, no endpoint, no secrets. Listing the channel
+            # name in notify_channels is the whole configuration.
+            _reject_unknown_keys(raw, frozenset({"transport"}), where)
+            return cls(name=name, transport=transport)
+
+        headers = _string_dict(raw, "headers", where)
+        reserved = (
+            _RESERVED_HEADERS_EMAIL
+            if transport == "email"
+            else _RESERVED_HEADERS_NTFY
+        )
+        for k in headers:
+            if k.lower() in reserved:
+                raise ConfigError(
+                    f"{where}: header {k!r} is set by crony and cannot "
+                    f"be overridden"
+                )
+
+        # Reject keys outside (channel-level + this transport's keys).
+        transport_keys = (
+            _KNOWN_TRANSPORT_EMAIL
+            if transport == "email"
+            else _KNOWN_TRANSPORT_NTFY
+        )
+        _reject_unknown_keys(raw, _KNOWN_NOTIFY_CHANNEL | transport_keys, where)
+
+        email_cfg: NotifyEmail | None = None
+        ntfy_cfg: NotifyNtfy | None = None
+        if transport == "email":
+            email_cfg = _parse_notify_email_settings(raw, where)
+        else:
+            ntfy_cfg = _parse_notify_ntfy_settings(raw, where)
+        return cls(
+            name=name,
+            transport=transport,
+            headers=headers,
+            email=email_cfg,
+            ntfy=ntfy_cfg,
+        )
+
 
 @dataclass
 class Defaults:
@@ -110,7 +183,7 @@ class Defaults:
     # fires per failure; per-channel results are recorded
     # independently in last-run.json's `notifications` dict. Each
     # entry must name a key in `notify_channel_defs` below, or a
-    # zero-config built-in channel (`_BUILTIN_NOTIFY_CHANNELS`, e.g.
+    # zero-config built-in channel (`BUILTIN_NOTIFY_CHANNELS`, e.g.
     # "dialog-popup") that needs no definition. The [NOTIFY_INHERIT_TOKEN]
     # sentinel inherits the default bundle's notify config -- alone, or
     # unioned with explicit siblings listed alongside it (and is the
@@ -166,8 +239,8 @@ class HostList:
 # continuous active input is conservative enough that a passing
 # wiggle of the mouse doesn't trigger the dialog; a 1h delay after
 # "Delay Job" gives breathing room before crony asks again.
-_INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
-_INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
+INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
+INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
 
 
 @dataclass
@@ -303,7 +376,7 @@ class TomlBundleConfig:
     entity must check the errored map first.
 
     Surface points for errored entries:
-      - Always: logged at ERROR by `_load_one_bundle`, and
+      - Always: logged at ERROR by `TomlBundle.load`, and
         included as warnings by `crony config validate` (which then
         exits non-zero).
       - Jobs and groups also: shown as a `config=error` row in
@@ -326,6 +399,321 @@ class TomlBundleConfig:
     errored_platform_targets: dict[str, str] = field(default_factory=dict)
     errored_host_targets: dict[str, str] = field(default_factory=dict)
 
+    @classmethod
+    def from_raw(
+        cls,
+        raw: dict[str, Any],
+        *,
+        bundle_name: str = DEFAULT_BUNDLE_NAME,
+    ) -> TomlBundleConfig:
+        """Parse a top-level config dict into a validated TomlBundleConfig.
+
+        `bundle_name` identifies the source bundle; it gates the
+        notify-inherit sentinel (only non-default bundles may inherit,
+        and they do so implicitly when notify config is omitted).
+        Callers with a single-bundle view default it to the default
+        bundle, the conservative choice (no implicit inherit, sentinel
+        rejected).
+        """
+        _reject_unknown_keys(raw, _KNOWN_TOPLEVEL, "(top level)")
+        is_default = bundle_name == DEFAULT_BUNDLE_NAME
+
+        config = cls()
+
+        if "defaults" in raw:
+            if not isinstance(raw["defaults"], dict):
+                raise ConfigError("[defaults] must be a table")
+            config.defaults = _parse_defaults(
+                raw["defaults"], is_default=is_default
+            )
+        elif not is_default:
+            # No [defaults] block at all still inherits the default
+            # bundle's notify config for a non-default bundle.
+            config.defaults = Defaults(notify_channels=[NOTIFY_INHERIT_TOKEN])
+
+        job_section = raw.get("job", {})
+        if not isinstance(job_section, dict):
+            raise ConfigError("[job] must be a table")
+        for name, body in job_section.items():
+            # Per-entity ConfigError tolerance: a parse failure on
+            # one job records its error and continues so sibling jobs
+            # still parse. Catching ConfigError (not Exception) keeps
+            # genuine bugs surfacing as tracebacks.
+            try:
+                if not isinstance(body, dict):
+                    raise ConfigError(f"[job.{name}] must be a table")
+                config.jobs[name] = _parse_job(name, body)
+            except ConfigError as exc:
+                config.errored_jobs[name] = str(exc)
+
+        group_section = raw.get("job-group", {})
+        if not isinstance(group_section, dict):
+            raise ConfigError("[job-group] must be a table")
+        for name, body in group_section.items():
+            try:
+                if not isinstance(body, dict):
+                    raise ConfigError(f"[job-group.{name}] must be a table")
+                config.job_groups[name] = _parse_job_group(name, body)
+            except ConfigError as exc:
+                config.errored_job_groups[name] = str(exc)
+
+        target_section = raw.get("target", {})
+        if not isinstance(target_section, dict):
+            raise ConfigError("[target] must be a table")
+        for name, body in target_section.items():
+            if name == "host":
+                # [target.host.<host>] entries
+                if not isinstance(body, dict):
+                    raise ConfigError("[target.host] must be a table")
+                for hostname, hostbody in body.items():
+                    if not isinstance(hostbody, dict):
+                        raise ConfigError(
+                            f"[target.host.{hostname}] must be a table"
+                        )
+                    config.host_targets[hostname] = _parse_target(
+                        hostname, "host", hostbody
+                    )
+            else:
+                # [target.<platform>] entry
+                if not isinstance(body, dict):
+                    raise ConfigError(f"[target.{name}] must be a table")
+                config.platform_targets[name] = _parse_target(
+                    name, "platform", body
+                )
+
+        _validate_config(config, is_default=is_default)
+        return config
+
+    @classmethod
+    def load(cls, path: Path) -> TomlBundleConfig:
+        """Load a single config file as a `TomlBundleConfig`.
+
+        Suited to tests and any caller that has one specific config
+        path in hand and wants the parsed `TomlBundleConfig` for that
+        file alone. Production code paths walk every bundle and should
+        use `TomlConfig.load_all()` instead.
+        """
+        if not path.exists():
+            raise ConfigError(f"config not found: {path}")
+        try:
+            raw = tomlkit.loads(path.read_text(encoding="utf-8"))
+        except tomlkit.exceptions.ParseError as e:
+            raise ConfigError(f"TOML parse error in {path}: {e}") from e
+        config = cls.from_raw(raw)
+        _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
+        return config
+
+    def resolve_target(
+        self, host: str | None = None, platform: str | None = None
+    ) -> Target | None:
+        """Pick the effective target for (host, platform).
+
+        Host and platform default to the current machine's values
+        when omitted. Host target wins; otherwise the platform
+        target; otherwise None (nothing selected on this host).
+        """
+        if host is None:
+            host = crony.platform.current_host()
+        if platform is None:
+            platform = crony.platform.current_platform()
+        if host in self.host_targets:
+            return self.host_targets[host]
+        if platform in self.platform_targets:
+            return self.platform_targets[platform]
+        return None
+
+    def selected_jobs_and_groups(
+        self, target: Target | None
+    ) -> tuple[set[str], set[str]]:
+        """Compute the set of job and group names selected by target.
+
+        A target's `jobs` list names roots; each root's transitive
+        descendants (group children, which may themselves be groups)
+        are also selected so they get stamped on this host and don't
+        appear as orphans. Per-entry `platforms` / `hosts` filters
+        exclude entries from the selected sets; a child whose only
+        reachable parent is filtered out gets excluded along with it.
+        Validation enforces single-parent within a target's subtree,
+        so there is at most one path to any name on this host.
+
+        Cycle protection is defensive -- `_validate_config` should
+        have already rejected cycles.
+        """
+        jobs, groups, _ = self.selected_and_masked_jobs_and_groups(target)
+        return jobs, groups
+
+    def selected_and_masked_jobs_and_groups(
+        self, target: Target | None
+    ) -> tuple[set[str], set[str], dict[str, str]]:
+        """Walk the target's selection, distinguishing selected from
+        masked.
+
+        Mirrors `selected_jobs_and_groups` for the selected sets; in
+        addition, returns a `masked` mapping of name -> reason (axis
+        string from `_mask_reason`) for entries reached through the
+        target whose own filters exclude them, plus children of a
+        masked group (which inherit the parent's reason -- they're
+        inactive on this host even if their own filters would pass).
+        A group whose every direct child is itself masked on this
+        host has nothing to dispatch and joins the masked set with
+        reason `"empty"`; the cascade iterates to a fixed point so a
+        parent whose only effective child was a now-empty group is
+        demoted as well. The selected sets are identical to what
+        `selected_jobs_and_groups` returns; `masked` is the strictly-
+        additional set that `--all` exposes.
+        """
+        jobs: set[str] = set()
+        groups: set[str] = set()
+        masked: dict[str, str] = {}
+        if target is None:
+            return jobs, groups, masked
+        host = crony.platform.current_host()
+        platform = crony.platform.current_platform()
+
+        def _walk(name: str, parent_mask: str | None, seen: set[str]) -> None:
+            if name in seen:
+                return
+            seen = seen | {name}
+            if name in self.jobs:
+                j = self.jobs[name]
+                own_reason = _mask_reason(
+                    j.platforms, j.hosts, host=host, platform=platform
+                )
+                effective = own_reason or parent_mask
+                if effective is None:
+                    jobs.add(name)
+                else:
+                    masked[name] = effective
+            elif name in self.job_groups:
+                g = self.job_groups[name]
+                own_reason = _mask_reason(
+                    g.platforms, g.hosts, host=host, platform=platform
+                )
+                effective = own_reason or parent_mask
+                if effective is None:
+                    groups.add(name)
+                else:
+                    masked[name] = effective
+                for child in g.jobs:
+                    _walk(child, effective, seen)
+
+        for name in target.jobs:
+            _walk(name, None, set())
+        # Empty-group cascade: a selected group with no unmasked
+        # direct child has nothing to dispatch on this host, so the
+        # reference is treated as a no-op and the group joins the
+        # masked set with reason "empty". Iterate to a fixed point so
+        # a parent whose only remaining child was itself a now-empty
+        # group cascades too. Cycles are rejected by
+        # `_validate_config`, so the loop terminates in
+        # O(group_count) iterations.
+        while True:
+            empties: list[str] = []
+            for gname in groups:
+                g = self.job_groups[gname]
+                if not g.jobs or not any(
+                    (c in jobs) or (c in groups) for c in g.jobs
+                ):
+                    empties.append(gname)
+            if not empties:
+                break
+            for gname in empties:
+                groups.discard(gname)
+                masked[gname] = "empty"
+        return jobs, groups, masked
+
+    def resolved_notify_channels(
+        self, target: Target | None, job: TomlJob
+    ) -> list[str]:
+        """Cascade notify_channels: target > job > defaults.
+
+        Each layer's value is either None ("inherit from below") or a
+        list ("override; this is the value for this layer"). An empty
+        list at any layer is a deliberate "no external dispatch" choice
+        that wins over lower layers. The bottom-most fallback is the
+        defaults' list, which may itself be empty.
+        """
+        if target is not None and target.notify_channels is not None:
+            return list(target.notify_channels)
+        if job.notify_channels is not None:
+            return list(job.notify_channels)
+        return list(self.defaults.notify_channels)
+
+    def resolved_job_timeout_sec(self, job: TomlJob) -> int:
+        """Cascade job_timeout_sec: job > defaults. 0 means no cap.
+
+        Targets and groups intentionally have no user-tunable timeout
+        knob; see the `Target` and `TomlJobGroup` docstrings for the
+        rationale.
+        """
+        if job.job_timeout_sec is not None:
+            return job.job_timeout_sec
+        return self.defaults.job_timeout_sec
+
+    def resolved_priority(self, job: TomlJob) -> PriorityClass | None:
+        """Cascade priority: job > defaults. Targets carry no
+        priority."""
+        if job.priority is not None:
+            return job.priority
+        return self.defaults.priority
+
+    def resolved_keep_awake(self, job: TomlJob) -> bool:
+        """Cascade keep_awake: job > defaults. Targets carry no
+        keep_awake."""
+        if job.keep_awake is not None:
+            return job.keep_awake
+        return self.defaults.keep_awake
+
+    def resolved_env(self, job: TomlJob) -> dict[str, str]:
+        """Merge env: defaults under job (a job's own key wins).
+        Targets carry no env. Values stay literal here -- `$VAR`
+        expansion happens at fire time in `_runtime_env`."""
+        return {**self.defaults.env, **job.env}
+
+    def resolved_group_timeout_sec(
+        self, target: Target | None, group_name: str
+    ) -> int:
+        """Auto-computed effective timeout for a group.
+
+        Returns 1.05 * sum of children's effective timeouts (jobs use
+        `resolved_job_timeout_sec`; sub-groups recurse into this same
+        helper). Floor at 1 second. Returns 0 ("no cap") if any
+        selected, non-interactive child is itself uncapped
+        (`job_timeout_sec = 0`, or a sub-group that resolved to 0) --
+        an uncapped child can't be bounded by a finite cumulative
+        deadline, so the whole group goes uncapped. Used by:
+        - `run_group` to bound its cumulative dispatch loop.
+        - The waiter in `_trigger_unit_sync` to bound its pid-watch
+          when waiting for a group.
+        Cycle-safety: `_validate_config` rejects cycles in group
+        references, so the recursion always terminates.
+
+        Children not selected on this host contribute zero (own
+        filter excludes them or empty-group cascade demoted them) --
+        the parent won't trigger them here, so the budget shouldn't
+        reserve their time either. Interactive children also
+        contribute zero: the group fires them async (no wait), so
+        their `job_timeout_sec` doesn't bound any actual wait inside
+        `run_group` and would just inflate the budget.
+        """
+        group = self.job_groups[group_name]
+        sel_jobs, sel_groups = self.selected_jobs_and_groups(target)
+        total = 0.0
+        for child in group.jobs:
+            if child not in sel_jobs and child not in sel_groups:
+                continue
+            if child in self.jobs:
+                child_job = self.jobs[child]
+                if child_job.interactive:
+                    continue
+                child_timeout = self.resolved_job_timeout_sec(child_job)
+            else:
+                child_timeout = self.resolved_group_timeout_sec(target, child)
+            if child_timeout == 0:
+                return 0
+            total += child_timeout
+        return max(1, int(total * _GROUP_TIMEOUT_PADDING))
+
 
 @dataclass
 class TomlBundle:
@@ -344,6 +732,43 @@ class TomlBundle:
     def full_name(self, short: str) -> str:
         return f"{self.name}.{short}"
 
+    @classmethod
+    def load(cls, name: str, path: Path) -> TomlBundle:
+        """Parse a single bundle file and validate it. Raises
+        ConfigError on parse / schema failure, naming the source path
+        for context.
+
+        Per-entity ConfigErrors (a single bad job, group, or target
+        inside an otherwise-valid bundle) do not raise:
+        `TomlBundleConfig.from_raw` and `_validate_config` record them
+        on `TomlBundleConfig.errored_jobs` / `errored_job_groups` /
+        `errored_platform_targets` / `errored_host_targets`, and they
+        surface at status time with `config=error` plus a logged line
+        here so the user sees the problem regardless of subcommand.
+        """
+        try:
+            raw = tomlkit.loads(path.read_text(encoding="utf-8"))
+        except tomlkit.exceptions.ParseError as e:
+            raise ConfigError(f"TOML parse error in {path}: {e}") from e
+        try:
+            config = TomlBundleConfig.from_raw(raw, bundle_name=name)
+        except ConfigError as e:
+            raise ConfigError(f"{path}: {e}") from e
+        _demote_duplicate_uuids(config, name)
+        # Per-entity error messages are already prefixed with
+        # `[job.X]` / `[job-group.X]` / `[target.X]` /
+        # `[target.host.X]`; we only prepend the bundle path so the
+        # user sees which file produced each error.
+        for msg in sorted(config.errored_jobs.values()):
+            logger.error("%s: %s", path, msg)
+        for msg in sorted(config.errored_job_groups.values()):
+            logger.error("%s: %s", path, msg)
+        for msg in sorted(config.errored_platform_targets.values()):
+            logger.error("%s: %s", path, msg)
+        for msg in sorted(config.errored_host_targets.values()):
+            logger.error("%s: %s", path, msg)
+        return cls(name=name, source=path, config=config)
+
 
 @dataclass
 class TomlConfig:
@@ -359,6 +784,75 @@ class TomlConfig:
 
     bundles: list[TomlBundle] = field(default_factory=list)
     errored_bundles: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def load_all(cls) -> TomlConfig:
+        """Load every bundle: `config.toml` (-> bundle 'default') plus
+        `config/*.toml` (each -> bundle named after its filename stem).
+
+        Per-bundle failures are isolated: a bundle that fails to parse,
+        fails schema validation, or has an invalid filename is recorded
+        in `TomlConfig.errored_bundles` (source path -> error
+        message) with a CONFIG-level error logged for that source.
+        Subsequent bundles continue loading.
+
+        Returns an empty `TomlConfig` when no candidate files exist or
+        every candidate file fails -- read-side subcommands
+        (`status`, `destroy`, `logs`, `crony run`) operate on the on-
+        disk state alone (`current`, `broken`, `unit_only`), so the
+        runner keeps firing through a config-broken state and the
+        operator can still inspect / clean up the on-disk picture.
+        `apply` is the only path that errors hard against the
+        affected bundle -- it needs pending-side data to do its job.
+        """
+        bundles = cls()
+        seen_names: set[str] = set()
+
+        candidates: list[tuple[str, Path]] = []
+        if crony.paths.CONFIG_FILE.exists():
+            candidates.append((DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE))
+        if crony.paths.CONFIG_DROPIN_DIR.exists():
+            for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")):
+                candidates.append((path.stem, path))
+
+        for bundle_name, path in candidates:
+            try:
+                validate_bundle_name(bundle_name, str(path))
+            except ConfigError as e:
+                bundles.errored_bundles[str(path)] = str(e)
+                continue
+            if bundle_name in seen_names:
+                bundles.errored_bundles[str(path)] = (
+                    f"bundle name {bundle_name!r} collides with "
+                    f"already-loaded bundle; this file will not load"
+                )
+                continue
+            try:
+                bundle = TomlBundle.load(bundle_name, path)
+            except ConfigError as e:
+                bundles.errored_bundles[str(path)] = str(e)
+                continue
+            bundles.bundles.append(bundle)
+            seen_names.add(bundle_name)
+
+        for src, msg in bundles.errored_bundles.items():
+            logger.error("%s: %s", src, msg)
+        return bundles
+
+    def require_known(self, bundle: str | None) -> None:
+        """Reject `--bundle <name>` if `<name>` isn't a loaded bundle.
+
+        Used by the subcommands that need the bundle's parsed config:
+        `apply` and `validate` act on the pending entries, and
+        `notify-test` reads the bundle's notify settings. A bundle
+        whose file failed to parse has none of that, so scoping to it
+        is an error. Subcommands that address installed units
+        (`status` / `destroy` / `enable` / `disable` / `trigger`) use
+        `require_addressable_bundle` instead, which also accepts a
+        bundle present only as on-disk state.
+        """
+        if bundle is not None and self.by_name(bundle) is None:
+            raise UsageError(f"unknown bundle: {bundle!r}")
 
     def by_name(self, bundle_name: str) -> TomlBundle | None:
         for b in self.bundles:
@@ -543,7 +1037,7 @@ _KNOWN_TRANSPORT_NTFY: frozenset[str] = frozenset(
 # `[defaults.notify.email] transport = "email"`. A channel named
 # anything else must declare `transport=` explicitly so the
 # parser knows which schema to validate the block against.
-_VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
+VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
     {
         "email",
         "ntfy",
@@ -558,7 +1052,7 @@ _VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
 # (see `_builtin_notify_channel`). A built-in's channel name equals
 # its transport name. An explicit block is still allowed but never
 # required.
-_BUILTIN_NOTIFY_CHANNELS: frozenset[str] = frozenset({"dialog-popup"})
+BUILTIN_NOTIFY_CHANNELS: frozenset[str] = frozenset({"dialog-popup"})
 
 # Headers crony controls per transport. User-supplied `headers`
 # entries that match (case-insensitively) are rejected at parse
@@ -669,7 +1163,7 @@ def _parse_uuid_field(raw: dict[str, Any], where: str) -> str | None:
     return canonical
 
 
-def _validate_bundle_name(name: str, where: str) -> None:
+def validate_bundle_name(name: str, where: str) -> None:
     """Reject filenames whose stem can't be a bundle name."""
     if not _BUNDLE_NAME_RE.match(name):
         raise ConfigError(
@@ -743,22 +1237,6 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
             f"{scope_bundle!r} is set"
         )
     return f"{bundle}.{short}"
-
-
-def require_known_bundle(bundles: TomlConfig, bundle: str | None) -> None:
-    """Reject `--bundle <name>` if `<name>` isn't a loaded bundle.
-
-    Used by the subcommands that need the bundle's parsed config:
-    `apply` and `validate` act on the pending entries, and
-    `notify-test` reads the bundle's notify settings. A bundle
-    whose file failed to parse has none of that, so scoping to it
-    is an error. Subcommands that address installed units
-    (`status` / `destroy` / `enable` / `disable` / `trigger`) use
-    `require_addressable_bundle` instead, which also accepts a
-    bundle present only as on-disk state.
-    """
-    if bundle is not None and bundles.by_name(bundle) is None:
-        raise UsageError(f"unknown bundle: {bundle!r}")
 
 
 def bundle_prefix_filter(names: Iterable[str], bundle: str) -> set[str]:
@@ -929,77 +1407,6 @@ def _parse_notify_ntfy_settings(raw: dict[str, Any], where: str) -> NotifyNtfy:
     )
 
 
-def _parse_notify_channel(name: str, raw: dict[str, Any]) -> NotifyChannel:
-    """Parse a single [defaults.notify.<name>] block.
-
-    Channel-level keys: `transport` (defaults to the channel name
-    when name matches a built-in transport; required otherwise) and
-    `headers` (optional dict of user-supplied headers).
-    Transport-specific keys live alongside. The zero-config
-    `dialog-popup` transport takes only `transport` -- no headers, no
-    endpoint -- and is usually listed by name without a block at all.
-    """
-    where = f"[defaults.notify.{name}]"
-    _validate_name(name, where)
-
-    transport = _typed_field(raw, "transport", str, where)
-    if transport is None:
-        if name in _VALID_NOTIFY_TRANSPORTS:
-            transport = name
-        else:
-            raise ConfigError(
-                f"{where}: 'transport' required for channel {name!r} "
-                f"(only {sorted(_VALID_NOTIFY_TRANSPORTS)} can omit it)"
-            )
-    if transport not in _VALID_NOTIFY_TRANSPORTS:
-        raise ConfigError(
-            f"{where}: transport {transport!r} not in "
-            f"{sorted(_VALID_NOTIFY_TRANSPORTS)}"
-        )
-
-    if transport == "dialog-popup":
-        # Zero-config built-in: only `transport` is permitted -- no
-        # headers, no endpoint, no secrets. Listing the channel name
-        # in notify_channels is the whole configuration.
-        _reject_unknown_keys(raw, frozenset({"transport"}), where)
-        return NotifyChannel(name=name, transport=transport)
-
-    headers = _string_dict(raw, "headers", where)
-    reserved = (
-        _RESERVED_HEADERS_EMAIL
-        if transport == "email"
-        else _RESERVED_HEADERS_NTFY
-    )
-    for k in headers:
-        if k.lower() in reserved:
-            raise ConfigError(
-                f"{where}: header {k!r} is set by crony and cannot "
-                f"be overridden"
-            )
-
-    # Reject keys outside (channel-level + this transport's keys).
-    transport_keys = (
-        _KNOWN_TRANSPORT_EMAIL
-        if transport == "email"
-        else _KNOWN_TRANSPORT_NTFY
-    )
-    _reject_unknown_keys(raw, _KNOWN_NOTIFY_CHANNEL | transport_keys, where)
-
-    email_cfg: NotifyEmail | None = None
-    ntfy_cfg: NotifyNtfy | None = None
-    if transport == "email":
-        email_cfg = _parse_notify_email_settings(raw, where)
-    else:
-        ntfy_cfg = _parse_notify_ntfy_settings(raw, where)
-    return NotifyChannel(
-        name=name,
-        transport=transport,
-        headers=headers,
-        email=email_cfg,
-        ntfy=ntfy_cfg,
-    )
-
-
 def _positive_int(
     raw: dict[str, Any], key: str, where: str, default: int
 ) -> int:
@@ -1078,7 +1485,7 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
             )
         if not isinstance(sub_body, dict):
             raise ConfigError(f"[defaults.notify.{sub_key}]: must be a table")
-        notify_channel_defs[sub_key] = _parse_notify_channel(sub_key, sub_body)
+        notify_channel_defs[sub_key] = NotifyChannel.from_raw(sub_key, sub_body)
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
@@ -1306,7 +1713,7 @@ def _collect_target_parents(
     return parents
 
 
-def _validate_notify_channels(
+def validate_notify_channels(
     channels: list[str],
     defined_channels: set[str],
     label: str,
@@ -1321,7 +1728,7 @@ def _validate_notify_channels(
     channels (the resolved set is their union); it is only valid in a
     non-default bundle (the default bundle cannot inherit itself).
     Every non-sentinel entry must name a channel defined in this bundle
-    or a zero-config built-in (`_BUILTIN_NOTIFY_CHANNELS`, e.g.
+    or a zero-config built-in (`BUILTIN_NOTIFY_CHANNELS`, e.g.
     "dialog-popup").
     """
     if NOTIFY_INHERIT_TOKEN in channels and is_default:
@@ -1332,11 +1739,11 @@ def _validate_notify_channels(
     for ch in channels:
         if ch == NOTIFY_INHERIT_TOKEN:
             continue
-        if ch not in defined_channels and ch not in _BUILTIN_NOTIFY_CHANNELS:
+        if ch not in defined_channels and ch not in BUILTIN_NOTIFY_CHANNELS:
             return (
                 f"{label}: notify_channels entry {ch!r} is not "
                 f"defined; expected one of "
-                f"{sorted(defined_channels | _BUILTIN_NOTIFY_CHANNELS)}"
+                f"{sorted(defined_channels | BUILTIN_NOTIFY_CHANNELS)}"
             )
     return None
 
@@ -1395,7 +1802,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     # references are unattributable -> raise; per-job and per-target
     # references are per-entity -> demote.
     defined_channels = set(config.defaults.notify_channel_defs.keys())
-    defaults_msg = _validate_notify_channels(
+    defaults_msg = validate_notify_channels(
         config.defaults.notify_channels,
         defined_channels,
         "[defaults]",
@@ -1408,7 +1815,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     for jname, job in config.jobs.items():
         if job.notify_channels is None:
             continue
-        job_msg = _validate_notify_channels(
+        job_msg = validate_notify_channels(
             job.notify_channels,
             defined_channels,
             f"[job.{jname}]",
@@ -1449,7 +1856,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             if ref not in all_names:
                 return f"{label}: 'jobs' references undefined name {ref!r}"
         if target.notify_channels is not None:
-            notify_msg = _validate_notify_channels(
+            notify_msg = validate_notify_channels(
                 target.notify_channels,
                 defined_channels,
                 label,
@@ -1550,7 +1957,8 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
     in the same bundle into the errored maps. Operates in-place.
 
     UUIDs are bundle-scoped, so this check runs after each bundle's
-    `parse_config` rather than across bundles. Duplicates are almost
+    `TomlBundleConfig.from_raw` rather than across bundles. Duplicates
+    are almost
     always a copy-paste mistake; both sides are demoted rather than
     picking a winner so the user sees the conflict on both rows and
     is forced to resolve.
@@ -1588,214 +1996,9 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
                 config.errored_job_groups[short] = entity_msg
 
 
-def _load_one_bundle(name: str, path: Path) -> TomlBundle:
-    """Parse a single bundle file and validate it. Raises ConfigError
-    on parse / schema failure, naming the source path for context.
-
-    Per-entity ConfigErrors (a single bad job, group, or target
-    inside an otherwise-valid bundle) do not raise: `parse_config`
-    and `_validate_config` record them on `TomlBundleConfig.errored_jobs` /
-    `errored_job_groups` / `errored_platform_targets` /
-    `errored_host_targets`, and they surface at status time with
-    `config=error` plus a logged line here so the user sees the
-    problem regardless of subcommand.
-    """
-    try:
-        raw = tomlkit.loads(path.read_text(encoding="utf-8"))
-    except tomlkit.exceptions.ParseError as e:
-        raise ConfigError(f"TOML parse error in {path}: {e}") from e
-    try:
-        config = parse_config(raw, bundle_name=name)
-    except ConfigError as e:
-        raise ConfigError(f"{path}: {e}") from e
-    _demote_duplicate_uuids(config, name)
-    # Per-entity error messages are already prefixed with
-    # `[job.X]` / `[job-group.X]` / `[target.X]` /
-    # `[target.host.X]`; we only prepend the bundle path so the
-    # user sees which file produced each error.
-    for msg in sorted(config.errored_jobs.values()):
-        logger.error("%s: %s", path, msg)
-    for msg in sorted(config.errored_job_groups.values()):
-        logger.error("%s: %s", path, msg)
-    for msg in sorted(config.errored_platform_targets.values()):
-        logger.error("%s: %s", path, msg)
-    for msg in sorted(config.errored_host_targets.values()):
-        logger.error("%s: %s", path, msg)
-    return TomlBundle(name=name, source=path, config=config)
-
-
-def load_all_bundles() -> TomlConfig:
-    """Load every bundle: `config.toml` (-> bundle 'default') plus
-    `config/*.toml` (each -> bundle named after its filename stem).
-
-    Per-bundle failures are isolated: a bundle that fails to parse,
-    fails schema validation, or has an invalid filename is recorded
-    in `TomlConfig.errored_bundles` (source path -> error
-    message) with a CONFIG-level error logged for that source.
-    Subsequent bundles continue loading.
-
-    Returns an empty `TomlConfig` when no candidate files exist or
-    every candidate file fails -- read-side subcommands
-    (`status`, `destroy`, `logs`, `crony run`) operate on the on-
-    disk state alone (`current`, `broken`, `unit_only`), so the
-    runner keeps firing through a config-broken state and the
-    operator can still inspect / clean up the on-disk picture.
-    `apply` is the only path that errors hard against the
-    affected bundle -- it needs pending-side data to do its job.
-    """
-    bundles = TomlConfig()
-    seen_names: set[str] = set()
-
-    candidates: list[tuple[str, Path]] = []
-    if crony.paths.CONFIG_FILE.exists():
-        candidates.append((DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE))
-    if crony.paths.CONFIG_DROPIN_DIR.exists():
-        for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")):
-            candidates.append((path.stem, path))
-
-    for bundle_name, path in candidates:
-        try:
-            _validate_bundle_name(bundle_name, str(path))
-        except ConfigError as e:
-            bundles.errored_bundles[str(path)] = str(e)
-            continue
-        if bundle_name in seen_names:
-            bundles.errored_bundles[str(path)] = (
-                f"bundle name {bundle_name!r} collides with "
-                f"already-loaded bundle; this file will not load"
-            )
-            continue
-        try:
-            bundle = _load_one_bundle(bundle_name, path)
-        except ConfigError as e:
-            bundles.errored_bundles[str(path)] = str(e)
-            continue
-        bundles.bundles.append(bundle)
-        seen_names.add(bundle_name)
-
-    for src, msg in bundles.errored_bundles.items():
-        logger.error("%s: %s", src, msg)
-    return bundles
-
-
-def load_toml_bundle_config(path: Path) -> TomlBundleConfig:
-    """Load a single config file as a `TomlBundleConfig` (single-bundle view).
-
-    Suited to tests and any caller that has one specific config
-    path in hand and wants the parsed `TomlBundleConfig` for that file
-    alone. Production code paths walk every bundle and should use
-    `load_all_bundles()` instead.
-    """
-    if not path.exists():
-        raise ConfigError(f"config not found: {path}")
-    try:
-        raw = tomlkit.loads(path.read_text(encoding="utf-8"))
-    except tomlkit.exceptions.ParseError as e:
-        raise ConfigError(f"TOML parse error in {path}: {e}") from e
-    config = parse_config(raw)
-    _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
-    return config
-
-
-def parse_config(
-    raw: dict[str, Any], *, bundle_name: str = DEFAULT_BUNDLE_NAME
-) -> TomlBundleConfig:
-    """Parse a top-level config dict into a validated TomlBundleConfig.
-
-    `bundle_name` identifies the source bundle; it gates the
-    notify-inherit sentinel (only non-default bundles may inherit, and
-    they do so implicitly when notify config is omitted). Callers with
-    a single-bundle view default it to the default bundle, the
-    conservative choice (no implicit inherit, sentinel rejected).
-    """
-    _reject_unknown_keys(raw, _KNOWN_TOPLEVEL, "(top level)")
-    is_default = bundle_name == DEFAULT_BUNDLE_NAME
-
-    config = TomlBundleConfig()
-
-    if "defaults" in raw:
-        if not isinstance(raw["defaults"], dict):
-            raise ConfigError("[defaults] must be a table")
-        config.defaults = _parse_defaults(
-            raw["defaults"], is_default=is_default
-        )
-    elif not is_default:
-        # No [defaults] block at all still inherits the default
-        # bundle's notify config for a non-default bundle.
-        config.defaults = Defaults(notify_channels=[NOTIFY_INHERIT_TOKEN])
-
-    job_section = raw.get("job", {})
-    if not isinstance(job_section, dict):
-        raise ConfigError("[job] must be a table")
-    for name, body in job_section.items():
-        # Per-entity ConfigError tolerance: a parse failure on
-        # one job records its error and continues so sibling jobs
-        # still parse. Catching ConfigError (not Exception) keeps
-        # genuine bugs surfacing as tracebacks.
-        try:
-            if not isinstance(body, dict):
-                raise ConfigError(f"[job.{name}] must be a table")
-            config.jobs[name] = _parse_job(name, body)
-        except ConfigError as exc:
-            config.errored_jobs[name] = str(exc)
-
-    group_section = raw.get("job-group", {})
-    if not isinstance(group_section, dict):
-        raise ConfigError("[job-group] must be a table")
-    for name, body in group_section.items():
-        try:
-            if not isinstance(body, dict):
-                raise ConfigError(f"[job-group.{name}] must be a table")
-            config.job_groups[name] = _parse_job_group(name, body)
-        except ConfigError as exc:
-            config.errored_job_groups[name] = str(exc)
-
-    target_section = raw.get("target", {})
-    if not isinstance(target_section, dict):
-        raise ConfigError("[target] must be a table")
-    for name, body in target_section.items():
-        if name == "host":
-            # [target.host.<host>] entries
-            if not isinstance(body, dict):
-                raise ConfigError("[target.host] must be a table")
-            for hostname, hostbody in body.items():
-                if not isinstance(hostbody, dict):
-                    raise ConfigError(
-                        f"[target.host.{hostname}] must be a table"
-                    )
-                config.host_targets[hostname] = _parse_target(
-                    hostname, "host", hostbody
-                )
-        else:
-            # [target.<platform>] entry
-            if not isinstance(body, dict):
-                raise ConfigError(f"[target.{name}] must be a table")
-            config.platform_targets[name] = _parse_target(
-                name, "platform", body
-            )
-
-    _validate_config(config, is_default=is_default)
-    return config
-
-
 # =============================================================================
 # RESOLUTION
 # =============================================================================
-
-
-def resolve_target(
-    config: TomlBundleConfig, host: str, platform: str
-) -> Target | None:
-    """Pick the effective target for (host, platform).
-
-    Host target wins; otherwise the platform target; otherwise None
-    (nothing selected on this host).
-    """
-    if host in config.host_targets:
-        return config.host_targets[host]
-    if platform in config.platform_targets:
-        return config.platform_targets[platform]
-    return None
 
 
 def _mask_reason(
@@ -1846,224 +2049,9 @@ def _entry_applies_here(
     return _mask_reason(platforms, hosts, host=host, platform=platform) is None
 
 
-def selected_jobs_and_groups(
-    config: TomlBundleConfig, target: Target | None
-) -> tuple[set[str], set[str]]:
-    """Compute the set of job and group names selected by target.
-
-    A target's `jobs` list names roots; each root's transitive
-    descendants (group children, which may themselves be groups)
-    are also selected so they get stamped on this host and don't
-    appear as orphans. Per-entry `platforms` / `hosts` filters
-    exclude entries from the selected sets; a child whose only
-    reachable parent is filtered out gets excluded along with it.
-    Validation enforces single-parent within a target's subtree,
-    so there is at most one path to any name on this host.
-
-    Cycle protection is defensive -- `_validate_config` should
-    have already rejected cycles.
-    """
-    jobs, groups, _ = selected_and_masked_jobs_and_groups(config, target)
-    return jobs, groups
-
-
-def selected_and_masked_jobs_and_groups(
-    config: TomlBundleConfig, target: Target | None
-) -> tuple[set[str], set[str], dict[str, str]]:
-    """Walk the target's selection, distinguishing selected from masked.
-
-    Mirrors `selected_jobs_and_groups` for the selected sets; in
-    addition, returns a `masked` mapping of name -> reason (axis
-    string from `_mask_reason`) for entries reached through the
-    target whose own filters exclude them, plus children of a
-    masked group (which inherit the parent's reason -- they're
-    inactive on this host even if their own filters would pass).
-    A group whose every direct child is itself masked on this
-    host has nothing to dispatch and joins the masked set with
-    reason `"empty"`; the cascade iterates to a fixed point so a
-    parent whose only effective child was a now-empty group is
-    demoted as well. The selected sets are identical to what
-    `selected_jobs_and_groups` returns; `masked` is the strictly-
-    additional set that `--all` exposes.
-    """
-    jobs: set[str] = set()
-    groups: set[str] = set()
-    masked: dict[str, str] = {}
-    if target is None:
-        return jobs, groups, masked
-    host = crony.platform.current_host()
-    platform = crony.platform.current_platform()
-
-    def _walk(name: str, parent_mask: str | None, seen: set[str]) -> None:
-        if name in seen:
-            return
-        seen = seen | {name}
-        if name in config.jobs:
-            j = config.jobs[name]
-            own_reason = _mask_reason(
-                j.platforms, j.hosts, host=host, platform=platform
-            )
-            effective = own_reason or parent_mask
-            if effective is None:
-                jobs.add(name)
-            else:
-                masked[name] = effective
-        elif name in config.job_groups:
-            g = config.job_groups[name]
-            own_reason = _mask_reason(
-                g.platforms, g.hosts, host=host, platform=platform
-            )
-            effective = own_reason or parent_mask
-            if effective is None:
-                groups.add(name)
-            else:
-                masked[name] = effective
-            for child in g.jobs:
-                _walk(child, effective, seen)
-
-    for name in target.jobs:
-        _walk(name, None, set())
-    # Empty-group cascade: a selected group with no unmasked
-    # direct child has nothing to dispatch on this host, so the
-    # reference is treated as a no-op and the group joins the
-    # masked set with reason "empty". Iterate to a fixed point so
-    # a parent whose only remaining child was itself a now-empty
-    # group cascades too. Cycles are rejected by `_validate_config`,
-    # so the loop terminates in O(group_count) iterations.
-    while True:
-        empties: list[str] = []
-        for gname in groups:
-            g = config.job_groups[gname]
-            if not g.jobs or not any(
-                (c in jobs) or (c in groups) for c in g.jobs
-            ):
-                empties.append(gname)
-        if not empties:
-            break
-        for gname in empties:
-            groups.discard(gname)
-            masked[gname] = "empty"
-    return jobs, groups, masked
-
-
-def resolved_notify_channels(
-    config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> list[str]:
-    """Cascade notify_channels: target > job > defaults.
-
-    Each layer's value is either None ("inherit from below") or a
-    list ("override; this is the value for this layer"). An empty
-    list at any layer is a deliberate "no external dispatch" choice
-    that wins over lower layers. The bottom-most fallback is the
-    defaults' list, which may itself be empty.
-    """
-    if target is not None and target.notify_channels is not None:
-        return list(target.notify_channels)
-    if job.notify_channels is not None:
-        return list(job.notify_channels)
-    return list(config.defaults.notify_channels)
-
-
-def resolved_job_timeout_sec(
-    config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> int:
-    """Cascade job_timeout_sec: job > defaults. 0 means no cap.
-
-    `target` is accepted for signature symmetry with
-    `resolved_notify_channels` (and to keep callers unaware of the
-    cascade shape) but does not contribute -- targets and groups
-    intentionally have no user-tunable timeout knob; see the
-    `Target` and `TomlJobGroup` docstrings for the rationale.
-    """
-    del target
-    if job.job_timeout_sec is not None:
-        return job.job_timeout_sec
-    return config.defaults.job_timeout_sec
-
-
-def resolved_priority(
-    config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> PriorityClass | None:
-    """Cascade priority: job > defaults. `target` is ignored (kept for
-    call-site symmetry with the other resolvers); targets carry no
-    priority."""
-    del target
-    if job.priority is not None:
-        return job.priority
-    return config.defaults.priority
-
-
-def resolved_keep_awake(
-    config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> bool:
-    """Cascade keep_awake: job > defaults. `target` is ignored (kept
-    for call-site symmetry with the other resolvers); targets carry no
-    keep_awake."""
-    del target
-    if job.keep_awake is not None:
-        return job.keep_awake
-    return config.defaults.keep_awake
-
-
-def resolved_env(
-    config: TomlBundleConfig, target: Target | None, job: TomlJob
-) -> dict[str, str]:
-    """Merge env: defaults under job (a job's own key wins). `target`
-    is ignored (kept for call-site symmetry with the other resolvers);
-    targets carry no env. Values stay literal here -- `$VAR` expansion
-    happens at fire time in `_runtime_env`."""
-    del target
-    return {**config.defaults.env, **job.env}
-
-
 # Padding factor applied to a group's effective timeout. The 5%
 # slack lets a leaf job hit its own timeout (and propagate the
 # error up through last-run.json) before the parent group's own
 # cumulative deadline fires. Compounds with nesting depth, by
 # design.
 _GROUP_TIMEOUT_PADDING: float = 1.05
-
-
-def resolved_group_timeout_sec(
-    config: TomlBundleConfig, target: Target | None, group_name: str
-) -> int:
-    """Auto-computed effective timeout for a group.
-
-    Returns 1.05 * sum of children's effective timeouts (jobs use
-    `resolved_job_timeout_sec`; sub-groups recurse into this same
-    helper). Floor at 1 second. Returns 0 ("no cap") if any selected,
-    non-interactive child is itself uncapped (`job_timeout_sec = 0`, or
-    a sub-group that resolved to 0) -- an uncapped child can't be
-    bounded by a finite cumulative deadline, so the whole group goes
-    uncapped. Used by:
-    - `run_group` to bound its cumulative dispatch loop.
-    - The waiter in `_trigger_unit_sync` to bound its pid-watch
-      when waiting for a group.
-    Cycle-safety: `_validate_config` rejects cycles in group
-    references, so the recursion always terminates.
-
-    Children not selected on this host contribute zero (own
-    filter excludes them or empty-group cascade demoted them) --
-    the parent won't trigger them here, so the budget shouldn't
-    reserve their time either. Interactive children also
-    contribute zero: the group fires them async (no wait), so
-    their `job_timeout_sec` doesn't bound any actual wait inside
-    `run_group` and would just inflate the budget.
-    """
-    group = config.job_groups[group_name]
-    sel_jobs, sel_groups = selected_jobs_and_groups(config, target)
-    total = 0.0
-    for child in group.jobs:
-        if child not in sel_jobs and child not in sel_groups:
-            continue
-        if child in config.jobs:
-            child_job = config.jobs[child]
-            if child_job.interactive:
-                continue
-            child_timeout = resolved_job_timeout_sec(config, target, child_job)
-        else:
-            child_timeout = resolved_group_timeout_sec(config, target, child)
-        if child_timeout == 0:
-            return 0
-        total += child_timeout
-    return max(1, int(total * _GROUP_TIMEOUT_PADDING))

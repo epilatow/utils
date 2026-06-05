@@ -48,10 +48,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony.config import (  # noqa: E402
-    _parse_notify_channel,
-    _validate_notify_channels,
-    load_toml_bundle_config,
-    parse_config,
+    NotifyChannel,
+    TomlBundleConfig,
+    validate_notify_channels,
 )
 from crony.errors import JobTimeoutError, SubprocessError  # noqa: E402
 from crony.platform import PidWait, launchd, systemd  # noqa: E402
@@ -344,7 +343,7 @@ def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _parse(raw: dict[str, Any]) -> Any:
     """Auto-stamp missing uuids and parse. The dominant test path."""
-    return parse_config(_inject_uuids(raw))
+    return TomlBundleConfig.from_raw(_inject_uuids(raw))
 
 
 def _uuid_toml(text: str) -> str:
@@ -361,7 +360,7 @@ def _uuid_toml(text: str) -> str:
 
 
 def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
-    """Assert parse_config records a per-entity error for job `short`.
+    """Assert from_raw records a per-entity error for job `short`.
 
     Per-entity parse failures land in `TomlBundleConfig.errored_jobs` instead
     of raising, so tests of bad-shape inputs check the recorded
@@ -990,14 +989,14 @@ class TestUuidField:
     def test_job_missing_uuid_is_errored(self) -> None:
         # Bypass `_parse` so `_inject_uuids` doesn't paper over the
         # condition we're verifying.
-        cfg = parse_config({"job": {"j": _job()}})
+        cfg = TomlBundleConfig.from_raw({"job": {"j": _job()}})
         assert "j" in cfg.errored_jobs
         assert "uuid" in cfg.errored_jobs["j"]
         assert "crony config update" in cfg.errored_jobs["j"]
         assert "j" not in cfg.jobs
 
     def test_group_missing_uuid_is_errored(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             {
                 "job": {
                     "a": {"command": "true", "uuid": self.GOOD},
@@ -1087,10 +1086,10 @@ class TestUuidField:
 
 class TestDuplicateUuidInBundle:
     """UUIDs are bundle-scoped, so this check runs after each
-    bundle's parse_config. Both entries sharing the duplicate
-    UUID are demoted into the errored maps with the same message
-    -- the user sees the conflict on every side, not just one,
-    and other bundles/entries remain operational.
+    bundle's TomlBundleConfig.from_raw. Both entries sharing the
+    duplicate UUID are demoted into the errored maps with the same
+    message -- the user sees the conflict on every side, not just
+    one, and other bundles/entries remain operational.
     """
 
     GOOD = "aabbccdd-1234-5678-9abc-aabbccddeeff"
@@ -1098,7 +1097,7 @@ class TestDuplicateUuidInBundle:
     def _write_and_load(self, tmp_path: Path, body: str) -> Any:
         path = tmp_path / "bundle.toml"
         path.write_text(body, encoding="utf-8")
-        return crony._load_one_bundle("default", path)
+        return crony.TomlBundle.load("default", path)
 
     def test_duplicate_uuid_on_two_jobs_demotes_both(
         self, tmp_path: Path
@@ -1513,8 +1512,8 @@ class TestValidateConfig:
             }
         )
         # Parse succeeds; selection on linux excludes `a`.
-        target = crony.resolve_target(cfg, "host-l", "linux")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("host-l", "linux")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" not in sel_jobs
 
 
@@ -1541,7 +1540,7 @@ class TestLoadConfigFromFile:
         )
         f = tmp_path / "config.toml"
         f.write_text(cfg_text)
-        cfg = load_toml_bundle_config(f)
+        cfg = TomlBundleConfig.load(f)
         assert "brew-update" in cfg.jobs
         assert cfg.jobs["brew-update"].timing == Schedule.from_str(
             "*-*-* 03:15"
@@ -1549,13 +1548,13 @@ class TestLoadConfigFromFile:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(crony.ConfigError, match="not found"):
-            load_toml_bundle_config(tmp_path / "absent.toml")
+            TomlBundleConfig.load(tmp_path / "absent.toml")
 
     def test_bad_toml(self, tmp_path: Path) -> None:
         f = tmp_path / "config.toml"
         f.write_text("this is not [toml")
         with pytest.raises(crony.ConfigError, match="TOML parse error"):
-            load_toml_bundle_config(f)
+            TomlBundleConfig.load(f)
 
 
 # =============================================================================
@@ -1574,7 +1573,7 @@ class TestResolution:
                 },
             }
         )
-        target = crony.resolve_target(cfg, "my-host", "darwin")
+        target = cfg.resolve_target("my-host", "darwin")
         assert target is not None
         assert target.jobs == ["b"]
         assert target.kind == "host"
@@ -1586,14 +1585,14 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "other-host", "darwin")
+        target = cfg.resolve_target("other-host", "darwin")
         assert target is not None
         assert target.jobs == ["a"]
         assert target.kind == "platform"
 
     def test_no_target_returns_none(self) -> None:
         cfg = _parse({})
-        assert crony.resolve_target(cfg, "h", "darwin") is None
+        assert cfg.resolve_target("h", "darwin") is None
 
     def test_selected_includes_group_children(self) -> None:
         cfg = _parse(
@@ -1612,14 +1611,14 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["g", "c"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        jobs, groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "darwin")
+        jobs, groups = cfg.selected_jobs_and_groups(target)
         assert jobs == {"a", "b", "c"}
         assert groups == {"g"}
 
     def test_selected_for_no_target_is_empty(self) -> None:
         cfg = _parse({})
-        jobs, groups = crony.selected_jobs_and_groups(cfg, None)
+        jobs, groups = cfg.selected_jobs_and_groups(None)
         assert jobs == set()
         assert groups == set()
 
@@ -1642,10 +1641,8 @@ class TestResolution:
                 },
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == [
-            "ntfy"
-        ]
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_channels(target, cfg.jobs["a"]) == ["ntfy"]
 
     def test_notify_job_overrides_defaults(self) -> None:
         cfg = _parse(
@@ -1658,10 +1655,8 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == [
-            "email"
-        ]
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_channels(target, cfg.jobs["a"]) == ["email"]
 
     def test_notify_default_fallback(self) -> None:
         cfg = _parse(
@@ -1674,10 +1669,8 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == [
-            "ntfy"
-        ]
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_channels(target, cfg.jobs["a"]) == ["ntfy"]
 
     def test_notify_target_empty_list_overrides_job(self) -> None:
         # An explicit empty list at the target layer suppresses
@@ -1700,8 +1693,8 @@ class TestResolution:
                 },
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == []
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_channels(target, cfg.jobs["a"]) == []
 
     def test_notify_multi_channel_resolution(self) -> None:
         cfg = _parse(
@@ -1719,8 +1712,8 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_notify_channels(cfg, target, cfg.jobs["a"]) == [
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_channels(target, cfg.jobs["a"]) == [
             "email",
             "ntfy",
         ]
@@ -1733,8 +1726,7 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 200
+        assert cfg.resolved_job_timeout_sec(cfg.jobs["a"]) == 200
 
     def test_target_rejects_job_timeout_sec(self) -> None:
         # Targets deliberately have no timeout knob: timeouts are a
@@ -1758,8 +1750,7 @@ class TestResolution:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        assert crony.resolved_job_timeout_sec(cfg, target, cfg.jobs["a"]) == 100
+        assert cfg.resolved_job_timeout_sec(cfg.jobs["a"]) == 100
 
 
 def _bundle_set(*pairs: tuple[str, Any]) -> Any:
@@ -1783,13 +1774,13 @@ class TestNotifyInherit:
     """
 
     def test_implicit_default_for_nondefault_bundle(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
 
     def test_implicit_default_with_defaults_but_no_notify(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {"defaults": {"job_timeout_sec": 60}, "job": {"a": _job()}}
             ),
@@ -1798,11 +1789,11 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == [crony.NOTIFY_INHERIT_TOKEN]
 
     def test_default_bundle_stays_empty(self) -> None:
-        cfg = parse_config(_inject_uuids({"job": {"a": _job()}}))
+        cfg = TomlBundleConfig.from_raw(_inject_uuids({"job": {"a": _job()}}))
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_empty_opts_out(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {"defaults": {"notify_channels": []}, "job": {"a": _job()}}
             ),
@@ -1811,7 +1802,7 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_token_in_nondefault_ok(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {
                     "defaults": {"notify_channels": ["default"]},
@@ -1824,13 +1815,13 @@ class TestNotifyInherit:
 
     def test_token_rejected_in_default_bundle(self) -> None:
         with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
-            parse_config(
+            TomlBundleConfig.from_raw(
                 _inject_uuids({"defaults": {"notify_channels": ["default"]}})
             )
 
     def test_token_combines_with_siblings(self) -> None:
         # The sentinel may now sit alongside explicit channels.
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1851,7 +1842,7 @@ class TestNotifyInherit:
         # Even combined with siblings, the default bundle can't inherit
         # itself.
         with pytest.raises(crony.ConfigError, match="cannot inherit its own"):
-            parse_config(
+            TomlBundleConfig.from_raw(
                 _inject_uuids(
                     {
                         "defaults": {
@@ -1863,14 +1854,14 @@ class TestNotifyInherit:
 
     def test_reserved_channel_name_rejected(self) -> None:
         with pytest.raises(crony.ConfigError, match="reserved channel name"):
-            parse_config(
+            TomlBundleConfig.from_raw(
                 _inject_uuids(
                     {"defaults": {"notify": {"default": _ntfy_block()}}}
                 )
             )
 
     def test_job_level_token_ok_in_nondefault(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}}),
             bundle_name="borgadm",
         )
@@ -1878,14 +1869,14 @@ class TestNotifyInherit:
         assert cfg.jobs["a"].notify_channels == ["default"]
 
     def test_job_level_token_demoted_in_default(self) -> None:
-        cfg = parse_config(
+        cfg = TomlBundleConfig.from_raw(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}})
         )
         assert "a" in cfg.errored_jobs
         assert "cannot inherit its own" in cfg.errored_jobs["a"]
 
     def _two_bundles(self, default_notify: list[str]) -> tuple[Any, Any]:
-        default_cfg = parse_config(
+        default_cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1898,7 +1889,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        borgadm_cfg = parse_config(
+        borgadm_cfg = TomlBundleConfig.from_raw(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         return default_cfg, borgadm_cfg
@@ -1995,7 +1986,7 @@ class TestNotifyInherit:
     def test_expand_merges_local_def_for_new_sibling(self) -> None:
         # A sibling defined only in the inheriting bundle must still be
         # dispatchable: its def is merged alongside the inherited ones.
-        default_cfg = parse_config(
+        default_cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -2005,7 +1996,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        local_cfg = parse_config(
+        local_cfg = TomlBundleConfig.from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -2132,8 +2123,8 @@ class TestSelectionFilters:
                 "target": {"darwin": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "darwin")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" in sel_jobs
 
     def test_job_with_excluding_platform_filtered_out(
@@ -2147,8 +2138,8 @@ class TestSelectionFilters:
                 "target": {"linux": {"jobs": ["a"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "linux")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "linux")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" not in sel_jobs
 
     def test_job_hosts_filter(self, monkeypatch: Any) -> None:
@@ -2163,13 +2154,13 @@ class TestSelectionFilters:
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
-        target = crony.resolve_target(cfg, "alpha", "darwin")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("alpha", "darwin")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" in sel_jobs
         # On a non-listed host: filtered out.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "gamma")
-        target = crony.resolve_target(cfg, "gamma", "darwin")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("gamma", "darwin")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" not in sel_jobs
 
     def test_group_filter_skips_recursion(self, monkeypatch: Any) -> None:
@@ -2192,8 +2183,8 @@ class TestSelectionFilters:
                 "target": {"linux": {"jobs": ["g"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "linux")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "linux")
+        sel_jobs, sel_groups = cfg.selected_jobs_and_groups(target)
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
 
@@ -2216,14 +2207,14 @@ class TestSelectionFilters:
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
-        target = crony.resolve_target(cfg, "alpha", "darwin")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("alpha", "darwin")
+        sel_jobs, sel_groups = cfg.selected_jobs_and_groups(target)
         assert "g" in sel_groups
         assert "a" in sel_jobs
         # On a different host: group filtered, child not reached.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "beta")
-        target = crony.resolve_target(cfg, "beta", "darwin")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("beta", "darwin")
+        sel_jobs, sel_groups = cfg.selected_jobs_and_groups(target)
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
 
@@ -2241,13 +2232,13 @@ class TestSelectionFilters:
         )
         # On a non-listed host: selected.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
-        target = crony.resolve_target(cfg, "alpha", "darwin")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("alpha", "darwin")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" in sel_jobs
         # On the listed (denied) host: filtered out.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "squee")
-        target = crony.resolve_target(cfg, "squee", "darwin")
-        sel_jobs, _ = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("squee", "darwin")
+        sel_jobs, _ = cfg.selected_jobs_and_groups(target)
         assert "a" not in sel_jobs
 
     def test_group_hosts_filter_negated(self, monkeypatch: Any) -> None:
@@ -2269,14 +2260,14 @@ class TestSelectionFilters:
         )
         # On a non-denied host: group + child selected.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "alpha")
-        target = crony.resolve_target(cfg, "alpha", "darwin")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("alpha", "darwin")
+        sel_jobs, sel_groups = cfg.selected_jobs_and_groups(target)
         assert "g" in sel_groups
         assert "a" in sel_jobs
         # On the denied host: group filtered, child not reached.
         monkeypatch.setattr(crony_platform, "current_host", lambda: "squee")
-        target = crony.resolve_target(cfg, "squee", "darwin")
-        sel_jobs, sel_groups = crony.selected_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("squee", "darwin")
+        sel_jobs, sel_groups = cfg.selected_jobs_and_groups(target)
         assert "g" not in sel_groups
         assert "a" not in sel_jobs
 
@@ -2300,9 +2291,9 @@ class TestSelectionFilters:
                 "target": {"linux": {"jobs": ["g"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "linux")
-        _sel_jobs, sel_groups, masked = (
-            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "linux")
+        _sel_jobs, sel_groups, masked = cfg.selected_and_masked_jobs_and_groups(
+            target
         )
         assert "g" not in sel_groups
         assert masked.get("g") == "empty"
@@ -2327,9 +2318,9 @@ class TestSelectionFilters:
                 "target": {"linux": {"jobs": ["p"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "linux")
-        _sel_jobs, sel_groups, masked = (
-            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "linux")
+        _sel_jobs, sel_groups, masked = cfg.selected_and_masked_jobs_and_groups(
+            target
         )
         assert "g" not in sel_groups
         assert "p" not in sel_groups
@@ -2356,9 +2347,9 @@ class TestSelectionFilters:
                 "target": {"linux": {"jobs": ["g"]}},
             }
         )
-        target = crony.resolve_target(cfg, "h", "linux")
-        sel_jobs, sel_groups, masked = (
-            crony.selected_and_masked_jobs_and_groups(cfg, target)
+        target = cfg.resolve_target("h", "linux")
+        sel_jobs, sel_groups, masked = cfg.selected_and_masked_jobs_and_groups(
+            target
         )
         assert "g" in sel_groups
         assert "a" in sel_jobs
@@ -2477,7 +2468,7 @@ class TestInit:
 
         Extract section headers (`# [foo]`) and simple key = value
         lines (`# foo = ...`), strip the leading `# `, and feed the
-        result to parse_config. Prose comments, dividers, and
+        result to from_raw. Prose comments, dividers, and
         double-commented variants (`# # foo`) don't match the
         strict patterns and are skipped.
         """
@@ -2922,7 +2913,7 @@ class _RunnerHarness:
                 if isinstance(body, dict) and isinstance(body.get("uuid"), str):
                     self._uuid_pins[(section, short)] = body["uuid"]
         self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
-        cfg = parse_config(full)
+        cfg = TomlBundleConfig.from_raw(full)
         self._last_cfg = cfg
         return cfg
 
@@ -3015,7 +3006,6 @@ class TestPathFieldExpansion:
         )
         snap = crony._resolve_job_snapshot(
             crony.TomlBundleConfig(),
-            None,
             job,
             EntityName.from_str("default.j"),
         )
@@ -3045,7 +3035,6 @@ class TestPathFieldExpansion:
         )
         snap = crony._resolve_job_snapshot(
             crony.TomlBundleConfig(),
-            None,
             job,
             EntityName.from_str("default.j"),
         )
@@ -4128,8 +4117,8 @@ class TestRunGroupInteractive:
             },
             default_target_jobs=["g"],
         )
-        target = crony.resolve_target(cfg, "test-host", "darwin")
-        budget = crony.resolved_group_timeout_sec(cfg, target, "g")
+        target = cfg.resolve_target("test-host", "darwin")
+        budget = cfg.resolved_group_timeout_sec(target, "g")
         # Only the non-interactive child contributes:
         # 1.05 * 100 == 105.
         assert budget == 105
@@ -4153,9 +4142,9 @@ class TestRunGroupInteractive:
             },
             default_target_jobs=["g"],
         )
-        target = crony.resolve_target(cfg, "test-host", "darwin")
+        target = cfg.resolve_target("test-host", "darwin")
         # An uncapped child makes the whole group uncapped (0 = no cap).
-        assert crony.resolved_group_timeout_sec(cfg, target, "g") == 0
+        assert cfg.resolved_group_timeout_sec(target, "g") == 0
 
     def test_group_budget_zero_propagates_through_subgroup(
         self, tmp_path: Path, monkeypatch: Any
@@ -4173,10 +4162,10 @@ class TestRunGroupInteractive:
             },
             default_target_jobs=["root"],
         )
-        target = crony.resolve_target(cfg, "test-host", "darwin")
+        target = cfg.resolve_target("test-host", "darwin")
         # 0 propagates up the group chain.
-        assert crony.resolved_group_timeout_sec(cfg, target, "leaf") == 0
-        assert crony.resolved_group_timeout_sec(cfg, target, "root") == 0
+        assert cfg.resolved_group_timeout_sec(target, "leaf") == 0
+        assert cfg.resolved_group_timeout_sec(target, "root") == 0
 
     def test_dispatched_does_not_poison_rollup(self) -> None:
         # `dispatched` has precedence 0 so it ties with ok / gated
@@ -4858,7 +4847,7 @@ class TestDialogPopupNotify:
         # No block, no other defined channels: the built-in name is
         # still a valid notify_channels entry.
         assert (
-            _validate_notify_channels(
+            validate_notify_channels(
                 ["dialog-popup"], set(), "[defaults]", is_default=False
             )
             is None
@@ -4892,7 +4881,7 @@ class TestDialogPopupNotify:
 
     def test_explicit_block_rejects_extra_keys(self) -> None:
         with pytest.raises(crony.ConfigError, match="unknown key"):
-            _parse_notify_channel(
+            NotifyChannel.from_raw(
                 "dialog-popup",
                 {"transport": "dialog-popup", "headers": {"X": "y"}},
             )
@@ -5457,18 +5446,14 @@ class TestJobPriority:
 
     def test_snapshot_carries_priority(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        target = crony.resolve_target(cfg, "h", "darwin")
         snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], EntityName.from_str("default.a")
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority is PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
-        target = crony.resolve_target(cfg, "h", "darwin")
-        snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
-        )
+        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
         assert snap.priority == PriorityClass.HIGH
 
     def test_job_overrides_default(self) -> None:
@@ -5478,10 +5463,7 @@ class TestJobPriority:
                 "job": {"a": _job(priority="low")},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
-        )
+        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
         assert snap.priority == PriorityClass.LOW
 
     def test_apply_writes_priority_into_plist(
@@ -5572,9 +5554,8 @@ class TestKeepAwake:
 
     def _snap(self, keep_awake: bool) -> Any:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
-        target = crony.resolve_target(cfg, "h", "darwin")
         return crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], EntityName.from_str("default.a")
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 
     def test_parse_true(self) -> None:
@@ -5589,10 +5570,7 @@ class TestKeepAwake:
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"keep_awake": True}, "job": {"a": _job()}})
-        target = crony.resolve_target(cfg, "h", "darwin")
-        snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
-        )
+        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
         assert snap.keep_awake is True
 
     def test_job_false_overrides_true_default(self) -> None:
@@ -5602,10 +5580,7 @@ class TestKeepAwake:
                 "job": {"a": _job(keep_awake=False)},
             }
         )
-        target = crony.resolve_target(cfg, "h", "darwin")
-        snap = crony._resolve_job_snapshot(
-            cfg, target, cfg.jobs["a"], "default.a"
-        )
+        snap = crony._resolve_job_snapshot(cfg, cfg.jobs["a"], "default.a")
         assert snap.keep_awake is False
 
     def test_parse_non_bool_rejected(self) -> None:
@@ -6066,7 +6041,7 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         crony.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm_cfg = bundles.by_name("borgadm").config
         k_uuid = borgadm_cfg.jobs["k"].uuid
         assert (h.state / "borgadm" / k_uuid / "snapshot.json").exists()
@@ -6099,7 +6074,7 @@ class TestApplyFullSync:
         # The full-sync refusal is for the unscoped (bundle=None)
         # sweep, whose orphan removal spans the broken bundle. A
         # `--bundle` sweep is scoped to that one bundle (confirmed
-        # parsed by require_known_bundle), so a broken *sibling*
+        # parsed by require_known), so a broken *sibling*
         # bundle is out of scope and must not block it.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
@@ -6441,7 +6416,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -6478,7 +6453,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -6574,7 +6549,7 @@ class TestDestroy:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("old_b", bundle="borgadm")
@@ -8625,7 +8600,7 @@ class TestStatusReport:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -8821,7 +8796,7 @@ class TestStatusReport:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
         h.apply("k", bundle="borgadm")
@@ -9975,7 +9950,7 @@ class TestPerEntityConfigErrors:
         import logging
 
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         # `path: [job.bad]: unknown key(s) ['surprise']`
         assert any(
             "[job.bad]" in r.message and "unknown key" in r.message
@@ -10849,7 +10824,7 @@ class TestLogsByEntityRef:
 
 
 class TestBundleLoading:
-    """`load_all_bundles` discovers config.toml + config/*.toml,
+    """`TomlConfig.load_all` discovers config.toml + config/*.toml,
     isolates per-bundle failures, and rejects collisions."""
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> tuple[Path, Path]:
@@ -10871,7 +10846,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         assert "j" in bundles.bundles[0].config.jobs
 
@@ -10891,7 +10866,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["borgadm", "default"]
         assert bundles.by_name("borgadm") is not None
@@ -10909,18 +10884,18 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["private"]
 
     def test_no_configs_at_all_returns_empty(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `load_all_bundles` tolerates the no-config case so the
+        # `TomlConfig.load_all` tolerates the no-config case so the
         # runner / destroy / status keep working off on-disk
         # state alone. `apply` is the only caller that enforces
         # "must have a config" -- it needs pending data.
         self._setup(tmp_path, monkeypatch)
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         assert bundles.bundles == []
         assert bundles.errored_bundles == {}
 
@@ -10936,7 +10911,7 @@ class TestBundleLoading:
                 ),
                 encoding="utf-8",
             )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         # default first, then config/*.toml lex-sorted
         assert [b.name for b in bundles.bundles] == [
             "default",
@@ -10967,7 +10942,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["default", "ok"]
         # The broken bundle's path is in errored_bundles and in
@@ -10980,13 +10955,13 @@ class TestBundleLoading:
     ) -> None:
         # The runner is config-independent so a fully-broken
         # config shouldn't take down `crony status` / `destroy` /
-        # `logs`; load_all_bundles returns an empty TomlConfig
+        # `logs`; TomlConfig.load_all returns an empty TomlConfig
         # with the parse failures captured.
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text("this is not [valid toml", encoding="utf-8")
         (dropin / "alpha.toml").write_text("also broken (", encoding="utf-8")
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         assert bundles.bundles == []
         assert len(bundles.errored_bundles) == 2
 
@@ -11007,7 +10982,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         config = bundles.by_name("default").config
         assert "good" in config.jobs
@@ -11033,7 +11008,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         config = bundles.by_name("default").config
         assert "darwin" in config.errored_platform_targets
@@ -11062,7 +11037,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
         assert any(
@@ -11089,7 +11064,7 @@ class TestBundleLoading:
             encoding="utf-8",
         )
         with caplog.at_level(logging.ERROR, logger=crony.logger.name):
-            bundles = crony.load_all_bundles()
+            bundles = crony.TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
         # The colliding dropin is referenced in the error.
@@ -11190,13 +11165,9 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         # Build a snapshot that matches what apply would write.
-        bundles = crony.load_all_bundles()
-        target = crony.resolve_target(
-            bundles.bundles[0].config, "test-host", "darwin"
-        )
+        bundles = crony.TomlConfig.load_all()
         snap = crony._resolve_job_snapshot(
             bundles.bundles[0].config,
-            target,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
         )
@@ -11220,13 +11191,9 @@ class TestLoadConfig:
             '[target.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
-        target = crony.resolve_target(
-            bundles.bundles[0].config, "test-host", "darwin"
-        )
+        bundles = crony.TomlConfig.load_all()
         snap = crony._resolve_job_snapshot(
             bundles.bundles[0].config,
-            target,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
         )
@@ -11997,7 +11964,7 @@ class TestBundleNamespacing:
             ),
             encoding="utf-8",
         )
-        bundles = crony.load_all_bundles()
+        bundles = crony.TomlConfig.load_all()
         # Both bundles loaded successfully despite identical short.
         assert {b.name for b in bundles.bundles} == {"default", "borgadm"}
         # Full names are distinct.
