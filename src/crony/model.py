@@ -374,6 +374,83 @@ def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
 
 
 @dataclass
+class NotificationResult:
+    """One channel's outcome inside a JobRunResult.notifications entry."""
+
+    sent: bool
+    error: str | None = None
+    error_class: str | None = None
+
+
+@dataclass
+class JobRunResult:
+    """Recorded as last-run.json for each completed job run.
+
+    Identity isn't repeated in the record: the file already lives at
+    `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
+    `snapshot.json` in the same dir carries the full namespaced name
+    of the entity it was applied as.
+    """
+
+    host: str
+    platform: str
+    started_at: str
+    ended_at: str
+    duration_sec: float
+    exit_class: str
+    exit_code: int | None
+    signal: int | None
+    # "none" if no gate ran (no config, or --skip-gate), "passed" on
+    # exit 0, "failed" on any non-zero or timeout. The numeric exit
+    # code stays in run.log for diagnosis; this field is the binary
+    # answer "did the gate let the job run?".
+    gate: str
+    log_path: str
+    log_bytes_this_run: int
+    # Per-channel outcomes. Keys are channel names that were
+    # attempted (e.g. "email", "ntfy"); values are NotificationResult
+    # records. Empty dict means no external dispatch was attempted
+    # (notify_channels resolved to []).
+    notifications: dict[str, NotificationResult] = field(default_factory=dict)
+
+
+@dataclass
+class GroupChildResult:
+    """One child's outcome inside a group run."""
+
+    name: str
+    exit_class: str
+    exit_code: int
+
+
+@dataclass
+class GroupRunResult:
+    """Recorded as last-run.json for each completed group run.
+
+    Identity isn't repeated in the record: the file already lives at
+    `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
+    `snapshot.json` in the same dir carries the full namespaced
+    name of the group it was applied as.
+
+    `exit_class` is a rollup from `jobs_run`: timeout outranks
+    fail / signal (which are equally severe), and ok / gated tie
+    at the bottom (gating is "intentionally not run", not a
+    group-level outcome). The status / list readers
+    consult this single field for the group's LAST axis instead
+    of re-deriving the rollup on every query.
+    """
+
+    host: str
+    platform: str
+    started_at: str
+    ended_at: str
+    duration_sec: float
+    exit_class: str
+    log_path: str
+    jobs_run: list[GroupChildResult]
+
+
+@dataclass
 class LastRun:
     """Display-side view of `last-run.json`. Captures the fields
     status consumes regardless of whether the underlying
