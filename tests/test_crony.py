@@ -26,7 +26,7 @@ from collections.abc import Callable
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
@@ -46,7 +46,9 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from crony import cli as crony_cli  # noqa: E402
 from crony import commands as crony_commands  # noqa: E402
+from crony import config as crony_config  # noqa: E402
 from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -67,6 +69,8 @@ from crony.config import (  # noqa: E402
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
+    CronyError,
+    ExitCode,
     JobTimeoutError,
     LockBusyError,
     PreconditionError,
@@ -224,7 +228,7 @@ class TestHelpOutput:
     """`crony --help` surfaces the design block appended to the epilog."""
 
     def test_help_includes_design_block(self) -> None:
-        parser = crony.build_parser()
+        parser = crony_cli.build_parser()
         text = parser.format_help()
         # Design block documents the default status columns.
         assert "CONFIG    synced" in text
@@ -241,7 +245,7 @@ class TestHelpOutput:
 class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
 
-    PARSER_FUNC = staticmethod(crony.build_parser)
+    PARSER_FUNC = staticmethod(crony_cli.build_parser)
     CASES = [
         (["status", "--bogus"], "status"),
         (["logs", "--bogus"], "logs"),
@@ -252,29 +256,29 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
 class TestCmdCallbacks(CmdCallbacksBase):
     """Test command callback dispatch table."""
 
-    CALLBACKS = crony.COMMAND_CALLBACKS
-    PARSER_FUNC = crony.build_parser
-    CLI_FUNC = staticmethod(crony.cli)
-    MODULE = crony
-    EXIT_CODE_USAGE = crony.ExitCode.USAGE
+    CALLBACKS = crony_cli.COMMAND_CALLBACKS
+    PARSER_FUNC = crony_cli.build_parser
+    CLI_FUNC = staticmethod(crony_cli.cli)
+    MODULE: ClassVar[Any] = crony_cli
+    EXIT_CODE_USAGE = ExitCode.USAGE
     TEST_SUBCOMMAND = "status"
     EXCEPTION_EXIT_CODE_MAP = [
-        (UsageError("t"), crony.ExitCode.USAGE),
-        (ConfigError("t"), crony.ExitCode.CONFIG),
+        (UsageError("t"), ExitCode.USAGE),
+        (ConfigError("t"), ExitCode.CONFIG),
         (
             SubprocessError(1, ["bogus"]),
-            crony.ExitCode.SUBPROCESS,
+            ExitCode.SUBPROCESS,
         ),
-        (LockBusyError("t"), crony.ExitCode.LOCK_BUSY),
+        (LockBusyError("t"), ExitCode.LOCK_BUSY),
         (
             PreconditionError("t"),
-            crony.ExitCode.PRECONDITION,
+            ExitCode.PRECONDITION,
         ),
         (
             JobTimeoutError("t"),
-            crony.ExitCode.TIMEOUT,
+            ExitCode.TIMEOUT,
         ),
-        (RuntimeError("t"), crony.ExitCode.ERROR),
+        (RuntimeError("t"), ExitCode.ERROR),
     ]
 
 
@@ -292,12 +296,12 @@ class TestConfigSubcommandDispatch:
         mock_cb = MagicMock()
         with (
             patch.dict(
-                crony.COMMAND_CALLBACKS,
+                crony_cli.COMMAND_CALLBACKS,
                 {"config init": mock_cb},
             ),
             patch("sys.argv", ["prog", "config", "init", "--force"]),
         ):
-            result = crony.cli()
+            result = crony_cli.cli()
         assert result == 0
         mock_cb.assert_called_once_with(force=True, bundle=None)
 
@@ -305,12 +309,12 @@ class TestConfigSubcommandDispatch:
         mock_cb = MagicMock()
         with (
             patch.dict(
-                crony.COMMAND_CALLBACKS,
+                crony_cli.COMMAND_CALLBACKS,
                 {"config validate": mock_cb},
             ),
             patch("sys.argv", ["prog", "config", "validate", "-b", "foo"]),
         ):
-            result = crony.cli()
+            result = crony_cli.cli()
         assert result == 0
         mock_cb.assert_called_once_with(bundle="foo", file=None)
 
@@ -321,8 +325,8 @@ class TestConfigSubcommandDispatch:
             patch("sys.argv", ["prog", "config"]),
             pytest.raises(SystemExit) as exc_info,
         ):
-            crony.cli()
-        assert exc_info.value.code == crony.ExitCode.USAGE
+            crony_cli.cli()
+        assert exc_info.value.code == ExitCode.USAGE
         out = capsys.readouterr().out
         # The subcommand's full help (usage line + the action list),
         # not just a usage stub.
@@ -334,7 +338,7 @@ class TestConfigSubcommandDispatch:
             patch("sys.argv", ["prog", "config", "bogus"]),
             pytest.raises(SystemExit) as exc_info,
         ):
-            crony.cli()
+            crony_cli.cli()
         assert exc_info.value.code != 0
         err = capsys.readouterr().err
         assert "bogus" in err
@@ -3274,7 +3278,7 @@ class TestRunJobBasics:
             )
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
-        assert rec["exit_code"] == int(crony.ExitCode.PRECONDITION)
+        assert rec["exit_code"] == int(ExitCode.PRECONDITION)
         assert "schema 999" in rec["reason"]
         # run.log gained the canceled entry too.
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
@@ -3647,7 +3651,7 @@ class TestRunJobLockContention:
         finally:
             _fcntl.flock(held, _fcntl.LOCK_UN)
             held.close()
-        assert rc == int(crony.ExitCode.LOCK_BUSY)
+        assert rc == int(ExitCode.LOCK_BUSY)
         # No last-run.json on contention; the previous holder owns
         # that record.
         assert not (sd / "last-run.json").exists()
@@ -4001,7 +4005,7 @@ class TestRunGroup:
         missing_rec = rec["jobs_run"][0]
         assert missing_rec["name"] == h.full("missing")
         assert missing_rec["exit_class"] == "fail"
-        assert missing_rec["exit_code"] == int(crony.ExitCode.PRECONDITION)
+        assert missing_rec["exit_code"] == int(ExitCode.PRECONDITION)
         # Sibling still ran.
         assert rec["jobs_run"][1]["name"] == h.full("ok")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
@@ -4051,7 +4055,7 @@ class TestRunGroup:
         synthetic = rec["jobs_run"][1]
         assert synthetic["name"] == f"default:{gone_uuid}"
         assert synthetic["exit_class"] == "fail"
-        assert synthetic["exit_code"] == int(crony.ExitCode.PRECONDITION)
+        assert synthetic["exit_code"] == int(ExitCode.PRECONDITION)
         assert rec["exit_class"] == "fail"
 
 
@@ -5205,7 +5209,7 @@ class TestNotifyTestSubcommand:
             )
 
         monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _raise)
-        with pytest.raises(crony.CronyError) as exc:
+        with pytest.raises(CronyError) as exc:
             crony_commands.do_notify_test(channel="ntfy", bundle=None)
         # Distinguishing from ConfigError matters: CronyError exits
         # with ERROR (4), ConfigError with CONFIG (3).
@@ -5302,7 +5306,7 @@ class TestNotifyTestSubcommand:
             )
 
         monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _raise)
-        with pytest.raises(crony.CronyError, match="notify-test failed") as exc:
+        with pytest.raises(CronyError, match="notify-test failed") as exc:
             crony_commands.do_notify_test(channel=None, bundle="borgadm")
         assert calls, "inherited ntfy channel was not attempted"
         # The failure detail attributes the channel to where it is
@@ -6409,7 +6413,7 @@ class TestDestroy:
                     orphans=False,
                 )
             assert "run in progress; will not destroy" in str(exc.value)
-            assert exc.value.exit_code == crony.ExitCode.LOCK_BUSY
+            assert exc.value.exit_code == ExitCode.LOCK_BUSY
         finally:
             _fcntl.flock(held, _fcntl.LOCK_UN)
             held.close()
@@ -6802,7 +6806,7 @@ class TestBrokenPipeHandler:
         # Create the handler attached to a regular file we can verify.
         log_path = tmp_path / "out"
         stream = open(log_path, "w")
-        handler = crony.BrokenPipeAwareStreamHandler(stream)
+        handler = crony_cli.BrokenPipeAwareStreamHandler(stream)
         # Synthesize a "BrokenPipeError caught while emitting" by
         # stuffing one into sys.exc_info via a dummy raise.
         record = logging.LogRecord(
@@ -6846,7 +6850,7 @@ class TestSchedulerVerifyEmission:
         monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: False)
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_validate(bundle=None, file=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "linger is disabled" in out
         assert "enable-linger" in out
@@ -7212,7 +7216,7 @@ class TestEnableDisable:
             crony_commands.do_trigger(
                 jobs=["j"], wait=True, trigger_timeout=None, bundle=None
             )
-        assert exc.value.code == int(crony.ExitCode.TIMEOUT)
+        assert exc.value.code == int(ExitCode.TIMEOUT)
 
     def test_trigger_wait_uncapped_job_passes_inf(
         self, tmp_path: Path, monkeypatch: Any
@@ -9222,7 +9226,7 @@ class TestStatusReport:
         assert not header.rstrip().endswith("UNIT")
 
     def test_status_help_epilog_lists_columns(self) -> None:
-        parser = crony.build_parser()
+        parser = crony_cli.build_parser()
         # Locate the status subparser and pull its epilog text.
         subparsers_action = next(
             a
@@ -9616,7 +9620,7 @@ class TestValidate:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_validate(bundle=None, file=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "channel 'email'" in out
         assert "SMTP password" in out
@@ -9640,7 +9644,7 @@ class TestValidate:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_validate(bundle=None, file=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "channel 'ntfy'" in out
         assert "never referenced" in out
@@ -9690,7 +9694,7 @@ class TestValidate:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_validate(bundle=None, file=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "undefined name" in out
         assert "errored=1" in out
@@ -9708,7 +9712,7 @@ class TestValidate:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_validate(bundle=None, file=None)
-        assert exc.value.code == int(crony.ExitCode.WARNING)
+        assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
         assert "[target.darwin]" in out
         assert "undefined name" in out
@@ -10019,7 +10023,7 @@ class TestPerEntityConfigErrors:
         )
         import logging
 
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         # `path: [job.bad]: unknown key(s) ['surprise']`
         assert any(
@@ -11027,7 +11031,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         names = sorted(b.name for b in bundles.bundles)
         assert names == ["default", "ok"]
@@ -11046,7 +11050,7 @@ class TestBundleLoading:
         cfg_file, dropin = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text("this is not [valid toml", encoding="utf-8")
         (dropin / "alpha.toml").write_text("also broken (", encoding="utf-8")
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         assert bundles.bundles == []
         assert len(bundles.errored_bundles) == 2
@@ -11067,7 +11071,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         default = bundles.by_name("default")
@@ -11095,7 +11099,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         assert [b.name for b in bundles.bundles] == ["default"]
         default = bundles.by_name("default")
@@ -11126,7 +11130,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
@@ -11153,7 +11157,7 @@ class TestBundleLoading:
             ),
             encoding="utf-8",
         )
-        with caplog.at_level(logging.ERROR, logger=crony.logger.name):
+        with caplog.at_level(logging.ERROR, logger=crony_config.logger.name):
             bundles = TomlConfig.load_all()
         names = [b.name for b in bundles.bundles]
         assert names == ["default"]
@@ -12746,7 +12750,7 @@ class TestSnapshotLifecycle:
         # nor in the subcommand description block. Free-form prose
         # in the epilog can still mention "run" as a verb -- this
         # test scopes to the structural surfaces only.
-        parser = crony.build_parser()
+        parser = crony_cli.build_parser()
         usage_line = parser.format_usage()
         assert "trigger" not in usage_line  # uses metavar, not choices
         assert "run" not in usage_line, (
