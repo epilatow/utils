@@ -46,6 +46,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from crony import commands as crony_commands  # noqa: E402
 from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -13753,7 +13754,7 @@ class TestStatusColor:
 
     def _force_color(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
-        monkeypatch.setattr(crony, "_color_supported", lambda: True)
+        monkeypatch.setattr(crony_commands, "_color_supported", lambda: True)
 
     def test_stale_and_divergence_are_yellow_missing_is_red(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
