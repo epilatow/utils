@@ -72,7 +72,7 @@ class UnitNotInstalledError(PreconditionError):
     """A dispatcher was asked to fire a unit that isn't installed
     on this host.
 
-    Surfaces from `_trigger_unit` when the platform unit file the
+    Surfaces from `trigger_unit` when the platform unit file the
     dispatcher would reach for doesn't exist. The typical cause
     is a parent group whose snapshot still references a child
     that was destroyed (or never applied here): `crony apply`

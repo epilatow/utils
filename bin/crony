@@ -65,15 +65,12 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     LockBusyError,
     PreconditionError,
-    TriggerStartTimeout,  # noqa: F401  re-exported for tests
-    UnitNotInstalledError,  # noqa: F401  re-exported for tests
     UsageError,
 )
 from crony.model import (  # noqa: E402
     SNAPSHOT_SCHEMA,  # noqa: F401  re-exported for tests
     Config,
     Graph,
-    GroupChildResult,  # noqa: F401  re-exported for tests
     Job,
     JobGroup,
     JobRunResult,
@@ -91,22 +88,9 @@ from crony.platform import (  # noqa: E402
     get_scheduler,  # noqa: F401  re-exported for tests
 )
 from crony.runner import (  # noqa: E402
-    ExitOutcome,  # noqa: F401  re-exported for tests
-    _command_argv,  # noqa: F401  re-exported for tests
-    _delay_or_bypass,  # noqa: F401  re-exported for tests
-    _gate_argv,  # noqa: F401  re-exported for tests
-    _keep_awake_argv,  # noqa: F401  re-exported for tests
-    _rollup_group_exit_class,  # noqa: F401  re-exported for tests
-    _runtime_env,  # noqa: F401  re-exported for tests
-    _show_interactive_dialog,  # noqa: F401  re-exported for tests
-    _timeout_to_wait,
-    _trigger_exit_code,
-    _trigger_unit,  # noqa: F401  re-exported for tests
-    _trigger_unit_sync,  # noqa: F401  re-exported for tests
-    _wait_for_user_active,  # noqa: F401  re-exported for tests
     do_run,
-    run_group,  # noqa: F401  re-exported for tests
-    run_job,  # noqa: F401  re-exported for tests
+    timeout_to_wait,
+    trigger_exit_code,
 )
 from crony.runtime import (  # noqa: E402
     acquire_lock,
@@ -1884,7 +1868,7 @@ def do_trigger(
         for full, ref, unit_name in targets:
             # Fire the unit under its installed (current) name; the
             # user-trigger flag lands in the uuid-keyed state dir.
-            crony.runner._trigger_unit(
+            crony.runner.trigger_unit(
                 unit_name,
                 triggered_by_user=True,
                 state_dir=entity_state_dir(ref),
@@ -1916,11 +1900,11 @@ def do_trigger(
             )
         b_target = b.config.resolve_target()
         if short in b.config.jobs:
-            timeout = _timeout_to_wait(
+            timeout = timeout_to_wait(
                 b.config.resolved_job_timeout_sec(b.config.jobs[short])
             )
         else:
-            timeout = _timeout_to_wait(
+            timeout = timeout_to_wait(
                 b.config.resolved_group_timeout_sec(b_target, short)
             )
         tt = (
@@ -1928,7 +1912,7 @@ def do_trigger(
             if trigger_timeout is not None
             else float(b.config.defaults.trigger_timeout_sec)
         )
-        rec = crony.runner._trigger_unit_sync(
+        rec = crony.runner.trigger_unit_sync(
             unit_name,
             state_dir=entity_state_dir(ref),
             job_timeout=timeout,
@@ -1936,7 +1920,7 @@ def do_trigger(
             triggered_by_user=True,
         )
         cls = rec.get("exit_class", "ok")
-        rc = _trigger_exit_code(rec)
+        rc = trigger_exit_code(rec)
         logger.info("%s: %s (exit %s)", full, cls, rc)
         if rc and (not worst_rc or abs(rc) > abs(worst_rc)):
             worst_rc = rc

@@ -69,16 +69,16 @@ from crony.runtime import (
 from crony.unit import EntityRef
 
 
-def _timeout_to_wait(sec: int) -> float:
+def timeout_to_wait(sec: int) -> float:
     """Map a resolved timeout (0 = no cap) to the float the pid-watch
     waiters take: math.inf for no cap, else the value. Used wherever a
-    resolved/snapshot timeout feeds `_trigger_unit_sync`, so the
+    resolved/snapshot timeout feeds `trigger_unit_sync`, so the
     uncapped sentinel reaches it as inf (which it converts to a
     no-timeout wait) rather than as 0 (a near-instant wait)."""
     return math.inf if sec == 0 else float(sec)
 
 
-def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
+def rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     """Worst-of children's exit_class, with a precedence ladder.
 
     A group with no children, or one whose children are all `ok`,
@@ -122,7 +122,7 @@ def _expand_env_value(raw: str, env: dict[str, str]) -> str:
     return string.Template(raw).safe_substitute(env)
 
 
-def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
+def runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
     The command runs from the platform scheduler's unit, which hands
@@ -149,7 +149,7 @@ def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _command_argv(snap: Job) -> list[str]:
+def command_argv(snap: Job) -> list[str]:
     """argv for the job's main command, drawn from the snapshot.
 
     Snapshot fields are pre-resolved at apply time (script paths
@@ -162,7 +162,7 @@ def _command_argv(snap: Job) -> list[str]:
     return [snap.script, *snap.args]
 
 
-def _gate_argv(snap: Job) -> list[str] | None:
+def gate_argv(snap: Job) -> list[str] | None:
     """argv for the gate, or None if the snapshot has no gate."""
     if snap.gate is not None:
         return ["/bin/sh", "-c", snap.gate]
@@ -171,9 +171,7 @@ def _gate_argv(snap: Job) -> list[str] | None:
     return None
 
 
-def _keep_awake_argv(
-    argv: list[str], snap: Job
-) -> tuple[list[str], str | None]:
+def keep_awake_argv(argv: list[str], snap: Job) -> tuple[list[str], str | None]:
     """Wrap `argv` so the machine stays awake while the command runs.
 
     Returns (argv, note). When `snap.keep_awake` is set, delegates to
@@ -201,7 +199,7 @@ class ExitOutcome(NamedTuple):
     signal: int | None
 
 
-def _exec_with_timeout(
+def exec_with_timeout(
     argv: list[str],
     *,
     env: dict[str, str],
@@ -236,14 +234,14 @@ def _exec_with_timeout(
     return ExitOutcome(rc=rc, signal=None)
 
 
-def _wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
+def wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
     """Block until `pid` exits via the host's kernel-level pid-exit
     notification; delegates to the HostPlatform backend. `timeout=None`
     waits indefinitely."""
     return crony.runtime.host().wait_for_pid_exit(pid, timeout)
 
 
-def _wait_for_user_active(
+def wait_for_user_active(
     required_sec: int,
     *,
     bypass_check: Callable[[], bool] | None = None,
@@ -285,7 +283,7 @@ def _wait_for_user_active(
         time.sleep(poll_sec)
 
 
-def _delay_or_bypass(
+def delay_or_bypass(
     delay_sec: int,
     *,
     bypass_check: Callable[[], bool],
@@ -311,7 +309,7 @@ def _delay_or_bypass(
 _INTERACTIVE_BUTTONS = ["Cancel Job", "Delay Job", "Run Job"]
 
 
-def _show_interactive_dialog(job_name: str, message: str) -> str:
+def show_interactive_dialog(job_name: str, message: str) -> str:
     """Pop the three-button approval dialog. Returns one of
     'run' / 'delay' / 'cancel'.
 
@@ -331,7 +329,7 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     return "cancel"
 
 
-def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
+def interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     """Run the wait/prompt/delay loop for an interactive job.
 
     Returns 'run' or 'cancel'. Logs each phase transition into
@@ -361,7 +359,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
                 f"input\n"
             ).encode()
         )
-        if not _wait_for_user_active(
+        if not wait_for_user_active(
             snap.interactive_active_sec, bypass_check=_bypass
         ):
             log_file.write(
@@ -369,7 +367,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
             )
             return "run"
         log_file.write(b"interactive: prompting user\n")
-        choice = _show_interactive_dialog(
+        choice = show_interactive_dialog(
             str(snap.name),
             f"crony wants to run '{snap.name}'. Now?",
         )
@@ -380,7 +378,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
             f"interactive: delaying for "
             f"{snap.interactive_delay_sec}s\n".encode()
         )
-        if not _delay_or_bypass(
+        if not delay_or_bypass(
             snap.interactive_delay_sec, bypass_check=_bypass
         ):
             log_file.write(
@@ -423,8 +421,8 @@ def run_job(
     notify_channels, notify_defaults = resolve_notify_at_runtime(full_name)
     job_timeout_sec = snap.job_timeout_sec
     # snap.env stores the user-written env literally; overlay it on
-    # the inherited env at fire time (see _runtime_env).
-    env = _runtime_env(snap.env)
+    # the inherited env at fire time (see runtime_env).
+    env = runtime_env(snap.env)
     started = time.time()
     started_iso = now_iso()
     host = crony.platform.current_host()
@@ -451,13 +449,13 @@ def run_job(
                 log_file.write(header)
 
                 gate: str = "none"
-                gate_argv = _gate_argv(snap)
-                if gate_argv is not None and not skip_gate:
-                    log_file.write(f"gate: {shlex.join(gate_argv)}\n".encode())
+                gate_cmd = gate_argv(snap)
+                if gate_cmd is not None and not skip_gate:
+                    log_file.write(f"gate: {shlex.join(gate_cmd)}\n".encode())
                     gate_rc: int
                     try:
                         gate_proc = subprocess.run(
-                            gate_argv,
+                            gate_cmd,
                             stdout=log_file,
                             stderr=subprocess.STDOUT,
                             env=env,
@@ -503,9 +501,7 @@ def run_job(
                         pending_flag = sd / "pending.flag"
                         pending_flag.write_bytes(b"")
                         try:
-                            choice = _interactive_wait_and_prompt(
-                                snap, log_file
-                            )
+                            choice = interactive_wait_and_prompt(snap, log_file)
                         finally:
                             pending_flag.unlink(missing_ok=True)
                         if choice == "cancel":
@@ -530,13 +526,13 @@ def run_job(
                             )
                             return 0
 
-                argv = _command_argv(snap)
-                argv, keep_awake_note = _keep_awake_argv(argv, snap)
+                argv = command_argv(snap)
+                argv, keep_awake_note = keep_awake_argv(argv, snap)
                 if keep_awake_note is not None:
                     log_file.write(f"{keep_awake_note}\n".encode())
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
                 try:
-                    rc, sig = _exec_with_timeout(
+                    rc, sig = exec_with_timeout(
                         argv,
                         env=env,
                         job_timeout_sec=job_timeout_sec or None,
@@ -653,10 +649,10 @@ def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     except PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
     raw = cs.job_timeout_sec if isinstance(cs, Job) else cs.group_budget_sec
-    return _timeout_to_wait(raw)
+    return timeout_to_wait(raw)
 
 
-def _child_is_interactive(child_ref: EntityRef) -> bool:
+def child_is_interactive(child_ref: EntityRef) -> bool:
     """True iff the child is a job whose pinned snapshot has
     `interactive = True`. Groups and non-interactive jobs return
     False. A missing snapshot returns False so the existing
@@ -682,7 +678,7 @@ def run_group(
 
     Fires each child through the platform scheduler in order,
     waiting for completion via kernel-level pid-exit notification
-    (`_trigger_unit_sync`). The group's `run.log` becomes a
+    (`trigger_unit_sync`). The group's `run.log` becomes a
     sequencer trace (fired/finished lines per child); child
     stdout/stderr stays in each child's own log. The group never
     sends notifications; each child's own runner handles notify
@@ -755,7 +751,7 @@ def run_group(
                 )
                 for child_ref, child_full_name in resolved_pairs:
                     child_sd = entity_state_dir(child_ref)
-                    if _child_is_interactive(child_ref):
+                    if child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
                         # the user-active wait + dialog independently;
@@ -768,7 +764,7 @@ def run_group(
                             ).encode()
                         )
                         try:
-                            _trigger_unit(child_full_name)
+                            trigger_unit(child_full_name)
                             children.append(
                                 GroupChildResult(
                                     name=child_full_name,
@@ -818,7 +814,7 @@ def run_group(
                         ).encode()
                     )
                     try:
-                        rec = _trigger_unit_sync(
+                        rec = trigger_unit_sync(
                             child_full_name,
                             state_dir=child_sd,
                             job_timeout=child_wait,
@@ -845,7 +841,7 @@ def run_group(
                         )
                         continue
                     cls = rec.get("exit_class", "fail")
-                    rc = _trigger_exit_code(rec)
+                    rc = trigger_exit_code(rec)
                     log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
                     children.append(
                         GroupChildResult(
@@ -883,7 +879,7 @@ def run_group(
                     started_at=started_iso,
                     ended_at=now_iso(),
                     duration_sec=time.time() - started,
-                    exit_class=_rollup_group_exit_class(children),
+                    exit_class=rollup_group_exit_class(children),
                     log_path=str(log_path),
                     jobs_run=children,
                 )
@@ -901,7 +897,7 @@ def run_group(
         return int(ExitCode.LOCK_BUSY)
 
 
-def _trigger_unit(
+def trigger_unit(
     name: str,
     platform: str | None = None,
     *,
@@ -916,7 +912,7 @@ def _trigger_unit(
     Both platforms treat "trigger an already-running unit" as a
     no-op -- the in-flight run continues and there is no fresh
     fire. Waiters that need to know the next completion's outcome
-    use `_trigger_unit_sync` instead.
+    use `trigger_unit_sync` instead.
 
     `triggered_by_user` writes a one-shot sentinel flag in the
     entity's state dir, consumed by `crony run` on startup to
@@ -925,7 +921,7 @@ def _trigger_unit(
     the flag lands in the right uuid-keyed dir; when
     `triggered_by_user` is True and `state_dir` is None the call
     raises `ValueError`. Group-dispatched fires
-    (`run_group` -> `_trigger_unit_sync` -> `_trigger_unit`) keep
+    (`run_group` -> `trigger_unit_sync` -> `trigger_unit`) keep
     the default False so a group never accidentally bypasses an
     interactive wait. Under the current validation rules groups
     can't contain interactive jobs so this is defense-in-depth,
@@ -966,7 +962,7 @@ def _trigger_unit(
             user_trigger_flag_path(state_dir).unlink(missing_ok=True)
 
 
-def _trigger_unit_sync(
+def trigger_unit_sync(
     full_name: str,
     *,
     state_dir: Path,
@@ -1019,7 +1015,7 @@ def _trigger_unit_sync(
     pid_path = state_dir / "run.pid"
     last_run_path = state_dir / "last-run.json"
 
-    _trigger_unit(
+    trigger_unit(
         full_name,
         triggered_by_user=triggered_by_user,
         state_dir=state_dir if triggered_by_user else None,
@@ -1063,7 +1059,7 @@ def _trigger_unit_sync(
                 if math.isinf(job_timeout)
                 else max(1.0, job_timeout - elapsed)
             )
-            _wait_for_pid_exit(pid, timeout=pid_wait)
+            wait_for_pid_exit(pid, timeout=pid_wait)
             continue
         # No pid and no fresh result: still in the start window.
         # Bound this state by trigger_timeout so a broken /
@@ -1076,7 +1072,7 @@ def _trigger_unit_sync(
         time.sleep(1.0)
 
 
-def _trigger_exit_code(rec: dict[str, Any]) -> int:
+def trigger_exit_code(rec: dict[str, Any]) -> int:
     """Map a last-run.json record to a process exit code.
 
     A run classified "ok" maps to 0 even when its recorded `exit_code`

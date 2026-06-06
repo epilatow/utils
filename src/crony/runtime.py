@@ -453,7 +453,7 @@ def _platform_unit_timer_path(
 
 
 def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
-    """File `_trigger_unit` fires for `name` (may not exist). Used to
+    """File `trigger_unit` fires for `name` (may not exist). Used to
     refuse early when the unit was never installed."""
     return scheduler(platform).dispatch_unit_path(name)
 

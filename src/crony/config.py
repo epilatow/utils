@@ -667,7 +667,7 @@ class TomlBundleConfig:
     def resolved_env(self, job: TomlJob) -> dict[str, str]:
         """Merge env: defaults under job (a job's own key wins).
         Targets carry no env. Values stay literal here -- `$VAR`
-        expansion happens at fire time in `_runtime_env`."""
+        expansion happens at fire time in `runtime_env`."""
         return {**self.defaults.env, **job.env}
 
     def resolved_group_timeout_sec(
@@ -683,7 +683,7 @@ class TomlBundleConfig:
         an uncapped child can't be bounded by a finite cumulative
         deadline, so the whole group goes uncapped. Used by:
         - `run_group` to bound its cumulative dispatch loop.
-        - The waiter in `_trigger_unit_sync` to bound its pid-watch
+        - The waiter in `trigger_unit_sync` to bound its pid-watch
           when waiting for a group.
         Cycle-safety: `_validate_config` rejects cycles in group
         references, so the recursion always terminates.
