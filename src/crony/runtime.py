@@ -48,7 +48,7 @@ from crony.platform import (
 from crony.unit import EntityRef
 
 
-def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
+def load_snapshot(ref: EntityRef) -> Job | JobGroup:
     """Load and validate a snapshot file by ref. Raises
     PreconditionError if missing (entry not applied) or schema
     mismatch (re-apply required).
@@ -129,7 +129,7 @@ def _read_runtime_state(
     lock_path = state_dir / "run.lock"
     if lock_path.is_file():
         try:
-            with _acquire_lock(lock_path):
+            with acquire_lock(lock_path):
                 pass
         except LockBusyError:
             is_running = True
@@ -138,7 +138,7 @@ def _read_runtime_state(
     unit_timer: Path | None = None
     unit_is_stale = False
     if full_name is not None:
-        unit_config = _platform_unit_config_path(full_name)
+        unit_config = platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(snapshot)
@@ -310,7 +310,7 @@ def load_config() -> Config:
     accounted_labels.update(broken_by_full_name)
     unit_only: dict[EntityRef, UnitOnlyOrphan] = {}
     unit_only_by_full_name: dict[str, EntityRef] = {}
-    for full_name in _platform_unit_names() - accounted_labels:
+    for full_name in platform_unit_names() - accounted_labels:
         bundle_name, _, _ = full_name.partition(".")
         if not bundle_name:
             continue
@@ -328,7 +328,7 @@ def load_config() -> Config:
         # Make the platform paths available through RuntimeState so
         # status's unit-config / unit-timer columns don't re-walk the
         # unit dirs.
-        unit_config = _platform_unit_config_path(full_name)
+        unit_config = platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         runtime[ref] = RuntimeState(
             state_dir=entity_state_dir(ref),
@@ -355,7 +355,7 @@ def load_config() -> Config:
     )
 
 
-def _state_dir_for(ref: EntityRef) -> Path:
+def state_dir_for(ref: EntityRef) -> Path:
     """State directory for an entity, materialized on disk.
 
     Returns the uuid-keyed state dir for `ref`, creating it (and
@@ -377,7 +377,7 @@ def _state_dir_for(ref: EntityRef) -> Path:
     return d
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     """Current local time in ISO 8601 format with timezone offset."""
     return (
         datetime.datetime.now(datetime.UTC)
@@ -387,11 +387,11 @@ def _now_iso() -> str:
 
 
 @contextlib.contextmanager
-def _acquire_lock(lock_path: Path) -> Iterator[None]:
+def acquire_lock(lock_path: Path) -> Iterator[None]:
     """Hold an exclusive non-blocking flock on lock_path for a run.
 
     The lock is a run-liveness signal: a held lock means a run is in
-    flight, which `_run_in_progress` (and status / apply / destroy
+    flight, which `run_in_progress` (and status / apply / destroy
     through it) reads by probing whether the lock is acquirable. flock
     is used rather than the sibling run.pid because the kernel releases
     it when the runner dies, so a crashed run never reads as still
@@ -422,7 +422,7 @@ def _acquire_lock(lock_path: Path) -> Iterator[None]:
         fd.close()
 
 
-def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
+def write_last_run(path: Path, payload: dict[str, Any]) -> None:
     """Atomically write last-run.json so partial writes can't corrupt it.
 
     Insertion order is preserved (no `sort_keys=True`): top-level keys
@@ -435,12 +435,12 @@ def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _platform_unit_config_path(
+def platform_unit_config_path(
     name: str, platform: str | None = None
 ) -> Path | None:
     """The on-disk platform config unit file backing `name`, or None.
     The status `unit-config` column reads this from `RuntimeState`."""
-    return _scheduler(platform).unit_config_path(name)
+    return scheduler(platform).unit_config_path(name)
 
 
 def _platform_unit_timer_path(
@@ -449,16 +449,16 @@ def _platform_unit_timer_path(
     """The on-disk timer unit arming `name`'s schedule, or None when the
     platform has no separate timer unit or the entry is unscheduled. The
     status `unit-timer` column reads this from `RuntimeState`."""
-    return _scheduler(platform).unit_timer_path(name)
+    return scheduler(platform).unit_timer_path(name)
 
 
-def _dispatch_unit_path(name: str, platform: str | None = None) -> Path:
+def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
     """File `_trigger_unit` fires for `name` (may not exist). Used to
     refuse early when the unit was never installed."""
-    return _scheduler(platform).dispatch_unit_path(name)
+    return scheduler(platform).dispatch_unit_path(name)
 
 
-def _scheduler(platform: str | None = None) -> Scheduler:
+def scheduler(platform: str | None = None) -> Scheduler:
     """The platform Scheduler for the host. `platform` defaults to the
     running host's `crony.platform.current_platform()`; tests pass it
     explicitly to exercise a specific backend. Built per call; the
@@ -469,7 +469,7 @@ def _scheduler(platform: str | None = None) -> Scheduler:
     return get_scheduler(platform)
 
 
-def _host() -> HostPlatform:
+def host() -> HostPlatform:
     """The HostPlatform backend for the running host. Built per call via
     crony.platform.current_platform() so tests can redirect the platform."""
     return get_host(crony.platform.current_platform())
@@ -478,10 +478,10 @@ def _host() -> HostPlatform:
 def _unit_is_stale(snap: Job | JobGroup, platform: str | None = None) -> bool:
     """True when the platform install diverges from the snapshot --
     delegates to the scheduler's drift check."""
-    return _scheduler(platform).is_stale(snap.unit_spec())
+    return scheduler(platform).is_stale(snap.unit_spec())
 
 
-def _recover_full_name(state_dir: Path) -> str | None:
+def recover_full_name(state_dir: Path) -> str | None:
     """Return the full namespaced name a state dir was last
     applied under, or None when the snapshot is missing or
     unreadable.
@@ -497,7 +497,7 @@ def _recover_full_name(state_dir: Path) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _run_in_progress(state_dir: Path) -> bool:
+def run_in_progress(state_dir: Path) -> bool:
     """True when `state_dir`'s `run.lock` is held by another
     process -- a fire is in flight. False when the lock file is
     absent or freely acquirable.
@@ -506,13 +506,13 @@ def _run_in_progress(state_dir: Path) -> bool:
     if not lock_path.is_file():
         return False
     try:
-        with _acquire_lock(lock_path):
+        with acquire_lock(lock_path):
             return False
     except LockBusyError:
         return True
 
 
-def _platform_unit_names() -> set[str]:
+def platform_unit_names() -> set[str]:
     """Names with a crony-managed platform unit file on this host.
 
     Walks the platform's user-unit directory and returns the name
@@ -525,10 +525,10 @@ def _platform_unit_names() -> set[str]:
     invisible to status / destroy and the user would have to track
     them down manually.
     """
-    return _scheduler().installed_names()
+    return scheduler().installed_names()
 
 
-def _unit_state(name: str, platform: str | None = None) -> str:
+def unit_state(name: str, platform: str | None = None) -> str:
     """The platform scheduler's enable state for a stamped entity:
     `enabled`, `disabled`, or `none`.
 
@@ -538,15 +538,15 @@ def _unit_state(name: str, platform: str | None = None) -> str:
     to flip on or off. (The `grouped` UNIT-axis value, for an entry
     with no own unit to enable, is set by the status caller, not here.)
     """
-    return _scheduler(platform).state(name).value
+    return scheduler(platform).state(name).value
 
 
-def _user_trigger_flag_path(state_dir: Path) -> Path:
+def user_trigger_flag_path(state_dir: Path) -> Path:
     """Filesystem path of the one-shot user-trigger sentinel."""
     return state_dir / "user-trigger.flag"
 
 
-def _write_user_trigger_flag(state_dir: Path) -> None:
+def write_user_trigger_flag(state_dir: Path) -> None:
     """Write the user-trigger sentinel just before kicking the
     platform scheduler. Empty file -- presence is the signal. The
     caller passes the entry's uuid-keyed state dir so the sentinel
@@ -554,22 +554,22 @@ def _write_user_trigger_flag(state_dir: Path) -> None:
     last-run.json).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    _user_trigger_flag_path(state_dir).write_bytes(b"")
+    user_trigger_flag_path(state_dir).write_bytes(b"")
 
 
-def _consume_user_trigger_flag(state_dir: Path) -> bool:
+def consume_user_trigger_flag(state_dir: Path) -> bool:
     """Read-and-delete the user-trigger sentinel. Returns True if
     the flag was present (the runner should bypass the interactive
     wait), False otherwise.
     """
     try:
-        _user_trigger_flag_path(state_dir).unlink()
+        user_trigger_flag_path(state_dir).unlink()
     except FileNotFoundError:
         return False
     return True
 
 
-def _read_pid_file(pid_path: Path) -> int | None:
+def read_pid_file(pid_path: Path) -> int | None:
     try:
         text = pid_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:

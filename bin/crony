@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import crony.paths  # noqa: E402
 import crony.platform  # noqa: E402
+import crony.runtime  # noqa: E402
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from crony.config import (  # noqa: E402
     BUILTIN_NOTIFY_CHANNELS,
@@ -97,24 +98,19 @@ from crony.platform import (  # noqa: E402
     get_scheduler,  # noqa: F401  re-exported for tests
 )
 from crony.runtime import (  # noqa: E402
-    _acquire_lock,
-    _consume_user_trigger_flag,
-    _dispatch_unit_path,
-    _host,
-    _load_snapshot,
-    _now_iso,
-    _platform_unit_config_path,  # noqa: F401  re-exported for tests
-    _platform_unit_names,  # noqa: F401  re-exported for tests
-    _read_pid_file,
-    _recover_full_name,
-    _run_in_progress,
-    _scheduler,
-    _state_dir_for,
-    _unit_state,
-    _user_trigger_flag_path,
-    _write_last_run,
-    _write_user_trigger_flag,
+    acquire_lock,
+    consume_user_trigger_flag,
     load_config,
+    load_snapshot,
+    now_iso,
+    read_pid_file,
+    recover_full_name,
+    run_in_progress,
+    scheduler,
+    state_dir_for,
+    user_trigger_flag_path,
+    write_last_run,
+    write_user_trigger_flag,
 )
 from crony.unit import (  # noqa: E402
     EntityRef,
@@ -749,7 +745,7 @@ def _keep_awake_argv(
     """
     if not snap.keep_awake:
         return argv, None
-    return _host().keep_awake_argv(argv, str(snap.name))
+    return crony.runtime.host().keep_awake_argv(argv, str(snap.name))
 
 
 def _crony_executable() -> Path:
@@ -840,7 +836,7 @@ def _wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
     """Block until `pid` exits via the host's kernel-level pid-exit
     notification; delegates to the HostPlatform backend. `timeout=None`
     waits indefinitely."""
-    return _host().wait_for_pid_exit(pid, timeout)
+    return crony.runtime.host().wait_for_pid_exit(pid, timeout)
 
 
 _NOTIFY_TIMEOUT_SEC: int = 15
@@ -864,7 +860,9 @@ def _retrieve_secret(
     runtime path tries to use it.
     """
     if keychain_service is not None:
-        secret = _host().keychain_secret(keychain_service, keychain_account)
+        secret = crony.runtime.host().keychain_secret(
+            keychain_service, keychain_account
+        )
         if secret is not None:
             return secret
     if file_path is not None:
@@ -1203,7 +1201,7 @@ def _send_dialog_popup_for(
     `_NOTIFY_DISPATCH` sender signature; only the run result + log feed
     the dialog.
     """
-    host = _host()
+    host = crony.runtime.host()
     if not host.supports_interactive:
         raise CronyError(
             "dialog-popup notify channel not implemented on "
@@ -1403,7 +1401,7 @@ def _wait_for_user_active(
     active blip between polls doesn't get missed; the defaults (30s
     poll, 60s break) give a healthy margin.
     """
-    host = _host()
+    host = crony.runtime.host()
     active_since: float | None = None
     while True:
         if bypass_check is not None and bypass_check():
@@ -1458,7 +1456,7 @@ def _show_interactive_dialog(job_name: str, message: str) -> str:
     yields no choice and maps to 'cancel' -- silently running without
     user confirmation would defeat the whole point of the flag.
     """
-    clicked = _host().show_dialog(
+    clicked = crony.runtime.host().show_dialog(
         f"crony: {job_name}", message, _INTERACTIVE_BUTTONS
     )
     if clicked == "Run Job":
@@ -1475,7 +1473,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     the run.log so a post-mortem reader can see how long the
     user took, whether they delayed, etc.
 
-    Polls `_consume_user_trigger_flag` inside both the active-
+    Polls `consume_user_trigger_flag` inside both the active-
     wait and the delay-sleep so a `crony trigger` arriving while
     this run is pending breaks the waiter out and runs the
     command. `crony trigger` writes that flag in its own process
@@ -1488,7 +1486,7 @@ def _interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     sd = entity_state_dir(snap.ref)
 
     def _bypass() -> bool:
-        return _consume_user_trigger_flag(sd)
+        return consume_user_trigger_flag(sd)
 
     while True:
         log_file.write(
@@ -1551,7 +1549,7 @@ def run_job(
         if not os.access(sp, os.X_OK):
             raise PreconditionError(f"script not executable: {sp}")
 
-    sd = _state_dir_for(snap.ref)
+    sd = state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
@@ -1563,12 +1561,12 @@ def run_job(
     # the inherited env at fire time (see _runtime_env).
     env = _runtime_env(snap.env)
     started = time.time()
-    started_iso = _now_iso()
+    started_iso = now_iso()
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
     try:
-        with _acquire_lock(lock_path):
+        with acquire_lock(lock_path):
             if dry_run:
                 return 0
             # Publish our pid for waiters (parent groups, `crony
@@ -1613,7 +1611,7 @@ def run_job(
                             host=host,
                             platform=platform,
                             started_at=started_iso,
-                            ended_at=_now_iso(),
+                            ended_at=now_iso(),
                             duration_sec=time.time() - started,
                             exit_class="gated",
                             exit_code=0,
@@ -1625,13 +1623,13 @@ def run_job(
                             ),
                             notifications={},
                         )
-                        _write_last_run(
+                        write_last_run(
                             last_run_path, dataclasses.asdict(result)
                         )
                         return 0
 
                 if snap.interactive:
-                    bypass = _consume_user_trigger_flag(sd)
+                    bypass = consume_user_trigger_flag(sd)
                     if bypass:
                         log_file.write(
                             b"interactive: bypass (user-triggered)\n"
@@ -1650,7 +1648,7 @@ def run_job(
                                 host=host,
                                 platform=platform,
                                 started_at=started_iso,
-                                ended_at=_now_iso(),
+                                ended_at=now_iso(),
                                 duration_sec=time.time() - started,
                                 exit_class="canceled",
                                 exit_code=0,
@@ -1662,7 +1660,7 @@ def run_job(
                                 ),
                                 notifications={},
                             )
-                            _write_last_run(
+                            write_last_run(
                                 last_run_path, dataclasses.asdict(result)
                             )
                             return 0
@@ -1712,7 +1710,7 @@ def run_job(
                     host=host,
                     platform=platform,
                     started_at=started_iso,
-                    ended_at=_now_iso(),
+                    ended_at=now_iso(),
                     duration_sec=time.time() - started,
                     exit_class=exit_class,
                     exit_code=exit_code,
@@ -1737,7 +1735,7 @@ def run_job(
                         result, full_name, log_text, notify_defaults
                     )
 
-                _write_last_run(last_run_path, dataclasses.asdict(result))
+                write_last_run(last_run_path, dataclasses.asdict(result))
                 return surfaced_rc
             finally:
                 log_file.close()
@@ -1745,7 +1743,7 @@ def run_job(
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{_now_iso()}] LOCK_BUSY: skipping "
+                f"[{now_iso()}] LOCK_BUSY: skipping "
                 f"(already running)\n".encode()
             )
         return int(ExitCode.LOCK_BUSY)
@@ -1786,7 +1784,7 @@ def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     "wait with no cap" at the pid-watch.
     """
     try:
-        cs = _load_snapshot(child_ref)
+        cs = load_snapshot(child_ref)
     except PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
     raw = cs.job_timeout_sec if isinstance(cs, Job) else cs.group_budget_sec
@@ -1801,7 +1799,7 @@ def _child_is_interactive(child_ref: EntityRef) -> bool:
     fires and surfaces the issue with its usual error.
     """
     try:
-        cs = _load_snapshot(child_ref)
+        cs = load_snapshot(child_ref)
     except PreconditionError:
         return False
     return isinstance(cs, Job) and cs.interactive
@@ -1835,19 +1833,19 @@ def run_group(
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = _state_dir_for(snap.ref)
+    sd = state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
     started = time.time()
-    started_iso = _now_iso()
+    started_iso = now_iso()
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
     try:
-        with _acquire_lock(lock_path):
+        with acquire_lock(lock_path):
             if dry_run:
                 return 0
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
@@ -2018,13 +2016,13 @@ def run_group(
                     host=host,
                     platform=platform,
                     started_at=started_iso,
-                    ended_at=_now_iso(),
+                    ended_at=now_iso(),
                     duration_sec=time.time() - started,
                     exit_class=_rollup_group_exit_class(children),
                     log_path=str(log_path),
                     jobs_run=children,
                 )
-                _write_last_run(last_run_path, dataclasses.asdict(result))
+                write_last_run(last_run_path, dataclasses.asdict(result))
                 return 0
             finally:
                 log_file.close()
@@ -2032,7 +2030,7 @@ def run_group(
     except LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{_now_iso()}] LOCK_BUSY: skipping "
+                f"[{now_iso()}] LOCK_BUSY: skipping "
                 f"(already running)\n".encode()
             )
         return int(ExitCode.LOCK_BUSY)
@@ -2043,7 +2041,7 @@ def run_group(
 # =============================================================================
 # Render and (un)load platform-native scheduler units. The per-platform
 # divergence lives entirely in the crony.platform backends; the
-# functions here are thin delegates via _scheduler(), which carries no
+# functions here are thin delegates via scheduler(), which carries no
 # platform branch -- the backend owns its own unit directory.
 
 
@@ -2057,7 +2055,7 @@ def _render_units(
     check re-renders inside the scheduler using the paths it recovers
     from the on-disk unit, so it does not go through here.)
     """
-    return _scheduler(platform).render(
+    return scheduler(platform).render(
         snap.unit_spec(),
         uv_path=_uv_executable(),
         crony_path=_crony_executable(),
@@ -2101,7 +2099,7 @@ def _activate_unit(
     starts it). The plist analog is the same -- a plist with no
     Start* keys loads fine and just doesn't auto-fire.
     """
-    _scheduler(platform).activate(
+    scheduler(platform).activate(
         name,
         prior_disabled=prior_disabled,
         scheduled=scheduled,
@@ -2202,12 +2200,12 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
     # is the source of truth here (the platform unit can outlive
-    # the state-dir snapshot); _unit_state returns "none" for a
+    # the state-dir snapshot); crony.runtime.unit_state returns "none" for a
     # not-yet-installed unit, so only an explicit "disabled"
     # answer counts and a fresh install still lands enabled.
-    prior_disabled = _unit_state(full_name) == "disabled"
+    prior_disabled = crony.runtime.unit_state(full_name) == "disabled"
     units = _render_units(snapshot)
-    sched = _scheduler()
+    sched = scheduler()
     target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name that
@@ -2222,7 +2220,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         scheduled=timing is not None,
     )
 
-    _state_dir_for(ref)
+    state_dir_for(ref)
     snapshot_path.write_text(
         json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -2247,7 +2245,7 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     state dir to clean up.
     """
     if name is not None:
-        _scheduler().remove_files(name)
+        scheduler().remove_files(name)
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
@@ -2280,10 +2278,10 @@ def _sweep_superseded_state_dirs(
     for uuid_dir in sorted(bundle_root.iterdir()):
         if not uuid_dir.is_dir() or uuid_dir.name in live_uuids:
             continue
-        if _recover_full_name(uuid_dir) != full_name:
+        if recover_full_name(uuid_dir) != full_name:
             continue
         stray = EntityRef(keep.bundle, uuid_dir.name)
-        if _run_in_progress(uuid_dir):
+        if run_in_progress(uuid_dir):
             logger.warning(
                 "%s: superseded state dir %s left in place (run in progress)",
                 full_name,
@@ -2441,12 +2439,12 @@ def _config_axis(
 
 def _enable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `enabled` state for `name` (delegates)."""
-    _scheduler(platform).enable(name)
+    scheduler(platform).enable(name)
 
 
 def _disable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `disabled` state for `name` (delegates)."""
-    _scheduler(platform).disable(name)
+    scheduler(platform).disable(name)
 
 
 def _trigger_unit(
@@ -2488,7 +2486,7 @@ def _trigger_unit(
     side-effects (a created state dir, a hung waiter) before the
     caller can decide to soft-fail.
     """
-    if not _dispatch_unit_path(name, platform).exists():
+    if not crony.runtime.dispatch_unit_path(name, platform).exists():
         raise UnitNotInstalledError(
             f"unit for {name!r} is not installed on this host "
             f"(run `crony apply` to re-pin the parent's snapshot)"
@@ -2500,10 +2498,10 @@ def _trigger_unit(
             "the trigger path)"
         )
     if triggered_by_user and state_dir is not None:
-        _write_user_trigger_flag(state_dir)
+        write_user_trigger_flag(state_dir)
     succeeded = False
     try:
-        _scheduler(platform).trigger(name)
+        scheduler(platform).trigger(name)
         succeeded = True
     finally:
         if triggered_by_user and state_dir is not None and not succeeded:
@@ -2511,7 +2509,7 @@ def _trigger_unit(
             # never reached the scheduler. The next legitimately
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
-            _user_trigger_flag_path(state_dir).unlink(missing_ok=True)
+            user_trigger_flag_path(state_dir).unlink(missing_ok=True)
 
 
 def _trigger_unit_sync(
@@ -2558,12 +2556,12 @@ def _trigger_unit_sync(
     completion" is well-defined and serves the group-dispatch use
     case (we wanted the child's run; an in-flight run satisfies).
     """
-    # Match the runner's `_now_iso()` precision (whole seconds): if
+    # Match the runner's `now_iso()` precision (whole seconds): if
     # pre_trigger captured microseconds and the runner's ended_at
     # truncated them, a sub-second run could compare ended_at <
     # pre_trigger and the loop would conclude "no fresh run yet"
     # for the entire trigger_timeout window.
-    pre_trigger_dt = datetime.datetime.fromisoformat(_now_iso())
+    pre_trigger_dt = datetime.datetime.fromisoformat(now_iso())
     pid_path = state_dir / "run.pid"
     last_run_path = state_dir / "last-run.json"
 
@@ -2576,7 +2574,7 @@ def _trigger_unit_sync(
     started_at = time.monotonic()
     while True:
         elapsed = time.monotonic() - started_at
-        pid = _read_pid_file(pid_path)
+        pid = read_pid_file(pid_path)
         # `last-run.json` check goes first so a sub-second run
         # whose pid file came and went between iterations is
         # still observable via the file the runner wrote at exit.
@@ -3086,7 +3084,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
             name = config.name_for(ref)
             sd = entity_state_dir(ref)
             label = name if name is not None else str(ref)
-            if sd.is_dir() and _run_in_progress(sd):
+            if sd.is_dir() and run_in_progress(sd):
                 logger.warning(
                     "%s: orphan left in place (run in progress)", label
                 )
@@ -3226,7 +3224,7 @@ def do_destroy(
         lock_path = sd / "run.lock" if sd is not None else None
         if lock_path is not None and lock_path.exists():
             try:
-                with _acquire_lock(lock_path):
+                with acquire_lock(lock_path):
                     pass
             except LockBusyError:
                 raise LockBusyError(
@@ -3243,7 +3241,7 @@ def do_destroy(
         sd = entity_state_dir(ref)
         if not sd.is_dir():
             continue
-        if _run_in_progress(sd):
+        if run_in_progress(sd):
             logger.warning(
                 "%s: shadowed residue left in place (run in progress)", ref
             )
@@ -3962,7 +3960,7 @@ def _resolve_state_axes(
             installed_name = (
                 str(current_node.name) if current_node is not None else full
             )
-            unit_state = _unit_state(installed_name)
+            unit_state = crony.runtime.unit_state(installed_name)
     last_state = _last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
@@ -4015,7 +4013,7 @@ def _unit_name_for(
         scheduled: bool | None = _entry_is_scheduled(entry)
     else:
         scheduled = _snapshot_says_scheduled(config, full)
-    return _scheduler(platform).unit_name(full, scheduled)
+    return scheduler(platform).unit_name(full, scheduled)
 
 
 # Trailing flag on a status cell whose pending and current values
@@ -4288,7 +4286,7 @@ def do_status(
         }
 
     try:
-        _scheduler().verify()
+        scheduler().verify()
     except SchedulerWarning as warn:
         logger.warning("%s", warn)
 
@@ -4912,7 +4910,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
             f"Use `crony trigger <name>` to fire by name."
         )
     try:
-        snap = _load_snapshot(parsed)
+        snap = load_snapshot(parsed)
     except PreconditionError as exc:
         _record_snapshot_load_failure(parsed, exc)
         raise
@@ -4947,7 +4945,7 @@ def _record_snapshot_load_failure(
     state_dir = entity_state_dir(ref)
     if not state_dir.is_dir():
         return
-    now = _now_iso()
+    now = now_iso()
     payload: dict[str, Any] = {
         "host": crony.platform.current_host(),
         "platform": crony.platform.current_platform(),
@@ -4958,7 +4956,7 @@ def _record_snapshot_load_failure(
         "exit_code": int(ExitCode.PRECONDITION),
         "reason": str(exc),
     }
-    _write_last_run(state_dir / "last-run.json", payload)
+    write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / "run.log"
     line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
@@ -5175,7 +5173,7 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     warnings: list[str] = []
     if bundle is None:
         try:
-            _scheduler().verify()
+            scheduler().verify()
         except SchedulerWarning as warn:
             warnings.append(str(warn))
 
@@ -5273,8 +5271,8 @@ def _notify_test_one_bundle(
     result = JobRunResult(
         host=crony.platform.current_host(),
         platform=crony.platform.current_platform(),
-        started_at=_now_iso(),
-        ended_at=_now_iso(),
+        started_at=now_iso(),
+        ended_at=now_iso(),
         duration_sec=0.0,
         exit_class="fail",
         exit_code=1,

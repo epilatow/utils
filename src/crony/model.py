@@ -423,7 +423,7 @@ class RuntimeState:
     not None` is the "a config unit exists on disk" test. The platform
     unit *file* presence and the unit-drift check are captured here at
     load time; the live scheduler enable/disable state is not -- status'
-    UNIT axis queries `_unit_state` on demand, since the scheduler view
+    UNIT axis queries `unit_state` on demand, since the scheduler view
     can change between load and read.
 
     `unit_is_stale` is True when the platform install diverges
