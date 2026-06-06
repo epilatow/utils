@@ -19,10 +19,10 @@ import json
 import logging
 import os
 import re
-import shutil
-import subprocess
-import sys
-import time
+import shutil as shutil  # noqa: PLC0414  re-exported for tests
+import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
+import sys as sys  # noqa: PLC0414  re-exported for tests
+import time as time  # noqa: PLC0414  re-exported for tests
 import uuid
 from pathlib import Path
 
@@ -109,7 +109,7 @@ def _repo_root() -> Path:
 # Emitted by `crony config init`. Every section is commented out so a user can
 # uncomment the bits they want without touching the explanatory prose.
 
-_DEFAULT_CONFIG_TEMPLATE: str = """\
+DEFAULT_CONFIG_TEMPLATE: str = """\
 # ============================================================================
 # crony config bundle
 # ============================================================================
@@ -373,7 +373,7 @@ def _crony_executable() -> Path:
     return _repo_root() / "bin" / "crony"
 
 
-def _uv_executable() -> Path:
+def uv_executable() -> Path:
     """Absolute path to `uv`, baked into platform unit files.
 
     The platform scheduler starts a unit's program
@@ -413,14 +413,14 @@ def _render_units(
 ) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
-    Delegates to the platform Scheduler with the live `_uv_executable()`
+    Delegates to the platform Scheduler with the live `uv_executable()`
     / `_crony_executable()` paths baked into the unit argv. (The drift
     check re-renders inside the scheduler using the paths it recovers
     from the on-disk unit, so it does not go through here.)
     """
     return scheduler(platform).render(
         snap.unit_spec(),
-        uv_path=_uv_executable(),
+        uv_path=uv_executable(),
         crony_path=_crony_executable(),
     )
 
@@ -669,7 +669,7 @@ def _sweep_superseded_state_dirs(
 # off when the user runs `crony apply` to push other changes.
 
 
-def _last_run_state(config: Config, full_name: str) -> str:
+def last_run_state(config: Config, full_name: str) -> str:
     """Return LAST axis value for a stamped entity.
 
     Lock-held implies a run is currently in flight: "pending" when
@@ -842,7 +842,7 @@ def do_init(force: bool, bundle: str | None) -> None:
                 f"{target} already exists; pass --force to overwrite"
             )
         crony.paths.CONFIG_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
-        target.write_text(_DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
+        target.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
         logger.info("wrote bundle config to %s", target)
         return
     if crony.paths.CONFIG_FILE.exists() and not force:
@@ -852,7 +852,7 @@ def do_init(force: bool, bundle: str | None) -> None:
         )
     crony.paths.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     crony.paths.CONFIG_FILE.write_text(
-        _DEFAULT_CONFIG_TEMPLATE, encoding="utf-8"
+        DEFAULT_CONFIG_TEMPLATE, encoding="utf-8"
     )
     logger.info("wrote default config to %s", crony.paths.CONFIG_FILE)
 
@@ -894,7 +894,7 @@ def _bundle_files_for_update(
     return candidates
 
 
-def _insert_missing_uuids_in_section(
+def insert_missing_uuids_in_section(
     doc: tomlkit.TOMLDocument, section: str
 ) -> int:
     """Assign a fresh UUID to every subtable of `[<section>.*]`
@@ -953,8 +953,8 @@ def do_config_update(bundle: str | None) -> None:
         except tomlkit.exceptions.ParseError as e:
             logger.error("%s: TOML parse error: %s", path, e)
             continue
-        added_jobs = _insert_missing_uuids_in_section(doc, "job")
-        added_groups = _insert_missing_uuids_in_section(doc, "job-group")
+        added_jobs = insert_missing_uuids_in_section(doc, "job")
+        added_groups = insert_missing_uuids_in_section(doc, "job-group")
         total = added_jobs + added_groups
         if total == 0:
             logger.info(
@@ -1057,7 +1057,7 @@ def _selected_and_masked_full_names_per_bundle(
             full = b.full_name(short)
             by_full[full] = (b, short)
             # Errored entries get the same `unused` label as
-            # genuinely-unused ones at this layer; `_resolve_state_axes`
+            # genuinely-unused ones at this layer; `resolve_state_axes`
             # promotes them back to `error` so the user sees the
             # actual problem instead of a generic mask.
             masked_by_full[full] = "unused"
@@ -1833,7 +1833,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-config": "UNIT CONFIG",
     "unit-timer": "UNIT TIMER",
 }
-_DEFAULT_STATUS_COLS: tuple[str, ...] = (
+DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
     "config",
     "schedule",
@@ -1841,7 +1841,7 @@ _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "last-ran",
 )
 _STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
-    "default": _DEFAULT_STATUS_COLS,
+    "default": DEFAULT_STATUS_COLS,
     "all": tuple(_STATUS_COL_HEADERS.keys()),
     "unit-files": ("unit-config", "unit-timer"),
 }
@@ -1976,7 +1976,7 @@ def _build_status_aliases_block() -> str:
     return "\n".join(lines)
 
 
-_STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
+STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
     aliases_block=_build_status_aliases_block(),
 )
 
@@ -1997,7 +1997,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     so a typo is loud, not a silent missing column.
     """
     if not spec:
-        return list(_DEFAULT_STATUS_COLS)
+        return list(DEFAULT_STATUS_COLS)
     raw = [c.strip() for c in spec.split(",") if c.strip()]
     valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIASES)
     unknown = [c for c in raw if c not in valid]
@@ -2025,7 +2025,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     return ["job-or-uuid"] + cols
 
 
-def _resolve_state_axes(
+def resolve_state_axes(
     config: Config,
     full: str,
     remnants: set[str],
@@ -2117,7 +2117,7 @@ def _resolve_state_axes(
                 str(current_node.name) if current_node is not None else full
             )
             unit_state = crony.runtime.unit_state(installed_name)
-    last_state = _last_run_state(config, full)
+    last_state = last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
 
@@ -2189,9 +2189,9 @@ _STALE_VALUE_FOOTER: str = (
 # failed state; yellow flags drift the operator can reconcile with
 # `crony apply` (a `stale` config verdict, or any divergence-flagged
 # cell). The `^` marker itself is never colored.
-_ANSI_RED: str = "\033[31m"
-_ANSI_YELLOW: str = "\033[33m"
-_ANSI_RESET: str = "\033[0m"
+ANSI_RED: str = "\033[31m"
+ANSI_YELLOW: str = "\033[33m"
+ANSI_RESET: str = "\033[0m"
 
 # CONFIG values worth a red flag. `last` is folded so `signal` never
 # reaches the cell (it renders as `fail`); `timeout` / `canceled` are
@@ -2202,7 +2202,7 @@ _STATUS_RED_CONFIG: frozenset[str] = frozenset(
 _STATUS_RED_LAST: frozenset[str] = frozenset({"fail", "timeout", "canceled"})
 
 
-def _color_supported() -> bool:
+def color_supported() -> bool:
     """Return True if ANSI color escape sequences should be emitted.
 
     Color is suppressed when NO_COLOR is set in the environment or
@@ -2222,11 +2222,11 @@ def _status_value_color(col: str, value: str) -> str | None:
     """
     if col == "config":
         if value in _STATUS_RED_CONFIG:
-            return _ANSI_RED
+            return ANSI_RED
         if value == "stale":
-            return _ANSI_YELLOW
+            return ANSI_YELLOW
     elif col == "last" and value in _STATUS_RED_LAST:
-        return _ANSI_RED
+        return ANSI_RED
     return None
 
 
@@ -2245,11 +2245,11 @@ def _render_status_cell(
         return value + pad
     if value.endswith(_DIVERGENCE_MARKER):
         body = value[: -len(_DIVERGENCE_MARKER)]
-        return f"{_ANSI_YELLOW}{body}{_ANSI_RESET}{_DIVERGENCE_MARKER}{pad}"
+        return f"{ANSI_YELLOW}{body}{ANSI_RESET}{_DIVERGENCE_MARKER}{pad}"
     code = _status_value_color(col, value)
     if code is None:
         return value + pad
-    return f"{code}{value}{_ANSI_RESET}{pad}"
+    return f"{code}{value}{ANSI_RESET}{pad}"
 
 
 def _build_group_membership(
@@ -2620,7 +2620,7 @@ def do_status(
         # CONFIG / UNIT / LAST are single-source verdicts (not flag-
         # selected); resolve them against the config name so the
         # TOML-entry-based grouped check and errored detection land.
-        cfg_state, unit_state, last = _resolve_state_axes(
+        cfg_state, unit_state, last = resolve_state_axes(
             config, config_name, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, config_name)
@@ -2812,7 +2812,7 @@ def do_status(
         f"{_STATUS_COL_HEADERS[c]:<{widths[c]}}" for c in selected_cols
     )
     print(header_line.rstrip())
-    use_color = _color_supported()
+    use_color = color_supported()
     for row in rows:
         line = sep.join(
             _render_status_cell(c, row[c], widths[c], use_color)
@@ -2914,7 +2914,7 @@ def do_logs(
     if n is None:
         n = 10 if tail else 200
     if tail:
-        _follow_log(log_path, n=n)
+        follow_log(log_path, n=n)
         return
     text = log_path.read_text(encoding="utf-8", errors="replace")
     if latest:
@@ -2933,7 +2933,7 @@ def do_logs(
     sys.stdout.flush()
 
 
-def _follow_log(log_path: Path, *, n: int = 0) -> None:
+def follow_log(log_path: Path, *, n: int = 0) -> None:
     """tail -f equivalent on the log file.
 
     Prints the last `n` lines of the file before entering the
@@ -2981,7 +2981,7 @@ def _follow_log(log_path: Path, *, n: int = 0) -> None:
 _DURATION_RE = re.compile(r"^(\d+)([smhd])$")
 
 
-def _parse_since(spec: str) -> datetime.datetime:
+def parse_since(spec: str) -> datetime.datetime:
     """Parse a --since argument as duration shorthand or ISO timestamp.
 
     Returns a tz-aware datetime. ISO inputs without an offset are
@@ -3015,7 +3015,7 @@ def _parse_since(spec: str) -> datetime.datetime:
 
 def _filter_since(text: str, since: str) -> str:
     """Drop log content older than --since by run-header timestamp."""
-    cutoff = _parse_since(since)
+    cutoff = parse_since(since)
     header_re = re.compile(r"^=== (\S+) ")
     keep_from: int | None = None
     lines = text.splitlines(keepends=True)

@@ -13,11 +13,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil  # noqa: F401  re-exported for tests
 import signal
-import subprocess  # noqa: F401  re-exported for tests
 import sys
-import time  # noqa: F401  re-exported for tests
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -32,24 +29,9 @@ from typing import (
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import crony.commands  # noqa: E402, F401  re-exported for tests
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
 from crony.commands import (  # noqa: E402
-    _ANSI_RED,  # noqa: F401  re-exported for tests
-    _ANSI_RESET,  # noqa: F401  re-exported for tests
-    _ANSI_YELLOW,  # noqa: F401  re-exported for tests
-    _DEFAULT_CONFIG_TEMPLATE,  # noqa: F401  re-exported for tests
-    _DEFAULT_STATUS_COLS,  # noqa: F401  re-exported for tests
-    _STATUS_HELP_EPILOG,
-    _color_supported,  # noqa: F401  re-exported for tests
-    _follow_log,  # noqa: F401  re-exported for tests
-    _insert_missing_uuids_in_section,  # noqa: F401  re-exported for tests
-    _last_run_state,  # noqa: F401  re-exported for tests
-    _parse_since,  # noqa: F401  re-exported for tests
-    _resolve_state_axes,  # noqa: F401  re-exported for tests
-    _uv_executable,  # noqa: F401  re-exported for tests
-    apply_one,  # noqa: F401  re-exported for tests
-    destroy_one,  # noqa: F401  re-exported for tests
+    STATUS_HELP_EPILOG,
     do_apply,
     do_config_update,
     do_destroy,
@@ -65,21 +47,8 @@ from crony.commands import (  # noqa: E402
     do_validate,
 )
 from crony.errors import (  # noqa: E402
-    ConfigError,  # noqa: F401  re-exported for tests
     CronyError,
     ExitCode,
-    LockBusyError,  # noqa: F401  re-exported for tests
-    PreconditionError,  # noqa: F401  re-exported for tests
-    UsageError,  # noqa: F401  re-exported for tests
-)
-from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,  # noqa: F401  re-exported for tests
-    Job,  # noqa: F401  re-exported for tests
-    JobRunResult,  # noqa: F401  re-exported for tests
-    NotificationResult,  # noqa: F401  re-exported for tests
-)
-from crony.platform import (  # noqa: E402
-    get_scheduler,  # noqa: F401  re-exported for tests
 )
 from crony.runner import (  # noqa: E402
     do_run,
@@ -505,7 +474,7 @@ def build_parser() -> StrictArgumentParser:
     p_status = subparsers.add_parser(
         "status",
         help="Print resolved state per job",
-        epilog=_STATUS_HELP_EPILOG,
+        epilog=STATUS_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_status.add_argument(
