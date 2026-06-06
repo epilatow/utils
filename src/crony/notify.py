@@ -18,7 +18,9 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-import smtplib
+import smtplib as smtplib  # noqa: PLC0414  re-exported for tests
+import urllib as urllib  # noqa: PLC0414  re-exported for tests
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from email.message import EmailMessage
@@ -52,7 +54,7 @@ from crony.model import (
 _NOTIFY_TIMEOUT_SEC: int = 15
 
 
-def _retrieve_secret(
+def retrieve_secret(
     *,
     keychain_service: str | None,
     keychain_account: str | None = None,
@@ -125,7 +127,7 @@ def _format_summary(result: JobRunResult, full_name: str) -> str:
 #       Snapshot couldn't be loaded (missing, unreadable, wrong
 #       schema, unknown kind). No pid; the line surfaces the
 #       cancel for `crony logs --latest`.
-# `_extract_latest_log_entry` finds the last `=== ... ===` header
+# `extract_latest_log_entry` finds the last `=== ... ===` header
 # and returns everything from there to EOF (the most recent run's
 # trace). Used by `crony logs --latest` (single-run readout) and
 # the ntfy notify path (3KB inline body instead of a full-log
@@ -133,7 +135,7 @@ def _format_summary(result: JobRunResult, full_name: str) -> str:
 _RUN_HEADER_RE = re.compile(r"^=== ", re.MULTILINE)
 
 
-def _extract_latest_log_entry(text: str) -> str:
+def extract_latest_log_entry(text: str) -> str:
     """Return the slice from the last `=== ... ===` header to EOF.
 
     If there is no header (log empty or pre-header content), the
@@ -145,7 +147,7 @@ def _extract_latest_log_entry(text: str) -> str:
     return text[matches[-1].start() :]
 
 
-def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
+def head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
     """Tail a string to at most max_kb KB, head-truncating.
 
     When truncation occurs, the returned text is prepended with a
@@ -203,7 +205,7 @@ def _build_email_message(
             msg[k] = v
     body = _format_summary(result, full_name)
     if attach_log and log_text:
-        body += _LOG_SEPARATOR + _format_log_for_notification(
+        body += LOG_SEPARATOR + _format_log_for_notification(
             log_text, attach_max_kb
         )
     msg.set_content(body)
@@ -222,7 +224,7 @@ def _send_email(msg: EmailMessage, cfg: NotifyEmail, password: str) -> None:
 
 
 _NTFY_MAX_BODY_KB: int = 3
-_LOG_SEPARATOR: str = "\n--- log (latest run) ---\n"
+LOG_SEPARATOR: str = "\n--- log (latest run) ---\n"
 
 
 def _format_log_for_notification(log_text: str, max_kb: int) -> str:
@@ -234,8 +236,8 @@ def _format_log_for_notification(log_text: str, max_kb: int) -> str:
     most recent header would just be noise (and on ntfy would
     bump out the actual diagnostic detail under the 3 KB cap).
     """
-    latest = _extract_latest_log_entry(log_text)
-    truncated, _trunc = _head_truncate_to_kb(latest, max_kb)
+    latest = extract_latest_log_entry(log_text)
+    truncated, _trunc = head_truncate_to_kb(latest, max_kb)
     return truncated
 
 
@@ -257,7 +259,7 @@ def _build_ntfy_body(summary: str, log_text: str, attach_log: bool) -> bytes:
     summary_bytes = summary.encode("utf-8")
     if not (attach_log and log_text):
         return summary_bytes
-    sep_bytes = _LOG_SEPARATOR.encode("utf-8")
+    sep_bytes = LOG_SEPARATOR.encode("utf-8")
     max_bytes = _NTFY_MAX_BODY_KB * 1024
     log_budget_bytes = max_bytes - len(summary_bytes) - len(sep_bytes)
     if log_budget_bytes <= 0:
@@ -328,7 +330,7 @@ def _send_email_for(
         raise ConfigError(
             f"channel {channel.name!r} has no email transport config"
         )
-    password = _retrieve_secret(
+    password = retrieve_secret(
         keychain_service=channel.email.smtp_pass_keychain_service,
         keychain_account=channel.email.smtp_pass_keychain_account,
         file_path=channel.email.smtp_pass_file,
@@ -362,7 +364,7 @@ def _send_ntfy_for(
         raise ConfigError(
             f"channel {channel.name!r} has no ntfy transport config"
         )
-    token = _retrieve_secret(
+    token = retrieve_secret(
         keychain_service=channel.ntfy.token_keychain_service,
         keychain_account=channel.ntfy.token_keychain_account,
         file_path=channel.ntfy.token_file,
@@ -422,7 +424,7 @@ def _send_dialog_popup_for(
     if defaults.notify_attach_log and log_text:
         tail = _format_log_for_notification(log_text, _DIALOG_POPUP_LOG_KB)
         if tail.strip():
-            body = f"{body}{_LOG_SEPARATOR}{tail}"
+            body = f"{body}{LOG_SEPARATOR}{tail}"
     host.show_failure_dialog(title, body)
 
 
@@ -461,7 +463,7 @@ def _builtin_notify_channel(name: str) -> NotifyChannel | None:
     return None
 
 
-def _dispatch_notify(
+def dispatch_notify(
     result: JobRunResult,
     full_name: str,
     log_text: str,
@@ -505,7 +507,7 @@ def _dispatch_notify(
             )
 
 
-def _expand_notify_inherit(
+def expand_notify_inherit(
     channels: list[str],
     firing_bundle: str,
     bundles: TomlConfig,
@@ -558,7 +560,7 @@ def _expand_notify_inherit(
     return resolved, merged
 
 
-def _resolve_notify_at_runtime(
+def resolve_notify_at_runtime(
     full_name: str,
 ) -> tuple[list[str], Defaults]:
     """Look up notify channels + bundle defaults from the live config.
@@ -585,4 +587,4 @@ def _resolve_notify_at_runtime(
         channels = list(config.defaults.notify_channels)
     else:
         channels = config.resolved_notify_channels(target, job)
-    return _expand_notify_inherit(channels, bn, bundles, config.defaults)
+    return expand_notify_inherit(channels, bn, bundles, config.defaults)

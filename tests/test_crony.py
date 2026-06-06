@@ -23,6 +23,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,6 +46,7 @@ REPO_ROOT = Path(__file__).parent.parent
 # module below only ever yields Any.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
@@ -1906,7 +1908,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default"], "borgadm", bundles, borgadm_cfg.defaults
         )
         assert channels == ["ntfy"]
@@ -1919,7 +1921,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["email"], "borgadm", bundles, borgadm_cfg.defaults
         )
         assert channels == ["email"]
@@ -1930,7 +1932,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default"], "default", bundles, default_cfg.defaults
         )
         assert channels == []
@@ -1939,7 +1941,7 @@ class TestNotifyInherit:
     def test_expand_missing_default_bundle(self) -> None:
         _, borgadm_cfg = self._two_bundles(["ntfy"])
         bundles = _bundle_set(("borgadm", borgadm_cfg))
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default"], "borgadm", bundles, borgadm_cfg.defaults
         )
         assert channels == []
@@ -1953,7 +1955,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, _ = crony._expand_notify_inherit(
+        channels, _ = crony_notify.expand_notify_inherit(
             ["default"], "borgadm", bundles, borgadm_cfg.defaults
         )
         assert channels == ["ntfy"]
@@ -1963,7 +1965,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default", "dialog-popup"],
             "borgadm",
             bundles,
@@ -1981,7 +1983,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, _ = crony._expand_notify_inherit(
+        channels, _ = crony_notify.expand_notify_inherit(
             ["default", "dialog-popup"],
             "borgadm",
             bundles,
@@ -2016,7 +2018,7 @@ class TestNotifyInherit:
             bundle_name="borgadm",
         )
         bundles = _bundle_set(("default", default_cfg), ("borgadm", local_cfg))
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default", "myemail"], "borgadm", bundles, local_cfg.defaults
         )
         assert channels == ["ntfy", "myemail"]
@@ -2026,7 +2028,7 @@ class TestNotifyInherit:
     def test_expand_extras_only_without_default_bundle(self) -> None:
         _, borgadm_cfg = self._two_bundles(["ntfy"])
         bundles = _bundle_set(("borgadm", borgadm_cfg))
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default", "dialog-popup"],
             "borgadm",
             bundles,
@@ -2040,7 +2042,7 @@ class TestNotifyInherit:
         bundles = _bundle_set(
             ("default", default_cfg), ("borgadm", borgadm_cfg)
         )
-        channels, defaults = crony._expand_notify_inherit(
+        channels, defaults = crony_notify.expand_notify_inherit(
             ["default", "dialog-popup"],
             "default",
             bundles,
@@ -2072,7 +2074,9 @@ class TestNotifyInherit:
             ),
             encoding="utf-8",
         )
-        channels, defaults = crony._resolve_notify_at_runtime("borgadm.check")
+        channels, defaults = crony_notify.resolve_notify_at_runtime(
+            "borgadm.check"
+        )
         assert channels == ["ntfy", "dialog-popup"]
         assert "ntfy" in defaults.notify_channel_defs
 
@@ -2099,10 +2103,12 @@ class TestNotifyInherit:
             ),
             encoding="utf-8",
         )
-        channels, defaults = crony._resolve_notify_at_runtime("borgadm.check")
+        channels, defaults = crony_notify.resolve_notify_at_runtime(
+            "borgadm.check"
+        )
         assert channels == ["ntfy"]
         assert "ntfy" in defaults.notify_channel_defs
-        disabled, _ = crony._resolve_notify_at_runtime("borgadm.create")
+        disabled, _ = crony_notify.resolve_notify_at_runtime("borgadm.create")
         assert disabled == []
 
 
@@ -3518,7 +3524,7 @@ class TestSuccessExitCodes:
         )
         called: list[int] = []
         monkeypatch.setattr(
-            crony, "_dispatch_notify", lambda *_a, **_k: called.append(1)
+            crony_notify, "dispatch_notify", lambda *_a, **_k: called.append(1)
         )
         crony.run_job(h.snap(cfg, "warn"))
         assert not called  # ok -> dispatch skipped, no dialog
@@ -4252,11 +4258,11 @@ class TestTriggerUnitNotInstalled:
 
 
 class TestSecretRetrieval:
-    """_retrieve_secret reads from the host keychain or a 0600 file."""
+    """retrieve_secret reads from the host keychain or a 0600 file."""
 
     def test_returns_none_when_no_source(self) -> None:
         assert (
-            crony._retrieve_secret(keychain_service=None, file_path=None)
+            crony_notify.retrieve_secret(keychain_service=None, file_path=None)
             is None
         )
 
@@ -4265,7 +4271,9 @@ class TestSecretRetrieval:
         f.write_text("supersecret\n")
         f.chmod(0o600)
         assert (
-            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+            crony_notify.retrieve_secret(
+                keychain_service=None, file_path=str(f)
+            )
             == "supersecret"
         )
 
@@ -4274,7 +4282,9 @@ class TestSecretRetrieval:
         f.write_text("supersecret")
         f.chmod(0o644)  # group/world readable
         with pytest.raises(crony.PreconditionError, match="0600"):
-            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+            crony_notify.retrieve_secret(
+                keychain_service=None, file_path=str(f)
+            )
 
     def test_rejects_loose_parent_dir(self, tmp_path: Path) -> None:
         # File mode is fine but the directory is group/world
@@ -4285,10 +4295,12 @@ class TestSecretRetrieval:
         f.write_text("hunter2")
         f.chmod(0o600)
         with pytest.raises(crony.PreconditionError, match="secret directory"):
-            crony._retrieve_secret(keychain_service=None, file_path=str(f))
+            crony_notify.retrieve_secret(
+                keychain_service=None, file_path=str(f)
+            )
 
     def test_keychain_hit_returns_secret(self, monkeypatch: Any) -> None:
-        # _retrieve_secret returns the host keychain value, passing the
+        # retrieve_secret returns the host keychain value, passing the
         # (service, account) pair through verbatim and not consulting
         # file_path. (The per-host keychain command is covered by the
         # backend tests in test_crony_platform_host_darwin.py.)
@@ -4302,7 +4314,7 @@ class TestSecretRetrieval:
                 return "thesecret"
 
         monkeypatch.setattr(crony_runtime, "host", lambda: _FakeHost())
-        secret = crony._retrieve_secret(
+        secret = crony_notify.retrieve_secret(
             keychain_service="svc",
             keychain_account="acct",
             file_path=None,
@@ -4314,7 +4326,7 @@ class TestSecretRetrieval:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # When the host keychain yields nothing (no item, or a host with
-        # no keychain), _retrieve_secret falls back to file_path.
+        # no keychain), retrieve_secret falls back to file_path.
         f = tmp_path / "secret"
         f.write_text("from-file")
         f.chmod(0o600)
@@ -4327,7 +4339,7 @@ class TestSecretRetrieval:
 
         monkeypatch.setattr(crony_runtime, "host", lambda: _NoKeychainHost())
         assert (
-            crony._retrieve_secret(
+            crony_notify.retrieve_secret(
                 keychain_service="missing-item", file_path=str(f)
             )
             == "from-file"
@@ -4389,13 +4401,13 @@ class TestEmailNotify:
         # autospec exercises the real SMTP signature; the resulting
         # mock instance plays the context-manager role with the same
         # return-value contract.
-        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
         smtp_inst.__exit__.return_value = None
-        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(
+        crony_notify.dispatch_notify(
             result, "default.j", "log content here", cfg.defaults
         )
 
@@ -4423,11 +4435,11 @@ class TestEmailNotify:
         cfg = self._common_config(tmp_path)
         result = self._make_failed_result(["email"])
 
-        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
         smtp_inst.__exit__.return_value = None
-        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
 
         log_text = (
             "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
@@ -4435,7 +4447,9 @@ class TestEmailNotify:
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest-run-detail\n"
         )
-        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
+        crony_notify.dispatch_notify(
+            result, "default.j", log_text, cfg.defaults
+        )
         sent = smtp_inst.send_message.call_args[0][0]
         body = sent.get_content()
         assert "newest-run-detail" in body
@@ -4448,11 +4462,11 @@ class TestEmailNotify:
         result = self._make_failed_result(["email"])
 
         smtp_cls = create_autospec(
-            crony.smtplib.SMTP, side_effect=ConnectionRefusedError("no")
+            crony_notify.smtplib.SMTP, side_effect=ConnectionRefusedError("no")
         )
-        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
+        crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is False
         assert "ConnectionRefusedError" in (
             result.notifications["email"].error or ""
@@ -4477,7 +4491,7 @@ class TestEmailNotify:
             }
         )
         result = self._make_failed_result(["email"])
-        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
+        crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is False
         assert "no SMTP password" in (result.notifications["email"].error or "")
 
@@ -4511,13 +4525,13 @@ class TestEmailNotify:
             }
         )
         result = self._make_failed_result(["email"])
-        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
         smtp_inst.__exit__.return_value = None
-        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
 
-        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
+        crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is True
         sent = smtp_inst.send_message.call_args[0][0]
         assert sent["Reply-To"] == "support@example.com"
@@ -4591,8 +4605,10 @@ class TestNtfyNotify:
             captured["method"] = req.get_method()
             return _Resp()
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
-        crony._dispatch_notify(
+        monkeypatch.setattr(
+            crony_notify.urllib.request, "urlopen", _fake_urlopen
+        )
+        crony_notify.dispatch_notify(
             result, "default.j", "log content here", cfg.defaults
         )
 
@@ -4647,14 +4663,16 @@ class TestNtfyNotify:
             captured["data"] = req.data
             return _Resp()
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _fake)
         log_text = (
             "=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n"
             "older-run-detail\n"
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest-run-detail\n"
         )
-        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
+        crony_notify.dispatch_notify(
+            result, "default.j", log_text, cfg.defaults
+        )
         body = captured["data"].decode("utf-8")
         assert "newest-run-detail" in body
         assert "older-run-detail" not in body
@@ -4682,13 +4700,15 @@ class TestNtfyNotify:
             captured["data"] = req.data
             return _Resp()
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _fake)
         log_text = (
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             + ("X" * 5000)
             + "MARKER-AT-TAIL\n"
         )
-        crony._dispatch_notify(result, "default.j", log_text, cfg.defaults)
+        crony_notify.dispatch_notify(
+            result, "default.j", log_text, cfg.defaults
+        )
         body_bytes = captured["data"]
         assert len(body_bytes) <= 3 * 1024
         body = body_bytes.decode("utf-8", errors="replace")
@@ -4739,8 +4759,8 @@ class TestNtfyNotify:
             captured["data"] = req.data
             return _Resp()
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake)
-        crony._dispatch_notify(
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _fake)
+        crony_notify.dispatch_notify(
             result, "default.j", "log content not in body", cfg.defaults
         )
         body = captured["data"].decode("utf-8")
@@ -4758,12 +4778,12 @@ class TestNtfyNotify:
         # urllib raises HTTPError for 4xx/5xx responses; mirror that
         # so the test reflects real-world failure.
         def _raise(req: Any, **_kwargs: object) -> Any:
-            raise crony.urllib.error.HTTPError(
-                req.full_url, 503, "service unavailable", {}, None
+            raise crony_notify.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", Message(), None
             )
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
-        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _raise)
+        crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["ntfy"].sent is False
         assert "503" in (result.notifications["ntfy"].error or "")
 
@@ -4809,8 +4829,10 @@ class TestNtfyNotify:
             captured["headers"] = dict(req.header_items())
             return _Resp()
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fake_urlopen)
-        crony._dispatch_notify(result, "default.j", "log", cfg.defaults)
+        monkeypatch.setattr(
+            crony_notify.urllib.request, "urlopen", _fake_urlopen
+        )
+        crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["ntfy-email"].sent is True
         # User headers reached the request. urllib normalizes header
         # keys via .capitalize().
@@ -4906,7 +4928,7 @@ class TestDialogPopupNotify:
 
         monkeypatch.setattr(crony.subprocess, "Popen", _fake_popen)
         result = self._make_failed_result(["dialog-popup"])
-        crony._dispatch_notify(
+        crony_notify.dispatch_notify(
             result, "borgadm.check-repo", "boom log line", Defaults()
         )
         assert result.notifications["dialog-popup"].sent is True
@@ -4929,7 +4951,7 @@ class TestDialogPopupNotify:
 
         monkeypatch.setattr(crony.subprocess, "Popen", _boom)
         result = self._make_failed_result(["dialog-popup"])
-        crony._dispatch_notify(result, "default.j", "log", Defaults())
+        crony_notify.dispatch_notify(result, "default.j", "log", Defaults())
         nr = result.notifications["dialog-popup"]
         assert nr.sent is False
         assert nr.error_class == "CronyError"
@@ -4947,7 +4969,7 @@ class TestDialogPopupNotify:
             lambda cmd, **_k: captured.setdefault("cmd", cmd),
         )
         result = self._make_failed_result(["dialog-popup"])
-        crony._dispatch_notify(
+        crony_notify.dispatch_notify(
             result, "default.j", 'he said "hi" \\ bye', Defaults()
         )
         script = captured["cmd"][2]
@@ -4967,7 +4989,7 @@ class TestDialogPopupNotify:
             lambda cmd, **_k: captured.setdefault("cmd", cmd),
         )
         result = self._make_failed_result(["dialog-popup"])
-        crony._dispatch_notify(
+        crony_notify.dispatch_notify(
             result,
             "default.j",
             "secret log line",
@@ -4975,11 +4997,11 @@ class TestDialogPopupNotify:
         )
         script = captured["cmd"][2]
         assert "secret log line" not in script
-        assert crony._LOG_SEPARATOR not in script
+        assert crony_notify.LOG_SEPARATOR not in script
 
 
 class TestMultiChannelDispatch:
-    """`_dispatch_notify` fans out across all configured channels and
+    """`dispatch_notify` fans out across all configured channels and
     one channel's failure must not suppress the others. The
     single-channel tests in TestEmailNotify / TestNtfyNotify don't
     exercise this; this class pins the headline contract.
@@ -5037,19 +5059,21 @@ class TestMultiChannelDispatch:
                 "ntfy": crony.NotificationResult(sent=False),
             },
         )
-        smtp_cls = create_autospec(crony.smtplib.SMTP)
+        smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
         smtp_inst.__exit__.return_value = None
-        monkeypatch.setattr(crony.smtplib, "SMTP", smtp_cls)
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
 
         def _fail_post(req: Any, **_kwargs: object) -> Any:
-            raise crony.urllib.error.HTTPError(
-                req.full_url, 503, "service unavailable", {}, None
+            raise crony_notify.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", Message(), None
             )
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _fail_post)
-        crony._dispatch_notify(result, "default.j", "log content", cfg.defaults)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _fail_post)
+        crony_notify.dispatch_notify(
+            result, "default.j", "log content", cfg.defaults
+        )
 
         # email succeeded
         assert result.notifications["email"].sent is True
@@ -5157,11 +5181,11 @@ class TestNotifyTestSubcommand:
         )
 
         def _raise(req: Any, **_kwargs: object) -> Any:
-            raise crony.urllib.error.HTTPError(
-                req.full_url, 503, "service unavailable", {}, None
+            raise crony_notify.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", Message(), None
             )
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _raise)
         with pytest.raises(crony.CronyError) as exc:
             crony.do_notify_test(channel="ntfy", bundle=None)
         # Distinguishing from ConfigError matters: CronyError exits
@@ -5252,11 +5276,11 @@ class TestNotifyTestSubcommand:
 
         def _raise(req: Any, **_kwargs: object) -> Any:
             calls.append(req.full_url)
-            raise crony.urllib.error.HTTPError(
-                req.full_url, 503, "service unavailable", {}, None
+            raise crony_notify.urllib.error.HTTPError(
+                req.full_url, 503, "service unavailable", Message(), None
             )
 
-        monkeypatch.setattr(crony.urllib.request, "urlopen", _raise)
+        monkeypatch.setattr(crony_notify.urllib.request, "urlopen", _raise)
         with pytest.raises(crony.CronyError, match="notify-test failed") as exc:
             crony.do_notify_test(channel=None, bundle="borgadm")
         assert calls, "inherited ntfy channel was not attempted"
@@ -5289,7 +5313,9 @@ class TestNotifyTestSubcommand:
             "[defaults]\n", encoding="utf-8"
         )
         monkeypatch.setattr(
-            crony.urllib.request, "urlopen", lambda *_a, **_k: MagicMock()
+            crony_notify.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: MagicMock(),
         )
         with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel=None, bundle="private")
@@ -5326,7 +5352,9 @@ class TestNotifyTestSubcommand:
             "[defaults]\n", encoding="utf-8"
         )
         monkeypatch.setattr(
-            crony.urllib.request, "urlopen", lambda *_a, **_k: MagicMock()
+            crony_notify.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: MagicMock(),
         )
         with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel="ntfy", bundle="private")
@@ -5360,7 +5388,9 @@ class TestNotifyTestSubcommand:
             default_target_jobs=[],
         )
         monkeypatch.setattr(
-            crony.urllib.request, "urlopen", lambda *_a, **_k: MagicMock()
+            crony_notify.urllib.request,
+            "urlopen",
+            lambda *_a, **_k: MagicMock(),
         )
         with caplog.at_level(logging.INFO, logger="crony_app"):
             crony.do_notify_test(channel=None, bundle=None)
@@ -10534,8 +10564,8 @@ class TestGroupExitClassRollup:
 
 
 class TestLogHelpers:
-    """Direct unit tests for `_extract_latest_log_entry` and
-    `_head_truncate_to_kb`. Exercised end-to-end via TestLogs and
+    """Direct unit tests for `extract_latest_log_entry` and
+    `head_truncate_to_kb`. Exercised end-to-end via TestLogs and
     TestNtfyNotify; this class isolates the boundary conditions
     so a regression in either helper surfaces here first.
     """
@@ -10547,21 +10577,21 @@ class TestLogHelpers:
             "=== 2026-05-02T03:00:00-08:00 j pid=2 ===\n"
             "newest\n"
         )
-        out = crony._extract_latest_log_entry(text)
+        out = crony_notify.extract_latest_log_entry(text)
         assert out.startswith("=== 2026-05-02T03:00:00-08:00")
         assert "newest" in out
         assert "older" not in out
 
     def test_extract_returns_full_text_when_no_header(self) -> None:
         text = "no header here, just content\n"
-        assert crony._extract_latest_log_entry(text) == text
+        assert crony_notify.extract_latest_log_entry(text) == text
 
     def test_extract_returns_empty_for_empty_input(self) -> None:
-        assert crony._extract_latest_log_entry("") == ""
+        assert crony_notify.extract_latest_log_entry("") == ""
 
     def test_head_truncate_under_cap_passes_through(self) -> None:
         text = "small body\n"
-        out, truncated = crony._head_truncate_to_kb(text, 1)
+        out, truncated = crony_notify.head_truncate_to_kb(text, 1)
         assert out == text
         assert truncated is False
 
@@ -10570,7 +10600,7 @@ class TestLogHelpers:
         # the start. The output must be <= 1024 bytes and start with
         # the truncation marker.
         text = "X" * 3000 + "TAIL"
-        out, truncated = crony._head_truncate_to_kb(text, 1)
+        out, truncated = crony_notify.head_truncate_to_kb(text, 1)
         assert truncated is True
         assert len(out.encode("utf-8")) <= 1024
         assert out.startswith("[... ")

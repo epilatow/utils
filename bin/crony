@@ -21,14 +21,11 @@ import re
 import shlex
 import shutil
 import signal
-import smtplib  # noqa: F401  re-exported for tests
 import string
 import subprocess
 import sys
 import time
 import traceback
-import urllib.error  # noqa: F401  re-exported for tests
-import urllib.request  # noqa: F401  re-exported for tests
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -48,6 +45,7 @@ import tomlkit.exceptions
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import crony.notify  # noqa: E402
 import crony.paths  # noqa: E402
 import crony.platform  # noqa: E402
 import crony.runtime  # noqa: E402
@@ -90,13 +88,10 @@ from crony.model import (  # noqa: E402
     snapshot_path_for,
 )
 from crony.notify import (  # noqa: E402
-    _LOG_SEPARATOR,  # noqa: F401  re-exported for tests
-    _dispatch_notify,
-    _expand_notify_inherit,
-    _extract_latest_log_entry,
-    _head_truncate_to_kb,  # noqa: F401  re-exported for tests
-    _resolve_notify_at_runtime,
-    _retrieve_secret,
+    expand_notify_inherit,
+    extract_latest_log_entry,
+    resolve_notify_at_runtime,
+    retrieve_secret,
 )
 from crony.platform import (  # noqa: E402
     PidWait,
@@ -945,7 +940,7 @@ def run_job(
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
-    notify_channels, notify_defaults = _resolve_notify_at_runtime(full_name)
+    notify_channels, notify_defaults = resolve_notify_at_runtime(full_name)
     job_timeout_sec = snap.job_timeout_sec
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see _runtime_env).
@@ -1121,7 +1116,7 @@ def run_job(
                         )[-200_000:]
                     except OSError:
                         pass
-                    _dispatch_notify(
+                    crony.notify.dispatch_notify(
                         result, full_name, log_text, notify_defaults
                     )
 
@@ -4155,7 +4150,7 @@ def do_logs(
         # `--latest` is a single-run readout; it overrides -n /
         # --since since the entry is bounded by run-header
         # markers, not line count or wallclock.
-        text = _extract_latest_log_entry(text)
+        text = extract_latest_log_entry(text)
     else:
         if since is not None:
             text = _filter_since(text, since)
@@ -4426,7 +4421,7 @@ def _validate_bundle_warnings(
             assert channel.email is not None
             label = f"channel {ch_name!r}: SMTP password"
             try:
-                secret = _retrieve_secret(
+                secret = retrieve_secret(
                     keychain_service=channel.email.smtp_pass_keychain_service,
                     keychain_account=channel.email.smtp_pass_keychain_account,
                     file_path=channel.email.smtp_pass_file,
@@ -4450,7 +4445,7 @@ def _validate_bundle_warnings(
             assert channel.ntfy is not None
             label = f"channel {ch_name!r}: ntfy token"
             try:
-                token = _retrieve_secret(
+                token = retrieve_secret(
                     keychain_service=channel.ntfy.token_keychain_service,
                     keychain_account=channel.ntfy.token_keychain_account,
                     file_path=channel.ntfy.token_file,
@@ -4645,10 +4640,10 @@ def _notify_test_one_bundle(
     # for dispatch; a bundle that inherits sends through the default
     # bundle's definitions, so an explicit --channel resolves there
     # too.
-    resolved, eff_defaults = _expand_notify_inherit(
+    resolved, eff_defaults = expand_notify_inherit(
         resolved, bundle.name, bundles, config.defaults
     )
-    # `_expand_notify_inherit` swaps in the default bundle's Defaults
+    # `expand_notify_inherit` swaps in the default bundle's Defaults
     # object only when it actually expands the inherit sentinel, so an
     # identity change means the channels (and their definitions) came
     # from the default bundle.
@@ -4679,7 +4674,7 @@ def _notify_test_one_bundle(
         f"(bundle: {bundle.name}).\n"
         "if you can read this, the channel is working end-to-end.\n"
     )
-    _dispatch_notify(
+    crony.notify.dispatch_notify(
         result, f"{bundle.name}.notify-test", log_text, eff_defaults
     )
     successes = [ch for ch, nr in result.notifications.items() if nr.sent]
