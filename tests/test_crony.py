@@ -49,6 +49,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
+from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
@@ -3701,7 +3702,7 @@ def _stub_trigger_sync(
         )
         return results.get(full_name, {"exit_code": 0, "exit_class": "ok"})
 
-    monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+    monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _stub)
     monkeypatch.setattr(crony, "_ledger", ledger, raising=False)
 
 
@@ -3873,7 +3874,7 @@ class TestRunGroup:
             return float(real_monotonic()) + clock["now"]
 
         monkeypatch.setattr(crony.time, "monotonic", fake_monotonic)
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _slow)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _slow)
 
         # Advance the fake clock forward in the stub so the second
         # iteration sees no remaining budget.
@@ -3884,7 +3885,7 @@ class TestRunGroup:
             clock["now"] += 11.0  # past 1.05*(5+5) budget
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_advance)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _stub_advance)
 
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "b")
@@ -3926,7 +3927,7 @@ class TestRunGroup:
             captured[full_name] = job_timeout
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _capture)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _capture)
         h.write_snap(cfg, "a")
         assert crony.run_group(h.snap(cfg, "g")) == 0
         assert math.isinf(captured[h.full("a")])
@@ -3968,7 +3969,7 @@ class TestRunGroup:
                 )
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _stub)
         h.write_snap(cfg, "missing")
         h.write_snap(cfg, "ok")
         rc = crony.run_group(h.snap(cfg, "g"))
@@ -4017,7 +4018,7 @@ class TestRunGroup:
         def _stub(*_args: object, **_kwargs: object) -> dict[str, Any]:
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _stub)
         # Only "ok" gets a snapshot; "gone" stays unresolvable.
         h.write_snap(cfg, "ok")
         rc = crony.run_group(h.snap(cfg, "g"))
@@ -4079,8 +4080,8 @@ class TestRunGroupInteractive:
         def _stub_async(name: str, *_args: object, **_kwargs: object) -> None:
             async_calls.append(name)
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _stub_sync)
-        monkeypatch.setattr(crony, "_trigger_unit", _stub_async)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _stub_sync)
+        monkeypatch.setattr(crony_runner, "_trigger_unit", _stub_async)
 
         rc = crony.run_group(h.snap(cfg, "g"))
         assert rc == 0
@@ -5674,7 +5675,7 @@ class TestKeepAwake:
             captured["argv"] = argv
             return crony.ExitOutcome(rc=0, signal=None)
 
-        monkeypatch.setattr(crony, "_exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -5709,7 +5710,7 @@ class TestKeepAwake:
             captured["job_timeout_sec"] = job_timeout_sec
             return crony.ExitOutcome(rc=0, signal=None)
 
-        monkeypatch.setattr(crony, "_exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -7177,7 +7178,7 @@ class TestEnableDisable:
         )
         h.apply("j")
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_trigger_unit_sync",
             lambda *_a, **_kw: {
                 "exit_class": "timeout",
@@ -7217,7 +7218,7 @@ class TestEnableDisable:
             captured["job_timeout"] = kw["job_timeout"]
             return {"exit_class": "ok", "exit_code": 0, "signal": None}
 
-        monkeypatch.setattr(crony, "_trigger_unit_sync", _capture)
+        monkeypatch.setattr(crony_runner, "_trigger_unit_sync", _capture)
         crony.do_trigger(
             jobs=["j"], wait=True, trigger_timeout=None, bundle=None
         )
@@ -7233,7 +7234,7 @@ class TestEnableDisable:
         )
         h.apply("j")
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_trigger_unit_sync",
             lambda *_a, **_kw: {
                 "exit_class": "signal",
@@ -7257,7 +7258,7 @@ class TestEnableDisable:
         )
         h.apply("j")
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_trigger_unit_sync",
             lambda *_a, **_kw: {
                 "exit_class": "fail",
@@ -7284,7 +7285,7 @@ class TestEnableDisable:
         )
         h.apply("j")
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_trigger_unit_sync",
             lambda *_a, **_kw: {
                 "exit_class": "ok",
@@ -12044,7 +12045,7 @@ class TestTriggerUnitSync:
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
+        monkeypatch.setattr(crony_runner, "_trigger_unit", _stub_trigger)
         rec = crony._trigger_unit_sync(
             full, state_dir=sd, job_timeout=5.0, trigger_timeout=5.0
         )
@@ -12057,7 +12058,9 @@ class TestTriggerUnitSync:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
-        monkeypatch.setattr(crony, "_trigger_unit", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            crony_runner, "_trigger_unit", lambda *_a, **_kw: None
+        )
         with pytest.raises(crony.TriggerStartTimeout, match="never produced"):
             crony._trigger_unit_sync(
                 full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
@@ -12078,7 +12081,9 @@ class TestTriggerUnitSync:
             ' "exit_code": 0, "exit_class": "ok"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony, "_trigger_unit", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            crony_runner, "_trigger_unit", lambda *_a, **_kw: None
+        )
         with pytest.raises(crony.TriggerStartTimeout):
             crony._trigger_unit_sync(
                 full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
@@ -12107,7 +12112,7 @@ class TestTriggerUnitSync:
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(crony, "_trigger_unit", _stub_trigger)
+        monkeypatch.setattr(crony_runner, "_trigger_unit", _stub_trigger)
         rec = crony._trigger_unit_sync(
             full, state_dir=sd, job_timeout=5.0, trigger_timeout=2.0
         )
@@ -12148,8 +12153,10 @@ class TestTriggerUnitSync:
             (sd / "run.pid").unlink(missing_ok=True)
             return PidWait.EXITED
 
-        monkeypatch.setattr(crony, "_trigger_unit", lambda *_a, **_kw: None)
-        monkeypatch.setattr(crony, "_wait_for_pid_exit", _stub_wait)
+        monkeypatch.setattr(
+            crony_runner, "_trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _stub_wait)
         rec = crony._trigger_unit_sync(
             full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
         )
@@ -13396,7 +13403,7 @@ class TestRunJobInteractive:
             default_target_jobs=["iv"],
         )
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_interactive_wait_and_prompt",
             lambda _snap, _log_file: "run",
         )
@@ -13424,7 +13431,7 @@ class TestRunJobInteractive:
             default_target_jobs=["iv"],
         )
         monkeypatch.setattr(
-            crony,
+            crony_runner,
             "_interactive_wait_and_prompt",
             lambda _snap, _log_file: "cancel",
         )
@@ -13465,7 +13472,9 @@ class TestRunJobInteractive:
             called.append(True)
             return "run"
 
-        monkeypatch.setattr(crony, "_interactive_wait_and_prompt", _no_wait)
+        monkeypatch.setattr(
+            crony_runner, "_interactive_wait_and_prompt", _no_wait
+        )
         rc = crony.run_job(h.snap(cfg, "iv"))
         assert rc == 0
         assert called == []
