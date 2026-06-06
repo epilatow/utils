@@ -10,7 +10,7 @@ selection) and the model<->dict serialization that backs snapshot.json.
 
 Everything here is pure: it operates on already-parsed config objects
 and produces in-memory model values. Disk reads, locks, and scheduler
-queries live in the caller (bin/crony).
+queries live in crony.runtime.
 """
 
 from __future__ import annotations

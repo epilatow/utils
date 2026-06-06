@@ -11,10 +11,8 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
 import datetime
-import fcntl
 import json
 import logging
 import math
@@ -32,7 +30,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -85,26 +83,38 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,
-    BrokenEntity,
+    SNAPSHOT_SCHEMA,  # noqa: F401  re-exported for tests
     Config,
     Graph,
     Job,
     JobGroup,
-    LastRun,
-    RuntimeState,
-    UnitOnlyOrphan,
     entity_state_dir,
-    snapshot_from_dict,
     snapshot_path_for,
 )
 from crony.platform import (  # noqa: E402
-    HostPlatform,
     PidWait,
-    Scheduler,
     SchedulerWarning,
-    get_host,
-    get_scheduler,
+    get_scheduler,  # noqa: F401  re-exported for tests
+)
+from crony.runtime import (  # noqa: E402
+    _acquire_lock,
+    _consume_user_trigger_flag,
+    _dispatch_unit_path,
+    _host,
+    _load_snapshot,
+    _now_iso,
+    _platform_unit_config_path,  # noqa: F401  re-exported for tests
+    _platform_unit_names,  # noqa: F401  re-exported for tests
+    _read_pid_file,
+    _recover_full_name,
+    _run_in_progress,
+    _scheduler,
+    _state_dir_for,
+    _unit_state,
+    _user_trigger_flag_path,
+    _write_last_run,
+    _write_user_trigger_flag,
+    load_config,
 )
 from crony.unit import (  # noqa: E402
     EntityRef,
@@ -545,64 +555,6 @@ def _timeout_to_wait(sec: int) -> float:
 
 
 # =============================================================================
-# APPLIED SNAPSHOT I/O
-# =============================================================================
-# Apply pins each entry's resolved Job / JobGroup into a JSON snapshot
-# next to its platform unit, so editing the toml without `apply` has no
-# effect on running units. `_load_snapshot` reads one back from disk and
-# schema-checks it. The snapshot model itself -- the Job / JobGroup value
-# objects, their serialization, and the dataclass-equality drift check --
-# lives in `crony.model`.
-
-
-def _load_snapshot(ref: EntityRef) -> Job | JobGroup:
-    """Load and validate a snapshot file by ref. Raises
-    PreconditionError if missing (entry not applied) or schema
-    mismatch (re-apply required).
-
-    The platform unit's argv carries `bundle:uuid` so the runner
-    addresses the snapshot directly via `entity_state_dir`
-    without scanning the bundle's state dirs. The error messages
-    use the recovered `name` field when available so the operator
-    sees the human-readable identity.
-    """
-    state_dir = entity_state_dir(ref)
-    ref_str = str(ref)
-    p = state_dir / "snapshot.json"
-    if not p.is_file():
-        raise PreconditionError(
-            f"no snapshot for {ref_str} (run `crony apply` first; "
-            f"if state exists on disk, ensure {p} is parseable)"
-        )
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise PreconditionError(f"snapshot at {p} is unreadable: {e}") from e
-    name_hint = raw.get("name") if isinstance(raw, dict) else None
-    display = name_hint if isinstance(name_hint, str) else ref_str
-    schema = raw.get("schema") if isinstance(raw, dict) else None
-    if schema != SNAPSHOT_SCHEMA:
-        raise PreconditionError(
-            f"snapshot for {display!r} has schema {schema!r}, "
-            f"expected {SNAPSHOT_SCHEMA} (re-apply required)"
-        )
-    # A schema-matched but otherwise malformed snapshot (extra /
-    # missing fields, a bad schedule / interval string, or an unknown
-    # kind) raises TypeError / ValueError from snapshot_from_dict.
-    # `_build_current_graph` already treats that as a broken entity;
-    # mirror it here so the runner records a `canceled` last-run via
-    # its PreconditionError handler instead of crashing with a
-    # traceback the scheduler never sees.
-    try:
-        return snapshot_from_dict(raw)
-    except (TypeError, ValueError) as e:
-        raise PreconditionError(
-            f"snapshot for {display!r} has malformed fields: {e} "
-            f"(re-apply required)"
-        ) from e
-
-
-# =============================================================================
 # RUNNER
 # =============================================================================
 # `crony run <bundle>:<uuid>` is the platform unit's entry point --
@@ -689,279 +641,6 @@ class GroupRunResult:
     jobs_run: list[GroupChildResult]
 
 
-# =============================================================================
-# CONFIG MODEL (pending + current graphs, runtime state, world view)
-# =============================================================================
-# Built once at startup by `load_config()`. The rest of crony treats
-# the result as read-only: apply / destroy plan their work against
-# the loaded Config, perform disk mutations, and exit. A caller that
-# needs the post-mutation view re-invokes `load_config()`. No
-# subcommand re-scans crony's on-disk state after load -- the model
-# is the single source. (`config validate` is config-only: it parses
-# the TOML via `TomlConfig.load_all()` and never inspects applied
-# state.)
-
-
-def _read_runtime_state(
-    state_dir: Path,
-    *,
-    full_name: str | None,
-    snapshot: Job | JobGroup | None = None,
-) -> RuntimeState:
-    """Snapshot the runtime-only state inside one state dir: the
-    parsed last-run record and presence of the lock / pending /
-    user-trigger flag files. When `full_name` is known, also probe
-    the platform unit file path so subcommands can read it from
-    RuntimeState instead of walking the unit dirs ad-hoc.
-    `full_name` is None only for a broken entry whose snapshot
-    didn't yield a recoverable name.
-
-    `snapshot` is the parsed `Job` / `JobGroup` for entries in
-    `Config.current`; when supplied (with a known `full_name`),
-    the unit-install integrity check runs and `unit_is_stale`
-    reflects the result. Left None for broken refs (no snapshot)
-    and unit-only refs (no state dir to read from).
-    """
-    last_run: LastRun | None = None
-    last_run_path = state_dir / "last-run.json"
-    if last_run_path.is_file():
-        try:
-            raw = json.loads(last_run_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = None
-        if isinstance(raw, dict):
-            last_run = LastRun.from_raw(raw)
-
-    is_running = False
-    lock_path = state_dir / "run.lock"
-    if lock_path.is_file():
-        try:
-            with _acquire_lock(lock_path):
-                pass
-        except LockBusyError:
-            is_running = True
-
-    unit_config: Path | None = None
-    unit_timer: Path | None = None
-    unit_is_stale = False
-    if full_name is not None:
-        unit_config = _platform_unit_config_path(full_name)
-        unit_timer = _platform_unit_timer_path(full_name)
-        if snapshot is not None:
-            unit_is_stale = _unit_is_stale(snapshot)
-
-    return RuntimeState(
-        state_dir=state_dir,
-        last_run=last_run,
-        is_running=is_running,
-        is_pending=(state_dir / "pending.flag").is_file(),
-        has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
-        unit_config=unit_config,
-        unit_timer=unit_timer,
-        unit_is_stale=unit_is_stale,
-    )
-
-
-def _build_current_graph(
-    state_root: Path,
-) -> tuple[Graph, dict[EntityRef, BrokenEntity], dict[EntityRef, RuntimeState]]:
-    """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
-    with a parseable schema-matched `snapshot.json` becomes a
-    current-graph node; the rest of the dir contents become its
-    `RuntimeState`. Snapshots that exist but can't be turned into
-    a `Job` / `JobGroup` (corrupt JSON, wrong schema, unrecognized
-    kind, dataclass `TypeError`) become `BrokenEntity` records so
-    status / destroy can surface them with a clear
-    "re-apply required" signal instead of treating the entry as
-    silently absent.
-    """
-    current = Graph()
-    broken: dict[EntityRef, BrokenEntity] = {}
-    runtime: dict[EntityRef, RuntimeState] = {}
-    if not state_root.exists():
-        return current, broken, runtime
-    for bundle_dir in state_root.iterdir():
-        if not bundle_dir.is_dir():
-            continue
-        for uuid_dir in bundle_dir.iterdir():
-            if not uuid_dir.is_dir():
-                continue
-            snap_path = uuid_dir / "snapshot.json"
-            if not snap_path.is_file():
-                continue
-            ref = EntityRef(bundle_dir.name, uuid_dir.name)
-            try:
-                raw = json.loads(snap_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                broken[ref] = BrokenEntity(
-                    bundle=bundle_dir.name,
-                    uuid=uuid_dir.name,
-                    name=None,
-                    reason=f"snapshot.json unreadable: {exc}",
-                    source_path=snap_path,
-                )
-                continue
-            raw_name = raw.get("name") if isinstance(raw, dict) else None
-            name_hint = raw_name if isinstance(raw_name, str) else None
-            if not isinstance(raw, dict):
-                broken[ref] = BrokenEntity(
-                    bundle=bundle_dir.name,
-                    uuid=uuid_dir.name,
-                    name=name_hint,
-                    reason="snapshot.json is not a JSON object",
-                    source_path=snap_path,
-                )
-                continue
-            if raw.get("schema") != SNAPSHOT_SCHEMA:
-                broken[ref] = BrokenEntity(
-                    bundle=bundle_dir.name,
-                    uuid=uuid_dir.name,
-                    name=name_hint,
-                    reason=(
-                        f"snapshot schema {raw.get('schema')!r} "
-                        f"(expected {SNAPSHOT_SCHEMA})"
-                    ),
-                    source_path=snap_path,
-                )
-                continue
-            try:
-                snap = snapshot_from_dict(raw)
-            except (TypeError, ValueError) as exc:
-                broken[ref] = BrokenEntity(
-                    bundle=bundle_dir.name,
-                    uuid=uuid_dir.name,
-                    name=name_hint,
-                    reason=f"snapshot conversion failed: {exc}",
-                    source_path=snap_path,
-                )
-                continue
-            full = str(snap.name)
-            if isinstance(snap, Job):
-                current.jobs[snap.ref] = snap
-                current.by_full_name[full] = snap.ref
-                runtime[snap.ref] = _read_runtime_state(
-                    uuid_dir,
-                    full_name=full,
-                    snapshot=snap,
-                )
-            else:
-                current.groups[snap.ref] = snap
-                current.by_full_name[full] = snap.ref
-                runtime[snap.ref] = _read_runtime_state(
-                    uuid_dir,
-                    full_name=full,
-                    snapshot=snap,
-                )
-    # Broken entries get a runtime entry too -- the state dir
-    # exists and carries the same per-run files (last-run.json /
-    # run.lock / pending.flag / user-trigger.flag) as a normal
-    # current entry, plus the platform unit path. Without this
-    # the unit-config / last / last-ran columns render empty
-    # for broken rows even when those files are on disk.
-    for ref, broken_entry in broken.items():
-        state_dir = entity_state_dir(ref)
-        runtime[ref] = _read_runtime_state(
-            state_dir,
-            full_name=broken_entry.name,
-        )
-    return current, broken, runtime
-
-
-def load_config() -> Config:
-    """Build the whole-process Config: parse every bundle's TOML,
-    walk the state-dir tree once, build pending + current graphs +
-    runtime state in memory, and detect platform-unit-only orphans.
-    """
-    host = crony.platform.current_host()
-    platform = crony.platform.current_platform()
-
-    toml_config = TomlConfig.load_all()
-    pending = Graph.build_pending(toml_config)
-    current, broken, runtime = _build_current_graph(crony.paths.STATE_DIR)
-
-    # Resolve same-name collisions among current entries. Two state
-    # dirs can recover the same full name (uuid-edit residue that
-    # escaped apply's cleanup, or hand-mucked state). The ref that
-    # matches the live config keeps the plain name; the rest become
-    # `shadowed` and surface by `<bundle>:<UUID>` in status. Without
-    # this, `current.by_full_name` would silently drop all but the
-    # last-scanned ref, hiding the residue.
-    shadowed: set[EntityRef] = set()
-    name_to_refs: dict[str, list[EntityRef]] = {}
-    for ref in current.refs():
-        snap = current.jobs.get(ref) or current.groups.get(ref)
-        assert snap is not None  # ref came from current.refs()
-        name_to_refs.setdefault(str(snap.name), []).append(ref)
-    pending_refs = pending.refs()
-    for name, refs in name_to_refs.items():
-        if len(refs) < 2:
-            continue
-        winner = next((r for r in refs if r in pending_refs), None)
-        if winner is None:
-            winner = min(refs, key=lambda r: r.uuid)
-        current.by_full_name[name] = winner
-        shadowed.update(r for r in refs if r != winner)
-
-    broken_by_full_name: dict[str, EntityRef] = {}
-    for ref, broken_entry in broken.items():
-        if broken_entry.name is not None:
-            broken_by_full_name[broken_entry.name] = ref
-
-    # Platform unit files whose name isn't in `current` or
-    # `broken`: state-dir-less remnants (typically a state wipe
-    # without `crony destroy` first). Synthesize a deterministic
-    # `uuid5` so the entity has a stable EntityRef downstream and
-    # `destroy` can address it through the same machinery as
-    # other on-disk entities.
-    accounted_labels: set[str] = set(current.by_full_name)
-    accounted_labels.update(broken_by_full_name)
-    unit_only: dict[EntityRef, UnitOnlyOrphan] = {}
-    unit_only_by_full_name: dict[str, EntityRef] = {}
-    for full_name in _platform_unit_names() - accounted_labels:
-        bundle_name, _, _ = full_name.partition(".")
-        if not bundle_name:
-            continue
-        synthetic = str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, f"crony.unit-only/{full_name}")
-        )
-        ref = EntityRef(bundle_name, synthetic)
-        unit_only[ref] = UnitOnlyOrphan(
-            bundle=bundle_name,
-            uuid=synthetic,
-            name=full_name,
-            has_unit_file=True,
-        )
-        unit_only_by_full_name[full_name] = ref
-        # Make the platform paths available through RuntimeState so
-        # status's unit-config / unit-timer columns don't re-walk the
-        # unit dirs.
-        unit_config = _platform_unit_config_path(full_name)
-        unit_timer = _platform_unit_timer_path(full_name)
-        runtime[ref] = RuntimeState(
-            state_dir=entity_state_dir(ref),
-            last_run=None,
-            is_running=False,
-            is_pending=False,
-            has_user_trigger_flag=False,
-            unit_config=unit_config,
-            unit_timer=unit_timer,
-        )
-
-    return Config(
-        toml_config=toml_config,
-        pending=pending,
-        current=current,
-        broken=broken,
-        broken_by_full_name=broken_by_full_name,
-        unit_only=unit_only,
-        unit_only_by_full_name=unit_only_by_full_name,
-        runtime=runtime,
-        host=host,
-        platform=platform,
-        shadowed=shadowed,
-    )
-
-
 def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
     """Worst-of children's exit_class, with a precedence ladder.
 
@@ -992,73 +671,6 @@ def _rollup_group_exit_class(children: list[GroupChildResult]) -> str:
             worst_score = score
             worst_class = c.exit_class
     return worst_class
-
-
-def _state_dir_for(ref: EntityRef) -> Path:
-    """State directory for an entity, materialized on disk.
-
-    Returns the uuid-keyed state dir for `ref`, creating it (and
-    the bundle subdir) when missing. Used by apply and the runner
-    -- both write files under the returned path on every call, so
-    a pre-existing empty dir is the right starting state.
-
-    Also materializes an empty `run.log` when absent, so it exists
-    from apply time onward -- an operator can `tail -f` it before
-    the entity's first run instead of racing the runner to create
-    it. Only created when missing, never truncated, so an existing
-    log survives a re-apply untouched.
-    """
-    d = entity_state_dir(ref)
-    d.mkdir(parents=True, exist_ok=True)
-    log_path = d / "run.log"
-    if not log_path.exists():
-        log_path.touch()
-    return d
-
-
-def _now_iso() -> str:
-    """Current local time in ISO 8601 format with timezone offset."""
-    return (
-        datetime.datetime.now(datetime.UTC)
-        .astimezone()
-        .isoformat(timespec="seconds")
-    )
-
-
-@contextlib.contextmanager
-def _acquire_lock(lock_path: Path) -> Iterator[None]:
-    """Hold an exclusive non-blocking flock on lock_path for a run.
-
-    The lock is a run-liveness signal: a held lock means a run is in
-    flight, which `_run_in_progress` (and status / apply / destroy
-    through it) reads by probing whether the lock is acquirable. flock
-    is used rather than the sibling run.pid because the kernel releases
-    it when the runner dies, so a crashed run never reads as still
-    running.
-
-    Acquisition is non-blocking and raises LockBusyError when the lock
-    is already held. In normal operation that does not happen: jobs run
-    only via their platform unit, and a second fire of an
-    already-running unit is coalesced into a no-op, so a given run.lock
-    has a single contender. The raise is therefore incidental
-    single-flight defense against a stray direct `crony run`, not the
-    mechanism that prevents concurrent scheduled fires. The lock file is
-    left in place across runs.
-    """
-    fd = open(lock_path, "w")
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e:
-            raise LockBusyError(
-                f"another instance of {lock_path.parent.name} is running"
-            ) from e
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        fd.close()
 
 
 def _expand_env_value(raw: str, env: dict[str, str]) -> str:
@@ -1229,19 +841,6 @@ def _wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
     notification; delegates to the HostPlatform backend. `timeout=None`
     waits indefinitely."""
     return _host().wait_for_pid_exit(pid, timeout)
-
-
-def _write_last_run(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write last-run.json so partial writes can't corrupt it.
-
-    Insertion order is preserved (no `sort_keys=True`): top-level keys
-    follow dataclass field order, and `notifications` keeps the
-    configured channel order so the on-disk record matches what the
-    user wrote in the toml.
-    """
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
 
 
 _NOTIFY_TIMEOUT_SEC: int = 15
@@ -2448,46 +2047,6 @@ def run_group(
 # platform branch -- the backend owns its own unit directory.
 
 
-def _platform_unit_config_path(
-    name: str, platform: str | None = None
-) -> Path | None:
-    """The on-disk platform config unit file backing `name`, or None.
-    The status `unit-config` column reads this from `RuntimeState`."""
-    return _scheduler(platform).unit_config_path(name)
-
-
-def _platform_unit_timer_path(
-    name: str, platform: str | None = None
-) -> Path | None:
-    """The on-disk timer unit arming `name`'s schedule, or None when the
-    platform has no separate timer unit or the entry is unscheduled. The
-    status `unit-timer` column reads this from `RuntimeState`."""
-    return _scheduler(platform).unit_timer_path(name)
-
-
-def _dispatch_unit_path(name: str, platform: str | None = None) -> Path:
-    """File `_trigger_unit` fires for `name` (may not exist). Used to
-    refuse early when the unit was never installed."""
-    return _scheduler(platform).dispatch_unit_path(name)
-
-
-def _scheduler(platform: str | None = None) -> Scheduler:
-    """The platform Scheduler for the host. `platform` defaults to the
-    running host's `crony.platform.current_platform()`; tests pass it
-    explicitly to exercise a specific backend. Built per call; the
-    backend resolves its own unit directory (honoring its CRONY_*_DIR
-    env override), so tests that redirect that env are picked up."""
-    if platform is None:
-        platform = crony.platform.current_platform()
-    return get_scheduler(platform)
-
-
-def _host() -> HostPlatform:
-    """The HostPlatform backend for the running host. Built per call via
-    crony.platform.current_platform() so tests can redirect the platform."""
-    return get_host(crony.platform.current_platform())
-
-
 def _render_units(
     snap: Job | JobGroup, platform: str | None = None
 ) -> dict[str, str]:
@@ -2503,12 +2062,6 @@ def _render_units(
         uv_path=_uv_executable(),
         crony_path=_crony_executable(),
     )
-
-
-def _unit_is_stale(snap: Job | JobGroup, platform: str | None = None) -> bool:
-    """True when the platform install diverges from the snapshot --
-    delegates to the scheduler's drift check."""
-    return _scheduler(platform).is_stale(snap.unit_spec())
 
 
 def _schedule_display(timing: Timing | None) -> str:
@@ -2700,37 +2253,6 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     shutil.rmtree(state_dir)
 
 
-def _recover_full_name(state_dir: Path) -> str | None:
-    """Return the full namespaced name a state dir was last
-    applied under, or None when the snapshot is missing or
-    unreadable.
-    """
-    snap_p = state_dir / "snapshot.json"
-    if not snap_p.is_file():
-        return None
-    try:
-        raw = json.loads(snap_p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    name = raw.get("name")
-    return name if isinstance(name, str) else None
-
-
-def _run_in_progress(state_dir: Path) -> bool:
-    """True when `state_dir`'s `run.lock` is held by another
-    process -- a fire is in flight. False when the lock file is
-    absent or freely acquirable.
-    """
-    lock_path = state_dir / "run.lock"
-    if not lock_path.is_file():
-        return False
-    try:
-        with _acquire_lock(lock_path):
-            return False
-    except LockBusyError:
-        return True
-
-
 def _sweep_superseded_state_dirs(
     keep: EntityRef, full_name: str, live_uuids: set[str]
 ) -> None:
@@ -2776,22 +2298,6 @@ def _sweep_superseded_state_dirs(
         )
 
 
-def _platform_unit_names() -> set[str]:
-    """Names with a crony-managed platform unit file on this host.
-
-    Walks the platform's user-unit directory and returns the name
-    encoded in every crony-shaped filename -- including a stray whose
-    name isn't a valid `<bundle>.<short>` (a hand-created or legacy
-    unit), so `crony destroy` can still reach it. Used to discover
-    entries whose unit landed on disk but whose state dir is missing
-    -- e.g. a state wipe (rm -rf ~/.local/state/crony/) without
-    `crony destroy` first. Without this, those units would be
-    invisible to status / destroy and the user would have to track
-    them down manually.
-    """
-    return _scheduler().installed_names()
-
-
 # =============================================================================
 # RUNTIME STATE (enable / disable / status / linger)
 # =============================================================================
@@ -2800,19 +2306,6 @@ def _platform_unit_names() -> set[str]:
 # config but `disabled` at runtime because the user paused it. apply
 # preserves this state across re-renders so a hand-disabled job stays
 # off when the user runs `crony apply` to push other changes.
-
-
-def _unit_state(name: str, platform: str | None = None) -> str:
-    """The platform scheduler's enable state for a stamped entity:
-    `enabled`, `disabled`, or `none`.
-
-    Distinct from CONFIG: a unit can be configured-and-stamped while
-    being disabled at the platform scheduler. `none` means the
-    scheduler doesn't know a unit by this name -- nothing instantiated
-    to flip on or off. (The `grouped` UNIT-axis value, for an entry
-    with no own unit to enable, is set by the status caller, not here.)
-    """
-    return _scheduler(platform).state(name).value
 
 
 def _last_run_state(config: Config, full_name: str) -> str:
@@ -3019,45 +2512,6 @@ def _trigger_unit(
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
             _user_trigger_flag_path(state_dir).unlink(missing_ok=True)
-
-
-def _user_trigger_flag_path(state_dir: Path) -> Path:
-    """Filesystem path of the one-shot user-trigger sentinel."""
-    return state_dir / "user-trigger.flag"
-
-
-def _write_user_trigger_flag(state_dir: Path) -> None:
-    """Write the user-trigger sentinel just before kicking the
-    platform scheduler. Empty file -- presence is the signal. The
-    caller passes the entry's uuid-keyed state dir so the sentinel
-    lives alongside the other per-run files (run.lock, pending.flag,
-    last-run.json).
-    """
-    state_dir.mkdir(parents=True, exist_ok=True)
-    _user_trigger_flag_path(state_dir).write_bytes(b"")
-
-
-def _consume_user_trigger_flag(state_dir: Path) -> bool:
-    """Read-and-delete the user-trigger sentinel. Returns True if
-    the flag was present (the runner should bypass the interactive
-    wait), False otherwise.
-    """
-    try:
-        _user_trigger_flag_path(state_dir).unlink()
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _read_pid_file(pid_path: Path) -> int | None:
-    try:
-        text = pid_path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
 
 
 def _trigger_unit_sync(
