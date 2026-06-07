@@ -93,6 +93,7 @@ class ExitCode(ExitCodeBase):
     CHECK_REPO = 12, "Check failed: repo metadata"
     CHECK_ARCHIVES = 13, "Check failed: archive metadata"
     CHECK_PRUNE = 14, "Check failed: unpruned archives"
+    CHECK_FULL = 15, "Check failed: full repo + archives"
 
 
 class BorgadmError(RuntimeError):
@@ -135,6 +136,12 @@ class CheckArchivesError(BorgadmError):
     """Archive metadata check failed."""
 
     exit_code = ExitCode.CHECK_ARCHIVES
+
+
+class CheckFullError(BorgadmError):
+    """Full repo + archives check failed."""
+
+    exit_code = ExitCode.CHECK_FULL
 
 
 class CheckPruneError(BorgadmError):
@@ -1361,8 +1368,7 @@ def _crony_jobs() -> list[tuple[str, str, str]]:
         ),
         ("check-age", check("age"), "1d"),
         ("check-prune", check("prune"), "1d"),
-        ("check-repo", check("repo"), "7d"),
-        ("check-archives", check("archives"), "7d"),
+        ("check-full", check("full"), "7d"),
     ]
 
 
@@ -1583,28 +1589,80 @@ def do_check_age() -> None:
     )
 
 
-def do_check_all(progress: bool) -> None:
-    do_check_age()
-    do_check_prune()
-    do_check_repo(progress)
-    do_check_archives(progress)
+def _borg_check_cmd(
+    target: str,
+    *,
+    progress: bool,
+    repository_only: bool = False,
+    archives_only: bool = False,
+    repair: bool = False,
+) -> list[str]:
+    """Build a `borg check` argv for one target.
+
+    `repository_only` and `archives_only` select borg's two check phases
+    (segment/index vs. archive metadata) and are mutually exclusive;
+    passing neither runs both. `repair` adds --repair -- callers gate it
+    behind --yes and set the BORG_CHECK_I_KNOW_WHAT_I_AM_DOING env borg
+    requires for non-interactive repair.
+    """
+    assert not (repository_only and archives_only), (
+        "repository_only and archives_only are mutually exclusive"
+    )
+    args = borg_cmd() + ["check"]
+    if repair:
+        args.append("--repair")
+    if repository_only:
+        args.append("--repository-only")
+    if archives_only:
+        args.append("--archives-only")
+    if progress:
+        args.append("--progress")
+    args.append(target)
+    return args
 
 
-def do_check_archives(progress: bool) -> None:
-    backups = list_backups(latest=True)
-    if not backups:
-        raise CheckNoBackupsError("No full backups found.")
-    assert len(backups.keys()) == 1
-    archives = list(backups.values())[0]
-    for archive in archives:
-        logger.info(f"Checking archive metadata: {archive}")
-        args = ["check", *(["--progress"] if progress else []), archive]
+def _check_archive_targets(targets: list[str], progress: bool) -> None:
+    for target in targets:
+        logger.info(f"Checking archive metadata: {target}")
+        cmd = _borg_check_cmd(target, progress=progress)
         try:
-            run_cmd(borg_cmd() + args, allow_output=progress)
+            run_cmd(cmd, allow_output=progress)
         except SubprocessError as e:
             raise CheckArchivesError(
-                f"Archive metadata check failed: {archive}"
+                f"Archive metadata check failed: {target}"
             ) from e
+
+
+def do_check_archives(
+    progress: bool, latest: bool, archives: list[str]
+) -> None:
+    cfg = get_cfg()
+    assert not (latest and archives), (
+        "latest and archives are mutually exclusive"
+    )
+    if archives:
+        raw_names = list_backups_raw().stdout.strip().splitlines()
+        targets: list[str] = []
+        for name in archives:
+            if name not in raw_names:
+                raise BorgadmError(f"Archive not found: {name}")
+            targets.append(f"{cfg.BORG_REPO}::{name}")
+        _check_archive_targets(targets, progress)
+    elif latest:
+        backups = list_backups(latest=True)
+        if not backups:
+            raise CheckNoBackupsError("No full backups found.")
+        assert len(backups.keys()) == 1
+        _check_archive_targets(list(backups.values())[0], progress)
+    else:
+        logger.info("Checking archive metadata.")
+        cmd = _borg_check_cmd(
+            cfg.BORG_REPO, progress=progress, archives_only=True
+        )
+        try:
+            run_cmd(cmd, allow_output=progress)
+        except SubprocessError as e:
+            raise CheckArchivesError("Archive metadata check failed.") from e
 
 
 def do_check_prune() -> None:
@@ -1634,11 +1692,25 @@ def do_check_prune() -> None:
 def do_check_repo(progress: bool) -> None:
     cfg = get_cfg()
     logger.info("Checking repo metadata.")
-    args = ["check", *(["--progress"] if progress else []), cfg.BORG_REPO]
+    cmd = _borg_check_cmd(
+        cfg.BORG_REPO, progress=progress, repository_only=True
+    )
     try:
-        run_cmd(borg_cmd() + args, allow_output=progress)
+        run_cmd(cmd, allow_output=progress)
     except SubprocessError as e:
         raise CheckRepoError("Repo metadata check failed.") from e
+
+
+def do_check_full(progress: bool) -> None:
+    cfg = get_cfg()
+    logger.info("Checking full repo and archive metadata.")
+    cmd = _borg_check_cmd(cfg.BORG_REPO, progress=progress)
+    try:
+        run_cmd(cmd, allow_output=progress)
+    except SubprocessError as e:
+        raise CheckFullError(
+            "Full repo and archive metadata check failed."
+        ) from e
 
 
 def do_compact(progress: bool) -> None:
@@ -2197,7 +2269,20 @@ def do_repair_delete_cache() -> None:
     logger.info("Cache deleted successfully.")
 
 
-def do_repair_repo(progress: bool, yes: bool) -> None:
+def _repair_check(
+    *,
+    progress: bool,
+    yes: bool,
+    repository_only: bool = False,
+    archives_only: bool = False,
+) -> None:
+    """Run `borg check --repair` over the whole repo.
+
+    `repository_only` / `archives_only` scope the repair to one of
+    borg's two check phases (see `_borg_check_cmd`); passing neither
+    repairs both. The --yes gate guards every variant -- repair is
+    potentially lossy for corruption borg cannot fully resolve.
+    """
     cfg = get_cfg()
     if not yes:
         raise BorgadmError(
@@ -2209,18 +2294,31 @@ def do_repair_repo(progress: bool, yes: bool) -> None:
             "Pass --yes to confirm you understand the risks."
         )
     logger.info(f"Repairing repo: {cfg.BORG_REPO}")
-    args = [
-        "check",
-        "--repair",
-        *(["--progress"] if progress else []),
+    cmd = _borg_check_cmd(
         cfg.BORG_REPO,
-    ]
+        progress=progress,
+        repository_only=repository_only,
+        archives_only=archives_only,
+        repair=True,
+    )
     env = {
         **os.environ,
         "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
     }
-    run_cmd(borg_cmd() + args, allow_output=True, env=env)
+    run_cmd(cmd, allow_output=True, env=env)
     logger.info("Repo repair completed.")
+
+
+def do_repair_repo(progress: bool, yes: bool) -> None:
+    _repair_check(progress=progress, yes=yes, repository_only=True)
+
+
+def do_repair_archives(progress: bool, yes: bool) -> None:
+    _repair_check(progress=progress, yes=yes, archives_only=True)
+
+
+def do_repair_full(progress: bool, yes: bool) -> None:
+    _repair_check(progress=progress, yes=yes)
 
 
 def do_environment() -> None:
@@ -2360,20 +2458,35 @@ def args_parser() -> StrictArgumentParser:
     )
     add_seconds(check_age)
 
-    check_all = check_subparsers.add_parser(
-        "all",
-        help="Run all checks",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_progress(check_all)
-    add_seconds(check_all)
-
     check_archives = check_subparsers.add_parser(
         "archives",
-        help="Check archive metadata",
+        help="Check archive metadata (borg check --archives-only)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    check_archives.add_argument(
+        "archives",
+        nargs="*",
+        help=(
+            "Full archive name(s) to check. Default (none given): "
+            "check every archive in the repo."
+        ),
+    )
+    check_archives.add_argument(
+        "--latest",
+        action="store_true",
+        help="Check only the latest full backup set",
+    )
     add_progress(check_archives)
+
+    def validate_check_archives_args(
+        p: argparse.ArgumentParser, args: argparse.Namespace
+    ) -> None:
+        if args.latest and args.archives:
+            p.error("Cannot specify both --latest and archive name(s).")
+
+    check_archives.set_defaults(
+        validate=lambda args: validate_check_archives_args(check_archives, args)
+    )
 
     check_subparsers.add_parser(
         "prune",
@@ -2383,10 +2496,17 @@ def args_parser() -> StrictArgumentParser:
 
     check_repo = check_subparsers.add_parser(
         "repo",
-        help="Check repo metadata",
+        help="Check repo metadata (borg check --repository-only)",
         formatter_class=HelpFormatter,
     )
     add_progress(check_repo)
+
+    check_full = check_subparsers.add_parser(
+        "full",
+        help="Check repo + archive metadata (borg check)",
+        formatter_class=HelpFormatter,
+    )
+    add_progress(check_full)
 
     compact = add_parser("compact", help="Check full backup metadata")
     add_progress(compact)
@@ -2494,19 +2614,31 @@ def args_parser() -> StrictArgumentParser:
         help="Delete the local borg cache for the repository",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    repair_repo = repair_subparsers.add_parser(
+
+    def add_repair_check(name: str, help_text: str) -> None:
+        sub = repair_subparsers.add_parser(
+            name,
+            help=help_text,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        add_progress(sub)
+        sub.add_argument(
+            "--yes",
+            action="store_true",
+            help="confirm you understand the risks of --repair",
+        )
+
+    add_repair_check(
         "repo",
-        help=(
-            "Repair repository metadata "
-            "(runs borg check --repair --repository-only)"
-        ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        "Repair repo metadata (borg check --repair --repository-only)",
     )
-    add_progress(repair_repo)
-    repair_repo.add_argument(
-        "--yes",
-        action="store_true",
-        help="confirm you understand the risks of --repair",
+    add_repair_check(
+        "archives",
+        "Repair archive metadata (borg check --repair --archives-only)",
+    )
+    add_repair_check(
+        "full",
+        "Repair repo + archive metadata (borg check --repair)",
     )
 
     prune = add_parser("prune", help="Prune partial and old backups")
@@ -2601,17 +2733,6 @@ def args_parser() -> StrictArgumentParser:
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def rewrite_legacy_args(argv: list[str]) -> list[str]:
-    """Rewrite legacy check-* commands to check * subcommands."""
-    legacy_check_cmds: dict[str, list[str]] = {
-        "check-age": ["check", "age"],
-        "check-all": ["check", "all"],
-    }
-    if len(argv) > 1 and argv[1] in legacy_check_cmds:
-        argv = argv[:1] + legacy_check_cmds[argv[1]] + argv[2:]
-    return argv
-
-
 # Dispatch table mapping CLI commands to handler functions.
 # Handler signatures must not use default argument values;
 # defaults are owned by the argument parser so they stay in
@@ -2622,8 +2743,8 @@ COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
     "automate status": do_automate_status,
     "break-lock": do_break_lock,
     "check age": do_check_age,
-    "check all": do_check_all,
     "check archives": do_check_archives,
+    "check full": do_check_full,
     "check prune": do_check_prune,
     "check repo": do_check_repo,
     "compact": do_compact,
@@ -2634,7 +2755,9 @@ COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
     "list": do_list,
     "log-files": do_log_files,
     "prune": do_prune,
+    "repair archives": do_repair_archives,
     "repair delete-cache": do_repair_delete_cache,
+    "repair full": do_repair_full,
     "repair repo": do_repair_repo,
     "rsync": do_rsync,
 }
@@ -2698,7 +2821,6 @@ def main(
 
 
 def cli() -> int:
-    sys.argv = rewrite_legacy_args(sys.argv)
     parser = args_parser()
     args = parser.parse_command()
     validate = getattr(args, "validate", None)

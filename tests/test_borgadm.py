@@ -344,34 +344,6 @@ def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
 class TestArgumentParser:
     """Test argument parser structure."""
 
-    def test_check_legacy_rewrite(self) -> None:
-        """Test legacy check-* commands are rewritten to check *."""
-        cases: dict[str, list[str]] = {
-            "check-age": ["borgadm", "check", "age"],
-            "check-all": ["borgadm", "check", "all"],
-        }
-        for old_cmd, expected in cases.items():
-            result = ba.rewrite_legacy_args(["borgadm", old_cmd])
-            assert result == expected, (
-                f"rewrite_legacy_args({old_cmd!r}): "
-                f"expected {expected}, got {result}"
-            )
-
-    def test_check_legacy_rewrite_preserves_args(self) -> None:
-        """Test legacy rewrite preserves trailing arguments."""
-        result = ba.rewrite_legacy_args(["borgadm", "check-age", "--verbose"])
-        assert result == [
-            "borgadm",
-            "check",
-            "age",
-            "--verbose",
-        ]
-
-    def test_check_legacy_rewrite_ignores_non_legacy(self) -> None:
-        """Test that non-legacy commands pass through unchanged."""
-        argv = ["borgadm", "create", "--dry-run"]
-        assert ba.rewrite_legacy_args(argv) == argv
-
     def test_repair_subcommand_parses(self) -> None:
         """Test repair delete-cache subcommand parses."""
         parser = ba.args_parser()
@@ -391,6 +363,14 @@ class TestArgumentParser:
         args = parser.parse_command(["repair", "repo"])
         assert args.command == "repair repo"
         assert args.yes is False
+
+    @pytest.mark.parametrize("mode", ["repo", "archives", "full"])
+    def test_repair_modes_parse(self, mode: str) -> None:
+        """Each repair mode parses and carries the --yes gate."""
+        parser = ba.args_parser()
+        args = parser.parse_command(["repair", mode, "--yes"])
+        assert args.command == f"repair {mode}"
+        assert args.yes is True
 
     def test_common_args_rejected_before_action(self) -> None:
         """Common args between subcommand and action should fail."""
@@ -590,58 +570,76 @@ class TestRepair:
             ba.do_repair_repo(progress=False, yes=False)
         mock_run_cmd.assert_not_called()
 
+    def _assert_repair_argv(
+        self, mock_run_cmd: Any, repo: str, expected_args: list[str]
+    ) -> None:
+        mock_run_cmd.assert_called_once_with(
+            ["borg", "check", "--repair", *expected_args, repo],
+            allow_output=True,
+            env={
+                **os.environ,
+                "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
+            },
+        )
+
     def test_repair_repo(self, mock_cfg: Any) -> None:
-        """Test that repair repo calls borg check --repair."""
+        """repair repo scopes the repair to --repository-only."""
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
-            patch.object(
-                ba,
-                "borg_cmd",
-                autospec=True,
-                return_value=["borg"],
-            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_repo(progress=False, yes=True)
-            mock_run_cmd.assert_called_once_with(
-                [
-                    "borg",
-                    "check",
-                    "--repair",
-                    mock_cfg.BORG_REPO,
-                ],
-                allow_output=True,
-                env={
-                    **os.environ,
-                    "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
-                },
-            )
+        self._assert_repair_argv(
+            mock_run_cmd, mock_cfg.BORG_REPO, ["--repository-only"]
+        )
 
     def test_repair_repo_progress(self, mock_cfg: Any) -> None:
-        """Test that repair repo passes --progress to borg."""
+        """repair repo passes --progress through to borg."""
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
-            patch.object(
-                ba,
-                "borg_cmd",
-                autospec=True,
-                return_value=["borg"],
-            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_repo(progress=True, yes=True)
-            mock_run_cmd.assert_called_once_with(
-                [
-                    "borg",
-                    "check",
-                    "--repair",
-                    "--progress",
-                    mock_cfg.BORG_REPO,
-                ],
-                allow_output=True,
-                env={
-                    **os.environ,
-                    "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
-                },
-            )
+        self._assert_repair_argv(
+            mock_run_cmd,
+            mock_cfg.BORG_REPO,
+            ["--repository-only", "--progress"],
+        )
+
+    def test_repair_archives(self, mock_cfg: Any) -> None:
+        """repair archives scopes the repair to --archives-only."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.do_repair_archives(progress=False, yes=True)
+        self._assert_repair_argv(
+            mock_run_cmd, mock_cfg.BORG_REPO, ["--archives-only"]
+        )
+
+    def test_repair_full(self, mock_cfg: Any) -> None:
+        """repair full repairs both phases (no --*-only flag)."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.do_repair_full(progress=False, yes=True)
+        self._assert_repair_argv(mock_run_cmd, mock_cfg.BORG_REPO, [])
+
+    @pytest.mark.usefixtures("mock_cfg")
+    @pytest.mark.parametrize(
+        "func",
+        ["do_repair_archives", "do_repair_full"],
+    )
+    def test_repair_without_yes_exits(self, func: str) -> None:
+        """Every repair variant refuses to run without --yes."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            pytest.raises(ba.BorgadmError),
+        ):
+            getattr(ba, func)(progress=False, yes=False)
+        mock_run_cmd.assert_not_called()
 
 
 class TestDelete:
@@ -1333,8 +1331,7 @@ class TestAutomate:
         "create",
         "check-age",
         "check-prune",
-        "check-repo",
-        "check-archives",
+        "check-full",
     ]
 
     @pytest.fixture
@@ -1599,30 +1596,6 @@ class TestCheck:
             )
 
     @pytest.mark.usefixtures("mock_cfg")
-    def test_check_all_runs_all_checks(self) -> None:
-        """Verify do_check_all calls every individual check function."""
-        actions = self._check_subcommands() - {"all"}
-        assert actions, "No individual check subcommands found"
-
-        mocks: dict[str, Any] = {}
-        patches = []
-        for action in actions:
-            p = patch.object(ba, f"do_check_{action}", autospec=True)
-            mocks[action] = p.start()
-            patches.append(p)
-
-        try:
-            ba.do_check_all(progress=False)
-        finally:
-            for p in patches:
-                p.stop()
-
-        for action, mock_fn in mocks.items():
-            assert mock_fn.called, (
-                f"do_check_all did not call do_check_{action}"
-            )
-
-    @pytest.mark.usefixtures("mock_cfg")
     def test_check_age_no_backups(self) -> None:
         """Test check age raises CheckNoBackupsError."""
         with (
@@ -1663,13 +1636,153 @@ class TestCheck:
             ba.do_check_age()  # Should not raise
 
     @pytest.mark.usefixtures("mock_cfg")
-    def test_check_archives_no_backups(self) -> None:
-        """Test check archives raises CheckNoBackupsError."""
+    def test_check_archives_latest_no_backups(self) -> None:
+        """check archives --latest raises when no full backups exist."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             pytest.raises(ba.CheckNoBackupsError),
         ):
-            ba.do_check_archives(progress=False)
+            ba.do_check_archives(progress=False, latest=True, archives=[])
+
+    def test_check_repo_argv(self, mock_cfg: Any) -> None:
+        """check repo runs borg check --repository-only."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.do_check_repo(progress=False)
+        mock_run_cmd.assert_called_once_with(
+            ["borg", "check", "--repository-only", mock_cfg.BORG_REPO],
+            allow_output=False,
+        )
+
+    def test_check_full_argv(self, mock_cfg: Any) -> None:
+        """check full runs borg check with no --*-only flag."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.do_check_full(progress=True)
+        mock_run_cmd.assert_called_once_with(
+            ["borg", "check", "--progress", mock_cfg.BORG_REPO],
+            allow_output=True,
+        )
+
+    def test_check_full_failure_raises(self, mock_cfg: Any) -> None:
+        """A failing borg check surfaces as CheckFullError."""
+        err = ba.SubprocessError(2, ["borg", "check", mock_cfg.BORG_REPO])
+        with (
+            patch.object(ba, "run_cmd", autospec=True, side_effect=err),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            pytest.raises(ba.CheckFullError),
+        ):
+            ba.do_check_full(progress=False)
+
+    def test_check_archives_whole_repo_argv(self, mock_cfg: Any) -> None:
+        """check archives with no target runs --archives-only."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.do_check_archives(progress=False, latest=False, archives=[])
+        mock_run_cmd.assert_called_once_with(
+            ["borg", "check", "--archives-only", mock_cfg.BORG_REPO],
+            allow_output=False,
+        )
+
+    def test_check_archives_latest_checks_latest_set(
+        self, mock_cfg: Any
+    ) -> None:
+        """check archives --latest checks each archive in the newest
+        full set by name, skipping partials via list_backups."""
+        repo = mock_cfg.BORG_REPO
+        latest = {
+            "20250101_120000": [
+                f"{repo}::home-fuse-20250101_120000",
+                f"{repo}::home-local-20250101_120000",
+            ]
+        }
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                return_value=latest,
+            ) as mock_list,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+        ):
+            ba.do_check_archives(progress=False, latest=True, archives=[])
+        mock_list.assert_called_once_with(latest=True)
+        assert [c.args[0] for c in mock_run_cmd.call_args_list] == [
+            ["borg", "check", f"{repo}::home-fuse-20250101_120000"],
+            ["borg", "check", f"{repo}::home-local-20250101_120000"],
+        ]
+
+    def test_check_archives_by_name(self, mock_cfg: Any) -> None:
+        """check archives <names> verifies existence then checks each."""
+        repo = mock_cfg.BORG_REPO
+        raw = Mock()
+        raw.stdout = "home-fuse-20250101_120000\nhome-local-20250101_120000\n"
+        with (
+            patch.object(
+                ba, "list_backups_raw", autospec=True, return_value=raw
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+        ):
+            ba.do_check_archives(
+                progress=False,
+                latest=False,
+                archives=["home-fuse-20250101_120000"],
+            )
+        mock_run_cmd.assert_called_once_with(
+            ["borg", "check", f"{repo}::home-fuse-20250101_120000"],
+            allow_output=False,
+        )
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_archives_unknown_name_errors(self) -> None:
+        """An unknown archive name fails before any borg check runs."""
+        raw = Mock()
+        raw.stdout = "home-fuse-20250101_120000\n"
+        with (
+            patch.object(
+                ba, "list_backups_raw", autospec=True, return_value=raw
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            pytest.raises(ba.BorgadmError),
+        ):
+            ba.do_check_archives(
+                progress=False, latest=False, archives=["nope"]
+            )
+        mock_run_cmd.assert_not_called()
+
+    def test_check_archives_latest_and_names_parse_error(self) -> None:
+        """--latest with archive name(s) is a parser error."""
+        parser = ba.args_parser()
+        args = parser.parse_command(
+            ["check", "archives", "--latest", "home-fuse-20250101_120000"]
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            args.validate(args)
+        assert exc_info.value.code == 2
+
+    def test_check_archives_no_args_parses(self) -> None:
+        """check archives with neither target nor --latest is valid."""
+        parser = ba.args_parser()
+        args = parser.parse_command(["check", "archives"])
+        args.validate(args)  # whole-repo default: must not raise
+        assert args.latest is False
+        assert args.archives == []
+
+    @pytest.mark.parametrize("mode", ["repo", "archives", "full"])
+    def test_check_modes_parse(self, mode: str) -> None:
+        """Each check mode parses to its command path."""
+        parser = ba.args_parser()
+        args = parser.parse_command(["check", mode])
+        assert args.command == f"check {mode}"
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_prune_partial_archives(self) -> None:
