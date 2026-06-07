@@ -2463,30 +2463,22 @@ def args_parser() -> StrictArgumentParser:
         help="Check archive metadata (borg check --archives-only)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    check_archives.add_argument(
+    check_archives_target = check_archives.add_mutually_exclusive_group()
+    check_archives_target.add_argument(
         "archives",
         nargs="*",
+        default=[],
         help=(
             "Full archive name(s) to check. Default (none given): "
             "check every archive in the repo."
         ),
     )
-    check_archives.add_argument(
+    check_archives_target.add_argument(
         "--latest",
         action="store_true",
         help="Check only the latest full backup set",
     )
     add_progress(check_archives)
-
-    def validate_check_archives_args(
-        p: argparse.ArgumentParser, args: argparse.Namespace
-    ) -> None:
-        if args.latest and args.archives:
-            p.error("Cannot specify both --latest and archive name(s).")
-
-    check_archives.set_defaults(
-        validate=lambda args: validate_check_archives_args(check_archives, args)
-    )
 
     check_subparsers.add_parser(
         "prune",
@@ -2514,7 +2506,10 @@ def args_parser() -> StrictArgumentParser:
     delete_cmd = add_parser(
         "delete", help="Delete archives by timestamp or name"
     )
-    delete_cmd.add_argument(
+    # Exactly one of an explicit archive or --latest is required, so a
+    # bare `delete` cannot silently target the whole repo.
+    delete_target = delete_cmd.add_mutually_exclusive_group(required=True)
+    delete_target.add_argument(
         "archive",
         nargs="?",
         help=(
@@ -2523,25 +2518,13 @@ def args_parser() -> StrictArgumentParser:
             "single archive"
         ),
     )
-    delete_cmd.add_argument(
+    delete_target.add_argument(
         "--latest",
         action="store_true",
         help="Delete the latest full backup",
     )
     add_dry_run(delete_cmd)
     add_progress(delete_cmd)
-
-    def validate_delete_args(
-        p: argparse.ArgumentParser, args: argparse.Namespace
-    ) -> None:
-        if args.latest and args.archive:
-            p.error("Cannot specify both --latest and an archive.")
-        if not args.latest and not args.archive:
-            p.error("Must specify an archive or --latest.")
-
-    delete_cmd.set_defaults(
-        validate=lambda args: validate_delete_args(delete_cmd, args)
-    )
 
     create = add_parser("create", help="Create full backup")
     create.add_argument(
@@ -2823,11 +2806,7 @@ def main(
 def cli() -> int:
     parser = args_parser()
     args = parser.parse_command()
-    validate = getattr(args, "validate", None)
-    if validate:
-        validate(args)
     args_dict = vars(args).copy()
-    args_dict.pop("validate", None)
     command = args_dict.pop("command")
 
     if command == "self-test":

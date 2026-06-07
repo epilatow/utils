@@ -502,7 +502,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
         (RuntimeError("t"), ba.ExitCode.ERROR),
     ]
     POPPED_ARGS = {
-        "validate",
         "config",
         "verbose",
         "timestamp_messages",
@@ -671,17 +670,15 @@ class TestDelete:
     def test_delete_latest_and_archive_errors(self) -> None:
         """Test that --latest with an archive is a parser error."""
         parser = ba.args_parser()
-        args = parser.parse_command(["delete", "--latest", "20250101_120000"])
         with pytest.raises(SystemExit) as exc_info:
-            args.validate(args)
+            parser.parse_command(["delete", "--latest", "20250101_120000"])
         assert exc_info.value.code == 2
 
     def test_delete_no_args_errors(self) -> None:
         """Test that no archive and no --latest is a parser error."""
         parser = ba.args_parser()
-        args = parser.parse_args(["delete"])
         with pytest.raises(SystemExit) as exc_info:
-            args.validate(args)
+            parser.parse_command(["delete"])
         assert exc_info.value.code == 2
 
     def test_delete_latest(self, mock_cfg: Any) -> None:
@@ -1762,18 +1759,16 @@ class TestCheck:
     def test_check_archives_latest_and_names_parse_error(self) -> None:
         """--latest with archive name(s) is a parser error."""
         parser = ba.args_parser()
-        args = parser.parse_command(
-            ["check", "archives", "--latest", "home-fuse-20250101_120000"]
-        )
         with pytest.raises(SystemExit) as exc_info:
-            args.validate(args)
+            parser.parse_command(
+                ["check", "archives", "--latest", "home-fuse-20250101_120000"]
+            )
         assert exc_info.value.code == 2
 
     def test_check_archives_no_args_parses(self) -> None:
         """check archives with neither target nor --latest is valid."""
         parser = ba.args_parser()
         args = parser.parse_command(["check", "archives"])
-        args.validate(args)  # whole-repo default: must not raise
         assert args.latest is False
         assert args.archives == []
 
