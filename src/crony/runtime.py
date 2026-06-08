@@ -145,7 +145,7 @@ def _build_current_graph(
     state_root: Path,
 ) -> tuple[
     crony.model.Graph,
-    dict[crony.unit.EntityRef, crony.model.BrokenEntity],
+    dict[crony.unit.EntityRef, crony.model.JobOrphan],
     dict[crony.unit.EntityRef, crony.model.RuntimeState],
 ]:
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
@@ -153,13 +153,13 @@ def _build_current_graph(
     current-graph node; the rest of the dir contents become its
     `RuntimeState`. Snapshots that exist but can't be turned into
     a `Job` / `JobGroup` (corrupt JSON, wrong schema, unrecognized
-    kind, dataclass `TypeError`) become `BrokenEntity` records so
-    status / destroy can surface them with a clear
+    kind, dataclass `TypeError`) become broken `JobOrphan` records
+    (`reason` set) so status / destroy can surface them with a clear
     "re-apply required" signal instead of treating the entry as
     silently absent.
     """
     current = crony.model.Graph()
-    broken: dict[crony.unit.EntityRef, crony.model.BrokenEntity] = {}
+    broken: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
     runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
     if not state_root.exists():
         return current, broken, runtime
@@ -180,7 +180,7 @@ def _build_current_graph(
             try:
                 raw = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                broken[ref] = crony.model.BrokenEntity(
+                broken[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=None,
@@ -191,7 +191,7 @@ def _build_current_graph(
             raw_name = raw.get("name") if isinstance(raw, dict) else None
             name_hint = raw_name if isinstance(raw_name, str) else None
             if not isinstance(raw, dict):
-                broken[ref] = crony.model.BrokenEntity(
+                broken[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -200,7 +200,7 @@ def _build_current_graph(
                 )
                 continue
             if raw.get("schema") != crony.model.SNAPSHOT_SCHEMA:
-                broken[ref] = crony.model.BrokenEntity(
+                broken[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -214,7 +214,7 @@ def _build_current_graph(
             try:
                 snap = crony.model.snapshot_from_dict(raw)
             except (TypeError, ValueError) as exc:
-                broken[ref] = crony.model.BrokenEntity(
+                broken[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -294,26 +294,28 @@ def load_config() -> crony.model.Config:
         current.by_full_name[name] = winner
         shadowed.update(r for r in refs if r != winner)
 
-    broken_by_full_name: dict[str, crony.unit.EntityRef] = {}
-    for ref, broken_entry in broken.items():
-        if broken_entry.name is not None:
-            broken_by_full_name[broken_entry.name] = ref
+    # All on-disk junk lands in one `orphans` map keyed by ref: the
+    # broken snapshots discovered above (real uuid, `reason` set), plus
+    # the pure leftovers found next. `JobOrphan.is_broken` tells them
+    # apart for status (`broken` vs `orphan`).
+    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = dict(broken)
+    orphans_by_full_name: dict[str, crony.unit.EntityRef] = {
+        o.name: ref for ref, o in broken.items() if o.name is not None
+    }
 
-    # Names with an on-disk remnant -- a leftover platform unit file
-    # and / or a leftover short-name alias symlink -- that no current
-    # or broken snapshot accounts for. A rename leaves a stray alias
-    # with no unit; a state wipe leaves a unit with no alias; some
-    # carry both. Synthesize a deterministic `uuid5` keyed on the name
-    # so a name with both remnants resolves to one stable EntityRef
-    # that `destroy` addresses through the same machinery as other
-    # on-disk entities. The hash seed string is fixed for that
-    # stability and is not a description.
-    accounted_labels: set[str] = set(current.by_full_name)
-    accounted_labels.update(broken_by_full_name)
+    # Names with a leftover platform unit file and / or short-name
+    # alias symlink that no current or broken snapshot accounts for. A
+    # rename leaves a stray alias with no unit; a state wipe leaves a
+    # unit with no alias; some carry both. Synthesize a deterministic
+    # `uuid5` keyed on the name so a name with both remnants resolves
+    # to one stable EntityRef that `destroy` addresses through the same
+    # machinery. The hash seed string is fixed for that stability and
+    # is not a description.
+    accounted_labels: set[str] = set(current.by_full_name) | set(
+        orphans_by_full_name
+    )
     unit_names = _platform_unit_names()
     alias_names = _alias_symlink_names()
-    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
-    orphans_by_full_name: dict[str, crony.unit.EntityRef] = {}
     for full_name in (unit_names | alias_names) - accounted_labels:
         bundle_name, _, _ = full_name.partition(".")
         if not bundle_name:
@@ -353,8 +355,6 @@ def load_config() -> crony.model.Config:
         toml_config=toml_config,
         pending=pending,
         current=current,
-        broken=broken,
-        broken_by_full_name=broken_by_full_name,
         orphans=orphans,
         orphans_by_full_name=orphans_by_full_name,
         runtime=runtime,

@@ -626,7 +626,7 @@ class Graph:
         host/platform selection, and produce the pending graph. Entries
         masked out for this host don't appear in the graph -- they're
         not "what apply would install here", and they pair via the
-        orphan path when their on-disk remnants outlive a host-filter
+        orphan path when their on-disk orphans outlive a host-filter
         edit.
 
         `host` / `platform` default to the current machine when
@@ -662,26 +662,44 @@ class Graph:
 
 @dataclass(frozen=True)
 class JobOrphan:
-    """An on-disk remnant of a job whose name no current or broken
-    snapshot accounts for: a leftover platform unit file, a leftover
-    short-name alias symlink, or both.
+    """Leftover on-disk junk for one entity that no live config
+    selects -- a stray platform unit file, a stray short-name alias
+    symlink, and/or a state dir whose snapshot won't parse. Never a
+    usable current entity; the next apply / destroy reconciles it
+    (re-render if config still wants it, otherwise remove).
 
-    Populated by `load_config` for each such `<bundle>.<short>`. A
-    rename leaves a stray alias with no unit; a state wipe leaves a
-    unit with no alias; some names carry both, so the two artifacts
-    are flagged independently (`has_unit_file` / `has_symlink`). The
-    synthetic uuid is
-    `uuid.uuid5(NAMESPACE_DNS, "crony.unit-only/<full_name>")` --
-    deterministic so repeat loads address the same entity and a name
-    with both remnants resolves to one ref, indistinguishable
-    downstream from a config-generated uuid4.
+    The kind is derived, not a separate type:
+
+    - When a state-dir snapshot exists but can't be loaded (wrong
+      schema, unrecognized kind, dataclass `TypeError`, unreadable
+      JSON), `reason` (and `source_path`) are set; `is_broken` is True
+      and `crony status` reports `config=broken` -- re-apply territory.
+      The `uuid` is the real state-dir uuid; `name` is recovered from
+      `raw["name"]` when the JSON parsed far enough, else None.
+    - Otherwise it is a pure leftover (stray unit / alias, no parseable
+      snapshot): `is_broken` is False and status reports
+      `config=orphan`. `name` is always recovered, and `uuid` is a
+      deterministic `uuid5(NAMESPACE_DNS, "crony.unit-only/<full>")` so
+      repeat loads address the same entity -- with a unit and an alias
+      under one name resolving to one ref.
+
+    `has_unit_file` / `has_symlink` flag which stray artifacts are
+    present (independently; some names carry both).
     """
 
     bundle: str
     uuid: str
-    name: str
-    has_unit_file: bool
+    name: str | None
+    has_unit_file: bool = False
     has_symlink: bool = False
+    reason: str | None = None
+    source_path: Path | None = None
+
+    @property
+    def is_broken(self) -> bool:
+        """True when an unparseable on-disk snapshot is the orphan
+        (status `broken`); False for a pure leftover (status `orphan`)."""
+        return self.reason is not None
 
     @property
     def entity_ref(self) -> crony.unit.EntityRef:
@@ -692,57 +710,22 @@ class JobOrphan:
         return entity_state_dir(self.entity_ref)
 
     @property
-    def symlink_state_dir(self) -> Path:
-        """The short-name alias dir this remnant occupies (set only
-        when `has_symlink`)."""
+    def symlink_state_dir(self) -> Path | None:
+        """The short-name alias dir this orphan's name occupies, or
+        None when no name was recovered (so destroy can still reclaim
+        the alias whenever the name survived)."""
+        if self.name is None:
+            return None
         short = self.name.partition(".")[2]
         return crony.paths.STATE_DIR / self.bundle / short
 
     @property
     def log_path(self) -> Path:
         """Reported log path: the alias path when a stray alias is the
-        remnant, else the (synthetic) uuid-keyed path."""
-        base = self.symlink_state_dir if self.has_symlink else self.state_dir
-        return base / RUN_LOG_NAME
-
-
-@dataclass(frozen=True)
-class BrokenEntity:
-    """An on-disk entity this crony binary can't fully interpret.
-
-    Populated by `_build_current_graph` whenever a state-dir
-    snapshot exists but can't be turned into a `Job` /
-    `JobGroup`: wrong `schema`, unrecognized `kind`, dataclass
-    `TypeError`, or unreadable JSON. `name` is recovered from
-    `raw["name"]` when the JSON parsed far enough; `None` when
-    the file itself is corrupt. `reason` is a one-line
-    description suitable for surfacing in status (the
-    operator needs to know *why* re-apply is required).
-    `source_path` is the on-disk artifact that couldn't be
-    interpreted -- today always the entity's snapshot.json, but
-    the dataclass deliberately doesn't bake that assumption into
-    its name so other broken-entity kinds can share it.
-    """
-
-    bundle: str
-    uuid: str
-    name: str | None
-    reason: str
-    source_path: Path
-
-    @property
-    def entity_ref(self) -> crony.unit.EntityRef:
-        return crony.unit.EntityRef(self.bundle, self.uuid)
-
-    @property
-    def symlink_state_dir(self) -> Path | None:
-        """The short-name alias dir for this entry, or None when no
-        name was recovered (so destroy can still reclaim a broken
-        entry's alias when its name survived)."""
-        if self.name is None:
-            return None
-        short = self.name.partition(".")[2]
-        return crony.paths.STATE_DIR / self.bundle / short
+        orphan, else the uuid-keyed path."""
+        if self.has_symlink and self.symlink_state_dir is not None:
+            return self.symlink_state_dir / RUN_LOG_NAME
+        return self.state_dir / RUN_LOG_NAME
 
 
 @dataclass
@@ -757,8 +740,8 @@ class Config:
     toml_config: crony.config.TomlConfig
     pending: Graph
     current: Graph
-    broken: dict[crony.unit.EntityRef, BrokenEntity]
-    broken_by_full_name: dict[str, crony.unit.EntityRef]
+    # Leftover on-disk junk keyed by ref -- broken snapshots and pure
+    # orphans alike (`JobOrphan.is_broken` distinguishes them).
     orphans: dict[crony.unit.EntityRef, JobOrphan]
     orphans_by_full_name: dict[str, crony.unit.EntityRef]
     runtime: dict[crony.unit.EntityRef, RuntimeState]
@@ -773,30 +756,21 @@ class Config:
     shadowed: set[crony.unit.EntityRef] = field(default_factory=set)
 
     def all_refs(self) -> set[crony.unit.EntityRef]:
-        return (
-            self.pending.refs()
-            | self.current.refs()
-            | set(self.broken)
-            | set(self.orphans)
-        )
+        return self.pending.refs() | self.current.refs() | set(self.orphans)
 
     def installed_full_names(self) -> set[str]:
         """Full names with something installed on this host: a
-        parseable current snapshot, a leftover platform unit or alias
-        symlink (`orphans`), or a broken snapshot whose name was
-        recovered. Computed from the one `load_config()` disk pass
-        -- the addressable set status / trigger / enable / disable
-        / destroy operate on, without re-walking the state-dir and
-        unit trees per command.
+        parseable current snapshot, or an orphan whose name was
+        recovered (a leftover platform unit / alias symlink, or a
+        broken snapshot). Computed from the one `load_config()` disk
+        pass -- the addressable set status / trigger / enable /
+        disable / destroy operate on, without re-walking the state-dir
+        and unit trees per command.
         """
-        return (
-            set(self.current.by_full_name)
-            | set(self.orphans_by_full_name)
-            | set(self.broken_by_full_name)
-        )
+        return set(self.current.by_full_name) | set(self.orphans_by_full_name)
 
     def installed_bundle_names(self) -> set[str]:
-        """Bundle names with on-disk remnants -- a current or broken
+        """Bundle names with on-disk orphans -- a current or broken
         snapshot, or a leftover platform unit / alias symlink. The
         bundle-scope analogue of `installed_full_names`: read-side
         subcommands
@@ -804,17 +778,12 @@ class Config:
         broken (shadowed losers count too, so a bundle present only
         as collision residue stays addressable).
         """
-        return {
-            ref.bundle
-            for ref in (
-                self.current.refs() | set(self.broken) | set(self.orphans)
-            )
-        }
+        return {ref.bundle for ref in (self.current.refs() | set(self.orphans))}
 
     def require_addressable(self, bundle: str | None) -> None:
         """Reject `--bundle <name>` unless `<name>` is addressable on
         this host: either a successfully parsed bundle, or one with
-        on-disk remnants. Used by the subcommands that address
+        on-disk orphans. Used by the subcommands that address
         installed units (`status` / `destroy` / `enable` / `disable`
         / `trigger`); the on-disk fallback lets them scope to a bundle
         whose config has since broken -- exactly when the operator
@@ -844,10 +813,9 @@ class Config:
         applied); `orphan` if only `current` or `orphans` has
         it (config-side removed, disk-side lingers).
         """
-        if ref in self.broken:
-            return "broken"
-        if ref in self.orphans:
-            return "orphan"
+        orphan = self.orphans.get(ref)
+        if orphan is not None:
+            return "broken" if orphan.is_broken else "orphan"
         p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
         c = self.current.jobs.get(ref) or self.current.groups.get(ref)
         if p is None and c is None:
@@ -860,10 +828,10 @@ class Config:
 
     def name_for(self, ref: crony.unit.EntityRef) -> str | None:
         """Recover the full namespaced name `ref` was last seen
-        under -- from the pending entry, the current snapshot, the
-        recovered broken-entity name, or the on-disk orphan remnant
-        -- or None when no side carries a name (a broken snapshot too
-        corrupt to recover one).
+        under -- from the pending entry, the current snapshot, or the
+        on-disk orphan (a leftover unit / alias symlink or a recovered
+        broken snapshot) -- or None when no side carries a name (a
+        broken snapshot too corrupt to recover one).
         """
         for graph in (self.current, self.pending):
             j = graph.jobs.get(ref)
@@ -872,9 +840,6 @@ class Config:
             g = graph.groups.get(ref)
             if g is not None:
                 return str(g.entity_name)
-        broken = self.broken.get(ref)
-        if broken is not None:
-            return broken.name
         orphan = self.orphans.get(ref)
         if orphan is not None:
             return orphan.name
@@ -882,10 +847,10 @@ class Config:
 
     def alias_dir_for(self, ref: crony.unit.EntityRef) -> Path | None:
         """The short-name alias dir for `ref`'s entity, recovered from
-        whichever side carries it (current / pending node, broken
-        entry, or orphan remnant), or None when no name is known. The
-        alias path lives on the entity, so destroy reclaims it without
-        re-deriving it from a name string."""
+        whichever side carries it (current / pending node, or an
+        on-disk orphan), or None when no name is known. The alias path
+        lives on the entity, so destroy reclaims it without re-deriving
+        it from a name string."""
         node = (
             self.current.jobs.get(ref)
             or self.current.groups.get(ref)
@@ -897,9 +862,6 @@ class Config:
         orphan = self.orphans.get(ref)
         if orphan is not None:
             return orphan.symlink_state_dir
-        broken = self.broken.get(ref)
-        if broken is not None:
-            return broken.symlink_state_dir
         return None
 
     def resolve_runnable(self, full_name: str) -> crony.unit.EntityRef | None:
@@ -928,9 +890,9 @@ class Config:
     def resolve_current(self, full_name: str) -> crony.unit.EntityRef | None:
         """An entity with on-disk presence that destroy must
         clean up. Sources, in order: `current` (parseable
-        snapshots), `broken` (state dirs whose snapshot can't
-        be loaded), then `orphans` (a leftover platform unit or
-        alias symlink with no parseable snapshot).
+        snapshots), then `orphans` (a state dir whose snapshot
+        can't be loaded, or a leftover platform unit / alias
+        symlink with no snapshot at all).
 
         No `pending` fallback: a pending-only entry has no
         on-disk state to wipe. The current-first order matches
@@ -942,18 +904,12 @@ class Config:
         """
         ref = crony.unit.EntityRef.from_str(full_name)
         if ref is not None:
-            if (
-                ref in self.current.refs()
-                or ref in self.broken
-                or ref in self.orphans
-            ):
+            if ref in self.current.refs() or ref in self.orphans:
                 return ref
             return None
-        return (
-            self.current.by_full_name.get(full_name)
-            or self.broken_by_full_name.get(full_name)
-            or self.orphans_by_full_name.get(full_name)
-        )
+        return self.current.by_full_name.get(
+            full_name
+        ) or self.orphans_by_full_name.get(full_name)
 
     def resolve_pending(self, full_name: str) -> crony.unit.EntityRef | None:
         """An entry defined in the parsed TOML config but not

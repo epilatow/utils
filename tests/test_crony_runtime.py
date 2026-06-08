@@ -761,8 +761,8 @@ class TestLoadConfig:
         )
         (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
         config = crony_runtime.load_config()
-        assert set(config.broken) == {EntityRef("default", uuid_a)}
-        assert EntityRef("default", "a") not in config.broken
+        assert set(config.orphans) == {EntityRef("default", uuid_a)}
+        assert EntityRef("default", "a") not in config.orphans
 
     def test_stale_when_pending_differs(
         self, tmp_path: Path, monkeypatch: Any
@@ -812,11 +812,12 @@ class TestLoadConfig:
 
 
 class TestConfigBroken:
-    """`Config.broken` carries the entities whose on-disk
-    snapshot can't be loaded by this crony binary. `_build_current_graph`
-    populates it instead of silently dropping the state dir;
-    `Config.config_state` returns `"broken"` for refs that land
-    there, beating the synced / stale / orphan / missing axes.
+    """`Config.orphans` carries the entities whose on-disk snapshot
+    can't be loaded by this crony binary, flagged `is_broken`.
+    `_build_current_graph` records them instead of silently dropping
+    the state dir; `Config.config_state` returns `"broken"` for refs
+    that land there, beating the synced / stale / orphan / missing
+    axes.
     """
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
@@ -852,17 +853,17 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
+        assert ref in config.orphans
         assert ref not in config.current.jobs
         # Broken entries get a runtime entry so the unit-config /
         # last / last-ran columns can read the same state-dir
         # files normal current entries read.
         assert ref in config.runtime
-        assert config.broken[ref].name == "default.legacy"
-        assert "schema 999" in config.broken[ref].reason
+        assert config.orphans[ref].name == "default.legacy"
+        assert "schema 999" in (config.orphans[ref].reason or "")
         assert config.config_state(ref) == "broken"
-        # Name-recovery let it land in broken_by_full_name.
-        assert config.broken_by_full_name.get("default.legacy") == ref
+        # Name-recovery let it land in orphans_by_full_name.
+        assert config.orphans_by_full_name.get("default.legacy") == ref
 
     def test_unrecognized_kind_recorded_as_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -879,8 +880,8 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
-        assert "banana" in config.broken[ref].reason
+        assert ref in config.orphans
+        assert "banana" in (config.orphans[ref].reason or "")
         assert config.config_state(ref) == "broken"
 
     def test_dataclass_type_error_recorded_as_broken(
@@ -900,9 +901,9 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
-        assert config.broken[ref].name == "default.partial"
-        assert "snapshot conversion" in config.broken[ref].reason
+        assert ref in config.orphans
+        assert config.orphans[ref].name == "default.partial"
+        assert "snapshot conversion" in (config.orphans[ref].reason or "")
 
     def test_corrupt_json_recorded_as_broken_without_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -913,12 +914,12 @@ class TestConfigBroken:
             "{not valid json",
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
+        assert ref in config.orphans
         # No recoverable name from corrupt JSON; the entry is
         # reachable only by ref (or the synthetic input form).
-        assert config.broken[ref].name is None
-        assert "unreadable" in config.broken[ref].reason
-        assert ref not in config.broken_by_full_name.values()
+        assert config.orphans[ref].name is None
+        assert "unreadable" in (config.orphans[ref].reason or "")
+        assert ref not in config.orphans_by_full_name.values()
 
     def test_broken_beats_orphan_when_only_current_side_exists(
         self, tmp_path: Path, monkeypatch: Any

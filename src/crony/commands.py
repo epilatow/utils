@@ -762,15 +762,19 @@ def _config_axis(
         # is the pre-mask base the mask layer turns into "masked".
         return "missing"
     state = config.config_state(ref)
+    lingering = config.orphans_by_full_name.get(full)
     if (
         state == "missing"
         and entry is not None
-        and full in config.orphans_by_full_name
+        and lingering is not None
+        and not config.orphans[lingering].is_broken
     ):
         # In config and never cleanly applied (no current
-        # snapshot) but a platform unit lingers from a prior apply
-        # whose state dir was wiped -- re-apply territory,
-        # surfaced as drift rather than a clean "not applied."
+        # snapshot) but a platform unit / alias lingers from a prior
+        # apply whose state dir was wiped -- re-apply territory,
+        # surfaced as drift rather than a clean "not applied." (A
+        # broken-snapshot remnant under the name is `broken`, not this
+        # case.)
         return "stale"
     if state == "synced":
         # Snapshot equality alone isn't enough: a matching
@@ -1247,9 +1251,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         # keyed unit safe -- the residue of a live entry is
         # _apply_one's job, not the orphan sweep's, so the sweep
         # never unlinks a unit a selected entry is still firing.
-        on_disk = (
-            config.current.refs() | set(config.broken) | set(config.orphans)
-        )
+        on_disk = config.current.refs() | set(config.orphans)
         live = config.pending.refs()
         orphan_refs = sorted(
             (
@@ -1472,7 +1474,7 @@ def _installed_refs(config: crony.model.Config) -> set[crony.unit.EntityRef]:
     snapshot, or a leftover platform unit) -- the set an action
     command can act on. Excludes pending-only entries (never applied).
     """
-    return config.current.refs() | set(config.broken) | set(config.orphans)
+    return config.current.refs() | set(config.orphans)
 
 
 def _resolve_addressable(
@@ -2490,8 +2492,10 @@ def do_status(
         # only re-render the winner.)
         ref_form_only = {
             str(b.entity_ref)
-            for b in config.broken.values()
-            if b.name is None and (bundle is None or b.bundle == bundle)
+            for b in config.orphans.values()
+            if b.is_broken
+            and b.name is None
+            and (bundle is None or b.bundle == bundle)
         }
         ref_form_only |= {
             str(ref)
@@ -2588,15 +2592,8 @@ def do_status(
             str(current_node.entity_name) if current_node is not None else None
         )
         if current_name is None and ref is not None:
-            be = config.broken.get(ref)
             oe = config.orphans.get(ref)
-            current_name = (
-                be.name
-                if be is not None
-                else oe.name
-                if oe is not None
-                else None
-            )
+            current_name = oe.name if oe is not None else None
         fallback = sorted(candidates)[0] if candidates else ""
         # The config (pending) name drives tree placement, masking,
         # and the TOML-entry lookup; the displayed identity is chosen

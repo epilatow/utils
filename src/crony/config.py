@@ -807,7 +807,7 @@ class TomlConfig:
         Returns an empty `TomlConfig` when no candidate files exist or
         every candidate file fails -- read-side subcommands
         (`status`, `destroy`, `logs`, `crony run`) operate on the on-
-        disk state alone (`current`, `broken`, `orphans`), so the
+        disk state alone (`current`, `orphans`), so the
         runner keeps firing through a config-broken state and the
         operator can still inspect / clean up the on-disk picture.
         `apply` is the only path that errors hard against the
