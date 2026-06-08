@@ -227,19 +227,19 @@ def _build_current_graph(
             # expected pair, surfacing as drift through the snapshot
             # comparison (and steering `log_path` to the uuid path).
             snap.symlink = _read_symlink_pair(snap)
-            full = str(snap.name)
+            full = str(snap.entity_name)
             if isinstance(snap, crony.model.Job):
-                current.jobs[snap.ref] = snap
-                current.by_full_name[full] = snap.ref
-                runtime[snap.ref] = _read_runtime_state(
+                current.jobs[snap.entity_ref] = snap
+                current.by_full_name[full] = snap.entity_ref
+                runtime[snap.entity_ref] = _read_runtime_state(
                     uuid_dir,
                     full_name=full,
                     snapshot=snap,
                 )
             else:
-                current.groups[snap.ref] = snap
-                current.by_full_name[full] = snap.ref
-                runtime[snap.ref] = _read_runtime_state(
+                current.groups[snap.entity_ref] = snap
+                current.by_full_name[full] = snap.entity_ref
+                runtime[snap.entity_ref] = _read_runtime_state(
                     uuid_dir,
                     full_name=full,
                     snapshot=snap,
@@ -283,7 +283,7 @@ def load_config() -> crony.model.Config:
     for ref in current.refs():
         snap = current.jobs.get(ref) or current.groups.get(ref)
         assert snap is not None  # ref came from current.refs()
-        name_to_refs.setdefault(str(snap.name), []).append(ref)
+        name_to_refs.setdefault(str(snap.entity_name), []).append(ref)
     pending_refs = pending.refs()
     for name, refs in name_to_refs.items():
         if len(refs) < 2:

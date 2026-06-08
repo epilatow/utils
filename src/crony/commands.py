@@ -443,7 +443,7 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         raise crony.errors.PreconditionError(
             f"{ref} is not a selected entry to apply"
         )
-    full_name = str(snapshot.name)
+    full_name = str(snapshot.entity_name)
     bundle_name = ref.bundle
     timing = snapshot.timing
     snapshot_path = crony.model.snapshot_path_for(ref)
@@ -502,11 +502,11 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # would unlink a unit a live entry is firing from.
     if (
         current_snapshot is not None
-        and str(current_snapshot.name) != full_name
-        and str(current_snapshot.name) not in live_full_names
+        and str(current_snapshot.entity_name) != full_name
+        and str(current_snapshot.entity_name) not in live_full_names
     ):
         _destroy_one(
-            str(current_snapshot.name),
+            str(current_snapshot.entity_name),
             None,
             current_snapshot.symlink_state_dir,
         )
@@ -2124,7 +2124,9 @@ def _resolve_state_axes(
             unit_state = "grouped"
         else:
             installed_name = (
-                str(current_node.name) if current_node is not None else full
+                str(current_node.entity_name)
+                if current_node is not None
+                else full
             )
             unit_state = crony.runtime.unit_state(installed_name)
     last_state = _last_run_state(config, full)
@@ -2291,13 +2293,13 @@ def _build_group_membership(
         table: dict[crony.unit.EntityRef, list[str]] = {}
         for parent in graph.groups.values():
             for child_uuid in parent.children:
-                child_ref = crony.unit.EntityRef(parent.name.bundle, child_uuid)
+                child_ref = crony.unit.EntityRef(parent.bundle, child_uuid)
                 if (
                     child_ref not in graph.jobs
                     and child_ref not in graph.groups
                 ):
                     continue
-                table.setdefault(child_ref, []).append(str(parent.name))
+                table.setdefault(child_ref, []).append(str(parent.entity_name))
         for v in table.values():
             v.sort()
         return table
@@ -2487,7 +2489,7 @@ def do_status(
         # collision winner, so adding the name to `active` would
         # only re-render the winner.)
         ref_form_only = {
-            str(b.ref)
+            str(b.entity_ref)
             for b in config.broken.values()
             if b.name is None and (bundle is None or b.bundle == bundle)
         }
@@ -2580,10 +2582,10 @@ def do_status(
             else None
         )
         pending_name = (
-            str(pending_node.name) if pending_node is not None else None
+            str(pending_node.entity_name) if pending_node is not None else None
         )
         current_name = (
-            str(current_node.name) if current_node is not None else None
+            str(current_node.entity_name) if current_node is not None else None
         )
         if current_name is None and ref is not None:
             be = config.broken.get(ref)

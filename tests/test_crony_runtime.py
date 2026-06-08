@@ -653,7 +653,11 @@ class TestLoadConfig:
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert ref in config.pending.jobs
-        assert config.pending.jobs[ref].name == EntityName.from_str("default.a")
+        assert config.pending.jobs[ref].bundle == "default"
+        assert config.pending.jobs[ref].name == "a"
+        assert config.pending.jobs[ref].entity_name == EntityName.from_str(
+            "default.a"
+        )
         # No on-disk snapshot yet -> nothing in current.
         assert ref not in config.current.jobs
         assert config.config_state(ref) == "missing"

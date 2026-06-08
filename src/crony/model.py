@@ -73,26 +73,33 @@ class _JobCommon:
 
     schema: int
     kind: str  # "job" or "group"
-    name: crony.unit.EntityName  # full namespaced name `<bundle>.<short>`
+    bundle: str  # the bundle namespace; uuids are unique within it
+    name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
     symlink: tuple[Path, str] | None = field(default=None, kw_only=True)
 
     @property
-    def ref(self) -> crony.unit.EntityRef:
-        return crony.unit.EntityRef(self.name.bundle, self.uuid)
+    def entity_ref(self) -> crony.unit.EntityRef:
+        """The `<bundle>:<uuid>` identity."""
+        return crony.unit.EntityRef(self.bundle, self.uuid)
+
+    @property
+    def entity_name(self) -> crony.unit.EntityName:
+        """The human `<bundle>.<short>` name."""
+        return crony.unit.EntityName(self.bundle, self.name)
 
     @property
     def state_dir(self) -> Path:
         """The uuid-keyed state dir -- the path everything internal
         addresses."""
-        return entity_state_dir(self.ref)
+        return entity_state_dir(self.entity_ref)
 
     @property
     def symlink_state_dir(self) -> Path:
         """The short-name alias dir for this entry
         (`STATE_DIR/<bundle>/<short>`). apply maintains it as a
         relative symlink to `state_dir`."""
-        return crony.paths.STATE_DIR / self.name.bundle / self.name.short
+        return crony.paths.STATE_DIR / self.bundle / self.name
 
     @property
     def log_path_resolved(self) -> Path:
@@ -173,8 +180,8 @@ class Job(_JobCommon):
     def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks."""
         return crony.unit.UnitSpec(
-            name=self.name,
-            ref=self.ref,
+            name=self.entity_name,
+            ref=self.entity_ref,
             timing=self.timing,
             priority=self.priority,
         )
@@ -200,7 +207,8 @@ class Job(_JobCommon):
         snap = cls(
             schema=SNAPSHOT_SCHEMA,
             kind="job",
-            name=name,
+            bundle=name.bundle,
+            name=name.short,
             uuid=job.uuid,
             command=job.command,
             script=script,
@@ -260,8 +268,8 @@ class JobGroup(_JobCommon):
         """The platform UnitSpec the scheduler renders / drift-checks.
         Groups render without a priority."""
         return crony.unit.UnitSpec(
-            name=self.name,
-            ref=self.ref,
+            name=self.entity_name,
+            ref=self.entity_ref,
             timing=self.timing,
             priority=None,
         )
@@ -303,7 +311,8 @@ class JobGroup(_JobCommon):
         snap = cls(
             schema=SNAPSHOT_SCHEMA,
             kind="group",
-            name=name,
+            bundle=name.bundle,
+            name=name.short,
             uuid=group.uuid,
             children=children,
             group_budget_sec=config.resolved_group_timeout_sec(
@@ -327,7 +336,10 @@ def _snapshot_base_dict(snap: Job | JobGroup) -> dict[str, Any]:
     rendering the typed value-object fields back to their source
     strings. `Job.to_dict` layers the job-only `priority` on top."""
     d = dataclasses.asdict(snap)
-    d["name"] = str(snap.name)
+    # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
+    # is redundant with it and recomputed on load.
+    d["name"] = str(snap.entity_name)
+    d.pop("bundle", None)
     # The alias pair is derived disk / expected state, recomputed on
     # load -- it never belongs in the persisted snapshot.
     d.pop("symlink", None)
@@ -399,11 +411,13 @@ def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
     TypeError (wrong shape) or ValueError (bad typed field / unknown
     kind); callers treat both as a broken snapshot."""
     data = dict(raw)
-    # `bundle` is redundant with the name's bundle; drop it so a
-    # snapshot written before it was removed still loads.
-    data.pop("bundle", None)
+    # snapshot.json stores the full `<bundle>.<short>` name; split it
+    # back into the `bundle` + short `name` fields (overriding any
+    # legacy `bundle` key a very old snapshot may still carry).
     if isinstance(data.get("name"), str):
-        data["name"] = crony.unit.EntityName.from_str(data["name"])
+        en = crony.unit.EntityName.from_str(data["name"])
+        data["bundle"] = en.bundle
+        data["name"] = en.short
     schedule_str = data.pop("schedule", None)
     interval_str = data.pop("interval", None)
     timing: crony.unit.Timing | None
@@ -631,8 +645,8 @@ class Graph:
                     continue
                 name = crony.unit.EntityName(bundle.name, short)
                 snap_j = Job.from_config(bundle.config, toml_job, name)
-                pending.jobs[snap_j.ref] = snap_j
-                pending.by_full_name[str(name)] = snap_j.ref
+                pending.jobs[snap_j.entity_ref] = snap_j
+                pending.by_full_name[str(name)] = snap_j.entity_ref
             for short in sel_groups:
                 toml_group = bundle.config.job_groups.get(short)
                 if toml_group is None:
@@ -641,8 +655,8 @@ class Graph:
                 snap_g = JobGroup.from_config(
                     bundle.config, target, toml_group, name
                 )
-                pending.groups[snap_g.ref] = snap_g
-                pending.by_full_name[str(name)] = snap_g.ref
+                pending.groups[snap_g.entity_ref] = snap_g
+                pending.by_full_name[str(name)] = snap_g.entity_ref
         return pending
 
 
@@ -670,12 +684,12 @@ class JobOrphan:
     has_symlink: bool = False
 
     @property
-    def ref(self) -> crony.unit.EntityRef:
+    def entity_ref(self) -> crony.unit.EntityRef:
         return crony.unit.EntityRef(self.bundle, self.uuid)
 
     @property
     def state_dir(self) -> Path:
-        return entity_state_dir(self.ref)
+        return entity_state_dir(self.entity_ref)
 
     @property
     def symlink_state_dir(self) -> Path:
@@ -717,7 +731,7 @@ class BrokenEntity:
     source_path: Path
 
     @property
-    def ref(self) -> crony.unit.EntityRef:
+    def entity_ref(self) -> crony.unit.EntityRef:
         return crony.unit.EntityRef(self.bundle, self.uuid)
 
     @property
@@ -854,10 +868,10 @@ class Config:
         for graph in (self.current, self.pending):
             j = graph.jobs.get(ref)
             if j is not None:
-                return str(j.name)
+                return str(j.entity_name)
             g = graph.groups.get(ref)
             if g is not None:
-                return str(g.name)
+                return str(g.entity_name)
         broken = self.broken.get(ref)
         if broken is not None:
             return broken.name

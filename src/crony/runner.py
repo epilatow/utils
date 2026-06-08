@@ -159,7 +159,7 @@ def _keep_awake_argv(
     """
     if not snap.keep_awake:
         return argv, None
-    return crony.runtime.host().keep_awake_argv(argv, str(snap.name))
+    return crony.runtime.host().keep_awake_argv(argv, str(snap.entity_name))
 
 
 class _ExitOutcome(NamedTuple):
@@ -325,7 +325,7 @@ def _interactive_wait_and_prompt(
     silently bypass *that* wait.
     """
 
-    sd = crony.model.entity_state_dir(snap.ref)
+    sd = crony.model.entity_state_dir(snap.entity_ref)
 
     def _bypass() -> bool:
         return crony.runtime.consume_user_trigger_flag(sd)
@@ -347,8 +347,8 @@ def _interactive_wait_and_prompt(
             return "run"
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
-            str(snap.name),
-            f"crony wants to run '{snap.name}'. Now?",
+            str(snap.entity_name),
+            f"crony wants to run '{snap.entity_name}'. Now?",
         )
         log_file.write(f"interactive: user chose {choice}\n".encode())
         if choice in ("run", "cancel"):
@@ -382,7 +382,7 @@ def _run_job(
     signalled by raising PreconditionError -- cli() maps that to
     ExitCode.PRECONDITION.
     """
-    full_name = str(snap.name)
+    full_name = str(snap.entity_name)
 
     if snap.script is not None:
         sp = Path(snap.script)
@@ -680,7 +680,7 @@ def _run_group(
     agree. A group never applies a run-gate of its own -- each
     child's runner reads its own snapshot and gates itself.
     """
-    full_name = str(snap.name)
+    full_name = str(snap.entity_name)
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
@@ -713,9 +713,9 @@ def _run_group(
                     tuple[crony.unit.EntityRef, str | None]
                 ] = [
                     (
-                        crony.unit.EntityRef(snap.name.bundle, child_uuid),
+                        crony.unit.EntityRef(snap.bundle, child_uuid),
                         _child_full_name_from_uuid(
-                            crony.unit.EntityRef(snap.name.bundle, child_uuid)
+                            crony.unit.EntityRef(snap.bundle, child_uuid)
                         ),
                     )
                     for child_uuid in snap.children
