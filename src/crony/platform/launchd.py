@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -78,26 +79,27 @@ def render_plist(
     the runner gets the entity's `<bundle>:<uuid>` ref so it can
     locate the state dir directly without scanning.
 
-    ProgramArguments invokes uv with absolute paths rather than
-    relying on the script's `env -S uv run --script` shebang.
-    launchd's per-agent PATH is `/usr/bin:/bin:/usr/sbin:/sbin`,
-    which doesn't contain uv, so the shebang's `env` lookup fails
-    with exit 127 before crony can run at all.
-
     Serialized with `plistlib` so the XML is well-formed by
     construction (escaping, typed values, DOCTYPE); `sort_keys`
     keeps the byte output deterministic for the drift check.
     """
+    # launchd execs ProgramArguments[0] through xpcproxy, which
+    # enforces AMFI launch constraints. uv ships ad-hoc-signed, and
+    # after `uv self update` swaps the binary for a new cdhash that
+    # first launchd-driven launch is killed (OS_REASON_CODESIGNING)
+    # before crony runs -- silently breaking every scheduled unit
+    # until something relaunches it. Going through /bin/sh (a
+    # platform binary that always launches) makes uv an ordinary
+    # exec, like a terminal invocation, which the constraint check
+    # doesn't reach. `exec` so sh is replaced by uv (one process;
+    # uv's pid and exit code propagate straight to launchd). uv's
+    # absolute path because launchd's per-agent PATH omits it.
+    inner = shlex.join(
+        [str(uv_path), "run", "--script", str(crony_path), "run", str(ref)]
+    )
     contents: dict[str, object] = {
         "Label": label(name),
-        "ProgramArguments": [
-            str(uv_path),
-            "run",
-            "--script",
-            str(crony_path),
-            "run",
-            str(ref),
-        ],
+        "ProgramArguments": ["/bin/sh", "-c", f"exec {inner}"],
         "RunAtLoad": False,
         "KeepAlive": False,
         "AbandonProcessGroup": False,
@@ -124,7 +126,19 @@ def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
     args = data.get("ProgramArguments")
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         return None
-    return exec_paths_from_argv(list(args))
+    # render_plist wraps the run in `/bin/sh -c 'exec <uv> ...'`;
+    # unwrap to the bare runner argv the shared check validates. A
+    # plist not in this shape is treated as not-crony (None), which
+    # is_stale reads as drift and re-renders.
+    if len(args) != 3 or args[:2] != ["/bin/sh", "-c"]:
+        return None
+    try:
+        inner = shlex.split(args[2])
+    except ValueError:
+        return None
+    if not inner or inner[0] != "exec":
+        return None
+    return exec_paths_from_argv(inner[1:])
 
 
 def _launchctl_print_disabled() -> str:

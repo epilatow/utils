@@ -1063,6 +1063,28 @@ class TestExtractUnitExecPaths:
         )
         assert launchd._extract_exec_paths(bogus) is None
 
+    def test_returns_none_for_plist_sh_wrapper_bad_inner(self) -> None:
+        # /bin/sh -c wrapper whose inner argv isn't the runner shape.
+        bogus = (
+            '<?xml version="1.0"?><plist><dict>'
+            "<key>ProgramArguments</key><array>"
+            "<string>/bin/sh</string><string>-c</string>"
+            "<string>exec /abs/uv weird /abs/crony</string>"
+            "</array></dict></plist>"
+        )
+        assert launchd._extract_exec_paths(bogus) is None
+
+    def test_returns_none_for_plist_sh_wrapper_without_exec(self) -> None:
+        # Wrapper command must start with `exec`.
+        bogus = (
+            '<?xml version="1.0"?><plist><dict>'
+            "<key>ProgramArguments</key><array>"
+            "<string>/bin/sh</string><string>-c</string>"
+            "<string>/abs/uv run --script /abs/crony run x:y</string>"
+            "</array></dict></plist>"
+        )
+        assert launchd._extract_exec_paths(bogus) is None
+
     def test_returns_none_for_systemd_missing_exec_start(self) -> None:
         no_exec = "[Service]\nType=oneshot\n"
         assert systemd._extract_exec_paths(no_exec) is None

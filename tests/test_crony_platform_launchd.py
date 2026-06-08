@@ -102,10 +102,7 @@ class TestPlistRendering:
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
 
-    def test_program_args_invoke_uv_with_absolute_path(self) -> None:
-        # launchd's per-agent PATH omits uv, so the shebang's `env`
-        # lookup fails (exit 127). Render uv's absolute path into
-        # ProgramArguments so the unit doesn't depend on PATH.
+    def test_program_args_wrap_uv_in_sh_with_absolute_path(self) -> None:
         plist = launchd.render_plist(
             "j",
             _REF,
@@ -113,12 +110,14 @@ class TestPlistRendering:
             uv_path=_UV,
             crony_path=_CRONY,
         )
-        assert "<string>/abs/uv</string>" in plist
-        assert "<string>run</string>" in plist
-        assert "<string>--script</string>" in plist
-        assert "<string>/abs/crony</string>" in plist
-        # The runner argv carries the bundle:uuid ref, not the name.
-        assert "<string>default:u-test</string>" in plist
+        d = plistlib.loads(plist.encode("utf-8"))
+        assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+        # uv's absolute path because launchd's per-agent PATH omits
+        # it, exec so sh is replaced by uv, and the bundle:uuid ref
+        # (not the name) so the runner locates the state dir.
+        assert d["ProgramArguments"][2] == (
+            "exec /abs/uv run --script /abs/crony run default:u-test"
+        )
 
     def test_every_shape_is_a_valid_plist(self) -> None:
         # Each rendered plist must parse back as a well-formed plist
@@ -139,7 +138,7 @@ class TestPlistRendering:
             )
             d = plistlib.loads(plist.encode("utf-8"))
             assert d["Label"] == "org.crony.j"
-            assert d["ProgramArguments"][1] == "run"
+            assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
 
 
 class TestLaunchdPriority:
