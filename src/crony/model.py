@@ -51,7 +51,7 @@ SNAPSHOT_SCHEMA: int = 4
 RUN_LOG_NAME: str = "run.log"
 
 
-@dataclass
+@dataclass(frozen=True)
 class _JobCommon:
     """Identity and behavior shared by `Job` and `JobGroup`.
 
@@ -110,12 +110,22 @@ class _JobCommon:
         """The applied-snapshot file inside this entry's state dir."""
         return self.state_dir / "snapshot.json"
 
+    @classmethod
+    def symlink_state_dir_from_name(cls, name: crony.unit.EntityName) -> Path:
+        """The short-name alias dir for a name:
+        `STATE_DIR/<bundle>/<short>`. The base case for callers that
+        hold only a name and no built node -- the current-graph scan
+        reading a node's on-disk alias before constructing it. The
+        `symlink_state_dir` property routes through here so the layout
+        join lives in one place."""
+        return crony.paths.STATE_DIR / name.bundle / name.short
+
     @property
     def symlink_state_dir(self) -> Path:
         """The short-name alias dir for this entry
         (`STATE_DIR/<bundle>/<short>`). apply maintains it as a
         relative symlink to `state_dir`."""
-        return crony.paths.STATE_DIR / self.bundle / self.name
+        return self.symlink_state_dir_from_name(self.entity_name)
 
     @property
     def log_path_resolved(self) -> Path:
@@ -123,10 +133,15 @@ class _JobCommon:
         writes, independent of alias state."""
         return self.state_dir / RUN_LOG_NAME
 
-    def expected_symlink(self) -> tuple[Path, str]:
-        """The alias pair this node expects on disk: the alias path
-        and its relative target (the bare uuid)."""
-        return (self.symlink_state_dir, self.uuid)
+    @classmethod
+    def expected_symlink(
+        cls, name: crony.unit.EntityName, uuid: str
+    ) -> tuple[Path, str]:
+        """The alias pair a config-built node expects on disk: the
+        short-name alias dir and its relative target (the bare uuid).
+        A classmethod so `from_config` can set `symlink` at
+        construction rather than building the node and replacing it."""
+        return (cls.symlink_state_dir_from_name(name), uuid)
 
     @property
     def log_path(self) -> Path:
@@ -142,7 +157,7 @@ class _JobCommon:
         return self.log_path_resolved
 
 
-@dataclass
+@dataclass(frozen=True)
 class Job(_JobCommon):
     """Resolved runtime parameters for a single job. Most fields are
     final values: paths are pre-expanded (`~` and `$VAR`), timeouts
@@ -220,12 +235,13 @@ class Job(_JobCommon):
             if job.gate_script is not None
             else None
         )
-        snap = cls(
+        return cls(
             schema=SNAPSHOT_SCHEMA,
             kind="job",
             bundle=name.bundle,
             name=name.short,
             uuid=job.uuid,
+            symlink=cls.expected_symlink(name, job.uuid),
             command=job.command,
             script=script,
             args=args,
@@ -250,8 +266,6 @@ class Job(_JobCommon):
                 else crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
             ),
         )
-        snap.symlink = snap.expected_symlink()
-        return snap
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this job to its JSON dict. The typed value-object
@@ -264,7 +278,7 @@ class Job(_JobCommon):
         return d
 
 
-@dataclass
+@dataclass(frozen=True)
 class JobGroup(_JobCommon):
     """Resolved runtime parameters for a job-group. `children` are
     bundle-scoped uuids; the runner resolves each back to its
@@ -324,12 +338,13 @@ class JobGroup(_JobCommon):
                 children.append(config.jobs[c].uuid)
             elif c in sel_groups:
                 children.append(config.job_groups[c].uuid)
-        snap = cls(
+        return cls(
             schema=SNAPSHOT_SCHEMA,
             kind="group",
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
+            symlink=cls.expected_symlink(name, group.uuid),
             children=children,
             group_budget_sec=config.resolved_group_timeout_sec(
                 target, group.name
@@ -337,8 +352,6 @@ class JobGroup(_JobCommon):
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
             timing=group.timing,
         )
-        snap.symlink = snap.expected_symlink()
-        return snap
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this group to its JSON dict. The typed value-object
@@ -413,12 +426,23 @@ def _resolve_snapshot_for(
     raise crony.errors.PreconditionError(f"unknown job/group: {short!r}")
 
 
-def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
+def snapshot_from_dict(
+    raw: dict[str, Any],
+    *,
+    symlink: tuple[Path, str] | None = None,
+) -> Job | JobGroup:
     """Construct a snapshot from its JSON dict, parsing the typed
     value-object fields back from their source strings. Raises
     TypeError (wrong shape) or ValueError (bad typed field / unknown
-    kind); callers treat both as a broken snapshot."""
+    kind); callers treat both as a broken snapshot.
+
+    `symlink` is the on-disk alias pair the caller read for this entry
+    (None when it has no link, or for a load that doesn't care about
+    the alias). It is not part of `raw` -- the alias is derived disk
+    state, never serialized -- so the current-graph scan passes the
+    pair it read so the frozen node carries it from construction."""
     data = dict(raw)
+    data["symlink"] = symlink
     # snapshot.json stores the full `<bundle>.<short>` name; split it
     # back into the `bundle` + short `name` fields (overriding any
     # legacy `bundle` key a very old snapshot may still carry).

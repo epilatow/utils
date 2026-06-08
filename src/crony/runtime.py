@@ -211,8 +211,30 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
+            # Read the alias as it is on disk and pin it at construction
+            # so the frozen node carries the actual pair -- a missing /
+            # mis-pointed link then diverges from the config-built
+            # node's expected pair, surfacing as drift through the
+            # snapshot comparison (and steering `log_path` to the uuid
+            # path). A malformed name raises here and is treated as a
+            # broken snapshot, same as a malformed body.
             try:
-                snap = crony.model.snapshot_from_dict(raw)
+                en = (
+                    crony.unit.EntityName.from_str(name_hint)
+                    if isinstance(name_hint, str)
+                    else None
+                )
+                alias = (
+                    crony.model.Job.symlink_state_dir_from_name(en)
+                    if en is not None
+                    else None
+                )
+                snap = crony.model.snapshot_from_dict(
+                    raw,
+                    symlink=_read_symlink_pair(alias)
+                    if alias is not None
+                    else None,
+                )
             except (TypeError, ValueError) as exc:
                 broken[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
@@ -222,11 +244,6 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            # Pin the alias as it actually is on disk so a missing /
-            # mis-pointed link diverges from the config-built node's
-            # expected pair, surfacing as drift through the snapshot
-            # comparison (and steering `log_path` to the uuid path).
-            snap.symlink = _read_symlink_pair(snap)
             full = str(snap.entity_name)
             if isinstance(snap, crony.model.Job):
                 current.jobs[snap.entity_ref] = snap
@@ -487,15 +504,12 @@ def recover_full_name(state_dir: Path) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _read_symlink_pair(
-    node: crony.model.Job | crony.model.JobGroup,
-) -> tuple[Path, str] | None:
-    """The on-disk alias pair for a node: (alias_path, target) when
-    the alias is a symlink (a dangling one included), else None.
-    `target` is the link's literal contents -- the bare uuid for an
-    apply-created alias -- compared against the entry's uuid to tell a
-    correct alias from a mis-pointed one."""
-    link = node.symlink_state_dir
+def _read_symlink_pair(link: Path) -> tuple[Path, str] | None:
+    """The on-disk alias pair at `link`: (link, target) when it is a
+    symlink (a dangling one included), else None. `target` is the
+    link's literal contents -- the bare uuid for an apply-created
+    alias -- compared against the entry's uuid to tell a correct alias
+    from a mis-pointed one."""
     if link.is_symlink():
         return (link, str(link.readlink()))
     return None

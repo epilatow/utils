@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 from typing import Any
@@ -254,15 +255,16 @@ class TestLogPath:
         assert snap.log_path == snap.symlink_state_dir / RUN_LOG_NAME
 
     def test_missing_pair_reports_uuid_path(self) -> None:
-        snap = self._snap()
-        snap.symlink = None
+        snap = dataclasses.replace(self._snap(), symlink=None)
         assert snap.log_path == snap.log_path_resolved
 
     def test_mismatched_target_reports_uuid_path(self) -> None:
-        snap = self._snap()
+        base = self._snap()
         # A link that points at some other uuid is not this node's
         # alias, so the reported path falls back to the uuid dir.
-        snap.symlink = (snap.symlink_state_dir, "other-uuid")
+        snap = dataclasses.replace(
+            base, symlink=(base.symlink_state_dir, "other-uuid")
+        )
         assert snap.log_path == snap.log_path_resolved
 
 
