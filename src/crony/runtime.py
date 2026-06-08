@@ -167,7 +167,11 @@ def _build_current_graph(
         if not bundle_dir.is_dir():
             continue
         for uuid_dir in bundle_dir.iterdir():
-            if not uuid_dir.is_dir():
+            # Skip the short-name alias symlinks that live alongside the
+            # uuid dirs: `is_dir()` follows a symlink to its target, so
+            # an alias would otherwise be scanned as a phantom uuid dir
+            # keyed by the short name and double-load the same snapshot.
+            if uuid_dir.is_symlink() or not uuid_dir.is_dir():
                 continue
             snap_path = uuid_dir / "snapshot.json"
             if not snap_path.is_file():
@@ -218,6 +222,11 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
+            # Pin the alias as it actually is on disk so a missing /
+            # mis-pointed link diverges from the config-built node's
+            # expected pair, surfacing as drift through the snapshot
+            # comparison (and steering `log_path` to the uuid path).
+            snap.symlink = _read_symlink_pair(snap)
             full = str(snap.name)
             if isinstance(snap, crony.model.Job):
                 current.jobs[snap.ref] = snap
@@ -290,17 +299,22 @@ def load_config() -> crony.model.Config:
         if broken_entry.name is not None:
             broken_by_full_name[broken_entry.name] = ref
 
-    # Platform unit files whose name isn't in `current` or
-    # `broken`: state-dir-less remnants (typically a state wipe
-    # without `crony destroy` first). Synthesize a deterministic
-    # `uuid5` so the entity has a stable EntityRef downstream and
-    # `destroy` can address it through the same machinery as
-    # other on-disk entities.
+    # Names with an on-disk remnant -- a leftover platform unit file
+    # and / or a leftover short-name alias symlink -- that no current
+    # or broken snapshot accounts for. A rename leaves a stray alias
+    # with no unit; a state wipe leaves a unit with no alias; some
+    # carry both. Synthesize a deterministic `uuid5` keyed on the name
+    # so a name with both remnants resolves to one stable EntityRef
+    # that `destroy` addresses through the same machinery as other
+    # on-disk entities. The hash seed string is fixed for that
+    # stability and is not a description.
     accounted_labels: set[str] = set(current.by_full_name)
     accounted_labels.update(broken_by_full_name)
-    unit_only: dict[crony.unit.EntityRef, crony.model.UnitOnlyOrphan] = {}
-    unit_only_by_full_name: dict[str, crony.unit.EntityRef] = {}
-    for full_name in _platform_unit_names() - accounted_labels:
+    unit_names = _platform_unit_names()
+    alias_names = _alias_symlink_names()
+    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
+    orphans_by_full_name: dict[str, crony.unit.EntityRef] = {}
+    for full_name in (unit_names | alias_names) - accounted_labels:
         bundle_name, _, _ = full_name.partition(".")
         if not bundle_name:
             continue
@@ -308,26 +322,31 @@ def load_config() -> crony.model.Config:
             uuid.uuid5(uuid.NAMESPACE_DNS, f"crony.unit-only/{full_name}")
         )
         ref = crony.unit.EntityRef(bundle_name, synthetic)
-        unit_only[ref] = crony.model.UnitOnlyOrphan(
+        has_unit = full_name in unit_names
+        orphans[ref] = crony.model.JobOrphan(
             bundle=bundle_name,
             uuid=synthetic,
             name=full_name,
-            has_unit_file=True,
+            has_unit_file=has_unit,
+            has_symlink=full_name in alias_names,
         )
-        unit_only_by_full_name[full_name] = ref
-        # Make the platform paths available through RuntimeState so
+        orphans_by_full_name[full_name] = ref
+        # Surface the platform unit paths through RuntimeState (so
         # status's unit-config / unit-timer columns don't re-walk the
-        # unit dirs.
-        unit_config = _platform_unit_config_path(full_name)
-        unit_timer = _platform_unit_timer_path(full_name)
+        # unit dirs); a symlink-only orphan has no unit file, so leave
+        # them None.
         runtime[ref] = crony.model.RuntimeState(
             state_dir=crony.model.entity_state_dir(ref),
             last_run=None,
             is_running=False,
             is_pending=False,
             has_user_trigger_flag=False,
-            unit_config=unit_config,
-            unit_timer=unit_timer,
+            unit_config=(
+                _platform_unit_config_path(full_name) if has_unit else None
+            ),
+            unit_timer=(
+                _platform_unit_timer_path(full_name) if has_unit else None
+            ),
         )
 
     return crony.model.Config(
@@ -336,8 +355,8 @@ def load_config() -> crony.model.Config:
         current=current,
         broken=broken,
         broken_by_full_name=broken_by_full_name,
-        unit_only=unit_only,
-        unit_only_by_full_name=unit_only_by_full_name,
+        orphans=orphans,
+        orphans_by_full_name=orphans_by_full_name,
         runtime=runtime,
         host=host,
         platform=platform,
@@ -345,13 +364,13 @@ def load_config() -> crony.model.Config:
     )
 
 
-def state_dir_for(ref: crony.unit.EntityRef) -> Path:
+def state_dir_for(node: crony.model.Job | crony.model.JobGroup) -> Path:
     """State directory for an entity, materialized on disk.
 
-    Returns the uuid-keyed state dir for `ref`, creating it (and
-    the bundle subdir) when missing. Used by apply and the runner
-    -- both write files under the returned path on every call, so
-    a pre-existing empty dir is the right starting state.
+    Returns `node`'s uuid-keyed state dir, creating it (and the bundle
+    subdir) when missing. Used by apply and the runner -- both write
+    files under the returned path on every call, so a pre-existing
+    empty dir is the right starting state.
 
     Also materializes an empty `run.log` when absent, so it exists
     from apply time onward -- an operator can `tail -f` it before
@@ -359,11 +378,10 @@ def state_dir_for(ref: crony.unit.EntityRef) -> Path:
     it. Only created when missing, never truncated, so an existing
     log survives a re-apply untouched.
     """
-    d = crony.model.entity_state_dir(ref)
+    d = node.state_dir
     d.mkdir(parents=True, exist_ok=True)
-    log_path = d / "run.log"
-    if not log_path.exists():
-        log_path.touch()
+    if not node.log_path_resolved.exists():
+        node.log_path_resolved.touch()
     return d
 
 
@@ -489,6 +507,20 @@ def recover_full_name(state_dir: Path) -> str | None:
     return name if isinstance(name, str) else None
 
 
+def _read_symlink_pair(
+    node: crony.model.Job | crony.model.JobGroup,
+) -> tuple[Path, str] | None:
+    """The on-disk alias pair for a node: (alias_path, target) when
+    the alias is a symlink (a dangling one included), else None.
+    `target` is the link's literal contents -- the bare uuid for an
+    apply-created alias -- compared against the entry's uuid to tell a
+    correct alias from a mis-pointed one."""
+    link = node.symlink_state_dir
+    if link.is_symlink():
+        return (link, str(link.readlink()))
+    return None
+
+
 def run_in_progress(state_dir: Path) -> bool:
     """True when `state_dir`'s `run.lock` is held by another
     process -- a fire is in flight. False when the lock file is
@@ -518,6 +550,30 @@ def _platform_unit_names() -> set[str]:
     them down manually.
     """
     return scheduler().installed_names()
+
+
+def _alias_symlink_names() -> set[str]:
+    """The `<bundle>.<short>` of every short-name alias symlink under
+    the state tree.
+
+    The alias is the only symlink crony plants beside the uuid dirs,
+    so any symlink child of a bundle dir is one. A dangling alias (its
+    uuid dir gone) is still reported -- orphan cleanup reclaims the
+    link by name. Used to discover aliases whose name no current /
+    broken snapshot accounts for (a rename that left the old alias
+    behind, or a hand-created one).
+    """
+    names: set[str] = set()
+    root = crony.paths.STATE_DIR
+    if not root.exists():
+        return names
+    for bundle_dir in root.iterdir():
+        if not bundle_dir.is_dir():
+            continue
+        for child in bundle_dir.iterdir():
+            if child.is_symlink():
+                names.add(f"{bundle_dir.name}.{child.name}")
+    return names
 
 
 def unit_state(name: str, platform: str | None = None) -> str:

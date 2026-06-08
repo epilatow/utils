@@ -391,9 +391,9 @@ def _run_job(
         if not os.access(sp, os.X_OK):
             raise crony.errors.PreconditionError(f"script not executable: {sp}")
 
-    sd = crony.runtime.state_dir_for(snap.ref)
+    sd = crony.runtime.state_dir_for(snap)
     lock_path = sd / "run.lock"
-    log_path = sd / "run.log"
+    log_path = snap.log_path_resolved
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -684,9 +684,9 @@ def _run_group(
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = crony.runtime.state_dir_for(snap.ref)
+    sd = crony.runtime.state_dir_for(snap)
     lock_path = sd / "run.lock"
-    log_path = sd / "run.log"
+    log_path = snap.log_path_resolved
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -1184,7 +1184,7 @@ def _record_snapshot_load_failure(
         "reason": str(exc),
     }
     crony.runtime.write_last_run(state_dir / "last-run.json", payload)
-    log_path = state_dir / "run.log"
+    log_path = state_dir / crony.model.RUN_LOG_NAME
     line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))

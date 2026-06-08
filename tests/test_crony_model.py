@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,6 +34,10 @@ from crony.config import (  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
     UsageError,
+)
+from crony.model import (  # noqa: E402
+    RUN_LOG_NAME,
+    _resolve_snapshot_for,
 )
 from crony.unit import (  # noqa: E402
     EntityRef,
@@ -231,6 +236,34 @@ class TestEntityRefInput:
         # walking outside `STATE_DIR`.
         bad = f"../etc:{self._CANONICAL_UUID}"
         assert EntityRef.from_str(bad) is None
+
+
+class TestLogPath:
+    """`log_path` reports the short-name alias when the node's recorded
+    `symlink` pair resolves to its own uuid, else the uuid-keyed path.
+    """
+
+    def _snap(self) -> Any:
+        cfg = _parse({"job": {"j": _job()}})
+        return _resolve_snapshot_for(cfg, "j")
+
+    def test_expected_pair_reports_alias(self) -> None:
+        snap = self._snap()
+        # A config-built node carries the expected pair (alias -> uuid).
+        assert snap.symlink == (snap.symlink_state_dir, snap.uuid)
+        assert snap.log_path == snap.symlink_state_dir / RUN_LOG_NAME
+
+    def test_missing_pair_reports_uuid_path(self) -> None:
+        snap = self._snap()
+        snap.symlink = None
+        assert snap.log_path == snap.log_path_resolved
+
+    def test_mismatched_target_reports_uuid_path(self) -> None:
+        snap = self._snap()
+        # A link that points at some other uuid is not this node's
+        # alias, so the reported path falls back to the uuid dir.
+        snap.symlink = (snap.symlink_state_dir, "other-uuid")
+        assert snap.log_path == snap.log_path_resolved
 
 
 if __name__ == "__main__":

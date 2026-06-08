@@ -505,7 +505,11 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         and str(current_snapshot.name) != full_name
         and str(current_snapshot.name) not in live_full_names
     ):
-        _destroy_one(str(current_snapshot.name), None)
+        _destroy_one(
+            str(current_snapshot.name),
+            None,
+            current_snapshot.symlink_state_dir,
+        )
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
     # unit stays disabled across the re-load. The scheduler view
@@ -530,32 +534,59 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         scheduled=timing is not None,
     )
 
-    crony.runtime.state_dir_for(ref)
+    crony.runtime.state_dir_for(snapshot)
     snapshot_path.write_text(
         json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    _link_alias(snapshot)
     return "updated" if is_update else "added"
 
 
-def _destroy_one(name: str | None, state_dir: Path | None) -> None:
+def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:
+    """Point the entry's short-name alias at its uuid dir.
+
+    The alias is `node.symlink_state_dir` and its (relative) target is
+    the bare uuid, so the state tree stays relocatable. A correctly-
+    pointed alias is left untouched; one pointing elsewhere is
+    repointed. A non-symlink already sitting at the alias path is left
+    alone -- apply never clobbers real state.
+    """
+    link = node.symlink_state_dir
+    if link.is_symlink():
+        if os.readlink(link) == node.uuid:
+            return
+        link.unlink()
+    elif link.exists():
+        return
+    link.symlink_to(node.uuid)
+
+
+def _destroy_one(
+    name: str | None,
+    state_dir: Path | None,
+    alias_dir: Path | None = None,
+) -> None:
     """Remove a single entity's platform unit and apply-time state.
 
-    Always a full wipe: the platform unit files and the entire
-    uuid-keyed state dir go away in one shot. Tolerant of partial
-    state throughout so a partially-installed entity can still be
-    cleaned up.
+    Always a full wipe: the platform unit files, the short-name alias
+    symlink, and the entire uuid-keyed state dir go away in one shot.
+    Tolerant of partial state throughout so a partially-installed
+    entity can still be cleaned up.
 
-    `name` is the full namespaced name used for platform unit
-    paths (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`).
-    Pass `None` when no name is recoverable -- e.g. a ref-form
-    destroy whose state dir snapshot is unparseable -- to skip
-    platform unit cleanup. `state_dir` is the uuid-keyed dir
-    (resolved by the caller via Config); None means there's no
-    state dir to clean up.
+    `name` is the full namespaced name used for platform unit paths
+    (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`); pass
+    `None` to skip platform unit cleanup (e.g. a ref-form destroy whose
+    snapshot is unparseable). `alias_dir` is the entity's
+    `symlink_state_dir` (resolved by the caller from the entity it
+    holds); when it is a symlink it is unlinked, never a real dir. None
+    means no alias to clean. `state_dir` is the uuid-keyed dir; None
+    means there's no state dir to clean up.
     """
     if name is not None:
         crony.runtime.scheduler().remove_files(name)
+    if alias_dir is not None and alias_dir.is_symlink():
+        alias_dir.unlink()
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
@@ -586,7 +617,11 @@ def _sweep_superseded_state_dirs(
     if not bundle_root.is_dir():
         return
     for uuid_dir in sorted(bundle_root.iterdir()):
-        if not uuid_dir.is_dir() or uuid_dir.name in live_uuids:
+        # Skip short-name alias symlinks (is_dir() dereferences them);
+        # only real uuid-keyed dirs are superseded-state candidates.
+        if uuid_dir.is_symlink() or not uuid_dir.is_dir():
+            continue
+        if uuid_dir.name in live_uuids:
             continue
         if crony.runtime.recover_full_name(uuid_dir) != full_name:
             continue
@@ -730,7 +765,7 @@ def _config_axis(
     if (
         state == "missing"
         and entry is not None
-        and full in config.unit_only_by_full_name
+        and full in config.orphans_by_full_name
     ):
         # In config and never cleanly applied (no current
         # snapshot) but a platform unit lingers from a prior apply
@@ -1213,7 +1248,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         # _apply_one's job, not the orphan sweep's, so the sweep
         # never unlinks a unit a selected entry is still firing.
         on_disk = (
-            config.current.refs() | set(config.broken) | set(config.unit_only)
+            config.current.refs() | set(config.broken) | set(config.orphans)
         )
         live = config.pending.refs()
         orphan_refs = sorted(
@@ -1234,7 +1269,11 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
                     "%s: orphan left in place (run in progress)", label
                 )
                 continue
-            _destroy_one(name, sd if sd.is_dir() else None)
+            _destroy_one(
+                name,
+                sd if sd.is_dir() else None,
+                config.alias_dir_for(ref),
+            )
             logger.info("%s: orphan removed", label)
 
 
@@ -1377,7 +1416,8 @@ def do_destroy(
                 raise crony.errors.LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 ) from None
-        _destroy_one(name_for_cleanup, sd)
+        alias_dir = config.alias_dir_for(ref) if ref is not None else None
+        _destroy_one(name_for_cleanup, sd, alias_dir)
         logger.info("%s: destroyed", full)
 
     # Reclaim shadowed collision residue (state dir only -- the
@@ -1432,7 +1472,7 @@ def _installed_refs(config: crony.model.Config) -> set[crony.unit.EntityRef]:
     snapshot, or a leftover platform unit) -- the set an action
     command can act on. Excludes pending-only entries (never applied).
     """
-    return config.current.refs() | set(config.broken) | set(config.unit_only)
+    return config.current.refs() | set(config.broken) | set(config.orphans)
 
 
 def _resolve_addressable(
@@ -1795,6 +1835,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "uuid": "UUID",
     "unit-config": "UNIT CONFIG",
     "unit-timer": "UNIT TIMER",
+    "log-file": "LOG FILE",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
@@ -1905,6 +1946,12 @@ Columns
                     (`crony-<name>.timer` on Linux). Always empty on
                     macOS (the plist carries its own schedule) and for
                     an unscheduled / grouped entry.
+  log-file          Filesystem path of the entry's log file (the path
+                    `crony logs <name>` reads). Opt-in. Source-selected
+                    like `schedule`: default and --config-pending show
+                    the config path, --config-current the applied one,
+                    flagged with `^` when the two diverge (a not-yet-
+                    applied rename).
 
 Aliases
 -------
@@ -2420,7 +2467,7 @@ def do_status(
     # Surface bundle parse failures at the top of the report so
     # the operator sees them before scanning the table. The table
     # itself shows whatever is interpretable on-disk; entries
-    # whose bundle didn't load show up as orphans or unit_only.
+    # whose bundle didn't load show up as orphans.
     if bundles.errored_bundles:
         print("bundle parse failures (config-side entries not loaded):")
         for src, msg in bundles.errored_bundles.items():
@@ -2540,12 +2587,12 @@ def do_status(
         )
         if current_name is None and ref is not None:
             be = config.broken.get(ref)
-            ue = config.unit_only.get(ref)
+            oe = config.orphans.get(ref)
             current_name = (
                 be.name
                 if be is not None
-                else ue.name
-                if ue is not None
+                else oe.name
+                if oe is not None
                 else None
             )
         fallback = sorted(candidates)[0] if candidates else ""
@@ -2687,6 +2734,20 @@ def do_status(
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
+        # `log-file`: the reported log path, read off each side's node
+        # via the same `log_path` accessor `crony logs` uses. Dual-
+        # source, so a not-yet-applied rename flags `^`. An orphan row
+        # (no graph node) reports its remnant's path on the current
+        # side; a broken row with no recoverable name reports nothing.
+        pending_log = (
+            str(pending_node.log_path) if pending_node is not None else None
+        )
+        current_log: str | None = None
+        if current_node is not None:
+            current_log = str(current_node.log_path)
+        elif row_ref is not None and row_ref in config.orphans:
+            current_log = str(config.orphans[row_ref].log_path)
+        log_file_cell = _mark(pending_log, current_log)
         built.append(
             (
                 config_name,
@@ -2705,6 +2766,7 @@ def do_status(
                     "uuid": uuid_cell,
                     "unit-config": unit_config_cell,
                     "unit-timer": unit_timer_cell,
+                    "log-file": log_file_cell,
                 },
             )
         )
@@ -2850,6 +2912,7 @@ def do_logs(
     except crony.errors.ConfigError:
         config = None
     sd: Path | None = None
+    current_node: crony.model.Job | crony.model.JobGroup | None = None
     if config is not None:
         # Logs: prefer the current ref (where the run.log actually
         # lives), fall back to pending so `--path` mode prints the
@@ -2870,17 +2933,25 @@ def do_logs(
             # it's also defined for refs that aren't
             # (`<bundle>:<UUID>` input whose snapshot is
             # unparseable, pre-apply entries, broken / future
-            # unit-only orphans). The `log_path.exists()` check
+            # orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
             sd = crony.model.entity_state_dir(ref)
+            current_node = config.current.jobs.get(
+                ref
+            ) or config.current.groups.get(ref)
     if sd is None:
         raise crony.errors.UsageError(
             f"no log for {full!r} (no applied state on this host)"
         )
-    log_path = sd / "run.log"
+    log_path = sd / crony.model.RUN_LOG_NAME
     if path:
-        print(log_path)
+        # The reported path comes from the applied (current) node, so
+        # it shows the short-name alias when the on-disk link resolves
+        # and the uuid path otherwise -- always a valid on-disk
+        # location. A pre-apply / ref-form / broken entry has no
+        # current node, so it reports the uuid path directly.
+        print(current_node.log_path if current_node is not None else log_path)
         return
     if not log_path.exists():
         raise crony.errors.UsageError(f"no log for {full!r} (state dir: {sd})")

@@ -721,9 +721,44 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(snap.to_dict()), encoding="utf-8"
         )
+        # apply also plants the short-name alias; without it the
+        # current node's recorded link diverges from the expected one.
+        (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "synced"
+
+    def test_scan_skips_alias_symlink(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """The short-name alias symlink that sits beside the uuid dirs
+        is skipped by the state scan: `is_dir()` follows the link, so
+        without the guard the alias would be re-scanned under its short
+        name -- here surfacing a phantom broken entry keyed by that
+        name instead of only the real uuid-keyed one."""
+        self._setup(tmp_path, monkeypatch)
+        crony_paths.CONFIG_FILE.write_text("", encoding="utf-8")
+        uuid_a = "33333333-4444-5555-6666-aaaaaaaaaaaa"
+        sd = crony_paths.STATE_DIR / "default" / uuid_a
+        sd.mkdir(parents=True)
+        # A schema-mismatched snapshot makes the real uuid dir a broken
+        # entry; reaching it again through the alias would mint a second
+        # broken entry keyed by the alias's short name.
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": 999,
+                    "kind": "job",
+                    "name": "default.a",
+                    "uuid": uuid_a,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
+        config = crony_runtime.load_config()
+        assert set(config.broken) == {EntityRef("default", uuid_a)}
+        assert EntityRef("default", "a") not in config.broken
 
     def test_stale_when_pending_differs(
         self, tmp_path: Path, monkeypatch: Any

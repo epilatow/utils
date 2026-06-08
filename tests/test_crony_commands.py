@@ -832,6 +832,12 @@ class TestApplyRenamePreservesHistory:
         # New label is wired up; old label is gone.
         assert (h.agents / f"org.crony.{h.full('bar')}.plist").exists()
         assert not (h.agents / f"org.crony.{h.full('foo')}.plist").exists()
+        # The alias follows the rename: the old short is unlinked, the
+        # new short points at the (shared) uuid-keyed dir.
+        assert not (h.state / "default" / "foo").is_symlink()
+        new_alias = h.state / "default" / "bar"
+        assert new_alias.is_symlink()
+        assert new_alias.resolve() == foo_dir.resolve()
 
     def test_name_swap_preserves_renamed_entry_history(
         self, tmp_path: Path, monkeypatch: Any
@@ -884,6 +890,79 @@ class TestApplyRenamePreservesHistory:
         # renamed entry must not have unlinked the new aaa's unit.
         assert (h.agents / f"org.crony.{h.full('zzz')}.plist").exists()
         assert (h.agents / f"org.crony.{h.full('aaa')}.plist").exists()
+        # The aliases end correctly cross-linked: `zzz` -> the renamed
+        # entry's uuid, `aaa` -> the new claimant's uuid.
+        assert (h.state / "default" / "zzz").resolve() == renamed_dir.resolve()
+        assert (h.state / "default" / "aaa").resolve() == (
+            h.state / "default" / new_aaa_uuid
+        ).resolve()
+
+
+class TestApplyAlias:
+    """apply maintains the short-name alias symlink beside each uuid
+    dir -- the uuid-free form `crony logs` / `crony status` report. The
+    alias is a compared part of the snapshot, so a missing or
+    mis-pointed link reads `stale` and a re-apply repairs it.
+    """
+
+    def test_apply_creates_relative_alias(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j", ensure_snapshot=False)
+        alias = h.state / "default" / "j"
+        assert alias.is_symlink()
+        # Relative target is the bare uuid, so the tree stays movable.
+        assert os.readlink(alias) == sd.name
+        assert alias.resolve() == sd.resolve()
+        assert (
+            crony_runtime.load_config().config_state(
+                EntityRef("default", sd.name)
+            )
+            == "synced"
+        )
+
+    def test_missing_alias_reads_stale_and_apply_repairs(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j", ensure_snapshot=False)
+        ref = EntityRef("default", sd.name)
+        alias = h.state / "default" / "j"
+        alias.unlink()
+        assert crony_runtime.load_config().config_state(ref) == "stale"
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        assert alias.is_symlink()
+        assert crony_runtime.load_config().config_state(ref) == "synced"
+
+    def test_mispointed_alias_reads_stale_and_apply_repairs(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j", ensure_snapshot=False)
+        ref = EntityRef("default", sd.name)
+        alias = h.state / "default" / "j"
+        alias.unlink()
+        alias.symlink_to("00000000-0000-0000-0000-000000000000")
+        assert crony_runtime.load_config().config_state(ref) == "stale"
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        assert os.readlink(alias) == sd.name
+        assert crony_runtime.load_config().config_state(ref) == "synced"
 
 
 class TestDestroy:
@@ -895,11 +974,15 @@ class TestDestroy:
         )
         h.apply("j")
         sd = h.state_dir("j", ensure_snapshot=False)
+        alias = h.state / "default" / "j"
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert (sd / "snapshot.json").exists()
+        assert alias.is_symlink()
         crony_commands.do_destroy(jobs=[], bundle=None, orphans=False)
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         assert not sd.exists()
+        # The alias symlink is cleaned up with the rest of the entry.
+        assert not alias.is_symlink()
 
     def test_surgical_destroy(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -4202,6 +4285,45 @@ class TestLogs:
         expected = h.state_dir("j") / "run.log"
         assert out == str(expected)
 
+    def test_path_reports_alias_for_applied_entry(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        crony_commands.do_logs(
+            name="j", n=0, since=None, tail=False, path=True, latest=False
+        )
+        out = capsys.readouterr().out.strip()
+        # The applied entry has a short-name alias, so -p reports the
+        # uuid-free path -- which resolves to the real run.log.
+        alias_log = h.state / "default" / "j" / "run.log"
+        assert out == str(alias_log)
+        uuid_log = h.state_dir("j", ensure_snapshot=False) / "run.log"
+        assert Path(out).resolve() == uuid_log.resolve()
+
+    def test_path_falls_back_to_uuid_when_alias_missing(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # Remove the alias: the path must fall back to the uuid form so
+        # it still resolves to a real location.
+        (h.state / "default" / "j").unlink()
+        crony_commands.do_logs(
+            name="j", n=0, since=None, tail=False, path=True, latest=False
+        )
+        out = capsys.readouterr().out.strip()
+        uuid_log = h.state_dir("j", ensure_snapshot=False) / "run.log"
+        assert out == str(uuid_log)
+
     def test_since_filters_old_runs(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
@@ -4780,7 +4902,7 @@ class TestNameCollision:
 
 class TestUnitOnlyOrphan:
     """A platform unit file with no corresponding state dir
-    becomes a `Config.unit_only` entry with a deterministic
+    becomes a `Config.orphans` entry with a deterministic
     synthetic uuid. Destroy reaches it through `resolve_current`,
     same as the broken-state surface. The synthetic uuid is
     `uuid5(NAMESPACE_DNS, "crony.unit-only/<full_name>")` so
@@ -4801,12 +4923,12 @@ class TestUnitOnlyOrphan:
         plist.parent.mkdir(parents=True, exist_ok=True)
         plist.write_text("", encoding="utf-8")
         config = crony_runtime.load_config()
-        ref = config.unit_only_by_full_name.get("default.ghost")
+        ref = config.orphans_by_full_name.get("default.ghost")
         assert ref is not None
         # The synthetic uuid is deterministic: repeat loads
         # produce the same ref.
         config2 = crony_runtime.load_config()
-        assert config2.unit_only_by_full_name["default.ghost"] == ref
+        assert config2.orphans_by_full_name["default.ghost"] == ref
         # The platform unit path is captured in RuntimeState.
         rt = config.runtime[ref]
         assert rt.unit_config == plist
@@ -4840,7 +4962,7 @@ class TestUnitOnlyOrphan:
         timer.parent.mkdir(parents=True, exist_ok=True)
         timer.write_text("", encoding="utf-8")
         config = crony_runtime.load_config()
-        ref = config.unit_only_by_full_name.get("default.ghost")
+        ref = config.orphans_by_full_name.get("default.ghost")
         assert ref is not None
         assert config.config_state(ref) == "orphan"
         rt = config.runtime[ref]
@@ -4863,6 +4985,87 @@ class TestUnitOnlyOrphan:
             jobs=["default.ghost"], bundle=None, orphans=False
         )
         assert not timer.exists()
+
+
+class TestAliasOrphan:
+    """A short-name alias symlink whose name no live entry accounts for
+    is a `Config.orphans` entry (has_symlink), cleaned by
+    destroy --orphans / factory reset and by a targeted destroy. The
+    alias is unlinked but its target dir -- which may belong to a live
+    entry under another name -- is never touched.
+    """
+
+    def test_stray_alias_lands_in_orphans(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        # An alias pointing at a uuid dir nothing else references.
+        (h.state / "default").mkdir(parents=True, exist_ok=True)
+        alias = h.state / "default" / "ghost"
+        alias.symlink_to("11111111-2222-3333-4444-555555555555")
+        config = crony_runtime.load_config()
+        ref = config.orphans_by_full_name.get("default.ghost")
+        assert ref is not None
+        orphan = config.orphans[ref]
+        assert orphan.has_symlink
+        assert not orphan.has_unit_file
+        assert config.config_state(ref) == "orphan"
+
+    def test_destroy_orphans_unlinks_stray_alias(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        (h.state / "default").mkdir(parents=True, exist_ok=True)
+        alias = h.state / "default" / "ghost"
+        alias.symlink_to("11111111-2222-3333-4444-555555555555")
+        crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
+        assert not alias.is_symlink()
+
+    def test_rename_leftover_alias_is_orphan_target_untouched(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An alias whose name no entry claims but whose target is a
+        # live entry's uuid dir (a stale rename leftover): the alias is
+        # an orphan, but cleaning it must only unlink the alias -- the
+        # live target dir stays intact.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        live_dir = h.state_dir("j", ensure_snapshot=False)
+        stale_alias = h.state / "default" / "oldname"
+        stale_alias.symlink_to(live_dir.name)
+        config = crony_runtime.load_config()
+        ref = config.orphans_by_full_name.get("default.oldname")
+        assert ref is not None
+        assert config.orphans[ref].has_symlink
+        crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
+        assert not stale_alias.is_symlink()
+        # The live entry and its alias are untouched.
+        assert live_dir.is_dir()
+        assert (h.state / "default" / "j").resolve() == live_dir.resolve()
+
+    def test_dangling_alias_is_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        (h.state / "default").mkdir(parents=True, exist_ok=True)
+        alias = h.state / "default" / "ghost"
+        # Target dir does not exist -> dangling link.
+        alias.symlink_to("deadbeef-0000-0000-0000-000000000000")
+        config = crony_runtime.load_config()
+        ref = config.orphans_by_full_name.get("default.ghost")
+        assert ref is not None
+        # A dangling alias (its target dir gone) still surfaces as a
+        # symlink-bearing orphan that destroy can reclaim.
+        assert config.orphans[ref].has_symlink
+        crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
+        assert not alias.is_symlink()
 
 
 class TestStatusUnitConfigColumn:
@@ -4922,6 +5125,95 @@ class TestStatusUnitConfigColumn:
         # separate .timer.
         assert "crony-default.j.service" in out
         assert "crony-default.j.timer" in out
+
+
+class TestStatusLogFileColumn:
+    """`crony status --cols log-file` shows the entry's reported log
+    path (the form `crony logs` reads). Opt-in (not in the default
+    columns); dual-source, so a not-yet-applied rename flags `^`.
+    """
+
+    def _status(self, cols: str, **kw: Any) -> None:
+        crony_commands.do_status(
+            jobs=[],
+            cols=cols,
+            show_masked=False,
+            bundle=None,
+            config_current=kw.get("config_current", False),
+            config_pending=kw.get("config_pending", False),
+            exclude_healthy=False,
+        )
+
+    def test_log_file_not_in_default_columns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        crony_commands.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        assert "LOG FILE" not in capsys.readouterr().out
+
+    def test_log_file_renders_alias_path(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("job,log-file")
+        out = capsys.readouterr().out
+        assert "LOG FILE" in out
+        alias_log = h.state / "default" / "j" / "run.log"
+        assert str(alias_log) in out
+
+    def test_log_file_flags_pending_rename(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"foo": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["foo"],
+        )
+        h.apply("foo")
+        foo_uuid = cfg.jobs["foo"].uuid
+        h.config(
+            {
+                "job": {
+                    "bar": {
+                        "uuid": foo_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["bar"],
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        # Default view shows the pending (config) path with a `^` since
+        # the applied path still points at the old name.
+        self._status("job,log-file")
+        out = capsys.readouterr().out
+        assert str(h.state / "default" / "bar" / "run.log") in out
+        assert "^" in out
+        # --config-current shows the applied (old-name) path.
+        self._status("job,log-file", config_current=True)
+        out = capsys.readouterr().out
+        assert str(h.state / "default" / "foo" / "run.log") in out
 
 
 class TestStatusExcludeHealthy:
