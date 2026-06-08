@@ -38,12 +38,12 @@ def load_snapshot(
     mismatch (re-apply required).
 
     The platform unit's argv carries `bundle:uuid` so the runner
-    addresses the snapshot directly via `entity_state_dir`
+    addresses the snapshot directly via `Job.state_dir_from_ref(ref)`
     without scanning the bundle's state dirs. The error messages
     use the recovered `name` field when available so the operator
     sees the human-readable identity.
     """
-    state_dir = crony.model.entity_state_dir(ref)
+    state_dir = crony.model.Job.state_dir_from_ref(ref)
     ref_str = str(ref)
     p = state_dir / "snapshot.json"
     if not p.is_file():
@@ -251,7 +251,7 @@ def _build_current_graph(
     # the unit-config / last / last-ran columns render empty
     # for broken rows even when those files are on disk.
     for ref, broken_entry in broken.items():
-        state_dir = crony.model.entity_state_dir(ref)
+        state_dir = broken_entry.state_dir
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=broken_entry.name,
@@ -325,20 +325,21 @@ def load_config() -> crony.model.Config:
         )
         ref = crony.unit.EntityRef(bundle_name, synthetic)
         has_unit = full_name in unit_names
-        orphans[ref] = crony.model.JobOrphan(
+        orphan = crony.model.JobOrphan(
             bundle=bundle_name,
             uuid=synthetic,
             name=full_name,
             has_unit_file=has_unit,
             has_symlink=full_name in alias_names,
         )
+        orphans[ref] = orphan
         orphans_by_full_name[full_name] = ref
         # Surface the platform unit paths through RuntimeState (so
         # status's unit-config / unit-timer columns don't re-walk the
         # unit dirs); a symlink-only orphan has no unit file, so leave
         # them None.
         runtime[ref] = crony.model.RuntimeState(
-            state_dir=crony.model.entity_state_dir(ref),
+            state_dir=orphan.state_dir,
             last_run=None,
             is_running=False,
             is_pending=False,
@@ -362,27 +363,6 @@ def load_config() -> crony.model.Config:
         platform=platform,
         shadowed=shadowed,
     )
-
-
-def state_dir_for(node: crony.model.Job | crony.model.JobGroup) -> Path:
-    """State directory for an entity, materialized on disk.
-
-    Returns `node`'s uuid-keyed state dir, creating it (and the bundle
-    subdir) when missing. Used by apply and the runner -- both write
-    files under the returned path on every call, so a pre-existing
-    empty dir is the right starting state.
-
-    Also materializes an empty `run.log` when absent, so it exists
-    from apply time onward -- an operator can `tail -f` it before
-    the entity's first run instead of racing the runner to create
-    it. Only created when missing, never truncated, so an existing
-    log survives a re-apply untouched.
-    """
-    d = node.state_dir
-    d.mkdir(parents=True, exist_ok=True)
-    if not node.log_path_resolved.exists():
-        node.log_path_resolved.touch()
-    return d
 
 
 def now_iso() -> str:

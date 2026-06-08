@@ -446,7 +446,7 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     full_name = str(snapshot.entity_name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    snapshot_path = crony.model.snapshot_path_for(ref)
+    snapshot_path = snapshot.snapshot_path
 
     # Every uuid / full name the bundle's config currently defines
     # (plus `ref` itself, defensively). Used to keep per-entry
@@ -534,7 +534,12 @@ def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         scheduled=timing is not None,
     )
 
-    crony.runtime.state_dir_for(snapshot)
+    # Materialize the uuid-keyed state dir and seed an empty run.log
+    # so an operator can `tail -f` it from apply time, before the first
+    # run; never truncated, so an existing log survives a re-apply.
+    snapshot.state_dir.mkdir(parents=True, exist_ok=True)
+    if not snapshot.log_path_resolved.exists():
+        snapshot.log_path_resolved.touch()
     snapshot_path.write_text(
         json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1264,7 +1269,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         )
         for ref in orphan_refs:
             name = config.name_for(ref)
-            sd = crony.model.entity_state_dir(ref)
+            sd = crony.model.Job.state_dir_from_ref(ref)
             label = name if name is not None else str(ref)
             if sd.is_dir() and crony.runtime.run_in_progress(sd):
                 logger.warning(
@@ -1354,7 +1359,10 @@ def do_destroy(
             if n in known:
                 continue
             syn = crony.unit.EntityRef.from_str(n)
-            if syn is not None and crony.model.entity_state_dir(syn).is_dir():
+            if (
+                syn is not None
+                and crony.model.Job.state_dir_from_ref(syn).is_dir()
+            ):
                 continue
             unknown.append(n)
         if unknown:
@@ -1394,7 +1402,9 @@ def do_destroy(
             ref = _resolve_addressable(config, full)
         else:
             ref = config.resolve_current(full) or direct_ref
-        sd = crony.model.entity_state_dir(ref) if ref is not None else None
+        sd = (
+            crony.model.Job.state_dir_from_ref(ref) if ref is not None else None
+        )
         # Recover the entity's actual name for platform unit cleanup:
         # the unit file is keyed by the installed (current) name, which
         # a `<bundle>:<UUID>` input or a renamed entry's new name
@@ -1427,7 +1437,7 @@ def do_destroy(
     # in a factory reset, is removed by the winner's own pass
     # above).
     for ref in shadowed_refs:
-        sd = crony.model.entity_state_dir(ref)
+        sd = crony.model.Job.state_dir_from_ref(ref)
         if not sd.is_dir():
             continue
         if crony.runtime.run_in_progress(sd):
@@ -1717,7 +1727,7 @@ def do_trigger(
             crony.runner.trigger_unit(
                 unit_name,
                 triggered_by_user=True,
-                state_dir=crony.model.entity_state_dir(ref),
+                state_dir=crony.model.Job.state_dir_from_ref(ref),
             )
             logger.info("%s: triggered", full)
         return
@@ -1760,7 +1770,7 @@ def do_trigger(
         )
         rec = crony.runner.trigger_unit_sync(
             unit_name,
-            state_dir=crony.model.entity_state_dir(ref),
+            state_dir=crony.model.Job.state_dir_from_ref(ref),
             job_timeout=timeout,
             trigger_timeout=tt,
             triggered_by_user=True,
@@ -2935,7 +2945,7 @@ def do_logs(
             # orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
-            sd = crony.model.entity_state_dir(ref)
+            sd = crony.model.Job.state_dir_from_ref(ref)
             current_node = config.current.jobs.get(
                 ref
             ) or config.current.groups.get(ref)

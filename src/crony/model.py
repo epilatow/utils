@@ -56,9 +56,10 @@ class _JobCommon:
     """Identity and behavior shared by `Job` and `JobGroup`.
 
     Holds the fields both snapshot kinds carry -- the schema / kind
-    tags, the namespaced `name`, the bundle-scoped `uuid`, and the
+    tags, the `bundle` namespace, the short `name`, the `uuid`, and the
     `symlink` alias pair -- plus the identity / alias derivations over
-    them, so neither subclass redeclares them.
+    them (`entity_ref`, `entity_name`, `state_dir`, ...), so neither
+    subclass redeclares them.
 
     `symlink` is the short-name alias as a graph knows it: (alias_path,
     target). A config-built (pending) node carries the expected pair
@@ -88,11 +89,26 @@ class _JobCommon:
         """The human `<bundle>.<short>` name."""
         return crony.unit.EntityName(self.bundle, self.name)
 
+    @classmethod
+    def state_dir_from_ref(cls, ref: crony.unit.EntityRef) -> Path:
+        """The uuid-keyed state dir for a bare ref:
+        `STATE_DIR/<bundle>/<uuid>`. The base case for callers that
+        hold only an `EntityRef` and have no built node -- loading a
+        snapshot, a not-yet-resolved group child, a ref-only destroy.
+        The `state_dir` property routes through here so the layout
+        join lives in one place."""
+        return crony.paths.STATE_DIR / ref.bundle / ref.uuid
+
     @property
     def state_dir(self) -> Path:
         """The uuid-keyed state dir -- the path everything internal
         addresses."""
-        return entity_state_dir(self.entity_ref)
+        return self.state_dir_from_ref(self.entity_ref)
+
+    @property
+    def snapshot_path(self) -> Path:
+        """The applied-snapshot file inside this entry's state dir."""
+        return self.state_dir / "snapshot.json"
 
     @property
     def symlink_state_dir(self) -> Path:
@@ -352,14 +368,6 @@ def _snapshot_base_dict(snap: Job | JobGroup) -> dict[str, Any]:
         str(timing) if isinstance(timing, crony.unit.Interval) else None
     )
     return d
-
-
-def entity_state_dir(ref: crony.unit.EntityRef) -> Path:
-    return crony.paths.STATE_DIR / ref.bundle / ref.uuid
-
-
-def snapshot_path_for(ref: crony.unit.EntityRef) -> Path:
-    return entity_state_dir(ref) / "snapshot.json"
 
 
 def _expand_path_field(value: str) -> str:
@@ -707,7 +715,7 @@ class JobOrphan:
 
     @property
     def state_dir(self) -> Path:
-        return entity_state_dir(self.entity_ref)
+        return _JobCommon.state_dir_from_ref(self.entity_ref)
 
     @property
     def symlink_state_dir(self) -> Path | None:
