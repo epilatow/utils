@@ -131,7 +131,7 @@ class TestUnitNameDelegatesTolerateRefForm:
 class TestConfigState:
     """`Config.config_state` classification driven through the real
     apply -> load_config path (vs `TestConfigStateInMemory`, which
-    plants snapshots by hand). Confirms _apply_one writes a snapshot
+    plants snapshots by hand). Confirms apply_one writes a snapshot
     that load_config scores as synced, and that a config edit
     without re-apply flips it to stale.
     """
@@ -1241,7 +1241,7 @@ class TestUnitDriftDetection:
         # extracted paths against the filesystem and flags the
         # install as broken when either's gone.
         content = unit_config.read_text()
-        live_uv = str(crony_commands._uv_executable())
+        live_uv = str(crony_runtime._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
@@ -1268,7 +1268,7 @@ class TestUnitDriftDetection:
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
         # `do_apply` reads the unit-drift verdict from the Config it
-        # loaded once at start (_apply_one's `model` path), not by
+        # loaded once at start (apply_one's `model` path), not by
         # re-probing disk per entry. A unit deleted after the first
         # apply is `unit_is_stale` at load time, so the no-arg apply
         # re-renders it.

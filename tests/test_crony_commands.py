@@ -442,7 +442,7 @@ class TestApplyFullSync:
     def test_no_arg_apply_fully_wipes_orphan_state_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Apply's orphan removal goes through _destroy_one with
+        # Apply's orphan removal goes through destroy_one with
         # default semantics, which fully wipes the entry's state
         # dir -- runtime artifacts included. This matches the
         # default destroy behavior so a renamed entry's residue
@@ -788,7 +788,7 @@ class TestApplyRenamePreservesHistory:
     """The whole point of keying state by uuid: a TOML edit that
     only changes a job's short name keeps the same state dir, so
     run.log and last-run.json carry over to the new name. The old
-    name's platform unit becomes a stale label; _apply_one removes
+    name's platform unit becomes a stale label; apply_one removes
     it when re-applying the entry under its new name (unless the
     old name was handed to a live sibling in a name-swap edit).
     """
@@ -1365,9 +1365,9 @@ class TestUvExecutable:
     def test_uv_executable_errors_when_uv_not_on_path(
         self, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(crony_commands.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(crony_runtime.shutil, "which", lambda _name: None)
         with pytest.raises(PreconditionError, match="uv not found"):
-            crony_commands._uv_executable()
+            crony_runtime._uv_executable()
 
 
 class TestEnableDisable:
@@ -5820,7 +5820,7 @@ class TestSnapshotLifecycle:
         h.apply("j")
         snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
-        crony_commands._destroy_one(h.full("j"), h.state_dir("j"))
+        crony_runtime.destroy_one(h.full("j"), h.state_dir("j"))
         assert not snap_path.exists()
 
     def test_run_subcommand_hidden_from_top_level_help(self) -> None:

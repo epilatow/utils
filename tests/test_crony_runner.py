@@ -1560,7 +1560,7 @@ class TestKeepAwake:
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
         monkeypatch.setattr(
-            crony_commands.shutil,
+            crony_runtime.shutil,
             "which",
             lambda n: "/x/caffeinate" if n == "caffeinate" else None,
         )
@@ -1626,7 +1626,7 @@ class TestKeepAwake:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
-        monkeypatch.setattr(crony_commands.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(crony_runtime.shutil, "which", lambda _n: None)
         cfg = h.config(
             {
                 "job": {

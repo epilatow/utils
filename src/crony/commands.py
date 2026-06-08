@@ -3,23 +3,21 @@
 """crony's command handlers.
 
 The do_* verbs behind the CLI -- apply / destroy / enable / disable /
-trigger / status / logs / config / validate / notify-test --
-plus the apply and destroy primitives, the name-resolution and
-apply-ordering helpers, and the status renderer (its column model,
-divergence and color handling, and per-axis state derivation). This is
-the in-process API a caller drives instead of shelling out to the crony
-CLI; it composes the lower layers (config, model, runtime, notify,
-runner) and performs the on-disk unit lifecycle.
+trigger / status / logs / config / validate / notify-test -- plus the
+name-resolution and apply-ordering helpers and the status renderer (its
+column model, divergence and color handling, and per-axis state
+derivation). This is the in-process API a caller drives instead of
+shelling out to the crony CLI; it orchestrates the lower layers
+(config, model, runtime, notify, runner). The per-entry on-disk unit
+lifecycle itself (apply_one / destroy_one) lives in crony.runtime.
 """
 
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import re
-import shutil as shutil  # noqa: PLC0414  re-exported for tests
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys as sys  # noqa: PLC0414  re-exported for tests
 import time as time  # noqa: PLC0414  re-exported for tests
@@ -40,12 +38,6 @@ import crony.runtime
 import crony.unit
 
 logger = logging.getLogger(__name__)
-
-
-def _repo_root() -> Path:
-    """Repo root, derived from this module's location at
-    <repo>/src/crony/commands.py."""
-    return Path(__file__).resolve().parent.parent.parent
 
 
 # =============================================================================
@@ -306,70 +298,6 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 """
 
 
-def _crony_executable() -> Path:
-    """Absolute path to bin/crony for re-invocation by groups.
-
-    Derives bin/crony from this package's location
-    (<repo>/src/crony/commands.py -> <repo>/bin/crony) rather than
-    from `sys.argv[0]` so the subprocess re-invocation reaches the
-    right binary even when crony has been imported as a module (e.g.
-    by the test suite, where sys.argv[0] is pytest, not crony).
-    """
-    return _repo_root() / "bin" / "crony"
-
-
-def _uv_executable() -> Path:
-    """Absolute path to `uv`, baked into platform unit files.
-
-    The platform scheduler starts a unit's program
-    with a minimal PATH that does not include $HOME/.local/bin or
-    /opt/homebrew/bin. Crony's PEP 723 shebang `env -S uv run
-    --script` therefore can't find uv and exits 127 before the
-    script even starts. Resolving uv to an absolute path at apply
-    time and writing it directly into the unit's argv sidesteps
-    PATH entirely.
-
-    Errors clearly if uv isn't on the agent's PATH at apply time;
-    a misconfigured environment shouldn't silently render a unit
-    that will fail at run time.
-    """
-    path = shutil.which("uv")
-    if path is None:
-        raise crony.errors.PreconditionError(
-            "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
-            "before running `crony apply`. Platform units bake uv's "
-            "absolute path so the scheduler doesn't have to find it "
-            "on its minimal PATH."
-        )
-    return Path(path).resolve()
-
-
-# =============================================================================
-# PLATFORM UNITS
-# =============================================================================
-# Render and (un)load platform-native scheduler units. The per-platform
-# divergence lives entirely in the crony.platform backends; the
-# functions here are thin delegates via scheduler(), which carries no
-# platform branch -- the backend owns its own unit directory.
-
-
-def _render_units(
-    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
-) -> dict[str, str]:
-    """Return {filename: content} for `snap`'s platform units.
-
-    Delegates to the platform Scheduler with the live `_uv_executable()`
-    / `_crony_executable()` paths baked into the unit argv. (The drift
-    check re-renders inside the scheduler using the paths it recovers
-    from the on-disk unit, so it does not go through here.)
-    """
-    return crony.runtime.scheduler(platform).render(
-        snap.unit_spec(),
-        uv_path=_uv_executable(),
-        crony_path=_crony_executable(),
-    )
-
-
 def _schedule_display(timing: crony.unit.Timing | None) -> str:
     """Render a unit's timing into one status cell value.
 
@@ -383,267 +311,6 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     if isinstance(timing, crony.unit.Interval):
         return f"interval={timing}"
     return "grouped"
-
-
-def _activate_unit(
-    name: str,
-    platform: str | None = None,
-    *,
-    prior_disabled: bool,
-    scheduled: bool,
-) -> None:
-    """Load the unit into the platform scheduler.
-
-    `prior_disabled=True` preserves a hand-disabled state across an
-    apply re-render: the unit is reloaded so the new content takes
-    effect, but the persistent disable record is restored afterward
-    so the scheduler doesn't fire it. Without this, a `crony disable
-    foo` followed by an unrelated config edit would silently re-arm
-    foo.
-
-    `scheduled=False` means the entry has no schedule / interval.
-    On linux that means there's no .timer to enable; only the
-    .service is registered (oneshot, sits dormant until something
-    starts it). The plist analog is the same -- a plist with no
-    Start* keys loads fine and just doesn't auto-fire.
-    """
-    crony.runtime.scheduler(platform).activate(
-        name,
-        prior_disabled=prior_disabled,
-        scheduled=scheduled,
-    )
-
-
-def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
-    """Apply one selected entry from the loaded model; return
-    "added", "updated", or "unchanged".
-
-    `ref` must be a selected pending entry of `config` -- `do_apply`
-    only applies what `config.pending` selected on this host. The
-    full namespaced name `<bundle>.<short>` is what lands on disk
-    (the platform unit identifier).
-
-    Every entry installs a platform unit, even schedule-less ones:
-    a transit group's plist sits dormant until a parent dispatches
-    it (or `crony trigger` fires it explicitly). On linux, only the
-    .service file is installed for schedule-less entries; the
-    .timer (which would have nothing to trigger on) is omitted, and
-    apply cleans up a stale .timer if an entry transitions
-    scheduled -> unscheduled.
-
-    The entity's prior snapshot and unit-drift verdict come from
-    the loaded model (`current` / `runtime`): the entry's own state
-    is untouched by the apply loop until this call, so the loaded
-    view still matches disk.
-    """
-    snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
-    )
-    if snapshot is None:
-        raise crony.errors.PreconditionError(
-            f"{ref} is not a selected entry to apply"
-        )
-    full_name = str(snapshot.entity_name)
-    bundle_name = ref.bundle
-    timing = snapshot.timing
-    snapshot_path = snapshot.snapshot_path
-
-    # Every uuid / full name the bundle's config currently defines
-    # (plus `ref` itself, defensively). Used to keep per-entry
-    # cleanup from clobbering a *different* live entry's state when
-    # names move between entries in one edit (a rename that frees a
-    # name another entry then claims).
-    bundle = config.toml_config.by_name(bundle_name)
-    bcfg = bundle.config if bundle is not None else None
-    live_uuids = {ref.uuid}
-    live_full_names: set[str] = set()
-    if bcfg is not None:
-        live_uuids |= {e.uuid for e in bcfg.jobs.values()} | {
-            e.uuid for e in bcfg.job_groups.values()
-        }
-        live_full_names = {f"{bundle_name}.{s}" for s in bcfg.jobs} | {
-            f"{bundle_name}.{s}" for s in bcfg.job_groups
-        }
-
-    # A uuid edit leaves the prior uuid's state dir behind under
-    # the same name (the name-keyed unit re-points at this uuid).
-    # Reclaim it before deciding "unchanged" so the residue is
-    # cleaned even when the new uuid's snapshot already matches --
-    # and so the full-sync orphan sweep can exclude still-selected
-    # names (it trusts _apply_one to have handled their residue).
-    _sweep_superseded_state_dirs(ref, full_name, live_uuids)
-    # Drift detection via direct snapshot comparison: take the
-    # entity's prior snapshot (if any) and compare it to the
-    # pending one. Both sides are the same dataclass shape, so
-    # equality is a single Python `==`. A missing / unparseable /
-    # wrong-schema prior snapshot is absent from `current` and so
-    # "not equal", triggering a fresh write. Equality alone isn't
-    # enough though: the unit-install integrity check (pinned on
-    # `runtime` at load) catches a hand-edited / missing unit file
-    # (or a scheduled unit the scheduler unloaded) whose snapshot
-    # still matches, so an otherwise-clean apply still re-renders
-    # and re-bootstraps the platform side.
-    current_snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.current.jobs.get(ref) or config.current.groups.get(ref)
-    )
-    rt = config.runtime.get(ref)
-    unit_stale = rt.unit_is_stale if rt is not None else False
-    if current_snapshot == snapshot and not unit_stale:
-        return "unchanged"
-    is_update = current_snapshot is not None
-
-    # Same uuid, new name: the entry was renamed in config. The
-    # state dir (uuid-keyed) is reused under the new name, but the
-    # old name's platform unit is now stale -- remove it so only
-    # the new name's unit remains. The shared state dir is left
-    # alone (passing no state_dir to _destroy_one). Skip when the
-    # old name is itself a live entry (a name-swap edit handed it
-    # to a sibling): that sibling owns the unit now, so removing it
-    # would unlink a unit a live entry is firing from.
-    if (
-        current_snapshot is not None
-        and str(current_snapshot.entity_name) != full_name
-        and str(current_snapshot.entity_name) not in live_full_names
-    ):
-        _destroy_one(
-            str(current_snapshot.entity_name),
-            None,
-            current_snapshot.symlink_state_dir,
-        )
-
-    # Capture runtime state BEFORE we re-render so a hand-disabled
-    # unit stays disabled across the re-load. The scheduler view
-    # is the source of truth here (the platform unit can outlive
-    # the state-dir snapshot); crony.runtime.unit_state returns "none" for a
-    # not-yet-installed unit, so only an explicit "disabled"
-    # answer counts and a fresh install still lands enabled.
-    prior_disabled = crony.runtime.unit_state(full_name) == "disabled"
-    units = _render_units(snapshot)
-    sched = crony.runtime.scheduler()
-    target_dir = sched.unit_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    # Clean up any previously-installed unit files for this name that
-    # aren't in the current render set (handles a scheduled ->
-    # unscheduled transition where the .timer should be removed).
-    sched.prune_units(full_name, set(units))
-    for fname, content in units.items():
-        (target_dir / fname).write_text(content, encoding="utf-8")
-    _activate_unit(
-        full_name,
-        prior_disabled=prior_disabled,
-        scheduled=timing is not None,
-    )
-
-    # Materialize the uuid-keyed state dir and seed an empty run.log
-    # so an operator can `tail -f` it from apply time, before the first
-    # run; never truncated, so an existing log survives a re-apply.
-    snapshot.state_dir.mkdir(parents=True, exist_ok=True)
-    if not snapshot.log_path_resolved.exists():
-        snapshot.log_path_resolved.touch()
-    snapshot_path.write_text(
-        json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    _link_alias(snapshot)
-    return "updated" if is_update else "added"
-
-
-def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:
-    """Point the entry's short-name alias at its uuid dir.
-
-    The alias is `node.symlink_state_dir` and its (relative) target is
-    the bare uuid, so the state tree stays relocatable. A correctly-
-    pointed alias is left untouched; one pointing elsewhere is
-    repointed. A non-symlink already sitting at the alias path is left
-    alone -- apply never clobbers real state.
-    """
-    link = node.symlink_state_dir
-    if link.is_symlink():
-        if os.readlink(link) == node.uuid:
-            return
-        link.unlink()
-    elif link.exists():
-        return
-    link.symlink_to(node.uuid)
-
-
-def _destroy_one(
-    name: str | None,
-    state_dir: Path | None,
-    alias_dir: Path | None = None,
-) -> None:
-    """Remove a single entity's platform unit and apply-time state.
-
-    Always a full wipe: the platform unit files, the short-name alias
-    symlink, and the entire uuid-keyed state dir go away in one shot.
-    Tolerant of partial state throughout so a partially-installed
-    entity can still be cleaned up.
-
-    `name` is the full namespaced name used for platform unit paths
-    (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`); pass
-    `None` to skip platform unit cleanup (e.g. a ref-form destroy whose
-    snapshot is unparseable). `alias_dir` is the entity's
-    `symlink_state_dir` (resolved by the caller from the entity it
-    holds); when it is a symlink it is unlinked, never a real dir. None
-    means no alias to clean. `state_dir` is the uuid-keyed dir; None
-    means there's no state dir to clean up.
-    """
-    if name is not None:
-        crony.runtime.scheduler().remove_files(name)
-    if alias_dir is not None and alias_dir.is_symlink():
-        alias_dir.unlink()
-    if state_dir is None or not state_dir.is_dir():
-        return
-    shutil.rmtree(state_dir)
-
-
-def _sweep_superseded_state_dirs(
-    keep: crony.unit.EntityRef, full_name: str, live_uuids: set[str]
-) -> None:
-    """Remove state dirs in `keep`'s bundle whose snapshot recovers
-    `full_name` under a uuid no live config entry claims.
-
-    These are residue from a uuid edit: the name-keyed platform
-    unit now points at `keep`, so the old uuid dirs are unreachable
-    history. Only the state dir is wiped -- the unit is shared by
-    name and already re-rendered for `keep`.
-
-    `live_uuids` is every uuid the bundle's config currently
-    defines. A dir keyed by one of those belongs to a live entry,
-    not residue -- even when its on-disk name still matches
-    `full_name` because that entry was renamed and hasn't been
-    re-applied yet in this pass (a name-swap edit). Skipping them
-    keeps a live entry's run history from being wiped by a sibling
-    entry that grabbed its old name. A dir with a run in progress
-    is left in place (logged); the next apply or an explicit
-    `crony destroy <bundle>:<uuid>` reclaims it.
-    """
-    bundle_root = crony.paths.STATE_DIR / keep.bundle
-    if not bundle_root.is_dir():
-        return
-    for uuid_dir in sorted(bundle_root.iterdir()):
-        # Skip short-name alias symlinks (is_dir() dereferences them);
-        # only real uuid-keyed dirs are superseded-state candidates.
-        if uuid_dir.is_symlink() or not uuid_dir.is_dir():
-            continue
-        if uuid_dir.name in live_uuids:
-            continue
-        if crony.runtime.recover_full_name(uuid_dir) != full_name:
-            continue
-        stray = crony.unit.EntityRef(keep.bundle, uuid_dir.name)
-        if crony.runtime.run_in_progress(uuid_dir):
-            logger.warning(
-                "%s: superseded state dir %s left in place (run in progress)",
-                full_name,
-                stray,
-            )
-            continue
-        _destroy_one(None, uuid_dir)
-        logger.info(
-            "%s: removed superseded state dir %s",
-            full_name,
-            stray,
-        )
 
 
 # =============================================================================
@@ -1163,7 +830,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """
     # One in-memory model for the whole command: selection comes
     # from the parsed bundles, drift / orphan reconciliation from
-    # the current + broken + unit-only graphs. _apply_one mutates
+    # the current + broken + unit-only graphs. apply_one mutates
     # disk per entry, but the orphan plan is derived from this one
     # load -- no second `load_config()` after the apply loop.
     config = crony.runtime.load_config()
@@ -1235,7 +902,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
-        result = _apply_one(config, ref)
+        result = crony.runtime.apply_one(config, ref)
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
 
@@ -1249,12 +916,12 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         #
         # Derived from the one up-front `config` (no reload): the
         # apply loop only installs selected entries and reclaims
-        # their own superseded same-name residue (_apply_one's
+        # their own superseded same-name residue (apply_one's
         # state-only sweep), so the set of orphans whose name is
         # NOT selected is unchanged by the loop. Excluding
         # still-selected names is also what keeps a shared name-
         # keyed unit safe -- the residue of a live entry is
-        # _apply_one's job, not the orphan sweep's, so the sweep
+        # apply_one's job, not the orphan sweep's, so the sweep
         # never unlinks a unit a selected entry is still firing.
         on_disk = config.current.refs() | set(config.orphans)
         live = config.pending.refs()
@@ -1276,7 +943,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
                     "%s: orphan left in place (run in progress)", label
                 )
                 continue
-            _destroy_one(
+            crony.runtime.destroy_one(
                 name,
                 sd if sd.is_dir() else None,
                 config.alias_dir_for(ref),
@@ -1429,7 +1096,7 @@ def do_destroy(
                     f"{full}: run in progress; will not destroy"
                 ) from None
         alias_dir = config.alias_dir_for(ref) if ref is not None else None
-        _destroy_one(name_for_cleanup, sd, alias_dir)
+        crony.runtime.destroy_one(name_for_cleanup, sd, alias_dir)
         logger.info("%s: destroyed", full)
 
     # Reclaim shadowed collision residue (state dir only -- the
@@ -1445,7 +1112,7 @@ def do_destroy(
                 "%s: shadowed residue left in place (run in progress)", ref
             )
             continue
-        _destroy_one(None, sd)
+        crony.runtime.destroy_one(None, sd)
         logger.info("%s: destroyed shadowed residue", ref)
 
 

@@ -68,7 +68,7 @@ _spec.loader.exec_module(crony)
 
 def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     """Apply one entry through the production path: build the
-    `Config` model (one disk pass) and call `_apply_one` with the
+    `Config` model (one disk pass) and call `apply_one` with the
     resolved ref -- mirroring what `do_apply` does per entry, so
     tests exercise the model-based code rather than a standalone
     path. For tests not built on `_ApplyHarness` (which exposes the
@@ -77,7 +77,7 @@ def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     config = crony_runtime.load_config()
     ref = config.pending.by_full_name.get(f"{bundle}.{short}")
     assert ref is not None, f"{bundle}.{short} not selected on this host"
-    result: str = crony_commands._apply_one(config, ref)
+    result: str = crony_runtime.apply_one(config, ref)
     return result
 
 
