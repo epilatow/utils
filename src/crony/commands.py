@@ -3437,12 +3437,23 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
 
 
 def do_self_test(*, verbose: bool, coverage: bool) -> int:
-    """Run tests by invoking the test file directly."""
+    """Run crony's tests by invoking each test file directly.
+
+    The crony suite is split across per-module ``test_crony*.py`` files,
+    each independently executable with the same flag surface. Run them
+    in turn and return the first non-zero exit, or 0 when all pass.
+    """
     repo_root = _repo_root()
-    test_file = repo_root / "tests" / "test_crony.py"
-    cmd = [str(test_file)]
+    test_files = sorted((repo_root / "tests").glob("test_crony*.py"))
+    flags: list[str] = []
     if verbose:
-        cmd.append("--verbose")
+        flags.append("--verbose")
     if coverage:
-        cmd.append("--coverage")
-    return subprocess.run(cmd, cwd=repo_root).returncode
+        flags.append("--coverage")
+    rc = 0
+    for test_file in test_files:
+        cmd = [str(test_file), *flags]
+        result = subprocess.run(cmd, cwd=repo_root).returncode
+        if result != 0 and rc == 0:
+            rc = result
+    return rc
