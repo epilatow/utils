@@ -29,70 +29,15 @@ from pathlib import Path
 import tomlkit
 import tomlkit.exceptions
 
+import crony.config
+import crony.errors
+import crony.model
 import crony.notify
 import crony.paths
 import crony.platform
 import crony.runner
 import crony.runtime
-from crony.config import (
-    BUILTIN_NOTIFY_CHANNELS,
-    DEFAULT_BUNDLE_NAME,
-    NOTIFY_INHERIT_TOKEN,
-    TomlBundle,
-    TomlConfig,
-    TomlJob,
-    TomlJobGroup,
-    bundle_prefix_filter,
-    normalize_full_name,
-    parse_full_name,
-    resolve_cli_name,
-    validate_bundle_name,
-)
-from crony.errors import (
-    ConfigError,
-    CronyError,
-    ExitCode,
-    LockBusyError,
-    PreconditionError,
-    UsageError,
-)
-from crony.model import (
-    Config,
-    Graph,
-    Job,
-    JobGroup,
-    JobRunResult,
-    NotificationResult,
-    entity_state_dir,
-    snapshot_path_for,
-)
-from crony.notify import (
-    expand_notify_inherit,
-    extract_latest_log_entry,
-    retrieve_secret,
-)
-from crony.platform import (
-    SchedulerWarning,
-)
-from crony.runner import (
-    timeout_to_wait,
-    trigger_exit_code,
-)
-from crony.runtime import (
-    acquire_lock,
-    load_config,
-    now_iso,
-    recover_full_name,
-    run_in_progress,
-    scheduler,
-    state_dir_for,
-)
-from crony.unit import (
-    EntityRef,
-    Interval,
-    Schedule,
-    Timing,
-)
+import crony.unit
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +335,7 @@ def uv_executable() -> Path:
     """
     path = shutil.which("uv")
     if path is None:
-        raise PreconditionError(
+        raise crony.errors.PreconditionError(
             "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
             "before running `crony apply`. Platform units bake uv's "
             "absolute path so the scheduler doesn't have to find it "
@@ -409,7 +354,7 @@ def uv_executable() -> Path:
 
 
 def _render_units(
-    snap: Job | JobGroup, platform: str | None = None
+    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
 ) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
@@ -418,14 +363,14 @@ def _render_units(
     check re-renders inside the scheduler using the paths it recovers
     from the on-disk unit, so it does not go through here.)
     """
-    return scheduler(platform).render(
+    return crony.runtime.scheduler(platform).render(
         snap.unit_spec(),
         uv_path=uv_executable(),
         crony_path=_crony_executable(),
     )
 
 
-def _schedule_display(timing: Timing | None) -> str:
+def _schedule_display(timing: crony.unit.Timing | None) -> str:
     """Render a unit's timing into one status cell value.
 
     A Schedule shows its OnCalendar source; an Interval shows
@@ -433,9 +378,9 @@ def _schedule_display(timing: Timing | None) -> str:
     group-only job -- displays as `grouped` to mirror the UNIT axis
     value for the same condition.
     """
-    if isinstance(timing, Schedule):
+    if isinstance(timing, crony.unit.Schedule):
         return str(timing)
-    if isinstance(timing, Interval):
+    if isinstance(timing, crony.unit.Interval):
         return f"interval={timing}"
     return "grouped"
 
@@ -462,14 +407,14 @@ def _activate_unit(
     starts it). The plist analog is the same -- a plist with no
     Start* keys loads fine and just doesn't auto-fire.
     """
-    scheduler(platform).activate(
+    crony.runtime.scheduler(platform).activate(
         name,
         prior_disabled=prior_disabled,
         scheduled=scheduled,
     )
 
 
-def apply_one(config: Config, ref: EntityRef) -> str:
+def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     """Apply one selected entry from the loaded model; return
     "added", "updated", or "unchanged".
 
@@ -491,15 +436,17 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     is untouched by the apply loop until this call, so the loaded
     view still matches disk.
     """
-    snapshot: Job | JobGroup | None = config.pending.jobs.get(
-        ref
-    ) or config.pending.groups.get(ref)
+    snapshot: crony.model.Job | crony.model.JobGroup | None = (
+        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
+    )
     if snapshot is None:
-        raise PreconditionError(f"{ref} is not a selected entry to apply")
+        raise crony.errors.PreconditionError(
+            f"{ref} is not a selected entry to apply"
+        )
     full_name = str(snapshot.name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    snapshot_path = snapshot_path_for(ref)
+    snapshot_path = crony.model.snapshot_path_for(ref)
 
     # Every uuid / full name the bundle's config currently defines
     # (plus `ref` itself, defensively). Used to keep per-entry
@@ -536,9 +483,9 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # (or a scheduled unit the scheduler unloaded) whose snapshot
     # still matches, so an otherwise-clean apply still re-renders
     # and re-bootstraps the platform side.
-    current_snapshot: Job | JobGroup | None = config.current.jobs.get(
-        ref
-    ) or config.current.groups.get(ref)
+    current_snapshot: crony.model.Job | crony.model.JobGroup | None = (
+        config.current.jobs.get(ref) or config.current.groups.get(ref)
+    )
     rt = config.runtime.get(ref)
     unit_stale = rt.unit_is_stale if rt is not None else False
     if current_snapshot == snapshot and not unit_stale:
@@ -568,7 +515,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
     # answer counts and a fresh install still lands enabled.
     prior_disabled = crony.runtime.unit_state(full_name) == "disabled"
     units = _render_units(snapshot)
-    sched = scheduler()
+    sched = crony.runtime.scheduler()
     target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name that
@@ -583,7 +530,7 @@ def apply_one(config: Config, ref: EntityRef) -> str:
         scheduled=timing is not None,
     )
 
-    state_dir_for(ref)
+    crony.runtime.state_dir_for(ref)
     snapshot_path.write_text(
         json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -608,14 +555,14 @@ def destroy_one(name: str | None, state_dir: Path | None) -> None:
     state dir to clean up.
     """
     if name is not None:
-        scheduler().remove_files(name)
+        crony.runtime.scheduler().remove_files(name)
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
 
 
 def _sweep_superseded_state_dirs(
-    keep: EntityRef, full_name: str, live_uuids: set[str]
+    keep: crony.unit.EntityRef, full_name: str, live_uuids: set[str]
 ) -> None:
     """Remove state dirs in `keep`'s bundle whose snapshot recovers
     `full_name` under a uuid no live config entry claims.
@@ -641,10 +588,10 @@ def _sweep_superseded_state_dirs(
     for uuid_dir in sorted(bundle_root.iterdir()):
         if not uuid_dir.is_dir() or uuid_dir.name in live_uuids:
             continue
-        if recover_full_name(uuid_dir) != full_name:
+        if crony.runtime.recover_full_name(uuid_dir) != full_name:
             continue
-        stray = EntityRef(keep.bundle, uuid_dir.name)
-        if run_in_progress(uuid_dir):
+        stray = crony.unit.EntityRef(keep.bundle, uuid_dir.name)
+        if crony.runtime.run_in_progress(uuid_dir):
             logger.warning(
                 "%s: superseded state dir %s left in place (run in progress)",
                 full_name,
@@ -669,7 +616,7 @@ def _sweep_superseded_state_dirs(
 # off when the user runs `crony apply` to push other changes.
 
 
-def last_run_state(config: Config, full_name: str) -> str:
+def last_run_state(config: crony.model.Config, full_name: str) -> str:
     """Return LAST axis value for a stamped entity.
 
     Lock-held implies a run is currently in flight: "pending" when
@@ -712,7 +659,7 @@ def last_run_state(config: Config, full_name: str) -> str:
     return "unknown"
 
 
-def _last_ran_at(config: Config, full_name: str) -> str:
+def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
     """Return a compact "when did this last run" string for status.
 
     Returns "never" when there's no last-run record and "unknown"
@@ -750,9 +697,9 @@ def _last_ran_at(config: Config, full_name: str) -> str:
 
 
 def _config_axis(
-    config: Config,
+    config: crony.model.Config,
     full: str,
-    entry: TomlJob | TomlJobGroup | None,
+    entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
     bn: str,
 ) -> str:
     """CONFIG axis (synced / stale / broken / missing / orphan)
@@ -770,7 +717,7 @@ def _config_axis(
     bare snapshot comparison.
     """
     if entry is not None:
-        ref: EntityRef | None = EntityRef(bn, entry.uuid)
+        ref: crony.unit.EntityRef | None = crony.unit.EntityRef(bn, entry.uuid)
     else:
         ref = config.resolve_current(full) or config.resolve_pending(full)
     if ref is None or ref not in config.all_refs():
@@ -802,12 +749,12 @@ def _config_axis(
 
 def _enable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `enabled` state for `name` (delegates)."""
-    scheduler(platform).enable(name)
+    crony.runtime.scheduler(platform).enable(name)
 
 
 def _disable_unit(name: str, platform: str | None = None) -> None:
     """Move the scheduler to the `disabled` state for `name` (delegates)."""
-    scheduler(platform).disable(name)
+    crony.runtime.scheduler(platform).disable(name)
 
 
 # =============================================================================
@@ -826,19 +773,19 @@ def do_init(force: bool, bundle: str | None) -> None:
     the dropin dir if missing). Otherwise writes `config.toml`.
     """
     if bundle is not None:
-        if bundle == DEFAULT_BUNDLE_NAME:
-            raise UsageError(
-                f"--bundle {DEFAULT_BUNDLE_NAME!r} would shadow "
+        if bundle == crony.config.DEFAULT_BUNDLE_NAME:
+            raise crony.errors.UsageError(
+                f"--bundle {crony.config.DEFAULT_BUNDLE_NAME!r} would shadow "
                 f"config.toml; use plain `crony config init` (without "
                 f"--bundle) for the default bundle"
             )
         try:
-            validate_bundle_name(bundle, "--bundle")
-        except ConfigError as e:
-            raise UsageError(str(e)) from e
+            crony.config.validate_bundle_name(bundle, "--bundle")
+        except crony.errors.ConfigError as e:
+            raise crony.errors.UsageError(str(e)) from e
         target = crony.paths.CONFIG_DROPIN_DIR / f"{bundle}.toml"
         if target.exists() and not force:
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"{target} already exists; pass --force to overwrite"
             )
         crony.paths.CONFIG_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -846,7 +793,7 @@ def do_init(force: bool, bundle: str | None) -> None:
         logger.info("wrote bundle config to %s", target)
         return
     if crony.paths.CONFIG_FILE.exists() and not force:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"{crony.paths.CONFIG_FILE} already exists; "
             "pass --force to overwrite"
         )
@@ -883,7 +830,9 @@ def _bundle_files_for_update(
     """
     candidates: list[tuple[str, Path]] = []
     if crony.paths.CONFIG_FILE.exists():
-        candidates.append((DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE))
+        candidates.append(
+            (crony.config.DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE)
+        )
     if crony.paths.CONFIG_DROPIN_DIR.exists():
         for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")):
             candidates.append((path.stem, path))
@@ -933,17 +882,17 @@ def do_config_update(bundle: str | None) -> None:
     """
     if bundle is not None:
         try:
-            validate_bundle_name(bundle, "--bundle")
-        except ConfigError as e:
-            raise UsageError(str(e)) from e
+            crony.config.validate_bundle_name(bundle, "--bundle")
+        except crony.errors.ConfigError as e:
+            raise crony.errors.UsageError(str(e)) from e
     files = _bundle_files_for_update(bundle)
     if not files:
         if bundle is None:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"no config: expected {crony.paths.CONFIG_FILE} or "
                 f"{crony.paths.CONFIG_DROPIN_DIR}/*.toml"
             )
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"no config file for bundle {bundle!r} "
             f"(expected {crony.paths.CONFIG_DROPIN_DIR}/{bundle}.toml)"
         )
@@ -973,7 +922,9 @@ def do_config_update(bundle: str | None) -> None:
         )
 
 
-def _errored_full_names(bundles: TomlConfig, bundle: str | None) -> set[str]:
+def _errored_full_names(
+    bundles: crony.config.TomlConfig, bundle: str | None
+) -> set[str]:
     """Full-namespaced names of entries whose bundle config rejected them.
 
     Walks every bundle (or just `bundle` when scoped). Errored
@@ -994,8 +945,8 @@ def _errored_full_names(bundles: TomlConfig, bundle: str | None) -> set[str]:
 
 
 def _selected_full_names_per_bundle(
-    bundles: TomlConfig,
-) -> tuple[dict[str, tuple[TomlBundle, str]], set[str]]:
+    bundles: crony.config.TomlConfig,
+) -> tuple[dict[str, tuple[crony.config.TomlBundle, str]], set[str]]:
     """Return (full_name -> (bundle, short)) and full_names set,
     spanning every bundle's selection on the current host.
 
@@ -1005,7 +956,7 @@ def _selected_full_names_per_bundle(
     "everything else".  Callers that also need to inspect masked
     entries use `_selected_and_masked_full_names_per_bundle`.
     """
-    by_full: dict[str, tuple[TomlBundle, str]] = {}
+    by_full: dict[str, tuple[crony.config.TomlBundle, str]] = {}
     for b in bundles.bundles:
         target = b.config.resolve_target()
         sel_jobs, sel_groups = b.config.selected_jobs_and_groups(target)
@@ -1015,8 +966,10 @@ def _selected_full_names_per_bundle(
 
 
 def _selected_and_masked_full_names_per_bundle(
-    bundles: TomlConfig,
-) -> tuple[dict[str, tuple[TomlBundle, str]], set[str], dict[str, str]]:
+    bundles: crony.config.TomlConfig,
+) -> tuple[
+    dict[str, tuple[crony.config.TomlBundle, str]], set[str], dict[str, str]
+]:
     """Spans every bundle, returning selected and masked names.
 
     `by_full` maps full_name -> (bundle, short) for every entry
@@ -1030,7 +983,7 @@ def _selected_and_masked_full_names_per_bundle(
     a bundle's config but not reached by the host's resolved
     target get the literal reason `unused`.
     """
-    by_full: dict[str, tuple[TomlBundle, str]] = {}
+    by_full: dict[str, tuple[crony.config.TomlBundle, str]] = {}
     selected: set[str] = set()
     masked_by_full: dict[str, str] = {}
     for b in bundles.bundles:
@@ -1065,7 +1018,8 @@ def _selected_and_masked_full_names_per_bundle(
 
 
 def _expand_apply_subtree(
-    by_full: dict[str, tuple[TomlBundle, str]], full_names: list[str]
+    by_full: dict[str, tuple[crony.config.TomlBundle, str]],
+    full_names: list[str],
 ) -> list[str]:
     """Expand each name to include its transitive group children.
 
@@ -1093,7 +1047,8 @@ def _expand_apply_subtree(
 
 
 def _topo_apply_order(
-    by_full: dict[str, tuple[TomlBundle, str]], full_names: list[str]
+    by_full: dict[str, tuple[crony.config.TomlBundle, str]],
+    full_names: list[str],
 ) -> list[str]:
     """Order names so each group's children are applied first.
 
@@ -1167,7 +1122,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # the current + broken + unit-only graphs. apply_one mutates
     # disk per entry, but the orphan plan is derived from this one
     # load -- no second `load_config()` after the apply loop.
-    config = load_config()
+    config = crony.runtime.load_config()
     bundles = config.toml_config
     bundles.require_known(bundle)
     # Apply needs pending-side data for every entry it considers
@@ -1182,7 +1137,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # so an unrelated broken bundle can't derail it.
     if not jobs and bundle is None and bundles.errored_bundles:
         affected = sorted(bundles.errored_bundles)
-        raise UsageError(
+        raise crony.errors.UsageError(
             "refusing the full-sync apply: one or more config "
             f"files failed to parse ({affected}). Fix the config "
             "or pass explicit job names / `--bundle <name>` so "
@@ -1190,17 +1145,19 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         )
     by_full, selected = _selected_full_names_per_bundle(bundles)
     if bundle is not None:
-        selected = bundle_prefix_filter(selected, bundle)
+        selected = crony.config.bundle_prefix_filter(selected, bundle)
 
     if jobs:
-        normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
+        normalized = [
+            crony.config.resolve_cli_name(arg, bundle) for arg in jobs
+        ]
         errored = _errored_full_names(bundles, bundle)
         errored_in_args = sorted(n for n in normalized if n in errored)
         if errored_in_args:
             # An errored entry has no parsed TomlBundleConfig fields, so we
             # can't render its plist / unit. Bail before any
             # partial apply happens.
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"config error -- fix and re-run apply: {errored_in_args}"
             )
         unknown = [n for n in normalized if n not in by_full]
@@ -1215,7 +1172,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
                 if n in by_full and n not in selected and n not in unknown
             )
         if unknown:
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"unknown or unselected on this host: {sorted(unknown)}"
             )
         # Cascade `crony apply <group>` to the group's transitive
@@ -1270,9 +1227,9 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         )
         for ref in orphan_refs:
             name = config.name_for(ref)
-            sd = entity_state_dir(ref)
+            sd = crony.model.entity_state_dir(ref)
             label = name if name is not None else str(ref)
-            if sd.is_dir() and run_in_progress(sd):
+            if sd.is_dir() and crony.runtime.run_in_progress(sd):
                 logger.warning(
                     "%s: orphan left in place (run in progress)", label
                 )
@@ -1321,10 +1278,10 @@ def do_destroy(
     dropped and only the state dir is wiped.
     """
     if orphans and jobs:
-        raise UsageError(
+        raise crony.errors.UsageError(
             "--orphans and positional names are mutually exclusive"
         )
-    config = load_config()
+    config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
     # Shadowed collision losers share a live name, so they never
@@ -1334,7 +1291,7 @@ def do_destroy(
     # factory-reset and `--orphans` reclaim them; surgical
     # `destroy <name>` doesn't (the operator can paste a
     # `<bundle>:<UUID>` from status to target one).
-    shadowed_refs: list[EntityRef] = []
+    shadowed_refs: list[crony.unit.EntityRef] = []
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
@@ -1343,8 +1300,10 @@ def do_destroy(
         defined = set(by_full.keys()) | bundles.all_full_names()
         known = defined | config.installed_full_names()
         if bundle is not None:
-            known = bundle_prefix_filter(known, bundle)
-        normalized = [resolve_cli_name(arg, bundle) for arg in jobs]
+            known = crony.config.bundle_prefix_filter(known, bundle)
+        normalized = [
+            crony.config.resolve_cli_name(arg, bundle) for arg in jobs
+        ]
         # A `<bundle>:<UUID>` input is "known" iff
         # its state dir exists on disk; this lets the operator
         # destroy entries that have no recoverable name (corrupt
@@ -1353,12 +1312,12 @@ def do_destroy(
         for n in normalized:
             if n in known:
                 continue
-            syn = EntityRef.from_str(n)
-            if syn is not None and entity_state_dir(syn).is_dir():
+            syn = crony.unit.EntityRef.from_str(n)
+            if syn is not None and crony.model.entity_state_dir(syn).is_dir():
                 continue
             unknown.append(n)
         if unknown:
-            raise UsageError(f"unknown name(s): {sorted(unknown)}")
+            raise crony.errors.UsageError(f"unknown name(s): {sorted(unknown)}")
         full_names_to_destroy = normalized
     else:
         names = config.installed_full_names()
@@ -1366,7 +1325,7 @@ def do_destroy(
             _by_full, selected = _selected_full_names_per_bundle(bundles)
             names = names - selected
         if bundle is not None:
-            names = bundle_prefix_filter(names, bundle)
+            names = crony.config.bundle_prefix_filter(names, bundle)
         full_names_to_destroy = sorted(names)
         shadowed_refs = sorted(
             (
@@ -1389,12 +1348,12 @@ def do_destroy(
         # an old-name remnant to a uuid still live under its new name
         # and wipe shared state. A `<bundle>:<UUID>` input lands as
         # `direct_ref` and is used directly.
-        direct_ref = EntityRef.from_str(full)
+        direct_ref = crony.unit.EntityRef.from_str(full)
         if explicit:
             ref = _resolve_addressable(config, full)
         else:
             ref = config.resolve_current(full) or direct_ref
-        sd = entity_state_dir(ref) if ref is not None else None
+        sd = crony.model.entity_state_dir(ref) if ref is not None else None
         # Recover the entity's actual name for platform unit cleanup:
         # the unit file is keyed by the installed (current) name, which
         # a `<bundle>:<UUID>` input or a renamed entry's new name
@@ -1412,10 +1371,10 @@ def do_destroy(
         lock_path = sd / "run.lock" if sd is not None else None
         if lock_path is not None and lock_path.exists():
             try:
-                with acquire_lock(lock_path):
+                with crony.runtime.acquire_lock(lock_path):
                     pass
-            except LockBusyError:
-                raise LockBusyError(
+            except crony.errors.LockBusyError:
+                raise crony.errors.LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 ) from None
         destroy_one(name_for_cleanup, sd)
@@ -1426,10 +1385,10 @@ def do_destroy(
     # in a factory reset, is removed by the winner's own pass
     # above).
     for ref in shadowed_refs:
-        sd = entity_state_dir(ref)
+        sd = crony.model.entity_state_dir(ref)
         if not sd.is_dir():
             continue
-        if run_in_progress(sd):
+        if crony.runtime.run_in_progress(sd):
             logger.warning(
                 "%s: shadowed residue left in place (run in progress)", ref
             )
@@ -1438,7 +1397,7 @@ def do_destroy(
         logger.info("%s: destroyed shadowed residue", ref)
 
 
-def _applied_schedule_state(config: Config, full: str) -> str:
+def _applied_schedule_state(config: crony.model.Config, full: str) -> str:
     """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`
     from the APPLIED snapshot.
 
@@ -1458,9 +1417,9 @@ def _applied_schedule_state(config: Config, full: str) -> str:
     ref = config.resolve_current(full) or config.resolve_pending(full)
     if ref is None:
         return "unresolved"
-    snap: Job | JobGroup | None = config.current.jobs.get(
-        ref
-    ) or config.current.groups.get(ref)
+    snap: crony.model.Job | crony.model.JobGroup | None = (
+        config.current.jobs.get(ref) or config.current.groups.get(ref)
+    )
     if snap is None:
         return "unresolved"
     if snap.timing is None:
@@ -1468,7 +1427,7 @@ def _applied_schedule_state(config: Config, full: str) -> str:
     return "scheduled"
 
 
-def _installed_refs(config: Config) -> set[EntityRef]:
+def _installed_refs(config: crony.model.Config) -> set[crony.unit.EntityRef]:
     """The uuids with on-disk presence (a current snapshot, a broken
     snapshot, or a leftover platform unit) -- the set an action
     command can act on. Excludes pending-only entries (never applied).
@@ -1476,7 +1435,9 @@ def _installed_refs(config: Config) -> set[EntityRef]:
     return config.current.refs() | set(config.broken) | set(config.unit_only)
 
 
-def _resolve_addressable(config: Config, full: str) -> EntityRef | None:
+def _resolve_addressable(
+    config: crony.model.Config, full: str
+) -> crony.unit.EntityRef | None:
     """Resolve a user-supplied name to the single uuid it addresses
     for an action command (enable / disable / trigger / destroy).
 
@@ -1487,7 +1448,7 @@ def _resolve_addressable(config: Config, full: str) -> EntityRef | None:
     be disambiguated until `crony apply`. Returns None when neither
     graph knows the name (and it isn't a `<bundle>:<UUID>` address).
     """
-    direct = EntityRef.from_str(full)
+    direct = crony.unit.EntityRef.from_str(full)
     if direct is not None:
         return direct
     pending_ref = config.resolve_pending(full)
@@ -1497,7 +1458,7 @@ def _resolve_addressable(config: Config, full: str) -> EntityRef | None:
         and current_ref is not None
         and pending_ref != current_ref
     ):
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"{full!r} addresses {current_ref} on disk but {pending_ref} "
             f"in config; run `crony apply` to reconcile before addressing "
             f"it by name"
@@ -1506,8 +1467,8 @@ def _resolve_addressable(config: Config, full: str) -> EntityRef | None:
 
 
 def _resolve_action_targets(
-    config: Config, names: list[str], *, runnable_only: bool = False
-) -> list[tuple[str, EntityRef, str]]:
+    config: crony.model.Config, names: list[str], *, runnable_only: bool = False
+) -> list[tuple[str, crony.unit.EntityRef, str]]:
     """Map normalized names to `(input, ref, unit-name)` targets for an
     action command, rejecting any that can't be acted on here.
 
@@ -1528,7 +1489,7 @@ def _resolve_action_targets(
     acceptable = (
         config.current.refs() if runnable_only else _installed_refs(config)
     )
-    targets: list[tuple[str, EntityRef, str]] = []
+    targets: list[tuple[str, crony.unit.EntityRef, str]] = []
     unknown: list[str] = []
     for full in names:
         ref = _resolve_addressable(config, full)
@@ -1542,7 +1503,9 @@ def _resolve_action_targets(
             if runnable_only
             else "not stamped on this host"
         )
-        raise UsageError(f"{hint}: {sorted(unknown)} (run `crony apply` first)")
+        raise crony.errors.UsageError(
+            f"{hint}: {sorted(unknown)} (run `crony apply` first)"
+        )
     return targets
 
 
@@ -1550,7 +1513,7 @@ def _resolve_bulk_names(
     jobs: list[str],
     bundle: str | None,
     stamped: set[str],
-    config: Config,
+    config: crony.model.Config,
     scheduled_only: bool,
 ) -> list[str]:
     """Derive the operate-on name set for enable / disable / trigger.
@@ -1564,10 +1527,10 @@ def _resolve_bulk_names(
     call.
     """
     if jobs:
-        return [resolve_cli_name(arg, bundle) for arg in jobs]
+        return [crony.config.resolve_cli_name(arg, bundle) for arg in jobs]
     if bundle is None:
-        raise UsageError("specify job names or --bundle")
-    expanded = sorted(bundle_prefix_filter(stamped, bundle))
+        raise crony.errors.UsageError("specify job names or --bundle")
+    expanded = sorted(crony.config.bundle_prefix_filter(stamped, bundle))
     if scheduled_only:
         expanded = [
             n
@@ -1578,7 +1541,7 @@ def _resolve_bulk_names(
 
 
 def _refuse_unscheduled_full(
-    config: Config, full_names: list[str], verb: str
+    config: crony.model.Config, full_names: list[str], verb: str
 ) -> None:
     """Reject entries with no schedule (nothing to enable/disable)."""
     unscheduled = [
@@ -1587,7 +1550,7 @@ def _refuse_unscheduled_full(
         if _applied_schedule_state(config, full) == "unscheduled"
     ]
     if unscheduled:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"cannot {verb} grouped entries: {sorted(unscheduled)}. "
             f"Grouped entries are triggered by parent jobs with their "
             f"own schedule."
@@ -1610,7 +1573,7 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     positional args, bare names resolve in `<name>` and qualified
     names must match it.
     """
-    config = load_config()
+    config = crony.runtime.load_config()
     config.require_addressable(bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
@@ -1639,7 +1602,7 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     positional args, bare names resolve in `<name>` and qualified
     names must match it.
     """
-    config = load_config()
+    config = crony.runtime.load_config()
     config.require_addressable(bundle)
     installed = config.installed_full_names()
     normalized = _resolve_bulk_names(
@@ -1692,11 +1655,11 @@ def do_trigger(
     names must match it.
     """
     if trigger_timeout is not None and not wait:
-        raise UsageError(
+        raise crony.errors.UsageError(
             "--trigger-timeout requires --wait (only meaningful in "
             "synchronous mode)"
         )
-    config = load_config()
+    config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
     stamped = config.installed_full_names()
@@ -1712,7 +1675,7 @@ def do_trigger(
             crony.runner.trigger_unit(
                 unit_name,
                 triggered_by_user=True,
-                state_dir=entity_state_dir(ref),
+                state_dir=crony.model.entity_state_dir(ref),
             )
             logger.info("%s: triggered", full)
         return
@@ -1722,10 +1685,10 @@ def do_trigger(
     # up trigger_timeout_sec per-bundle too.
     worst_rc = 0
     for full, ref, unit_name in targets:
-        bn, short = parse_full_name(full)
+        bn, short = crony.config.parse_full_name(full)
         b = bundles.by_name(bn)
         if b is None:
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"unknown bundle for {full!r} (apply may be stale)"
             )
         if short not in b.config.jobs and short not in b.config.job_groups:
@@ -1734,18 +1697,18 @@ def do_trigger(
             # resolves per-name timeouts from the config, which no
             # longer describes it -- refuse with a clear message
             # rather than a raw KeyError.
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"{full!r} is installed but not in the current config "
                 f"(apply may be stale -- re-apply or `crony destroy` "
                 f"it); --wait cannot resolve its timeouts"
             )
         b_target = b.config.resolve_target()
         if short in b.config.jobs:
-            timeout = timeout_to_wait(
+            timeout = crony.runner.timeout_to_wait(
                 b.config.resolved_job_timeout_sec(b.config.jobs[short])
             )
         else:
-            timeout = timeout_to_wait(
+            timeout = crony.runner.timeout_to_wait(
                 b.config.resolved_group_timeout_sec(b_target, short)
             )
         tt = (
@@ -1755,13 +1718,13 @@ def do_trigger(
         )
         rec = crony.runner.trigger_unit_sync(
             unit_name,
-            state_dir=entity_state_dir(ref),
+            state_dir=crony.model.entity_state_dir(ref),
             job_timeout=timeout,
             trigger_timeout=tt,
             triggered_by_user=True,
         )
         cls = rec.get("exit_class", "ok")
-        rc = trigger_exit_code(rec)
+        rc = crony.runner.trigger_exit_code(rec)
         logger.info("%s: %s (exit %s)", full, cls, rc)
         if rc and (not worst_rc or abs(rc) > abs(worst_rc)):
             worst_rc = rc
@@ -1770,7 +1733,7 @@ def do_trigger(
 
 
 def _build_status_tree(
-    bundles: TomlConfig, host: str, platform: str
+    bundles: crony.config.TomlConfig, host: str, platform: str
 ) -> tuple[list[str], dict[str, int]]:
     """Return the DFS order and per-name depth of each active target tree.
 
@@ -1790,7 +1753,7 @@ def _build_status_tree(
     depth: dict[str, int] = {}
 
     def _walk(
-        bundle: TomlBundle,
+        bundle: crony.config.TomlBundle,
         short: str,
         d: int,
         seen: set[str],
@@ -2002,7 +1965,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIASES)
     unknown = [c for c in raw if c not in valid]
     if unknown:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"unknown status column(s): {sorted(unknown)} "
             f"(valid: {sorted(_STATUS_COL_HEADERS)}; "
             f"aliases: {sorted(_STATUS_COL_ALIASES)})"
@@ -2026,7 +1989,7 @@ def _parse_status_cols(spec: str | None) -> list[str]:
 
 
 def resolve_state_axes(
-    config: Config,
+    config: crony.model.Config,
     full: str,
     remnants: set[str],
     *,
@@ -2061,9 +2024,9 @@ def resolve_state_axes(
     `"masked"` otherwise. The orphan-on-mask rule encodes
     "cleanup needed wins over passive-not-for-this-host."
     """
-    bn, short = parse_full_name(full)
+    bn, short = crony.config.parse_full_name(full)
     bundle = config.toml_config.by_name(bn)
-    entry: TomlJob | TomlJobGroup | None = None
+    entry: crony.config.TomlJob | crony.config.TomlJobGroup | None = None
     if bundle is not None and (
         short in bundle.config.errored_jobs
         or short in bundle.config.errored_job_groups
@@ -2086,7 +2049,7 @@ def resolve_state_axes(
     # unit installed under the *current* (applied) name -- which may
     # differ from `full` for a not-yet-applied rename.
     ref = (
-        EntityRef(bn, entry.uuid)
+        crony.unit.EntityRef(bn, entry.uuid)
         if entry is not None
         else config.resolve_current(full) or config.resolve_pending(full)
     )
@@ -2121,13 +2084,17 @@ def resolve_state_axes(
     return cfg_state, unit_state, last_state
 
 
-def _entry_is_scheduled(entry: TomlJob | TomlJobGroup | None) -> bool:
+def _entry_is_scheduled(
+    entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
+) -> bool:
     if entry is None:
         return False
     return entry.timing is not None
 
 
-def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
+def _snapshot_says_scheduled(
+    config: crony.model.Config, full: str
+) -> bool | None:
     """`True` / `False` if the current-graph entry for `full`
     records schedule fields; `None` otherwise. Used to guess UNIT
     NAME for entries whose live config no longer exists.
@@ -2153,8 +2120,8 @@ def _snapshot_says_scheduled(config: Config, full: str) -> bool | None:
 
 def _unit_name_for(
     full: str,
-    entry: TomlJob | TomlJobGroup | None,
-    config: Config,
+    entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
+    config: crony.model.Config,
     platform: str | None = None,
 ) -> str:
     """Platform unit identifier for the UNIT NAME column.
@@ -2169,7 +2136,7 @@ def _unit_name_for(
         scheduled: bool | None = _entry_is_scheduled(entry)
     else:
         scheduled = _snapshot_says_scheduled(config, full)
-    return scheduler(platform).unit_name(full, scheduled)
+    return crony.runtime.scheduler(platform).unit_name(full, scheduled)
 
 
 # Trailing flag on a status cell whose pending and current values
@@ -2253,8 +2220,10 @@ def _render_status_cell(
 
 
 def _build_group_membership(
-    config: Config,
-) -> tuple[dict[EntityRef, list[str]], dict[EntityRef, list[str]]]:
+    config: crony.model.Config,
+) -> tuple[
+    dict[crony.unit.EntityRef, list[str]], dict[crony.unit.EntityRef, list[str]]
+]:
     """Reverse-index group membership from the pending and current
     graphs.
 
@@ -2269,11 +2238,13 @@ def _build_group_membership(
     Each value list is sorted for stable display order.
     """
 
-    def _membership(graph: Graph) -> dict[EntityRef, list[str]]:
-        table: dict[EntityRef, list[str]] = {}
+    def _membership(
+        graph: crony.model.Graph,
+    ) -> dict[crony.unit.EntityRef, list[str]]:
+        table: dict[crony.unit.EntityRef, list[str]] = {}
         for parent in graph.groups.values():
             for child_uuid in parent.children:
-                child_ref = EntityRef(parent.name.bundle, child_uuid)
+                child_ref = crony.unit.EntityRef(parent.name.bundle, child_uuid)
                 if (
                     child_ref not in graph.jobs
                     and child_ref not in graph.groups
@@ -2288,7 +2259,7 @@ def _build_group_membership(
 
 
 def _build_config_group_membership(
-    toml_config: TomlConfig,
+    toml_config: crony.config.TomlConfig,
 ) -> dict[str, list[str]]:
     """Reverse-index group membership straight from the parsed TOML,
     spanning every defined group whether or not it is selected here.
@@ -2413,7 +2384,7 @@ def do_status(
     `--help` epilog's Color section. Redirected output is plain.
     """
     if config_current and config_pending:
-        raise UsageError(
+        raise crony.errors.UsageError(
             "--config-current and --config-pending are mutually exclusive"
         )
     config_source = (
@@ -2424,7 +2395,7 @@ def do_status(
         else "default"
     )
     selected_cols = _parse_status_cols(cols)
-    config = load_config()
+    config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
     platform = config.platform
@@ -2433,8 +2404,8 @@ def do_status(
     )
     remnants = config.installed_full_names()
     if bundle is not None:
-        selected = bundle_prefix_filter(selected, bundle)
-        remnants = bundle_prefix_filter(remnants, bundle)
+        selected = crony.config.bundle_prefix_filter(selected, bundle)
+        remnants = crony.config.bundle_prefix_filter(remnants, bundle)
         masked_by_full = {
             n: r
             for n, r in masked_by_full.items()
@@ -2442,8 +2413,8 @@ def do_status(
         }
 
     try:
-        scheduler().verify()
-    except SchedulerWarning as warn:
+        crony.runtime.scheduler().verify()
+    except crony.platform.SchedulerWarning as warn:
         logger.warning("%s", warn)
 
     # Surface bundle parse failures at the top of the report so
@@ -2458,7 +2429,7 @@ def do_status(
 
     full_names: list[str]
     if jobs:
-        full_names = [resolve_cli_name(n, bundle) for n in jobs]
+        full_names = [crony.config.resolve_cli_name(n, bundle) for n in jobs]
     else:
         errored_full = _errored_full_names(bundles, bundle)
         # Broken entries with no recoverable name, and current
@@ -2505,18 +2476,18 @@ def do_status(
     # render as a single row shown under the name from the active
     # source. Errored entries never parsed to a uuid and keep their
     # own name-keyed row.
-    names_by_ref: dict[EntityRef, list[str]] = {}
-    refform_refs: set[EntityRef] = set()
+    names_by_ref: dict[crony.unit.EntityRef, list[str]] = {}
+    refform_refs: set[crony.unit.EntityRef] = set()
     nameless_rows: list[str] = []
     for full in full_names:
-        direct = EntityRef.from_str(full)
+        direct = crony.unit.EntityRef.from_str(full)
         if direct is not None:
             refform_refs.add(direct)
             names_by_ref.setdefault(direct, []).append(full)
             continue
         r = config.resolve_pending(full) or config.resolve_current(full)
         if r is None:
-            bn0, short0 = parse_full_name(full)
+            bn0, short0 = crony.config.parse_full_name(full)
             bdl0 = bundles.by_name(bn0)
             e0 = (
                 bdl0.config.jobs.get(short0)
@@ -2525,7 +2496,7 @@ def do_status(
                 else None
             )
             if e0 is not None:
-                r = EntityRef(bn0, e0.uuid)
+                r = crony.unit.EntityRef(bn0, e0.uuid)
         if r is None:
             nameless_rows.append(full)
         else:
@@ -2534,7 +2505,9 @@ def do_status(
     built: list[tuple[str, dict[str, str]]] = []
     any_stale = False
 
-    def _build_row(ref: EntityRef | None, candidates: list[str]) -> None:
+    def _build_row(
+        ref: crony.unit.EntityRef | None, candidates: list[str]
+    ) -> None:
         nonlocal any_stale
 
         def _mark(pending_val: str | None, current_val: str | None) -> str:
@@ -2549,12 +2522,12 @@ def do_status(
                 value = f"{value}{_DIVERGENCE_MARKER}"
             return value
 
-        pending_node: Job | JobGroup | None = (
+        pending_node: crony.model.Job | crony.model.JobGroup | None = (
             config.pending.jobs.get(ref) or config.pending.groups.get(ref)
             if ref is not None
             else None
         )
-        current_node: Job | JobGroup | None = (
+        current_node: crony.model.Job | crony.model.JobGroup | None = (
             config.current.jobs.get(ref) or config.current.groups.get(ref)
             if ref is not None
             else None
@@ -2582,9 +2555,9 @@ def do_status(
         # the enumerated name.
         config_name = pending_name or fallback
         mask_reason = masked_by_full.get(config_name, "")
-        bn, short = parse_full_name(config_name)
+        bn, short = crony.config.parse_full_name(config_name)
         bdl = bundles.by_name(bn)
-        entry: TomlJob | TomlJobGroup | None = (
+        entry: crony.config.TomlJob | crony.config.TomlJobGroup | None = (
             bdl.config.jobs.get(short) or bdl.config.job_groups.get(short)
             if bdl is not None
             else None
@@ -2596,21 +2569,21 @@ def do_status(
 
         pkind = (
             "group"
-            if isinstance(pending_node, JobGroup)
+            if isinstance(pending_node, crony.model.JobGroup)
             else "job"
             if pending_node is not None
             else None
         )
         ckind = (
             "group"
-            if isinstance(current_node, JobGroup)
+            if isinstance(current_node, crony.model.JobGroup)
             else "job"
             if current_node is not None
             else None
         )
         if pkind is not None or ckind is not None:
             kind = _mark(pkind, ckind)
-        elif isinstance(entry, TomlJobGroup):
+        elif isinstance(entry, crony.config.TomlJobGroup):
             kind = "group"
         elif entry is not None:
             kind = "job"
@@ -2699,7 +2672,7 @@ def do_status(
             any_stale = True
             unit_name = f"{unit_name}{_DIVERGENCE_MARKER}"
         if is_refform:
-            row_ref: EntityRef | None = ref
+            row_ref: crony.unit.EntityRef | None = ref
             job_cell = (config.name_for(ref) or "") if ref is not None else ""
             job_or_uuid_cell = str(ref)
         else:
@@ -2871,10 +2844,10 @@ def do_logs(
                 follow appended output (-f semantics) until
                 interrupted.
     """
-    full = normalize_full_name(name)
+    full = crony.config.normalize_full_name(name)
     try:
-        config = load_config()
-    except ConfigError:
+        config = crony.runtime.load_config()
+    except crony.errors.ConfigError:
         config = None
     sd: Path | None = None
     if config is not None:
@@ -2888,7 +2861,7 @@ def do_logs(
         ref = (
             config.resolve_current(full)
             or config.resolve_pending(full)
-            or EntityRef.from_str(full)
+            or crony.unit.EntityRef.from_str(full)
         )
         if ref is not None:
             # Derive the state dir directly from the ref. This
@@ -2900,17 +2873,21 @@ def do_logs(
             # unit-only orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
-            sd = entity_state_dir(ref)
+            sd = crony.model.entity_state_dir(ref)
     if sd is None:
-        raise UsageError(f"no log for {full!r} (no applied state on this host)")
+        raise crony.errors.UsageError(
+            f"no log for {full!r} (no applied state on this host)"
+        )
     log_path = sd / "run.log"
     if path:
         print(log_path)
         return
     if not log_path.exists():
-        raise UsageError(f"no log for {full!r} (state dir: {sd})")
+        raise crony.errors.UsageError(f"no log for {full!r} (state dir: {sd})")
     if tail and latest:
-        raise UsageError("--tail and --latest are mutually exclusive")
+        raise crony.errors.UsageError(
+            "--tail and --latest are mutually exclusive"
+        )
     if n is None:
         n = 10 if tail else 200
     if tail:
@@ -2921,7 +2898,7 @@ def do_logs(
         # `--latest` is a single-run readout; it overrides -n /
         # --since since the entry is bounded by run-header
         # markers, not line count or wallclock.
-        text = extract_latest_log_entry(text)
+        text = crony.notify.extract_latest_log_entry(text)
     else:
         if since is not None:
             text = _filter_since(text, since)
@@ -3001,12 +2978,12 @@ def parse_since(spec: str) -> datetime.datetime:
     try:
         ts = datetime.datetime.fromisoformat(text)
     except ValueError as e:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"unparseable --since value: {spec!r} "
             f"(use NUMs/m/h/d or ISO timestamp)"
         ) from e
     if ts.tzinfo is None:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"--since {spec!r} is missing a timezone offset; "
             f"use a form like 2026-04-01T12:00:00-07:00"
         )
@@ -3066,7 +3043,7 @@ def _secret_warning(
 
 
 def _validate_bundle_warnings(
-    bundle: TomlBundle,
+    bundle: crony.config.TomlBundle,
 ) -> list[str]:
     """Return per-bundle warnings: defined channels whose secrets
     don't resolve, channels defined but never referenced, etc."""
@@ -3086,12 +3063,12 @@ def _validate_bundle_warnings(
             listed.update(t.notify_channels)
 
     for ch_name in sorted(listed):
-        if ch_name == NOTIFY_INHERIT_TOKEN:
+        if ch_name == crony.config.NOTIFY_INHERIT_TOKEN:
             # The inherit sentinel resolves to the default bundle's
             # channels; their secrets are checked when that bundle is
             # validated, not here.
             continue
-        if ch_name in BUILTIN_NOTIFY_CHANNELS:
+        if ch_name in crony.config.BUILTIN_NOTIFY_CHANNELS:
             # Zero-config built-in (e.g. dialog-popup): no block and no
             # secrets to resolve, so there is nothing to warn about.
             continue
@@ -3108,7 +3085,7 @@ def _validate_bundle_warnings(
             assert channel.email is not None
             label = f"channel {ch_name!r}: SMTP password"
             try:
-                secret = retrieve_secret(
+                secret = crony.notify.retrieve_secret(
                     keychain_service=channel.email.smtp_pass_keychain_service,
                     keychain_account=channel.email.smtp_pass_keychain_account,
                     file_path=channel.email.smtp_pass_file,
@@ -3126,13 +3103,13 @@ def _validate_bundle_warnings(
                             file_path=channel.email.smtp_pass_file,
                         )
                     )
-            except PreconditionError as e:
+            except crony.errors.PreconditionError as e:
                 warnings.append(str(e))
         elif channel.transport == "ntfy":
             assert channel.ntfy is not None
             label = f"channel {ch_name!r}: ntfy token"
             try:
-                token = retrieve_secret(
+                token = crony.notify.retrieve_secret(
                     keychain_service=channel.ntfy.token_keychain_service,
                     keychain_account=channel.ntfy.token_keychain_account,
                     file_path=channel.ntfy.token_file,
@@ -3150,7 +3127,7 @@ def _validate_bundle_warnings(
                             file_path=channel.ntfy.token_file,
                         )
                     )
-            except PreconditionError as e:
+            except crony.errors.PreconditionError as e:
                 warnings.append(str(e))
 
     # Defined-but-unreferenced channels: not an error (may be staged
@@ -3190,16 +3167,16 @@ def _validate_file(path: Path) -> None:
     error; prints `ok` and returns when clean.
     """
     if not path.exists():
-        raise ConfigError(f"config not found: {path}")
+        raise crony.errors.ConfigError(f"config not found: {path}")
     if path.resolve() == crony.paths.CONFIG_FILE.resolve():
-        name = DEFAULT_BUNDLE_NAME
+        name = crony.config.DEFAULT_BUNDLE_NAME
     else:
         name = path.stem
-    validate_bundle_name(name, str(path))
+    crony.config.validate_bundle_name(name, str(path))
     # TomlBundle.load logs each per-entity error and raises on a
     # bundle-level structural failure; the errored_* counts catch the
     # per-entity cases so this exits non-zero on either.
-    bundle = TomlBundle.load(name, path)
+    bundle = crony.config.TomlBundle.load(name, path)
     cfg = bundle.config
     errored = (
         len(cfg.errored_jobs)
@@ -3208,7 +3185,7 @@ def _validate_file(path: Path) -> None:
         + len(cfg.errored_host_targets)
     )
     if errored:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{path}: {errored} invalid config "
             f"{'entry' if errored == 1 else 'entries'}"
         )
@@ -3239,14 +3216,14 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     if file is not None:
         _validate_file(Path(file))
         return
-    bundles = TomlConfig.load_all()
+    bundles = crony.config.TomlConfig.load_all()
     bundles.require_known(bundle)
 
     warnings: list[str] = []
     if bundle is None:
         try:
-            scheduler().verify()
-        except SchedulerWarning as warn:
+            crony.runtime.scheduler().verify()
+        except crony.platform.SchedulerWarning as warn:
             warnings.append(str(warn))
 
     target_bundles = (
@@ -3295,13 +3272,17 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             print(f"  - {w}")
         # WARNING is not raisable as a CronyError; SystemExit forwards
         # the code through cli() unchanged.
-        raise SystemExit(int(ExitCode.WARNING))
+        raise SystemExit(int(crony.errors.ExitCode.WARNING))
     print("ok")
 
 
 def _notify_test_one_bundle(
-    bundle: TomlBundle, channel: str | None, bundles: TomlConfig
-) -> tuple[list[str], list[tuple[str, NotificationResult]], str | None]:
+    bundle: crony.config.TomlBundle,
+    channel: str | None,
+    bundles: crony.config.TomlConfig,
+) -> tuple[
+    list[str], list[tuple[str, crony.model.NotificationResult]], str | None
+]:
     """Run notify-test against one bundle.
 
     Returns (successes, failures, inherited_from). `inherited_from` is
@@ -3316,7 +3297,7 @@ def _notify_test_one_bundle(
     # `resolved_notify_channels`. The uuid is never persisted and
     # never compared against any real entry, so the all-zeros
     # placeholder is fine.
-    synthetic_job = TomlJob(
+    synthetic_job = crony.config.TomlJob(
         name="notify-test",
         uuid="00000000-0000-0000-0000-000000000000",
         command="true",
@@ -3327,7 +3308,7 @@ def _notify_test_one_bundle(
     # for dispatch; a bundle that inherits sends through the default
     # bundle's definitions, so an explicit --channel resolves there
     # too.
-    resolved, eff_defaults = expand_notify_inherit(
+    resolved, eff_defaults = crony.notify.expand_notify_inherit(
         resolved, bundle.name, bundles, config.defaults
     )
     # `expand_notify_inherit` swaps in the default bundle's Defaults
@@ -3335,16 +3316,18 @@ def _notify_test_one_bundle(
     # identity change means the channels (and their definitions) came
     # from the default bundle.
     inherited_from = (
-        DEFAULT_BUNDLE_NAME if eff_defaults is not config.defaults else None
+        crony.config.DEFAULT_BUNDLE_NAME
+        if eff_defaults is not config.defaults
+        else None
     )
     use_channels = [channel] if channel is not None else resolved
     if not use_channels:
         return ([], [], inherited_from)
-    result = JobRunResult(
+    result = crony.model.JobRunResult(
         host=crony.platform.current_host(),
         platform=crony.platform.current_platform(),
-        started_at=now_iso(),
-        ended_at=now_iso(),
+        started_at=crony.runtime.now_iso(),
+        ended_at=crony.runtime.now_iso(),
         duration_sec=0.0,
         exit_class="fail",
         exit_code=1,
@@ -3353,7 +3336,8 @@ def _notify_test_one_bundle(
         log_path="(synthetic)",
         log_bytes_this_run=0,
         notifications={
-            ch: NotificationResult(sent=False) for ch in use_channels
+            ch: crony.model.NotificationResult(sent=False)
+            for ch in use_channels
         },
     )
     log_text = (
@@ -3393,25 +3377,27 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     per-channel failure surfaces as CONFIG (config-shaped) or ERROR
     (transport-shaped), preserving the original failure category.
     """
-    bundles = TomlConfig.load_all()
+    bundles = crony.config.TomlConfig.load_all()
 
     # Resolve --channel into (bundle_from_channel, channel_or_None).
     channel_bundle: str | None = None
     channel_short: str | None = None
     if channel is not None:
         if "." in channel:
-            channel_bundle, channel_short = parse_full_name(channel)
+            channel_bundle, channel_short = crony.config.parse_full_name(
+                channel
+            )
         else:
             channel_short = channel
 
     # Compose --bundle and --channel's bundle prefix.
     if channel_bundle is not None and bundle is not None:
         if channel_bundle != bundle:
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"--bundle {bundle!r} contradicts --channel "
                 f"{channel!r} (bundle {channel_bundle!r}); pick one"
             )
-    bundle_name = channel_bundle or bundle or DEFAULT_BUNDLE_NAME
+    bundle_name = channel_bundle or bundle or crony.config.DEFAULT_BUNDLE_NAME
     bundles.require_known(bundle_name)
     target_bundle = bundles.by_name(bundle_name)
     assert target_bundle is not None  # require_known guarantees
@@ -3432,7 +3418,7 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
         return
     if not failures:
         return
-    all_failures: list[tuple[str, str, NotificationResult]] = [
+    all_failures: list[tuple[str, str, crony.model.NotificationResult]] = [
         (target_bundle.name, ch, nr) for ch, nr in failures
     ]
     # Preserve the failure category: if every failure is config-shaped
@@ -3446,8 +3432,8 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
         f"{bn}.{ch}{origin}: {nr.error}" for bn, ch, nr in all_failures
     )
     if all_config:
-        raise ConfigError(f"notify-test failed: {detail}")
-    raise CronyError(f"notify-test failed: {detail}")
+        raise crony.errors.ConfigError(f"notify-test failed: {detail}")
+    raise crony.errors.CronyError(f"notify-test failed: {detail}")
 
 
 def do_self_test(*, verbose: bool, coverage: bool) -> int:

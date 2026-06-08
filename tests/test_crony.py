@@ -259,7 +259,9 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = crony_cli.COMMAND_CALLBACKS
     PARSER_FUNC = crony_cli.build_parser
     CLI_FUNC = staticmethod(crony_cli.cli)
-    MODULE: ClassVar[Any] = crony_cli
+    # cli() resolves the self-test handler as crony.commands.do_self_test
+    # (module-attribute), so the dispatch test patches it on crony.commands.
+    MODULE: ClassVar[Any] = crony_commands
     EXIT_CODE_USAGE = ExitCode.USAGE
     TEST_SUBCOMMAND = "status"
     EXCEPTION_EXIT_CODE_MAP = [

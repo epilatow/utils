@@ -32,41 +32,12 @@ from typing import (
     NamedTuple,
 )
 
+import crony.errors
+import crony.model
 import crony.notify
 import crony.platform
 import crony.runtime
-from crony.errors import (
-    ExitCode,
-    LockBusyError,
-    PreconditionError,
-    TriggerStartTimeout,
-    UnitNotInstalledError,
-    UsageError,
-)
-from crony.model import (
-    GroupChildResult,
-    GroupRunResult,
-    Job,
-    JobGroup,
-    JobRunResult,
-    NotificationResult,
-    entity_state_dir,
-)
-from crony.notify import resolve_notify_at_runtime
-from crony.platform import PidWait
-from crony.runtime import (
-    acquire_lock,
-    consume_user_trigger_flag,
-    load_snapshot,
-    now_iso,
-    read_pid_file,
-    scheduler,
-    state_dir_for,
-    user_trigger_flag_path,
-    write_last_run,
-    write_user_trigger_flag,
-)
-from crony.unit import EntityRef
+import crony.unit
 
 
 def timeout_to_wait(sec: int) -> float:
@@ -78,7 +49,9 @@ def timeout_to_wait(sec: int) -> float:
     return math.inf if sec == 0 else float(sec)
 
 
-def rollup_group_exit_class(children: list[GroupChildResult]) -> str:
+def rollup_group_exit_class(
+    children: list[crony.model.GroupChildResult],
+) -> str:
     """Worst-of children's exit_class, with a precedence ladder.
 
     A group with no children, or one whose children are all `ok`,
@@ -149,7 +122,7 @@ def runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def command_argv(snap: Job) -> list[str]:
+def command_argv(snap: crony.model.Job) -> list[str]:
     """argv for the job's main command, drawn from the snapshot.
 
     Snapshot fields are pre-resolved at apply time (script paths
@@ -162,7 +135,7 @@ def command_argv(snap: Job) -> list[str]:
     return [snap.script, *snap.args]
 
 
-def gate_argv(snap: Job) -> list[str] | None:
+def gate_argv(snap: crony.model.Job) -> list[str] | None:
     """argv for the gate, or None if the snapshot has no gate."""
     if snap.gate is not None:
         return ["/bin/sh", "-c", snap.gate]
@@ -171,7 +144,9 @@ def gate_argv(snap: Job) -> list[str] | None:
     return None
 
 
-def keep_awake_argv(argv: list[str], snap: Job) -> tuple[list[str], str | None]:
+def keep_awake_argv(
+    argv: list[str], snap: crony.model.Job
+) -> tuple[list[str], str | None]:
     """Wrap `argv` so the machine stays awake while the command runs.
 
     Returns (argv, note). When `snap.keep_awake` is set, delegates to
@@ -234,7 +209,9 @@ def exec_with_timeout(
     return ExitOutcome(rc=rc, signal=None)
 
 
-def wait_for_pid_exit(pid: int, timeout: float | None) -> PidWait:
+def wait_for_pid_exit(
+    pid: int, timeout: float | None
+) -> crony.platform.PidWait:
     """Block until `pid` exits via the host's kernel-level pid-exit
     notification; delegates to the HostPlatform backend. `timeout=None`
     waits indefinitely."""
@@ -329,7 +306,9 @@ def show_interactive_dialog(job_name: str, message: str) -> str:
     return "cancel"
 
 
-def interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
+def interactive_wait_and_prompt(
+    snap: crony.model.Job, log_file: IO[bytes]
+) -> str:
     """Run the wait/prompt/delay loop for an interactive job.
 
     Returns 'run' or 'cancel'. Logs each phase transition into
@@ -346,10 +325,10 @@ def interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
     silently bypass *that* wait.
     """
 
-    sd = entity_state_dir(snap.ref)
+    sd = crony.model.entity_state_dir(snap.ref)
 
     def _bypass() -> bool:
-        return consume_user_trigger_flag(sd)
+        return crony.runtime.consume_user_trigger_flag(sd)
 
     while True:
         log_file.write(
@@ -388,7 +367,7 @@ def interactive_wait_and_prompt(snap: Job, log_file: IO[bytes]) -> str:
 
 
 def run_job(
-    snap: Job,
+    snap: crony.model.Job,
     *,
     dry_run: bool = False,
     skip_gate: bool = False,
@@ -408,28 +387,30 @@ def run_job(
     if snap.script is not None:
         sp = Path(snap.script)
         if not sp.exists():
-            raise PreconditionError(f"script not found: {sp}")
+            raise crony.errors.PreconditionError(f"script not found: {sp}")
         if not os.access(sp, os.X_OK):
-            raise PreconditionError(f"script not executable: {sp}")
+            raise crony.errors.PreconditionError(f"script not executable: {sp}")
 
-    sd = state_dir_for(snap.ref)
+    sd = crony.runtime.state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
-    notify_channels, notify_defaults = resolve_notify_at_runtime(full_name)
+    notify_channels, notify_defaults = crony.notify.resolve_notify_at_runtime(
+        full_name
+    )
     job_timeout_sec = snap.job_timeout_sec
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see runtime_env).
     env = runtime_env(snap.env)
     started = time.time()
-    started_iso = now_iso()
+    started_iso = crony.runtime.now_iso()
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
     try:
-        with acquire_lock(lock_path):
+        with crony.runtime.acquire_lock(lock_path):
             if dry_run:
                 return 0
             # Publish our pid for waiters (parent groups, `crony
@@ -470,11 +451,11 @@ def run_job(
                         log_file.write(
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
-                        result = JobRunResult(
+                        result = crony.model.JobRunResult(
                             host=host,
                             platform=platform,
                             started_at=started_iso,
-                            ended_at=now_iso(),
+                            ended_at=crony.runtime.now_iso(),
                             duration_sec=time.time() - started,
                             exit_class="gated",
                             exit_code=0,
@@ -486,13 +467,13 @@ def run_job(
                             ),
                             notifications={},
                         )
-                        write_last_run(
+                        crony.runtime.write_last_run(
                             last_run_path, dataclasses.asdict(result)
                         )
                         return 0
 
                 if snap.interactive:
-                    bypass = consume_user_trigger_flag(sd)
+                    bypass = crony.runtime.consume_user_trigger_flag(sd)
                     if bypass:
                         log_file.write(
                             b"interactive: bypass (user-triggered)\n"
@@ -505,11 +486,11 @@ def run_job(
                         finally:
                             pending_flag.unlink(missing_ok=True)
                         if choice == "cancel":
-                            result = JobRunResult(
+                            result = crony.model.JobRunResult(
                                 host=host,
                                 platform=platform,
                                 started_at=started_iso,
-                                ended_at=now_iso(),
+                                ended_at=crony.runtime.now_iso(),
                                 duration_sec=time.time() - started,
                                 exit_class="canceled",
                                 exit_code=0,
@@ -521,7 +502,7 @@ def run_job(
                                 ),
                                 notifications={},
                             )
-                            write_last_run(
+                            crony.runtime.write_last_run(
                                 last_run_path, dataclasses.asdict(result)
                             )
                             return 0
@@ -558,20 +539,21 @@ def run_job(
                     exit_class = "timeout"
                     exit_code = None
                     sig = None
-                    surfaced_rc = int(ExitCode.TIMEOUT)
+                    surfaced_rc = int(crony.errors.ExitCode.TIMEOUT)
 
                 # Pre-populate per-channel slots with sent=False so
                 # the dispatcher can update each entry in place. Order
                 # is preserved (Python dict insertion order) so the
                 # JSON record reflects the configured channel order.
-                notifications: dict[str, NotificationResult] = {
-                    ch: NotificationResult(sent=False) for ch in notify_channels
+                notifications: dict[str, crony.model.NotificationResult] = {
+                    ch: crony.model.NotificationResult(sent=False)
+                    for ch in notify_channels
                 }
-                result = JobRunResult(
+                result = crony.model.JobRunResult(
                     host=host,
                     platform=platform,
                     started_at=started_iso,
-                    ended_at=now_iso(),
+                    ended_at=crony.runtime.now_iso(),
                     duration_sec=time.time() - started,
                     exit_class=exit_class,
                     exit_code=exit_code,
@@ -596,21 +578,23 @@ def run_job(
                         result, full_name, log_text, notify_defaults
                     )
 
-                write_last_run(last_run_path, dataclasses.asdict(result))
+                crony.runtime.write_last_run(
+                    last_run_path, dataclasses.asdict(result)
+                )
                 return surfaced_rc
             finally:
                 log_file.close()
                 pid_path.unlink(missing_ok=True)
-    except LockBusyError:
+    except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{now_iso()}] LOCK_BUSY: skipping "
+                f"[{crony.runtime.now_iso()}] LOCK_BUSY: skipping "
                 f"(already running)\n".encode()
             )
-        return int(ExitCode.LOCK_BUSY)
+        return int(crony.errors.ExitCode.LOCK_BUSY)
 
 
-def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
+def _child_full_name_from_uuid(child_ref: crony.unit.EntityRef) -> str | None:
     """Resolve a child's ref (as stored in a parent's
     `snapshot.children` -- uuids paired with the parent's bundle)
     to its full namespaced name by reading the child's own
@@ -620,7 +604,7 @@ def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
     at the cost of one snapshot read per child at dispatch time.
     Returns None when the child snapshot is missing or unreadable.
     """
-    snap_p = entity_state_dir(child_ref) / "snapshot.json"
+    snap_p = crony.model.entity_state_dir(child_ref) / "snapshot.json"
     if not snap_p.is_file():
         return None
     try:
@@ -631,7 +615,7 @@ def _child_full_name_from_uuid(child_ref: EntityRef) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
+def _child_timeout_from_snapshot(child_ref: crony.unit.EntityRef) -> float:
     """Per-child wait cap for the group runner. Reads the child's
     pinned snapshot rather than the live config, so the cap is
     consistent with what the child's own runner will enforce.
@@ -645,14 +629,18 @@ def _child_timeout_from_snapshot(child_ref: EntityRef) -> float:
     "wait with no cap" at the pid-watch.
     """
     try:
-        cs = load_snapshot(child_ref)
-    except PreconditionError:
+        cs = crony.runtime.load_snapshot(child_ref)
+    except crony.errors.PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
-    raw = cs.job_timeout_sec if isinstance(cs, Job) else cs.group_budget_sec
+    raw = (
+        cs.job_timeout_sec
+        if isinstance(cs, crony.model.Job)
+        else cs.group_budget_sec
+    )
     return timeout_to_wait(raw)
 
 
-def child_is_interactive(child_ref: EntityRef) -> bool:
+def child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
     """True iff the child is a job whose pinned snapshot has
     `interactive = True`. Groups and non-interactive jobs return
     False. A missing snapshot returns False so the existing
@@ -660,17 +648,17 @@ def child_is_interactive(child_ref: EntityRef) -> bool:
     fires and surfaces the issue with its usual error.
     """
     try:
-        cs = load_snapshot(child_ref)
-    except PreconditionError:
+        cs = crony.runtime.load_snapshot(child_ref)
+    except crony.errors.PreconditionError:
         return False
-    return isinstance(cs, Job) and cs.interactive
+    return isinstance(cs, crony.model.Job) and cs.interactive
 
 
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
 def run_group(
-    snap: JobGroup,
+    snap: crony.model.JobGroup,
     *,
     dry_run: bool = False,
 ) -> int:
@@ -694,36 +682,38 @@ def run_group(
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = state_dir_for(snap.ref)
+    sd = crony.runtime.state_dir_for(snap.ref)
     lock_path = sd / "run.lock"
     log_path = sd / "run.log"
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
     started = time.time()
-    started_iso = now_iso()
+    started_iso = crony.runtime.now_iso()
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
     try:
-        with acquire_lock(lock_path):
+        with crony.runtime.acquire_lock(lock_path):
             if dry_run:
                 return 0
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_file = open(log_path, "ab", buffering=0)
-            children: list[GroupChildResult] = []
+            children: list[crony.model.GroupChildResult] = []
             try:
                 # snap.children stores uuids; resolve each to its
                 # current full name via the child's own snapshot.
                 # A None resolution means the child has no state
                 # dir on this host -- log and treat as a fail row
                 # so the group rollup catches it.
-                resolved_children: list[tuple[EntityRef, str | None]] = [
+                resolved_children: list[
+                    tuple[crony.unit.EntityRef, str | None]
+                ] = [
                     (
-                        EntityRef(snap.name.bundle, child_uuid),
+                        crony.unit.EntityRef(snap.name.bundle, child_uuid),
                         _child_full_name_from_uuid(
-                            EntityRef(snap.name.bundle, child_uuid)
+                            crony.unit.EntityRef(snap.name.bundle, child_uuid)
                         ),
                     )
                     for child_uuid in snap.children
@@ -750,7 +740,7 @@ def run_group(
                     else time.monotonic() + group_budget
                 )
                 for child_ref, child_full_name in resolved_pairs:
-                    child_sd = entity_state_dir(child_ref)
+                    child_sd = crony.model.entity_state_dir(child_ref)
                     if child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
@@ -766,19 +756,21 @@ def run_group(
                         try:
                             trigger_unit(child_full_name)
                             children.append(
-                                GroupChildResult(
+                                crony.model.GroupChildResult(
                                     name=child_full_name,
                                     exit_class="dispatched",
                                     exit_code=0,
                                 )
                             )
-                        except UnitNotInstalledError as e:
+                        except crony.errors.UnitNotInstalledError as e:
                             log_file.write(f"   {e}\n".encode())
                             children.append(
-                                GroupChildResult(
+                                crony.model.GroupChildResult(
                                     name=child_full_name,
                                     exit_class="fail",
-                                    exit_code=int(ExitCode.PRECONDITION),
+                                    exit_code=int(
+                                        crony.errors.ExitCode.PRECONDITION
+                                    ),
                                 )
                             )
                         continue
@@ -792,10 +784,10 @@ def run_group(
                             ).encode()
                         )
                         children.append(
-                            GroupChildResult(
+                            crony.model.GroupChildResult(
                                 name=child_full_name,
                                 exit_class="timeout",
-                                exit_code=int(ExitCode.TIMEOUT),
+                                exit_code=int(crony.errors.ExitCode.TIMEOUT),
                             )
                         )
                         continue
@@ -820,23 +812,25 @@ def run_group(
                             job_timeout=child_wait,
                             trigger_timeout=trigger_timeout,
                         )
-                    except TriggerStartTimeout as e:
+                    except crony.errors.TriggerStartTimeout as e:
                         log_file.write(f"   {e}\n".encode())
                         children.append(
-                            GroupChildResult(
+                            crony.model.GroupChildResult(
                                 name=child_full_name,
                                 exit_class="timeout",
-                                exit_code=int(ExitCode.TIMEOUT),
+                                exit_code=int(crony.errors.ExitCode.TIMEOUT),
                             )
                         )
                         continue
-                    except UnitNotInstalledError as e:
+                    except crony.errors.UnitNotInstalledError as e:
                         log_file.write(f"   {e}\n".encode())
                         children.append(
-                            GroupChildResult(
+                            crony.model.GroupChildResult(
                                 name=child_full_name,
                                 exit_class="fail",
-                                exit_code=int(ExitCode.PRECONDITION),
+                                exit_code=int(
+                                    crony.errors.ExitCode.PRECONDITION
+                                ),
                             )
                         )
                         continue
@@ -844,7 +838,7 @@ def run_group(
                     rc = trigger_exit_code(rec)
                     log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
                     children.append(
-                        GroupChildResult(
+                        crony.model.GroupChildResult(
                             name=child_full_name,
                             exit_class=cls,
                             exit_code=rc,
@@ -866,35 +860,39 @@ def run_group(
                             ).encode()
                         )
                         children.append(
-                            GroupChildResult(
+                            crony.model.GroupChildResult(
                                 name=str(child_ref),
                                 exit_class="fail",
-                                exit_code=int(ExitCode.PRECONDITION),
+                                exit_code=int(
+                                    crony.errors.ExitCode.PRECONDITION
+                                ),
                             )
                         )
 
-                result = GroupRunResult(
+                result = crony.model.GroupRunResult(
                     host=host,
                     platform=platform,
                     started_at=started_iso,
-                    ended_at=now_iso(),
+                    ended_at=crony.runtime.now_iso(),
                     duration_sec=time.time() - started,
                     exit_class=rollup_group_exit_class(children),
                     log_path=str(log_path),
                     jobs_run=children,
                 )
-                write_last_run(last_run_path, dataclasses.asdict(result))
+                crony.runtime.write_last_run(
+                    last_run_path, dataclasses.asdict(result)
+                )
                 return 0
             finally:
                 log_file.close()
                 pid_path.unlink(missing_ok=True)
-    except LockBusyError:
+    except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
-                f"[{now_iso()}] LOCK_BUSY: skipping "
+                f"[{crony.runtime.now_iso()}] LOCK_BUSY: skipping "
                 f"(already running)\n".encode()
             )
-        return int(ExitCode.LOCK_BUSY)
+        return int(crony.errors.ExitCode.LOCK_BUSY)
 
 
 def trigger_unit(
@@ -937,7 +935,7 @@ def trigger_unit(
     caller can decide to soft-fail.
     """
     if not crony.runtime.dispatch_unit_path(name, platform).exists():
-        raise UnitNotInstalledError(
+        raise crony.errors.UnitNotInstalledError(
             f"unit for {name!r} is not installed on this host "
             f"(run `crony apply` to re-pin the parent's snapshot)"
         )
@@ -948,10 +946,10 @@ def trigger_unit(
             "the trigger path)"
         )
     if triggered_by_user and state_dir is not None:
-        write_user_trigger_flag(state_dir)
+        crony.runtime.write_user_trigger_flag(state_dir)
     succeeded = False
     try:
-        scheduler(platform).trigger(name)
+        crony.runtime.scheduler(platform).trigger(name)
         succeeded = True
     finally:
         if triggered_by_user and state_dir is not None and not succeeded:
@@ -959,7 +957,9 @@ def trigger_unit(
             # never reached the scheduler. The next legitimately
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
-            user_trigger_flag_path(state_dir).unlink(missing_ok=True)
+            crony.runtime.user_trigger_flag_path(state_dir).unlink(
+                missing_ok=True
+            )
 
 
 def trigger_unit_sync(
@@ -1011,7 +1011,7 @@ def trigger_unit_sync(
     # truncated them, a sub-second run could compare ended_at <
     # pre_trigger and the loop would conclude "no fresh run yet"
     # for the entire trigger_timeout window.
-    pre_trigger_dt = datetime.datetime.fromisoformat(now_iso())
+    pre_trigger_dt = datetime.datetime.fromisoformat(crony.runtime.now_iso())
     pid_path = state_dir / "run.pid"
     last_run_path = state_dir / "last-run.json"
 
@@ -1024,7 +1024,7 @@ def trigger_unit_sync(
     started_at = time.monotonic()
     while True:
         elapsed = time.monotonic() - started_at
-        pid = read_pid_file(pid_path)
+        pid = crony.runtime.read_pid_file(pid_path)
         # `last-run.json` check goes first so a sub-second run
         # whose pid file came and went between iterations is
         # still observable via the file the runner wrote at exit.
@@ -1065,7 +1065,7 @@ def trigger_unit_sync(
         # Bound this state by trigger_timeout so a broken /
         # unloaded unit fails fast instead of hanging.
         if elapsed > trigger_timeout:
-            raise TriggerStartTimeout(
+            raise crony.errors.TriggerStartTimeout(
                 f"trigger of {full_name!r} never produced a fresh "
                 f"run within {trigger_timeout}s"
             )
@@ -1093,12 +1093,12 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
         return int(rc)
     cls = rec.get("exit_class", "ok")
     if cls == "timeout":
-        return int(ExitCode.TIMEOUT)
+        return int(crony.errors.ExitCode.TIMEOUT)
     if cls == "signal":
         sig = rec.get("signal")
-        return 128 + int(sig) if sig else int(ExitCode.ERROR)
+        return 128 + int(sig) if sig else int(crony.errors.ExitCode.ERROR)
     if cls == "lock_busy":
-        return int(ExitCode.LOCK_BUSY)
+        return int(crony.errors.ExitCode.LOCK_BUSY)
     if cls == "gated":
         return 0
     return 0
@@ -1127,19 +1127,19 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     the same in `crony status` as an ordinary "edited config,
     not yet applied" drift while scheduled fires silently fail.
     """
-    parsed = EntityRef.from_str(ref)
+    parsed = crony.unit.EntityRef.from_str(ref)
     if parsed is None:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"crony run takes <bundle>:<uuid>, got {ref!r}; "
             f"this entry point is for platform-unit invocation. "
             f"Use `crony trigger <name>` to fire by name."
         )
     try:
-        snap = load_snapshot(parsed)
-    except PreconditionError as exc:
+        snap = crony.runtime.load_snapshot(parsed)
+    except crony.errors.PreconditionError as exc:
         _record_snapshot_load_failure(parsed, exc)
         raise
-    if isinstance(snap, Job):
+    if isinstance(snap, crony.model.Job):
         rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
         rc = run_group(snap, dry_run=dry_run)
@@ -1147,7 +1147,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
 
 
 def _record_snapshot_load_failure(
-    ref: EntityRef, exc: PreconditionError
+    ref: crony.unit.EntityRef, exc: crony.errors.PreconditionError
 ) -> None:
     """Write a minimal `last-run.json` recording a snapshot-load
     failure so the cancel surfaces in `crony status` -- same
@@ -1167,10 +1167,10 @@ def _record_snapshot_load_failure(
     `JobRunResult` / `GroupRunResult` dataclasses with a new
     error variant.
     """
-    state_dir = entity_state_dir(ref)
+    state_dir = crony.model.entity_state_dir(ref)
     if not state_dir.is_dir():
         return
-    now = now_iso()
+    now = crony.runtime.now_iso()
     payload: dict[str, Any] = {
         "host": crony.platform.current_host(),
         "platform": crony.platform.current_platform(),
@@ -1178,10 +1178,10 @@ def _record_snapshot_load_failure(
         "ended_at": now,
         "duration_sec": 0.0,
         "exit_class": "canceled",
-        "exit_code": int(ExitCode.PRECONDITION),
+        "exit_code": int(crony.errors.ExitCode.PRECONDITION),
         "reason": str(exc),
     }
-    write_last_run(state_dir / "last-run.json", payload)
+    crony.runtime.write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / "run.log"
     line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:

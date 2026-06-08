@@ -21,25 +21,10 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+import crony.commands
+import crony.errors
+import crony.runner
 from common.argparse_ext import StrictArgumentParser
-from crony.commands import (
-    STATUS_HELP_EPILOG,
-    do_apply,
-    do_config_update,
-    do_destroy,
-    do_disable,
-    do_enable,
-    do_generate_uuid,
-    do_init,
-    do_logs,
-    do_notify_test,
-    do_self_test,
-    do_status,
-    do_trigger,
-    do_validate,
-)
-from crony.errors import CronyError, ExitCode
-from crony.runner import do_run
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -204,7 +189,7 @@ def build_parser() -> StrictArgumentParser:
             "User-level scheduled-job manager for macOS "
             "(launchd LaunchAgents) and Linux (systemd user timers)."
         ),
-        epilog=f"{ExitCode.epilog()}\n\n{_CRONY_DESIGN}",
+        epilog=f"{crony.errors.ExitCode.epilog()}\n\n{_CRONY_DESIGN}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # `metavar=` overrides argparse's auto-generated `{a,b,c,...}`
@@ -457,7 +442,7 @@ def build_parser() -> StrictArgumentParser:
     p_status = subparsers.add_parser(
         "status",
         help="Print resolved state per job",
-        epilog=STATUS_HELP_EPILOG,
+        epilog=crony.commands.STATUS_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_status.add_argument(
@@ -638,19 +623,19 @@ def build_parser() -> StrictArgumentParser:
 # =============================================================================
 
 COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
-    "config init": do_init,
-    "config validate": do_validate,
-    "config update": do_config_update,
-    "config generate-uuid": do_generate_uuid,
-    "apply": do_apply,
-    "destroy": do_destroy,
-    "enable": do_enable,
-    "disable": do_disable,
-    "trigger": do_trigger,
-    "status": do_status,
-    "logs": do_logs,
-    "run": do_run,
-    "notify-test": do_notify_test,
+    "config init": crony.commands.do_init,
+    "config validate": crony.commands.do_validate,
+    "config update": crony.commands.do_config_update,
+    "config generate-uuid": crony.commands.do_generate_uuid,
+    "apply": crony.commands.do_apply,
+    "destroy": crony.commands.do_destroy,
+    "enable": crony.commands.do_enable,
+    "disable": crony.commands.do_disable,
+    "trigger": crony.commands.do_trigger,
+    "status": crony.commands.do_status,
+    "logs": crony.commands.do_logs,
+    "run": crony.runner.do_run,
+    "notify-test": crony.commands.do_notify_test,
 }
 
 
@@ -660,7 +645,7 @@ def cli() -> int:
     command = args_dict.pop("command")
 
     if command == "self-test":
-        return do_self_test(
+        return crony.commands.do_self_test(
             verbose=args_dict.pop("verbose"),
             coverage=args_dict.pop("coverage"),
         )
@@ -674,8 +659,12 @@ def cli() -> int:
         # squashed to ExitCode.SUCCESS.
         if isinstance(e.code, int):
             return e.code
-        return ExitCode.SUCCESS if e.code is None else ExitCode.ERROR
-    except CronyError as e:
+        return (
+            crony.errors.ExitCode.SUCCESS
+            if e.code is None
+            else crony.errors.ExitCode.ERROR
+        )
+    except crony.errors.CronyError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
     except Exception:
@@ -683,5 +672,5 @@ def cli() -> int:
         # user with a stable exit code rather than crashing the
         # process and leaving the scheduler with no exit code at all.
         traceback.print_exc()
-        return ExitCode.ERROR
-    return ExitCode.SUCCESS
+        return crony.errors.ExitCode.ERROR
+    return crony.errors.ExitCode.SUCCESS

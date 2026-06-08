@@ -21,27 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import crony.config
+import crony.errors
 import crony.paths
-from crony.config import (
-    DEFAULT_BUNDLE_NAME,
-    INTERACTIVE_ACTIVE_DEFAULT_SEC,
-    INTERACTIVE_DELAY_DEFAULT_SEC,
-    Target,
-    TomlBundleConfig,
-    TomlConfig,
-    TomlJob,
-    TomlJobGroup,
-)
-from crony.errors import PreconditionError, UsageError
-from crony.unit import (
-    EntityName,
-    EntityRef,
-    Interval,
-    PriorityClass,
-    Schedule,
-    Timing,
-    UnitSpec,
-)
+import crony.unit
 
 # =============================================================================
 # APPLIED SNAPSHOT
@@ -80,7 +63,7 @@ class Job:
 
     schema: int
     kind: str  # "job"
-    name: EntityName  # full namespaced name `<bundle>.<short>`
+    name: crony.unit.EntityName  # full namespaced name `<bundle>.<short>`
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
     command: str | None
     script: str | None
@@ -96,12 +79,12 @@ class Job:
     # edit to the live config. Default-None (on-demand) for back-compat
     # with snapshots written before a timing was pinned; loaders rely on
     # the dataclass default rather than a schema bump.
-    timing: Timing | None = None
+    timing: crony.unit.Timing | None = None
     # Process-priority class baked into the platform unit (HIGH / LOW /
     # NORMAL / None). Pinned in the snapshot so a change re-renders the
     # unit on the next apply. Default-None for back-compat with
     # snapshots written before this field existed.
-    priority: PriorityClass | None = None
+    priority: crony.unit.PriorityClass | None = None
     # Whether the runner wraps the command in a power assertion to
     # keep the machine awake for its duration. Read at fire time;
     # default-False for back-compat with older snapshots.
@@ -115,16 +98,16 @@ class Job:
     # table; the per-job `_sec` knobs cascade through the resolver
     # to the baked defaults defined alongside the TomlJob dataclass.
     interactive: bool = False
-    interactive_active_sec: int = INTERACTIVE_ACTIVE_DEFAULT_SEC
-    interactive_delay_sec: int = INTERACTIVE_DELAY_DEFAULT_SEC
+    interactive_active_sec: int = crony.config.INTERACTIVE_ACTIVE_DEFAULT_SEC
+    interactive_delay_sec: int = crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
 
     @property
-    def ref(self) -> EntityRef:
-        return EntityRef(self.name.bundle, self.uuid)
+    def ref(self) -> crony.unit.EntityRef:
+        return crony.unit.EntityRef(self.name.bundle, self.uuid)
 
-    def unit_spec(self) -> UnitSpec:
+    def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks."""
-        return UnitSpec(
+        return crony.unit.UnitSpec(
             name=self.name,
             ref=self.ref,
             timing=self.timing,
@@ -134,9 +117,9 @@ class Job:
     @classmethod
     def from_config(
         cls,
-        config: TomlBundleConfig,
-        job: TomlJob,
-        name: EntityName,
+        config: crony.config.TomlBundleConfig,
+        job: crony.config.TomlJob,
+        name: crony.unit.EntityName,
     ) -> Job:
         """Build a Job by applying every cascade once."""
         args = [_expand_path_field(a) for a in job.args]
@@ -170,12 +153,12 @@ class Job:
             interactive_active_sec=(
                 job.interactive_active_sec
                 if job.interactive_active_sec is not None
-                else INTERACTIVE_ACTIVE_DEFAULT_SEC
+                else crony.config.INTERACTIVE_ACTIVE_DEFAULT_SEC
             ),
             interactive_delay_sec=(
                 job.interactive_delay_sec
                 if job.interactive_delay_sec is not None
-                else INTERACTIVE_DELAY_DEFAULT_SEC
+                else crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
             ),
         )
 
@@ -203,21 +186,21 @@ class JobGroup:
 
     schema: int
     kind: str  # "group"
-    name: EntityName  # full namespaced name `<bundle>.<short>`
+    name: crony.unit.EntityName  # full namespaced name `<bundle>.<short>`
     uuid: str
     children: list[str]
     group_budget_sec: int
     trigger_timeout_sec: int
-    timing: Timing | None = None
+    timing: crony.unit.Timing | None = None
 
     @property
-    def ref(self) -> EntityRef:
-        return EntityRef(self.name.bundle, self.uuid)
+    def ref(self) -> crony.unit.EntityRef:
+        return crony.unit.EntityRef(self.name.bundle, self.uuid)
 
-    def unit_spec(self) -> UnitSpec:
+    def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks.
         Groups render without a priority."""
-        return UnitSpec(
+        return crony.unit.UnitSpec(
             name=self.name,
             ref=self.ref,
             timing=self.timing,
@@ -227,10 +210,10 @@ class JobGroup:
     @classmethod
     def from_config(
         cls,
-        config: TomlBundleConfig,
-        target: Target | None,
-        group: TomlJobGroup,
-        name: EntityName,
+        config: crony.config.TomlBundleConfig,
+        target: crony.config.Target | None,
+        group: crony.config.TomlJobGroup,
+        name: crony.unit.EntityName,
     ) -> JobGroup:
         """Build a JobGroup. `group_budget_sec` is recomputed from
         the live config (not from children's pinned snapshots), so an
@@ -286,16 +269,20 @@ def _snapshot_base_dict(snap: Job | JobGroup) -> dict[str, Any]:
     d["name"] = str(snap.name)
     timing = snap.timing
     d.pop("timing", None)
-    d["schedule"] = str(timing) if isinstance(timing, Schedule) else None
-    d["interval"] = str(timing) if isinstance(timing, Interval) else None
+    d["schedule"] = (
+        str(timing) if isinstance(timing, crony.unit.Schedule) else None
+    )
+    d["interval"] = (
+        str(timing) if isinstance(timing, crony.unit.Interval) else None
+    )
     return d
 
 
-def entity_state_dir(ref: EntityRef) -> Path:
+def entity_state_dir(ref: crony.unit.EntityRef) -> Path:
     return crony.paths.STATE_DIR / ref.bundle / ref.uuid
 
 
-def snapshot_path_for(ref: EntityRef) -> Path:
+def snapshot_path_for(ref: crony.unit.EntityRef) -> Path:
     return entity_state_dir(ref) / "snapshot.json"
 
 
@@ -321,9 +308,9 @@ def resolve_script(script: str) -> Path:
 
 
 def resolve_snapshot_for(
-    config: TomlBundleConfig,
+    config: crony.config.TomlBundleConfig,
     short: str,
-    bundle_name: str = DEFAULT_BUNDLE_NAME,
+    bundle_name: str = crony.config.DEFAULT_BUNDLE_NAME,
 ) -> Job | JobGroup:
     """Resolve a snapshot for a single config entry by short name.
 
@@ -331,7 +318,7 @@ def resolve_snapshot_for(
     want the resolved snapshot in one step (apply pipeline + tests
     that exercise the runner without going through full apply).
     """
-    name = EntityName(bundle_name, short)
+    name = crony.unit.EntityName(bundle_name, short)
     target = config.resolve_target()
     if short in config.jobs:
         return Job.from_config(config, config.jobs[short], name)
@@ -339,7 +326,7 @@ def resolve_snapshot_for(
         return JobGroup.from_config(
             config, target, config.job_groups[short], name
         )
-    raise PreconditionError(f"unknown job/group: {short!r}")
+    raise crony.errors.PreconditionError(f"unknown job/group: {short!r}")
 
 
 def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
@@ -352,19 +339,19 @@ def snapshot_from_dict(raw: dict[str, Any]) -> Job | JobGroup:
     # snapshot written before it was removed still loads.
     data.pop("bundle", None)
     if isinstance(data.get("name"), str):
-        data["name"] = EntityName.from_str(data["name"])
+        data["name"] = crony.unit.EntityName.from_str(data["name"])
     schedule_str = data.pop("schedule", None)
     interval_str = data.pop("interval", None)
-    timing: Timing | None
+    timing: crony.unit.Timing | None
     if schedule_str is not None:
-        timing = Schedule.from_str(schedule_str)
+        timing = crony.unit.Schedule.from_str(schedule_str)
     elif interval_str is not None:
-        timing = Interval.from_str(interval_str)
+        timing = crony.unit.Interval.from_str(interval_str)
     else:
         timing = None
     data["timing"] = timing
     if data.get("priority") is not None:
-        data["priority"] = PriorityClass.from_str(data["priority"])
+        data["priority"] = crony.unit.PriorityClass.from_str(data["priority"])
     kind = data.get("kind")
     if kind == "job":
         return Job(**data)
@@ -536,14 +523,14 @@ class Graph:
     a paired entity's fields may diverge between sides.
     """
 
-    jobs: dict[EntityRef, Job] = field(default_factory=dict)
-    groups: dict[EntityRef, JobGroup] = field(default_factory=dict)
-    by_full_name: dict[str, EntityRef] = field(default_factory=dict)
+    jobs: dict[crony.unit.EntityRef, Job] = field(default_factory=dict)
+    groups: dict[crony.unit.EntityRef, JobGroup] = field(default_factory=dict)
+    by_full_name: dict[str, crony.unit.EntityRef] = field(default_factory=dict)
 
-    def refs(self) -> set[EntityRef]:
+    def refs(self) -> set[crony.unit.EntityRef]:
         return set(self.jobs) | set(self.groups)
 
-    def kind_of(self, ref: EntityRef) -> str | None:
+    def kind_of(self, ref: crony.unit.EntityRef) -> str | None:
         if ref in self.jobs:
             return "job"
         if ref in self.groups:
@@ -553,7 +540,7 @@ class Graph:
     @classmethod
     def build_pending(
         cls,
-        toml_config: TomlConfig,
+        toml_config: crony.config.TomlConfig,
         host: str | None = None,
         platform: str | None = None,
     ) -> Graph:
@@ -578,7 +565,7 @@ class Graph:
                 toml_job = bundle.config.jobs.get(short)
                 if toml_job is None:
                     continue
-                name = EntityName(bundle.name, short)
+                name = crony.unit.EntityName(bundle.name, short)
                 snap_j = Job.from_config(bundle.config, toml_job, name)
                 pending.jobs[snap_j.ref] = snap_j
                 pending.by_full_name[str(name)] = snap_j.ref
@@ -586,7 +573,7 @@ class Graph:
                 toml_group = bundle.config.job_groups.get(short)
                 if toml_group is None:
                     continue
-                name = EntityName(bundle.name, short)
+                name = crony.unit.EntityName(bundle.name, short)
                 snap_g = JobGroup.from_config(
                     bundle.config, target, toml_group, name
                 )
@@ -613,8 +600,8 @@ class UnitOnlyOrphan:
     has_unit_file: bool
 
     @property
-    def ref(self) -> EntityRef:
-        return EntityRef(self.bundle, self.uuid)
+    def ref(self) -> crony.unit.EntityRef:
+        return crony.unit.EntityRef(self.bundle, self.uuid)
 
 
 @dataclass(frozen=True)
@@ -642,8 +629,8 @@ class BrokenEntity:
     source_path: Path
 
     @property
-    def ref(self) -> EntityRef:
-        return EntityRef(self.bundle, self.uuid)
+    def ref(self) -> crony.unit.EntityRef:
+        return crony.unit.EntityRef(self.bundle, self.uuid)
 
 
 @dataclass
@@ -655,14 +642,14 @@ class Config:
     `load_config()` if it needs the post-mutation view.
     """
 
-    toml_config: TomlConfig
+    toml_config: crony.config.TomlConfig
     pending: Graph
     current: Graph
-    broken: dict[EntityRef, BrokenEntity]
-    broken_by_full_name: dict[str, EntityRef]
-    unit_only: dict[EntityRef, UnitOnlyOrphan]
-    unit_only_by_full_name: dict[str, EntityRef]
-    runtime: dict[EntityRef, RuntimeState]
+    broken: dict[crony.unit.EntityRef, BrokenEntity]
+    broken_by_full_name: dict[str, crony.unit.EntityRef]
+    unit_only: dict[crony.unit.EntityRef, UnitOnlyOrphan]
+    unit_only_by_full_name: dict[str, crony.unit.EntityRef]
+    runtime: dict[crony.unit.EntityRef, RuntimeState]
     host: str
     platform: str
     # Current entries whose full name collides with another current
@@ -671,9 +658,9 @@ class Config:
     # config-matching ref; these shadowed refs keep their own
     # snapshot but surface by `<bundle>:<UUID>` in status so they
     # stay addressable for `crony destroy`.
-    shadowed: set[EntityRef] = field(default_factory=set)
+    shadowed: set[crony.unit.EntityRef] = field(default_factory=set)
 
-    def all_refs(self) -> set[EntityRef]:
+    def all_refs(self) -> set[crony.unit.EntityRef]:
         return (
             self.pending.refs()
             | self.current.refs()
@@ -728,9 +715,9 @@ class Config:
             return
         if bundle in self.installed_bundle_names():
             return
-        raise UsageError(f"unknown bundle: {bundle!r}")
+        raise crony.errors.UsageError(f"unknown bundle: {bundle!r}")
 
-    def config_state(self, ref: EntityRef) -> str:
+    def config_state(self, ref: crony.unit.EntityRef) -> str:
         """synced | stale | broken | missing | orphan for `ref`.
 
         `broken` wins over the other axes: if the on-disk
@@ -758,7 +745,7 @@ class Config:
             return "missing"
         return "synced" if p == c else "stale"
 
-    def name_for(self, ref: EntityRef) -> str | None:
+    def name_for(self, ref: crony.unit.EntityRef) -> str | None:
         """Recover the full namespaced name `ref` was last seen
         under -- from the pending entry, the current snapshot, the
         recovered broken-entity name, or the unit-only orphan --
@@ -780,7 +767,7 @@ class Config:
             return unit_only.name
         return None
 
-    def resolve_runnable(self, full_name: str) -> EntityRef | None:
+    def resolve_runnable(self, full_name: str) -> crony.unit.EntityRef | None:
         """A name with a parseable current snapshot. Source:
         `current` only, keyed by name.
 
@@ -798,12 +785,12 @@ class Config:
         address targeting a broken / unit-only / unknown entry
         returns None on purpose.
         """
-        ref = EntityRef.from_str(full_name)
+        ref = crony.unit.EntityRef.from_str(full_name)
         if ref is not None:
             return ref if ref in self.current.refs() else None
         return self.current.by_full_name.get(full_name)
 
-    def resolve_current(self, full_name: str) -> EntityRef | None:
+    def resolve_current(self, full_name: str) -> crony.unit.EntityRef | None:
         """An entity with on-disk presence that destroy must
         clean up. Sources, in order: `current` (parseable
         snapshots), `broken` (state dirs whose snapshot can't
@@ -818,7 +805,7 @@ class Config:
         phantom dir produced by a pending uuid edit that hasn't
         been applied yet.
         """
-        ref = EntityRef.from_str(full_name)
+        ref = crony.unit.EntityRef.from_str(full_name)
         if ref is not None:
             if (
                 ref in self.current.refs()
@@ -833,7 +820,7 @@ class Config:
             or self.unit_only_by_full_name.get(full_name)
         )
 
-    def resolve_pending(self, full_name: str) -> EntityRef | None:
+    def resolve_pending(self, full_name: str) -> crony.unit.EntityRef | None:
         """An entry defined in the parsed TOML config but not
         necessarily applied yet. Source: `pending` only.
 
@@ -848,7 +835,7 @@ class Config:
         `<bundle>:<UUID>` ref-form inputs are honored only when
         the addressed entry is in `pending`.
         """
-        ref = EntityRef.from_str(full_name)
+        ref = crony.unit.EntityRef.from_str(full_name)
         if ref is not None:
             return ref if ref in self.pending.refs() else None
         return self.pending.by_full_name.get(full_name)

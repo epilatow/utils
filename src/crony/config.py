@@ -23,16 +23,10 @@ from typing import Any
 import tomlkit
 import tomlkit.exceptions
 
+import crony.errors
 import crony.paths
 import crony.platform
-from crony.errors import ConfigError, UsageError
-from crony.unit import (
-    EntityRef,
-    Interval,
-    PriorityClass,
-    Schedule,
-    Timing,
-)
+import crony.unit
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +114,13 @@ class NotifyChannel:
             if name in VALID_NOTIFY_TRANSPORTS:
                 transport = name
             else:
-                raise ConfigError(
+                raise crony.errors.ConfigError(
                     f"{where}: 'transport' required for channel "
                     f"{name!r} (only "
                     f"{sorted(VALID_NOTIFY_TRANSPORTS)} can omit it)"
                 )
         if transport not in VALID_NOTIFY_TRANSPORTS:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: transport {transport!r} not in "
                 f"{sorted(VALID_NOTIFY_TRANSPORTS)}"
             )
@@ -146,7 +140,7 @@ class NotifyChannel:
         )
         for k in headers:
             if k.lower() in reserved:
-                raise ConfigError(
+                raise crony.errors.ConfigError(
                     f"{where}: header {k!r} is set by crony and cannot "
                     f"be overridden"
                 )
@@ -209,7 +203,7 @@ class Defaults:
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior
     # when a bundle sets no default.
-    priority: PriorityClass | None = None
+    priority: crony.unit.PriorityClass | None = None
     keep_awake: bool = False
     # Base env merged under every job's own `env` (job keys win); see
     # resolved_env. Values are expanded at fire time like a job's env.
@@ -260,11 +254,11 @@ class TomlJob:
     gate: str | None = None
     gate_script: str | None = None
     gate_args: list[str] = field(default_factory=list)
-    timing: Timing | None = None
+    timing: crony.unit.Timing | None = None
     # Process-priority class baked into the platform unit: HIGH (run
     # un-throttled, app-like QoS), LOW (throttle CPU + IO), or NORMAL /
     # None (emit nothing). None inherits the bundle [defaults].
-    priority: PriorityClass | None = None
+    priority: crony.unit.PriorityClass | None = None
     # Hold a power assertion for the command's duration so an idle /
     # on-AC machine doesn't sleep mid-run. Lid-close on battery still
     # sleeps. None = inherit [defaults]; True / False explicitly
@@ -334,7 +328,7 @@ class TomlJobGroup:
     name: str
     uuid: str
     jobs: list[str] = field(default_factory=list)
-    timing: Timing | None = None
+    timing: crony.unit.Timing | None = None
     platforms: list[str] = field(default_factory=list)
     hosts: HostList = field(default_factory=HostList)
 
@@ -422,7 +416,7 @@ class TomlBundleConfig:
 
         if "defaults" in raw:
             if not isinstance(raw["defaults"], dict):
-                raise ConfigError("[defaults] must be a table")
+                raise crony.errors.ConfigError("[defaults] must be a table")
             config.defaults = _parse_defaults(
                 raw["defaults"], is_default=is_default
             )
@@ -433,7 +427,7 @@ class TomlBundleConfig:
 
         job_section = raw.get("job", {})
         if not isinstance(job_section, dict):
-            raise ConfigError("[job] must be a table")
+            raise crony.errors.ConfigError("[job] must be a table")
         for name, body in job_section.items():
             # Per-entity ConfigError tolerance: a parse failure on
             # one job records its error and continues so sibling jobs
@@ -441,33 +435,39 @@ class TomlBundleConfig:
             # genuine bugs surfacing as tracebacks.
             try:
                 if not isinstance(body, dict):
-                    raise ConfigError(f"[job.{name}] must be a table")
+                    raise crony.errors.ConfigError(
+                        f"[job.{name}] must be a table"
+                    )
                 config.jobs[name] = _parse_job(name, body)
-            except ConfigError as exc:
+            except crony.errors.ConfigError as exc:
                 config.errored_jobs[name] = str(exc)
 
         group_section = raw.get("job-group", {})
         if not isinstance(group_section, dict):
-            raise ConfigError("[job-group] must be a table")
+            raise crony.errors.ConfigError("[job-group] must be a table")
         for name, body in group_section.items():
             try:
                 if not isinstance(body, dict):
-                    raise ConfigError(f"[job-group.{name}] must be a table")
+                    raise crony.errors.ConfigError(
+                        f"[job-group.{name}] must be a table"
+                    )
                 config.job_groups[name] = _parse_job_group(name, body)
-            except ConfigError as exc:
+            except crony.errors.ConfigError as exc:
                 config.errored_job_groups[name] = str(exc)
 
         target_section = raw.get("target", {})
         if not isinstance(target_section, dict):
-            raise ConfigError("[target] must be a table")
+            raise crony.errors.ConfigError("[target] must be a table")
         for name, body in target_section.items():
             if name == "host":
                 # [target.host.<host>] entries
                 if not isinstance(body, dict):
-                    raise ConfigError("[target.host] must be a table")
+                    raise crony.errors.ConfigError(
+                        "[target.host] must be a table"
+                    )
                 for hostname, hostbody in body.items():
                     if not isinstance(hostbody, dict):
-                        raise ConfigError(
+                        raise crony.errors.ConfigError(
                             f"[target.host.{hostname}] must be a table"
                         )
                     config.host_targets[hostname] = _parse_target(
@@ -476,7 +476,9 @@ class TomlBundleConfig:
             else:
                 # [target.<platform>] entry
                 if not isinstance(body, dict):
-                    raise ConfigError(f"[target.{name}] must be a table")
+                    raise crony.errors.ConfigError(
+                        f"[target.{name}] must be a table"
+                    )
                 config.platform_targets[name] = _parse_target(
                     name, "platform", body
                 )
@@ -494,11 +496,13 @@ class TomlBundleConfig:
         use `TomlConfig.load_all()` instead.
         """
         if not path.exists():
-            raise ConfigError(f"config not found: {path}")
+            raise crony.errors.ConfigError(f"config not found: {path}")
         try:
             raw = tomlkit.loads(path.read_text(encoding="utf-8"))
         except tomlkit.exceptions.ParseError as e:
-            raise ConfigError(f"TOML parse error in {path}: {e}") from e
+            raise crony.errors.ConfigError(
+                f"TOML parse error in {path}: {e}"
+            ) from e
         config = cls.from_raw(raw)
         _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
         return config
@@ -650,7 +654,9 @@ class TomlBundleConfig:
             return job.job_timeout_sec
         return self.defaults.job_timeout_sec
 
-    def resolved_priority(self, job: TomlJob) -> PriorityClass | None:
+    def resolved_priority(
+        self, job: TomlJob
+    ) -> crony.unit.PriorityClass | None:
         """Cascade priority: job > defaults. Targets carry no
         priority."""
         if job.priority is not None:
@@ -749,11 +755,13 @@ class TomlBundle:
         try:
             raw = tomlkit.loads(path.read_text(encoding="utf-8"))
         except tomlkit.exceptions.ParseError as e:
-            raise ConfigError(f"TOML parse error in {path}: {e}") from e
+            raise crony.errors.ConfigError(
+                f"TOML parse error in {path}: {e}"
+            ) from e
         try:
             config = TomlBundleConfig.from_raw(raw, bundle_name=name)
-        except ConfigError as e:
-            raise ConfigError(f"{path}: {e}") from e
+        except crony.errors.ConfigError as e:
+            raise crony.errors.ConfigError(f"{path}: {e}") from e
         _demote_duplicate_uuids(config, name)
         # Per-entity error messages are already prefixed with
         # `[job.X]` / `[job-group.X]` / `[target.X]` /
@@ -818,7 +826,7 @@ class TomlConfig:
         for bundle_name, path in candidates:
             try:
                 validate_bundle_name(bundle_name, str(path))
-            except ConfigError as e:
+            except crony.errors.ConfigError as e:
                 bundles.errored_bundles[str(path)] = str(e)
                 continue
             if bundle_name in seen_names:
@@ -829,7 +837,7 @@ class TomlConfig:
                 continue
             try:
                 bundle = TomlBundle.load(bundle_name, path)
-            except ConfigError as e:
+            except crony.errors.ConfigError as e:
                 bundles.errored_bundles[str(path)] = str(e)
                 continue
             bundles.bundles.append(bundle)
@@ -852,7 +860,7 @@ class TomlConfig:
         bundle present only as on-disk state.
         """
         if bundle is not None and self.by_name(bundle) is None:
-            raise UsageError(f"unknown bundle: {bundle!r}")
+            raise crony.errors.UsageError(f"unknown bundle: {bundle!r}")
 
     def by_name(self, bundle_name: str) -> TomlBundle | None:
         for b in self.bundles:
@@ -893,34 +901,36 @@ class TomlConfig:
 
 def _parse_timing(
     schedule_str: str | None, interval_str: str | None, where: str
-) -> Timing | None:
+) -> crony.unit.Timing | None:
     """Build a unit's timing from the config's mutually-exclusive
     `schedule` / `interval` keys, or None for an on-demand entry.
     Surfaces the value objects' validation as a config error tied to
     `where`."""
     if schedule_str is not None and interval_str is not None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
         )
     try:
         if schedule_str is not None:
-            return Schedule.from_str(schedule_str)
+            return crony.unit.Schedule.from_str(schedule_str)
         if interval_str is not None:
-            return Interval.from_str(interval_str)
+            return crony.unit.Interval.from_str(interval_str)
     except ValueError as e:
-        raise ConfigError(f"{where}: {e}") from e
+        raise crony.errors.ConfigError(f"{where}: {e}") from e
     return None
 
 
-def _parse_priority(text: str | None, where: str) -> PriorityClass | None:
+def _parse_priority(
+    text: str | None, where: str
+) -> crony.unit.PriorityClass | None:
     """Build a PriorityClass from a config string, or None. Surfaces
     the value object's validation as a config error tied to `where`."""
     if text is None:
         return None
     try:
-        return PriorityClass.from_str(text)
+        return crony.unit.PriorityClass.from_str(text)
     except ValueError as e:
-        raise ConfigError(f"{where}: {e}") from e
+        raise crony.errors.ConfigError(f"{where}: {e}") from e
 
 
 # =============================================================================
@@ -1076,7 +1086,9 @@ def _reject_unknown_keys(
     """Raise ConfigError if raw has keys not in `known`."""
     unknown = set(raw.keys()) - known
     if unknown:
-        raise ConfigError(f"{where}: unknown key(s) {sorted(unknown)}")
+        raise crony.errors.ConfigError(
+            f"{where}: unknown key(s) {sorted(unknown)}"
+        )
 
 
 def _typed_field(
@@ -1098,13 +1110,15 @@ def _typed_field(
     val = raw[key]
     # bool is a subclass of int; require strict separation here.
     if expected is int and isinstance(val, bool):
-        raise ConfigError(f"{where}: '{key}' must be int, got bool")
+        raise crony.errors.ConfigError(
+            f"{where}: '{key}' must be int, got bool"
+        )
     if expected is bool and not isinstance(val, bool):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: '{key}' must be bool, got {type(val).__name__}"
         )
     if not isinstance(val, expected):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: '{key}' must be {expected.__name__}, "
             f"got {type(val).__name__}"
         )
@@ -1128,7 +1142,7 @@ _BUNDLE_NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 def _validate_name(name: str, where: str) -> None:
     """Reject names that would break filesystem paths or unit labels."""
     if not _NAME_RE.match(name):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: name {name!r} must match "
             f"[A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, "
             f"empty, or leading punctuation)"
@@ -1150,12 +1164,12 @@ def _parse_uuid_field(raw: dict[str, Any], where: str) -> str | None:
     try:
         parsed = uuid.UUID(value)
     except ValueError as e:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'uuid' is not a valid UUID: {value!r} ({e})"
         ) from e
     canonical = str(parsed)
     if value != canonical:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'uuid' must be canonical lowercase "
             f"8-4-4-4-12 form (got {value!r}, expected "
             f"{canonical!r})"
@@ -1166,7 +1180,7 @@ def _parse_uuid_field(raw: dict[str, Any], where: str) -> str | None:
 def validate_bundle_name(name: str, where: str) -> None:
     """Reject filenames whose stem can't be a bundle name."""
     if not _BUNDLE_NAME_RE.match(name):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: bundle name {name!r} must match "
             f"[A-Za-z0-9][A-Za-z0-9_-]* (no dots -- the dot is "
             f"reserved as the bundle/job-name separator)"
@@ -1186,7 +1200,7 @@ def parse_full_name(arg: str) -> tuple[str, str]:
         return (DEFAULT_BUNDLE_NAME, arg)
     bundle, _, short = arg.partition(".")
     if not bundle or not short:
-        raise UsageError(f"invalid job reference: {arg!r}")
+        raise crony.errors.UsageError(f"invalid job reference: {arg!r}")
     return (bundle, short)
 
 
@@ -1200,7 +1214,7 @@ def normalize_full_name(arg: str) -> str:
     downstream lookup can recognize it. Used at the entry point
     of every CLI handler that takes user-supplied job references.
     """
-    if EntityRef.from_str(arg) is not None:
+    if crony.unit.EntityRef.from_str(arg) is not None:
         return arg
     bundle, short = parse_full_name(arg)
     return f"{bundle}.{short}"
@@ -1220,10 +1234,10 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
     """
     if scope_bundle is None:
         return normalize_full_name(arg)
-    ref = EntityRef.from_str(arg)
+    ref = crony.unit.EntityRef.from_str(arg)
     if ref is not None:
         if ref.bundle != scope_bundle:
-            raise UsageError(
+            raise crony.errors.UsageError(
                 f"{arg!r} is in bundle {ref.bundle!r} but --bundle "
                 f"{scope_bundle!r} is set"
             )
@@ -1232,7 +1246,7 @@ def resolve_cli_name(arg: str, scope_bundle: str | None) -> str:
     if "." not in arg:
         return f"{scope_bundle}.{short}"
     if bundle != scope_bundle:
-        raise UsageError(
+        raise crony.errors.UsageError(
             f"{arg!r} is in bundle {bundle!r} but --bundle "
             f"{scope_bundle!r} is set"
         )
@@ -1251,7 +1265,9 @@ def _string_list(raw: dict[str, Any], key: str, where: str) -> list[str]:
     if val is None:
         return []
     if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
-        raise ConfigError(f"{where}: '{key}' must be a list of strings")
+        raise crony.errors.ConfigError(
+            f"{where}: '{key}' must be a list of strings"
+        )
     return list(val)
 
 
@@ -1265,7 +1281,7 @@ def _parse_platforms_field(raw: dict[str, Any], where: str) -> list[str]:
     platforms = _string_list(raw, "platforms", where)
     for p in platforms:
         if p not in _VALID_PLATFORMS:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: platforms entry {p!r} not in "
                 f"{sorted(_VALID_PLATFORMS)}"
             )
@@ -1287,7 +1303,7 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
         return HostList()
     negated = [e.startswith("!") for e in entries]
     if any(negated) and not all(negated):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'hosts' entries must all be negated ('!host') or none"
         )
     if not any(negated):
@@ -1296,7 +1312,7 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
     for e in entries:
         name = e[1:]
         if not name:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: 'hosts' entry '!' is empty after the negation prefix"
             )
         stripped.append(name)
@@ -1334,12 +1350,14 @@ def _parse_interactive_timespan(
     if text is None:
         return None
     if not interactive:
-        raise ConfigError(f"{where}: {key!r} set without 'interactive = true'")
+        raise crony.errors.ConfigError(
+            f"{where}: {key!r} set without 'interactive = true'"
+        )
     try:
         # from_str validates the time-span and rejects non-positive.
-        return Interval.from_str(text).total_seconds
+        return crony.unit.Interval.from_str(text).total_seconds
     except ValueError as e:
-        raise ConfigError(f"{where}: {key!r} {e}") from e
+        raise crony.errors.ConfigError(f"{where}: {key!r} {e}") from e
 
 
 def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
@@ -1348,11 +1366,13 @@ def _string_dict(raw: dict[str, Any], key: str, where: str) -> dict[str, str]:
     if val is None:
         return {}
     if not isinstance(val, dict):
-        raise ConfigError(f"{where}: '{key}' must be a table (dict)")
+        raise crony.errors.ConfigError(
+            f"{where}: '{key}' must be a table (dict)"
+        )
     out: dict[str, str] = {}
     for k, v in val.items():
         if not isinstance(k, str) or not isinstance(v, str):
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: '{key}' values must be string -> string"
             )
         out[k] = v
@@ -1368,7 +1388,7 @@ def _parse_notify_email_settings(
     smtp_user = _typed_field(raw, "smtp_user", str, where)
     smtp_port = _typed_field(raw, "smtp_port", int, where, default=587)
     if to is None or smtp_host is None or smtp_user is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'to', 'smtp_host', 'smtp_user' are required"
         )
     return NotifyEmail(
@@ -1394,7 +1414,7 @@ def _parse_notify_ntfy_settings(raw: dict[str, Any], where: str) -> NotifyNtfy:
     """Parse the ntfy-transport keys from a channel block."""
     url = _typed_field(raw, "url", str, where)
     if url is None:
-        raise ConfigError(f"{where}: 'url' is required")
+        raise crony.errors.ConfigError(f"{where}: 'url' is required")
     return NotifyNtfy(
         url=url,
         token_keychain_service=_typed_field(
@@ -1413,7 +1433,9 @@ def _positive_int(
     """Read a positive int defaulting to `default`. Reject 0 / negative."""
     val: int = _typed_field(raw, key, int, where, default=default)
     if val <= 0:
-        raise ConfigError(f"{where}: '{key}' must be positive, got {val}")
+        raise crony.errors.ConfigError(
+            f"{where}: '{key}' must be positive, got {val}"
+        )
     return val
 
 
@@ -1425,7 +1447,9 @@ def _nonneg_int(raw: dict[str, Any], key: str, where: str, default: int) -> int:
     """
     val: int = _typed_field(raw, key, int, where, default=default)
     if val < 0:
-        raise ConfigError(f"{where}: '{key}' must be >= 0, got {val}")
+        raise crony.errors.ConfigError(
+            f"{where}: '{key}' must be >= 0, got {val}"
+        )
     return val
 
 
@@ -1445,14 +1469,14 @@ def _parse_notify_channels(
         return [] if required else None
     val = raw["notify_channels"]
     if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'notify_channels' must be a list of strings"
         )
     seen: set[str] = set()
     out: list[str] = []
     for ch in val:
         if ch in seen:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: notify_channels entry {ch!r} listed twice"
             )
         seen.add(ch)
@@ -1476,15 +1500,17 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     notify_channel_defs: dict[str, NotifyChannel] = {}
     nested = raw.get("notify", {})
     if not isinstance(nested, dict):
-        raise ConfigError(f"{where}.notify must be a table (dict)")
+        raise crony.errors.ConfigError(f"{where}.notify must be a table (dict)")
     for sub_key, sub_body in nested.items():
         if sub_key == NOTIFY_INHERIT_TOKEN:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"[defaults.notify.{sub_key}]: {sub_key!r} is a reserved "
                 f"channel name (the notify-inherit sentinel)"
             )
         if not isinstance(sub_body, dict):
-            raise ConfigError(f"[defaults.notify.{sub_key}]: must be a table")
+            raise crony.errors.ConfigError(
+                f"[defaults.notify.{sub_key}]: must be a table"
+            )
         notify_channel_defs[sub_key] = NotifyChannel.from_raw(sub_key, sub_body)
     return Defaults(
         notify_channels=channels or [],
@@ -1517,12 +1543,12 @@ def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
     if not isinstance(val, list) or not all(
         isinstance(x, int) and not isinstance(x, bool) for x in val
     ):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'success_exit_codes' must be a list of integers"
         )
     for code in val:
         if not 0 <= code <= 255:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: success_exit_codes entry {code} is out of the "
                 f"valid 0-255 exit-code range"
             )
@@ -1531,7 +1557,7 @@ def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
 
 def _parse_priority_field(
     raw: dict[str, Any], where: str
-) -> PriorityClass | None:
+) -> crony.unit.PriorityClass | None:
     """Parse + validate a `priority` field (None if absent)."""
     return _parse_priority(_typed_field(raw, "priority", str, where), where)
 
@@ -1543,30 +1569,30 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     _reject_unknown_keys(raw, _KNOWN_JOB, where)
     job_uuid = _parse_uuid_field(raw, where)
     if job_uuid is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'uuid' is required; run `crony config update` "
             f"to assign UUIDs"
         )
     command = _typed_field(raw, "command", str, where)
     script = _typed_field(raw, "script", str, where)
     if (command is None) == (script is None):
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: must have exactly one of 'command' or 'script'"
         )
     args = _string_list(raw, "args", where)
     if args and command is not None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'args' is only valid with 'script', not 'command'"
         )
     gate = _typed_field(raw, "gate", str, where)
     gate_script = _typed_field(raw, "gate_script", str, where)
     if gate is not None and gate_script is not None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'gate' and 'gate_script' are mutually exclusive"
         )
     gate_args = _string_list(raw, "gate_args", where)
     if gate_args and gate_script is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'gate_args' is only valid with 'gate_script'"
         )
     schedule_str = _typed_field(raw, "schedule", str, where)
@@ -1580,7 +1606,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     success_exit_codes = _parse_success_exit_codes(raw, where)
     job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec < 0:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'job_timeout_sec' must be >= 0, got {job_timeout_sec}"
         )
     interactive, interactive_active_sec, interactive_delay_sec = (
@@ -1590,7 +1616,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         if not platforms:
             platforms = ["darwin"]
         elif platforms != ["darwin"]:
-            raise ConfigError(
+            raise crony.errors.ConfigError(
                 f"{where}: 'interactive = true' implies "
                 f"platforms = ['darwin']; remove or change the "
                 f"'platforms' override"
@@ -1632,13 +1658,15 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
     group_uuid = _parse_uuid_field(raw, where)
     if group_uuid is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"{where}: 'uuid' is required; run `crony config update` "
             f"to assign UUIDs"
         )
     jobs = _string_list(raw, "jobs", where)
     if not jobs:
-        raise ConfigError(f"{where}: 'jobs' must be a non-empty list")
+        raise crony.errors.ConfigError(
+            f"{where}: 'jobs' must be a non-empty list"
+        )
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     timing = _parse_timing(schedule_str, interval_str, where)
@@ -1773,7 +1801,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     all_group_names = set(config.job_groups) | set(config.errored_job_groups)
     overlap = all_job_names & all_group_names
     if overlap:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"name collision: {sorted(overlap)} appear as both "
             f"[job.*] and [job-group.*]"
         )
@@ -1809,7 +1837,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
         is_default=is_default,
     )
     if defaults_msg is not None:
-        raise ConfigError(defaults_msg)
+        raise crony.errors.ConfigError(defaults_msg)
 
     bad_job_channel: dict[str, str] = {}
     for jname, job in config.jobs.items():

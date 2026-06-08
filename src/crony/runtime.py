@@ -22,33 +22,17 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import crony.config
+import crony.errors
+import crony.model
 import crony.paths
 import crony.platform
-from crony.config import TomlConfig
-from crony.errors import LockBusyError, PreconditionError
-from crony.model import (
-    SNAPSHOT_SCHEMA,
-    BrokenEntity,
-    Config,
-    Graph,
-    Job,
-    JobGroup,
-    LastRun,
-    RuntimeState,
-    UnitOnlyOrphan,
-    entity_state_dir,
-    snapshot_from_dict,
-)
-from crony.platform import (
-    HostPlatform,
-    Scheduler,
-    get_host,
-    get_scheduler,
-)
-from crony.unit import EntityRef
+import crony.unit
 
 
-def load_snapshot(ref: EntityRef) -> Job | JobGroup:
+def load_snapshot(
+    ref: crony.unit.EntityRef,
+) -> crony.model.Job | crony.model.JobGroup:
     """Load and validate a snapshot file by ref. Raises
     PreconditionError if missing (entry not applied) or schema
     mismatch (re-apply required).
@@ -59,25 +43,27 @@ def load_snapshot(ref: EntityRef) -> Job | JobGroup:
     use the recovered `name` field when available so the operator
     sees the human-readable identity.
     """
-    state_dir = entity_state_dir(ref)
+    state_dir = crony.model.entity_state_dir(ref)
     ref_str = str(ref)
     p = state_dir / "snapshot.json"
     if not p.is_file():
-        raise PreconditionError(
+        raise crony.errors.PreconditionError(
             f"no snapshot for {ref_str} (run `crony apply` first; "
             f"if state exists on disk, ensure {p} is parseable)"
         )
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        raise PreconditionError(f"snapshot at {p} is unreadable: {e}") from e
+        raise crony.errors.PreconditionError(
+            f"snapshot at {p} is unreadable: {e}"
+        ) from e
     name_hint = raw.get("name") if isinstance(raw, dict) else None
     display = name_hint if isinstance(name_hint, str) else ref_str
     schema = raw.get("schema") if isinstance(raw, dict) else None
-    if schema != SNAPSHOT_SCHEMA:
-        raise PreconditionError(
+    if schema != crony.model.SNAPSHOT_SCHEMA:
+        raise crony.errors.PreconditionError(
             f"snapshot for {display!r} has schema {schema!r}, "
-            f"expected {SNAPSHOT_SCHEMA} (re-apply required)"
+            f"expected {crony.model.SNAPSHOT_SCHEMA} (re-apply required)"
         )
     # A schema-matched but otherwise malformed snapshot (extra /
     # missing fields, a bad schedule / interval string, or an unknown
@@ -87,9 +73,9 @@ def load_snapshot(ref: EntityRef) -> Job | JobGroup:
     # its PreconditionError handler instead of crashing with a
     # traceback the scheduler never sees.
     try:
-        return snapshot_from_dict(raw)
+        return crony.model.snapshot_from_dict(raw)
     except (TypeError, ValueError) as e:
-        raise PreconditionError(
+        raise crony.errors.PreconditionError(
             f"snapshot for {display!r} has malformed fields: {e} "
             f"(re-apply required)"
         ) from e
@@ -99,8 +85,8 @@ def _read_runtime_state(
     state_dir: Path,
     *,
     full_name: str | None,
-    snapshot: Job | JobGroup | None = None,
-) -> RuntimeState:
+    snapshot: crony.model.Job | crony.model.JobGroup | None = None,
+) -> crony.model.RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
     parsed last-run record and presence of the lock / pending /
     user-trigger flag files. When `full_name` is known, also probe
@@ -115,7 +101,7 @@ def _read_runtime_state(
     reflects the result. Left None for broken refs (no snapshot)
     and unit-only refs (no state dir to read from).
     """
-    last_run: LastRun | None = None
+    last_run: crony.model.LastRun | None = None
     last_run_path = state_dir / "last-run.json"
     if last_run_path.is_file():
         try:
@@ -123,7 +109,7 @@ def _read_runtime_state(
         except (OSError, json.JSONDecodeError):
             raw = None
         if isinstance(raw, dict):
-            last_run = LastRun.from_raw(raw)
+            last_run = crony.model.LastRun.from_raw(raw)
 
     is_running = False
     lock_path = state_dir / "run.lock"
@@ -131,7 +117,7 @@ def _read_runtime_state(
         try:
             with acquire_lock(lock_path):
                 pass
-        except LockBusyError:
+        except crony.errors.LockBusyError:
             is_running = True
 
     unit_config: Path | None = None
@@ -143,7 +129,7 @@ def _read_runtime_state(
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(snapshot)
 
-    return RuntimeState(
+    return crony.model.RuntimeState(
         state_dir=state_dir,
         last_run=last_run,
         is_running=is_running,
@@ -157,7 +143,11 @@ def _read_runtime_state(
 
 def _build_current_graph(
     state_root: Path,
-) -> tuple[Graph, dict[EntityRef, BrokenEntity], dict[EntityRef, RuntimeState]]:
+) -> tuple[
+    crony.model.Graph,
+    dict[crony.unit.EntityRef, crony.model.BrokenEntity],
+    dict[crony.unit.EntityRef, crony.model.RuntimeState],
+]:
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
     with a parseable schema-matched `snapshot.json` becomes a
     current-graph node; the rest of the dir contents become its
@@ -168,9 +158,9 @@ def _build_current_graph(
     "re-apply required" signal instead of treating the entry as
     silently absent.
     """
-    current = Graph()
-    broken: dict[EntityRef, BrokenEntity] = {}
-    runtime: dict[EntityRef, RuntimeState] = {}
+    current = crony.model.Graph()
+    broken: dict[crony.unit.EntityRef, crony.model.BrokenEntity] = {}
+    runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
     if not state_root.exists():
         return current, broken, runtime
     for bundle_dir in state_root.iterdir():
@@ -182,11 +172,11 @@ def _build_current_graph(
             snap_path = uuid_dir / "snapshot.json"
             if not snap_path.is_file():
                 continue
-            ref = EntityRef(bundle_dir.name, uuid_dir.name)
+            ref = crony.unit.EntityRef(bundle_dir.name, uuid_dir.name)
             try:
                 raw = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                broken[ref] = BrokenEntity(
+                broken[ref] = crony.model.BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=None,
@@ -197,7 +187,7 @@ def _build_current_graph(
             raw_name = raw.get("name") if isinstance(raw, dict) else None
             name_hint = raw_name if isinstance(raw_name, str) else None
             if not isinstance(raw, dict):
-                broken[ref] = BrokenEntity(
+                broken[ref] = crony.model.BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -205,22 +195,22 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            if raw.get("schema") != SNAPSHOT_SCHEMA:
-                broken[ref] = BrokenEntity(
+            if raw.get("schema") != crony.model.SNAPSHOT_SCHEMA:
+                broken[ref] = crony.model.BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
                     reason=(
                         f"snapshot schema {raw.get('schema')!r} "
-                        f"(expected {SNAPSHOT_SCHEMA})"
+                        f"(expected {crony.model.SNAPSHOT_SCHEMA})"
                     ),
                     source_path=snap_path,
                 )
                 continue
             try:
-                snap = snapshot_from_dict(raw)
+                snap = crony.model.snapshot_from_dict(raw)
             except (TypeError, ValueError) as exc:
-                broken[ref] = BrokenEntity(
+                broken[ref] = crony.model.BrokenEntity(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -229,7 +219,7 @@ def _build_current_graph(
                 )
                 continue
             full = str(snap.name)
-            if isinstance(snap, Job):
+            if isinstance(snap, crony.model.Job):
                 current.jobs[snap.ref] = snap
                 current.by_full_name[full] = snap.ref
                 runtime[snap.ref] = _read_runtime_state(
@@ -252,7 +242,7 @@ def _build_current_graph(
     # the unit-config / last / last-ran columns render empty
     # for broken rows even when those files are on disk.
     for ref, broken_entry in broken.items():
-        state_dir = entity_state_dir(ref)
+        state_dir = crony.model.entity_state_dir(ref)
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=broken_entry.name,
@@ -260,7 +250,7 @@ def _build_current_graph(
     return current, broken, runtime
 
 
-def load_config() -> Config:
+def load_config() -> crony.model.Config:
     """Build the whole-process Config: parse every bundle's TOML,
     walk the state-dir tree once, build pending + current graphs +
     runtime state in memory, and detect platform-unit-only orphans.
@@ -268,8 +258,8 @@ def load_config() -> Config:
     host = crony.platform.current_host()
     platform = crony.platform.current_platform()
 
-    toml_config = TomlConfig.load_all()
-    pending = Graph.build_pending(toml_config)
+    toml_config = crony.config.TomlConfig.load_all()
+    pending = crony.model.Graph.build_pending(toml_config)
     current, broken, runtime = _build_current_graph(crony.paths.STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
@@ -279,8 +269,8 @@ def load_config() -> Config:
     # `shadowed` and surface by `<bundle>:<UUID>` in status. Without
     # this, `current.by_full_name` would silently drop all but the
     # last-scanned ref, hiding the residue.
-    shadowed: set[EntityRef] = set()
-    name_to_refs: dict[str, list[EntityRef]] = {}
+    shadowed: set[crony.unit.EntityRef] = set()
+    name_to_refs: dict[str, list[crony.unit.EntityRef]] = {}
     for ref in current.refs():
         snap = current.jobs.get(ref) or current.groups.get(ref)
         assert snap is not None  # ref came from current.refs()
@@ -295,7 +285,7 @@ def load_config() -> Config:
         current.by_full_name[name] = winner
         shadowed.update(r for r in refs if r != winner)
 
-    broken_by_full_name: dict[str, EntityRef] = {}
+    broken_by_full_name: dict[str, crony.unit.EntityRef] = {}
     for ref, broken_entry in broken.items():
         if broken_entry.name is not None:
             broken_by_full_name[broken_entry.name] = ref
@@ -308,8 +298,8 @@ def load_config() -> Config:
     # other on-disk entities.
     accounted_labels: set[str] = set(current.by_full_name)
     accounted_labels.update(broken_by_full_name)
-    unit_only: dict[EntityRef, UnitOnlyOrphan] = {}
-    unit_only_by_full_name: dict[str, EntityRef] = {}
+    unit_only: dict[crony.unit.EntityRef, crony.model.UnitOnlyOrphan] = {}
+    unit_only_by_full_name: dict[str, crony.unit.EntityRef] = {}
     for full_name in platform_unit_names() - accounted_labels:
         bundle_name, _, _ = full_name.partition(".")
         if not bundle_name:
@@ -317,8 +307,8 @@ def load_config() -> Config:
         synthetic = str(
             uuid.uuid5(uuid.NAMESPACE_DNS, f"crony.unit-only/{full_name}")
         )
-        ref = EntityRef(bundle_name, synthetic)
-        unit_only[ref] = UnitOnlyOrphan(
+        ref = crony.unit.EntityRef(bundle_name, synthetic)
+        unit_only[ref] = crony.model.UnitOnlyOrphan(
             bundle=bundle_name,
             uuid=synthetic,
             name=full_name,
@@ -330,8 +320,8 @@ def load_config() -> Config:
         # unit dirs.
         unit_config = platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
-        runtime[ref] = RuntimeState(
-            state_dir=entity_state_dir(ref),
+        runtime[ref] = crony.model.RuntimeState(
+            state_dir=crony.model.entity_state_dir(ref),
             last_run=None,
             is_running=False,
             is_pending=False,
@@ -340,7 +330,7 @@ def load_config() -> Config:
             unit_timer=unit_timer,
         )
 
-    return Config(
+    return crony.model.Config(
         toml_config=toml_config,
         pending=pending,
         current=current,
@@ -355,7 +345,7 @@ def load_config() -> Config:
     )
 
 
-def state_dir_for(ref: EntityRef) -> Path:
+def state_dir_for(ref: crony.unit.EntityRef) -> Path:
     """State directory for an entity, materialized on disk.
 
     Returns the uuid-keyed state dir for `ref`, creating it (and
@@ -369,7 +359,7 @@ def state_dir_for(ref: EntityRef) -> Path:
     it. Only created when missing, never truncated, so an existing
     log survives a re-apply untouched.
     """
-    d = entity_state_dir(ref)
+    d = crony.model.entity_state_dir(ref)
     d.mkdir(parents=True, exist_ok=True)
     log_path = d / "run.log"
     if not log_path.exists():
@@ -411,7 +401,7 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
-            raise LockBusyError(
+            raise crony.errors.LockBusyError(
                 f"another instance of {lock_path.parent.name} is running"
             ) from e
         try:
@@ -458,7 +448,7 @@ def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
     return scheduler(platform).dispatch_unit_path(name)
 
 
-def scheduler(platform: str | None = None) -> Scheduler:
+def scheduler(platform: str | None = None) -> crony.platform.Scheduler:
     """The platform Scheduler for the host. `platform` defaults to the
     running host's `crony.platform.current_platform()`; tests pass it
     explicitly to exercise a specific backend. Built per call; the
@@ -466,16 +456,18 @@ def scheduler(platform: str | None = None) -> Scheduler:
     env override), so tests that redirect that env are picked up."""
     if platform is None:
         platform = crony.platform.current_platform()
-    return get_scheduler(platform)
+    return crony.platform.get_scheduler(platform)
 
 
-def host() -> HostPlatform:
+def host() -> crony.platform.HostPlatform:
     """The HostPlatform backend for the running host. Built per call via
     crony.platform.current_platform() so tests can redirect the platform."""
-    return get_host(crony.platform.current_platform())
+    return crony.platform.get_host(crony.platform.current_platform())
 
 
-def _unit_is_stale(snap: Job | JobGroup, platform: str | None = None) -> bool:
+def _unit_is_stale(
+    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
+) -> bool:
     """True when the platform install diverges from the snapshot --
     delegates to the scheduler's drift check."""
     return scheduler(platform).is_stale(snap.unit_spec())
@@ -508,7 +500,7 @@ def run_in_progress(state_dir: Path) -> bool:
     try:
         with acquire_lock(lock_path):
             return False
-    except LockBusyError:
+    except crony.errors.LockBusyError:
         return True
 
 

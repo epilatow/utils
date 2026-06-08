@@ -26,30 +26,11 @@ from collections.abc import Callable
 from email.message import EmailMessage
 from pathlib import Path
 
+import crony.config
+import crony.errors
+import crony.model
 import crony.platform
 import crony.runtime
-from crony.config import (
-    BUILTIN_NOTIFY_CHANNELS,
-    DEFAULT_BUNDLE_NAME,
-    NOTIFY_INHERIT_TOKEN,
-    VALID_NOTIFY_TRANSPORTS,
-    Defaults,
-    NotifyChannel,
-    NotifyEmail,
-    NotifyNtfy,
-    TomlConfig,
-    parse_full_name,
-)
-from crony.errors import (
-    ConfigError,
-    CronyError,
-    PreconditionError,
-    UsageError,
-)
-from crony.model import (
-    JobRunResult,
-    NotificationResult,
-)
 
 _NOTIFY_TIMEOUT_SEC: int = 15
 
@@ -87,14 +68,14 @@ def retrieve_secret(
             parent = p.parent
             parent_mode = parent.stat().st_mode & 0o777
             if parent_mode & 0o077:
-                raise PreconditionError(
+                raise crony.errors.PreconditionError(
                     f"secret directory {parent} is mode "
                     f"0o{parent_mode:o}; require no group / world "
                     f"bits (e.g. 0700)"
                 )
             mode = p.stat().st_mode & 0o777
             if mode & 0o077:
-                raise PreconditionError(
+                raise crony.errors.PreconditionError(
                     f"secret file {p} is mode 0o{mode:o}; require 0600 "
                     f"(group / world readable secrets are unsafe)"
                 )
@@ -102,7 +83,7 @@ def retrieve_secret(
     return None
 
 
-def _format_summary(result: JobRunResult, full_name: str) -> str:
+def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
     """One-line-per-field human summary for notification bodies."""
     return (
         f"Job:        {full_name}\n"
@@ -177,10 +158,10 @@ def head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
 
 
 def _build_email_message(
-    result: JobRunResult,
+    result: crony.model.JobRunResult,
     full_name: str,
     log_text: str,
-    cfg: NotifyEmail,
+    cfg: crony.config.NotifyEmail,
     attach_log: bool,
     attach_max_kb: int,
     extra_headers: dict[str, str],
@@ -212,7 +193,9 @@ def _build_email_message(
     return msg
 
 
-def _send_email(msg: EmailMessage, cfg: NotifyEmail, password: str) -> None:
+def _send_email(
+    msg: EmailMessage, cfg: crony.config.NotifyEmail, password: str
+) -> None:
     """SMTP send with optional STARTTLS + AUTH. Raises smtplib errors."""
     with smtplib.SMTP(
         cfg.smtp_host, cfg.smtp_port, timeout=_NOTIFY_TIMEOUT_SEC
@@ -279,7 +262,7 @@ def _build_ntfy_body(summary: str, log_text: str, attach_log: bool) -> bytes:
 
 
 def _post_ntfy(
-    cfg: NotifyNtfy,
+    cfg: crony.config.NotifyNtfy,
     token: str,
     title: str,
     exit_class: str,
@@ -319,15 +302,15 @@ def _post_ntfy(
 
 
 def _send_email_for(
-    channel: NotifyChannel,
-    result: JobRunResult,
+    channel: crony.config.NotifyChannel,
+    result: crony.model.JobRunResult,
     full_name: str,
     log_text: str,
-    defaults: Defaults,
+    defaults: crony.config.Defaults,
 ) -> None:
     """Send the failure email through the given channel. Raises on any error."""
     if channel.email is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"channel {channel.name!r} has no email transport config"
         )
     password = retrieve_secret(
@@ -336,7 +319,7 @@ def _send_email_for(
         file_path=channel.email.smtp_pass_file,
     )
     if password is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"channel {channel.name!r}: no SMTP password available "
             f"(configure smtp_pass_keychain_service or smtp_pass_file)"
         )
@@ -353,15 +336,15 @@ def _send_email_for(
 
 
 def _send_ntfy_for(
-    channel: NotifyChannel,
-    result: JobRunResult,
+    channel: crony.config.NotifyChannel,
+    result: crony.model.JobRunResult,
     full_name: str,
     log_text: str,
-    defaults: Defaults,
+    defaults: crony.config.Defaults,
 ) -> None:
     """Send the failure ntfy POST through the channel. Raises on error."""
     if channel.ntfy is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"channel {channel.name!r} has no ntfy transport config"
         )
     token = retrieve_secret(
@@ -370,7 +353,7 @@ def _send_ntfy_for(
         file_path=channel.ntfy.token_file,
     )
     if token is None:
-        raise ConfigError(
+        raise crony.errors.ConfigError(
             f"channel {channel.name!r}: no ntfy token available "
             f"(configure token_keychain_service or token_file)"
         )
@@ -397,11 +380,11 @@ _DIALOG_POPUP_LOG_KB: int = 8
 
 
 def _send_dialog_popup_for(
-    _channel: NotifyChannel,
-    result: JobRunResult,
+    _channel: crony.config.NotifyChannel,
+    result: crony.model.JobRunResult,
     full_name: str,
     log_text: str,
-    defaults: Defaults,
+    defaults: crony.config.Defaults,
 ) -> None:
     """Pop a native desktop dialog for a failed job. Raises on error.
 
@@ -415,7 +398,7 @@ def _send_dialog_popup_for(
     """
     host = crony.runtime.host()
     if not host.supports_interactive:
-        raise CronyError(
+        raise crony.errors.CronyError(
             "dialog-popup notify channel not implemented on "
             f"{crony.platform.current_platform()!r}"
         )
@@ -434,7 +417,16 @@ def _send_dialog_popup_for(
 # VALID_NOTIFY_TRANSPORTS.
 _NOTIFY_DISPATCH: dict[
     str,
-    Callable[[NotifyChannel, JobRunResult, str, str, Defaults], None],
+    Callable[
+        [
+            crony.config.NotifyChannel,
+            crony.model.JobRunResult,
+            str,
+            str,
+            crony.config.Defaults,
+        ],
+        None,
+    ],
 ] = {
     "email": _send_email_for,
     "ntfy": _send_ntfy_for,
@@ -444,12 +436,12 @@ _NOTIFY_DISPATCH: dict[
 # Pin parser-side and dispatcher-side enumerations together so a
 # new transport can never be accepted by the parser but unknown to
 # dispatch (or vice versa).
-assert set(_NOTIFY_DISPATCH.keys()) == VALID_NOTIFY_TRANSPORTS, (
+assert set(_NOTIFY_DISPATCH.keys()) == crony.config.VALID_NOTIFY_TRANSPORTS, (
     "_NOTIFY_DISPATCH and VALID_NOTIFY_TRANSPORTS have drifted"
 )
 
 
-def _builtin_notify_channel(name: str) -> NotifyChannel | None:
+def _builtin_notify_channel(name: str) -> crony.config.NotifyChannel | None:
     """Synthesize a zero-config built-in channel def for `name`.
 
     Built-ins (`BUILTIN_NOTIFY_CHANNELS`) carry no per-channel
@@ -458,16 +450,16 @@ def _builtin_notify_channel(name: str) -> NotifyChannel | None:
     instead of erroring. A built-in's name equals its transport.
     Returns None for non-built-in names.
     """
-    if name in BUILTIN_NOTIFY_CHANNELS:
-        return NotifyChannel(name=name, transport=name)
+    if name in crony.config.BUILTIN_NOTIFY_CHANNELS:
+        return crony.config.NotifyChannel(name=name, transport=name)
     return None
 
 
 def dispatch_notify(
-    result: JobRunResult,
+    result: crony.model.JobRunResult,
     full_name: str,
     log_text: str,
-    defaults: Defaults,
+    defaults: crony.config.Defaults,
 ) -> None:
     """Fan out to every channel in result.notifications.
 
@@ -484,23 +476,23 @@ def dispatch_notify(
             if channel is None:
                 channel = _builtin_notify_channel(channel_name)
             if channel is None:
-                raise ConfigError(
+                raise crony.errors.ConfigError(
                     f"unknown notify channel: {channel_name!r} "
                     f"(no [defaults.notify.{channel_name}] block)"
                 )
             sender = _NOTIFY_DISPATCH.get(channel.transport)
             if sender is None:
-                raise ConfigError(
+                raise crony.errors.ConfigError(
                     f"unknown notify transport: {channel.transport!r}"
                 )
             sender(channel, result, full_name, log_text, defaults)
-            result.notifications[channel_name] = NotificationResult(
+            result.notifications[channel_name] = crony.model.NotificationResult(
                 sent=True, error=None, error_class=None
             )
         except Exception as e:
             # Notify is best-effort; record the failure on this
             # channel and continue with the next one.
-            result.notifications[channel_name] = NotificationResult(
+            result.notifications[channel_name] = crony.model.NotificationResult(
                 sent=False,
                 error=f"{type(e).__name__}: {e}",
                 error_class=type(e).__name__,
@@ -510,9 +502,9 @@ def dispatch_notify(
 def expand_notify_inherit(
     channels: list[str],
     firing_bundle: str,
-    bundles: TomlConfig,
-    local_defaults: Defaults,
-) -> tuple[list[str], Defaults]:
+    bundles: crony.config.TomlConfig,
+    local_defaults: crony.config.Defaults,
+) -> tuple[list[str], crony.config.Defaults]:
     """Resolve the notify-inherit sentinel against the default bundle.
 
     When [NOTIFY_INHERIT_TOKEN] appears in `channels`, it expands in
@@ -531,17 +523,19 @@ def expand_notify_inherit(
     recurses: a sentinel carried by the default bundle's own list is
     dropped rather than re-expanded.
     """
-    if NOTIFY_INHERIT_TOKEN not in channels:
+    if crony.config.NOTIFY_INHERIT_TOKEN not in channels:
         return channels, local_defaults
-    extras = [c for c in channels if c != NOTIFY_INHERIT_TOKEN]
-    if firing_bundle == DEFAULT_BUNDLE_NAME:
+    extras = [c for c in channels if c != crony.config.NOTIFY_INHERIT_TOKEN]
+    if firing_bundle == crony.config.DEFAULT_BUNDLE_NAME:
         return extras, local_defaults
-    default_bundle = bundles.by_name(DEFAULT_BUNDLE_NAME)
+    default_bundle = bundles.by_name(crony.config.DEFAULT_BUNDLE_NAME)
     if default_bundle is None:
         return extras, local_defaults
     inherited = default_bundle.config.defaults
     inherited_channels = [
-        c for c in inherited.notify_channels if c != NOTIFY_INHERIT_TOKEN
+        c
+        for c in inherited.notify_channels
+        if c != crony.config.NOTIFY_INHERIT_TOKEN
     ]
     new_extras = [c for c in extras if c not in inherited_channels]
     resolved = inherited_channels + new_extras
@@ -562,7 +556,7 @@ def expand_notify_inherit(
 
 def resolve_notify_at_runtime(
     full_name: str,
-) -> tuple[list[str], Defaults]:
+) -> tuple[list[str], crony.config.Defaults]:
     """Look up notify channels + bundle defaults from the live config.
 
     Notify routing is intentionally NOT pinned in the snapshot:
@@ -572,14 +566,14 @@ def resolve_notify_at_runtime(
     already be surfacing the orphan, so log-only here is a
     coherent degraded behavior.
     """
-    bn, short = parse_full_name(full_name)
+    bn, short = crony.config.parse_full_name(full_name)
     try:
-        bundles = TomlConfig.load_all()
-    except (OSError, ConfigError, UsageError):
-        return [], Defaults()
+        bundles = crony.config.TomlConfig.load_all()
+    except (OSError, crony.errors.ConfigError, crony.errors.UsageError):
+        return [], crony.config.Defaults()
     bundle = bundles.by_name(bn)
     if bundle is None:
-        return [], Defaults()
+        return [], crony.config.Defaults()
     config = bundle.config
     target = config.resolve_target()
     job = config.jobs.get(short)
