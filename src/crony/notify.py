@@ -128,7 +128,7 @@ def extract_latest_log_entry(text: str) -> str:
     return text[matches[-1].start() :]
 
 
-def head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
+def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
     """Tail a string to at most max_kb KB, head-truncating.
 
     When truncation occurs, the returned text is prepended with a
@@ -186,7 +186,7 @@ def _build_email_message(
             msg[k] = v
     body = _format_summary(result, full_name)
     if attach_log and log_text:
-        body += LOG_SEPARATOR + _format_log_for_notification(
+        body += _LOG_SEPARATOR + _format_log_for_notification(
             log_text, attach_max_kb
         )
     msg.set_content(body)
@@ -207,7 +207,7 @@ def _send_email(
 
 
 _NTFY_MAX_BODY_KB: int = 3
-LOG_SEPARATOR: str = "\n--- log (latest run) ---\n"
+_LOG_SEPARATOR: str = "\n--- log (latest run) ---\n"
 
 
 def _format_log_for_notification(log_text: str, max_kb: int) -> str:
@@ -220,7 +220,7 @@ def _format_log_for_notification(log_text: str, max_kb: int) -> str:
     bump out the actual diagnostic detail under the 3 KB cap).
     """
     latest = extract_latest_log_entry(log_text)
-    truncated, _trunc = head_truncate_to_kb(latest, max_kb)
+    truncated, _trunc = _head_truncate_to_kb(latest, max_kb)
     return truncated
 
 
@@ -242,7 +242,7 @@ def _build_ntfy_body(summary: str, log_text: str, attach_log: bool) -> bytes:
     summary_bytes = summary.encode("utf-8")
     if not (attach_log and log_text):
         return summary_bytes
-    sep_bytes = LOG_SEPARATOR.encode("utf-8")
+    sep_bytes = _LOG_SEPARATOR.encode("utf-8")
     max_bytes = _NTFY_MAX_BODY_KB * 1024
     log_budget_bytes = max_bytes - len(summary_bytes) - len(sep_bytes)
     if log_budget_bytes <= 0:
@@ -407,7 +407,7 @@ def _send_dialog_popup_for(
     if defaults.notify_attach_log and log_text:
         tail = _format_log_for_notification(log_text, _DIALOG_POPUP_LOG_KB)
         if tail.strip():
-            body = f"{body}{LOG_SEPARATOR}{tail}"
+            body = f"{body}{_LOG_SEPARATOR}{tail}"
     host.show_failure_dialog(title, body)
 
 

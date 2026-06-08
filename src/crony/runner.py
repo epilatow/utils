@@ -49,7 +49,7 @@ def timeout_to_wait(sec: int) -> float:
     return math.inf if sec == 0 else float(sec)
 
 
-def rollup_group_exit_class(
+def _rollup_group_exit_class(
     children: list[crony.model.GroupChildResult],
 ) -> str:
     """Worst-of children's exit_class, with a precedence ladder.
@@ -95,7 +95,7 @@ def _expand_env_value(raw: str, env: dict[str, str]) -> str:
     return string.Template(raw).safe_substitute(env)
 
 
-def runtime_env(user_env: dict[str, str]) -> dict[str, str]:
+def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     """Build the env dict passed to the wrapped command.
 
     The command runs from the platform scheduler's unit, which hands
@@ -122,7 +122,7 @@ def runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def command_argv(snap: crony.model.Job) -> list[str]:
+def _command_argv(snap: crony.model.Job) -> list[str]:
     """argv for the job's main command, drawn from the snapshot.
 
     Snapshot fields are pre-resolved at apply time (script paths
@@ -135,7 +135,7 @@ def command_argv(snap: crony.model.Job) -> list[str]:
     return [snap.script, *snap.args]
 
 
-def gate_argv(snap: crony.model.Job) -> list[str] | None:
+def _gate_argv(snap: crony.model.Job) -> list[str] | None:
     """argv for the gate, or None if the snapshot has no gate."""
     if snap.gate is not None:
         return ["/bin/sh", "-c", snap.gate]
@@ -144,7 +144,7 @@ def gate_argv(snap: crony.model.Job) -> list[str] | None:
     return None
 
 
-def keep_awake_argv(
+def _keep_awake_argv(
     argv: list[str], snap: crony.model.Job
 ) -> tuple[list[str], str | None]:
     """Wrap `argv` so the machine stays awake while the command runs.
@@ -162,7 +162,7 @@ def keep_awake_argv(
     return crony.runtime.host().keep_awake_argv(argv, str(snap.name))
 
 
-class ExitOutcome(NamedTuple):
+class _ExitOutcome(NamedTuple):
     """Outcome of a wrapped subprocess invocation.
 
     `signal` is set to the killing signal number when the process was
@@ -174,13 +174,13 @@ class ExitOutcome(NamedTuple):
     signal: int | None
 
 
-def exec_with_timeout(
+def _exec_with_timeout(
     argv: list[str],
     *,
     env: dict[str, str],
     job_timeout_sec: int | None,
     log_file: IO[bytes],
-) -> ExitOutcome:
+) -> _ExitOutcome:
     """Exec argv, piping stdout+stderr into log_file.
 
     On timeout, sends SIGTERM, then SIGKILL after a grace window, and
@@ -205,11 +205,11 @@ def exec_with_timeout(
             proc.wait()
         raise
     if rc < 0:
-        return ExitOutcome(rc=0, signal=-rc)
-    return ExitOutcome(rc=rc, signal=None)
+        return _ExitOutcome(rc=0, signal=-rc)
+    return _ExitOutcome(rc=rc, signal=None)
 
 
-def wait_for_pid_exit(
+def _wait_for_pid_exit(
     pid: int, timeout: float | None
 ) -> crony.platform.PidWait:
     """Block until `pid` exits via the host's kernel-level pid-exit
@@ -218,7 +218,7 @@ def wait_for_pid_exit(
     return crony.runtime.host().wait_for_pid_exit(pid, timeout)
 
 
-def wait_for_user_active(
+def _wait_for_user_active(
     required_sec: int,
     *,
     bypass_check: Callable[[], bool] | None = None,
@@ -260,7 +260,7 @@ def wait_for_user_active(
         time.sleep(poll_sec)
 
 
-def delay_or_bypass(
+def _delay_or_bypass(
     delay_sec: int,
     *,
     bypass_check: Callable[[], bool],
@@ -286,7 +286,7 @@ def delay_or_bypass(
 _INTERACTIVE_BUTTONS = ["Cancel Job", "Delay Job", "Run Job"]
 
 
-def show_interactive_dialog(job_name: str, message: str) -> str:
+def _show_interactive_dialog(job_name: str, message: str) -> str:
     """Pop the three-button approval dialog. Returns one of
     'run' / 'delay' / 'cancel'.
 
@@ -306,7 +306,7 @@ def show_interactive_dialog(job_name: str, message: str) -> str:
     return "cancel"
 
 
-def interactive_wait_and_prompt(
+def _interactive_wait_and_prompt(
     snap: crony.model.Job, log_file: IO[bytes]
 ) -> str:
     """Run the wait/prompt/delay loop for an interactive job.
@@ -338,7 +338,7 @@ def interactive_wait_and_prompt(
                 f"input\n"
             ).encode()
         )
-        if not wait_for_user_active(
+        if not _wait_for_user_active(
             snap.interactive_active_sec, bypass_check=_bypass
         ):
             log_file.write(
@@ -346,7 +346,7 @@ def interactive_wait_and_prompt(
             )
             return "run"
         log_file.write(b"interactive: prompting user\n")
-        choice = show_interactive_dialog(
+        choice = _show_interactive_dialog(
             str(snap.name),
             f"crony wants to run '{snap.name}'. Now?",
         )
@@ -357,7 +357,7 @@ def interactive_wait_and_prompt(
             f"interactive: delaying for "
             f"{snap.interactive_delay_sec}s\n".encode()
         )
-        if not delay_or_bypass(
+        if not _delay_or_bypass(
             snap.interactive_delay_sec, bypass_check=_bypass
         ):
             log_file.write(
@@ -366,7 +366,7 @@ def interactive_wait_and_prompt(
             return "run"
 
 
-def run_job(
+def _run_job(
     snap: crony.model.Job,
     *,
     dry_run: bool = False,
@@ -402,8 +402,8 @@ def run_job(
     )
     job_timeout_sec = snap.job_timeout_sec
     # snap.env stores the user-written env literally; overlay it on
-    # the inherited env at fire time (see runtime_env).
-    env = runtime_env(snap.env)
+    # the inherited env at fire time (see _runtime_env).
+    env = _runtime_env(snap.env)
     started = time.time()
     started_iso = crony.runtime.now_iso()
     host = crony.platform.current_host()
@@ -430,7 +430,7 @@ def run_job(
                 log_file.write(header)
 
                 gate: str = "none"
-                gate_cmd = gate_argv(snap)
+                gate_cmd = _gate_argv(snap)
                 if gate_cmd is not None and not skip_gate:
                     log_file.write(f"gate: {shlex.join(gate_cmd)}\n".encode())
                     gate_rc: int
@@ -482,7 +482,9 @@ def run_job(
                         pending_flag = sd / "pending.flag"
                         pending_flag.write_bytes(b"")
                         try:
-                            choice = interactive_wait_and_prompt(snap, log_file)
+                            choice = _interactive_wait_and_prompt(
+                                snap, log_file
+                            )
                         finally:
                             pending_flag.unlink(missing_ok=True)
                         if choice == "cancel":
@@ -507,13 +509,13 @@ def run_job(
                             )
                             return 0
 
-                argv = command_argv(snap)
-                argv, keep_awake_note = keep_awake_argv(argv, snap)
+                argv = _command_argv(snap)
+                argv, keep_awake_note = _keep_awake_argv(argv, snap)
                 if keep_awake_note is not None:
                     log_file.write(f"{keep_awake_note}\n".encode())
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
                 try:
-                    rc, sig = exec_with_timeout(
+                    rc, sig = _exec_with_timeout(
                         argv,
                         env=env,
                         job_timeout_sec=job_timeout_sec or None,
@@ -640,7 +642,7 @@ def _child_timeout_from_snapshot(child_ref: crony.unit.EntityRef) -> float:
     return timeout_to_wait(raw)
 
 
-def child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
+def _child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
     """True iff the child is a job whose pinned snapshot has
     `interactive = True`. Groups and non-interactive jobs return
     False. A missing snapshot returns False so the existing
@@ -657,7 +659,7 @@ def child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
-def run_group(
+def _run_group(
     snap: crony.model.JobGroup,
     *,
     dry_run: bool = False,
@@ -741,7 +743,7 @@ def run_group(
                 )
                 for child_ref, child_full_name in resolved_pairs:
                     child_sd = crony.model.entity_state_dir(child_ref)
-                    if child_is_interactive(child_ref):
+                    if _child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
                         # the user-active wait + dialog independently;
@@ -875,7 +877,7 @@ def run_group(
                     started_at=started_iso,
                     ended_at=crony.runtime.now_iso(),
                     duration_sec=time.time() - started,
-                    exit_class=rollup_group_exit_class(children),
+                    exit_class=_rollup_group_exit_class(children),
                     log_path=str(log_path),
                     jobs_run=children,
                 )
@@ -919,7 +921,7 @@ def trigger_unit(
     the flag lands in the right uuid-keyed dir; when
     `triggered_by_user` is True and `state_dir` is None the call
     raises `ValueError`. Group-dispatched fires
-    (`run_group` -> `trigger_unit_sync` -> `trigger_unit`) keep
+    (`_run_group` -> `trigger_unit_sync` -> `trigger_unit`) keep
     the default False so a group never accidentally bypasses an
     interactive wait. Under the current validation rules groups
     can't contain interactive jobs so this is defense-in-depth,
@@ -1059,7 +1061,7 @@ def trigger_unit_sync(
                 if math.isinf(job_timeout)
                 else max(1.0, job_timeout - elapsed)
             )
-            wait_for_pid_exit(pid, timeout=pid_wait)
+            _wait_for_pid_exit(pid, timeout=pid_wait)
             continue
         # No pid and no fresh result: still in the start window.
         # Bound this state by trigger_timeout so a broken /
@@ -1140,9 +1142,9 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
         _record_snapshot_load_failure(parsed, exc)
         raise
     if isinstance(snap, crony.model.Job):
-        rc = run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
+        rc = _run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
     else:
-        rc = run_group(snap, dry_run=dry_run)
+        rc = _run_group(snap, dry_run=dry_run)
     raise SystemExit(rc)
 
 

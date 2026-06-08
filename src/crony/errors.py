@@ -77,7 +77,7 @@ class UnitNotInstalledError(PreconditionError):
     is a parent group whose snapshot still references a child
     that was destroyed (or never applied here): `crony apply`
     re-pins the parent's snapshot to drop the stale reference.
-    Caught and soft-failed by `run_group` so a single missing
+    Caught and soft-failed by `_run_group` so a single missing
     child doesn't take down a whole group run. Inherits
     `PreconditionError`'s `PRECONDITION` exit code so the
     "precondition failed before exec" framing is consistent at

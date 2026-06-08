@@ -124,7 +124,7 @@ def _read_runtime_state(
     unit_timer: Path | None = None
     unit_is_stale = False
     if full_name is not None:
-        unit_config = platform_unit_config_path(full_name)
+        unit_config = _platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(snapshot)
@@ -300,7 +300,7 @@ def load_config() -> crony.model.Config:
     accounted_labels.update(broken_by_full_name)
     unit_only: dict[crony.unit.EntityRef, crony.model.UnitOnlyOrphan] = {}
     unit_only_by_full_name: dict[str, crony.unit.EntityRef] = {}
-    for full_name in platform_unit_names() - accounted_labels:
+    for full_name in _platform_unit_names() - accounted_labels:
         bundle_name, _, _ = full_name.partition(".")
         if not bundle_name:
             continue
@@ -318,7 +318,7 @@ def load_config() -> crony.model.Config:
         # Make the platform paths available through RuntimeState so
         # status's unit-config / unit-timer columns don't re-walk the
         # unit dirs.
-        unit_config = platform_unit_config_path(full_name)
+        unit_config = _platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         runtime[ref] = crony.model.RuntimeState(
             state_dir=crony.model.entity_state_dir(ref),
@@ -425,7 +425,7 @@ def write_last_run(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def platform_unit_config_path(
+def _platform_unit_config_path(
     name: str, platform: str | None = None
 ) -> Path | None:
     """The on-disk platform config unit file backing `name`, or None.
@@ -504,7 +504,7 @@ def run_in_progress(state_dir: Path) -> bool:
         return True
 
 
-def platform_unit_names() -> set[str]:
+def _platform_unit_names() -> set[str]:
     """Names with a crony-managed platform unit file on this host.
 
     Walks the platform's user-unit directory and returns the name

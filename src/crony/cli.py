@@ -148,7 +148,7 @@ State (logs, locks, last-run records, applied snapshots) lives at
 logger = logging.getLogger(__name__)
 
 
-class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
+class _BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
     """StreamHandler that silently disables itself once its downstream
     pipe consumer closes (e.g., piping to `head`). The first
     BrokenPipeError swaps the stream for /dev/null so subsequent log
@@ -169,7 +169,7 @@ class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
 
 def _initialize_logger() -> None:
     """Configure root logger with a broken-pipe-aware handler."""
-    handler = BrokenPipeAwareStreamHandler(sys.stderr)
+    handler = _BrokenPipeAwareStreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
@@ -182,7 +182,7 @@ _initialize_logger()
 # =============================================================================
 
 
-def build_parser() -> StrictArgumentParser:
+def _build_parser() -> StrictArgumentParser:
     """Build and return the argument parser."""
     parser = StrictArgumentParser(
         description=(
@@ -622,7 +622,7 @@ def build_parser() -> StrictArgumentParser:
 # COMMAND DISPATCH
 # =============================================================================
 
-COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+_COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "config init": crony.commands.do_init,
     "config validate": crony.commands.do_validate,
     "config update": crony.commands.do_config_update,
@@ -641,7 +641,7 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 
 def cli() -> int:
     """CLI entry point with exception handling."""
-    args_dict = vars(build_parser().parse_command())
+    args_dict = vars(_build_parser().parse_command())
     command = args_dict.pop("command")
 
     if command == "self-test":
@@ -651,7 +651,7 @@ def cli() -> int:
         )
 
     try:
-        COMMAND_CALLBACKS[command](**args_dict)
+        _COMMAND_CALLBACKS[command](**args_dict)
     except SystemExit as e:
         # `crony run` raises SystemExit(<wrapped-rc>) so an
         # arbitrary exit code from the executed job (0-255) reaches

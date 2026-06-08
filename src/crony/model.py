@@ -125,10 +125,10 @@ class Job:
         args = [_expand_path_field(a) for a in job.args]
         gate_args = [_expand_path_field(a) for a in job.gate_args]
         script = (
-            str(resolve_script(job.script)) if job.script is not None else None
+            str(_resolve_script(job.script)) if job.script is not None else None
         )
         gate_script = (
-            str(resolve_script(job.gate_script))
+            str(_resolve_script(job.gate_script))
             if job.gate_script is not None
             else None
         )
@@ -299,7 +299,7 @@ def _expand_path_field(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
-def resolve_script(script: str) -> Path:
+def _resolve_script(script: str) -> Path:
     """Resolve a `script` field to an absolute path."""
     p = Path(_expand_path_field(script))
     if not p.is_absolute():
@@ -307,7 +307,7 @@ def resolve_script(script: str) -> Path:
     return p
 
 
-def resolve_snapshot_for(
+def _resolve_snapshot_for(
     config: crony.config.TomlBundleConfig,
     short: str,
     bundle_name: str = crony.config.DEFAULT_BUNDLE_NAME,

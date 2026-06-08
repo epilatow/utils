@@ -63,9 +63,9 @@ from crony.config import (  # noqa: E402
     TomlBundleConfig,
     TomlConfig,
     TomlJob,
+    _validate_notify_channels,
     parse_full_name,
     resolve_cli_name,
-    validate_notify_channels,
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -85,8 +85,8 @@ from crony.model import (  # noqa: E402
     Job,
     JobRunResult,
     NotificationResult,
-    resolve_script,
-    resolve_snapshot_for,
+    _resolve_script,
+    _resolve_snapshot_for,
 )
 from crony.platform import (  # noqa: E402
     PidWait,
@@ -119,7 +119,7 @@ _spec.loader.exec_module(crony)
 
 def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     """Apply one entry through the production path: build the
-    `Config` model (one disk pass) and call `apply_one` with the
+    `Config` model (one disk pass) and call `_apply_one` with the
     resolved ref -- mirroring what `do_apply` does per entry, so
     tests exercise the model-based code rather than a standalone
     path. For tests not built on `_ApplyHarness` (which exposes the
@@ -128,7 +128,7 @@ def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     config = crony_runtime.load_config()
     ref = config.pending.by_full_name.get(f"{bundle}.{short}")
     assert ref is not None, f"{bundle}.{short} not selected on this host"
-    result: str = crony_commands.apply_one(config, ref)
+    result: str = crony_commands._apply_one(config, ref)
     return result
 
 
@@ -228,7 +228,7 @@ class TestHelpOutput:
     """`crony --help` surfaces the design block appended to the epilog."""
 
     def test_help_includes_design_block(self) -> None:
-        parser = crony_cli.build_parser()
+        parser = crony_cli._build_parser()
         text = parser.format_help()
         # Design block documents the default status columns.
         assert "CONFIG    synced" in text
@@ -245,7 +245,7 @@ class TestHelpOutput:
 class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
 
-    PARSER_FUNC = staticmethod(crony_cli.build_parser)
+    PARSER_FUNC = staticmethod(crony_cli._build_parser)
     CASES = [
         (["status", "--bogus"], "status"),
         (["logs", "--bogus"], "logs"),
@@ -256,8 +256,8 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
 class TestCmdCallbacks(CmdCallbacksBase):
     """Test command callback dispatch table."""
 
-    CALLBACKS = crony_cli.COMMAND_CALLBACKS
-    PARSER_FUNC = crony_cli.build_parser
+    CALLBACKS = crony_cli._COMMAND_CALLBACKS
+    PARSER_FUNC = crony_cli._build_parser
     CLI_FUNC = staticmethod(crony_cli.cli)
     # cli() resolves the self-test handler as crony.commands.do_self_test
     # (module-attribute), so the dispatch test patches it on crony.commands.
@@ -286,7 +286,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
 class TestConfigSubcommandDispatch:
     """The `config` parent routes its nested actions through the
-    "<command> <action>" key in COMMAND_CALLBACKS. These tests pin
+    "<command> <action>" key in _COMMAND_CALLBACKS. These tests pin
     that the nested form actually reaches the right callback (a
     flat dispatch table without the join would silently do
     nothing), that a missing action prints the parent's help, and
@@ -298,7 +298,7 @@ class TestConfigSubcommandDispatch:
         mock_cb = MagicMock()
         with (
             patch.dict(
-                crony_cli.COMMAND_CALLBACKS,
+                crony_cli._COMMAND_CALLBACKS,
                 {"config init": mock_cb},
             ),
             patch("sys.argv", ["prog", "config", "init", "--force"]),
@@ -311,7 +311,7 @@ class TestConfigSubcommandDispatch:
         mock_cb = MagicMock()
         with (
             patch.dict(
-                crony_cli.COMMAND_CALLBACKS,
+                crony_cli._COMMAND_CALLBACKS,
                 {"config validate": mock_cb},
             ),
             patch("sys.argv", ["prog", "config", "validate", "-b", "foo"]),
@@ -391,8 +391,8 @@ def _uuid_toml(text: str) -> str:
     repeating `uuid = "..."` lines.
     """
     doc = tomlkit.parse(text)
-    crony_commands.insert_missing_uuids_in_section(doc, "job")
-    crony_commands.insert_missing_uuids_in_section(doc, "job-group")
+    crony_commands._insert_missing_uuids_in_section(doc, "job")
+    crony_commands._insert_missing_uuids_in_section(doc, "job-group")
     return tomlkit.dumps(doc)
 
 
@@ -2460,7 +2460,7 @@ class TestInit:
         """All persistent files in this repo are ASCII; the template
         we ship as a starting point must be too.
         """
-        crony_commands.DEFAULT_CONFIG_TEMPLATE.encode("ascii")  # raises if not
+        crony_commands._DEFAULT_CONFIG_TEMPLATE.encode("ascii")  # raises if not
 
     def test_bundle_writes_to_dropin(
         self, tmp_path: Path, monkeypatch: Any
@@ -2514,7 +2514,7 @@ class TestInit:
         extracted: list[str] = []
         section_re = re.compile(r"^# \[[\w.\-]+\]\s*$")
         kv_re = re.compile(r"^# [A-Za-z_][\w.]*\s*=")
-        for line in crony_commands.DEFAULT_CONFIG_TEMPLATE.splitlines():
+        for line in crony_commands._DEFAULT_CONFIG_TEMPLATE.splitlines():
             if section_re.match(line) or kv_re.match(line):
                 extracted.append(line[2:])
         text = "\n".join(extracted)
@@ -2689,7 +2689,7 @@ class TestConfigUpdateAction:
 class _RunnerHarness:
     """Isolated state + config so runner tests don't touch the real
     ~/.local/state/crony. Sets the in-process module attributes
-    (for direct calls into run_job/run_group) and the matching
+    (for direct calls into _run_job/_run_group) and the matching
     CRONY_*_DIR / CRONY_CONFIG_FILE env vars (so subprocess
     re-invocations from group dispatch see the same paths).
     """
@@ -2887,10 +2887,10 @@ class _RunnerHarness:
 
     def snap(self, cfg: Any, short: str) -> Any:
         """Resolve a snapshot for a default-bundle entry. Convenience
-        for runner tests that build a TomlBundleConfig and call run_job /
-        run_group directly without going through full apply.
+        for runner tests that build a TomlBundleConfig and call _run_job /
+        _run_group directly without going through full apply.
         """
-        return resolve_snapshot_for(cfg, short)
+        return _resolve_snapshot_for(cfg, short)
 
     def write_snap(self, cfg: Any, short: str) -> None:
         """Write a snapshot to disk so `load_snapshot` finds it.
@@ -2915,7 +2915,7 @@ class _RunnerHarness:
 
         Persists the raw config to the on-disk file so subprocess
         re-invocations of `crony run <child>` (group dispatch) load
-        the same config we hand to run_group. The target keys on the
+        the same config we hand to _run_group. The target keys on the
         simulated platform so the entries are actually selected when
         a later `load_config()` resolves the host's target.
         """
@@ -3008,17 +3008,17 @@ class TestPathFieldExpansion:
 
     def test_resolve_script_expands_tilde(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = resolve_script("~/bin/foo.sh")
+        p = _resolve_script("~/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_dollar_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = resolve_script("$HOME/bin/foo.sh")
+        p = _resolve_script("$HOME/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_expands_braced_var(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/home/user")
-        p = resolve_script("${HOME}/bin/foo.sh")
+        p = _resolve_script("${HOME}/bin/foo.sh")
         assert str(p) == "/home/user/bin/foo.sh"
 
     def test_resolve_script_unresolved_var_stays_literal(
@@ -3027,7 +3027,7 @@ class TestPathFieldExpansion:
         monkeypatch.delenv("CRONY_NO_SUCH_VAR", raising=False)
         # When no expansion applies, the value falls under CONFIG_DIR
         # as a relative path. The literal `$VAR` is preserved.
-        p = resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
+        p = _resolve_script("$CRONY_NO_SUCH_VAR/foo.sh")
         assert "$CRONY_NO_SUCH_VAR" in str(p)
 
     def test_snapshot_resolves_expanded_args(self, monkeypatch: Any) -> None:
@@ -3052,7 +3052,7 @@ class TestPathFieldExpansion:
             "/home/user/cache",
             "--flag",
         ]
-        assert crony_runner.command_argv(snap) == [
+        assert crony_runner._command_argv(snap) == [
             "/abs/path.sh",
             "/home/user/data",
             "/home/user/cache",
@@ -3077,14 +3077,14 @@ class TestPathFieldExpansion:
         )
         assert snap.gate_script == "/abs/gate.sh"
         assert snap.gate_args == ["/home/user/state"]
-        assert crony_runner.gate_argv(snap) == [
+        assert crony_runner._gate_argv(snap) == [
             "/abs/gate.sh",
             "/home/user/state",
         ]
 
 
 class TestRuntimeEnvExpansion:
-    """`runtime_env` is called at fire time with the snapshot's
+    """`_runtime_env` is called at fire time with the snapshot's
     user_env dict. It passes the inherited (scheduler-provided) env
     through and overlays user_env, expanding `$VAR` / `${VAR}`
     references in user_env values against the merged env. Called at
@@ -3094,7 +3094,7 @@ class TestRuntimeEnvExpansion:
 
     def test_inherits_path_when_no_env_override(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        env = crony_runner.runtime_env({})
+        env = crony_runner._runtime_env({})
         assert env["PATH"] == "/usr/bin:/bin"
 
     def test_session_bus_vars_forwarded(self, monkeypatch: Any) -> None:
@@ -3104,7 +3104,7 @@ class TestRuntimeEnvExpansion:
         monkeypatch.setenv(
             "DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"
         )
-        env = crony_runner.runtime_env({})
+        env = crony_runner._runtime_env({})
         assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
         assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
 
@@ -3114,25 +3114,25 @@ class TestRuntimeEnvExpansion:
         # this path so jobs can reach the user's ssh-agent.
         monkeypatch.setenv("CRONY_INHERIT_PROBE", "passed-through")
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
-        env = crony_runner.runtime_env({})
+        env = crony_runner._runtime_env({})
         assert env["CRONY_INHERIT_PROBE"] == "passed-through"
         assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
 
     def test_unset_var_absent(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_INHERIT_PROBE", raising=False)
-        env = crony_runner.runtime_env({})
+        env = crony_runner._runtime_env({})
         assert "CRONY_INHERIT_PROBE" not in env
 
     def test_dollar_var_resolves_against_inherited(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        env = crony_runner.runtime_env({"PATH": "/extra:$PATH"})
+        env = crony_runner._runtime_env({"PATH": "/extra:$PATH"})
         assert env["PATH"] == "/extra:/usr/bin:/bin"
 
     def test_brace_form_resolves(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("HOME", "/Users/edp")
-        env = crony_runner.runtime_env({"TMPDIR": "${HOME}/.local/tmp"})
+        env = crony_runner._runtime_env({"TMPDIR": "${HOME}/.local/tmp"})
         assert env["TMPDIR"] == "/Users/edp/.local/tmp"
 
     def test_expansion_resolves_against_any_inherited_var(
@@ -3141,16 +3141,16 @@ class TestRuntimeEnvExpansion:
         # Expansion sees the whole inherited env, so a value can
         # reference any inherited var (here the session runtime dir).
         monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-        env = crony_runner.runtime_env({"BUS": "$XDG_RUNTIME_DIR/bus"})
+        env = crony_runner._runtime_env({"BUS": "$XDG_RUNTIME_DIR/bus"})
         assert env["BUS"] == "/run/user/1000/bus"
 
     def test_unknown_var_stays_literal(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_NOPE", raising=False)
-        env = crony_runner.runtime_env({"FOO": "$CRONY_NOPE"})
+        env = crony_runner._runtime_env({"FOO": "$CRONY_NOPE"})
         assert env["FOO"] == "$CRONY_NOPE"
 
     def test_double_dollar_escapes_to_literal(self) -> None:
-        env = crony_runner.runtime_env({"MSG": "cost: $$5"})
+        env = crony_runner._runtime_env({"MSG": "cost: $$5"})
         assert env["MSG"] == "cost: $5"
 
     def test_iteration_order_lets_later_keys_see_earlier(
@@ -3159,7 +3159,7 @@ class TestRuntimeEnvExpansion:
         # Python dicts preserve insertion order; toml parsers do too.
         # An earlier job.env key should be visible to a later one.
         monkeypatch.setenv("PATH", "/usr/bin")
-        env = crony_runner.runtime_env(
+        env = crony_runner._runtime_env(
             {
                 "PATH": "/extra:$PATH",
                 "LD_LIBRARY_PATH": "$PATH/../lib",
@@ -3174,7 +3174,7 @@ class TestRuntimeEnvExpansion:
         # Job env is overlay; absent keys inherit unchanged.
         monkeypatch.setenv("HOME", "/Users/edp")
         monkeypatch.setenv("LANG", "en_US.UTF-8")
-        env = crony_runner.runtime_env({"FOO": "bar"})
+        env = crony_runner._runtime_env({"FOO": "bar"})
         assert env["HOME"] == "/Users/edp"
         assert env["LANG"] == "en_US.UTF-8"
         assert env["FOO"] == "bar"
@@ -3184,7 +3184,7 @@ class TestRuntimeEnvExpansion:
         # rather than raising. $1 isn't a valid identifier; a
         # trailing bare $ has nothing to consume; ${UNCLOSED has
         # no closing brace.
-        env = crony_runner.runtime_env(
+        env = crony_runner._runtime_env(
             {
                 "DIGIT": "$1 is not an identifier",
                 "TRAILING": "ends with $",
@@ -3205,7 +3205,7 @@ class TestRunJobBasics:
             {"job": {"ok": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["ok"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "ok"))
+        rc = crony_runner._run_job(h.snap(cfg, "ok"))
         assert rc == 0
         rec = h.last_run("ok")
         assert rec["exit_class"] == "ok"
@@ -3227,7 +3227,7 @@ class TestRunJobBasics:
             },
             default_target_jobs=["fail"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "fail"))
+        rc = crony_runner._run_job(h.snap(cfg, "fail"))
         assert rc == 17
         rec = h.last_run("fail")
         assert rec["exit_class"] == "fail"
@@ -3239,7 +3239,7 @@ class TestRunJobBasics:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config({}, default_target_jobs=[])
         with pytest.raises(PreconditionError, match="unknown"):
-            resolve_snapshot_for(cfg, "ghost")
+            _resolve_snapshot_for(cfg, "ghost")
 
     def test_run_without_snapshot_raises_precondition(
         self, tmp_path: Path, monkeypatch: Any
@@ -3431,7 +3431,7 @@ class TestRunJobBasics:
             },
             default_target_jobs=["ok"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "ok"), dry_run=True)
+        rc = crony_runner._run_job(h.snap(cfg, "ok"), dry_run=True)
         assert rc == 0
         # No last-run.json written on dry-run
         assert not (h.state_dir("ok") / "last-run.json").exists()
@@ -3503,7 +3503,7 @@ class TestSuccessExitCodes:
             default_target_jobs=["warn"],
         )
         # Surfaces 0 to the scheduler even though the command exited 1.
-        rc = crony_runner.run_job(h.snap(cfg, "warn"))
+        rc = crony_runner._run_job(h.snap(cfg, "warn"))
         assert rc == 0
         rec = h.last_run("warn")
         assert rec["exit_class"] == "ok"
@@ -3526,7 +3526,7 @@ class TestSuccessExitCodes:
             },
             default_target_jobs=["warn"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "warn"))
+        rc = crony_runner._run_job(h.snap(cfg, "warn"))
         assert rc == 2
         rec = h.last_run("warn")
         assert rec["exit_class"] == "fail"
@@ -3553,7 +3553,7 @@ class TestSuccessExitCodes:
         monkeypatch.setattr(
             crony_notify, "dispatch_notify", lambda *_a, **_k: called.append(1)
         )
-        crony_runner.run_job(h.snap(cfg, "warn"))
+        crony_runner._run_job(h.snap(cfg, "warn"))
         assert not called  # ok -> dispatch skipped, no dialog
 
 
@@ -3574,7 +3574,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "g"))
+        rc = crony_runner._run_job(h.snap(cfg, "g"))
         assert rc == 0
         rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
@@ -3596,7 +3596,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "g"))
+        rc = crony_runner._run_job(h.snap(cfg, "g"))
         assert rc == 0  # gated exits 0
         rec = h.last_run("g")
         assert rec["exit_class"] == "gated"
@@ -3622,7 +3622,7 @@ class TestRunJobGate:
             },
             default_target_jobs=["g"],
         )
-        rc = crony_runner.run_job(h.snap(cfg, "g"), skip_gate=True)
+        rc = crony_runner._run_job(h.snap(cfg, "g"), skip_gate=True)
         assert rc == 0
         rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
@@ -3649,7 +3649,7 @@ class TestRunJobLockContention:
         held = open(lock, "w")
         _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         try:
-            rc = crony_runner.run_job(h.snap(cfg, "j"))
+            rc = crony_runner._run_job(h.snap(cfg, "j"))
         finally:
             _fcntl.flock(held, _fcntl.LOCK_UN)
             held.close()
@@ -3675,7 +3675,7 @@ class TestRunJobNotify:
             },
             default_target_jobs=["fail"],
         )
-        crony_runner.run_job(h.snap(cfg, "fail"))
+        crony_runner._run_job(h.snap(cfg, "fail"))
         rec = h.last_run("fail")
         assert rec["notifications"] == {}
 
@@ -3761,7 +3761,7 @@ class TestRunGroup:
                 h.full("b"): {"exit_code": 0, "exit_class": "ok"},
             },
         )
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = h.last_run("g")
         names = [c["name"] for c in rec["jobs_run"]]
@@ -3798,7 +3798,7 @@ class TestRunGroup:
                 h.full("good"): {"exit_code": 0, "exit_class": "ok"},
             },
         )
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         # Group orchestration succeeds even if a child failed.
         assert rc == 0
         rec = h.last_run("g")
@@ -3837,7 +3837,7 @@ class TestRunGroup:
         )
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "b")
-        crony_runner.run_group(h.snap(cfg, "g"))
+        crony_runner._run_group(h.snap(cfg, "g"))
         rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
 
@@ -3853,7 +3853,7 @@ class TestRunGroup:
             default_target_jobs=["g"],
         )
         _stub_trigger_sync(monkeypatch, {})
-        rc = crony_runner.run_group(h.snap(cfg, "g"), dry_run=True)
+        rc = crony_runner._run_group(h.snap(cfg, "g"), dry_run=True)
         assert rc == 0
         # No last-run.json for either group or child on dry-run.
         # The stub was never called.
@@ -3915,7 +3915,7 @@ class TestRunGroup:
 
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "b")
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = h.last_run("g")
         # Only `a` actually fired; `b` was budget-skipped.
@@ -3955,7 +3955,7 @@ class TestRunGroup:
 
         monkeypatch.setattr(crony_runner, "trigger_unit_sync", _capture)
         h.write_snap(cfg, "a")
-        assert crony_runner.run_group(h.snap(cfg, "g")) == 0
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         assert math.isinf(captured[h.full("a")])
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "ok"
@@ -3998,7 +3998,7 @@ class TestRunGroup:
         monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub)
         h.write_snap(cfg, "missing")
         h.write_snap(cfg, "ok")
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         # Group orchestration succeeds (rc 0); the child failure
         # surfaces in the rolled-up exit_class and per-child
         # records so the runner's notification path fires.
@@ -4047,7 +4047,7 @@ class TestRunGroup:
         monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub)
         # Only "ok" gets a snapshot; "gone" stays unresolvable.
         h.write_snap(cfg, "ok")
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         assert rc == 0
         rec = h.last_run("g")
         # Resolved child ran first; the synthetic fail row trails.
@@ -4092,7 +4092,7 @@ class TestRunGroupInteractive:
             },
             default_target_jobs=["g"],
         )
-        # Snapshots so `child_is_interactive` can read them.
+        # Snapshots so `_child_is_interactive` can read them.
         h.write_snap(cfg, "iv")
         h.write_snap(cfg, "regular")
 
@@ -4109,7 +4109,7 @@ class TestRunGroupInteractive:
         monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub_sync)
         monkeypatch.setattr(crony_runner, "trigger_unit", _stub_async)
 
-        rc = crony_runner.run_group(h.snap(cfg, "g"))
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
         assert rc == 0
 
         # Interactive child went through the async path; the
@@ -4209,7 +4209,7 @@ class TestRunGroupInteractive:
         # `dispatched` has precedence 0 so it ties with ok / gated
         # in the rollup; a group with only dispatched children
         # rolls up as "ok".
-        rollup = crony_runner.rollup_group_exit_class(
+        rollup = crony_runner._rollup_group_exit_class(
             [
                 GroupChildResult(
                     name="a", exit_class="dispatched", exit_code=0
@@ -4220,7 +4220,7 @@ class TestRunGroupInteractive:
         assert rollup == "ok"
 
     def test_dispatched_rolls_up_under_fail(self) -> None:
-        rollup = crony_runner.rollup_group_exit_class(
+        rollup = crony_runner._rollup_group_exit_class(
             [
                 GroupChildResult(
                     name="a", exit_class="dispatched", exit_code=0
@@ -4899,7 +4899,7 @@ class TestDialogPopupNotify:
         # No block, no other defined channels: the built-in name is
         # still a valid notify_channels entry.
         assert (
-            validate_notify_channels(
+            _validate_notify_channels(
                 ["dialog-popup"], set(), "[defaults]", is_default=False
             )
             is None
@@ -5022,7 +5022,7 @@ class TestDialogPopupNotify:
         )
         script = captured["cmd"][2]
         assert "secret log line" not in script
-        assert crony_notify.LOG_SEPARATOR not in script
+        assert crony_notify._LOG_SEPARATOR not in script
 
 
 class TestMultiChannelDispatch:
@@ -5143,7 +5143,7 @@ class TestNotifyChannelOrderPreserved:
             },
             default_target_jobs=["fail"],
         )
-        crony_runner.run_job(h.snap(cfg, "fail"))
+        crony_runner._run_job(h.snap(cfg, "fail"))
         rec = h.last_run("fail")
         assert list(rec["notifications"].keys()) == order
 
@@ -5662,12 +5662,12 @@ class TestKeepAwake:
         assert self._snap(True).keep_awake is True
 
     def test_disabled_passthrough(self) -> None:
-        argv, note = crony_runner.keep_awake_argv(["true"], self._snap(False))
+        argv, note = crony_runner._keep_awake_argv(["true"], self._snap(False))
         assert argv == ["true"]
         assert note is None
 
     def test_enabled_delegates_to_host(self, monkeypatch: Any) -> None:
-        # When keep_awake is set, keep_awake_argv hands the command and
+        # When keep_awake is set, _keep_awake_argv hands the command and
         # the job label to the host wrapper and returns its result. The
         # per-host inhibitor command is covered by the backend tests.
         seen: dict[str, Any] = {}
@@ -5680,7 +5680,7 @@ class TestKeepAwake:
                 return ["wrap", *argv], None
 
         monkeypatch.setattr(crony_runtime, "host", lambda: _FakeHost())
-        argv, note = crony_runner.keep_awake_argv(["true"], self._snap(True))
+        argv, note = crony_runner._keep_awake_argv(["true"], self._snap(True))
         assert argv == ["wrap", "true"]
         assert note is None
         # The job's full name is passed through as the label.
@@ -5699,9 +5699,9 @@ class TestKeepAwake:
 
         def fake_exec(argv: list[str], **_kwargs: object) -> Any:
             captured["argv"] = argv
-            return crony_runner.ExitOutcome(rc=0, signal=None)
+            return crony_runner._ExitOutcome(rc=0, signal=None)
 
-        monkeypatch.setattr(crony_runner, "exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -5714,7 +5714,7 @@ class TestKeepAwake:
             },
             default_target_jobs=["j"],
         )
-        assert crony_runner.run_job(h.snap(cfg, "j")) == 0
+        assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         assert captured["argv"] == [
             "/x/caffeinate",
             "-i",
@@ -5734,9 +5734,9 @@ class TestKeepAwake:
             *_args: object, job_timeout_sec: Any, **_kwargs: object
         ) -> Any:
             captured["job_timeout_sec"] = job_timeout_sec
-            return crony_runner.ExitOutcome(rc=0, signal=None)
+            return crony_runner._ExitOutcome(rc=0, signal=None)
 
-        monkeypatch.setattr(crony_runner, "exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -5749,7 +5749,7 @@ class TestKeepAwake:
             },
             default_target_jobs=["j"],
         )
-        assert crony_runner.run_job(h.snap(cfg, "j")) == 0
+        assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         # 0 (no cap) reaches the runner as None so proc.wait never caps.
         assert captured["job_timeout_sec"] is None
 
@@ -5770,7 +5770,7 @@ class TestKeepAwake:
             },
             default_target_jobs=["j"],
         )
-        assert crony_runner.run_job(h.snap(cfg, "j")) == 0
+        assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         log = (h.state_dir("j") / "run.log").read_text(encoding="utf-8")
         assert "caffeinate not found" in log
 
@@ -5879,7 +5879,7 @@ class TestApplyFullSync:
     def test_no_arg_apply_fully_wipes_orphan_state_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Apply's orphan removal goes through destroy_one with
+        # Apply's orphan removal goes through _destroy_one with
         # default semantics, which fully wipes the entry's state
         # dir -- runtime artifacts included. This matches the
         # default destroy behavior so a renamed entry's residue
@@ -6225,7 +6225,7 @@ class TestApplyRenamePreservesHistory:
     """The whole point of keying state by uuid: a TOML edit that
     only changes a job's short name keeps the same state dir, so
     run.log and last-run.json carry over to the new name. The old
-    name's platform unit becomes a stale label; apply_one removes
+    name's platform unit becomes a stale label; _apply_one removes
     it when re-applying the entry under its new name (unless the
     old name was handed to a live sibling in a name-swap edit).
     """
@@ -6799,7 +6799,7 @@ class TestResolveCliName:
 
 
 class TestBrokenPipeHandler:
-    """Smoke check that BrokenPipeAwareStreamHandler swallows
+    """Smoke check that _BrokenPipeAwareStreamHandler swallows
     BrokenPipeError without raising and swaps to /dev/null so the
     next emit doesn't blow up either.
     """
@@ -6808,7 +6808,7 @@ class TestBrokenPipeHandler:
         # Create the handler attached to a regular file we can verify.
         log_path = tmp_path / "out"
         stream = open(log_path, "w")
-        handler = crony_cli.BrokenPipeAwareStreamHandler(stream)
+        handler = crony_cli._BrokenPipeAwareStreamHandler(stream)
         # Synthesize a "BrokenPipeError caught while emitting" by
         # stuffing one into sys.exc_info via a dummy raise.
         record = logging.LogRecord(
@@ -6938,7 +6938,7 @@ class TestUnitNameDelegatesTolerateRefForm:
 
     def test_unit_config_path_none_for_ref_form(self) -> None:
         for platform in ("darwin", "linux"):
-            got = crony_runtime.platform_unit_config_path(
+            got = crony_runtime._platform_unit_config_path(
                 self._REF_FORM, platform
             )
             assert got is None
@@ -6955,13 +6955,13 @@ class TestUvExecutable:
     ) -> None:
         monkeypatch.setattr(crony_commands.shutil, "which", lambda _name: None)
         with pytest.raises(PreconditionError, match="uv not found"):
-            crony_commands.uv_executable()
+            crony_commands._uv_executable()
 
 
 class TestConfigState:
     """`Config.config_state` classification driven through the real
     apply -> load_config path (vs `TestConfigStateInMemory`, which
-    plants snapshots by hand). Confirms apply_one writes a snapshot
+    plants snapshots by hand). Confirms _apply_one writes a snapshot
     that load_config scores as synced, and that a config edit
     without re-apply flips it to stale.
     """
@@ -9228,7 +9228,7 @@ class TestStatusReport:
         assert not header.rstrip().endswith("UNIT")
 
     def test_status_help_epilog_lists_columns(self) -> None:
-        parser = crony_cli.build_parser()
+        parser = crony_cli._build_parser()
         # Locate the status subparser and pull its epilog text.
         subparsers_action = next(
             a
@@ -9256,7 +9256,7 @@ class TestStatusReport:
             assert col in text
         # `default` alias enumerates its expansion verbatim so the
         # block doubles as the documentation of the default set.
-        for col in crony_commands.DEFAULT_STATUS_COLS:
+        for col in crony_commands._DEFAULT_STATUS_COLS:
             assert col in text
         # `all` is rendered as a label rather than the full list.
         assert "  all       all" in text
@@ -9819,7 +9819,7 @@ class TestValidate:
 
 
 class TestResolveStateAxes:
-    """Direct unit tests for `resolve_state_axes`. `do_status` is
+    """Direct unit tests for `_resolve_state_axes`. `do_status` is
     the only consumer; the helper is unit-tested separately so
     a future refactor can rely on its branch semantics being
     pinned without re-deriving them from the renderer.
@@ -9837,7 +9837,7 @@ class TestResolveStateAxes:
         h.config({}, default_target_jobs=[])
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
         config = crony_runtime.load_config()
-        cfg, sched, last = crony_commands.resolve_state_axes(
+        cfg, sched, last = crony_commands._resolve_state_axes(
             config, ghost, config.installed_full_names()
         )
         assert cfg == "orphan"
@@ -9859,7 +9859,7 @@ class TestResolveStateAxes:
 
         monkeypatch.setattr(crony_runtime, "unit_state", _stub_sched)
         config = crony_runtime.load_config()
-        cfg, unit_state, last = crony_commands.resolve_state_axes(
+        cfg, unit_state, last = crony_commands._resolve_state_axes(
             config, h.full("ghost"), set()
         )
         assert cfg == "missing"
@@ -9885,7 +9885,7 @@ class TestResolveStateAxes:
         h.apply("g")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
         config = crony_runtime.load_config()
-        _, sched, _ = crony_commands.resolve_state_axes(
+        _, sched, _ = crony_commands._resolve_state_axes(
             config, h.full("a"), config.installed_full_names()
         )
         assert sched == "grouped"
@@ -9902,7 +9902,7 @@ class TestResolveStateAxes:
         h.apply("j")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "disabled")
         config = crony_runtime.load_config()
-        cfg_state, sched, _ = crony_commands.resolve_state_axes(
+        cfg_state, sched, _ = crony_commands._resolve_state_axes(
             config, h.full("j"), config.installed_full_names()
         )
         assert cfg_state == "synced"
@@ -10207,8 +10207,10 @@ class TestPerEntityConfigErrors:
             default_target_jobs=[],
         )
         config = crony_runtime.load_config()
-        cfg_state, _unit_state, _last_state = crony_commands.resolve_state_axes(
-            config, h.full("bad"), config.installed_full_names()
+        cfg_state, _unit_state, _last_state = (
+            crony_commands._resolve_state_axes(
+                config, h.full("bad"), config.installed_full_names()
+            )
         )
         assert cfg_state == "error"
 
@@ -10281,7 +10283,7 @@ class TestLogs:
         monkeypatch.setattr(crony_commands.time, "sleep", _interrupt)
         # Mirrors the resolution `do_logs` performs when `n is None`
         # and `tail` is True.
-        crony_commands.follow_log(log, n=10)
+        crony_commands._follow_log(log, n=10)
         out = capsys.readouterr().out
         printed = out.splitlines()
         assert printed == [f"line-{i}" for i in range(40, 50)]
@@ -10366,13 +10368,13 @@ class TestLogs:
 
     def test_parse_since_unparseable(self) -> None:
         with pytest.raises(UsageError, match="unparseable"):
-            crony_commands.parse_since("eventually")
+            crony_commands._parse_since("eventually")
 
     def test_parse_since_naive_iso_rejected(self) -> None:
         # Naive ISO would crash later when compared with tz-aware
         # run-header timestamps; surface at parse time instead.
         with pytest.raises(UsageError, match="timezone offset"):
-            crony_commands.parse_since("2026-04-01T12:00:00")
+            crony_commands._parse_since("2026-04-01T12:00:00")
 
     def test_follow_log_returns_cleanly_on_keyboard_interrupt(
         self, tmp_path: Path, monkeypatch: Any
@@ -10388,7 +10390,7 @@ class TestLogs:
 
         monkeypatch.setattr(crony_commands.time, "sleep", _interrupt)
         # Returns cleanly rather than propagating the KeyboardInterrupt.
-        crony_commands.follow_log(log)
+        crony_commands._follow_log(log)
 
     def test_follow_log_prints_history_before_following(
         self,
@@ -10407,7 +10409,7 @@ class TestLogs:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(crony_commands.time, "sleep", _interrupt)
-        crony_commands.follow_log(log, n=5)
+        crony_commands._follow_log(log, n=5)
         out = capsys.readouterr().out
         # Last 5 lines (15..19) present, earlier lines suppressed.
         assert "line-19" in out
@@ -10428,7 +10430,7 @@ class TestLogs:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(crony_commands.time, "sleep", _interrupt)
-        crony_commands.follow_log(log, n=0)
+        crony_commands._follow_log(log, n=0)
         out = capsys.readouterr().out
         assert out == ""
 
@@ -10509,7 +10511,7 @@ class TestLogs:
 
 
 class TestGroupExitClassRollup:
-    """Direct unit tests for `rollup_group_exit_class`. Status
+    """Direct unit tests for `_rollup_group_exit_class`. Status
     and the LAST axis read this rolled-up value from the
     group's last-run.json instead of re-deriving it; coverage
     here keeps the precedence ladder honest as new exit_class
@@ -10523,11 +10525,11 @@ class TestGroupExitClassRollup:
         ]
 
     def test_empty_rolls_up_to_ok(self) -> None:
-        assert crony_runner.rollup_group_exit_class([]) == "ok"
+        assert crony_runner._rollup_group_exit_class([]) == "ok"
 
     def test_all_ok_rolls_up_to_ok(self) -> None:
         assert (
-            crony_runner.rollup_group_exit_class(self._children("ok", "ok"))
+            crony_runner._rollup_group_exit_class(self._children("ok", "ok"))
             == "ok"
         )
 
@@ -10535,11 +10537,11 @@ class TestGroupExitClassRollup:
         # Gating is per-child intent ("don't run today"), not a
         # group-level outcome.
         assert (
-            crony_runner.rollup_group_exit_class(self._children("ok", "gated"))
+            crony_runner._rollup_group_exit_class(self._children("ok", "gated"))
             == "ok"
         )
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("gated", "gated")
             )
             == "ok"
@@ -10547,7 +10549,7 @@ class TestGroupExitClassRollup:
 
     def test_any_fail_rolls_up_to_fail(self) -> None:
         assert (
-            crony_runner.rollup_group_exit_class(self._children("ok", "fail"))
+            crony_runner._rollup_group_exit_class(self._children("ok", "fail"))
             == "fail"
         )
 
@@ -10556,7 +10558,9 @@ class TestGroupExitClassRollup:
         # downstream reader can distinguish abort signals from
         # plain non-zero exits if it cares.
         assert (
-            crony_runner.rollup_group_exit_class(self._children("ok", "signal"))
+            crony_runner._rollup_group_exit_class(
+                self._children("ok", "signal")
+            )
             == "signal"
         )
 
@@ -10564,7 +10568,7 @@ class TestGroupExitClassRollup:
         # Group with both a fail and a timeout: timeout wins so
         # the LAST axis surfaces the more severe condition.
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("fail", "timeout", "ok")
             )
             == "timeout"
@@ -10574,13 +10578,13 @@ class TestGroupExitClassRollup:
         # gated ties with ok at the bottom; a fail child must
         # still surface, not be masked by sibling gating.
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("gated", "fail")
             )
             == "fail"
         )
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("fail", "gated")
             )
             == "fail"
@@ -10592,13 +10596,13 @@ class TestGroupExitClassRollup:
         # encountered-order outcome rather than swapping based on
         # iteration. This pins the tie-break for either case.
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("signal", "fail")
             )
             == "signal"
         )
         assert (
-            crony_runner.rollup_group_exit_class(
+            crony_runner._rollup_group_exit_class(
                 self._children("fail", "signal")
             )
             == "fail"
@@ -10607,7 +10611,7 @@ class TestGroupExitClassRollup:
 
 class TestLogHelpers:
     """Direct unit tests for `extract_latest_log_entry` and
-    `head_truncate_to_kb`. Exercised end-to-end via TestLogs and
+    `_head_truncate_to_kb`. Exercised end-to-end via TestLogs and
     TestNtfyNotify; this class isolates the boundary conditions
     so a regression in either helper surfaces here first.
     """
@@ -10633,7 +10637,7 @@ class TestLogHelpers:
 
     def test_head_truncate_under_cap_passes_through(self) -> None:
         text = "small body\n"
-        out, truncated = crony_notify.head_truncate_to_kb(text, 1)
+        out, truncated = crony_notify._head_truncate_to_kb(text, 1)
         assert out == text
         assert truncated is False
 
@@ -10642,7 +10646,7 @@ class TestLogHelpers:
         # the start. The output must be <= 1024 bytes and start with
         # the truncation marker.
         text = "X" * 3000 + "TAIL"
-        out, truncated = crony_notify.head_truncate_to_kb(text, 1)
+        out, truncated = crony_notify._head_truncate_to_kb(text, 1)
         assert truncated is True
         assert len(out.encode("utf-8")) <= 1024
         assert out.startswith("[... ")
@@ -12185,7 +12189,7 @@ class TestTriggerUnitSync:
         # Stub the platform trigger to write a pid file
         # immediately. The pid points at the real test process
         # (which won't exit during the test) -- we additionally
-        # stub `wait_for_pid_exit` to simulate the runner
+        # stub `_wait_for_pid_exit` to simulate the runner
         # finishing AFTER trigger_timeout has already elapsed.
         (sd / "run.pid").write_text(f"{os.getpid()}\n")
         wait_calls: list[float] = []
@@ -12205,7 +12209,7 @@ class TestTriggerUnitSync:
         monkeypatch.setattr(
             crony_runner, "trigger_unit", lambda *_a, **_kw: None
         )
-        monkeypatch.setattr(crony_runner, "wait_for_pid_exit", _stub_wait)
+        monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _stub_wait)
         rec = crony_runner.trigger_unit_sync(
             full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
         )
@@ -12219,7 +12223,7 @@ class TestTriggerUnitSync:
 
 
 class TestPlatformUnitDiscovery:
-    """`platform_unit_names` walks the platform unit directory
+    """`_platform_unit_names` walks the platform unit directory
     and returns crony-managed entries by parsing their filenames.
     Used so units lingering after a state wipe still surface as
     orphans for status / destroy.
@@ -12234,7 +12238,7 @@ class TestPlatformUnitDiscovery:
         (h.agents / "org.crony.bundle.bar.plist").write_text("")
         # Non-crony plist must be ignored.
         (h.agents / "com.other.app.plist").write_text("")
-        names = crony_runtime.platform_unit_names()
+        names = crony_runtime._platform_unit_names()
         assert names == {"default.foo", "bundle.bar"}
 
     def test_finds_service_and_timer_on_linux(
@@ -12246,7 +12250,7 @@ class TestPlatformUnitDiscovery:
         (h.sysd / "crony-bundle.bar.service").write_text("")
         # Foreign unit must be ignored.
         (h.sysd / "myapp.service").write_text("")
-        names = crony_runtime.platform_unit_names()
+        names = crony_runtime._platform_unit_names()
         assert names == {"default.foo", "bundle.bar"}
 
     def test_missing_unit_dir_returns_empty(
@@ -12256,7 +12260,7 @@ class TestPlatformUnitDiscovery:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         if h.agents.exists():
             shutil.rmtree(h.agents)
-        assert crony_runtime.platform_unit_names() == set()
+        assert crony_runtime._platform_unit_names() == set()
 
 
 class TestSnapshotLifecycle:
@@ -12743,7 +12747,7 @@ class TestSnapshotLifecycle:
         h.apply("j")
         snap_path = h.state_dir("j") / "snapshot.json"
         assert snap_path.exists()
-        crony_commands.destroy_one(h.full("j"), h.state_dir("j"))
+        crony_commands._destroy_one(h.full("j"), h.state_dir("j"))
         assert not snap_path.exists()
 
     def test_run_subcommand_hidden_from_top_level_help(self) -> None:
@@ -12752,7 +12756,7 @@ class TestSnapshotLifecycle:
         # nor in the subcommand description block. Free-form prose
         # in the epilog can still mention "run" as a verb -- this
         # test scopes to the structural surfaces only.
-        parser = crony_cli.build_parser()
+        parser = crony_cli._build_parser()
         usage_line = parser.format_usage()
         assert "trigger" not in usage_line  # uses metavar, not choices
         assert "run" not in usage_line, (
@@ -12964,7 +12968,7 @@ class TestUnitDriftDetection:
         # extracted paths against the filesystem and flags the
         # install as broken when either's gone.
         content = unit_config.read_text()
-        live_uv = str(crony_commands.uv_executable())
+        live_uv = str(crony_commands._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
@@ -12991,7 +12995,7 @@ class TestUnitDriftDetection:
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
         # `do_apply` reads the unit-drift verdict from the Config it
-        # loaded once at start (apply_one's `model` path), not by
+        # loaded once at start (_apply_one's `model` path), not by
         # re-probing disk per entry. A unit deleted after the first
         # apply is `unit_is_stale` at load time, so the no-arg apply
         # re-renders it.
@@ -13211,7 +13215,7 @@ class TestInteractiveHelpers:
             "sleep",
             lambda s: now.__setitem__(0, now[0] + s),
         )
-        crony_runner.wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
+        crony_runner._wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
         # Reached the return path; bound the elapsed time so a
         # broken loop would have hung the test.
         assert now[0] <= 300
@@ -13233,7 +13237,7 @@ class TestInteractiveHelpers:
             "sleep",
             lambda s: now.__setitem__(0, now[0] + s),
         )
-        crony_runner.wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
+        crony_runner._wait_for_user_active(120, poll_sec=30, idle_break_sec=60)
 
     def test_wait_treats_locked_screen_as_idle(self, monkeypatch: Any) -> None:
         # Even with idle == 0, a locked screen prevents the active
@@ -13250,7 +13254,7 @@ class TestInteractiveHelpers:
             "sleep",
             lambda s: now.__setitem__(0, now[0] + s),
         )
-        crony_runner.wait_for_user_active(60, poll_sec=30, idle_break_sec=60)
+        crony_runner._wait_for_user_active(60, poll_sec=30, idle_break_sec=60)
 
     def test_wait_bypass_check_short_circuits(self, monkeypatch: Any) -> None:
         host = _idle_lock_host(idle=lambda: 0.0, locked=lambda: False)
@@ -13258,7 +13262,7 @@ class TestInteractiveHelpers:
         # Trip the bypass on the first poll; idle / lock checks are
         # never consulted.
         assert (
-            crony_runner.wait_for_user_active(
+            crony_runner._wait_for_user_active(
                 100_000, bypass_check=lambda: True, poll_sec=1
             )
             is False
@@ -13283,7 +13287,7 @@ class TestInteractiveHelpers:
             lambda s: now.__setitem__(0, now[0] + s),
         )
         assert (
-            crony_runner.wait_for_user_active(
+            crony_runner._wait_for_user_active(
                 120,
                 bypass_check=lambda: False,
                 poll_sec=30,
@@ -13303,7 +13307,7 @@ class TestInteractiveHelpers:
             lambda s: now.__setitem__(0, now[0] + s),
         )
         assert (
-            crony_runner.delay_or_bypass(
+            crony_runner._delay_or_bypass(
                 120, bypass_check=lambda: False, poll_sec=30
             )
             is True
@@ -13320,7 +13324,7 @@ class TestInteractiveHelpers:
         sleeps: list[float] = []
         monkeypatch.setattr(crony_commands.time, "sleep", sleeps.append)
         assert (
-            crony_runner.delay_or_bypass(
+            crony_runner._delay_or_bypass(
                 3600,
                 bypass_check=lambda: next(bypass_values),
                 poll_sec=30,
@@ -13343,12 +13347,12 @@ class TestInteractiveHelpers:
     def test_dialog_run_button(self, monkeypatch: Any) -> None:
         host = self._dialog_host("Run Job")
         monkeypatch.setattr(crony_runtime, "host", lambda: host)
-        assert crony_runner.show_interactive_dialog("foo", "msg") == "run"
+        assert crony_runner._show_interactive_dialog("foo", "msg") == "run"
 
     def test_dialog_delay_button(self, monkeypatch: Any) -> None:
         host = self._dialog_host("Delay Job")
         monkeypatch.setattr(crony_runtime, "host", lambda: host)
-        assert crony_runner.show_interactive_dialog("foo", "msg") == "delay"
+        assert crony_runner._show_interactive_dialog("foo", "msg") == "delay"
         # The cancel button is first and the run button last, so the
         # backend uses them as the AppleScript cancel / default buttons.
         assert host.captured["buttons"] == [
@@ -13362,7 +13366,7 @@ class TestInteractiveHelpers:
         # dialog, or an unavailable osascript; all map to 'cancel'.
         host = self._dialog_host("")
         monkeypatch.setattr(crony_runtime, "host", lambda: host)
-        assert crony_runner.show_interactive_dialog("foo", "msg") == "cancel"
+        assert crony_runner._show_interactive_dialog("foo", "msg") == "cancel"
 
 
 class TestUserTriggerFlag:
@@ -13442,7 +13446,7 @@ class TestUserTriggerFlag:
 
 
 class TestRunJobInteractive:
-    """End-to-end run_job behavior for interactive jobs. The wait /
+    """End-to-end _run_job behavior for interactive jobs. The wait /
     prompt helper is monkeypatched to return scripted choices so
     the tests don't depend on idle detection or osascript.
     """
@@ -13465,10 +13469,10 @@ class TestRunJobInteractive:
         )
         monkeypatch.setattr(
             crony_runner,
-            "interactive_wait_and_prompt",
+            "_interactive_wait_and_prompt",
             lambda _snap, _log_file: "run",
         )
-        rc = crony_runner.run_job(h.snap(cfg, "iv"))
+        rc = crony_runner._run_job(h.snap(cfg, "iv"))
         assert rc == 0
         rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
@@ -13493,10 +13497,10 @@ class TestRunJobInteractive:
         )
         monkeypatch.setattr(
             crony_runner,
-            "interactive_wait_and_prompt",
+            "_interactive_wait_and_prompt",
             lambda _snap, _log_file: "cancel",
         )
-        rc = crony_runner.run_job(h.snap(cfg, "iv"))
+        rc = crony_runner._run_job(h.snap(cfg, "iv"))
         assert rc == 0
         rec = h.last_run("iv")
         assert rec["exit_class"] == "canceled"
@@ -13522,7 +13526,7 @@ class TestRunJobInteractive:
         )
         # Snapshot resolution creates the state dir, but the flag
         # might be written by trigger BEFORE the runner starts. Mimic
-        # that: write the flag before run_job, into the uuid-keyed
+        # that: write the flag before _run_job, into the uuid-keyed
         # state dir.
         sd = h.state_dir("iv", cfg=cfg)
         crony_runtime.write_user_trigger_flag(sd)
@@ -13534,9 +13538,9 @@ class TestRunJobInteractive:
             return "run"
 
         monkeypatch.setattr(
-            crony_runner, "interactive_wait_and_prompt", _no_wait
+            crony_runner, "_interactive_wait_and_prompt", _no_wait
         )
-        rc = crony_runner.run_job(h.snap(cfg, "iv"))
+        rc = crony_runner._run_job(h.snap(cfg, "iv"))
         assert rc == 0
         assert called == []
         rec = h.last_run("iv")
@@ -13566,7 +13570,7 @@ class TestRunJobInteractive:
             default_target_jobs=["iv"],
         )
         sd = h.state_dir("iv", cfg=cfg)
-        # Drive the real interactive_wait_and_prompt: HID idle is
+        # Drive the real _interactive_wait_and_prompt: HID idle is
         # high (idle break), screen is locked -- no natural
         # accumulation -- but on the second poll a `crony trigger`
         # writes the bypass flag and the wait short-circuits.
@@ -13583,7 +13587,7 @@ class TestRunJobInteractive:
 
         monkeypatch.setattr(crony_commands.time, "sleep", fake_sleep)
 
-        rc = crony_runner.run_job(h.snap(cfg, "iv"))
+        rc = crony_runner._run_job(h.snap(cfg, "iv"))
         assert rc == 0
         rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
@@ -13592,7 +13596,7 @@ class TestRunJobInteractive:
 
 
 class TestLastRunStateInteractive:
-    """`last_run_state` reports `pending` for an interactive job
+    """`_last_run_state` reports `pending` for an interactive job
     sitting in its wait loop, and `canceled` for a completed run
     whose user clicked Cancel Job.
     """
@@ -13607,7 +13611,7 @@ class TestLastRunStateInteractive:
         (sd / "pending.flag").write_bytes(b"")
         with crony_runtime.acquire_lock(sd / "run.lock"):
             config = crony_runtime.load_config()
-            assert crony_commands.last_run_state(config, full) == "pending"
+            assert crony_commands._last_run_state(config, full) == "pending"
 
     def test_running_when_lock_held_without_flag(
         self, tmp_path: Path, monkeypatch: Any
@@ -13618,7 +13622,7 @@ class TestLastRunStateInteractive:
         sd = h.fabricate_orphan("iv")
         with crony_runtime.acquire_lock(sd / "run.lock"):
             config = crony_runtime.load_config()
-            assert crony_commands.last_run_state(config, full) == "running"
+            assert crony_commands._last_run_state(config, full) == "running"
 
     def test_canceled_from_last_run_json(
         self, tmp_path: Path, monkeypatch: Any
@@ -13638,7 +13642,7 @@ class TestLastRunStateInteractive:
             encoding="utf-8",
         )
         config = crony_runtime.load_config()
-        assert crony_commands.last_run_state(config, full) == "canceled"
+        assert crony_commands._last_run_state(config, full) == "canceled"
 
 
 class TestStatusRenameUuidModel:
@@ -13790,13 +13794,13 @@ class TestStatusColor:
     when stdout is a color-capable TTY. The `^` marker stays uncolored.
     """
 
-    R = crony_commands.ANSI_RED
-    Y = crony_commands.ANSI_YELLOW
-    X = crony_commands.ANSI_RESET
+    R = crony_commands._ANSI_RED
+    Y = crony_commands._ANSI_YELLOW
+    X = crony_commands._ANSI_RESET
 
     def _force_color(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
-        monkeypatch.setattr(crony_commands, "color_supported", lambda: True)
+        monkeypatch.setattr(crony_commands, "_color_supported", lambda: True)
 
     def test_stale_and_divergence_are_yellow_missing_is_red(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -13925,13 +13929,13 @@ class TestStatusColor:
 
         monkeypatch.setattr(crony_commands.sys, "stdout", _Tty())
         monkeypatch.delenv("NO_COLOR", raising=False)
-        assert crony_commands.color_supported() is True
+        assert crony_commands._color_supported() is True
         monkeypatch.setenv("NO_COLOR", "1")
-        assert crony_commands.color_supported() is False
+        assert crony_commands._color_supported() is False
         # Non-TTY stream never colors, regardless of NO_COLOR.
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setattr(crony_commands.sys, "stdout", io.StringIO())
-        assert crony_commands.color_supported() is False
+        assert crony_commands._color_supported() is False
 
 
 if __name__ == "__main__":

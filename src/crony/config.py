@@ -2,7 +2,7 @@
 
 """crony's TOML configuration layer.
 
-The input model (the Toml* / Notify* / Defaults / Target / HostList
+The input model (the Toml* / Notify* / Defaults / Target / _HostList
 dataclasses), the parsers that build it from raw TOML, cross-cutting
 validation, multi-bundle loading, target selection, and the resolved_*
 cascade that derives effective per-job settings. ConfigError on any
@@ -213,7 +213,7 @@ class Defaults:
 
 
 @dataclass
-class HostList:
+class _HostList:
     """A `hosts = [...]` filter.
 
     Empty `names` = applies everywhere (the common case). Non-empty
@@ -267,9 +267,9 @@ class TomlJob:
     # `platforms`: empty list = applies to every platform. Non-empty
     # = applies only on listed platforms; otherwise the entry is
     # silently skipped at selection time. `hosts` works the same
-    # way but additionally supports negation -- see HostList.
+    # way but additionally supports negation -- see _HostList.
     platforms: list[str] = field(default_factory=list)
-    hosts: HostList = field(default_factory=HostList)
+    hosts: _HostList = field(default_factory=_HostList)
     job_timeout_sec: int | None = None
     # None = inherit from target/defaults; 0 = no wallclock cap (the
     # job caps itself). An uncapped job propagates up: any group that
@@ -320,7 +320,7 @@ class TomlJobGroup:
 
     `platforms` / `hosts` work the same way as on TomlJob: empty
     means "applies everywhere", non-empty restricts selection.
-    `hosts` supports negation via `!host` entries -- see HostList.
+    `hosts` supports negation via `!host` entries -- see _HostList.
     A group filtered out doesn't recurse into its children; a
     child filtered out is skipped while siblings continue.
     """
@@ -330,7 +330,7 @@ class TomlJobGroup:
     jobs: list[str] = field(default_factory=list)
     timing: crony.unit.Timing | None = None
     platforms: list[str] = field(default_factory=list)
-    hosts: HostList = field(default_factory=HostList)
+    hosts: _HostList = field(default_factory=_HostList)
 
 
 @dataclass
@@ -673,7 +673,7 @@ class TomlBundleConfig:
     def resolved_env(self, job: TomlJob) -> dict[str, str]:
         """Merge env: defaults under job (a job's own key wins).
         Targets carry no env. Values stay literal here -- `$VAR`
-        expansion happens at fire time in `runtime_env`."""
+        expansion happens at fire time in `_runtime_env`."""
         return {**self.defaults.env, **job.env}
 
     def resolved_group_timeout_sec(
@@ -688,7 +688,7 @@ class TomlBundleConfig:
         (`job_timeout_sec = 0`, or a sub-group that resolved to 0) --
         an uncapped child can't be bounded by a finite cumulative
         deadline, so the whole group goes uncapped. Used by:
-        - `run_group` to bound its cumulative dispatch loop.
+        - `_run_group` to bound its cumulative dispatch loop.
         - The waiter in `trigger_unit_sync` to bound its pid-watch
           when waiting for a group.
         Cycle-safety: `_validate_config` rejects cycles in group
@@ -700,7 +700,7 @@ class TomlBundleConfig:
         reserve their time either. Interactive children also
         contribute zero: the group fires them async (no wait), so
         their `job_timeout_sec` doesn't bound any actual wait inside
-        `run_group` and would just inflate the budget.
+        `_run_group` and would just inflate the budget.
         """
         group = self.job_groups[group_name]
         sel_jobs, sel_groups = self.selected_jobs_and_groups(target)
@@ -1288,7 +1288,7 @@ def _parse_platforms_field(raw: dict[str, Any], where: str) -> list[str]:
     return platforms
 
 
-def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
+def _parse_hosts_field(raw: dict[str, Any], where: str) -> _HostList:
     """Parse a `hosts = [...]` field with optional `!` negation.
 
     Entries prefixed with `!` make the whole list a denylist
@@ -1300,14 +1300,14 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
     """
     entries = _string_list(raw, "hosts", where)
     if not entries:
-        return HostList()
+        return _HostList()
     negated = [e.startswith("!") for e in entries]
     if any(negated) and not all(negated):
         raise crony.errors.ConfigError(
             f"{where}: 'hosts' entries must all be negated ('!host') or none"
         )
     if not any(negated):
-        return HostList(names=entries, negated=False)
+        return _HostList(names=entries, negated=False)
     stripped: list[str] = []
     for e in entries:
         name = e[1:]
@@ -1316,7 +1316,7 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> HostList:
                 f"{where}: 'hosts' entry '!' is empty after the negation prefix"
             )
         stripped.append(name)
-    return HostList(names=stripped, negated=True)
+    return _HostList(names=stripped, negated=True)
 
 
 def _parse_interactive_fields(
@@ -1741,7 +1741,7 @@ def _collect_target_parents(
     return parents
 
 
-def validate_notify_channels(
+def _validate_notify_channels(
     channels: list[str],
     defined_channels: set[str],
     label: str,
@@ -1830,7 +1830,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     # references are unattributable -> raise; per-job and per-target
     # references are per-entity -> demote.
     defined_channels = set(config.defaults.notify_channel_defs.keys())
-    defaults_msg = validate_notify_channels(
+    defaults_msg = _validate_notify_channels(
         config.defaults.notify_channels,
         defined_channels,
         "[defaults]",
@@ -1843,7 +1843,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     for jname, job in config.jobs.items():
         if job.notify_channels is None:
             continue
-        job_msg = validate_notify_channels(
+        job_msg = _validate_notify_channels(
             job.notify_channels,
             defined_channels,
             f"[job.{jname}]",
@@ -1884,7 +1884,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             if ref not in all_names:
                 return f"{label}: 'jobs' references undefined name {ref!r}"
         if target.notify_channels is not None:
-            notify_msg = validate_notify_channels(
+            notify_msg = _validate_notify_channels(
                 target.notify_channels,
                 defined_channels,
                 label,
@@ -2031,7 +2031,7 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
 
 def _mask_reason(
     platforms: list[str],
-    hosts: HostList,
+    hosts: _HostList,
     *,
     host: str,
     platform: str,
@@ -2062,7 +2062,7 @@ def _mask_reason(
 
 def _entry_applies_here(
     platforms: list[str],
-    hosts: HostList,
+    hosts: _HostList,
     *,
     host: str,
     platform: str,
