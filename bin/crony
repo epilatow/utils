@@ -6,7 +6,6 @@
 # This is AI generated code
 #
 # IMPORTANT: This script has tests in tests/test_crony.py
-# Always run the `self-test` subcommand after making modifications.
 #
 # The implementation lives in the importable `crony` package under
 # <repo>/src; this entry is just the platform-unit-invocable shim that

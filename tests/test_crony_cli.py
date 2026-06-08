@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,7 +29,6 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from conftest_crony import _isolate_home  # noqa: E402, F401
 
 from crony import cli as crony_cli  # noqa: E402
-from crony import commands as crony_commands  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -129,9 +128,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = crony_cli._COMMAND_CALLBACKS
     PARSER_FUNC = crony_cli._build_parser
     CLI_FUNC = staticmethod(crony_cli.cli)
-    # cli() resolves the self-test handler as crony.commands.do_self_test
-    # (module-attribute), so the dispatch test patches it on crony.commands.
-    MODULE: ClassVar[Any] = crony_commands
     EXIT_CODE_USAGE = ExitCode.USAGE
     TEST_SUBCOMMAND = "status"
     EXCEPTION_EXIT_CODE_MAP = [

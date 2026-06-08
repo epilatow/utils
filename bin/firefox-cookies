@@ -6,7 +6,6 @@
 # This is AI generated code
 #
 # IMPORTANT: This script has tests in tests/test_firefox_cookies.py
-# Always run the `self-test` subcommand after making modifications.
 
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ import shutil
 import signal
 import sqlite3
 import struct
-import subprocess
 import sys
 import tempfile
 import traceback
@@ -927,20 +925,6 @@ def do_list_containers(
             print(f"{count:{count_w}d}  {ctx_id:{id_w}d}  {name}")
 
 
-def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
-    """Run tests by invoking the test file directly."""
-    repo_root = Path(__file__).parent.parent
-    test_file = repo_root / "tests" / "test_firefox_cookies.py"
-
-    cmd = [str(test_file)]
-    if verbose:
-        cmd.append("--verbose")
-    if coverage:
-        cmd.append("--coverage")
-
-    return subprocess.run(cmd, cwd=repo_root).returncode
-
-
 # =============================================================================
 # Argument Parser
 # =============================================================================
@@ -1082,24 +1066,6 @@ def build_parser() -> StrictArgumentParser:
     add_profile_arg(list_containers)
     add_src_arg(list_containers)
 
-    # self-test
-    test_parser = subparsers.add_parser(
-        "self-test",
-        help="Run tests",
-        formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
-    )
-    test_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose test output",
-    )
-    test_parser.add_argument(
-        "--coverage",
-        action="store_true",
-        help="Run with coverage report",
-    )
-
     return parser
 
 
@@ -1121,12 +1087,6 @@ def cli() -> int:
     args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
     args_dict.pop("_seen_flags", None)
-
-    if command == "self-test":
-        return do_self_test(
-            verbose=args_dict.pop("verbose"),
-            coverage=args_dict.pop("coverage"),
-        )
 
     try:
         COMMAND_CALLBACKS[command](**args_dict)

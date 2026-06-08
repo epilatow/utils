@@ -6,7 +6,6 @@
 #
 # IMPORTANT: This script has tests in tests/test_dotfiles.py
 # (and tests/test_binfiles.py when invoked as binfiles).
-# Always run the `self-test` subcommand after making modifications.
 
 from __future__ import annotations
 
@@ -14,7 +13,6 @@ import argparse
 import fnmatch
 import logging
 import os
-import subprocess
 import sys
 import traceback
 from collections.abc import Callable, Iterable, Iterator
@@ -1295,20 +1293,6 @@ def do_cleanup(*, dry_run: bool) -> None:
                     item.unlink()
 
 
-def do_self_test(*, verbose: bool = False, coverage: bool = False) -> int:
-    """Run tests by invoking the active profile's test file directly."""
-    repo_root = Path(__file__).resolve().parent.parent
-    test_file = repo_root / "tests" / f"test_{ACTIVE_PROFILE.name}.py"
-
-    cmd = [str(test_file)]
-    if verbose:
-        cmd.append("--verbose")
-    if coverage:
-        cmd.append("--coverage")
-
-    return subprocess.run(cmd, cwd=repo_root).returncode
-
-
 # =============================================================================
 # ARGUMENT PARSER
 # =============================================================================
@@ -1415,20 +1399,6 @@ def build_parser() -> StrictArgumentParser:
         help="Show what would be removed without removing it",
     )
 
-    # Self-test subcommand
-    test_parser = subparsers.add_parser("self-test", help="Run tests")
-    test_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose test output",
-    )
-    test_parser.add_argument(
-        "--coverage",
-        action="store_true",
-        help="Run with coverage report",
-    )
-
     return parser
 
 
@@ -1458,12 +1428,6 @@ def cli() -> int:
     parser = build_parser()
     args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
-
-    if command == "self-test":
-        return do_self_test(
-            verbose=args_dict.pop("verbose"),
-            coverage=args_dict.pop("coverage"),
-        )
 
     try:
         COMMAND_CALLBACKS[command](**args_dict)

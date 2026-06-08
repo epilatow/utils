@@ -472,7 +472,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = ba.COMMAND_CALLBACKS
     PARSER_FUNC = ba.args_parser
     CLI_FUNC = staticmethod(ba.cli)
-    MODULE = ba
     EXIT_CODE_USAGE = ba.ExitCode.USAGE
     TEST_SUBCOMMAND = "environment"
     EXCEPTION_EXIT_CODE_MAP = [
@@ -2086,32 +2085,6 @@ class TestRequireBorgOrFail:
         with pytest.raises(pytest.fail.Exception) as exc_info:
             _require_borg_or_fail()
         assert "borg must be installed" in str(exc_info.value)
-
-
-class TestDoSelfTest:
-    """Test do_self_test argv assembly."""
-
-    def _captured_argv(self, **kwargs: Any) -> list[str]:
-        with patch.object(ba.subprocess, "run", autospec=True) as run:
-            run.return_value = Mock(returncode=0)
-            ba.do_self_test(**kwargs)
-            return list(run.call_args.args[0])
-
-    def test_default_omits_flags(self) -> None:
-        argv = self._captured_argv()
-        assert "--verbose" not in argv
-        assert "--coverage" not in argv
-        assert "--e2e" not in argv
-
-    def test_e2e_flag_forwarded(self) -> None:
-        """--e2e is the canonical flag for verifying borgadm changes."""
-        argv = self._captured_argv(e2e=True)
-        assert "--e2e" in argv
-
-    def test_verbose_and_coverage_forwarded(self) -> None:
-        argv = self._captured_argv(verbose=True, coverage=True)
-        assert "--verbose" in argv
-        assert "--coverage" in argv
 
 
 class TestMain:

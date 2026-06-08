@@ -213,16 +213,13 @@ class CmdCallbacksBase:
     """Base class for command callback table tests.
 
     Subclasses must define CALLBACKS, PARSER_FUNC,
-    CLI_FUNC, MODULE, EXIT_CODE_USAGE, and
-    SELF_TEST_CMD.
+    CLI_FUNC, and EXIT_CODE_USAGE.
     """
 
     CALLBACKS: ClassVar[Any]
     PARSER_FUNC: ClassVar[Any]
     CLI_FUNC: ClassVar[Any]
-    MODULE: ClassVar[Any]
     EXIT_CODE_USAGE: ClassVar[int]
-    SELF_TEST_CMD: ClassVar[str] = "self-test"
     POPPED_ARGS: ClassVar[set[str]] = set()
     TEST_SUBCOMMAND: ClassVar[str] = ""
     EXCEPTION_EXIT_CODE_MAP: ClassVar[list[tuple[Exception, int]]] = []
@@ -252,7 +249,6 @@ class CmdCallbacksBase:
         """COMMAND_CALLBACKS matches parser commands."""
         parser = type(self).PARSER_FUNC()
         parser_cmds = {cmd for cmd, _ in self._leaf_subparsers(parser)}
-        parser_cmds.discard(self.SELF_TEST_CMD)
         assert set(self.CALLBACKS.keys()) == parser_cmds
 
     def test_dispatch_handlers_have_no_defaults(
@@ -329,26 +325,6 @@ class CmdCallbacksBase:
         parser = type(self).PARSER_FUNC()
         assert parser is not None
 
-    def test_self_test_parses_flags(self) -> None:
-        """self-test subcommand parses common -v/--coverage flags."""
-        parser = type(self).PARSER_FUNC()
-        cmd = type(self).SELF_TEST_CMD
-        args = parser.parse_command([cmd, "-v", "--coverage"])
-        assert args.command == cmd
-        assert args.verbose is True
-        assert args.coverage is True
-
-    def _self_test_default_kwargs(self) -> dict[str, Any]:
-        """Defaults the parser produces for ``self-test`` minus
-        the ``command`` key dispatch consumes. Lets the dispatch
-        assertion stay correct as utilities add self-test flags."""
-        parser = type(self).PARSER_FUNC()
-        kwargs: dict[str, Any] = vars(
-            parser.parse_command([type(self).SELF_TEST_CMD])
-        )
-        kwargs.pop("command", None)
-        return kwargs
-
     def test_no_args_leaves_top_level_unset(self) -> None:
         """The top-level command group is non-required, so parse_args([])
         leaves its dest at None -- the state parse_command turns into a
@@ -420,45 +396,6 @@ class CmdCallbacksBase:
             result = type(self).CLI_FUNC()
         assert result == 0
         assert mock_cb.called
-
-    def test_cli_self_test_dispatches(self) -> None:
-        """cli() dispatches self-test correctly."""
-        mod = type(self).MODULE
-        with (
-            patch.object(
-                mod,
-                "do_self_test",
-                autospec=True,
-                return_value=0,
-            ) as mock,
-            patch(
-                "sys.argv",
-                ["prog", "self-test"],
-            ),
-        ):
-            result = type(self).CLI_FUNC()
-        assert result == 0
-        mock.assert_called_once_with(**self._self_test_default_kwargs())
-
-    def test_cli_self_test_returns_test_results(
-        self,
-    ) -> None:
-        """cli() passes through do_self_test exit code."""
-        mod = type(self).MODULE
-        with (
-            patch.object(
-                mod,
-                "do_self_test",
-                autospec=True,
-                return_value=1,
-            ),
-            patch(
-                "sys.argv",
-                ["prog", "self-test"],
-            ),
-        ):
-            result = type(self).CLI_FUNC()
-        assert result == 1
 
 
 class UnknownArgRoutedToSubparserBase:

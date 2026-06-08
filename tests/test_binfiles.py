@@ -24,7 +24,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from conftest import (
@@ -391,29 +391,12 @@ class TestBinfilesCli:
             assert bf.ACTIVE_PROFILE is bf.DOTFILES_PROFILE
 
 
-class TestDoSelfTest:
-    """do_self_test invokes the active profile's test file."""
-
-    @patch("subprocess.run", autospec=True)
-    def test_uses_binfiles_test_when_binfiles_active(
-        self, mock_run: MagicMock, monkeypatch: Any
-    ) -> None:
-        mock_run.return_value = MagicMock(returncode=0)
-        monkeypatch.setattr(bf, "ACTIVE_PROFILE", bf.BINFILES_PROFILE)
-
-        bf.do_self_test(verbose=False, coverage=False)
-
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0].endswith("test_binfiles.py")
-
-
 class TestCmdCallbacks(CmdCallbacksBase):
     """Reuse generic CLI dispatch tests against the binfiles module."""
 
     CALLBACKS = bf.COMMAND_CALLBACKS
     PARSER_FUNC = bf.build_parser
     CLI_FUNC = staticmethod(bf.cli)
-    MODULE = bf
     EXIT_CODE_USAGE = bf.ExitCode.USAGE
     TEST_SUBCOMMAND = "audit"
     EXCEPTION_EXIT_CODE_MAP = [

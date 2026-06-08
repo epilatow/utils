@@ -3,7 +3,7 @@
 """crony's command handlers.
 
 The do_* verbs behind the CLI -- apply / destroy / enable / disable /
-trigger / status / logs / config / validate / notify-test / self-test --
+trigger / status / logs / config / validate / notify-test --
 plus the apply and destroy primitives, the name-resolution and
 apply-ordering helpers, and the status renderer (its column model,
 divergence and color handling, and per-axis state derivation). This is
@@ -3434,26 +3434,3 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
     if all_config:
         raise crony.errors.ConfigError(f"notify-test failed: {detail}")
     raise crony.errors.CronyError(f"notify-test failed: {detail}")
-
-
-def do_self_test(*, verbose: bool, coverage: bool) -> int:
-    """Run crony's tests by invoking each test file directly.
-
-    The crony suite is split across per-module ``test_crony*.py`` files,
-    each independently executable with the same flag surface. Run them
-    in turn and return the first non-zero exit, or 0 when all pass.
-    """
-    repo_root = _repo_root()
-    test_files = sorted((repo_root / "tests").glob("test_crony*.py"))
-    flags: list[str] = []
-    if verbose:
-        flags.append("--verbose")
-    if coverage:
-        flags.append("--coverage")
-    rc = 0
-    for test_file in test_files:
-        cmd = [str(test_file), *flags]
-        result = subprocess.run(cmd, cwd=repo_root).returncode
-        if result != 0 and rc == 0:
-            rc = result
-    return rc

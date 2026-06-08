@@ -23,7 +23,6 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
 
 import pytest
 import tomlkit
@@ -6199,50 +6198,6 @@ class TestStatusColor:
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setattr(crony_commands.sys, "stdout", io.StringIO())
         assert crony_commands._color_supported() is False
-
-
-class TestDoSelfTest:
-    """do_self_test runs every per-module crony test file in turn."""
-
-    def _captured_runs(self, **kwargs: Any) -> list[list[str]]:
-        with patch.object(
-            crony_commands.subprocess, "run", autospec=True
-        ) as run:
-            run.return_value = Mock(returncode=0)
-            crony_commands.do_self_test(**kwargs)
-            return [list(c.args[0]) for c in run.call_args_list]
-
-    def test_runs_each_crony_test_file(self) -> None:
-        runs = self._captured_runs(verbose=False, coverage=False)
-        invoked = {Path(argv[0]).name for argv in runs}
-        # Every per-module crony test file on disk is invoked.
-        expected = {
-            p.name for p in (REPO_ROOT / "tests").glob("test_crony*.py")
-        }
-        assert invoked == expected
-        assert expected, "no crony test files discovered"
-
-    def test_default_omits_flags(self) -> None:
-        for argv in self._captured_runs(verbose=False, coverage=False):
-            assert "--verbose" not in argv
-            assert "--coverage" not in argv
-
-    def test_verbose_and_coverage_forwarded(self) -> None:
-        for argv in self._captured_runs(verbose=True, coverage=True):
-            assert "--verbose" in argv
-            assert "--coverage" in argv
-
-    def test_returns_first_nonzero_exit(self) -> None:
-        with patch.object(
-            crony_commands.subprocess, "run", autospec=True
-        ) as run:
-            run.side_effect = [
-                Mock(returncode=0),
-                Mock(returncode=2),
-                Mock(returncode=0),
-            ] + [Mock(returncode=0)] * 20
-            rc = crony_commands.do_self_test(verbose=False, coverage=False)
-        assert rc == 2
 
 
 if __name__ == "__main__":

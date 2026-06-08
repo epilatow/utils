@@ -20,7 +20,7 @@ import struct
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import lz4.block  # type: ignore[import-untyped]
 import pytest
@@ -446,7 +446,6 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
         (["list-domains", "--bogus"], "list-domains"),
         (["list-profiles", "--bogus"], "list-profiles"),
         (["list-containers", "--bogus"], "list-containers"),
-        (["self-test", "--bogus"], "self-test"),
     ]
 
 
@@ -1322,7 +1321,6 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = fc.COMMAND_CALLBACKS
     PARSER_FUNC = fc.build_parser
     CLI_FUNC = staticmethod(fc.cli)
-    MODULE = fc
     EXIT_CODE_USAGE = fc.ExitCode.USAGE
     TEST_SUBCOMMAND = "list-profiles"
     EXCEPTION_EXIT_CODE_MAP = [
@@ -2009,68 +2007,6 @@ class TestDoListWithSessionCookies:
         # Only container 1 cookies (from sqlite)
         assert len(data) == 1
         assert data[0]["name"] == "container_cookie"
-
-
-class TestDoSelfTest:
-    """Test do_self_test function."""
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_basic(self, mock_run: MagicMock) -> None:
-        """Test do_self_test invokes the test file."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        fc.do_self_test(verbose=False, coverage=False)
-
-        assert mock_run.called
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0].endswith("test_firefox_cookies.py")
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_with_verbose(self, mock_run: MagicMock) -> None:
-        """Test do_self_test passes --verbose."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        fc.do_self_test(verbose=True, coverage=False)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--verbose" in cmd
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_without_verbose(self, mock_run: MagicMock) -> None:
-        """Test do_self_test omits --verbose."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        fc.do_self_test(verbose=False, coverage=False)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--verbose" not in cmd
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_with_coverage(self, mock_run: MagicMock) -> None:
-        """Test do_self_test passes --coverage."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        fc.do_self_test(verbose=False, coverage=True)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--coverage" in cmd
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_without_coverage(self, mock_run: MagicMock) -> None:
-        """Test do_self_test omits --coverage."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        fc.do_self_test(verbose=False, coverage=False)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--coverage" not in cmd
-
-    @patch.object(fc.subprocess, "run", autospec=True)
-    def test_returns_failure_code(self, mock_run: MagicMock) -> None:
-        """Test do_self_test returns subprocess returncode."""
-        mock_run.return_value = MagicMock(returncode=1)
-
-        assert fc.do_self_test(verbose=False, coverage=False) == 1
 
 
 class TestDoListDomainsWithSession:

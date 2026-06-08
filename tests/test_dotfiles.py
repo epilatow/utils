@@ -18,7 +18,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from conftest import (
@@ -2347,57 +2347,12 @@ class TestStaleLinkDetection:
         assert installed_link.exists()
 
 
-class TestDoSelfTest:
-    """Test do_self_test function."""
-
-    @patch("subprocess.run", autospec=True)
-    def test_do_self_test_basic(self, mock_run: MagicMock) -> None:
-        """Test do_self_test invokes the test file."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        df.do_self_test(verbose=False, coverage=False)
-
-        assert mock_run.called
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0].endswith("test_dotfiles.py")
-
-    @patch("subprocess.run", autospec=True)
-    def test_do_self_test_with_verbose(self, mock_run: MagicMock) -> None:
-        """Test do_self_test passes --verbose flag."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        df.do_self_test(verbose=True, coverage=False)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--verbose" in cmd
-
-    @patch("subprocess.run", autospec=True)
-    def test_do_self_test_with_coverage(self, mock_run: MagicMock) -> None:
-        """Test do_self_test passes --coverage flag."""
-        mock_run.return_value = MagicMock(returncode=0)
-
-        df.do_self_test(verbose=False, coverage=True)
-
-        cmd = mock_run.call_args[0][0]
-        assert "--coverage" in cmd
-
-    @patch("subprocess.run", autospec=True)
-    def test_do_self_test_returns_nonzero_on_failure(
-        self, mock_run: MagicMock
-    ) -> None:
-        """Test do_self_test returns nonzero on failure."""
-        mock_run.return_value = MagicMock(returncode=1)
-
-        assert df.do_self_test(verbose=False, coverage=False) == 1
-
-
 class TestCmdCallbacks(CmdCallbacksBase):
     """Test command callback dispatch table."""
 
     CALLBACKS = df.COMMAND_CALLBACKS
     PARSER_FUNC = df.build_parser
     CLI_FUNC = staticmethod(df.cli)
-    MODULE = df
     EXIT_CODE_USAGE = df.ExitCode.USAGE
     TEST_SUBCOMMAND = "audit"
     EXCEPTION_EXIT_CODE_MAP = [

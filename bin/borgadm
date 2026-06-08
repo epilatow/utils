@@ -6,9 +6,6 @@
 # This is human generated code that's been AI modified
 #
 # IMPORTANT: This script has tests in tests/test_borgadm.py
-# Always run the `self-test --e2e` subcommand after making
-# modifications -- the E2E suite is opt-in and is the part that
-# exercises borgadm end-to-end against a real borg repo.
 
 from __future__ import annotations
 
@@ -2331,26 +2328,6 @@ def do_environment() -> None:
         logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
-def do_self_test(
-    verbose: bool = False,
-    coverage: bool = False,
-    e2e: bool = False,
-) -> int:
-    """Run tests by invoking the test file directly."""
-    repo_root = _repo_root()
-    test_file = repo_root / "tests" / "test_borgadm.py"
-
-    cmd = [str(test_file)]
-    if verbose:
-        cmd.append("--verbose")
-    if coverage:
-        cmd.append("--coverage")
-    if e2e:
-        cmd.append("--e2e")
-
-    return subprocess.run(cmd, cwd=repo_root).returncode
-
-
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
@@ -2651,28 +2628,6 @@ def args_parser() -> StrictArgumentParser:
         "environment", help="Display environment settings to run borg cli"
     )
 
-    self_test = add_parser("self-test", help="Run tests")
-    self_test.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose test output",
-    )
-    self_test.add_argument(
-        "--coverage",
-        action="store_true",
-        help="Run with coverage report",
-    )
-    self_test.add_argument(
-        "--e2e",
-        action="store_true",
-        help=(
-            "Include tests marked @pytest.mark.e2e (slow, "
-            "subprocess-based). Off by default; required after "
-            "modifying borgadm."
-        ),
-    )
-
     def add_common_args(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--config",
@@ -2691,10 +2646,7 @@ def args_parser() -> StrictArgumentParser:
             help="Add timestamps to stdout/stderr messages",
         )
 
-    for name, subparser in subparsers.choices.items():
-        # self-test doesn't need the common config/output args
-        if name == "self-test":
-            continue
+    for subparser in subparsers.choices.values():
         has_actions = any(
             isinstance(a, argparse._SubParsersAction)
             for a in subparser._actions
@@ -2761,7 +2713,6 @@ def main(
         "environment",
         "list",
         "log-files",
-        "self-test",
     }
     timed = top_command not in quick_commands
     cmd_start = time.perf_counter()
@@ -2808,9 +2759,6 @@ def cli() -> int:
     args = parser.parse_command()
     args_dict = vars(args).copy()
     command = args_dict.pop("command")
-
-    if command == "self-test":
-        return do_self_test(**args_dict)
 
     config = args_dict.pop("config")
     verbose = args_dict.pop("verbose")

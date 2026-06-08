@@ -86,7 +86,7 @@ Subcommands fall into two categories:
   - config-derived state (apply / destroy):  manage unit-file presence
   - runtime state (enable / disable):        manage scheduler arming
 Plus operational subcommands: status, logs, trigger,
-notify-test, config, self-test.
+notify-test, config.
 
 `trigger` asks the platform scheduler to fire the unit
 immediately, the same path a scheduled fire would take. To run a
@@ -598,23 +598,6 @@ def _build_parser() -> StrictArgumentParser:
         ),
     )
 
-    # self-test
-    p_st = subparsers.add_parser(
-        "self-test",
-        help="Run the bundled pytest suite",
-    )
-    p_st.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose test output",
-    )
-    p_st.add_argument(
-        "--coverage",
-        action="store_true",
-        help="Run with coverage report",
-    )
-
     return parser
 
 
@@ -643,12 +626,6 @@ def cli() -> int:
     """CLI entry point with exception handling."""
     args_dict = vars(_build_parser().parse_command())
     command = args_dict.pop("command")
-
-    if command == "self-test":
-        return crony.commands.do_self_test(
-            verbose=args_dict.pop("verbose"),
-            coverage=args_dict.pop("coverage"),
-        )
 
     try:
         _COMMAND_CALLBACKS[command](**args_dict)
