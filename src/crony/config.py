@@ -93,6 +93,21 @@ class JobFlags(enum.Flag):
         return list(cls)
 
 
+def _compose_flags(
+    inherited: JobFlags, delta: dict[JobFlags, bool]
+) -> JobFlags:
+    """Apply one level's flag delta onto the inherited set: each flag
+    the delta names is turned on or off, and flags it doesn't name pass
+    through unchanged."""
+    result = inherited
+    for flag, enabled in delta.items():
+        if enabled:
+            result |= flag
+        else:
+            result &= ~flag
+    return result
+
+
 @dataclass
 class NotifyEmail:
     """SMTP transport settings."""
@@ -253,8 +268,8 @@ class Defaults:
     # The capability flags this level explicitly sets (true / false),
     # parsed from `flags = [...]` and the legacy scalar keys. A per-level
     # delta; the flag cascade composes these across levels. `keep_awake`
-    # above is the resolved scalar this level's delta yields, kept for
-    # the current cascade.
+    # above mirrors this level's own delta for that flag (the parser's
+    # per-flag result); the resolved value comes from composing `flags`.
     flags: dict[JobFlags, bool] = field(default_factory=dict)
     # Base env merged under every job's own `env` (job keys win); see
     # resolved_env. Values are expanded at fire time like a job's env.
@@ -340,18 +355,20 @@ class TomlJob:
     # Interactive jobs sit pending in the background after their
     # scheduled fire and prompt the user before running. The two
     # `_sec` knobs are None when the user didn't set them; the
-    # snapshot resolver substitutes baked defaults. Validation
-    # auto-tags `platforms = ["darwin"]` (the dialog and idle-
-    # detection helpers are macOS-only). An interactive job may be a
-    # group child -- the group dispatches it async, without waiting.
+    # snapshot resolver substitutes baked defaults. The dialog and
+    # idle-detection helpers are macOS-only, so an entry whose
+    # resolved flags include interactive is masked off non-darwin
+    # hosts at selection time. An interactive job may be a group
+    # child -- the group dispatches it async, without waiting.
     interactive: bool = False
     interactive_active_sec: int | None = None
     interactive_delay_sec: int | None = None
     # The capability flags this job explicitly sets (true / false),
     # parsed from `flags = [...]` and the legacy `interactive` /
     # `keep-awake` scalar keys. The `interactive` / `keep_awake` fields
-    # above are the resolved scalars this delta yields, kept for the
-    # current cascade; the flag cascade composes these per-level deltas.
+    # above mirror this job's own delta for those two flags (the
+    # parser's per-flag result); the flag cascade composes these
+    # per-level deltas into the resolved value.
     flags: dict[JobFlags, bool] = field(default_factory=dict)
 
 
@@ -658,6 +675,7 @@ class TomlBundleConfig:
             return jobs, groups, masked
         host = crony.platform.current_host()
         platform = crony.platform.current_platform()
+        flag_map = self.resolved_flags_by_name(target)
 
         def _walk(name: str, parent_mask: str | None, seen: set[str]) -> None:
             if name in seen:
@@ -668,6 +686,17 @@ class TomlBundleConfig:
                 own_reason = _mask_reason(
                     j.platforms, j.hosts, host=host, platform=platform
                 )
+                # An interactive job needs the macOS dialog, so it is
+                # darwin-only. Applied here -- after the flag cascade
+                # resolves -- rather than at parse, so an interactive
+                # flag inherited from defaults / a group restricts the
+                # job the same way an explicit one does.
+                if (
+                    own_reason is None
+                    and JobFlags.INTERACTIVE in flag_map.get(name, JobFlags(0))
+                    and platform != "darwin"
+                ):
+                    own_reason = "platform"
                 effective = own_reason or parent_mask
                 if effective is None:
                     jobs.add(name)
@@ -748,12 +777,59 @@ class TomlBundleConfig:
             return job.priority
         return self.defaults.priority
 
-    def resolved_keep_awake(self, job: TomlJob) -> bool:
-        """Cascade keep_awake: job > defaults. Targets carry no
-        keep_awake."""
-        if job.keep_awake is not None:
-            return job.keep_awake
-        return self.defaults.keep_awake
+    def resolved_flags_by_name(
+        self, target: Target | None
+    ) -> dict[str, JobFlags]:
+        """Resolve every entry reachable from `target` to its effective
+        flags by composing the per-level deltas down the tree: the
+        bundle defaults, then each ancestor group, then the entry.
+
+        The flag cascade is a config-file convenience and runs only on
+        the pending side -- applied snapshots store resolved flags, so
+        the current graph reads them without re-composing. Host masking
+        is irrelevant to the cascade (a masked group still passes its
+        delta to its children), so the walk visits the whole tree.
+        """
+        out: dict[str, JobFlags] = {}
+        if target is None:
+            return out
+        base = _compose_flags(JobFlags(0), self.defaults.flags)
+
+        def _walk(name: str, inherited: JobFlags, seen: set[str]) -> None:
+            if name in seen:
+                return
+            seen = seen | {name}
+            if name in self.jobs:
+                out[name] = _compose_flags(inherited, self.jobs[name].flags)
+            elif name in self.job_groups:
+                g = self.job_groups[name]
+                resolved = _compose_flags(inherited, g.flags)
+                out[name] = resolved
+                for child in g.jobs:
+                    _walk(child, resolved, seen)
+
+        for name in target.jobs:
+            _walk(name, base, set())
+        return out
+
+    def resolved_flags(self, short: str, target: Target | None) -> JobFlags:
+        """The resolved flags for one entry. Falls back to the defaults
+        composed with the entry's own delta when the entry is not
+        reached through the target (no ancestor groups to inherit)."""
+        by_name = self.resolved_flags_by_name(target)
+        if short in by_name:
+            return by_name[short]
+        entry = self.jobs.get(short) or self.job_groups.get(short)
+        delta = entry.flags if entry is not None else {}
+        return self.composed_flags(delta)
+
+    def composed_flags(self, delta: dict[JobFlags, bool]) -> JobFlags:
+        """The bundle defaults composed with one entry's own `delta` --
+        the resolved flags for an entry that inherits only the defaults,
+        with no ancestor-group chain above it."""
+        return _compose_flags(
+            _compose_flags(JobFlags(0), self.defaults.flags), delta
+        )
 
     def resolved_env(self, job: TomlJob) -> dict[str, str]:
         """Merge env: defaults under job (a job's own key wins).
@@ -767,26 +843,39 @@ class TomlBundleConfig:
         """Auto-computed effective timeout for a group.
 
         Returns 1.05 * sum of children's effective timeouts (jobs use
-        `resolved_job_timeout_sec`; sub-groups recurse into this same
-        helper). Floor at 1 second. Returns 0 ("no cap") if any
+        `resolved_job_timeout_sec`; sub-groups recurse into the same
+        computation). Floor at 1 second. Returns 0 ("no cap") if any
         selected, non-interactive child is itself uncapped
         (`job-timeout-sec = 0`, or a sub-group that resolved to 0) --
         an uncapped child can't be bounded by a finite cumulative
-        deadline, so the whole group goes uncapped. Used by:
-        - `_run_group` to bound its cumulative dispatch loop.
-        - The waiter in `trigger_unit_sync` to bound its pid-watch
-          when waiting for a group.
+        deadline, so the whole group goes uncapped. The value is pinned
+        on the JobGroup snapshot at apply, and the runtime (`_run_group`,
+        `trigger_unit_sync`) reads it from there rather than re-deriving.
         Cycle-safety: `_validate_config` rejects cycles in group
         references, so the recursion always terminates.
 
         Children not selected on this host contribute zero (own
         filter excludes them or empty-group cascade demoted them) --
         the parent won't trigger them here, so the budget shouldn't
-        reserve their time either. Interactive children also
-        contribute zero: the group fires them async (no wait), so
-        their `job-timeout-sec` doesn't bound any actual wait inside
-        `_run_group` and would just inflate the budget.
+        reserve their time either. Interactive children (by their
+        resolved flags -- explicit or inherited) also contribute zero:
+        the group fires them async (no wait), so their `job-timeout-sec`
+        doesn't bound any actual wait inside `_run_group`.
         """
+        # Resolve the flag cascade once for the whole tree, then thread
+        # it through the recursion. It is resolved from config rather
+        # than read off the model: this also runs while applying a single
+        # group, where the children's model nodes aren't built.
+        return self._group_timeout_sec(
+            target, group_name, self.resolved_flags_by_name(target)
+        )
+
+    def _group_timeout_sec(
+        self,
+        target: Target | None,
+        group_name: str,
+        flag_map: dict[str, JobFlags],
+    ) -> int:
         group = self.job_groups[group_name]
         sel_jobs, sel_groups = self.selected_jobs_and_groups(target)
         total = 0.0
@@ -794,12 +883,11 @@ class TomlBundleConfig:
             if child not in sel_jobs and child not in sel_groups:
                 continue
             if child in self.jobs:
-                child_job = self.jobs[child]
-                if child_job.interactive:
+                if JobFlags.INTERACTIVE in flag_map.get(child, JobFlags(0)):
                     continue
-                child_timeout = self.resolved_job_timeout_sec(child_job)
+                child_timeout = self.resolved_job_timeout_sec(self.jobs[child])
             else:
-                child_timeout = self.resolved_group_timeout_sec(target, child)
+                child_timeout = self._group_timeout_sec(target, child, flag_map)
             if child_timeout == 0:
                 return 0
             total += child_timeout
@@ -1823,15 +1911,6 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     interactive_active_sec, interactive_delay_sec = (
         _parse_interactive_timespans(raw, where, interactive)
     )
-    if interactive:
-        if not platforms:
-            platforms = ["darwin"]
-        elif platforms != ["darwin"]:
-            raise crony.errors.ConfigError(
-                f"{where}: an interactive job implies "
-                f"platforms = ['darwin']; remove or change the "
-                f"'platforms' override"
-            )
     return TomlJob(
         name=name,
         uuid=job_uuid,

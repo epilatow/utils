@@ -413,28 +413,29 @@ class TestParseJob:
         )
         assert cfg.jobs["a"].timing is None
 
-    def test_interactive_auto_tags_platform_darwin(self) -> None:
+    def test_interactive_does_not_tag_platforms_at_parse(self) -> None:
+        # The darwin restriction is applied at selection time now, not
+        # by mutating the job's platforms during parse.
         cfg = _parse(self._cfg(_job(interactive=True)))
         assert cfg.jobs["j"].interactive is True
-        assert cfg.jobs["j"].platforms == ["darwin"]
+        assert cfg.jobs["j"].platforms == []
 
     def test_interactive_explicit_darwin_platform_ok(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True, platforms=["darwin"])))
         assert cfg.jobs["j"].interactive is True
 
-    def test_interactive_with_linux_platform_rejected(self) -> None:
-        _assert_errored_job(
-            self._cfg(_job(interactive=True, platforms=["linux"])),
-            "j",
-            "implies platforms",
-        )
+    def test_interactive_with_other_platform_accepted(self) -> None:
+        # No longer a parse error: the job parses and is masked off
+        # non-darwin at selection (and off the explicit linux too).
+        cfg = _parse(self._cfg(_job(interactive=True, platforms=["linux"])))
+        assert cfg.jobs["j"].interactive is True
+        assert cfg.jobs["j"].platforms == ["linux"]
 
-    def test_interactive_with_multi_platform_rejected(self) -> None:
-        _assert_errored_job(
-            self._cfg(_job(interactive=True, platforms=["darwin", "linux"])),
-            "j",
-            "implies platforms",
+    def test_interactive_with_multi_platform_accepted(self) -> None:
+        cfg = _parse(
+            self._cfg(_job(interactive=True, platforms=["darwin", "linux"]))
         )
+        assert cfg.jobs["j"].interactive is True
 
     def test_interactive_active_resolves_to_seconds(self) -> None:
         cfg = _parse(
@@ -2364,10 +2365,10 @@ class TestJobFlagsField:
         cfg = _parse(self._cfg(_job(flags=["keep-awake=true"])))
         assert cfg.jobs["j"].keep_awake is True
 
-    def test_interactive_flag_auto_tags_darwin(self) -> None:
+    def test_interactive_flag_does_not_tag_platforms(self) -> None:
         cfg = _parse(self._cfg(_job(flags=["interactive"])))
         assert cfg.jobs["j"].interactive is True
-        assert cfg.jobs["j"].platforms == ["darwin"]
+        assert cfg.jobs["j"].platforms == []
 
     def test_scalar_and_flag_for_different_flags_ok(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True, flags=["keep-awake"])))
@@ -2472,6 +2473,127 @@ class TestFlagsAtDefaultsAndGroup:
             "g",
             "unknown flag",
         )
+
+
+class TestFlagsCascade:
+    """`resolved_flags_by_name` composes the per-level deltas down the
+    target tree: defaults, then each ancestor group, then the entry."""
+
+    @staticmethod
+    def _resolve(monkeypatch: Any, raw: dict[str, Any]) -> Any:
+        monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        cfg = _parse(raw)
+        return cfg.resolved_flags_by_name(cfg.resolve_target("h", "linux"))
+
+    def test_defaults_inherited_by_unset_job(self, monkeypatch: Any) -> None:
+        flags = self._resolve(
+            monkeypatch,
+            {
+                "defaults": {"flags": ["keep-awake"]},
+                "job": {"a": _job()},
+                "target": {"linux": {"jobs": ["a"]}},
+            },
+        )
+        assert flags["a"] == JobFlags.KEEP_AWAKE
+
+    def test_group_overrides_defaults_job_overrides_group(
+        self, monkeypatch: Any
+    ) -> None:
+        flags = self._resolve(
+            monkeypatch,
+            {
+                "defaults": {"flags": ["keep-awake"]},
+                "job": {"a": _job(flags=["keep-awake"])},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "flags": ["keep-awake=false"],
+                    }
+                },
+                "target": {"linux": {"jobs": ["g"]}},
+            },
+        )
+        # defaults ON -> group OFF -> job ON again: job wins.
+        assert flags["a"] == JobFlags.KEEP_AWAKE
+        # The group's own resolved flags reflect defaults ON then its
+        # own OFF.
+        assert flags["g"] == JobFlags(0)
+
+    def test_full_chain_through_nested_groups(self, monkeypatch: Any) -> None:
+        flags = self._resolve(
+            monkeypatch,
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "outer": {
+                        "jobs": ["inner"],
+                        "schedule": "daily",
+                        "flags": ["keep-awake"],
+                    },
+                    "inner": {"jobs": ["a"], "flags": ["interactive"]},
+                },
+                "target": {"linux": {"jobs": ["outer"]}},
+            },
+        )
+        # a inherits keep-awake (outer) + interactive (inner).
+        assert flags["a"] == JobFlags.KEEP_AWAKE | JobFlags.INTERACTIVE
+
+
+class TestInteractiveDarwinMasking:
+    """An interactive job is darwin-only, enforced at selection time
+    after the cascade resolves -- whether interactive is set on the job
+    or inherited."""
+
+    @staticmethod
+    def _select(monkeypatch: Any, raw: dict[str, Any], platform: str) -> Any:
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: platform
+        )
+        monkeypatch.setattr(crony_platform, "current_host", lambda: "h")
+        cfg = _parse(raw)
+        target = cfg.resolve_target("h", platform)
+        return cfg.selected_and_masked_jobs_and_groups(target)
+
+    def test_interactive_job_selected_on_darwin(self, monkeypatch: Any) -> None:
+        jobs, _, masked = self._select(
+            monkeypatch,
+            {
+                "job": {"a": _job(interactive=True)},
+                "target": {"darwin": {"jobs": ["a"]}},
+            },
+            "darwin",
+        )
+        assert "a" in jobs
+        assert "a" not in masked
+
+    def test_interactive_job_masked_on_linux(self, monkeypatch: Any) -> None:
+        jobs, _, masked = self._select(
+            monkeypatch,
+            {
+                "job": {"a": _job(interactive=True)},
+                "target": {"linux": {"jobs": ["a"]}},
+            },
+            "linux",
+        )
+        assert "a" not in jobs
+        assert masked.get("a") == "platform"
+
+    def test_inherited_interactive_masked_on_linux(
+        self, monkeypatch: Any
+    ) -> None:
+        jobs, _, masked = self._select(
+            monkeypatch,
+            {
+                "defaults": {"flags": ["interactive"]},
+                "job": {"a": _job()},
+                "target": {"linux": {"jobs": ["a"]}},
+            },
+            "linux",
+        )
+        assert "a" not in jobs
+        assert masked.get("a") == "platform"
 
 
 class TestJobFlags:

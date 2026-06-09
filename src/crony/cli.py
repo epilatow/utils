@@ -107,8 +107,9 @@ sum-of-children's-timeouts.
 Interactive jobs (`interactive = true` on `[job.<name>]`) sit
 pending in the background after their fire and prompt the user
 via a desktop dialog (Run / Delay / Cancel) before running.
-Auto-tagged `platforms = ["darwin"]` -- the dialog and idle
-detection are macOS-only. The runner waits for the user to be
+The dialog and idle detection are macOS-only, so an interactive
+job runs only on darwin -- a non-darwin host skips it at
+selection. The runner waits for the user to be
 continuously active for `interactive_active` (default 10min),
 then prompts; "Delay Job" sleeps `interactive_delay` (default
 1h) and re-waits. `crony status` reports such a job as

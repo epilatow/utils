@@ -307,10 +307,37 @@ class TestJobFlagsBacking:
         snap = self._snap(keep_awake=True)
         d = snap.to_dict()
         assert "flags" not in d
-        assert d["keep_awake"] is True
+        # Keyed by the dash token, matching the config spelling.
+        assert d["keep-awake"] is True
         assert d["interactive"] is False
+        assert "keep_awake" not in d
         # The booleans fold back into the bitmask on load.
         assert snapshot_from_dict(d).flags == snap.flags
+
+    def test_snapshot_loads_legacy_underscore_flag_key(self) -> None:
+        # Snapshots written before the dash rename keyed keep-awake as
+        # `keep_awake`; the loader still folds that legacy spelling in.
+        d = self._snap(keep_awake=True).to_dict()
+        d["keep_awake"] = d.pop("keep-awake")
+        assert snapshot_from_dict(d).flags == JobFlags.KEEP_AWAKE
+
+    def test_group_carries_resolved_flags_and_round_trips(self) -> None:
+        # A group carries its resolved cascade value (here keep-awake
+        # inherited from the defaults level) and serializes it like a
+        # job, so its pending snapshot equals its reloaded one -- no
+        # spurious config=stale drift from a flag that round-trips off.
+        cfg = _parse(
+            {
+                "defaults": {"flags": ["keep-awake"]},
+                "job": {"a": _job()},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            }
+        )
+        group = _resolve_snapshot_for(cfg, "g")
+        assert group.flags == JobFlags.KEEP_AWAKE
+        assert snapshot_from_dict(group.to_dict()) == dataclasses.replace(
+            group, symlink=None
+        )
 
 
 class TestSharedSnapshotSurface:

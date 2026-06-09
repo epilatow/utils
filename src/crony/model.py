@@ -52,6 +52,18 @@ SNAPSHOT_SCHEMA: int = 4
 # reachable through the short-name alias.
 RUN_LOG_NAME: str = "run.log"
 
+# Flags persist in the snapshot as one boolean per member rather than
+# the bitmask value (JSON has no IntFlag), keyed by the flag's dash
+# token (`keep-awake`) so the snapshot spelling matches the config one.
+# `snapshot_from_dict` also reads the legacy underscore spelling
+# (`keep_awake`) that older snapshots used, so they still load; that
+# fallback goes once no underscore-keyed snapshots remain. Derived from
+# `JobFlags.members()`, so a new flag needs no edit to `to_dict` /
+# `snapshot_from_dict`.
+_FLAG_SNAPSHOT_FIELDS: tuple[tuple[str, crony.config.JobFlags], ...] = tuple(
+    (flag.token, flag) for flag in crony.config.JobFlags.members()
+)
+
 
 @dataclass(frozen=True)
 class _JobCommon:
@@ -208,9 +220,15 @@ class _JobCommon:
         # The alias pair is derived disk / expected state, recomputed on
         # load -- it never belongs in the persisted snapshot.
         d.pop("symlink", None)
-        # Flags serialize as their individual booleans (see `Job.to_dict`),
-        # never the bitmask value itself.
+        # Flags persist as one boolean per member (see
+        # `_FLAG_SNAPSHOT_FIELDS`), never the bitmask value itself;
+        # folded back in `snapshot_from_dict`. Emitted for jobs and
+        # groups alike so a group's resolved cascade value round-trips
+        # -- it has no runtime effect but stays visible for tracing
+        # inheritance.
         d.pop("flags", None)
+        for key, flag in _FLAG_SNAPSHOT_FIELDS:
+            d[key] = flag in self.flags
         timing = self.timing
         d.pop("timing", None)
         d["schedule"] = (
@@ -286,8 +304,17 @@ class Job(_JobCommon):
         config: crony.config.TomlBundleConfig,
         job: crony.config.TomlJob,
         name: crony.unit.EntityName,
+        *,
+        flags: crony.config.JobFlags | None = None,
     ) -> Job:
-        """Build a Job by applying every cascade once."""
+        """Build a Job by applying every cascade once. `flags` is the
+        entry's resolved capability bitmask (composed across the config
+        levels by the caller); the runner-facing `interactive` /
+        `keep_awake` booleans derive from it. When omitted, it defaults
+        to the defaults composed with the job's own delta -- the
+        no-ancestor-group case."""
+        if flags is None:
+            flags = config.composed_flags(job.flags)
         args = [_expand_path_field(a) for a in job.args]
         gate_args = [_expand_path_field(a) for a in job.gate_args]
         script = (
@@ -298,11 +325,6 @@ class Job(_JobCommon):
             if job.gate_script is not None
             else None
         )
-        flags = crony.config.JobFlags(0)
-        if job.interactive:
-            flags |= crony.config.JobFlags.INTERACTIVE
-        if config.resolved_keep_awake(job):
-            flags |= crony.config.JobFlags.KEEP_AWAKE
         return cls(
             schema=SNAPSHOT_SCHEMA,
             kind="job",
@@ -336,14 +358,11 @@ class Job(_JobCommon):
 
     def to_dict(self) -> dict[str, Any]:
         """Extend the shared snapshot dict with the job-only `priority`
-        (rendered to its source string) and the per-flag booleans the
-        runner reads at fire time."""
+        (rendered to its source string)."""
         d = super().to_dict()
         d["priority"] = (
             str(self.priority) if self.priority is not None else None
         )
-        d["interactive"] = self.interactive
-        d["keep_awake"] = self.keep_awake
         return d
 
 
@@ -369,11 +388,21 @@ class JobGroup(_JobCommon):
         target: crony.config.Target | None,
         group: crony.config.TomlJobGroup,
         name: crony.unit.EntityName,
+        *,
+        flags: crony.config.JobFlags | None = None,
     ) -> JobGroup:
         """Build a JobGroup. `group_budget_sec` is recomputed from
         the live config (not from children's pinned snapshots), so an
         apply pass that walks topologically still produces the right
         parent budget regardless of children's prior applied state.
+
+        `flags` is the group's resolved cascade value (the defaults
+        composed with its ancestor groups and its own delta), supplied
+        by the caller; when omitted it defaults to the defaults composed
+        with the group's own delta. A group's flags have no runtime
+        effect -- the runner acts only on a job's flags -- but the
+        resolved value is persisted and shown so the inheritance the
+        group hands down to its children stays visible.
 
         Children that aren't selected on this host are dropped from
         `children`. That covers both own-filter masks (the child's
@@ -396,6 +425,8 @@ class JobGroup(_JobCommon):
                 children.append(config.jobs[c].uuid)
             elif c in sel_groups:
                 children.append(config.job_groups[c].uuid)
+        if flags is None:
+            flags = config.composed_flags(group.flags)
         return cls(
             schema=SNAPSHOT_SCHEMA,
             kind="group",
@@ -409,6 +440,7 @@ class JobGroup(_JobCommon):
             ),
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
             timing=group.timing,
+            flags=flags,
         )
 
 
@@ -447,10 +479,12 @@ def _resolve_snapshot_for(
     name = crony.unit.EntityName(bundle_name, short)
     target = config.resolve_target()
     if short in config.jobs:
-        return Job.from_config(config, config.jobs[short], name)
+        flags = config.resolved_flags(short, target)
+        return Job.from_config(config, config.jobs[short], name, flags=flags)
     if short in config.job_groups:
+        flags = config.resolved_flags(short, target)
         return JobGroup.from_config(
-            config, target, config.job_groups[short], name
+            config, target, config.job_groups[short], name, flags=flags
         )
     raise crony.errors.PreconditionError(f"unknown job/group: {short!r}")
 
@@ -491,17 +525,21 @@ def snapshot_from_dict(
     data["timing"] = timing
     if data.get("priority") is not None:
         data["priority"] = crony.unit.PriorityClass.from_str(data["priority"])
+    # The per-flag booleans are stored in the snapshot; fold them back
+    # into the bitmask for jobs and groups alike. Current snapshots key
+    # by the dash token; older ones used the underscore spelling
+    # (`keep_awake`), so read both (the legacy alias goes once none
+    # remain). Absent keys default off, so a pre-flags snapshot loads
+    # without a schema bump.
+    flags = crony.config.JobFlags(0)
+    for key, flag in _FLAG_SNAPSHOT_FIELDS:
+        enabled = data.pop(key, False)
+        legacy = data.pop(key.replace("-", "_"), False)
+        if enabled or legacy:
+            flags |= flag
+    data["flags"] = flags
     kind = data.get("kind")
     if kind == "job":
-        # The per-flag booleans are stored in the snapshot; fold them back
-        # into the bitmask. Absent keys default off, so a pre-flags
-        # snapshot loads without a schema bump.
-        flags = crony.config.JobFlags(0)
-        if data.pop("interactive", False):
-            flags |= crony.config.JobFlags.INTERACTIVE
-        if data.pop("keep_awake", False):
-            flags |= crony.config.JobFlags.KEEP_AWAKE
-        data["flags"] = flags
         return Job(**data)
     if kind == "group":
         return JobGroup(**data)
@@ -819,12 +857,18 @@ class Graph:
             sel_jobs, sel_groups = bundle.config.selected_jobs_and_groups(
                 target
             )
+            flag_map = bundle.config.resolved_flags_by_name(target)
             for short in sel_jobs:
                 toml_job = bundle.config.jobs.get(short)
                 if toml_job is None:
                     continue
                 name = crony.unit.EntityName(bundle.name, short)
-                snap_j = Job.from_config(bundle.config, toml_job, name)
+                snap_j = Job.from_config(
+                    bundle.config,
+                    toml_job,
+                    name,
+                    flags=flag_map.get(short, crony.config.JobFlags(0)),
+                )
                 pending.jobs[snap_j.entity_ref] = snap_j
                 pending.by_full_name[str(name)] = snap_j.entity_ref
             for short in sel_groups:
@@ -833,7 +877,11 @@ class Graph:
                     continue
                 name = crony.unit.EntityName(bundle.name, short)
                 snap_g = JobGroup.from_config(
-                    bundle.config, target, toml_group, name
+                    bundle.config,
+                    target,
+                    toml_group,
+                    name,
+                    flags=flag_map.get(short, crony.config.JobFlags(0)),
                 )
                 pending.groups[snap_g.entity_ref] = snap_g
                 pending.by_full_name[str(name)] = snap_g.entity_ref

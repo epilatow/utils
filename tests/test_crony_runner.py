@@ -1206,6 +1206,39 @@ class TestRunGroupInteractive:
         # 1.05 * 100 == 105.
         assert budget == 105
 
+    def test_group_budget_excludes_inherited_interactive_children(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child interactive only via an inherited flag (here from
+        # [defaults]) is excluded too -- the budget uses the resolved
+        # flags, not the child's own delta.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "defaults": {"flags": ["interactive"]},
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 10_000,
+                    },
+                    "regular": {
+                        "command": "true",
+                        "job_timeout_sec": 100,
+                        "flags": ["interactive=false"],
+                    },
+                },
+                "job-group": {
+                    "g": {"jobs": ["iv", "regular"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        target = cfg.resolve_target("test-host", "darwin")
+        # iv is interactive via the defaults flag -> excluded; only
+        # regular (which overrides it off, 100) contributes: 1.05 * 100.
+        assert cfg.resolved_group_timeout_sec(target, "g") == 105
+
     def test_group_budget_zero_when_child_uncapped(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

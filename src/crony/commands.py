@@ -89,6 +89,11 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # log-keep-runs        = 30
 # priority             = "high"       # priority class; jobs may override
 # keep-awake           = true         # default; jobs may override
+# # flags = ["keep-awake"]            # capability flags set here cascade
+# #            to every job; a group or a job overrides with its own
+# #            `flags` ("flag=false" turns one off). Same flags as the
+# #            per-job example below. Settable at [defaults],
+# #            [job-group.*], and [job.*].
 #
 # [defaults.env]
 # PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
@@ -239,10 +244,11 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # Interactive job: sits pending after its fire and pops a
 # desktop dialog (Run / Delay / Cancel) once the user has been
 # active continuously for `interactive-active` (default 10min).
-# Auto-tags `platforms = ["darwin"]`, so a non-darwin host
-# silently skips it. May live in a [job-group.*]; the group
-# dispatches it async (no wait) and the child's interactive wait
-# runs independently of the group's deadline.
+# Interactive needs the macOS dialog, so the job runs only on
+# darwin -- a non-darwin host silently skips it (and an explicit
+# non-darwin `platforms` just never selects). May live in a
+# [job-group.*]; the group dispatches it async (no wait) and the
+# child's interactive wait runs independently of the group's deadline.
 # [job.weekly-prompt]
 # command            = "/usr/local/bin/some-interactive-task"
 # schedule           = "Sun *-*-* 12:00"  # weekly at noon
