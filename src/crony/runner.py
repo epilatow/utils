@@ -159,7 +159,7 @@ def _keep_awake_argv(
     """
     if not snap.keep_awake:
         return argv, None
-    return crony.runtime.host().keep_awake_argv(argv, str(snap.name))
+    return crony.runtime.host().keep_awake_argv(argv, str(snap.entity_name))
 
 
 class _ExitOutcome(NamedTuple):
@@ -325,7 +325,7 @@ def _interactive_wait_and_prompt(
     silently bypass *that* wait.
     """
 
-    sd = crony.model.entity_state_dir(snap.ref)
+    sd = snap.state_dir
 
     def _bypass() -> bool:
         return crony.runtime.consume_user_trigger_flag(sd)
@@ -347,8 +347,8 @@ def _interactive_wait_and_prompt(
             return "run"
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
-            str(snap.name),
-            f"crony wants to run '{snap.name}'. Now?",
+            str(snap.entity_name),
+            f"crony wants to run '{snap.entity_name}'. Now?",
         )
         log_file.write(f"interactive: user chose {choice}\n".encode())
         if choice in ("run", "cancel"):
@@ -382,7 +382,7 @@ def _run_job(
     signalled by raising PreconditionError -- cli() maps that to
     ExitCode.PRECONDITION.
     """
-    full_name = str(snap.name)
+    full_name = str(snap.entity_name)
 
     if snap.script is not None:
         sp = Path(snap.script)
@@ -391,9 +391,10 @@ def _run_job(
         if not os.access(sp, os.X_OK):
             raise crony.errors.PreconditionError(f"script not executable: {sp}")
 
-    sd = crony.runtime.state_dir_for(snap.ref)
+    sd = snap.state_dir
+    sd.mkdir(parents=True, exist_ok=True)
     lock_path = sd / "run.lock"
-    log_path = sd / "run.log"
+    log_path = snap.log_path_resolved
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -606,7 +607,7 @@ def _child_full_name_from_uuid(child_ref: crony.unit.EntityRef) -> str | None:
     at the cost of one snapshot read per child at dispatch time.
     Returns None when the child snapshot is missing or unreadable.
     """
-    snap_p = crony.model.entity_state_dir(child_ref) / "snapshot.json"
+    snap_p = crony.model.Job.state_dir_from_ref(child_ref) / "snapshot.json"
     if not snap_p.is_file():
         return None
     try:
@@ -680,13 +681,14 @@ def _run_group(
     agree. A group never applies a run-gate of its own -- each
     child's runner reads its own snapshot and gates itself.
     """
-    full_name = str(snap.name)
+    full_name = str(snap.entity_name)
     group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
-    sd = crony.runtime.state_dir_for(snap.ref)
+    sd = snap.state_dir
+    sd.mkdir(parents=True, exist_ok=True)
     lock_path = sd / "run.lock"
-    log_path = sd / "run.log"
+    log_path = snap.log_path_resolved
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -713,9 +715,9 @@ def _run_group(
                     tuple[crony.unit.EntityRef, str | None]
                 ] = [
                     (
-                        crony.unit.EntityRef(snap.name.bundle, child_uuid),
+                        crony.unit.EntityRef(snap.bundle, child_uuid),
                         _child_full_name_from_uuid(
-                            crony.unit.EntityRef(snap.name.bundle, child_uuid)
+                            crony.unit.EntityRef(snap.bundle, child_uuid)
                         ),
                     )
                     for child_uuid in snap.children
@@ -742,7 +744,7 @@ def _run_group(
                     else time.monotonic() + group_budget
                 )
                 for child_ref, child_full_name in resolved_pairs:
-                    child_sd = crony.model.entity_state_dir(child_ref)
+                    child_sd = crony.model.Job.state_dir_from_ref(child_ref)
                     if _child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does
@@ -976,7 +978,7 @@ def trigger_unit_sync(
 
     `state_dir` is the entity's uuid-keyed state directory,
     resolved by the caller (via `Config.current` or
-    `entity_state_dir(ref)` for a group parent's child). The
+    `Job.state_dir_from_ref(child_ref)`). The
     path may not exist yet at call time (first
     fire); the watcher polls run.pid / last-run.json under it
     without pre-creating the dir, so a unit that fails to load
@@ -1111,7 +1113,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
 
     `ref` is the entity's `<bundle>:<uuid>` address, the form
     `apply` writes into the platform unit's argv. The runner
-    locates the state dir directly via `entity_state_dir`,
+    locates the state dir directly via `Job.state_dir_from_ref(ref)`,
     loads the pinned snapshot, and dispatches to the per-job or
     per-group pipeline. The wrapped command's exit code is
     surfaced via SystemExit so it propagates to the platform
@@ -1169,7 +1171,7 @@ def _record_snapshot_load_failure(
     `JobRunResult` / `GroupRunResult` dataclasses with a new
     error variant.
     """
-    state_dir = crony.model.entity_state_dir(ref)
+    state_dir = crony.model.Job.state_dir_from_ref(ref)
     if not state_dir.is_dir():
         return
     now = crony.runtime.now_iso()
@@ -1184,7 +1186,7 @@ def _record_snapshot_load_failure(
         "reason": str(exc),
     }
     crony.runtime.write_last_run(state_dir / "last-run.json", payload)
-    log_path = state_dir / "run.log"
+    log_path = state_dir / crony.model.RUN_LOG_NAME
     line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))

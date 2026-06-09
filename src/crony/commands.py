@@ -3,23 +3,21 @@
 """crony's command handlers.
 
 The do_* verbs behind the CLI -- apply / destroy / enable / disable /
-trigger / status / logs / config / validate / notify-test --
-plus the apply and destroy primitives, the name-resolution and
-apply-ordering helpers, and the status renderer (its column model,
-divergence and color handling, and per-axis state derivation). This is
-the in-process API a caller drives instead of shelling out to the crony
-CLI; it composes the lower layers (config, model, runtime, notify,
-runner) and performs the on-disk unit lifecycle.
+trigger / status / logs / config / validate / notify-test -- plus the
+name-resolution and apply-ordering helpers and the status renderer (its
+column model, divergence and color handling, and per-axis state
+derivation). This is the in-process API a caller drives instead of
+shelling out to the crony CLI; it orchestrates the lower layers
+(config, model, runtime, notify, runner). The per-entry on-disk unit
+lifecycle itself (apply_one / destroy_one) lives in crony.runtime.
 """
 
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import re
-import shutil as shutil  # noqa: PLC0414  re-exported for tests
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys as sys  # noqa: PLC0414  re-exported for tests
 import time as time  # noqa: PLC0414  re-exported for tests
@@ -40,12 +38,6 @@ import crony.runtime
 import crony.unit
 
 logger = logging.getLogger(__name__)
-
-
-def _repo_root() -> Path:
-    """Repo root, derived from this module's location at
-    <repo>/src/crony/commands.py."""
-    return Path(__file__).resolve().parent.parent.parent
 
 
 # =============================================================================
@@ -306,70 +298,6 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 """
 
 
-def _crony_executable() -> Path:
-    """Absolute path to bin/crony for re-invocation by groups.
-
-    Derives bin/crony from this package's location
-    (<repo>/src/crony/commands.py -> <repo>/bin/crony) rather than
-    from `sys.argv[0]` so the subprocess re-invocation reaches the
-    right binary even when crony has been imported as a module (e.g.
-    by the test suite, where sys.argv[0] is pytest, not crony).
-    """
-    return _repo_root() / "bin" / "crony"
-
-
-def _uv_executable() -> Path:
-    """Absolute path to `uv`, baked into platform unit files.
-
-    The platform scheduler starts a unit's program
-    with a minimal PATH that does not include $HOME/.local/bin or
-    /opt/homebrew/bin. Crony's PEP 723 shebang `env -S uv run
-    --script` therefore can't find uv and exits 127 before the
-    script even starts. Resolving uv to an absolute path at apply
-    time and writing it directly into the unit's argv sidesteps
-    PATH entirely.
-
-    Errors clearly if uv isn't on the agent's PATH at apply time;
-    a misconfigured environment shouldn't silently render a unit
-    that will fail at run time.
-    """
-    path = shutil.which("uv")
-    if path is None:
-        raise crony.errors.PreconditionError(
-            "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
-            "before running `crony apply`. Platform units bake uv's "
-            "absolute path so the scheduler doesn't have to find it "
-            "on its minimal PATH."
-        )
-    return Path(path).resolve()
-
-
-# =============================================================================
-# PLATFORM UNITS
-# =============================================================================
-# Render and (un)load platform-native scheduler units. The per-platform
-# divergence lives entirely in the crony.platform backends; the
-# functions here are thin delegates via scheduler(), which carries no
-# platform branch -- the backend owns its own unit directory.
-
-
-def _render_units(
-    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
-) -> dict[str, str]:
-    """Return {filename: content} for `snap`'s platform units.
-
-    Delegates to the platform Scheduler with the live `_uv_executable()`
-    / `_crony_executable()` paths baked into the unit argv. (The drift
-    check re-renders inside the scheduler using the paths it recovers
-    from the on-disk unit, so it does not go through here.)
-    """
-    return crony.runtime.scheduler(platform).render(
-        snap.unit_spec(),
-        uv_path=_uv_executable(),
-        crony_path=_crony_executable(),
-    )
-
-
 def _schedule_display(timing: crony.unit.Timing | None) -> str:
     """Render a unit's timing into one status cell value.
 
@@ -383,227 +311,6 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     if isinstance(timing, crony.unit.Interval):
         return f"interval={timing}"
     return "grouped"
-
-
-def _activate_unit(
-    name: str,
-    platform: str | None = None,
-    *,
-    prior_disabled: bool,
-    scheduled: bool,
-) -> None:
-    """Load the unit into the platform scheduler.
-
-    `prior_disabled=True` preserves a hand-disabled state across an
-    apply re-render: the unit is reloaded so the new content takes
-    effect, but the persistent disable record is restored afterward
-    so the scheduler doesn't fire it. Without this, a `crony disable
-    foo` followed by an unrelated config edit would silently re-arm
-    foo.
-
-    `scheduled=False` means the entry has no schedule / interval.
-    On linux that means there's no .timer to enable; only the
-    .service is registered (oneshot, sits dormant until something
-    starts it). The plist analog is the same -- a plist with no
-    Start* keys loads fine and just doesn't auto-fire.
-    """
-    crony.runtime.scheduler(platform).activate(
-        name,
-        prior_disabled=prior_disabled,
-        scheduled=scheduled,
-    )
-
-
-def _apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
-    """Apply one selected entry from the loaded model; return
-    "added", "updated", or "unchanged".
-
-    `ref` must be a selected pending entry of `config` -- `do_apply`
-    only applies what `config.pending` selected on this host. The
-    full namespaced name `<bundle>.<short>` is what lands on disk
-    (the platform unit identifier).
-
-    Every entry installs a platform unit, even schedule-less ones:
-    a transit group's plist sits dormant until a parent dispatches
-    it (or `crony trigger` fires it explicitly). On linux, only the
-    .service file is installed for schedule-less entries; the
-    .timer (which would have nothing to trigger on) is omitted, and
-    apply cleans up a stale .timer if an entry transitions
-    scheduled -> unscheduled.
-
-    The entity's prior snapshot and unit-drift verdict come from
-    the loaded model (`current` / `runtime`): the entry's own state
-    is untouched by the apply loop until this call, so the loaded
-    view still matches disk.
-    """
-    snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
-    )
-    if snapshot is None:
-        raise crony.errors.PreconditionError(
-            f"{ref} is not a selected entry to apply"
-        )
-    full_name = str(snapshot.name)
-    bundle_name = ref.bundle
-    timing = snapshot.timing
-    snapshot_path = crony.model.snapshot_path_for(ref)
-
-    # Every uuid / full name the bundle's config currently defines
-    # (plus `ref` itself, defensively). Used to keep per-entry
-    # cleanup from clobbering a *different* live entry's state when
-    # names move between entries in one edit (a rename that frees a
-    # name another entry then claims).
-    bundle = config.toml_config.by_name(bundle_name)
-    bcfg = bundle.config if bundle is not None else None
-    live_uuids = {ref.uuid}
-    live_full_names: set[str] = set()
-    if bcfg is not None:
-        live_uuids |= {e.uuid for e in bcfg.jobs.values()} | {
-            e.uuid for e in bcfg.job_groups.values()
-        }
-        live_full_names = {f"{bundle_name}.{s}" for s in bcfg.jobs} | {
-            f"{bundle_name}.{s}" for s in bcfg.job_groups
-        }
-
-    # A uuid edit leaves the prior uuid's state dir behind under
-    # the same name (the name-keyed unit re-points at this uuid).
-    # Reclaim it before deciding "unchanged" so the residue is
-    # cleaned even when the new uuid's snapshot already matches --
-    # and so the full-sync orphan sweep can exclude still-selected
-    # names (it trusts _apply_one to have handled their residue).
-    _sweep_superseded_state_dirs(ref, full_name, live_uuids)
-    # Drift detection via direct snapshot comparison: take the
-    # entity's prior snapshot (if any) and compare it to the
-    # pending one. Both sides are the same dataclass shape, so
-    # equality is a single Python `==`. A missing / unparseable /
-    # wrong-schema prior snapshot is absent from `current` and so
-    # "not equal", triggering a fresh write. Equality alone isn't
-    # enough though: the unit-install integrity check (pinned on
-    # `runtime` at load) catches a hand-edited / missing unit file
-    # (or a scheduled unit the scheduler unloaded) whose snapshot
-    # still matches, so an otherwise-clean apply still re-renders
-    # and re-bootstraps the platform side.
-    current_snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.current.jobs.get(ref) or config.current.groups.get(ref)
-    )
-    rt = config.runtime.get(ref)
-    unit_stale = rt.unit_is_stale if rt is not None else False
-    if current_snapshot == snapshot and not unit_stale:
-        return "unchanged"
-    is_update = current_snapshot is not None
-
-    # Same uuid, new name: the entry was renamed in config. The
-    # state dir (uuid-keyed) is reused under the new name, but the
-    # old name's platform unit is now stale -- remove it so only
-    # the new name's unit remains. The shared state dir is left
-    # alone (passing no state_dir to _destroy_one). Skip when the
-    # old name is itself a live entry (a name-swap edit handed it
-    # to a sibling): that sibling owns the unit now, so removing it
-    # would unlink a unit a live entry is firing from.
-    if (
-        current_snapshot is not None
-        and str(current_snapshot.name) != full_name
-        and str(current_snapshot.name) not in live_full_names
-    ):
-        _destroy_one(str(current_snapshot.name), None)
-
-    # Capture runtime state BEFORE we re-render so a hand-disabled
-    # unit stays disabled across the re-load. The scheduler view
-    # is the source of truth here (the platform unit can outlive
-    # the state-dir snapshot); crony.runtime.unit_state returns "none" for a
-    # not-yet-installed unit, so only an explicit "disabled"
-    # answer counts and a fresh install still lands enabled.
-    prior_disabled = crony.runtime.unit_state(full_name) == "disabled"
-    units = _render_units(snapshot)
-    sched = crony.runtime.scheduler()
-    target_dir = sched.unit_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    # Clean up any previously-installed unit files for this name that
-    # aren't in the current render set (handles a scheduled ->
-    # unscheduled transition where the .timer should be removed).
-    sched.prune_units(full_name, set(units))
-    for fname, content in units.items():
-        (target_dir / fname).write_text(content, encoding="utf-8")
-    _activate_unit(
-        full_name,
-        prior_disabled=prior_disabled,
-        scheduled=timing is not None,
-    )
-
-    crony.runtime.state_dir_for(ref)
-    snapshot_path.write_text(
-        json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return "updated" if is_update else "added"
-
-
-def _destroy_one(name: str | None, state_dir: Path | None) -> None:
-    """Remove a single entity's platform unit and apply-time state.
-
-    Always a full wipe: the platform unit files and the entire
-    uuid-keyed state dir go away in one shot. Tolerant of partial
-    state throughout so a partially-installed entity can still be
-    cleaned up.
-
-    `name` is the full namespaced name used for platform unit
-    paths (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`).
-    Pass `None` when no name is recoverable -- e.g. a ref-form
-    destroy whose state dir snapshot is unparseable -- to skip
-    platform unit cleanup. `state_dir` is the uuid-keyed dir
-    (resolved by the caller via Config); None means there's no
-    state dir to clean up.
-    """
-    if name is not None:
-        crony.runtime.scheduler().remove_files(name)
-    if state_dir is None or not state_dir.is_dir():
-        return
-    shutil.rmtree(state_dir)
-
-
-def _sweep_superseded_state_dirs(
-    keep: crony.unit.EntityRef, full_name: str, live_uuids: set[str]
-) -> None:
-    """Remove state dirs in `keep`'s bundle whose snapshot recovers
-    `full_name` under a uuid no live config entry claims.
-
-    These are residue from a uuid edit: the name-keyed platform
-    unit now points at `keep`, so the old uuid dirs are unreachable
-    history. Only the state dir is wiped -- the unit is shared by
-    name and already re-rendered for `keep`.
-
-    `live_uuids` is every uuid the bundle's config currently
-    defines. A dir keyed by one of those belongs to a live entry,
-    not residue -- even when its on-disk name still matches
-    `full_name` because that entry was renamed and hasn't been
-    re-applied yet in this pass (a name-swap edit). Skipping them
-    keeps a live entry's run history from being wiped by a sibling
-    entry that grabbed its old name. A dir with a run in progress
-    is left in place (logged); the next apply or an explicit
-    `crony destroy <bundle>:<uuid>` reclaims it.
-    """
-    bundle_root = crony.paths.STATE_DIR / keep.bundle
-    if not bundle_root.is_dir():
-        return
-    for uuid_dir in sorted(bundle_root.iterdir()):
-        if not uuid_dir.is_dir() or uuid_dir.name in live_uuids:
-            continue
-        if crony.runtime.recover_full_name(uuid_dir) != full_name:
-            continue
-        stray = crony.unit.EntityRef(keep.bundle, uuid_dir.name)
-        if crony.runtime.run_in_progress(uuid_dir):
-            logger.warning(
-                "%s: superseded state dir %s left in place (run in progress)",
-                full_name,
-                stray,
-            )
-            continue
-        _destroy_one(None, uuid_dir)
-        logger.info(
-            "%s: removed superseded state dir %s",
-            full_name,
-            stray,
-        )
 
 
 # =============================================================================
@@ -727,15 +434,19 @@ def _config_axis(
         # is the pre-mask base the mask layer turns into "masked".
         return "missing"
     state = config.config_state(ref)
+    lingering = config.orphans_by_full_name.get(full)
     if (
         state == "missing"
         and entry is not None
-        and full in config.unit_only_by_full_name
+        and lingering is not None
+        and not config.orphans[lingering].is_broken
     ):
         # In config and never cleanly applied (no current
-        # snapshot) but a platform unit lingers from a prior apply
-        # whose state dir was wiped -- re-apply territory,
-        # surfaced as drift rather than a clean "not applied."
+        # snapshot) but a platform unit / alias lingers from a prior
+        # apply whose state dir was wiped -- re-apply territory,
+        # surfaced as drift rather than a clean "not applied." (A
+        # broken-snapshot remnant under the name is `broken`, not this
+        # case.)
         return "stale"
     if state == "synced":
         # Snapshot equality alone isn't enough: a matching
@@ -1089,6 +800,71 @@ def _topo_apply_order(
     return out
 
 
+def _reclaim_entity(
+    config: crony.model.Config,
+    entity: crony.model.Job | crony.model.JobGroup | crony.model.JobOrphan,
+    *,
+    raise_on_lock: bool,
+) -> bool:
+    """Remove one on-disk entity: a full removal (platform unit, state
+    dir, alias), or state-dir-only for a shadowed collision loser -- a
+    *different* current entry is the live winner of the name and owns
+    the name-keyed unit / alias. Returns True when it acted, False when
+    a run in progress left it in place. With `raise_on_lock` a held
+    run.lock raises (a targeted `destroy`); otherwise it warns and
+    skips (a bulk sweep / apply reconcile shouldn't abort on one busy
+    entry).
+    """
+    sd = entity.state_dir
+    on_disk = sd if sd.is_dir() else None
+    label = entity.full_name or str(entity.entity_ref)
+    if on_disk is not None and crony.runtime.run_in_progress(on_disk):
+        if raise_on_lock:
+            raise crony.errors.LockBusyError(
+                f"{label}: run in progress; will not destroy"
+            )
+        logger.warning("%s: left in place (run in progress)", label)
+        return False
+    if entity.entity_ref in config.shadowed:
+        crony.runtime.destroy_one(None, on_disk, None)
+    else:
+        crony.runtime.destroy_one(
+            entity.full_name, on_disk, entity.symlink_state_dir
+        )
+    return True
+
+
+def _reclaim(
+    config: crony.model.Config, bundle: str | None, *, only_unselected: bool
+) -> None:
+    """Reclaim on-disk entities the live config no longer wants. With
+    `only_unselected` (apply's full sync, `destroy --orphans`) that is
+    every current node or orphan whose ref is not in pending; otherwise
+    (a factory reset) every on-disk entity. The single source of
+    "which entities are orphans," shared so apply and destroy agree.
+    """
+    live = config.pending.refs()
+    on_disk: list[
+        crony.model.Job | crony.model.JobGroup | crony.model.JobOrphan
+    ] = [
+        *config.current.jobs.values(),
+        *config.current.groups.values(),
+        *config.orphans.values(),
+    ]
+    targets = sorted(
+        (
+            e
+            for e in on_disk
+            if (not only_unselected or e.entity_ref not in live)
+            and (bundle is None or e.bundle == bundle)
+        ),
+        key=lambda e: (e.bundle, e.uuid),
+    )
+    for e in targets:
+        if _reclaim_entity(config, e, raise_on_lock=False):
+            logger.info("%s: removed", e.full_name or str(e.entity_ref))
+
+
 def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """Render and activate platform units to match config.
 
@@ -1119,7 +895,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     """
     # One in-memory model for the whole command: selection comes
     # from the parsed bundles, drift / orphan reconciliation from
-    # the current + broken + unit-only graphs. _apply_one mutates
+    # the current + broken + unit-only graphs. apply_one mutates
     # disk per entry, but the orphan plan is derived from this one
     # load -- no second `load_config()` after the apply loop.
     config = crony.runtime.load_config()
@@ -1189,53 +965,33 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # landed in this apply pass.
     full_names_to_apply = _topo_apply_order(by_full, full_names_to_apply)
 
+    # Clean-first reconcile: before installing the pending units, drop
+    # whatever the config no longer selects so the apply lays down a
+    # clean replacement. A full sync reclaims every unselected on-disk
+    # entity (identical to `destroy --orphans`); a targeted apply
+    # supersedes only the old uuid of each name it installs. A uuid
+    # change is delete-old + create-new -- we carry no state across it,
+    # the shared name is incidental -- so the old job is removed in
+    # full and the pending job is built fresh.
+    if remove_orphans:
+        _reclaim(config, bundle, only_unselected=True)
+    else:
+        for full in full_names_to_apply:
+            pending_ref = config.pending.by_full_name.get(full)
+            current_ref = config.current.by_full_name.get(full)
+            if current_ref is None or current_ref == pending_ref:
+                continue
+            old = config.current.job_from_ref(current_ref)
+            if old is not None and _reclaim_entity(
+                config, old, raise_on_lock=False
+            ):
+                logger.info("%s: superseded uuid removed", full)
+
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
-        result = _apply_one(config, ref)
+        result = crony.runtime.apply_one(config, ref)
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
-
-    if remove_orphans:
-        # Reconcile by identity, not by name: anything on disk
-        # (current snapshot, broken snapshot, or unit-only orphan)
-        # whose ref the live config no longer selects is an orphan,
-        # regardless of whether its name is recoverable. A name-
-        # based sweep missed broken snapshots (no recoverable
-        # name) and unit-only orphans.
-        #
-        # Derived from the one up-front `config` (no reload): the
-        # apply loop only installs selected entries and reclaims
-        # their own superseded same-name residue (_apply_one's
-        # state-only sweep), so the set of orphans whose name is
-        # NOT selected is unchanged by the loop. Excluding
-        # still-selected names is also what keeps a shared name-
-        # keyed unit safe -- the residue of a live entry is
-        # _apply_one's job, not the orphan sweep's, so the sweep
-        # never unlinks a unit a selected entry is still firing.
-        on_disk = (
-            config.current.refs() | set(config.broken) | set(config.unit_only)
-        )
-        live = config.pending.refs()
-        orphan_refs = sorted(
-            (
-                r
-                for r in on_disk - live
-                if (bundle is None or r.bundle == bundle)
-                and config.name_for(r) not in selected
-            ),
-            key=lambda r: (r.bundle, r.uuid),
-        )
-        for ref in orphan_refs:
-            name = config.name_for(ref)
-            sd = crony.model.entity_state_dir(ref)
-            label = name if name is not None else str(ref)
-            if sd.is_dir() and crony.runtime.run_in_progress(sd):
-                logger.warning(
-                    "%s: orphan left in place (run in progress)", label
-                )
-                continue
-            _destroy_one(name, sd if sd.is_dir() else None)
-            logger.info("%s: orphan removed", label)
 
 
 def do_destroy(
@@ -1268,14 +1024,13 @@ def do_destroy(
     name mapping to different uuids in config vs on disk is rejected
     until `crony apply`.
 
-    Also accepts the `<bundle>:<UUID>` input form
-    so an operator can copy the JOB cell from a status row for
-    an entity with no recoverable name (corrupt snapshot, broken
-    entry) and paste it here. The input validates iff the
-    addressed state dir exists; the entity's actual name (used
-    for platform unit cleanup) is recovered from the snapshot
-    when readable, otherwise the platform unit cleanup is
-    dropped and only the state dir is wiped.
+    Also accepts the `<bundle>:<UUID>` input form so an operator can
+    copy the JOB cell from a status row for an entity with no
+    recoverable name (a broken snapshot or a snapshot-less leftover
+    dir) and paste it here. The input validates iff it names a
+    modeled on-disk entity -- a current node or an orphan. The
+    entity's own name keys the platform-unit cleanup; a too-corrupt
+    orphan carries none, so only its state dir is wiped.
     """
     if orphans and jobs:
         raise crony.errors.UsageError(
@@ -1284,14 +1039,6 @@ def do_destroy(
     config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
-    # Shadowed collision losers share a live name, so they never
-    # surface in the name-keyed discovery set
-    # (`Config.installed_full_names()`) -- collect them by ref.
-    # They're always orphans (the winner holds the name), so both
-    # factory-reset and `--orphans` reclaim them; surgical
-    # `destroy <name>` doesn't (the operator can paste a
-    # `<bundle>:<UUID>` from status to target one).
-    shadowed_refs: list[crony.unit.EntityRef] = []
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
@@ -1304,97 +1051,44 @@ def do_destroy(
         normalized = [
             crony.config.resolve_cli_name(arg, bundle) for arg in jobs
         ]
-        # A `<bundle>:<UUID>` input is "known" iff
-        # its state dir exists on disk; this lets the operator
-        # destroy entries that have no recoverable name (corrupt
-        # snapshots) by pasting the form from a status row.
         unknown = []
         for n in normalized:
             if n in known:
                 continue
+            # A `<bundle>:<UUID>` paste is known iff it names a modeled
+            # on-disk entity -- a current node or an orphan (the only
+            # refs `crony status` renders for pasting back).
             syn = crony.unit.EntityRef.from_str(n)
-            if syn is not None and crony.model.entity_state_dir(syn).is_dir():
+            if syn is not None and (
+                config.current.job_from_ref(syn) is not None
+                or syn in config.orphans
+            ):
                 continue
             unknown.append(n)
         if unknown:
             raise crony.errors.UsageError(f"unknown name(s): {sorted(unknown)}")
-        full_names_to_destroy = normalized
-    else:
-        names = config.installed_full_names()
-        if orphans:
-            _by_full, selected = _selected_full_names_per_bundle(bundles)
-            names = names - selected
-        if bundle is not None:
-            names = crony.config.bundle_prefix_filter(names, bundle)
-        full_names_to_destroy = sorted(names)
-        shadowed_refs = sorted(
-            (
-                r
-                for r in config.shadowed
-                if bundle is None or r.bundle == bundle
-            ),
-            key=lambda r: (r.bundle, r.uuid),
-        )
-
-    explicit = bool(jobs)
-    for full in full_names_to_destroy:
-        # The state dir to wipe is the one the installed unit's argv
-        # addresses: the *current* (most-recently-applied) uuid. For an
-        # explicit `destroy <name>`, resolve by uuid so a rename
-        # addressed by its new name still wipes the right entity (and a
-        # name-swap raises rather than guessing). The `--orphans` /
-        # factory-reset path iterates installed (current) names, so it
-        # stays current-only -- a pending fallback there could resolve
-        # an old-name remnant to a uuid still live under its new name
-        # and wipe shared state. A `<bundle>:<UUID>` input lands as
-        # `direct_ref` and is used directly.
-        direct_ref = crony.unit.EntityRef.from_str(full)
-        if explicit:
+        for full in normalized:
+            # Resolve to the on-disk entity to wipe -- current node or
+            # orphan, never pending (a not-yet-applied rename still
+            # addresses the installed uuid; a name-swap raises). A name
+            # with no on-disk state but a stray same-name unit falls
+            # back to a name-keyed unit sweep. A held run.lock raises.
             ref = _resolve_addressable(config, full)
-        else:
-            ref = config.resolve_current(full) or direct_ref
-        sd = crony.model.entity_state_dir(ref) if ref is not None else None
-        # Recover the entity's actual name for platform unit cleanup:
-        # the unit file is keyed by the installed (current) name, which
-        # a `<bundle>:<UUID>` input or a renamed entry's new name
-        # doesn't carry. `name_for` recovers it (current-first); None
-        # when the snapshot was unparseable or absent, in which case
-        # the platform unit cleanup is dropped (no name -> no path).
-        if direct_ref is not None:
-            name_for_cleanup: str | None = config.name_for(direct_ref)
-        elif explicit and ref is not None:
-            name_for_cleanup = config.name_for(ref) or full
-        else:
-            name_for_cleanup = full
-        # Refuse if a run is in progress; a partial destroy would
-        # leave the running shim with deleted state under it.
-        lock_path = sd / "run.lock" if sd is not None else None
-        if lock_path is not None and lock_path.exists():
-            try:
-                with crony.runtime.acquire_lock(lock_path):
-                    pass
-            except crony.errors.LockBusyError:
-                raise crony.errors.LockBusyError(
-                    f"{full}: run in progress; will not destroy"
-                ) from None
-        _destroy_one(name_for_cleanup, sd)
-        logger.info("%s: destroyed", full)
-
-    # Reclaim shadowed collision residue (state dir only -- the
-    # shared name-keyed unit belongs to the surviving winner and,
-    # in a factory reset, is removed by the winner's own pass
-    # above).
-    for ref in shadowed_refs:
-        sd = crony.model.entity_state_dir(ref)
-        if not sd.is_dir():
-            continue
-        if crony.runtime.run_in_progress(sd):
-            logger.warning(
-                "%s: shadowed residue left in place (run in progress)", ref
+            entity = (
+                config.current.job_from_ref(ref) or config.orphans.get(ref)
+                if ref is not None
+                else None
             )
-            continue
-        _destroy_one(None, sd)
-        logger.info("%s: destroyed shadowed residue", ref)
+            if entity is None:
+                crony.runtime.destroy_one(full, None, None)
+            else:
+                _reclaim_entity(config, entity, raise_on_lock=True)
+            logger.info("%s: destroyed", full)
+    else:
+        # A bare `destroy` factory-resets every crony-managed remnant;
+        # `--orphans` limits it to entities the live config no longer
+        # selects. Both go through the one reclamation `apply` shares.
+        _reclaim(config, bundle, only_unselected=orphans)
 
 
 def _applied_schedule_state(config: crony.model.Config, full: str) -> str:
@@ -1432,7 +1126,7 @@ def _installed_refs(config: crony.model.Config) -> set[crony.unit.EntityRef]:
     snapshot, or a leftover platform unit) -- the set an action
     command can act on. Excludes pending-only entries (never applied).
     """
-    return config.current.refs() | set(config.broken) | set(config.unit_only)
+    return config.current.refs() | set(config.orphans)
 
 
 def _resolve_addressable(
@@ -1675,7 +1369,7 @@ def do_trigger(
             crony.runner.trigger_unit(
                 unit_name,
                 triggered_by_user=True,
-                state_dir=crony.model.entity_state_dir(ref),
+                state_dir=crony.model.Job.state_dir_from_ref(ref),
             )
             logger.info("%s: triggered", full)
         return
@@ -1718,7 +1412,7 @@ def do_trigger(
         )
         rec = crony.runner.trigger_unit_sync(
             unit_name,
-            state_dir=crony.model.entity_state_dir(ref),
+            state_dir=crony.model.Job.state_dir_from_ref(ref),
             job_timeout=timeout,
             trigger_timeout=tt,
             triggered_by_user=True,
@@ -1795,6 +1489,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "uuid": "UUID",
     "unit-config": "UNIT CONFIG",
     "unit-timer": "UNIT TIMER",
+    "log-file": "LOG FILE",
 }
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
@@ -1905,6 +1600,12 @@ Columns
                     (`crony-<name>.timer` on Linux). Always empty on
                     macOS (the plist carries its own schedule) and for
                     an unscheduled / grouped entry.
+  log-file          Filesystem path of the entry's log file (the path
+                    `crony logs <name>` reads). Opt-in. Source-selected
+                    like `schedule`: default and --config-pending show
+                    the config path, --config-current the applied one,
+                    flagged with `^` when the two diverge (a not-yet-
+                    applied rename).
 
 Aliases
 -------
@@ -2077,7 +1778,9 @@ def _resolve_state_axes(
             unit_state = "grouped"
         else:
             installed_name = (
-                str(current_node.name) if current_node is not None else full
+                str(current_node.entity_name)
+                if current_node is not None
+                else full
             )
             unit_state = crony.runtime.unit_state(installed_name)
     last_state = _last_run_state(config, full)
@@ -2244,13 +1947,13 @@ def _build_group_membership(
         table: dict[crony.unit.EntityRef, list[str]] = {}
         for parent in graph.groups.values():
             for child_uuid in parent.children:
-                child_ref = crony.unit.EntityRef(parent.name.bundle, child_uuid)
+                child_ref = crony.unit.EntityRef(parent.bundle, child_uuid)
                 if (
                     child_ref not in graph.jobs
                     and child_ref not in graph.groups
                 ):
                     continue
-                table.setdefault(child_ref, []).append(str(parent.name))
+                table.setdefault(child_ref, []).append(str(parent.entity_name))
         for v in table.values():
             v.sort()
         return table
@@ -2420,7 +2123,7 @@ def do_status(
     # Surface bundle parse failures at the top of the report so
     # the operator sees them before scanning the table. The table
     # itself shows whatever is interpretable on-disk; entries
-    # whose bundle didn't load show up as orphans or unit_only.
+    # whose bundle didn't load show up as orphans.
     if bundles.errored_bundles:
         print("bundle parse failures (config-side entries not loaded):")
         for src, msg in bundles.errored_bundles.items():
@@ -2432,17 +2135,24 @@ def do_status(
         full_names = [crony.config.resolve_cli_name(n, bundle) for n in jobs]
     else:
         errored_full = _errored_full_names(bundles, bundle)
-        # Broken entries with no recoverable name, and current
+        # On-disk orphans with no recoverable name (a broken snapshot
+        # or a bare state dir with no snapshot at all), and current
         # entries whose name is shadowed by a collision, are
         # addressable only through the synthetic `<bundle>:<UUID>`
         # form -- their row carries that form in the JOB / UUID
         # cell. (A shadowed entry's plain name still belongs to its
         # collision winner, so adding the name to `active` would
-        # only re-render the winner.)
+        # only re-render the winner.) A nameless orphan whose ref is
+        # still a live pending entry is that entry's own wiped state,
+        # rendered under the entry's named row -- not a separate
+        # ref-form row.
+        pending_refs = config.pending.refs()
         ref_form_only = {
-            str(b.ref)
-            for b in config.broken.values()
-            if b.name is None and (bundle is None or b.bundle == bundle)
+            str(b.entity_ref)
+            for b in config.orphans.values()
+            if b.name is None
+            and b.entity_ref not in pending_refs
+            and (bundle is None or b.bundle == bundle)
         }
         ref_form_only |= {
             str(ref)
@@ -2533,21 +2243,14 @@ def do_status(
             else None
         )
         pending_name = (
-            str(pending_node.name) if pending_node is not None else None
+            str(pending_node.entity_name) if pending_node is not None else None
         )
         current_name = (
-            str(current_node.name) if current_node is not None else None
+            str(current_node.entity_name) if current_node is not None else None
         )
         if current_name is None and ref is not None:
-            be = config.broken.get(ref)
-            ue = config.unit_only.get(ref)
-            current_name = (
-                be.name
-                if be is not None
-                else ue.name
-                if ue is not None
-                else None
-            )
+            oe = config.orphans.get(ref)
+            current_name = oe.name if oe is not None else None
         fallback = sorted(candidates)[0] if candidates else ""
         # The config (pending) name drives tree placement, masking,
         # and the TOML-entry lookup; the displayed identity is chosen
@@ -2672,8 +2375,13 @@ def do_status(
             any_stale = True
             unit_name = f"{unit_name}{_DIVERGENCE_MARKER}"
         if is_refform:
+            # A ref-form row is addressable only by uuid -- a shadowed
+            # loser's plain name belongs to its live collision winner,
+            # a nameless orphan has none. Show the ref in both the JOB
+            # and JOB / UUID columns so no column prints a name the
+            # operator can't act on.
             row_ref: crony.unit.EntityRef | None = ref
-            job_cell = (config.name_for(ref) or "") if ref is not None else ""
+            job_cell = str(ref) if ref is not None else ""
             job_or_uuid_cell = str(ref)
         else:
             row_ref = ref
@@ -2687,6 +2395,20 @@ def do_status(
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
+        # `log-file`: the reported log path, read off each side's node
+        # via the same `log_path` accessor `crony logs` uses. Dual-
+        # source, so a not-yet-applied rename flags `^`. An orphan row
+        # (no graph node) reports its remnant's path on the current
+        # side; a broken row with no recoverable name reports nothing.
+        pending_log = (
+            str(pending_node.log_path) if pending_node is not None else None
+        )
+        current_log: str | None = None
+        if current_node is not None:
+            current_log = str(current_node.log_path)
+        elif row_ref is not None and row_ref in config.orphans:
+            current_log = str(config.orphans[row_ref].log_path)
+        log_file_cell = _mark(pending_log, current_log)
         built.append(
             (
                 config_name,
@@ -2705,6 +2427,7 @@ def do_status(
                     "uuid": uuid_cell,
                     "unit-config": unit_config_cell,
                     "unit-timer": unit_timer_cell,
+                    "log-file": log_file_cell,
                 },
             )
         )
@@ -2850,6 +2573,7 @@ def do_logs(
     except crony.errors.ConfigError:
         config = None
     sd: Path | None = None
+    current_node: crony.model.Job | crony.model.JobGroup | None = None
     if config is not None:
         # Logs: prefer the current ref (where the run.log actually
         # lives), fall back to pending so `--path` mode prints the
@@ -2870,17 +2594,25 @@ def do_logs(
             # it's also defined for refs that aren't
             # (`<bundle>:<UUID>` input whose snapshot is
             # unparseable, pre-apply entries, broken / future
-            # unit-only orphans). The `log_path.exists()` check
+            # orphans). The `log_path.exists()` check
             # below handles "path is well-defined but no log
             # there yet".
-            sd = crony.model.entity_state_dir(ref)
+            sd = crony.model.Job.state_dir_from_ref(ref)
+            current_node = config.current.jobs.get(
+                ref
+            ) or config.current.groups.get(ref)
     if sd is None:
         raise crony.errors.UsageError(
             f"no log for {full!r} (no applied state on this host)"
         )
-    log_path = sd / "run.log"
+    log_path = sd / crony.model.RUN_LOG_NAME
     if path:
-        print(log_path)
+        # The reported path comes from the applied (current) node, so
+        # it shows the short-name alias when the on-disk link resolves
+        # and the uuid path otherwise -- always a valid on-disk
+        # location. A pre-apply / ref-form / broken entry has no
+        # current node, so it reports the uuid path directly.
+        print(current_node.log_path if current_node is not None else log_path)
         return
     if not log_path.exists():
         raise crony.errors.UsageError(f"no log for {full!r} (state dir: {sd})")

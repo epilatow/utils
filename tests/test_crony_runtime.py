@@ -131,7 +131,7 @@ class TestUnitNameDelegatesTolerateRefForm:
 class TestConfigState:
     """`Config.config_state` classification driven through the real
     apply -> load_config path (vs `TestConfigStateInMemory`, which
-    plants snapshots by hand). Confirms _apply_one writes a snapshot
+    plants snapshots by hand). Confirms apply_one writes a snapshot
     that load_config scores as synced, and that a config edit
     without re-apply flips it to stale.
     """
@@ -653,7 +653,11 @@ class TestLoadConfig:
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert ref in config.pending.jobs
-        assert config.pending.jobs[ref].name == EntityName.from_str("default.a")
+        assert config.pending.jobs[ref].bundle == "default"
+        assert config.pending.jobs[ref].name == "a"
+        assert config.pending.jobs[ref].entity_name == EntityName.from_str(
+            "default.a"
+        )
         # No on-disk snapshot yet -> nothing in current.
         assert ref not in config.current.jobs
         assert config.config_state(ref) == "missing"
@@ -721,9 +725,44 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(snap.to_dict()), encoding="utf-8"
         )
+        # apply also plants the short-name alias; without it the
+        # current node's recorded link diverges from the expected one.
+        (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "synced"
+
+    def test_scan_skips_alias_symlink(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """The short-name alias symlink that sits beside the uuid dirs
+        is skipped by the state scan: `is_dir()` follows the link, so
+        without the guard the alias would be re-scanned under its short
+        name -- here surfacing a phantom broken entry keyed by that
+        name instead of only the real uuid-keyed one."""
+        self._setup(tmp_path, monkeypatch)
+        crony_paths.CONFIG_FILE.write_text("", encoding="utf-8")
+        uuid_a = "33333333-4444-5555-6666-aaaaaaaaaaaa"
+        sd = crony_paths.STATE_DIR / "default" / uuid_a
+        sd.mkdir(parents=True)
+        # A schema-mismatched snapshot makes the real uuid dir a broken
+        # entry; reaching it again through the alias would mint a second
+        # broken entry keyed by the alias's short name.
+        (sd / "snapshot.json").write_text(
+            json.dumps(
+                {
+                    "schema": 999,
+                    "kind": "job",
+                    "name": "default.a",
+                    "uuid": uuid_a,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
+        config = crony_runtime.load_config()
+        assert set(config.orphans) == {EntityRef("default", uuid_a)}
+        assert EntityRef("default", "a") not in config.orphans
 
     def test_stale_when_pending_differs(
         self, tmp_path: Path, monkeypatch: Any
@@ -773,11 +812,12 @@ class TestLoadConfig:
 
 
 class TestConfigBroken:
-    """`Config.broken` carries the entities whose on-disk
-    snapshot can't be loaded by this crony binary. `_build_current_graph`
-    populates it instead of silently dropping the state dir;
-    `Config.config_state` returns `"broken"` for refs that land
-    there, beating the synced / stale / orphan / missing axes.
+    """`Config.orphans` carries the entities whose on-disk snapshot
+    can't be loaded by this crony binary, flagged `is_broken`.
+    `_build_current_graph` records them instead of silently dropping
+    the state dir; `Config.config_state` returns `"broken"` for refs
+    that land there, beating the synced / stale / orphan / missing
+    axes.
     """
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
@@ -813,17 +853,17 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
+        assert ref in config.orphans
         assert ref not in config.current.jobs
         # Broken entries get a runtime entry so the unit-config /
         # last / last-ran columns can read the same state-dir
         # files normal current entries read.
         assert ref in config.runtime
-        assert config.broken[ref].name == "default.legacy"
-        assert "schema 999" in config.broken[ref].reason
+        assert config.orphans[ref].name == "default.legacy"
+        assert "schema 999" in (config.orphans[ref].reason or "")
         assert config.config_state(ref) == "broken"
-        # Name-recovery let it land in broken_by_full_name.
-        assert config.broken_by_full_name.get("default.legacy") == ref
+        # Name-recovery let it land in orphans_by_full_name.
+        assert config.orphans_by_full_name.get("default.legacy") == ref
 
     def test_unrecognized_kind_recorded_as_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -840,8 +880,8 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
-        assert "banana" in config.broken[ref].reason
+        assert ref in config.orphans
+        assert "banana" in (config.orphans[ref].reason or "")
         assert config.config_state(ref) == "broken"
 
     def test_dataclass_type_error_recorded_as_broken(
@@ -861,9 +901,9 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
-        assert config.broken[ref].name == "default.partial"
-        assert "snapshot conversion" in config.broken[ref].reason
+        assert ref in config.orphans
+        assert config.orphans[ref].name == "default.partial"
+        assert "snapshot conversion" in (config.orphans[ref].reason or "")
 
     def test_corrupt_json_recorded_as_broken_without_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -874,12 +914,12 @@ class TestConfigBroken:
             "{not valid json",
         )
         config = crony_runtime.load_config()
-        assert ref in config.broken
+        assert ref in config.orphans
         # No recoverable name from corrupt JSON; the entry is
         # reachable only by ref (or the synthetic input form).
-        assert config.broken[ref].name is None
-        assert "unreadable" in config.broken[ref].reason
-        assert ref not in config.broken_by_full_name.values()
+        assert config.orphans[ref].name is None
+        assert "unreadable" in (config.orphans[ref].reason or "")
+        assert ref not in config.orphans_by_full_name.values()
 
     def test_broken_beats_orphan_when_only_current_side_exists(
         self, tmp_path: Path, monkeypatch: Any
@@ -896,6 +936,58 @@ class TestConfigBroken:
         )
         config = crony_runtime.load_config()
         assert config.config_state(ref) == "broken"
+
+
+class TestConfigSnapshotlessDir:
+    """A uuid dir with no snapshot.json at all is modeled as a
+    nameless, non-broken `JobOrphan` -- leftover junk a sweep or a
+    ref-form destroy reclaims, unless its uuid is a live config entry
+    (then it is that entry's wiped state, surfaced as `stale`).
+    """
+
+    def _plant(self, h: Any, ghost: str) -> Path:
+        sd: Path = h.state / DEFAULT_BUNDLE_NAME / ghost
+        sd.mkdir(parents=True)
+        (sd / "run.log").write_text("stale\n", encoding="utf-8")
+        return sd
+
+    def test_unmodeled_dir_is_nameless_non_broken_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        ghost = "deadbeef-0000-0000-0000-deadbeef0000"
+        self._plant(h, ghost)
+        config = crony_runtime.load_config()
+        ref = EntityRef(DEFAULT_BUNDLE_NAME, ghost)
+        assert ref in config.orphans
+        orphan = config.orphans[ref]
+        assert orphan.name is None
+        assert not orphan.is_broken
+        assert config.config_state(ref) == "orphan"
+        assert ref not in config.current.jobs
+        assert ref not in config.current.groups
+
+    def test_dir_for_live_config_uuid_reads_stale_not_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The wiped state dir of an applied entry that is still in
+        # config keeps that entry's uuid. It stays a (nameless)
+        # orphan so destroy / apply can reclaim it, but `config_state`
+        # reads it `stale` (re-apply) -- not `orphan` -- because the
+        # ref is still a live pending entry.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        (h.state_dir("j", cfg=cfg) / "snapshot.json").unlink()
+        config = crony_runtime.load_config()
+        ref = EntityRef(DEFAULT_BUNDLE_NAME, cfg.jobs["j"].uuid)
+        assert ref in config.orphans
+        assert config.orphans[ref].name is None
+        assert config.config_state(ref) == "stale"
 
 
 class TestResolveMethods:
@@ -1223,7 +1315,7 @@ class TestUnitDriftDetection:
         # extracted paths against the filesystem and flags the
         # install as broken when either's gone.
         content = unit_config.read_text()
-        live_uv = str(crony_commands._uv_executable())
+        live_uv = str(crony_runtime._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
@@ -1250,7 +1342,7 @@ class TestUnitDriftDetection:
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
         # `do_apply` reads the unit-drift verdict from the Config it
-        # loaded once at start (_apply_one's `model` path), not by
+        # loaded once at start (apply_one's `model` path), not by
         # re-probing disk per entry. A unit deleted after the first
         # apply is `unit_is_stale` at load time, so the no-arg apply
         # re-renders it.
