@@ -63,6 +63,7 @@ from crony.model import (  # noqa: E402
     SNAPSHOT_SCHEMA,
 )
 from crony.platform import (  # noqa: E402
+    launchd,
     systemd,
 )
 from crony.unit import (  # noqa: E402
@@ -6433,6 +6434,83 @@ class TestLastRunStateInteractive:
         )
         config = crony_runtime.load_config()
         assert crony_commands._last_run_state(config, full) == "canceled"
+
+
+class TestLastRunStateCrashed:
+    """When the scheduler's last launch ended without recording (killed,
+    or exited nonzero before the runner wrote its record), the surviving
+    last-run.json is stale: LAST reads `crashed` and LAST RAN reads
+    `unknown`. A status matching the recorded process exit is a normal
+    result and is left alone."""
+
+    def _setup(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        *,
+        status: int,
+        record: str,
+    ) -> str:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        full = h.full("iv")
+        sd = h.fabricate_orphan("iv")
+        (sd / "last-run.json").write_text(record, encoding="utf-8")
+        monkeypatch.setattr(
+            launchd,
+            "_launchctl_list",
+            lambda: f"PID\tStatus\tLabel\n-\t{status}\torg.crony.{full}\n",
+        )
+        return full
+
+    # A stale "ok" record (process_exit 0) from an earlier good launch.
+    _STALE_OK = (
+        '{"exit_class": "ok",'
+        ' "started_at": "2099-01-01T00:00:00-08:00",'
+        ' "host": "h", "platform": "darwin",'
+        ' "ended_at": "2099-01-01T00:00:01-08:00",'
+        ' "duration_sec": 1.0, "exit_code": 0, "signal": null,'
+        ' "process_exit": 0, "gate": "none",'
+        ' "log_path": "/tmp/run.log", "log_bytes_this_run": 0}'
+    )
+    # A recorded failure: the runner exited the process with code 1.
+    _RECORDED_FAIL = (
+        '{"exit_class": "fail",'
+        ' "started_at": "2099-01-01T00:00:00-08:00",'
+        ' "host": "h", "platform": "darwin",'
+        ' "ended_at": "2099-01-01T00:00:01-08:00",'
+        ' "duration_sec": 1.0, "exit_code": 1, "signal": null,'
+        ' "process_exit": 1, "gate": "none",'
+        ' "log_path": "/tmp/run.log", "log_bytes_this_run": 0}'
+    )
+
+    def test_signal_kill_is_crashed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        full = self._setup(
+            tmp_path, monkeypatch, status=-9, record=self._STALE_OK
+        )
+        config = crony_runtime.load_config()
+        assert crony_commands._last_run_state(config, full) == "crashed"
+        assert crony_commands._last_ran_at(config, full) == "unknown"
+
+    def test_nonzero_exit_without_record_is_crashed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        full = self._setup(
+            tmp_path, monkeypatch, status=127, record=self._STALE_OK
+        )
+        config = crony_runtime.load_config()
+        assert crony_commands._last_run_state(config, full) == "crashed"
+
+    def test_recorded_failure_is_not_crashed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        full = self._setup(
+            tmp_path, monkeypatch, status=1, record=self._RECORDED_FAIL
+        )
+        config = crony_runtime.load_config()
+        assert crony_commands._last_run_state(config, full) == "fail"
 
 
 class TestStatusRenameUuidModel:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import enum
+from dataclasses import dataclass
 from pathlib import Path
 
 from crony.unit import UnitSpec
@@ -39,6 +40,30 @@ class UnitState(enum.Enum):
     ENABLED = "enabled"
     DISABLED = "disabled"
     NONE = "none"
+
+
+@dataclass(frozen=True)
+class UnitLastExit:
+    """The scheduler's record of a unit's most recent completed launch.
+
+    `exit_status` is the launched process's wait status: 0 or a positive
+    exit code, or a negative number whose magnitude is the terminating
+    signal -- the `launchctl list` convention, which the systemd backend
+    normalizes to. A unit with a launch in flight, or one the scheduler
+    has no readable status for, is omitted from `unit_last_exits`
+    entirely (its in-flight state is the lock's job, not this).
+
+    Reconciled against the run record by `RuntimeState.crashed`: the
+    runner writes `last-run.json` and exits the process with that same
+    code on every path it controls, so a status matching the recorded
+    exit is a normal result. Anything else -- a signal (OOM, jetsam, a
+    manual kill, macOS OS_REASON_CODESIGNING) or a nonzero exit reached
+    before the runner recorded (e.g. a missing uv -> 127) -- is a launch
+    that left no matching record, and whatever `last-run.json` holds is
+    stale from an earlier launch.
+    """
+
+    exit_status: int
 
 
 class SchedulerWarning(Exception):
@@ -134,6 +159,18 @@ class Scheduler(abc.ABC):
     @abc.abstractmethod
     def state(self, name: str) -> UnitState:
         """The scheduler's enable/disable state for the unit `name`."""
+
+    @abc.abstractmethod
+    def unit_last_exits(self) -> dict[str, UnitLastExit]:
+        """Map every crony unit the scheduler knows to its last-launch
+        outcome (`UnitLastExit`), in one bulk query.
+
+        Keyed by the full `<bundle>.<short>` name. A unit the scheduler
+        has no record for is simply absent from the map. Status reads
+        this to tell a launch that ended without recording a result
+        (killed, or exited before the runner wrote `last-run.json`)
+        from a clean run, so a stale `last-run.json` isn't reported as
+        the live outcome."""
 
     @abc.abstractmethod
     def is_stale(self, spec: UnitSpec) -> bool:

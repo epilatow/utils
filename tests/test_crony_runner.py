@@ -354,6 +354,10 @@ class TestRunJobBasics:
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
         assert rec["exit_code"] == int(ExitCode.PRECONDITION)
+        # process_exit matches the code the process exits with, so status
+        # reconciles this against the scheduler as `canceled`, not
+        # `crashed`.
+        assert rec["process_exit"] == int(ExitCode.PRECONDITION)
         assert "schema 999" in rec["reason"]
         # run.log gained the canceled entry too.
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")

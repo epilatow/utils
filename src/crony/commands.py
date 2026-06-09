@@ -329,10 +329,13 @@ def _last_run_state(config: crony.model.Config, full_name: str) -> str:
     Lock-held implies a run is currently in flight: "pending" when
     the in-flight run is an interactive job sitting in its wait
     loop (signaled by a `pending.flag` file in the state dir),
-    "running" otherwise. Without the lock, read last-run.json's
-    recorded exit_class. Absence of either means the entity has
-    never run -- new install, group-only job that's never been
-    triggered, etc.
+    "running" otherwise. Otherwise "crashed" when the scheduler's
+    last launch ended without recording a run -- killed, or exited
+    before the runner wrote its record (so the last-run.json that
+    remains is stale; see RuntimeState.crashed) -- then
+    last-run.json's recorded exit_class. Absence of all of these
+    means the entity has never run -- new install, group-only job
+    that's never been triggered, etc.
 
     Resolution is current-first, pending-fallback. Runtime is
     uuid-keyed, and a rename keeps the uuid, so the run history
@@ -351,6 +354,8 @@ def _last_run_state(config: crony.model.Config, full_name: str) -> str:
         return "never"
     if rt.is_running:
         return "pending" if rt.is_pending else "running"
+    if rt.crashed:
+        return "crashed"
     if rt.last_run is None:
         return "never"
     cls = rt.last_run.exit_class
@@ -370,16 +375,23 @@ def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
     """Return a compact "when did this last run" string for status.
 
     Returns "never" when there's no last-run record and "unknown"
-    when the recorded timestamp is unreadable. Resolution is
-    current-first, pending-fallback: runtime is uuid-keyed, so a
-    not-yet-applied rename (new name, unchanged uuid) is recovered
-    via the pending graph when the applied-name lookup misses.
+    when the recorded timestamp is unreadable or the recorded run
+    was superseded by a launch that ended without recording (a
+    crash, so the surviving timestamp is from an earlier run).
+    Resolution is current-first, pending-fallback: runtime is
+    uuid-keyed, so a not-yet-applied rename (new name, unchanged
+    uuid) is recovered via the pending graph when the applied-name
+    lookup misses.
     """
     ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
         return "never"
     rt = config.runtime.get(ref)
-    if rt is None or rt.last_run is None:
+    if rt is None:
+        return "never"
+    if rt.crashed:
+        return "unknown"
+    if rt.last_run is None:
         return "never"
     started = rt.last_run.started_at
     if not started:
@@ -1850,12 +1862,16 @@ _ANSI_YELLOW: str = "\033[33m"
 _ANSI_RESET: str = "\033[0m"
 
 # CONFIG values worth a red flag. `last` is folded so `signal` never
-# reaches the cell (it renders as `fail`); `timeout` / `canceled` are
-# the other non-clean terminal outcomes.
+# reaches the cell (it renders as `fail`); `timeout` / `canceled` /
+# `crashed` are the other non-clean terminal outcomes (`crashed` = the
+# launch ended without recording a run -- killed, or exited before the
+# runner wrote its record).
 _STATUS_RED_CONFIG: frozenset[str] = frozenset(
     {"missing", "error", "broken", "orphan"}
 )
-_STATUS_RED_LAST: frozenset[str] = frozenset({"fail", "timeout", "canceled"})
+_STATUS_RED_LAST: frozenset[str] = frozenset(
+    {"fail", "timeout", "canceled", "crashed"}
+)
 
 
 def _color_supported() -> bool:
@@ -3070,6 +3086,7 @@ def _notify_test_one_bundle(
         exit_class="fail",
         exit_code=1,
         signal=None,
+        process_exit=1,
         gate="none",
         log_path="(synthetic)",
         log_bytes_this_run=0,

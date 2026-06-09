@@ -19,6 +19,7 @@ from crony.platform.scheduler import (
     UNIT_PREFIX,
     Scheduler,
     SchedulerWarning,
+    UnitLastExit,
     UnitState,
     exec_paths_from_argv,
 )
@@ -143,6 +144,51 @@ def _is_enabled(unit: str) -> str:
     return r.stdout.strip()
 
 
+def _show_services(units: list[str]) -> list[dict[str, str]]:
+    """Parse `systemctl --user show` property blocks for `units`.
+
+    One `key=value` block per requested unit (blank-line separated),
+    in request order; an unknown unit still yields a block carrying
+    its `Id`. Returns [] when systemctl is absent or times out."""
+    if not units:
+        return []
+    try:
+        r = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "-p",
+                "Id",
+                "-p",
+                "ActiveState",
+                "-p",
+                "Result",
+                "-p",
+                "ExecMainStatus",
+                *units,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    blocks: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if not line:
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        key, _, value = line.partition("=")
+        cur[key] = value
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
 def _current_user() -> str:
     """Best-effort resolution of the invoking user's name, for the
     linger check. Falls back through env vars and getpwuid so the
@@ -260,6 +306,34 @@ class SystemdScheduler(Scheduler):
         if st == "static":
             return UnitState.ENABLED
         return UnitState.NONE
+
+    def unit_last_exits(self) -> dict[str, UnitLastExit]:
+        # The `.service` is the unit that runs the job; query it (not
+        # the `.timer`). ExecMainStatus is the exit code for a normal
+        # exit and the signal number for a kill; Result distinguishes
+        # them. Normalize to the launchctl convention -- exit codes
+        # positive, signals negated -- so RuntimeState.crashed compares
+        # uniformly across backends. A unit with a launch in flight (its
+        # status is stale) or no readable status is left out.
+        services = {service_filename(n): n for n in self.installed_names()}
+        out: dict[str, UnitLastExit] = {}
+        for blk in _show_services(list(services)):
+            name = services.get(blk.get("Id", ""))
+            if name is None:
+                continue
+            if blk.get("ActiveState", "") in (
+                "active",
+                "activating",
+                "reloading",
+            ):
+                continue
+            try:
+                raw = int(blk.get("ExecMainStatus", ""))
+            except ValueError:
+                continue
+            killed = blk.get("Result", "") not in ("success", "exit-code")
+            out[name] = UnitLastExit(exit_status=-raw if killed else raw)
+        return out
 
     def is_stale(self, spec: UnitSpec) -> bool:
         name = str(spec.name)

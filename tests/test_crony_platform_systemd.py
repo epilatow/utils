@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.platform import (  # noqa: E402
     SchedulerWarning,
+    UnitLastExit,
     get_scheduler,
     systemd,
 )
@@ -274,6 +275,62 @@ class TestSystemdAnalyzeVerify:
                 f"{path.name} failed systemd-analyze verify "
                 f"(rc={proc.returncode}):\n{output}"
             )
+
+
+class TestSystemdUnitLastExits:
+    """`systemctl show` reports a service's last-launch outcome. The
+    backend normalizes ExecMainStatus to the launchctl convention:
+    exit codes positive, signal kills (`Result=signal`/`core-dump`)
+    negated. A unit whose `ActiveState` is active/activating has a run
+    in flight and is left out."""
+
+    def _setup(self, tmp_path: Path) -> None:
+        for short in ("ok", "failed", "killed", "running"):
+            (tmp_path / f"crony-default.{short}.service").write_text("x")
+
+    def test_parses_show_blocks(self, tmp_path: Path, monkeypatch: Any) -> None:
+        self._setup(tmp_path)
+        blocks = [
+            {
+                "Id": "crony-default.ok.service",
+                "ActiveState": "inactive",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            {
+                "Id": "crony-default.failed.service",
+                "ActiveState": "failed",
+                "Result": "exit-code",
+                "ExecMainStatus": "42",
+            },
+            {
+                "Id": "crony-default.killed.service",
+                "ActiveState": "failed",
+                "Result": "signal",
+                "ExecMainStatus": "9",
+            },
+            {
+                "Id": "crony-default.running.service",
+                "ActiveState": "activating",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        ]
+        monkeypatch.setattr(systemd, "_show_services", lambda _u: blocks)
+        got = get_scheduler("linux", tmp_path).unit_last_exits()
+        # default.running (ActiveState activating) is left out.
+        assert got == {
+            "default.ok": UnitLastExit(exit_status=0),
+            "default.failed": UnitLastExit(exit_status=42),
+            "default.killed": UnitLastExit(exit_status=-9),
+        }
+
+    def test_empty_when_systemctl_absent(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path)
+        monkeypatch.setattr(systemd, "_show_services", lambda _u: [])
+        assert get_scheduler("linux", tmp_path).unit_last_exits() == {}
 
 
 class TestSystemdUnitName:

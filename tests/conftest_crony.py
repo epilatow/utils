@@ -657,6 +657,11 @@ class _ApplyHarness(_RunnerHarness):
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         monkeypatch.setattr(launchd, "_is_disabled", lambda _label: False)
+        # load_config issues one bulk scheduler query for last-launch
+        # outcomes; stub its primitives so it stays off the captured
+        # subprocess path (tests asserting a no-start override these).
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
+        monkeypatch.setattr(systemd, "_show_services", lambda _u: [])
         self.platform = platform
         self.agents = agents
         self.sysd = sysd

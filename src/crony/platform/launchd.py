@@ -18,6 +18,7 @@ from pathlib import Path
 from crony.platform.scheduler import (
     UNIT_PREFIX,
     Scheduler,
+    UnitLastExit,
     UnitState,
     exec_paths_from_argv,
 )
@@ -248,6 +249,28 @@ class LaunchdScheduler(Scheduler):
         if _is_loaded(lbl):
             return UnitState.ENABLED
         return UnitState.NONE
+
+    def unit_last_exits(self) -> dict[str, UnitLastExit]:
+        # `launchctl list` lines are `<pid>\t<status>\t<label>`. The
+        # status column is the last completed run's wait status: 0 / a
+        # positive exit code, or a negative number whose magnitude is
+        # the terminating signal. A numeric pid means a launch is in
+        # flight (its status is stale) -- skip it, leaving the unit out.
+        out: dict[str, UnitLastExit] = {}
+        prefix = f"org.{UNIT_PREFIX}."
+        for raw in _launchctl_list().splitlines():
+            parts = raw.rstrip().split("\t")
+            if len(parts) != 3:
+                continue
+            pid_s, status_s, lbl = parts
+            if not lbl.startswith(prefix) or pid_s.strip() not in ("-", ""):
+                continue
+            try:
+                status = int(status_s)
+            except ValueError:
+                continue
+            out[lbl[len(prefix) :]] = UnitLastExit(exit_status=status)
+        return out
 
     def is_stale(self, spec: UnitSpec) -> bool:
         name = str(spec.name)

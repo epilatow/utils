@@ -1480,6 +1480,56 @@ class TestSnapshotBackwardLoad:
         assert snap.timing is None
 
 
+class TestRuntimeUnitLastExit:
+    """load_config captures each entry's scheduler last-launch outcome
+    on its RuntimeState via one bulk query."""
+
+    def _ref(self, config: Any, full: str) -> Any:
+        return config.pending.by_full_name.get(
+            full
+        ) or config.current.by_full_name.get(full)
+
+    def test_signal_kill_lands_on_runtime_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # The applied unit's last launch was killed by SIGKILL.
+        monkeypatch.setattr(
+            launchd,
+            "_launchctl_list",
+            lambda: "PID\tStatus\tLabel\n-\t-9\torg.crony.default.j\n",
+        )
+        config = crony_runtime.load_config()
+        rt = config.runtime[self._ref(config, "default.j")]
+        assert rt.unit_last_exit is not None
+        assert rt.unit_last_exit.exit_status == -9
+        assert rt.crashed is True
+
+    def test_clean_launch_leaves_runtime_state_clean(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(
+            launchd,
+            "_launchctl_list",
+            lambda: "PID\tStatus\tLabel\n-\t0\torg.crony.default.j\n",
+        )
+        config = crony_runtime.load_config()
+        rt = config.runtime[self._ref(config, "default.j")]
+        assert rt.unit_last_exit == crony_platform.UnitLastExit(exit_status=0)
+        assert rt.crashed is False
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

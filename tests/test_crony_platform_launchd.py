@@ -17,7 +17,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.platform import get_scheduler, launchd  # noqa: E402
+from crony.platform import (  # noqa: E402
+    UnitLastExit,
+    get_scheduler,
+    launchd,
+)
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
@@ -235,6 +239,36 @@ class TestLaunchdScheduler:
         # launchd auto-loads a logged-in user's agents; there is no
         # logout-survival toggle to warn about, so verify never raises.
         assert get_scheduler("darwin", _DIR).verify() is None
+
+
+class TestLaunchdUnitLastExits:
+    """`launchctl list` rows are `<pid>\\t<status>\\t<label>`; status is
+    the last completed run's wait status (0 / positive exit code /
+    negative signal). A numeric pid means a launch is in flight, so its
+    stale status is skipped and the unit is left out."""
+
+    _LIST = (
+        "PID\tStatus\tLabel\n"
+        "-\t0\torg.crony.default.ok\n"
+        "-\t42\torg.crony.default.failed\n"
+        "-\t-9\torg.crony.default.killed\n"
+        "1234\t0\torg.crony.default.running\n"
+        "-\t0\tcom.apple.somethingelse\n"
+    )
+
+    def test_parses_status_column(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: self._LIST)
+        got = get_scheduler("darwin", _DIR).unit_last_exits()
+        # default.running (numeric pid) and the non-crony label are out.
+        assert got == {
+            "default.ok": UnitLastExit(exit_status=0),
+            "default.failed": UnitLastExit(exit_status=42),
+            "default.killed": UnitLastExit(exit_status=-9),
+        }
+
+    def test_empty_when_launchctl_absent(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
+        assert get_scheduler("darwin", _DIR).unit_last_exits() == {}
 
 
 class TestLaunchdUnitName:

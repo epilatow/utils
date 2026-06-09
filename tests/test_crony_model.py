@@ -34,6 +34,7 @@ from crony.config import (  # noqa: E402
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
+    ExitCode,
     UsageError,
 )
 from crony.model import (  # noqa: E402
@@ -42,10 +43,13 @@ from crony.model import (  # noqa: E402
     Job,
     JobGroup,
     JobOrphan,
+    LastRun,
+    RuntimeState,
     _JobCommon,
     _resolve_snapshot_for,
     snapshot_from_dict,
 )
+from crony.platform import UnitLastExit  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityRef,
 )
@@ -370,6 +374,98 @@ class TestJobFromRefAndFullName:
         # difference from the node's always-set `str`.
         nameless = JobOrphan(bundle="default", uuid=snap.uuid, name=None)
         assert nameless.full_name is None
+
+
+class TestRuntimeStateCrashed:
+    """`crashed` reconciles the scheduler's last-launch status against
+    the recorded run: a launch that ended in a way the runner never
+    recorded (killed by signal, or exited nonzero before recording)
+    leaves a stale last-run.json, so status reports `crashed`. A status
+    matching the recorded process exit is a normal result."""
+
+    def _rs(
+        self,
+        unit_last_exit: UnitLastExit | None,
+        *,
+        last_run: LastRun | None = None,
+    ) -> RuntimeState:
+        return RuntimeState(
+            state_dir=Path("/x"),
+            last_run=last_run,
+            is_running=False,
+            is_pending=False,
+            has_user_trigger_flag=False,
+            unit_last_exit=unit_last_exit,
+        )
+
+    def _last(self, exit_class: str, process_exit: int | None) -> LastRun:
+        return LastRun(
+            exit_class=exit_class,
+            started_at="2026-01-01T00:00",
+            process_exit=process_exit,
+        )
+
+    def test_signal_kill_over_stale_ok_is_crashed(self) -> None:
+        # Stale "ok" (process_exit 0) survives a launch the scheduler
+        # killed (negative status); the two don't match.
+        rs = self._rs(
+            UnitLastExit(exit_status=-9),
+            last_run=self._last("ok", 0),
+        )
+        assert rs.crashed is True
+
+    def test_nonzero_exit_without_matching_record_is_crashed(self) -> None:
+        # uv-not-found (127) before the runner recorded; stale "ok".
+        rs = self._rs(
+            UnitLastExit(exit_status=127),
+            last_run=self._last("ok", 0),
+        )
+        assert rs.crashed is True
+
+    def test_abnormal_without_record_is_crashed(self) -> None:
+        rs = self._rs(UnitLastExit(exit_status=-11))
+        assert rs.crashed is True
+
+    def test_recorded_failure_matching_status_is_not_crashed(self) -> None:
+        # A normal job failure: the runner recorded it and exited the
+        # process with the same code the scheduler reports.
+        rs = self._rs(
+            UnitLastExit(exit_status=1),
+            last_run=self._last("fail", 1),
+        )
+        assert rs.crashed is False
+
+    def test_recorded_cancel_matching_status_is_not_crashed(self) -> None:
+        # A snapshot-load-failure cancel exits PRECONDITION and records
+        # the same process_exit, so it stays `canceled`, not `crashed`.
+        code = int(ExitCode.PRECONDITION)
+        rs = self._rs(
+            UnitLastExit(exit_status=code),
+            last_run=self._last("canceled", code),
+        )
+        assert rs.crashed is False
+
+    def test_lock_busy_skip_is_not_crashed(self) -> None:
+        # A coalesced "already running" skip exits LOCK_BUSY and writes
+        # no record; that benign mismatch must not read as a crash.
+        rs = self._rs(
+            UnitLastExit(exit_status=int(ExitCode.LOCK_BUSY)),
+            last_run=self._last("ok", 0),
+        )
+        assert rs.crashed is False
+
+    def test_clean_exit_is_not_crashed(self) -> None:
+        rs = self._rs(
+            UnitLastExit(exit_status=0),
+            last_run=self._last("ok", 0),
+        )
+        assert rs.crashed is False
+
+    def test_no_scheduler_record_is_not_crashed(self) -> None:
+        # Also the in-flight case: a running unit is omitted from the
+        # map, so its RuntimeState carries no unit_last_exit.
+        rs = self._rs(None)
+        assert rs.crashed is False
 
 
 if __name__ == "__main__":

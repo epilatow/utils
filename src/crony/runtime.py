@@ -93,6 +93,7 @@ def _read_runtime_state(
     *,
     full_name: str | None,
     snapshot: crony.model.Job | crony.model.JobGroup | None = None,
+    last_exits: dict[str, crony.platform.UnitLastExit] | None = None,
 ) -> crony.model.RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
     parsed last-run record and presence of the lock / pending /
@@ -107,6 +108,11 @@ def _read_runtime_state(
     the unit-install integrity check runs and `unit_is_stale`
     reflects the result. Left None for broken refs (no snapshot)
     and unit-only refs (no state dir to read from).
+
+    `last_exits` is the scheduler's bulk last-launch map (keyed by
+    full name); the entry for `full_name`, if any, is stored so
+    status can reconcile a killed-but-unrecorded launch against the
+    parsed `last_run`.
     """
     last_run: crony.model.LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -136,6 +142,11 @@ def _read_runtime_state(
         if snapshot is not None:
             unit_is_stale = _unit_is_stale(snapshot)
 
+    unit_last_exit = (
+        last_exits.get(full_name)
+        if last_exits is not None and full_name is not None
+        else None
+    )
     return crony.model.RuntimeState(
         state_dir=state_dir,
         last_run=last_run,
@@ -145,11 +156,13 @@ def _read_runtime_state(
         unit_config=unit_config,
         unit_timer=unit_timer,
         unit_is_stale=unit_is_stale,
+        unit_last_exit=unit_last_exit,
     )
 
 
 def _build_current_graph(
     state_root: Path,
+    last_exits: dict[str, crony.platform.UnitLastExit],
 ) -> tuple[
     crony.model.Graph,
     dict[crony.unit.EntityRef, crony.model.JobOrphan],
@@ -271,6 +284,7 @@ def _build_current_graph(
                     uuid_dir,
                     full_name=full,
                     snapshot=snap,
+                    last_exits=last_exits,
                 )
             else:
                 current.groups[snap.entity_ref] = snap
@@ -279,6 +293,7 @@ def _build_current_graph(
                     uuid_dir,
                     full_name=full,
                     snapshot=snap,
+                    last_exits=last_exits,
                 )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
@@ -291,6 +306,7 @@ def _build_current_graph(
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=orphan.name,
+            last_exits=last_exits,
         )
     return current, orphans, runtime
 
@@ -305,7 +321,13 @@ def load_config() -> crony.model.Config:
 
     toml_config = crony.config.TomlConfig.load_all()
     pending = crony.model.Graph.build_pending(toml_config)
-    current, orphans, runtime = _build_current_graph(crony.paths.STATE_DIR)
+    # One bulk scheduler query feeds every entry's `unit_last_exit`, so
+    # status can tell a launch killed before it recorded anything from
+    # the stale `last-run.json` that survives such a kill.
+    last_exits = scheduler(platform).unit_last_exits()
+    current, orphans, runtime = _build_current_graph(
+        crony.paths.STATE_DIR, last_exits
+    )
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -388,6 +410,7 @@ def load_config() -> crony.model.Config:
             unit_timer=(
                 _platform_unit_timer_path(full_name) if has_unit else None
             ),
+            unit_last_exit=last_exits.get(full_name),
         )
 
     return crony.model.Config(

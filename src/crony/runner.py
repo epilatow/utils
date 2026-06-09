@@ -461,6 +461,7 @@ def _run_job(
                             exit_class="gated",
                             exit_code=0,
                             signal=None,
+                            process_exit=0,
                             gate=gate,
                             log_path=str(log_path),
                             log_bytes_this_run=(
@@ -498,6 +499,7 @@ def _run_job(
                                 exit_class="canceled",
                                 exit_code=0,
                                 signal=None,
+                                process_exit=0,
                                 gate=gate,
                                 log_path=str(log_path),
                                 log_bytes_this_run=(
@@ -561,6 +563,7 @@ def _run_job(
                     exit_class=exit_class,
                     exit_code=exit_code,
                     signal=sig,
+                    process_exit=surfaced_rc,
                     gate=gate,
                     log_path=str(log_path),
                     log_bytes_this_run=(
@@ -880,6 +883,7 @@ def _run_group(
                     ended_at=crony.runtime.now_iso(),
                     duration_sec=time.time() - started,
                     exit_class=_rollup_group_exit_class(children),
+                    process_exit=0,
                     log_path=str(log_path),
                     jobs_run=children,
                 )
@@ -1183,6 +1187,11 @@ def _record_snapshot_load_failure(
         "duration_sec": 0.0,
         "exit_class": "canceled",
         "exit_code": int(crony.errors.ExitCode.PRECONDITION),
+        # The process exits with this code (do_run re-raises and cli
+        # maps it), so it matches what the scheduler records for this
+        # launch -- otherwise status would reconcile the cancel as a
+        # `crashed` launch that left no record (RuntimeState.crashed).
+        "process_exit": int(crony.errors.ExitCode.PRECONDITION),
         "reason": str(exc),
     }
     crony.runtime.write_last_run(state_dir / "last-run.json", payload)

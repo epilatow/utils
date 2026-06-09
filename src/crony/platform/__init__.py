@@ -41,6 +41,7 @@ from crony.platform.scheduler import (
     UNIT_PREFIX,
     Scheduler,
     SchedulerWarning,
+    UnitLastExit,
     UnitState,
 )
 from crony.platform.systemd import SystemdScheduler
@@ -55,6 +56,7 @@ __all__ = [
     "Scheduler",
     "SchedulerWarning",
     "SystemdScheduler",
+    "UnitLastExit",
     "UnitState",
     "current_host",
     "current_platform",

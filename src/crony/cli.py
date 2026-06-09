@@ -59,8 +59,14 @@ state via `crony status`. The default columns are:
   SCHEDULE  the cron / interval / `grouped` value for the entry,
             or `disabled` when the unit is off at the scheduler
   LAST      ok      | fail     | timeout  | gated   | canceled |
-            running | pending  | never    | unknown
+            crashed | running  | pending  | never   | unknown
   LAST RAN  compact relative time of the last run (e.g. `5m ago`)
+
+`last=crashed` means the scheduler's most recent launch ended without
+recording a run -- killed by a signal (OOM, a manual kill, macOS
+terminating a `uv` whose cdhash changed under a loaded unit), or
+exited before the runner wrote its record. The last-run.json that
+survives is from an earlier launch, so LAST RAN reads `unknown`.
 
 `config=masked` only appears with `crony status -a/--all` (no
 remnants to clean up); a filter-excluded entry with leftover

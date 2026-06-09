@@ -24,6 +24,7 @@ from typing import Any
 import crony.config
 import crony.errors
 import crony.paths
+import crony.platform
 import crony.unit
 
 # =============================================================================
@@ -498,6 +499,13 @@ class JobRunResult:
     exit_class: str
     exit_code: int | None
     signal: int | None
+    # The code the runner exits the process with -- what the platform
+    # scheduler records as this launch's wait status (0 for ok / gated /
+    # canceled, the job's code for fail, the timeout code, 128+sig for a
+    # signal-killed child). Status reconciles it against the scheduler's
+    # report so a launch that ended without writing this record reads as
+    # `crashed` rather than showing the stale prior outcome.
+    process_exit: int
     # "none" if no gate ran (no config, or --skip-gate), "passed" on
     # exit 0, "failed" on any non-zero or timeout. The numeric exit
     # code stays in run.log for diagnosis; this field is the binary
@@ -544,6 +552,11 @@ class GroupRunResult:
     ended_at: str
     duration_sec: float
     exit_class: str
+    # The code the group runner exits the process with (always 0 -- a
+    # group's rollup lives in `exit_class`, not its process exit). Stored
+    # for the same scheduler reconciliation as JobRunResult.process_exit:
+    # a group whose parent launch was killed reads as `crashed`.
+    process_exit: int
     log_path: str
     jobs_run: list[GroupChildResult]
 
@@ -561,23 +574,32 @@ class LastRun:
 
     exit_class: str | None
     started_at: str | None
+    # The process exit the run recorded (JobRunResult / GroupRunResult
+    # `process_exit`). None for a record predating the field or a
+    # partial / corrupt one. `RuntimeState.crashed` compares it to the
+    # scheduler's reported status to spot a launch that left no record.
+    process_exit: int | None
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> LastRun:
         """Extract the display-relevant subset of `last-run.json`.
 
         The full `JobRunResult` / `GroupRunResult` shapes are the
-        on-disk serialization; status only consumes `exit_class` and
-        `started_at`, so we pull those out tolerantly. A partial /
-        corrupt last-run.json still produces a LastRun with whatever
-        fields landed, rather than disqualifying the entity from
-        runtime state altogether.
+        on-disk serialization; status only consumes `exit_class`,
+        `started_at`, and `process_exit`, so we pull those out
+        tolerantly. A partial / corrupt last-run.json still produces a
+        LastRun with whatever fields landed, rather than disqualifying
+        the entity from runtime state altogether.
         """
         exit_class = raw.get("exit_class")
         started_at = raw.get("started_at")
+        process_exit = raw.get("process_exit")
         return cls(
             exit_class=exit_class if isinstance(exit_class, str) else None,
             started_at=started_at if isinstance(started_at, str) else None,
+            process_exit=(
+                process_exit if isinstance(process_exit, int) else None
+            ),
         )
 
 
@@ -622,6 +644,33 @@ class RuntimeState:
     unit_config: Path | None = None
     unit_timer: Path | None = None
     unit_is_stale: bool = False
+    # The scheduler's last-launch outcome, captured at load alongside
+    # `last_run`. None when the scheduler has no record (or wasn't
+    # queried). Reconciled against `last_run` by `crashed`.
+    unit_last_exit: crony.platform.UnitLastExit | None = None
+
+    @property
+    def crashed(self) -> bool:
+        """True when the scheduler's most recent launch ended in a way
+        the runner never recorded -- killed by a signal (OOM, jetsam, a
+        manual kill, macOS OS_REASON_CODESIGNING) or exited nonzero
+        before the runner wrote `last-run.json` (e.g. a missing uv ->
+        127). The runner records every outcome it controls and exits the
+        process with the recorded `process_exit`, so a scheduler status
+        matching that is a normal result; any other nonzero status (or
+        none recorded) means the surviving `last-run.json` is stale and
+        status reports `crashed`. A clean exit (0), and an in-flight run
+        (omitted from `unit_last_exit`, so None here), never count."""
+        ule = self.unit_last_exit
+        if ule is None or ule.exit_status == 0:
+            return False
+        if ule.exit_status == int(crony.errors.ExitCode.LOCK_BUSY):
+            # A fire coalesced against an in-flight run: the loser exits
+            # LOCK_BUSY and writes no record by design, so the mismatch
+            # is a benign skip, not a crash.
+            return False
+        recorded = self.last_run.process_exit if self.last_run else None
+        return ule.exit_status != recorded
 
 
 @dataclass
