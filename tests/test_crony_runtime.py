@@ -968,12 +968,14 @@ class TestConfigSnapshotlessDir:
         assert ref not in config.current.jobs
         assert ref not in config.current.groups
 
-    def test_dir_for_live_config_uuid_is_suppressed(
+    def test_dir_for_live_config_uuid_reads_stale_not_orphan(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The wiped state dir of an applied entry that is still in
-        # config keeps that entry's uuid; it must not surface as an
-        # `orphan` (the lingering unit already reads as `stale`).
+        # config keeps that entry's uuid. It stays a (nameless)
+        # orphan so destroy / apply can reclaim it, but `config_state`
+        # reads it `stale` (re-apply) -- not `orphan` -- because the
+        # ref is still a live pending entry.
         h = _ApplyHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -983,7 +985,9 @@ class TestConfigSnapshotlessDir:
         (h.state_dir("j", cfg=cfg) / "snapshot.json").unlink()
         config = crony_runtime.load_config()
         ref = EntityRef(DEFAULT_BUNDLE_NAME, cfg.jobs["j"].uuid)
-        assert ref not in config.orphans
+        assert ref in config.orphans
+        assert config.orphans[ref].name is None
+        assert config.config_state(ref) == "stale"
 
 
 class TestResolveMethods:

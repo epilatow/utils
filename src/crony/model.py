@@ -867,15 +867,25 @@ class Config:
         one). The remaining axes mirror graph membership:
         `synced` if both graphs hold the entity and the two
         instances are field-equal; `stale` if both hold it but
-        differ; `missing` if only `pending` has it (never
-        applied); `orphan` if only `current` or `orphans` has
-        it (config-side removed, disk-side lingers).
+        differ; `missing` if only `pending` has it and nothing is
+        on disk (never applied); `orphan` if only `current` /
+        `orphans` has it (config-side removed, disk-side lingers).
+
+        A non-broken on-disk remnant (a snapshot-less / wiped dir)
+        whose ref is still a live pending entry reads `stale`, not
+        `orphan`: there is on-disk state, so re-apply -- not "never
+        applied." A *broken* snapshot is `broken` even for a live
+        entry (apply overwrites it).
         """
         orphan = self.orphans.get(ref)
-        if orphan is not None:
-            return "broken" if orphan.is_broken else "orphan"
         p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
         c = self.current.jobs.get(ref) or self.current.groups.get(ref)
+        if orphan is not None:
+            if orphan.is_broken:
+                return "broken"
+            if p is None:
+                return "orphan"
+            return "stale"
         if p is None and c is None:
             raise KeyError(ref)
         if p is None:

@@ -543,6 +543,122 @@ class TestApplyFullSync:
         assert (h.state / "default" / new_uuid / "snapshot.json").is_file()
         assert not old_dir.exists()
 
+    def _stage_uuid_change(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> tuple[Any, str, str, Path]:
+        # apply j at U_old, then change its uuid in config to U_new
+        # WITHOUT applying -- U_old is now a superseded orphan (its
+        # uuid is gone from config) under the still-selected name.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        cfg1 = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        old_uuid = cfg1.jobs["j"].uuid
+        h.apply("j")
+        old_dir = h.state / "default" / old_uuid
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert old_dir.is_dir() and plist.exists()
+        new_uuid = "abcdabcd-1111-2222-3333-444455556666"
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "uuid": new_uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        return h, old_uuid, new_uuid, old_dir
+
+    def test_destroy_orphans_reclaims_superseded_uuid_in_full(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `destroy --orphans` tracks by uuid: the old uuid is gone from
+        # config, so it is a full orphan -- its dir AND its name-keyed
+        # unit go (the name reuse by the new uuid is incidental; the
+        # new uuid installs its own unit on the next apply).
+        h, _old, new_uuid, old_dir = self._stage_uuid_change(
+            tmp_path, monkeypatch
+        )
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
+        assert not old_dir.exists()
+        assert not plist.exists()
+        assert not (h.state / "default" / new_uuid).exists()
+
+    def test_full_apply_reclaims_superseded_uuid_clean_first(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A full `crony apply` reclaims the old uuid (the same set as
+        # `destroy --orphans`) before installing the new uuid.
+        h, _old, new_uuid, old_dir = self._stage_uuid_change(
+            tmp_path, monkeypatch
+        )
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        assert not old_dir.exists()
+        assert (h.state / "default" / new_uuid / "snapshot.json").is_file()
+        assert plist.exists()
+
+    def test_uuid_change_does_not_inherit_old_units_disabled_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A uuid change is a new job: it does NOT inherit the old
+        # uuid's unit state. A hand-disabled job re-keyed to a new
+        # uuid comes back enabled, because the old unit is reclaimed
+        # first and the new one installs fresh. (Same-uuid drift
+        # preserves the disable -- covered separately.)
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        recorded: dict[str, bool] = {}
+
+        def spy_activate(
+            _self: Any,
+            name: str,
+            *,
+            prior_disabled: bool,
+            scheduled: bool,
+        ) -> None:
+            del scheduled
+            recorded[name] = prior_disabled
+
+        # The disable lives on the unit file: read as disabled while
+        # its plist exists, gone once the plist is removed.
+        def fake_unit_state(name: str, platform: str | None = None) -> str:
+            del platform
+            plist = h.agents / f"org.crony.{name}.plist"
+            return "disabled" if plist.exists() else "none"
+
+        monkeypatch.setattr(
+            crony_platform.LaunchdScheduler, "activate", spy_activate
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", fake_unit_state)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # The job now reads disabled (its plist is on disk).
+        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "uuid": "abcdabcd-1111-2222-3333-444455556666",
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        recorded.clear()
+        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert recorded[h.full("j")] is False
+
     def test_surgical_apply_leaves_unrelated_broken_orphan(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -4642,6 +4758,25 @@ class TestSnapshotlessDirOrphan:
         crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
         assert not sd.exists()
 
+    def test_explicit_destroy_reclaims_live_entrys_empty_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An interrupted apply can leave an empty dir at a configured
+        # entry's uuid (no snapshot, no unit). `destroy <name>` resolves
+        # to that uuid and reclaims the dir -- it isn't stranded just
+        # because the entry is still in config.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        sd = h.state / DEFAULT_BUNDLE_NAME / cfg.jobs["j"].uuid
+        sd.mkdir(parents=True)
+        crony_commands.do_destroy(
+            jobs=[h.full("j")], bundle=None, orphans=False
+        )
+        assert not sd.exists()
+
 
 class TestLogsByEntityRef:
     """`do_logs` accepts a `<bundle>:<UUID>` input and reads the
@@ -4893,6 +5028,38 @@ class TestNameCollision:
         assert h.full("j") in out
         assert f"default:{stray_uuid}" in out
         assert "orphan" in out
+
+    def test_shadowed_row_shows_ref_in_plain_job_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The plain JOB column must not print the loser's phantom name
+        # (it resolves to the winner), so the operator never sees two
+        # rows reading `default.j` and can address the loser by ref.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        stray_uuid = "99999999-8888-7777-6666-555544443333"
+        self._plant_residue(h, h.full("j"), stray_uuid)
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        crony_commands.do_status(
+            jobs=[],
+            cols="job",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        loser = next(
+            ln for ln in out.splitlines() if f"default:{stray_uuid}" in ln
+        )
+        assert h.full("j") not in loser
+        # The winner's name appears exactly once across the table.
+        assert sum(h.full("j") in ln for ln in out.splitlines()) == 1
 
     def test_full_apply_clears_shadow_but_keeps_live_unit(
         self, tmp_path: Path, monkeypatch: Any

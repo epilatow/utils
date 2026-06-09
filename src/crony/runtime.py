@@ -167,10 +167,10 @@ def _build_current_graph(
     is recorded as a nameless, non-broken orphan (leftover junk).
     """
     current = crony.model.Graph()
-    disk_orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
+    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
     runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
     if not state_root.exists():
-        return current, disk_orphans, runtime
+        return current, orphans, runtime
     for bundle_dir in state_root.iterdir():
         if not bundle_dir.is_dir():
             continue
@@ -190,7 +190,7 @@ def _build_current_graph(
                 # orphan -- not "re-apply" territory (there is nothing
                 # to re-render), just junk a sweep or a ref-form destroy
                 # reclaims.
-                disk_orphans[ref] = crony.model.JobOrphan(
+                orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=None,
@@ -199,7 +199,7 @@ def _build_current_graph(
             try:
                 raw = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                disk_orphans[ref] = crony.model.JobOrphan(
+                orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=None,
@@ -210,7 +210,7 @@ def _build_current_graph(
             raw_name = raw.get("name") if isinstance(raw, dict) else None
             name_hint = raw_name if isinstance(raw_name, str) else None
             if not isinstance(raw, dict):
-                disk_orphans[ref] = crony.model.JobOrphan(
+                orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -219,7 +219,7 @@ def _build_current_graph(
                 )
                 continue
             if raw.get("schema") != crony.model.SNAPSHOT_SCHEMA:
-                disk_orphans[ref] = crony.model.JobOrphan(
+                orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -255,7 +255,7 @@ def _build_current_graph(
                     else None,
                 )
             except (TypeError, ValueError) as exc:
-                disk_orphans[ref] = crony.model.JobOrphan(
+                orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -286,13 +286,13 @@ def _build_current_graph(
     # current entry, plus the platform unit path. Without this
     # the unit-config / last / last-ran columns render empty
     # for broken rows even when those files are on disk.
-    for ref, orphan in disk_orphans.items():
+    for ref, orphan in orphans.items():
         state_dir = orphan.state_dir
         runtime[ref] = _read_runtime_state(
             state_dir,
             full_name=orphan.name,
         )
-    return current, disk_orphans, runtime
+    return current, orphans, runtime
 
 
 def load_config() -> crony.model.Config:
@@ -305,7 +305,7 @@ def load_config() -> crony.model.Config:
 
     toml_config = crony.config.TomlConfig.load_all()
     pending = crony.model.Graph.build_pending(toml_config)
-    current, disk_orphans, runtime = _build_current_graph(crony.paths.STATE_DIR)
+    current, orphans, runtime = _build_current_graph(crony.paths.STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -330,31 +330,15 @@ def load_config() -> crony.model.Config:
         current.by_full_name[name] = winner
         shadowed.update(r for r in refs if r != winner)
 
-    # A snapshot-less leftover dir whose uuid is still a live config
-    # (pending) entry is that entry's wiped state, not orphan junk: it
-    # reads as `stale` (re-apply) through its lingering unit, so drop
-    # it from the orphan + runtime maps rather than let it shadow the
-    # entry's config axis as `orphan`. A *broken* snapshot of a live
-    # entry stays -- a corrupt snapshot is `broken` / re-apply.
-    wiped_live = {
-        ref
-        for ref, o in disk_orphans.items()
-        if not o.is_broken and ref in pending_refs
-    }
-    for ref in wiped_live:
-        del disk_orphans[ref]
-        runtime.pop(ref, None)
-
-    # All on-disk junk lands in one `orphans` map keyed by ref: the
-    # state-dir orphans discovered above (broken snapshots with `reason`
-    # set, and snapshot-less leftover dirs), plus the pure unit / alias
-    # leftovers found next. `JobOrphan.is_broken` tells broken from
-    # orphan for status.
-    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = dict(
-        disk_orphans
-    )
+    # `orphans` already holds the state-dir orphans from the scan
+    # (broken snapshots with `reason` set, and snapshot-less leftover
+    # dirs); the pure unit / alias leftovers found next join it.
+    # `JobOrphan.is_broken` tells broken from orphan for status. A
+    # snapshot-less dir whose uuid is still a live pending entry stays
+    # in the map -- `config_state` reads it `stale` (re-apply), and
+    # destroy / apply reclaim it through the entity.
     orphans_by_full_name: dict[str, crony.unit.EntityRef] = {
-        o.name: ref for ref, o in disk_orphans.items() if o.name is not None
+        o.name: ref for ref, o in orphans.items() if o.name is not None
     }
 
     # Names with a leftover platform unit file and / or short-name
@@ -728,35 +712,6 @@ def _render_units(
     )
 
 
-def _activate_unit(
-    name: str,
-    platform: str | None = None,
-    *,
-    prior_disabled: bool,
-    scheduled: bool,
-) -> None:
-    """Load the unit into the platform scheduler.
-
-    `prior_disabled=True` preserves a hand-disabled state across an
-    apply re-render: the unit is reloaded so the new content takes
-    effect, but the persistent disable record is restored afterward
-    so the scheduler doesn't fire it. Without this, a `crony disable
-    foo` followed by an unrelated config edit would silently re-arm
-    foo.
-
-    `scheduled=False` means the entry has no schedule / interval.
-    On linux that means there's no .timer to enable; only the
-    .service is registered (oneshot, sits dormant until something
-    starts it). The plist analog is the same -- a plist with no
-    Start* keys loads fine and just doesn't auto-fire.
-    """
-    scheduler(platform).activate(
-        name,
-        prior_disabled=prior_disabled,
-        scheduled=scheduled,
-    )
-
-
 def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     """Apply one selected entry from the loaded model; return
     "added", "updated", or "unchanged".
@@ -791,30 +746,20 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     timing = snapshot.timing
     snapshot_path = snapshot.snapshot_path
 
-    # Every uuid / full name the bundle's config currently defines
-    # (plus `ref` itself, defensively). Used to keep per-entry
-    # cleanup from clobbering a *different* live entry's state when
-    # names move between entries in one edit (a rename that frees a
-    # name another entry then claims).
+    # The full names the bundle's config currently defines, used to
+    # keep the rename cleanup below from unlinking a *different* live
+    # entry's unit when a name moves between entries in one edit (a
+    # rename that frees a name a sibling then claims). A uuid change
+    # is not handled here -- `do_apply` reclaims the old uuid before
+    # this install runs.
     bundle = config.toml_config.by_name(bundle_name)
     bcfg = bundle.config if bundle is not None else None
-    live_uuids = {ref.uuid}
     live_full_names: set[str] = set()
     if bcfg is not None:
-        live_uuids |= {e.uuid for e in bcfg.jobs.values()} | {
-            e.uuid for e in bcfg.job_groups.values()
-        }
         live_full_names = {f"{bundle_name}.{s}" for s in bcfg.jobs} | {
             f"{bundle_name}.{s}" for s in bcfg.job_groups
         }
 
-    # A uuid edit leaves the prior uuid's state dir behind under
-    # the same name (the name-keyed unit re-points at this uuid).
-    # Reclaim it before deciding "unchanged" so the residue is
-    # cleaned even when the new uuid's snapshot already matches --
-    # and so the full-sync orphan sweep can exclude still-selected
-    # names (it trusts apply_one to have handled their residue).
-    _sweep_superseded_state_dirs(ref, full_name, live_uuids)
     # Drift detection via direct snapshot comparison: take the
     # entity's prior snapshot (if any) and compare it to the
     # pending one. Both sides are the same dataclass shape, so
@@ -859,7 +804,9 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # is the source of truth here (the platform unit can outlive
     # the state-dir snapshot); unit_state returns "none" for a
     # not-yet-installed unit, so only an explicit "disabled"
-    # answer counts and a fresh install still lands enabled.
+    # answer counts and a fresh install still lands enabled. A uuid
+    # change clears it: `do_apply` reclaimed the old unit first, so
+    # the new job installs fresh -- a uuid change is a new job.
     prior_disabled = unit_state(full_name) == "disabled"
     units = _render_units(snapshot)
     sched = scheduler()
@@ -871,7 +818,13 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     sched.prune_units(full_name, set(units))
     for fname, content in units.items():
         (target_dir / fname).write_text(content, encoding="utf-8")
-    _activate_unit(
+    # Load the unit into the scheduler. `prior_disabled` re-applies a
+    # hand-disable after the reload so a `crony disable` survives a
+    # same-uuid re-render; a uuid change reclaimed the old unit first,
+    # so the new job loads enabled (it is a new job). `scheduled=False`
+    # installs a dormant unit (no .timer on linux) that only fires when
+    # something triggers it.
+    sched.activate(
         full_name,
         prior_disabled=prior_disabled,
         scheduled=timing is not None,
@@ -938,52 +891,3 @@ def destroy_one(
     if state_dir is None or not state_dir.is_dir():
         return
     shutil.rmtree(state_dir)
-
-
-def _sweep_superseded_state_dirs(
-    keep: crony.unit.EntityRef, full_name: str, live_uuids: set[str]
-) -> None:
-    """Remove state dirs in `keep`'s bundle whose snapshot recovers
-    `full_name` under a uuid no live config entry claims.
-
-    These are residue from a uuid edit: the name-keyed platform
-    unit now points at `keep`, so the old uuid dirs are unreachable
-    history. Only the state dir is wiped -- the unit is shared by
-    name and already re-rendered for `keep`.
-
-    `live_uuids` is every uuid the bundle's config currently
-    defines. A dir keyed by one of those belongs to a live entry,
-    not residue -- even when its on-disk name still matches
-    `full_name` because that entry was renamed and hasn't been
-    re-applied yet in this pass (a name-swap edit). Skipping them
-    keeps a live entry's run history from being wiped by a sibling
-    entry that grabbed its old name. A dir with a run in progress
-    is left in place (logged); the next apply or an explicit
-    `crony destroy <bundle>:<uuid>` reclaims it.
-    """
-    bundle_root = crony.paths.STATE_DIR / keep.bundle
-    if not bundle_root.is_dir():
-        return
-    for uuid_dir in sorted(bundle_root.iterdir()):
-        # Skip short-name alias symlinks (is_dir() dereferences them);
-        # only real uuid-keyed dirs are superseded-state candidates.
-        if uuid_dir.is_symlink() or not uuid_dir.is_dir():
-            continue
-        if uuid_dir.name in live_uuids:
-            continue
-        if recover_full_name(uuid_dir) != full_name:
-            continue
-        stray = crony.unit.EntityRef(keep.bundle, uuid_dir.name)
-        if run_in_progress(uuid_dir):
-            logger.warning(
-                "%s: superseded state dir %s left in place (run in progress)",
-                full_name,
-                stray,
-            )
-            continue
-        destroy_one(None, uuid_dir)
-        logger.info(
-            "%s: removed superseded state dir %s",
-            full_name,
-            stray,
-        )
