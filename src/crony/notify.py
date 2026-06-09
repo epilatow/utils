@@ -265,7 +265,7 @@ def _post_ntfy(
     cfg: crony.config.NotifyNtfy,
     token: str,
     title: str,
-    exit_class: str,
+    exit_class: crony.model.ExitClass,
     body: str,
     log_text: str,
     attach_log: bool,

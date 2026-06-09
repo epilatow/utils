@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,10 +40,12 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
+    ExitClass,
     Graph,
     Job,
     JobGroup,
     JobOrphan,
+    JobStatus,
     LastRun,
     RuntimeState,
     _JobCommon,
@@ -400,7 +403,7 @@ class TestRuntimeStateCrashed:
 
     def _last(self, exit_class: str, process_exit: int | None) -> LastRun:
         return LastRun(
-            exit_class=exit_class,
+            exit_class=ExitClass(exit_class),
             started_at="2026-01-01T00:00",
             process_exit=process_exit,
         )
@@ -466,6 +469,39 @@ class TestRuntimeStateCrashed:
         # map, so its RuntimeState carries no unit_last_exit.
         rs = self._rs(None)
         assert rs.crashed is False
+
+
+class TestStatusEnums:
+    """ExitClass / JobStatus are StrEnums: they serialize as their plain
+    values (on-disk records round-trip) and JobStatus reuses ExitClass's
+    values for the outcomes it carries."""
+
+    def test_exitclass_serializes_as_plain_value(self) -> None:
+        assert (
+            json.dumps({"exit_class": ExitClass.OK}) == '{"exit_class": "ok"}'
+        )
+
+    def test_parse_known_value(self) -> None:
+        assert ExitClass.parse("timeout") is ExitClass.TIMEOUT
+
+    def test_parse_is_tolerant_of_bad_input(self) -> None:
+        assert ExitClass.parse("bogus") is None
+        assert ExitClass.parse(None) is None
+        assert ExitClass.parse(123) is None
+
+    def test_jobstatus_shares_exitclass_values(self) -> None:
+        # The shared members are defined as `= ExitClass.X`, so their
+        # string values stay in lockstep.
+        assert str(JobStatus.OK) == str(ExitClass.OK) == "ok"
+        assert str(JobStatus.CANCELED) == str(ExitClass.CANCELED)
+
+    def test_jobstatus_omits_folded_and_dropped_outcomes(self) -> None:
+        # signal folds to fail, dispatched shows as unknown -- neither
+        # reaches the LAST cell, so JobStatus carries no member for them.
+        values = {s.value for s in JobStatus}
+        assert "signal" not in values
+        assert "dispatched" not in values
+        assert "crashed" in values
 
 
 if __name__ == "__main__":

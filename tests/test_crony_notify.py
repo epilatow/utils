@@ -45,6 +45,7 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
+    ExitClass,
     JobRunResult,
     NotificationResult,
 )
@@ -178,7 +179,7 @@ class TestEmailNotify:
             started_at="2026-05-02T10:00:00-07:00",
             ended_at="2026-05-02T10:00:01-07:00",
             duration_sec=1.0,
-            exit_class="fail",
+            exit_class=ExitClass.FAIL,
             exit_code=2,
             signal=None,
             process_exit=2,
@@ -368,7 +369,7 @@ class TestNtfyNotify:
             started_at="2026-05-02T10:00:00-07:00",
             ended_at="2026-05-02T10:00:01-07:00",
             duration_sec=1.0,
-            exit_class="fail",
+            exit_class=ExitClass.FAIL,
             exit_code=2,
             signal=None,
             process_exit=2,
@@ -656,7 +657,7 @@ class TestDialogPopupNotify:
             started_at="2026-05-02T10:00:00-07:00",
             ended_at="2026-05-02T10:00:01-07:00",
             duration_sec=1.0,
-            exit_class="fail",
+            exit_class=ExitClass.FAIL,
             exit_code=2,
             signal=None,
             process_exit=2,
@@ -846,7 +847,7 @@ class TestMultiChannelDispatch:
             started_at="2026-05-02T10:00:00-07:00",
             ended_at="2026-05-02T10:00:01-07:00",
             duration_sec=1.0,
-            exit_class="fail",
+            exit_class=ExitClass.FAIL,
             exit_code=2,
             signal=None,
             process_exit=2,

@@ -51,7 +51,7 @@ def timeout_to_wait(sec: int) -> float:
 
 def _rollup_group_exit_class(
     children: list[crony.model.GroupChildResult],
-) -> str:
+) -> crony.model.ExitClass:
     """Worst-of children's exit_class, with a precedence ladder.
 
     A group with no children, or one whose children are all `ok`,
@@ -65,16 +65,17 @@ def _rollup_group_exit_class(
     child shows TIMEOUT in the status view rather than being
     masked by a sibling's plain fail.
     """
+    ec = crony.model.ExitClass
     precedence = {
-        "ok": 0,
-        "gated": 0,
-        "dispatched": 0,
-        "fail": 1,
-        "signal": 1,
-        "timeout": 2,
+        ec.OK: 0,
+        ec.GATED: 0,
+        ec.DISPATCHED: 0,
+        ec.FAIL: 1,
+        ec.SIGNAL: 1,
+        ec.TIMEOUT: 2,
     }
     worst_score = 0
-    worst_class = "ok"
+    worst_class = ec.OK
     for c in children:
         score = precedence.get(c.exit_class, 1)
         if score > worst_score:
@@ -458,7 +459,7 @@ def _run_job(
                             started_at=started_iso,
                             ended_at=crony.runtime.now_iso(),
                             duration_sec=time.time() - started,
-                            exit_class="gated",
+                            exit_class=crony.model.ExitClass.GATED,
                             exit_code=0,
                             signal=None,
                             process_exit=0,
@@ -496,7 +497,7 @@ def _run_job(
                                 started_at=started_iso,
                                 ended_at=crony.runtime.now_iso(),
                                 duration_sec=time.time() - started,
-                                exit_class="canceled",
+                                exit_class=crony.model.ExitClass.CANCELED,
                                 exit_code=0,
                                 signal=None,
                                 process_exit=0,
@@ -525,7 +526,7 @@ def _run_job(
                         log_file=log_file,
                     )
                     if sig is not None:
-                        exit_class = "signal"
+                        exit_class = crony.model.ExitClass.SIGNAL
                         exit_code: int | None = None
                         surfaced_rc = 128 + sig
                     elif rc == 0 or rc in snap.success_exit_codes:
@@ -533,15 +534,15 @@ def _run_job(
                         # a configured non-zero like borg's warning exit
                         # 1): classify "ok" and surface 0 so the platform
                         # scheduler doesn't record the unit as failed.
-                        exit_class = "ok"
+                        exit_class = crony.model.ExitClass.OK
                         exit_code = rc
                         surfaced_rc = 0
                     else:
-                        exit_class = "fail"
+                        exit_class = crony.model.ExitClass.FAIL
                         exit_code = rc
                         surfaced_rc = rc
                 except subprocess.TimeoutExpired:
-                    exit_class = "timeout"
+                    exit_class = crony.model.ExitClass.TIMEOUT
                     exit_code = None
                     sig = None
                     surfaced_rc = int(crony.errors.ExitCode.TIMEOUT)
@@ -572,7 +573,7 @@ def _run_job(
                     notifications=notifications,
                 )
 
-                if exit_class != "ok" and notify_channels:
+                if exit_class != crony.model.ExitClass.OK and notify_channels:
                     log_text = ""
                     try:
                         log_text = log_path.read_text(
@@ -765,7 +766,7 @@ def _run_group(
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
-                                    exit_class="dispatched",
+                                    exit_class=crony.model.ExitClass.DISPATCHED,
                                     exit_code=0,
                                 )
                             )
@@ -774,7 +775,7 @@ def _run_group(
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
-                                    exit_class="fail",
+                                    exit_class=crony.model.ExitClass.FAIL,
                                     exit_code=int(
                                         crony.errors.ExitCode.PRECONDITION
                                     ),
@@ -793,7 +794,7 @@ def _run_group(
                         children.append(
                             crony.model.GroupChildResult(
                                 name=child_full_name,
-                                exit_class="timeout",
+                                exit_class=crony.model.ExitClass.TIMEOUT,
                                 exit_code=int(crony.errors.ExitCode.TIMEOUT),
                             )
                         )
@@ -824,7 +825,7 @@ def _run_group(
                         children.append(
                             crony.model.GroupChildResult(
                                 name=child_full_name,
-                                exit_class="timeout",
+                                exit_class=crony.model.ExitClass.TIMEOUT,
                                 exit_code=int(crony.errors.ExitCode.TIMEOUT),
                             )
                         )
@@ -834,14 +835,17 @@ def _run_group(
                         children.append(
                             crony.model.GroupChildResult(
                                 name=child_full_name,
-                                exit_class="fail",
+                                exit_class=crony.model.ExitClass.FAIL,
                                 exit_code=int(
                                     crony.errors.ExitCode.PRECONDITION
                                 ),
                             )
                         )
                         continue
-                    cls = rec.get("exit_class", "fail")
+                    cls = (
+                        crony.model.ExitClass.parse(rec.get("exit_class"))
+                        or crony.model.ExitClass.FAIL
+                    )
                     rc = trigger_exit_code(rec)
                     log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
                     children.append(
@@ -869,7 +873,7 @@ def _run_group(
                         children.append(
                             crony.model.GroupChildResult(
                                 name=str(child_ref),
-                                exit_class="fail",
+                                exit_class=crony.model.ExitClass.FAIL,
                                 exit_code=int(
                                     crony.errors.ExitCode.PRECONDITION
                                 ),

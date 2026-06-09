@@ -323,7 +323,22 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
 # off when the user runs `crony apply` to push other changes.
 
 
-def _last_run_state(config: crony.model.Config, full_name: str) -> str:
+# Maps a recorded ExitClass to the JobStatus shown in the LAST cell:
+# `signal` folds to `fail`; `dispatched` (absent here) and an
+# unparseable class fall through to UNKNOWN at the call site.
+_EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
+    crony.model.ExitClass.OK: crony.model.JobStatus.OK,
+    crony.model.ExitClass.FAIL: crony.model.JobStatus.FAIL,
+    crony.model.ExitClass.SIGNAL: crony.model.JobStatus.FAIL,
+    crony.model.ExitClass.TIMEOUT: crony.model.JobStatus.TIMEOUT,
+    crony.model.ExitClass.GATED: crony.model.JobStatus.GATED,
+    crony.model.ExitClass.CANCELED: crony.model.JobStatus.CANCELED,
+}
+
+
+def _last_run_state(
+    config: crony.model.Config, full_name: str
+) -> crony.model.JobStatus:
     """Return LAST axis value for a stamped entity.
 
     Lock-held implies a run is currently in flight: "pending" when
@@ -346,29 +361,20 @@ def _last_run_state(config: crony.model.Config, full_name: str) -> str:
     pending-only entry resolves to a uuid with no state dir, so
     `runtime.get` is None and it still reports "never".
     """
+    js = crony.model.JobStatus
     ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
-        return "never"
+        return js.NEVER
     rt = config.runtime.get(ref)
     if rt is None:
-        return "never"
+        return js.NEVER
     if rt.is_running:
-        return "pending" if rt.is_pending else "running"
+        return js.PENDING if rt.is_pending else js.RUNNING
     if rt.crashed:
-        return "crashed"
-    if rt.last_run is None:
-        return "never"
-    cls = rt.last_run.exit_class
-    if cls in (
-        "ok",
-        "fail",
-        "timeout",
-        "gated",
-        "signal",
-        "canceled",
-    ):
-        return cls if cls != "signal" else "fail"
-    return "unknown"
+        return js.CRASHED
+    if rt.last_run is None or rt.last_run.exit_class is None:
+        return js.NEVER if rt.last_run is None else js.UNKNOWN
+    return _EXIT_TO_JOBSTATUS.get(rt.last_run.exit_class, js.UNKNOWN)
 
 
 def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
@@ -1704,7 +1710,7 @@ def _resolve_state_axes(
     remnants: set[str],
     *,
     mask_reason: str = "",
-) -> tuple[str, str, str]:
+) -> tuple[str, str, crony.model.JobStatus]:
     """Compute the (cfg, unit, last) status axes for one full name.
 
     `do_status` is the only consumer; the function is factored
@@ -1869,8 +1875,13 @@ _ANSI_RESET: str = "\033[0m"
 _STATUS_RED_CONFIG: frozenset[str] = frozenset(
     {"missing", "error", "broken", "orphan"}
 )
-_STATUS_RED_LAST: frozenset[str] = frozenset(
-    {"fail", "timeout", "canceled", "crashed"}
+_STATUS_RED_LAST: frozenset[crony.model.JobStatus] = frozenset(
+    {
+        crony.model.JobStatus.FAIL,
+        crony.model.JobStatus.TIMEOUT,
+        crony.model.JobStatus.CANCELED,
+        crony.model.JobStatus.CRASHED,
+    }
 )
 
 
@@ -2445,7 +2456,11 @@ def do_status(
         # AND `unit` not in {none, disabled} AND `last` in
         # {ok, never, gated}. A disabled unit is unhealthy
         # because it isn't firing.
-        healthy_last = {"ok", "never", "gated"}
+        healthy_last = {
+            crony.model.JobStatus.OK,
+            crony.model.JobStatus.NEVER,
+            crony.model.JobStatus.GATED,
+        }
         unhealthy_unit = {"none", "disabled"}
         rows = [
             r
@@ -3083,7 +3098,7 @@ def _notify_test_one_bundle(
         started_at=crony.runtime.now_iso(),
         ended_at=crony.runtime.now_iso(),
         duration_sec=0.0,
-        exit_class="fail",
+        exit_class=crony.model.ExitClass.FAIL,
         exit_code=1,
         signal=None,
         process_exit=1,

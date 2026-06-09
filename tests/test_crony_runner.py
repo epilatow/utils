@@ -55,6 +55,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     SNAPSHOT_SCHEMA,
+    ExitClass,
     GroupChildResult,
     Job,
     _resolve_script,
@@ -1256,9 +1257,11 @@ class TestRunGroupInteractive:
         rollup = crony_runner._rollup_group_exit_class(
             [
                 GroupChildResult(
-                    name="a", exit_class="dispatched", exit_code=0
+                    name="a", exit_class=ExitClass.DISPATCHED, exit_code=0
                 ),
-                GroupChildResult(name="b", exit_class="ok", exit_code=0),
+                GroupChildResult(
+                    name="b", exit_class=ExitClass.OK, exit_code=0
+                ),
             ]
         )
         assert rollup == "ok"
@@ -1267,9 +1270,11 @@ class TestRunGroupInteractive:
         rollup = crony_runner._rollup_group_exit_class(
             [
                 GroupChildResult(
-                    name="a", exit_class="dispatched", exit_code=0
+                    name="a", exit_class=ExitClass.DISPATCHED, exit_code=0
                 ),
-                GroupChildResult(name="b", exit_class="fail", exit_code=1),
+                GroupChildResult(
+                    name="b", exit_class=ExitClass.FAIL, exit_code=1
+                ),
             ]
         )
         assert rollup == "fail"
@@ -1658,7 +1663,11 @@ class TestGroupExitClassRollup:
 
     def _children(self, *classes: str) -> list[Any]:
         return [
-            GroupChildResult(name=f"default.c{i}", exit_class=cls, exit_code=0)
+            GroupChildResult(
+                name=f"default.c{i}",
+                exit_class=ExitClass(cls),
+                exit_code=0,
+            )
             for i, cls in enumerate(classes)
         ]
 

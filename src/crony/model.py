@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -481,6 +482,52 @@ class NotificationResult:
     error_class: str | None = None
 
 
+class ExitClass(StrEnum):
+    """The recorded outcome of a run: written to last-run.json as
+    `exit_class` and rolled up across a group's children. A StrEnum so
+    it serializes as its plain value and on-disk records round-trip
+    unchanged."""
+
+    OK = "ok"
+    FAIL = "fail"
+    TIMEOUT = "timeout"
+    SIGNAL = "signal"
+    GATED = "gated"
+    CANCELED = "canceled"
+    DISPATCHED = "dispatched"
+
+    @classmethod
+    def parse(cls, value: object) -> ExitClass | None:
+        """The member for `value`, or None when it isn't a known
+        outcome -- tolerant of a partial / corrupt on-disk record."""
+        if not isinstance(value, str):
+            return None
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
+
+class JobStatus(StrEnum):
+    """The verdict `crony status` shows in its LAST column: the run
+    outcomes that actually reach the cell plus the display-only states
+    derived at read time. Shares string values with `ExitClass` for the
+    outcomes it carries (so the two compare and serialize alike); it
+    omits `signal` (folded to `fail`) and `dispatched` (shown as
+    `unknown`), which never surface in the cell."""
+
+    OK = ExitClass.OK
+    FAIL = ExitClass.FAIL
+    TIMEOUT = ExitClass.TIMEOUT
+    GATED = ExitClass.GATED
+    CANCELED = ExitClass.CANCELED
+    CRASHED = "crashed"
+    RUNNING = "running"
+    PENDING = "pending"
+    NEVER = "never"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class JobRunResult:
     """Recorded as last-run.json for each completed job run.
@@ -496,7 +543,7 @@ class JobRunResult:
     started_at: str
     ended_at: str
     duration_sec: float
-    exit_class: str
+    exit_class: ExitClass
     exit_code: int | None
     signal: int | None
     # The code the runner exits the process with -- what the platform
@@ -525,7 +572,7 @@ class GroupChildResult:
     """One child's outcome inside a group run."""
 
     name: str
-    exit_class: str
+    exit_class: ExitClass
     exit_code: int
 
 
@@ -551,7 +598,7 @@ class GroupRunResult:
     started_at: str
     ended_at: str
     duration_sec: float
-    exit_class: str
+    exit_class: ExitClass
     # The code the group runner exits the process with (always 0 -- a
     # group's rollup lives in `exit_class`, not its process exit). Stored
     # for the same scheduler reconciliation as JobRunResult.process_exit:
@@ -572,7 +619,7 @@ class LastRun:
     surface "unknown" than have load_config abort.
     """
 
-    exit_class: str | None
+    exit_class: ExitClass | None
     started_at: str | None
     # The process exit the run recorded (JobRunResult / GroupRunResult
     # `process_exit`). None for a record predating the field or a
@@ -591,11 +638,11 @@ class LastRun:
         LastRun with whatever fields landed, rather than disqualifying
         the entity from runtime state altogether.
         """
-        exit_class = raw.get("exit_class")
+        exit_class = ExitClass.parse(raw.get("exit_class"))
         started_at = raw.get("started_at")
         process_exit = raw.get("process_exit")
         return cls(
-            exit_class=exit_class if isinstance(exit_class, str) else None,
+            exit_class=exit_class,
             started_at=started_at if isinstance(started_at, str) else None,
             process_exit=(
                 process_exit if isinstance(process_exit, int) else None
