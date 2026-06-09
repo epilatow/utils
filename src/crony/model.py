@@ -53,13 +53,11 @@ RUN_LOG_NAME: str = "run.log"
 
 @dataclass(frozen=True)
 class _JobCommon:
-    """Identity and behavior shared by `Job` and `JobGroup`.
+    """Holds the fields both snapshot kinds carry.
 
-    Holds the fields both snapshot kinds carry -- the schema / kind
-    tags, the `bundle` namespace, the short `name`, the `uuid`, and the
-    `symlink` alias pair -- plus the identity / alias derivations over
-    them (`entity_ref`, `entity_name`, `state_dir`, ...), so neither
-    subclass redeclares them.
+    The one per-kind difference is the unit's priority: a group renders
+    without one, so `unit_spec` reads it through the `_unit_priority`
+    hook that `Job` overrides to bake in its resolved class.
 
     `symlink` is the short-name alias as a graph knows it: (alias_path,
     target). A config-built (pending) node carries the expected pair
@@ -78,6 +76,14 @@ class _JobCommon:
     name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
     symlink: tuple[Path, str] | None = field(default=None, kw_only=True)
+    # The per-entry schedule / interval that drove the rendered platform
+    # unit, pinned so `crony status` shows the applied schedule
+    # independently of any later live-config edit. Default-None
+    # (on-demand) for back-compat with snapshots written before a timing
+    # was pinned; loaders rely on the dataclass default rather than a
+    # schema bump. Keyword-only so the subclasses can append their own
+    # non-default fields after it.
+    timing: crony.unit.Timing | None = field(default=None, kw_only=True)
 
     @property
     def entity_ref(self) -> crony.unit.EntityRef:
@@ -164,6 +170,45 @@ class _JobCommon:
             return sl[0] / RUN_LOG_NAME
         return self.log_path_resolved
 
+    @property
+    def _unit_priority(self) -> crony.unit.PriorityClass | None:
+        """The process-priority class baked into this entry's platform
+        unit. None here (groups render without one); `Job` overrides to
+        expose its `priority` field."""
+        return None
+
+    def unit_spec(self) -> crony.unit.UnitSpec:
+        """The platform UnitSpec the scheduler renders / drift-checks."""
+        return crony.unit.UnitSpec(
+            name=self.entity_name,
+            ref=self.entity_ref,
+            timing=self.timing,
+            priority=self._unit_priority,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this entry to its JSON dict, rendering the typed
+        value-object fields back to their source strings so snapshot.json
+        stays string-keyed regardless of the in-memory types. `Job`
+        layers the job-only `priority` on top."""
+        d = dataclasses.asdict(self)
+        # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
+        # is redundant with it and recomputed on load.
+        d["name"] = str(self.entity_name)
+        d.pop("bundle", None)
+        # The alias pair is derived disk / expected state, recomputed on
+        # load -- it never belongs in the persisted snapshot.
+        d.pop("symlink", None)
+        timing = self.timing
+        d.pop("timing", None)
+        d["schedule"] = (
+            str(timing) if isinstance(timing, crony.unit.Schedule) else None
+        )
+        d["interval"] = (
+            str(timing) if isinstance(timing, crony.unit.Interval) else None
+        )
+        return d
+
 
 @dataclass(frozen=True)
 class Job(_JobCommon):
@@ -188,13 +233,6 @@ class Job(_JobCommon):
     gate_args: list[str]
     env: dict[str, str]
     job_timeout_sec: int
-    # `timing` captures the per-entry schedule / interval config that
-    # drove the rendered platform unit, so `crony status` can show the
-    # currently-active (applied) schedule independently of any later
-    # edit to the live config. Default-None (on-demand) for back-compat
-    # with snapshots written before a timing was pinned; loaders rely on
-    # the dataclass default rather than a schema bump.
-    timing: crony.unit.Timing | None = None
     # Process-priority class baked into the platform unit (HIGH / LOW /
     # NORMAL / None). Pinned in the snapshot so a change re-renders the
     # unit on the next apply. Default-None for back-compat with
@@ -216,14 +254,10 @@ class Job(_JobCommon):
     interactive_active_sec: int = crony.config.INTERACTIVE_ACTIVE_DEFAULT_SEC
     interactive_delay_sec: int = crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
 
-    def unit_spec(self) -> crony.unit.UnitSpec:
-        """The platform UnitSpec the scheduler renders / drift-checks."""
-        return crony.unit.UnitSpec(
-            name=self.entity_name,
-            ref=self.entity_ref,
-            timing=self.timing,
-            priority=self.priority,
-        )
+    @property
+    def _unit_priority(self) -> crony.unit.PriorityClass | None:
+        """A job's platform unit bakes in its resolved priority class."""
+        return self.priority
 
     @classmethod
     def from_config(
@@ -276,10 +310,9 @@ class Job(_JobCommon):
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize this job to its JSON dict. The typed value-object
-        fields render back to their source strings, so snapshot.json
-        stays string-keyed regardless of the in-memory types."""
-        d = _snapshot_base_dict(self)
+        """Extend the shared snapshot dict with the job-only `priority`,
+        rendered back to its source string."""
+        d = super().to_dict()
         d["priority"] = (
             str(self.priority) if self.priority is not None else None
         )
@@ -300,17 +333,6 @@ class JobGroup(_JobCommon):
     children: list[str]
     group_budget_sec: int
     trigger_timeout_sec: int
-    timing: crony.unit.Timing | None = None
-
-    def unit_spec(self) -> crony.unit.UnitSpec:
-        """The platform UnitSpec the scheduler renders / drift-checks.
-        Groups render without a priority."""
-        return crony.unit.UnitSpec(
-            name=self.entity_name,
-            ref=self.entity_ref,
-            timing=self.timing,
-            priority=None,
-        )
 
     @classmethod
     def from_config(
@@ -360,35 +382,6 @@ class JobGroup(_JobCommon):
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
             timing=group.timing,
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize this group to its JSON dict. The typed value-object
-        fields render back to their source strings, so snapshot.json
-        stays string-keyed regardless of the in-memory types."""
-        return _snapshot_base_dict(self)
-
-
-def _snapshot_base_dict(snap: Job | JobGroup) -> dict[str, Any]:
-    """Serialize the fields Job and JobGroup share to a JSON dict,
-    rendering the typed value-object fields back to their source
-    strings. `Job.to_dict` layers the job-only `priority` on top."""
-    d = dataclasses.asdict(snap)
-    # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
-    # is redundant with it and recomputed on load.
-    d["name"] = str(snap.entity_name)
-    d.pop("bundle", None)
-    # The alias pair is derived disk / expected state, recomputed on
-    # load -- it never belongs in the persisted snapshot.
-    d.pop("symlink", None)
-    timing = snap.timing
-    d.pop("timing", None)
-    d["schedule"] = (
-        str(timing) if isinstance(timing, crony.unit.Schedule) else None
-    )
-    d["interval"] = (
-        str(timing) if isinstance(timing, crony.unit.Interval) else None
-    )
-    return d
 
 
 def _expand_path_field(value: str) -> str:

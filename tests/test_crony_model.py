@@ -40,7 +40,9 @@ from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
     Graph,
     JobOrphan,
+    _JobCommon,
     _resolve_snapshot_for,
+    snapshot_from_dict,
 )
 from crony.unit import (  # noqa: E402
     EntityRef,
@@ -268,6 +270,54 @@ class TestLogPath:
             base, symlink=(base.symlink_state_dir, "other-uuid")
         )
         assert snap.log_path == snap.log_path_resolved
+
+
+class TestSharedSnapshotSurface:
+    """`timing`, `unit_spec`, and `to_dict` are declared once on the
+    `_JobCommon` base and shared by both `Job` and `JobGroup`; only the
+    unit's priority differs (a job exposes its resolved class, a group
+    renders without one).
+    """
+
+    def _job_snap(self) -> Any:
+        cfg = _parse({"job": {"j": _job(priority="high")}})
+        return _resolve_snapshot_for(cfg, "j")
+
+    def _group_snap(self) -> Any:
+        raw = {
+            "job": {"a": _job()},
+            "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+        }
+        return _resolve_snapshot_for(_parse(raw), "g")
+
+    def test_timing_is_a_shared_base_field(self) -> None:
+        base_fields = {f.name for f in dataclasses.fields(_JobCommon)}
+        assert "timing" in base_fields
+        # Both kinds carry the pinned schedule through the same field.
+        assert self._job_snap().timing is not None
+        assert self._group_snap().timing is not None
+
+    def test_job_unit_spec_carries_its_priority(self) -> None:
+        snap = self._job_snap()
+        spec = snap.unit_spec()
+        assert spec.priority == snap.priority
+        assert snap.priority is not None
+        assert spec.timing == snap.timing
+
+    def test_group_unit_spec_has_no_priority(self) -> None:
+        group = self._group_snap()
+        spec = group.unit_spec()
+        assert spec.priority is None
+        assert spec.timing == group.timing
+
+    def test_group_to_dict_round_trips_without_priority(self) -> None:
+        group = self._group_snap()
+        d = group.to_dict()
+        assert "priority" not in d
+        # The alias pair is derived disk state, never serialized, so a
+        # reloaded node carries no symlink until the current-graph scan
+        # supplies one.
+        assert snapshot_from_dict(d) == dataclasses.replace(group, symlink=None)
 
 
 class TestJobFromRefAndFullName:
