@@ -2343,6 +2343,137 @@ class TestDashKeys:
         assert cfg.legacy_underscore_keys == []
 
 
+class TestJobFlagsField:
+    """The `flags = [...]` job field is an alternative spelling for the
+    interactive / keep-awake scalars; a flag set both ways at one level
+    is rejected."""
+
+    @staticmethod
+    def _cfg(body: dict[str, Any]) -> dict[str, Any]:
+        return {"job": {"j": body}}
+
+    def test_flag_enables(self) -> None:
+        cfg = _parse(self._cfg(_job(flags=["keep-awake"])))
+        assert cfg.jobs["j"].keep_awake is True
+
+    def test_flag_disable_form(self) -> None:
+        cfg = _parse(self._cfg(_job(flags=["keep-awake=false"])))
+        assert cfg.jobs["j"].keep_awake is False
+
+    def test_flag_explicit_true(self) -> None:
+        cfg = _parse(self._cfg(_job(flags=["keep-awake=true"])))
+        assert cfg.jobs["j"].keep_awake is True
+
+    def test_interactive_flag_auto_tags_darwin(self) -> None:
+        cfg = _parse(self._cfg(_job(flags=["interactive"])))
+        assert cfg.jobs["j"].interactive is True
+        assert cfg.jobs["j"].platforms == ["darwin"]
+
+    def test_scalar_and_flag_for_different_flags_ok(self) -> None:
+        cfg = _parse(self._cfg(_job(interactive=True, flags=["keep-awake"])))
+        assert cfg.jobs["j"].interactive is True
+        assert cfg.jobs["j"].keep_awake is True
+
+    def test_unknown_flag_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(flags=["turbo"])), "j", "unknown flag"
+        )
+
+    def test_bad_flag_value_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(flags=["keep-awake=maybe"])), "j", "true.*false"
+        )
+
+    def test_duplicate_flag_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(flags=["keep-awake", "keep-awake=false"])),
+            "j",
+            "more than once",
+        )
+
+    def test_flags_must_be_list_of_strings(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(flags="interactive")), "j", "list of strings"
+        )
+
+    def test_keep_awake_set_both_ways_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(keep_awake=True, flags=["keep-awake"])),
+            "j",
+            "use one",
+        )
+
+    def test_interactive_set_both_ways_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(_job(interactive=True, flags=["interactive"])),
+            "j",
+            "use one",
+        )
+
+    def test_job_partial_records_explicit_settings(self) -> None:
+        cfg = _parse(self._cfg(_job(flags=["interactive", "keep-awake=false"])))
+        assert cfg.jobs["j"].flags == {
+            JobFlags.INTERACTIVE: True,
+            JobFlags.KEEP_AWAKE: False,
+        }
+
+    def test_job_partial_empty_when_unset(self) -> None:
+        cfg = _parse(self._cfg(_job()))
+        assert cfg.jobs["j"].flags == {}
+
+
+class TestFlagsAtDefaultsAndGroup:
+    """`flags = [...]` is accepted at the defaults and group levels too,
+    recording each level's explicit per-flag delta."""
+
+    def test_defaults_flags_stored_and_keep_awake_derived(self) -> None:
+        cfg = _parse({"defaults": {"flags": ["keep-awake", "interactive"]}})
+        assert cfg.defaults.flags == {
+            JobFlags.KEEP_AWAKE: True,
+            JobFlags.INTERACTIVE: True,
+        }
+        # The legacy scalar this level yields is still derived.
+        assert cfg.defaults.keep_awake is True
+
+    def test_defaults_scalar_and_flag_conflict(self) -> None:
+        with pytest.raises(ConfigError, match="use one"):
+            _parse({"defaults": {"keep-awake": True, "flags": ["keep-awake"]}})
+
+    def test_group_flags_stored(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "flags": ["interactive", "keep-awake=false"],
+                    }
+                },
+            }
+        )
+        assert cfg.job_groups["g"].flags == {
+            JobFlags.INTERACTIVE: True,
+            JobFlags.KEEP_AWAKE: False,
+        }
+
+    def test_group_unknown_flag_rejected(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "flags": ["turbo"],
+                    }
+                },
+            },
+            "g",
+            "unknown flag",
+        )
+
+
 class TestJobFlags:
     def test_token_round_trips_for_every_member(self) -> None:
         for flag in JobFlags.members():

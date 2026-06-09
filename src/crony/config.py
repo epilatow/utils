@@ -250,6 +250,12 @@ class Defaults:
     # when a bundle sets no default.
     priority: crony.unit.PriorityClass | None = None
     keep_awake: bool = False
+    # The capability flags this level explicitly sets (true / false),
+    # parsed from `flags = [...]` and the legacy scalar keys. A per-level
+    # delta; the flag cascade composes these across levels. `keep_awake`
+    # above is the resolved scalar this level's delta yields, kept for
+    # the current cascade.
+    flags: dict[JobFlags, bool] = field(default_factory=dict)
     # Base env merged under every job's own `env` (job keys win); see
     # resolved_env. Values are expanded at fire time like a job's env.
     env: dict[str, str] = field(default_factory=dict)
@@ -336,11 +342,17 @@ class TomlJob:
     # `_sec` knobs are None when the user didn't set them; the
     # snapshot resolver substitutes baked defaults. Validation
     # auto-tags `platforms = ["darwin"]` (the dialog and idle-
-    # detection helpers are macOS-only) and rejects placement
-    # inside any [job-group.*].
+    # detection helpers are macOS-only). An interactive job may be a
+    # group child -- the group dispatches it async, without waiting.
     interactive: bool = False
     interactive_active_sec: int | None = None
     interactive_delay_sec: int | None = None
+    # The capability flags this job explicitly sets (true / false),
+    # parsed from `flags = [...]` and the legacy `interactive` /
+    # `keep-awake` scalar keys. The `interactive` / `keep_awake` fields
+    # above are the resolved scalars this delta yields, kept for the
+    # current cascade; the flag cascade composes these per-level deltas.
+    flags: dict[JobFlags, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -376,6 +388,11 @@ class TomlJobGroup:
     timing: crony.unit.Timing | None = None
     platforms: list[str] = field(default_factory=list)
     hosts: _HostList = field(default_factory=_HostList)
+    # The capability flags this group explicitly sets (true / false),
+    # parsed from `flags = [...]`. A group has no per-flag behavior of
+    # its own; the delta exists for the flag cascade to compose into its
+    # children.
+    flags: dict[JobFlags, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -1027,6 +1044,7 @@ _KNOWN_DEFAULTS: frozenset[str] = frozenset(
         "log-keep-runs",
         "priority",
         "keep-awake",
+        "flags",
         "env",
         "notify",
     }
@@ -1051,6 +1069,7 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "notify-channels",
         "success-exit-codes",
         "env",
+        "flags",
         "interactive",
         "interactive-active",
         "interactive-delay",
@@ -1065,6 +1084,7 @@ _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
         "interval",
         "platforms",
         "hosts",
+        "flags",
     }
 )
 
@@ -1429,27 +1449,92 @@ def _parse_hosts_field(raw: dict[str, Any], where: str) -> _HostList:
     return _HostList(names=stripped, negated=True)
 
 
-def _parse_interactive_fields(
-    raw: dict[str, Any], where: str
-) -> tuple[bool, int | None, int | None]:
-    """Parse the three `interactive*` fields together.
+def _parse_flags_field(raw: dict[str, Any], where: str) -> dict[JobFlags, bool]:
+    """Parse a `flags = [...]` list into the per-flag settings it
+    expresses.
 
-    Returns `(interactive, active_sec, delay_sec)`. The two `_sec`
-    values are `None` when the user did not provide a time-span
-    string; the snapshot resolver substitutes the baked default.
-    Either time-span set without `interactive = true` is a config
-    error (catches "I wrote the knob but forgot the flag"), and a
-    zero / negative time-span is rejected.
+    Each entry is a flag token (`"interactive"`, on) or `token=true` /
+    `token=false`. Returns the map of every flag the list mentions to
+    its requested state. An unknown token, a non-true/false value, or
+    the same flag listed twice is a ConfigError.
     """
-    raw_interactive = _typed_field(raw, "interactive", bool, where)
-    interactive = bool(raw_interactive)
+    val = raw.get("flags")
+    if val is None:
+        return {}
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise crony.errors.ConfigError(
+            f"{where}: 'flags' must be a list of strings"
+        )
+    settings: dict[JobFlags, bool] = {}
+    for entry in val:
+        token, sep, value_str = entry.partition("=")
+        token = token.strip()
+        try:
+            flag = JobFlags.from_token(token)
+        except ValueError as e:
+            raise crony.errors.ConfigError(f"{where}: {e}") from e
+        if not sep:
+            enabled = True
+        elif value_str.strip() == "true":
+            enabled = True
+        elif value_str.strip() == "false":
+            enabled = False
+        else:
+            raise crony.errors.ConfigError(
+                f"{where}: flag {flag.token!r} value must be 'true' or "
+                f"'false', got {value_str.strip()!r}"
+            )
+        if flag in settings:
+            raise crony.errors.ConfigError(
+                f"{where}: flag {flag.token!r} set more than once in 'flags'"
+            )
+        settings[flag] = enabled
+    return settings
+
+
+def _parse_flags_partial(
+    raw: dict[str, Any],
+    where: str,
+    *,
+    scalar_keys: dict[str, JobFlags],
+) -> dict[JobFlags, bool]:
+    """The per-level flag delta: the `flags = [...]` list combined with
+    the legacy boolean scalar keys that map to flags at this level.
+
+    A flag set both in `flags` and via its scalar key is one setting
+    expressed two ways at one level, so it is rejected. Returns the map
+    of every flag this level explicitly sets to its requested state.
+    """
+    partial = _parse_flags_field(raw, where)
+    for scalar_key, flag in scalar_keys.items():
+        if scalar_key not in raw:
+            continue
+        if flag in partial:
+            raise crony.errors.ConfigError(
+                f"{where}: {flag.token!r} is set both in 'flags' and as "
+                f"'{scalar_key}'; use one"
+            )
+        partial[flag] = bool(_typed_field(raw, scalar_key, bool, where))
+    return partial
+
+
+def _parse_interactive_timespans(
+    raw: dict[str, Any], where: str, interactive: bool
+) -> tuple[int | None, int | None]:
+    """Parse the `interactive-active` / `interactive-delay` knobs.
+
+    Each is `None` when the user did not provide a time-span string; the
+    snapshot resolver substitutes the baked default. Either set without
+    the job being interactive is a config error (catches "I wrote the
+    knob but forgot the flag"); a zero / negative time-span is rejected.
+    """
     active_sec = _parse_interactive_timespan(
         raw, "interactive-active", where, interactive
     )
     delay_sec = _parse_interactive_timespan(
         raw, "interactive-delay", where, interactive
     )
-    return interactive, active_sec, delay_sec
+    return active_sec, delay_sec
 
 
 def _parse_interactive_timespan(
@@ -1461,7 +1546,8 @@ def _parse_interactive_timespan(
         return None
     if not interactive:
         raise crony.errors.ConfigError(
-            f"{where}: {key!r} set without 'interactive = true'"
+            f"{where}: {key!r} set without enabling interactive "
+            f"('interactive = true' or flags = ['interactive'])"
         )
     try:
         # from_str validates the time-span and rejects non-positive.
@@ -1623,6 +1709,9 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
                 f"[defaults.notify.{sub_key}]: must be a table"
             )
         notify_channel_defs[sub_key] = NotifyChannel.from_raw(sub_key, sub_body)
+    flags = _parse_flags_partial(
+        raw, where, scalar_keys={"keep-awake": JobFlags.KEEP_AWAKE}
+    )
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
@@ -1639,7 +1728,8 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         ),
         log_keep_runs=_positive_int(raw, "log-keep-runs", where, default=30),
         priority=_parse_priority_field(raw, where),
-        keep_awake=_typed_field(raw, "keep-awake", bool, where, default=False),
+        keep_awake=flags.get(JobFlags.KEEP_AWAKE, False),
+        flags=flags,
         env=_string_dict(raw, "env", where),
         notify_channel_defs=notify_channel_defs,
     )
@@ -1711,7 +1801,15 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     interval_str = _typed_field(raw, "interval", str, where)
     timing = _parse_timing(schedule_str, interval_str, where)
     priority = _parse_priority_field(raw, where)
-    keep_awake = _typed_field(raw, "keep-awake", bool, where, default=None)
+    flags = _parse_flags_partial(
+        raw,
+        where,
+        scalar_keys={
+            "interactive": JobFlags.INTERACTIVE,
+            "keep-awake": JobFlags.KEEP_AWAKE,
+        },
+    )
+    keep_awake = flags.get(JobFlags.KEEP_AWAKE)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
@@ -1721,15 +1819,16 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         raise crony.errors.ConfigError(
             f"{where}: 'job-timeout-sec' must be >= 0, got {job_timeout_sec}"
         )
-    interactive, interactive_active_sec, interactive_delay_sec = (
-        _parse_interactive_fields(raw, where)
+    interactive = flags.get(JobFlags.INTERACTIVE, False)
+    interactive_active_sec, interactive_delay_sec = (
+        _parse_interactive_timespans(raw, where, interactive)
     )
     if interactive:
         if not platforms:
             platforms = ["darwin"]
         elif platforms != ["darwin"]:
             raise crony.errors.ConfigError(
-                f"{where}: 'interactive = true' implies "
+                f"{where}: an interactive job implies "
                 f"platforms = ['darwin']; remove or change the "
                 f"'platforms' override"
             )
@@ -1754,6 +1853,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         interactive=interactive,
         interactive_active_sec=interactive_active_sec,
         interactive_delay_sec=interactive_delay_sec,
+        flags=flags,
     )
 
 
@@ -1785,6 +1885,8 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     timing = _parse_timing(schedule_str, interval_str, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
+    # A group has no legacy scalar flag keys; only the `flags` list.
+    flags = _parse_flags_partial(raw, where, scalar_keys={})
     return TomlJobGroup(
         name=name,
         uuid=group_uuid,
@@ -1792,6 +1894,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
         timing=timing,
         platforms=platforms,
         hosts=hosts,
+        flags=flags,
     )
 
 
