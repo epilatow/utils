@@ -871,8 +871,8 @@ class Config:
         entry (apply overwrites it).
         """
         orphan = self.orphans.get(ref)
-        p = self.pending.jobs.get(ref) or self.pending.groups.get(ref)
-        c = self.current.jobs.get(ref) or self.current.groups.get(ref)
+        p = self.pending.job_from_ref(ref)
+        c = self.current.job_from_ref(ref)
         if orphan is not None:
             if orphan.is_broken:
                 return "broken"
@@ -895,12 +895,9 @@ class Config:
         broken snapshot too corrupt to recover one).
         """
         for graph in (self.current, self.pending):
-            j = graph.jobs.get(ref)
-            if j is not None:
-                return str(j.entity_name)
-            g = graph.groups.get(ref)
-            if g is not None:
-                return str(g.entity_name)
+            node = graph.job_from_ref(ref)
+            if node is not None:
+                return str(node.entity_name)
         orphan = self.orphans.get(ref)
         if orphan is not None:
             return orphan.name

@@ -734,9 +734,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     is untouched by the apply loop until this call, so the loaded
     view still matches disk.
     """
-    snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
-    )
+    snapshot = config.pending.job_from_ref(ref)
     if snapshot is None:
         raise crony.errors.PreconditionError(
             f"{ref} is not a selected entry to apply"
@@ -771,9 +769,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # (or a scheduled unit the scheduler unloaded) whose snapshot
     # still matches, so an otherwise-clean apply still re-renders
     # and re-bootstraps the platform side.
-    current_snapshot: crony.model.Job | crony.model.JobGroup | None = (
-        config.current.jobs.get(ref) or config.current.groups.get(ref)
-    )
+    current_snapshot = config.current.job_from_ref(ref)
     rt = config.runtime.get(ref)
     unit_stale = rt.unit_is_stale if rt is not None else False
     if current_snapshot == snapshot and not unit_stale:

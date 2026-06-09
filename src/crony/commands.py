@@ -1111,9 +1111,7 @@ def _applied_schedule_state(config: crony.model.Config, full: str) -> str:
     ref = config.resolve_current(full) or config.resolve_pending(full)
     if ref is None:
         return "unresolved"
-    snap: crony.model.Job | crony.model.JobGroup | None = (
-        config.current.jobs.get(ref) or config.current.groups.get(ref)
-    )
+    snap = config.current.job_from_ref(ref)
     if snap is None:
         return "unresolved"
     if snap.timing is None:
@@ -1754,16 +1752,8 @@ def _resolve_state_axes(
         if entry is not None
         else config.resolve_current(full) or config.resolve_pending(full)
     )
-    pending_node = (
-        config.pending.jobs.get(ref) or config.pending.groups.get(ref)
-        if ref is not None
-        else None
-    )
-    current_node = (
-        config.current.jobs.get(ref) or config.current.groups.get(ref)
-        if ref is not None
-        else None
-    )
+    pending_node = config.pending.job_from_ref(ref) if ref is not None else None
+    current_node = config.current.job_from_ref(ref) if ref is not None else None
     if cfg_state == "missing":
         unit_state = "none"
     else:
@@ -1812,12 +1802,9 @@ def _snapshot_says_scheduled(
     ref = config.resolve_runnable(full)
     if ref is None:
         return None
-    snap_j = config.current.jobs.get(ref)
-    if snap_j is not None:
-        return snap_j.timing is not None
-    snap_g = config.current.groups.get(ref)
-    if snap_g is not None:
-        return snap_g.timing is not None
+    snap = config.current.job_from_ref(ref)
+    if snap is not None:
+        return snap.timing is not None
     return None
 
 
@@ -2232,15 +2219,11 @@ def do_status(
                 value = f"{value}{_DIVERGENCE_MARKER}"
             return value
 
-        pending_node: crony.model.Job | crony.model.JobGroup | None = (
-            config.pending.jobs.get(ref) or config.pending.groups.get(ref)
-            if ref is not None
-            else None
+        pending_node = (
+            config.pending.job_from_ref(ref) if ref is not None else None
         )
-        current_node: crony.model.Job | crony.model.JobGroup | None = (
-            config.current.jobs.get(ref) or config.current.groups.get(ref)
-            if ref is not None
-            else None
+        current_node = (
+            config.current.job_from_ref(ref) if ref is not None else None
         )
         pending_name = (
             str(pending_node.entity_name) if pending_node is not None else None
@@ -2598,9 +2581,7 @@ def do_logs(
             # below handles "path is well-defined but no log
             # there yet".
             sd = crony.model.Job.state_dir_from_ref(ref)
-            current_node = config.current.jobs.get(
-                ref
-            ) or config.current.groups.get(ref)
+            current_node = config.current.job_from_ref(ref)
     if sd is None:
         raise crony.errors.UsageError(
             f"no log for {full!r} (no applied state on this host)"
