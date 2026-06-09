@@ -86,6 +86,13 @@ class _JobCommon:
     # schema bump. Keyword-only so the subclasses can append their own
     # non-default fields after it.
     timing: crony.unit.Timing | None = field(default=None, kw_only=True)
+    # The entry's resolved capability flags as a single bitmask. `Job`
+    # exposes the per-flag booleans (`interactive`, `keep_awake`) as
+    # properties over it. Keyword-only so the subclasses can append
+    # their own non-default fields after it.
+    flags: crony.config.JobFlags = field(
+        default=crony.config.JobFlags(0), kw_only=True
+    )
 
     @property
     def entity_ref(self) -> crony.unit.EntityRef:
@@ -201,6 +208,9 @@ class _JobCommon:
         # The alias pair is derived disk / expected state, recomputed on
         # load -- it never belongs in the persisted snapshot.
         d.pop("symlink", None)
+        # Flags serialize as their individual booleans (see `Job.to_dict`),
+        # never the bitmask value itself.
+        d.pop("flags", None)
         timing = self.timing
         d.pop("timing", None)
         d["schedule"] = (
@@ -240,10 +250,6 @@ class Job(_JobCommon):
     # unit on the next apply. Default-None for back-compat with
     # snapshots written before this field existed.
     priority: crony.unit.PriorityClass | None = None
-    # Whether the runner wraps the command in a power assertion to
-    # keep the machine awake for its duration. Read at fire time;
-    # default-False for back-compat with older snapshots.
-    keep_awake: bool = False
     # Non-zero exit codes the runner classifies as success (read at
     # fire time). Default-empty for back-compat with older snapshots.
     success_exit_codes: list[int] = field(default_factory=list)
@@ -252,9 +258,22 @@ class Job(_JobCommon):
     # the snapshot so the runner doesn't re-consult any defaults
     # table; the per-job `_sec` knobs cascade through the resolver
     # to the baked defaults defined alongside the TomlJob dataclass.
-    interactive: bool = False
+    # (Whether the job is interactive is the INTERACTIVE flag -- see the
+    # `interactive` property.)
     interactive_active_sec: int = crony.config.INTERACTIVE_ACTIVE_DEFAULT_SEC
     interactive_delay_sec: int = crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
+
+    @property
+    def interactive(self) -> bool:
+        """Whether the runner waits for user activity and prompts before
+        firing -- the INTERACTIVE flag."""
+        return crony.config.JobFlags.INTERACTIVE in self.flags
+
+    @property
+    def keep_awake(self) -> bool:
+        """Whether the runner holds a power assertion for the run's
+        duration -- the KEEP_AWAKE flag."""
+        return crony.config.JobFlags.KEEP_AWAKE in self.flags
 
     @property
     def _unit_priority(self) -> crony.unit.PriorityClass | None:
@@ -279,6 +298,11 @@ class Job(_JobCommon):
             if job.gate_script is not None
             else None
         )
+        flags = crony.config.JobFlags(0)
+        if job.interactive:
+            flags |= crony.config.JobFlags.INTERACTIVE
+        if config.resolved_keep_awake(job):
+            flags |= crony.config.JobFlags.KEEP_AWAKE
         return cls(
             schema=SNAPSHOT_SCHEMA,
             kind="job",
@@ -296,9 +320,8 @@ class Job(_JobCommon):
             job_timeout_sec=config.resolved_job_timeout_sec(job),
             timing=job.timing,
             priority=config.resolved_priority(job),
-            keep_awake=config.resolved_keep_awake(job),
+            flags=flags,
             success_exit_codes=list(job.success_exit_codes),
-            interactive=job.interactive,
             interactive_active_sec=(
                 job.interactive_active_sec
                 if job.interactive_active_sec is not None
@@ -312,12 +335,15 @@ class Job(_JobCommon):
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Extend the shared snapshot dict with the job-only `priority`,
-        rendered back to its source string."""
+        """Extend the shared snapshot dict with the job-only `priority`
+        (rendered to its source string) and the per-flag booleans the
+        runner reads at fire time."""
         d = super().to_dict()
         d["priority"] = (
             str(self.priority) if self.priority is not None else None
         )
+        d["interactive"] = self.interactive
+        d["keep_awake"] = self.keep_awake
         return d
 
 
@@ -467,6 +493,15 @@ def snapshot_from_dict(
         data["priority"] = crony.unit.PriorityClass.from_str(data["priority"])
     kind = data.get("kind")
     if kind == "job":
+        # The per-flag booleans are stored in the snapshot; fold them back
+        # into the bitmask. Absent keys default off, so a pre-flags
+        # snapshot loads without a schema bump.
+        flags = crony.config.JobFlags(0)
+        if data.pop("interactive", False):
+            flags |= crony.config.JobFlags.INTERACTIVE
+        if data.pop("keep_awake", False):
+            flags |= crony.config.JobFlags.KEEP_AWAKE
+        data["flags"] = flags
         return Job(**data)
     if kind == "group":
         return JobGroup(**data)

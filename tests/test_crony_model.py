@@ -30,6 +30,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
+    JobFlags,
     parse_full_name,
     resolve_cli_name,
 )
@@ -279,6 +280,37 @@ class TestLogPath:
             base, symlink=(base.symlink_state_dir, "other-uuid")
         )
         assert snap.log_path == snap.log_path_resolved
+
+
+class TestJobFlagsBacking:
+    """`interactive` and `keep_awake` are stored as a single `flags`
+    bitmask; the per-flag booleans are derived properties, and the
+    snapshot round-trips through those booleans (the bitmask itself is
+    never serialized)."""
+
+    def _snap(self, **over: Any) -> Any:
+        return _resolve_snapshot_for(_parse({"job": {"j": _job(**over)}}), "j")
+
+    def test_flags_reflect_interactive_and_keep_awake(self) -> None:
+        snap = self._snap(interactive=True, keep_awake=True)
+        assert snap.flags == JobFlags.INTERACTIVE | JobFlags.KEEP_AWAKE
+        assert snap.interactive is True
+        assert snap.keep_awake is True
+
+    def test_no_flags_by_default(self) -> None:
+        snap = self._snap()
+        assert snap.flags == JobFlags(0)
+        assert snap.interactive is False
+        assert snap.keep_awake is False
+
+    def test_snapshot_serializes_flags_as_booleans(self) -> None:
+        snap = self._snap(keep_awake=True)
+        d = snap.to_dict()
+        assert "flags" not in d
+        assert d["keep_awake"] is True
+        assert d["interactive"] is False
+        # The booleans fold back into the bitmask on load.
+        assert snapshot_from_dict(d).flags == snap.flags
 
 
 class TestSharedSnapshotSurface:
