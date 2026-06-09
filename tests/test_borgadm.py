@@ -1456,30 +1456,30 @@ class TestAutomate:
         doc = tomllib.loads(ba._render_crony_bundle())
         # Bundle default: inherit the user's default channels AND pop a
         # desktop dialog on failure.
-        assert doc["defaults"]["notify_channels"] == [
+        assert doc["defaults"]["notify-channels"] == [
             "default",
             "dialog-popup",
         ]
-        # create overrides to silent; the checks omit notify_channels,
+        # create overrides to silent; the checks omit notify-channels,
         # inheriting the bundle default above.
-        assert doc["job"]["create"]["notify_channels"] == []
-        assert "notify_channels" not in doc["job"]["check-age"]
+        assert doc["job"]["create"]["notify-channels"] == []
+        assert "notify-channels" not in doc["job"]["check-age"]
         # create treats borg's transient-warning exit 1 as success; the
         # checks keep the default (a check warning is a real signal).
-        assert doc["job"]["create"]["success_exit_codes"] == [1]
-        assert "success_exit_codes" not in doc["job"]["check-age"]
-        # priority, keep_awake, env, and the disabled wallclock cap are
+        assert doc["job"]["create"]["success-exit-codes"] == [1]
+        assert "success-exit-codes" not in doc["job"]["check-age"]
+        # priority, keep-awake, env, and the disabled wallclock cap are
         # the same for every job, so they live in [defaults] and no job
         # overrides them. (borgadm caps each borg command itself, so
-        # job_timeout_sec = 0 leaves that timeout the sole authority.)
+        # job-timeout-sec = 0 leaves that timeout the sole authority.)
         assert doc["defaults"]["priority"] == "high"
-        assert doc["defaults"]["keep_awake"] is True
-        assert doc["defaults"]["job_timeout_sec"] == 0
+        assert doc["defaults"]["keep-awake"] is True
+        assert doc["defaults"]["job-timeout-sec"] == 0
         assert doc["defaults"]["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
         for op in self.JOB_OPS:
             assert "priority" not in doc["job"][op]
-            assert "keep_awake" not in doc["job"][op]
-            assert "job_timeout_sec" not in doc["job"][op]
+            assert "keep-awake" not in doc["job"][op]
+            assert "job-timeout-sec" not in doc["job"][op]
             assert "env" not in doc["job"][op]
         # Target keys on this host.
         host = ba._current_host()
