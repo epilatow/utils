@@ -13,6 +13,7 @@ maps rather than aborting the whole bundle.
 from __future__ import annotations
 
 import contextvars
+import enum
 import logging
 import re
 import uuid
@@ -48,6 +49,48 @@ NOTIFY_INHERIT_TOKEN: str = DEFAULT_BUNDLE_NAME
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
+
+
+class JobFlags(enum.Flag):
+    """Boolean capability toggles for an entry, combined as a bitmask.
+
+    An entry's resolved flags are a single `JobFlags` value
+    (`JobFlags.INTERACTIVE | JobFlags.KEEP_AWAKE`); membership is the
+    per-flag query (`JobFlags.INTERACTIVE in flags`). Each member has a
+    token -- its lowercased, dash-joined name (`KEEP_AWAKE` ->
+    `keep-awake`) -- which is its spelling when addressed as text.
+    """
+
+    INTERACTIVE = enum.auto()
+    KEEP_AWAKE = enum.auto()
+
+    @property
+    def token(self) -> str:
+        """The token (text spelling) of a single flag member. Not
+        defined for a combined value -- callers render those by testing
+        each member from `members()`."""
+        if self.value.bit_count() != 1:
+            raise ValueError("token is defined only for a single flag")
+        name = self.name
+        assert name is not None  # a single-bit member always has a name
+        return name.lower().replace("_", "-")
+
+    @classmethod
+    def from_token(cls, token: str) -> JobFlags:
+        """The flag member named by `token` (its dash spelling)."""
+        try:
+            return cls[token.upper().replace("-", "_")]
+        except KeyError:
+            allowed = ", ".join(f.token for f in cls)
+            raise ValueError(
+                f"unknown flag {token!r}; expected one of {allowed}"
+            ) from None
+
+    @classmethod
+    def members(cls) -> list[JobFlags]:
+        """The individual flag members in declaration order (a combined
+        value is never in it)."""
+        return list(cls)
 
 
 @dataclass

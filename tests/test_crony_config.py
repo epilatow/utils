@@ -43,6 +43,7 @@ from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony.config import (  # noqa: E402
     NOTIFY_INHERIT_TOKEN,
+    JobFlags,
     TomlBundle,
     TomlBundleConfig,
     TomlConfig,
@@ -2340,6 +2341,38 @@ class TestDashKeys:
             }
         )
         assert cfg.legacy_underscore_keys == []
+
+
+class TestJobFlags:
+    def test_token_round_trips_for_every_member(self) -> None:
+        for flag in JobFlags.members():
+            assert JobFlags.from_token(flag.token) is flag
+
+    def test_token_spellings(self) -> None:
+        assert JobFlags.INTERACTIVE.token == "interactive"
+        assert JobFlags.KEEP_AWAKE.token == "keep-awake"
+
+    def test_from_token_rejects_unknown(self) -> None:
+        with pytest.raises(ValueError, match="unknown flag"):
+            JobFlags.from_token("turbo")
+
+    def test_combines_as_bitmask(self) -> None:
+        only_iv = JobFlags.INTERACTIVE
+        assert JobFlags.INTERACTIVE in only_iv
+        assert JobFlags.KEEP_AWAKE not in only_iv
+        both = JobFlags.INTERACTIVE | JobFlags.KEEP_AWAKE
+        assert JobFlags.INTERACTIVE in both
+        assert JobFlags.KEEP_AWAKE in both
+
+    def test_token_undefined_for_combined_value(self) -> None:
+        with pytest.raises(ValueError, match="single flag"):
+            _ = (JobFlags.INTERACTIVE | JobFlags.KEEP_AWAKE).token
+
+    def test_members_are_the_single_flags_in_order(self) -> None:
+        assert JobFlags.members() == [
+            JobFlags.INTERACTIVE,
+            JobFlags.KEEP_AWAKE,
+        ]
 
 
 if __name__ == "__main__":
