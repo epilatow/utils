@@ -81,25 +81,25 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # other bundles never apply -- each bundle has its own.
 
 # [defaults]
-# notify_channels      = []           # names defined below, or "dialog-popup"
-# notify_attach_log    = true         # include log content in notifications
-# notify_attach_max_kb = 256          # email cap (ntfy uses a 3 KB cap)
-# job_timeout_sec      = 1800         # per-job wallclock cap; 0 = no cap
-# trigger_timeout_sec  = 15           # `crony trigger --wait` deadline
-# log_keep_runs        = 30
+# notify-channels      = []           # names defined below, or "dialog-popup"
+# notify-attach-log    = true         # include log content in notifications
+# notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
+# job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
+# trigger-timeout-sec  = 15           # `crony trigger --wait` deadline
+# log-keep-runs        = 30
 # priority             = "high"       # priority class; jobs may override
-# keep_awake           = true         # default; jobs may override
+# keep-awake           = true         # default; jobs may override
 #
 # [defaults.env]
 # PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
 
 # Notification inheritance. The reserved channel name `default` in a
-# NON-default bundle's `notify_channels` pulls in the default bundle's
+# NON-default bundle's `notify-channels` pulls in the default bundle's
 # channel list, definitions, and attach settings. Alone
-# (`notify_channels = ["default"]`) the bundle notifies exactly as the
+# (`notify-channels = ["default"]`) the bundle notifies exactly as the
 # default bundle would, so it can omit every [defaults.notify.*] block
 # of its own. Combined with explicit siblings
-# (`notify_channels = ["default", "dialog-popup"]`) it notifies as the
+# (`notify-channels = ["default", "dialog-popup"]`) it notifies as the
 # default bundle would PLUS those channels -- de-duped, so a channel in
 # both fires once. Those siblings must be channels defined in THIS
 # bundle or zero-config built-ins (e.g. dialog-popup); the sentinel
@@ -107,12 +107,12 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # re-list the default bundle's channels by name. `default` is also the
 # implicit default: a
 # non-default bundle that says nothing about notify config inherits the
-# default bundle's. Opt back out with an explicit `notify_channels = []`
+# default bundle's. Opt back out with an explicit `notify-channels = []`
 # (silence). The default bundle cannot inherit itself, and `default` is
 # a reserved channel name (no [defaults.notify.default] block).
 
 # Each notify channel is a [defaults.notify.<name>] block. The name
-# is whatever the user lists in `notify_channels`. The `transport`
+# is whatever the user lists in `notify-channels`. The `transport`
 # field selects the underlying sender ("email", "ntfy", or
 # "dialog-popup"); when omitted, transport defaults to the channel
 # name (so a block named `email`, `ntfy`, or `dialog-popup` picks up
@@ -122,7 +122,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # Authorization/Tags/Title for ntfy) are reserved and rejected.
 #
 # `dialog-popup` is a zero-config built-in -- it needs no block at
-# all. Just list "dialog-popup" in `notify_channels` and a failing
+# all. Just list "dialog-popup" in `notify-channels` and a failing
 # job pops a native desktop dialog (macOS) showing the failure
 # summary and latest log. An explicit block is allowed but only ever
 # sets `transport`.
@@ -132,25 +132,25 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # # transport defaults to "email" since the channel is named "email"
 # to                         = "you@example.com"
 # from                       = "crony@example.com"
-# smtp_host                  = "smtp.gmail.com"
-# smtp_port                  = 587
-# smtp_user                  = "you@gmail.com"
-# smtp_starttls              = true
+# smtp-host                  = "smtp.gmail.com"
+# smtp-port                  = 587
+# smtp-user                  = "you@gmail.com"
+# smtp-starttls              = true
 # # Password retrieval -- first match wins. On macOS prefer the
-# # keychain item (the optional _account narrows the lookup when
+# # keychain item (the optional -account narrows the lookup when
 # # multiple items share a service name); on Linux fall back to a
 # # 0600 secrets file.
-# smtp_pass_keychain_service = "crony-smtp"
-# smtp_pass_keychain_account = "you@gmail.com"   # optional
-# smtp_pass_file             = "~/.config/crony/secrets/smtp-password"
+# smtp-pass-keychain-service = "crony-smtp"
+# smtp-pass-keychain-account = "you@gmail.com"   # optional
+# smtp-pass-file             = "~/.config/crony/secrets/smtp-password"
 # headers                    = { "Reply-To" = "you@example.com" }
 
 # ntfy channel.
 # [defaults.notify.ntfy]
 # url                    = "https://ntfy.example.com/automation"
-# token_keychain_service = "ntfy-automation"
-# token_keychain_account = "edp"                 # optional
-# token_file             = "~/.config/crony/secrets/ntfy-token"
+# token-keychain-service = "ntfy-automation"
+# token-keychain-account = "edp"                 # optional
+# token-file             = "~/.config/crony/secrets/ntfy-token"
 
 # Custom-named ntfy channel that also relays through ntfy's email
 # integration. The transport field is required because the channel
@@ -158,11 +158,11 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # [defaults.notify.ntfy-email]
 # transport              = "ntfy"
 # url                    = "https://ntfy.example.com/automation"
-# token_keychain_service = "ntfy-automation"
+# token-keychain-service = "ntfy-automation"
 # headers                = { "Email" = "you@example.com", "Priority" = "high" }
 
 # Native desktop dialog (macOS). Zero-config -- normally you just put
-# "dialog-popup" in notify_channels with no block at all; this
+# "dialog-popup" in notify-channels with no block at all; this
 # explicit form is equivalent and only names the transport.
 # [defaults.notify.dialog-popup]
 # transport = "dialog-popup"
@@ -195,8 +195,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
 # gate      = "command -v brew"        # skip benignly if absent
 # # Optional per-job overrides of [defaults]:
-# # notify_channels = ["email"]   # or [] to silence just this job
-# # job_timeout_sec = 7200        # 0 = no cap (job manages its own timeout)
+# # notify-channels = ["email"]   # or [] to silence just this job
+# # job-timeout-sec = 7200        # 0 = no cap (job manages its own timeout)
 # # priority = "high"             # process-priority class for the unit:
 # #   "high"   un-throttle: macOS ProcessType=Interactive + normal CPU/IO
 # #            (avoids the QoS throttling that slows IO-bound work); on
@@ -206,11 +206,11 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # #            Linux Nice 10 + idle IO scheduling.
 # #   "normal" (default) emit nothing. Applies on every fire path
 # #            (scheduled, `crony trigger`, parent-group dispatch).
-# # keep_awake = true            # hold a power assertion for the run so
+# # keep-awake = true            # hold a power assertion for the run so
 # #            an idle / on-AC machine doesn't sleep mid-job. NOTE:
 # #            closing the lid on battery still sleeps the machine --
 # #            nothing in userspace prevents that.
-# # success_exit_codes = [1]     # non-zero exit codes to classify as
+# # success-exit-codes = [1]     # non-zero exit codes to classify as
 # #            success (exit 0 is always success). A run whose code is
 # #            listed is "ok" -- not failed, no notification -- and the
 # #            unit sees a 0 exit. For commands that exit non-zero on
@@ -234,7 +234,7 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 
 # Interactive job: sits pending after its fire and pops a
 # desktop dialog (Run / Delay / Cancel) once the user has been
-# active continuously for `interactive_active` (default 10min).
+# active continuously for `interactive-active` (default 10min).
 # Auto-tags `platforms = ["darwin"]`, so a non-darwin host
 # silently skips it. May live in a [job-group.*]; the group
 # dispatches it async (no wait) and the child's interactive wait
@@ -244,8 +244,8 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # schedule           = "Sun *-*-* 12:00"  # weekly at noon
 # interactive        = true
 # # Optional knobs (defaults shown):
-# # interactive_active = "10min"          # required user-active window
-# # interactive_delay  = "1h"             # sleep after "Delay Job"
+# # interactive-active = "10min"          # required user-active window
+# # interactive-delay  = "1h"             # sleep after "Delay Job"
 
 
 # ----------------------------------------------------------------------------
@@ -286,15 +286,15 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 
 # [target.darwin]
 # jobs            = ["daily-updates"]
-# notify_channels = ["email"]
+# notify-channels = ["email"]
 
 # [target.linux]
 # jobs            = ["git-pull-utils"]
-# notify_channels = ["ntfy"]
+# notify-channels = ["ntfy"]
 
 # [target.host.work-laptop]
 # jobs            = ["brew-update", "git-pull-utils"]
-# notify_channels = []   # no external dispatch (run.log + last-run.json only)
+# notify-channels = []   # no external dispatch (run.log + last-run.json only)
 """
 
 

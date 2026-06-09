@@ -184,7 +184,7 @@ class TestInit:
         """
         extracted: list[str] = []
         section_re = re.compile(r"^# \[[\w.\-]+\]\s*$")
-        kv_re = re.compile(r"^# [A-Za-z_][\w.]*\s*=")
+        kv_re = re.compile(r"^# [A-Za-z_][\w.\-]*\s*=")
         for line in crony_commands._DEFAULT_CONFIG_TEMPLATE.splitlines():
             if section_re.match(line) or kv_re.match(line):
                 extracted.append(line[2:])

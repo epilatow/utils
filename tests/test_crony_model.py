@@ -85,7 +85,7 @@ class TestTypeStrictness:
             _parse({"defaults": {"priority": "turbo"}})
 
     def test_non_bool_default_keep_awake_rejected(self) -> None:
-        with pytest.raises(ConfigError, match="keep_awake' must be bool"):
+        with pytest.raises(ConfigError, match="keep-awake' must be bool"):
             _parse({"defaults": {"keep_awake": "yes"}})
 
 

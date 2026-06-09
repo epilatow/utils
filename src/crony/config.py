@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_BUNDLE_NAME: str = "default"
-# Sentinel value for a `notify_channels` list: in a non-default
+# Sentinel value for a `notify-channels` list: in a non-default
 # bundle it pulls in the default bundle's channels, definitions, and
 # attach settings. It may stand alone (notify exactly as the default
 # bundle would) or sit alongside explicit siblings (notify as the
@@ -78,7 +78,7 @@ class NotifyNtfy:
 class NotifyChannel:
     """A user-named notification channel.
 
-    `name` is the identifier the user lists in `notify_channels`.
+    `name` is the identifier the user lists in `notify-channels`.
     `transport` selects which sender to use ("email", "ntfy", or
     "dialog-popup"). For "email" / "ntfy" the matching `email` / `ntfy`
     config is populated; the zero-config "dialog-popup" transport
@@ -108,6 +108,7 @@ class NotifyChannel:
         """
         where = f"[defaults.notify.{name}]"
         _validate_name(name, where)
+        raw = _canonical_keys(raw, where)
 
         transport = _typed_field(raw, "transport", str, where)
         if transport is None:
@@ -128,7 +129,7 @@ class NotifyChannel:
         if transport == "dialog-popup":
             # Zero-config built-in: only `transport` is permitted -- no
             # headers, no endpoint, no secrets. Listing the channel
-            # name in notify_channels is the whole configuration.
+            # name in notify-channels is the whole configuration.
             _reject_unknown_keys(raw, frozenset({"transport"}), where)
             return cls(name=name, transport=transport)
 
@@ -229,7 +230,7 @@ class _HostList:
 
 
 # Resolution-time defaults for interactive jobs whose user did not
-# override `interactive_active` / `interactive_delay`. 10 min of
+# override `interactive-active` / `interactive-delay`. 10 min of
 # continuous active input is conservative enough that a passing
 # wiggle of the mouse doesn't trigger the dialog; a 1h delay after
 # "Delay Job" gives breathing room before crony asks again.
@@ -308,14 +309,14 @@ class TomlJobGroup:
     / defaults cascade. To apply a notify channel to all members of
     a group, set it at the target level (typical case) or per-job.
 
-    Groups also don't carry `job_timeout_sec` -- timeouts are a
+    Groups also don't carry `job-timeout-sec` -- timeouts are a
     per-leaf-job concern. A group's effective deadline is
     auto-computed from its children (`resolved_group_timeout_sec`,
     1.05 * sum of children's effective timeouts) and is not a
     user-facing knob: it acts as defense-in-depth so each child
     can hit its own per-job timeout before the parent's
     cumulative deadline fires. A child that is itself uncapped
-    (`job_timeout_sec = 0`) makes the group uncapped too -- there is
+    (`job-timeout-sec = 0`) makes the group uncapped too -- there is
     no finite cumulative deadline that could bound it.
 
     `platforms` / `hosts` work the same way as on TomlJob: empty
@@ -685,7 +686,7 @@ class TomlBundleConfig:
         `resolved_job_timeout_sec`; sub-groups recurse into this same
         helper). Floor at 1 second. Returns 0 ("no cap") if any
         selected, non-interactive child is itself uncapped
-        (`job_timeout_sec = 0`, or a sub-group that resolved to 0) --
+        (`job-timeout-sec = 0`, or a sub-group that resolved to 0) --
         an uncapped child can't be bounded by a finite cumulative
         deadline, so the whole group goes uncapped. Used by:
         - `_run_group` to bound its cumulative dispatch loop.
@@ -699,7 +700,7 @@ class TomlBundleConfig:
         the parent won't trigger them here, so the budget shouldn't
         reserve their time either. Interactive children also
         contribute zero: the group fires them async (no wait), so
-        their `job_timeout_sec` doesn't bound any actual wait inside
+        their `job-timeout-sec` doesn't bound any actual wait inside
         `_run_group` and would just inflate the budget.
         """
         group = self.job_groups[group_name]
@@ -951,14 +952,14 @@ _KNOWN_TOPLEVEL: frozenset[str] = frozenset(
 
 _KNOWN_DEFAULTS: frozenset[str] = frozenset(
     {
-        "notify_channels",
-        "notify_attach_log",
-        "notify_attach_max_kb",
-        "job_timeout_sec",
-        "trigger_timeout_sec",
-        "log_keep_runs",
+        "notify-channels",
+        "notify-attach-log",
+        "notify-attach-max-kb",
+        "job-timeout-sec",
+        "trigger-timeout-sec",
+        "log-keep-runs",
         "priority",
-        "keep_awake",
+        "keep-awake",
         "env",
         "notify",
     }
@@ -971,21 +972,21 @@ _KNOWN_JOB: frozenset[str] = frozenset(
         "script",
         "args",
         "gate",
-        "gate_script",
-        "gate_args",
+        "gate-script",
+        "gate-args",
         "schedule",
         "interval",
         "priority",
-        "keep_awake",
+        "keep-awake",
         "platforms",
         "hosts",
-        "job_timeout_sec",
-        "notify_channels",
-        "success_exit_codes",
+        "job-timeout-sec",
+        "notify-channels",
+        "success-exit-codes",
         "env",
         "interactive",
-        "interactive_active",
-        "interactive_delay",
+        "interactive-active",
+        "interactive-delay",
     }
 )
 
@@ -1003,7 +1004,7 @@ _KNOWN_JOB_GROUP: frozenset[str] = frozenset(
 _KNOWN_TARGET: frozenset[str] = frozenset(
     {
         "jobs",
-        "notify_channels",
+        "notify-channels",
     }
 )
 
@@ -1022,22 +1023,22 @@ _KNOWN_TRANSPORT_EMAIL: frozenset[str] = frozenset(
     {
         "to",
         "from",
-        "smtp_host",
-        "smtp_port",
-        "smtp_user",
-        "smtp_starttls",
-        "smtp_pass_keychain_service",
-        "smtp_pass_keychain_account",
-        "smtp_pass_file",
+        "smtp-host",
+        "smtp-port",
+        "smtp-user",
+        "smtp-starttls",
+        "smtp-pass-keychain-service",
+        "smtp-pass-keychain-account",
+        "smtp-pass-file",
     }
 )
 
 _KNOWN_TRANSPORT_NTFY: frozenset[str] = frozenset(
     {
         "url",
-        "token_keychain_service",
-        "token_keychain_account",
-        "token_file",
+        "token-keychain-service",
+        "token-keychain-account",
+        "token-file",
     }
 )
 
@@ -1056,7 +1057,7 @@ VALID_NOTIFY_TRANSPORTS: frozenset[str] = frozenset(
 )
 
 # Zero-config built-in channels. These names may be listed in a
-# `notify_channels` with no `[defaults.notify.<name>]` block at all:
+# `notify-channels` with no `[defaults.notify.<name>]` block at all:
 # the transport carries no per-channel settings (no secrets, no
 # endpoint), so dispatch synthesizes a default channel def on the fly
 # (see `_builtin_notify_channel`). A built-in's channel name equals
@@ -1091,6 +1092,33 @@ def _reject_unknown_keys(
         )
 
 
+def _canonical_keys(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    """Return `raw` with this table's field keys canonicalized to their
+    dash spelling.
+
+    Dashes are the canonical form for every multi-word config key
+    (`keep-awake`, `job-timeout-sec`, ...); the underscore spelling is
+    accepted for back-compat and folded onto the dash form here, so the
+    rest of the parser reads one spelling. Setting the same field under
+    both spellings is rejected as ambiguous.
+
+    Only the table's own field keys are rewritten. Values are left
+    verbatim -- the keys inside `env`, `headers`, and the host / channel
+    sub-tables are user data (env var names, header names, host names),
+    not config field names, so they must not be touched.
+    """
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        canonical = key.replace("_", "-") if isinstance(key, str) else key
+        if canonical != key and canonical in raw:
+            raise crony.errors.ConfigError(
+                f"{where}: {canonical!r} is set under both its dash "
+                f"spelling and the legacy {key!r}; use one"
+            )
+        out[canonical] = value
+    return out
+
+
 def _typed_field(
     raw: dict[str, Any],
     key: str,
@@ -1103,7 +1131,7 @@ def _typed_field(
 
     `bool` and `int` are distinct here, even though `isinstance(True, int)`
     is True in Python -- we explicitly reject booleans for int-typed fields
-    so `job_timeout_sec = true` raises clearly rather than silently meaning 1.
+    so `job-timeout-sec = true` raises clearly rather than silently meaning 1.
     """
     if key not in raw:
         return default
@@ -1334,10 +1362,10 @@ def _parse_interactive_fields(
     raw_interactive = _typed_field(raw, "interactive", bool, where)
     interactive = bool(raw_interactive)
     active_sec = _parse_interactive_timespan(
-        raw, "interactive_active", where, interactive
+        raw, "interactive-active", where, interactive
     )
     delay_sec = _parse_interactive_timespan(
-        raw, "interactive_delay", where, interactive
+        raw, "interactive-delay", where, interactive
     )
     return interactive, active_sec, delay_sec
 
@@ -1345,7 +1373,7 @@ def _parse_interactive_fields(
 def _parse_interactive_timespan(
     raw: dict[str, Any], key: str, where: str, interactive: bool
 ) -> int | None:
-    """Parse one `interactive_active` / `interactive_delay` knob."""
+    """Parse one `interactive-active` / `interactive-delay` knob."""
     text = _typed_field(raw, key, str, where)
     if text is None:
         return None
@@ -1384,12 +1412,12 @@ def _parse_notify_email_settings(
 ) -> NotifyEmail:
     """Parse the email-transport keys from a channel block."""
     to = _typed_field(raw, "to", str, where)
-    smtp_host = _typed_field(raw, "smtp_host", str, where)
-    smtp_user = _typed_field(raw, "smtp_user", str, where)
-    smtp_port = _typed_field(raw, "smtp_port", int, where, default=587)
+    smtp_host = _typed_field(raw, "smtp-host", str, where)
+    smtp_user = _typed_field(raw, "smtp-user", str, where)
+    smtp_port = _typed_field(raw, "smtp-port", int, where, default=587)
     if to is None or smtp_host is None or smtp_user is None:
         raise crony.errors.ConfigError(
-            f"{where}: 'to', 'smtp_host', 'smtp_user' are required"
+            f"{where}: 'to', 'smtp-host', 'smtp-user' are required"
         )
     return NotifyEmail(
         to=to,
@@ -1398,15 +1426,15 @@ def _parse_notify_email_settings(
         smtp_port=smtp_port,
         smtp_user=smtp_user,
         smtp_starttls=_typed_field(
-            raw, "smtp_starttls", bool, where, default=True
+            raw, "smtp-starttls", bool, where, default=True
         ),
         smtp_pass_keychain_service=_typed_field(
-            raw, "smtp_pass_keychain_service", str, where
+            raw, "smtp-pass-keychain-service", str, where
         ),
         smtp_pass_keychain_account=_typed_field(
-            raw, "smtp_pass_keychain_account", str, where
+            raw, "smtp-pass-keychain-account", str, where
         ),
-        smtp_pass_file=_typed_field(raw, "smtp_pass_file", str, where),
+        smtp_pass_file=_typed_field(raw, "smtp-pass-file", str, where),
     )
 
 
@@ -1418,12 +1446,12 @@ def _parse_notify_ntfy_settings(raw: dict[str, Any], where: str) -> NotifyNtfy:
     return NotifyNtfy(
         url=url,
         token_keychain_service=_typed_field(
-            raw, "token_keychain_service", str, where
+            raw, "token-keychain-service", str, where
         ),
         token_keychain_account=_typed_field(
-            raw, "token_keychain_account", str, where
+            raw, "token-keychain-account", str, where
         ),
-        token_file=_typed_field(raw, "token_file", str, where),
+        token_file=_typed_field(raw, "token-file", str, where),
     )
 
 
@@ -1442,7 +1470,7 @@ def _positive_int(
 def _nonneg_int(raw: dict[str, Any], key: str, where: str, default: int) -> int:
     """Read a non-negative int defaulting to `default`. Reject negative.
 
-    0 is accepted: `job_timeout_sec` uses it as the "no wallclock cap"
+    0 is accepted: `job-timeout-sec` uses it as the "no wallclock cap"
     sentinel, so the only invalid value is a negative one.
     """
     val: int = _typed_field(raw, key, int, where, default=default)
@@ -1456,7 +1484,7 @@ def _nonneg_int(raw: dict[str, Any], key: str, where: str, default: int) -> int:
 def _parse_notify_channels(
     raw: dict[str, Any], where: str, *, required: bool
 ) -> list[str] | None:
-    """Parse a `notify_channels` list (structural validation only).
+    """Parse a `notify-channels` list (structural validation only).
 
     `required=True` (Defaults) returns [] when the key is absent.
     `required=False` (TomlJob/Target) returns None when absent so the
@@ -1465,19 +1493,19 @@ def _parse_notify_channels(
     to a defined channel is checked later in `_validate_config`,
     once the bundle's channel definitions are known.
     """
-    if "notify_channels" not in raw:
+    if "notify-channels" not in raw:
         return [] if required else None
-    val = raw["notify_channels"]
+    val = raw["notify-channels"]
     if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
         raise crony.errors.ConfigError(
-            f"{where}: 'notify_channels' must be a list of strings"
+            f"{where}: 'notify-channels' must be a list of strings"
         )
     seen: set[str] = set()
     out: list[str] = []
     for ch in val:
         if ch in seen:
             raise crony.errors.ConfigError(
-                f"{where}: notify_channels entry {ch!r} listed twice"
+                f"{where}: notify-channels entry {ch!r} listed twice"
             )
         seen.add(ch)
         out.append(ch)
@@ -1488,14 +1516,15 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     """Parse [defaults].
 
     `is_default` flags the default bundle (config.toml). A non-default
-    bundle that omits `notify_channels` entirely inherits the default
+    bundle that omits `notify-channels` entirely inherits the default
     bundle's notify config (the [NOTIFY_INHERIT_TOKEN] sentinel);
-    explicit `notify_channels = []` opts back out to silence.
+    explicit `notify-channels = []` opts back out to silence.
     """
     where = "[defaults]"
+    raw = _canonical_keys(raw, where)
     _reject_unknown_keys(raw, _KNOWN_DEFAULTS, where)
     channels = _parse_notify_channels(raw, where, required=True)
-    if "notify_channels" not in raw and not is_default:
+    if "notify-channels" not in raw and not is_default:
         channels = [NOTIFY_INHERIT_TOKEN]
     notify_channel_defs: dict[str, NotifyChannel] = {}
     nested = raw.get("notify", {})
@@ -1515,41 +1544,41 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
-            raw, "notify_attach_log", bool, where, default=True
+            raw, "notify-attach-log", bool, where, default=True
         ),
         notify_attach_max_kb=_positive_int(
-            raw, "notify_attach_max_kb", where, default=256
+            raw, "notify-attach-max-kb", where, default=256
         ),
         job_timeout_sec=_nonneg_int(
-            raw, "job_timeout_sec", where, default=1800
+            raw, "job-timeout-sec", where, default=1800
         ),
         trigger_timeout_sec=_positive_int(
-            raw, "trigger_timeout_sec", where, default=15
+            raw, "trigger-timeout-sec", where, default=15
         ),
-        log_keep_runs=_positive_int(raw, "log_keep_runs", where, default=30),
+        log_keep_runs=_positive_int(raw, "log-keep-runs", where, default=30),
         priority=_parse_priority_field(raw, where),
-        keep_awake=_typed_field(raw, "keep_awake", bool, where, default=False),
+        keep_awake=_typed_field(raw, "keep-awake", bool, where, default=False),
         env=_string_dict(raw, "env", where),
         notify_channel_defs=notify_channel_defs,
     )
 
 
 def _parse_success_exit_codes(raw: dict[str, Any], where: str) -> list[int]:
-    """Parse a job's `success_exit_codes` list (absent -> [])."""
-    if "success_exit_codes" not in raw:
+    """Parse a job's `success-exit-codes` list (absent -> [])."""
+    if "success-exit-codes" not in raw:
         return []
-    val = raw["success_exit_codes"]
+    val = raw["success-exit-codes"]
     # bool is a subclass of int; reject it so `[true]` isn't read as [1].
     if not isinstance(val, list) or not all(
         isinstance(x, int) and not isinstance(x, bool) for x in val
     ):
         raise crony.errors.ConfigError(
-            f"{where}: 'success_exit_codes' must be a list of integers"
+            f"{where}: 'success-exit-codes' must be a list of integers"
         )
     for code in val:
         if not 0 <= code <= 255:
             raise crony.errors.ConfigError(
-                f"{where}: success_exit_codes entry {code} is out of the "
+                f"{where}: success-exit-codes entry {code} is out of the "
                 f"valid 0-255 exit-code range"
             )
     return val
@@ -1566,6 +1595,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     """Parse [job.<name>]."""
     _validate_name(name, f"[job.{name}]")
     where = f"[job.{name}]"
+    raw = _canonical_keys(raw, where)
     _reject_unknown_keys(raw, _KNOWN_JOB, where)
     job_uuid = _parse_uuid_field(raw, where)
     if job_uuid is None:
@@ -1585,29 +1615,29 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
             f"{where}: 'args' is only valid with 'script', not 'command'"
         )
     gate = _typed_field(raw, "gate", str, where)
-    gate_script = _typed_field(raw, "gate_script", str, where)
+    gate_script = _typed_field(raw, "gate-script", str, where)
     if gate is not None and gate_script is not None:
         raise crony.errors.ConfigError(
-            f"{where}: 'gate' and 'gate_script' are mutually exclusive"
+            f"{where}: 'gate' and 'gate-script' are mutually exclusive"
         )
-    gate_args = _string_list(raw, "gate_args", where)
+    gate_args = _string_list(raw, "gate-args", where)
     if gate_args and gate_script is None:
         raise crony.errors.ConfigError(
-            f"{where}: 'gate_args' is only valid with 'gate_script'"
+            f"{where}: 'gate-args' is only valid with 'gate-script'"
         )
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     timing = _parse_timing(schedule_str, interval_str, where)
     priority = _parse_priority_field(raw, where)
-    keep_awake = _typed_field(raw, "keep_awake", bool, where, default=None)
+    keep_awake = _typed_field(raw, "keep-awake", bool, where, default=None)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
     success_exit_codes = _parse_success_exit_codes(raw, where)
-    job_timeout_sec = _typed_field(raw, "job_timeout_sec", int, where)
+    job_timeout_sec = _typed_field(raw, "job-timeout-sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec < 0:
         raise crony.errors.ConfigError(
-            f"{where}: 'job_timeout_sec' must be >= 0, got {job_timeout_sec}"
+            f"{where}: 'job-timeout-sec' must be >= 0, got {job_timeout_sec}"
         )
     interactive, interactive_active_sec, interactive_delay_sec = (
         _parse_interactive_fields(raw, where)
@@ -1655,6 +1685,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     """
     _validate_name(name, f"[job-group.{name}]")
     where = f"[job-group.{name}]"
+    raw = _canonical_keys(raw, where)
     _reject_unknown_keys(raw, _KNOWN_JOB_GROUP, where)
     group_uuid = _parse_uuid_field(raw, where)
     if group_uuid is None:
@@ -1689,6 +1720,7 @@ def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
     )
     if kind == "host":
         _validate_name(name, where)
+    raw = _canonical_keys(raw, where)
     _reject_unknown_keys(raw, _KNOWN_TARGET, where)
     jobs = _string_list(raw, "jobs", where)
     channels = _parse_notify_channels(raw, where, required=False)
@@ -1748,7 +1780,7 @@ def _validate_notify_channels(
     *,
     is_default: bool,
 ) -> str | None:
-    """Validate one `notify_channels` list. Returns an error message
+    """Validate one `notify-channels` list. Returns an error message
     (for raise / demote at the call site) or None when valid.
 
     The inherit sentinel `NOTIFY_INHERIT_TOKEN` pulls in the default
@@ -1769,7 +1801,7 @@ def _validate_notify_channels(
             continue
         if ch not in defined_channels and ch not in BUILTIN_NOTIFY_CHANNELS:
             return (
-                f"{label}: notify_channels entry {ch!r} is not "
+                f"{label}: notify-channels entry {ch!r} is not "
                 f"defined; expected one of "
                 f"{sorted(defined_channels | BUILTIN_NOTIFY_CHANNELS)}"
             )

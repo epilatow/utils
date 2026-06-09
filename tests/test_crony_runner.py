@@ -1524,7 +1524,7 @@ class TestKeepAwake:
         _assert_errored_job(
             {"job": {"a": _job(keep_awake="yes")}},
             "a",
-            "keep_awake' must be bool",
+            "keep-awake' must be bool",
         )
 
     def test_snapshot_carries_keep_awake(self) -> None:

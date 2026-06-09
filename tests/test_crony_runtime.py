@@ -374,7 +374,7 @@ class TestPerEntityConfigErrors:
         assert "ok" in cfg.jobs
         assert "bad" not in cfg.jobs
         assert "bad" in cfg.errored_jobs
-        assert "notify_channels" in cfg.errored_jobs["bad"]
+        assert "notify-channels" in cfg.errored_jobs["bad"]
 
     def test_load_one_bundle_logs_per_entity_errors(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any

@@ -335,7 +335,7 @@ class TestParseJob:
         _assert_errored_job(
             self._cfg(_job(gate="x", gate_args=["a"])),
             "j",
-            "only valid with 'gate_script'",
+            "only valid with 'gate-script'",
         )
 
     def test_schedule_xor_interval(self) -> None:
@@ -381,7 +381,7 @@ class TestParseJob:
         _assert_errored_job(
             self._cfg(_job(notify_channels=["carrier-pigeon"])),
             "j",
-            "notify_channels",
+            "notify-channels",
         )
 
     def test_negative_timeout(self) -> None:
@@ -2244,6 +2244,67 @@ class TestBundleNamespacing:
         full_names = bundles.all_full_names()
         assert "default.daily-update" in full_names
         assert "borgadm.daily-update" in full_names
+
+
+class TestDashKeys:
+    """Config keys are canonically dash-spelled. The underscore
+    spelling is accepted for back-compat and folds onto the dash form,
+    so both parse identically; setting a field under both spellings is
+    rejected. Only field-name keys are folded -- the keys inside `env`,
+    `headers`, and host / channel sub-tables are user data and keep
+    their literal spelling.
+    """
+
+    def test_dash_and_underscore_parse_identically(self) -> None:
+        defaults = {
+            "job_timeout_sec": 3600,
+            "keep_awake": True,
+            "notify_attach_log": False,
+        }
+        job = {
+            "command": "true",
+            "schedule": "daily",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "keep_awake": False,
+            "success_exit_codes": [3],
+            "gate_script": "/bin/true",
+        }
+        under = _parse({"defaults": dict(defaults), "job": {"j": dict(job)}})
+
+        def _dash(d: dict[str, Any]) -> dict[str, Any]:
+            return {k.replace("_", "-"): v for k, v in d.items()}
+
+        dash = _parse({"defaults": _dash(defaults), "job": {"j": _dash(job)}})
+        assert dash.defaults == under.defaults
+        assert dash.jobs == under.jobs
+
+    def test_dash_in_notify_channel_block(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {
+                    "notify-channels": ["email"],
+                    "notify": {
+                        "email": {
+                            "to": "you@example.com",
+                            "smtp-host": "smtp.example.com",
+                            "smtp-user": "you",
+                        }
+                    },
+                }
+            }
+        )
+        ch = cfg.defaults.notify_channel_defs["email"]
+        assert ch.email is not None
+        assert ch.email.smtp_host == "smtp.example.com"
+
+    def test_both_spellings_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="use one"):
+            _parse({"defaults": {"keep-awake": True, "keep_awake": False}})
+
+    def test_env_var_names_not_folded(self) -> None:
+        # Underscores in env var NAMES are user data, never rewritten.
+        cfg = _parse({"job": {"j": _job(env={"MY_VAR": "x", "A_B_C": "y"})}})
+        assert cfg.jobs["j"].env == {"MY_VAR": "x", "A_B_C": "y"}
 
 
 if __name__ == "__main__":
