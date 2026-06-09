@@ -316,10 +316,10 @@ def load_config() -> crony.model.Config:
     # last-scanned ref, hiding the residue.
     shadowed: set[crony.unit.EntityRef] = set()
     name_to_refs: dict[str, list[crony.unit.EntityRef]] = {}
-    for ref in current.refs():
-        snap = current.jobs.get(ref) or current.groups.get(ref)
-        assert snap is not None  # ref came from current.refs()
-        name_to_refs.setdefault(str(snap.entity_name), []).append(ref)
+    for node in current.nodes():
+        name_to_refs.setdefault(str(node.entity_name), []).append(
+            node.entity_ref
+        )
     pending_refs = pending.refs()
     for name, refs in name_to_refs.items():
         if len(refs) < 2:

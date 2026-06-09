@@ -39,6 +39,8 @@ from crony.errors import (  # noqa: E402
 from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
     Graph,
+    Job,
+    JobGroup,
     JobOrphan,
     _JobCommon,
     _resolve_snapshot_for,
@@ -341,6 +343,23 @@ class TestJobFromRefAndFullName:
         # A ref the graph doesn't carry resolves to None.
         missing = EntityRef(snap.bundle, "11111111-2222-3333-4444-555555555555")
         assert graph.job_from_ref(missing) is None
+
+    def test_nodes_returns_jobs_then_groups(self) -> None:
+        raw = {
+            "job": {"a": _job()},
+            "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+        }
+        cfg = _parse(raw)
+        job = _resolve_snapshot_for(cfg, "a")
+        group = _resolve_snapshot_for(cfg, "g")
+        assert isinstance(job, Job)
+        assert isinstance(group, JobGroup)
+        graph = Graph()
+        graph.jobs[job.entity_ref] = job
+        graph.groups[group.entity_ref] = group
+        # The node-level analogue of refs(): jobs first, then groups.
+        assert graph.nodes() == [job, group]
+        assert Graph().nodes() == []
 
     def test_full_name_uniform_across_node_and_orphan(self) -> None:
         snap = self._snap()

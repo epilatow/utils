@@ -847,8 +847,7 @@ def _reclaim(
     on_disk: list[
         crony.model.Job | crony.model.JobGroup | crony.model.JobOrphan
     ] = [
-        *config.current.jobs.values(),
-        *config.current.groups.values(),
+        *config.current.nodes(),
         *config.orphans.values(),
     ]
     targets = sorted(

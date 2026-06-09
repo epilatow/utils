@@ -641,6 +641,12 @@ class Graph:
     def refs(self) -> set[crony.unit.EntityRef]:
         return set(self.jobs) | set(self.groups)
 
+    def nodes(self) -> list[Job | JobGroup]:
+        """Every job and group node this graph holds (jobs first, then
+        groups). The node-level analogue of `refs()`, for callers that
+        want the entities themselves rather than their identities."""
+        return [*self.jobs.values(), *self.groups.values()]
+
     def kind_of(self, ref: crony.unit.EntityRef) -> str | None:
         if ref in self.jobs:
             return "job"
