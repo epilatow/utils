@@ -2876,7 +2876,9 @@ def _validate_file(path: Path) -> None:
     bundle's channels live in the default bundle, which a single file
     can't see. Lets a tool (or user) pre-flight a generated bundle
     before installing it. Raises ConfigError (exit CONFIG) on any
-    error; prints `ok` and returns when clean.
+    error; prints `ok` and returns when clean. A clean file that still
+    uses the legacy underscore key spelling additionally prints one
+    deprecation warning and exits WARNING.
     """
     if not path.exists():
         raise crony.errors.ConfigError(f"config not found: {path}")
@@ -2902,6 +2904,22 @@ def _validate_file(path: Path) -> None:
             f"{'entry' if errored == 1 else 'entries'}"
         )
     print(f"ok: {path} validates as bundle {name!r}")
+    if cfg.legacy_underscore_keys:
+        print("warnings:")
+        print(f"  - {path}: {_legacy_keys_warning(cfg.legacy_underscore_keys)}")
+        # WARNING is not raisable as a CronyError; SystemExit forwards
+        # the code through cli() unchanged.
+        raise SystemExit(int(crony.errors.ExitCode.WARNING))
+
+
+def _legacy_keys_warning(keys: list[str]) -> str:
+    """One-line deprecation notice for a config file still using
+    underscore-spelled keys. Dashes are the canonical spelling; the
+    underscore form still parses but is being phased out."""
+    return (
+        f"legacy underscore-spelled config key(s) {', '.join(keys)}; dashes "
+        f"are the canonical spelling (e.g. 'keep-awake') -- update to silence"
+    )
 
 
 def do_validate(bundle: str | None, file: str | None) -> None:
@@ -2910,7 +2928,10 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     TomlConfig.load_all already enforces per-bundle structural rules
     and isolates failed bundles. This subcommand surfaces linger /
     per-bundle warnings as informational output and exits WARNING
-    (1) when any are present, CONFIG (3) when no bundles load.
+    (1) when any are present, CONFIG (3) when no bundles load. A bundle
+    still using the legacy underscore key spelling draws one
+    deprecation warning naming its underscore keys (the dash spelling is
+    canonical).
     `validate` looks only at the parsed config -- it never inspects
     crony's applied / on-disk state. (Use `crony status` or
     `crony destroy --orphans` to find and clean installed remnants
@@ -2961,6 +2982,11 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             warnings.append(f"{b.source}: {msg}")
         for w in _validate_bundle_warnings(b):
             warnings.append(f"{b.source}: {w}")
+        if config.legacy_underscore_keys:
+            warnings.append(
+                f"{b.source}: "
+                f"{_legacy_keys_warning(config.legacy_underscore_keys)}"
+            )
 
     print(f"bundles loaded: {len(target_bundles)}")
     for b in target_bundles:

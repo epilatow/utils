@@ -4181,8 +4181,8 @@ class TestValidate:
 
     def test_file_mode_valid(self, tmp_path: Path, capsys: Any) -> None:
         # Mirrors a borgadm-style drop-in: a non-default bundle whose
-        # check job omits notify_channels (implicit inherit) and whose
-        # noisy job silences itself, plus priority/keep_awake. The
+        # check job omits notify-channels (implicit inherit) and whose
+        # noisy job silences itself, plus priority/keep-awake. The
         # bundle name comes from the filename stem.
         p = tmp_path / "borgadm.toml"
         p.write_text(
@@ -4191,14 +4191,14 @@ class TestValidate:
             'command = "wrapper create"\n'
             'interval = "1h"\n'
             'priority = "high"\n'
-            "keep_awake = true\n"
-            "notify_channels = []\n"
+            "keep-awake = true\n"
+            "notify-channels = []\n"
             "[job.check-age]\n"
             'uuid = "22222222-2222-5222-8222-222222222222"\n'
             'command = "borgadm check age"\n'
             'interval = "1d"\n'
             'priority = "high"\n'
-            "keep_awake = true\n"
+            "keep-awake = true\n"
             "[target.darwin]\n"
             'jobs = ["create", "check-age"]\n',
             encoding="utf-8",
@@ -4207,6 +4207,32 @@ class TestValidate:
         out = capsys.readouterr().out
         assert "ok" in out
         assert "bundle 'borgadm'" in out
+
+    def test_file_mode_warns_on_legacy_underscore_keys(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        # A file still using the legacy underscore spelling validates
+        # (the key still parses) but draws a single deprecation warning
+        # and exits WARNING.
+        p = tmp_path / "borgadm.toml"
+        p.write_text(
+            "[job.create]\n"
+            'uuid = "11111111-1111-5111-8111-111111111111"\n'
+            'command = "wrapper create"\n'
+            'interval = "1h"\n'
+            "keep_awake = true\n"
+            "[target.darwin]\n"
+            'jobs = ["create"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=str(p))
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "ok" in out
+        # One warning line naming the legacy key.
+        assert out.count("legacy underscore-spelled") == 1
+        assert "keep_awake" in out
 
     def test_file_mode_rejects_invalid_entry(self, tmp_path: Path) -> None:
         p = tmp_path / "borgadm.toml"

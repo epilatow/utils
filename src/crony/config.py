@@ -12,6 +12,7 @@ maps rather than aborting the whole bundle.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 import uuid
@@ -356,6 +357,85 @@ class Target:
     notify_channels: list[str] | None = None
 
 
+def _parse_bundle_sections(
+    config: TomlBundleConfig,
+    raw: dict[str, Any],
+    *,
+    is_default: bool,
+) -> None:
+    """Parse the [defaults] / [job.*] / [job-group.*] / [target.*]
+    sections of a bundle into `config`.
+
+    Per-entity ConfigErrors are caught into the matching `errored_*`
+    map so one bad entry doesn't abort the bundle; a structural failure
+    (a section that isn't a table) raises.
+    """
+    if "defaults" in raw:
+        if not isinstance(raw["defaults"], dict):
+            raise crony.errors.ConfigError("[defaults] must be a table")
+        config.defaults = _parse_defaults(
+            raw["defaults"], is_default=is_default
+        )
+    elif not is_default:
+        # No [defaults] block at all still inherits the default
+        # bundle's notify config for a non-default bundle.
+        config.defaults = Defaults(notify_channels=[NOTIFY_INHERIT_TOKEN])
+
+    job_section = raw.get("job", {})
+    if not isinstance(job_section, dict):
+        raise crony.errors.ConfigError("[job] must be a table")
+    for name, body in job_section.items():
+        # Per-entity ConfigError tolerance: a parse failure on one job
+        # records its error and continues so sibling jobs still parse.
+        # Catching ConfigError (not Exception) keeps genuine bugs
+        # surfacing as tracebacks.
+        try:
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError(f"[job.{name}] must be a table")
+            config.jobs[name] = _parse_job(name, body)
+        except crony.errors.ConfigError as exc:
+            config.errored_jobs[name] = str(exc)
+
+    group_section = raw.get("job-group", {})
+    if not isinstance(group_section, dict):
+        raise crony.errors.ConfigError("[job-group] must be a table")
+    for name, body in group_section.items():
+        try:
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError(
+                    f"[job-group.{name}] must be a table"
+                )
+            config.job_groups[name] = _parse_job_group(name, body)
+        except crony.errors.ConfigError as exc:
+            config.errored_job_groups[name] = str(exc)
+
+    target_section = raw.get("target", {})
+    if not isinstance(target_section, dict):
+        raise crony.errors.ConfigError("[target] must be a table")
+    for name, body in target_section.items():
+        if name == "host":
+            # [target.host.<host>] entries
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError("[target.host] must be a table")
+            for hostname, hostbody in body.items():
+                if not isinstance(hostbody, dict):
+                    raise crony.errors.ConfigError(
+                        f"[target.host.{hostname}] must be a table"
+                    )
+                config.host_targets[hostname] = _parse_target(
+                    hostname, "host", hostbody
+                )
+        else:
+            # [target.<platform>] entry
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError(
+                    f"[target.{name}] must be a table"
+                )
+            config.platform_targets[name] = _parse_target(
+                name, "platform", body
+            )
+
+
 @dataclass
 class TomlBundleConfig:
     """Top-level parsed config (one bundle's content).
@@ -393,6 +473,10 @@ class TomlBundleConfig:
     host_targets: dict[str, Target] = field(default_factory=dict)
     errored_platform_targets: dict[str, str] = field(default_factory=dict)
     errored_host_targets: dict[str, str] = field(default_factory=dict)
+    # Legacy underscore-spelled field keys this bundle still uses (the
+    # dash spelling is canonical). Populated by `from_raw`; surfaced as a
+    # single deprecation warning per file by `crony config validate`.
+    legacy_underscore_keys: list[str] = field(default_factory=list)
 
     @classmethod
     def from_raw(
@@ -414,77 +498,17 @@ class TomlBundleConfig:
         is_default = bundle_name == DEFAULT_BUNDLE_NAME
 
         config = cls()
-
-        if "defaults" in raw:
-            if not isinstance(raw["defaults"], dict):
-                raise crony.errors.ConfigError("[defaults] must be a table")
-            config.defaults = _parse_defaults(
-                raw["defaults"], is_default=is_default
-            )
-        elif not is_default:
-            # No [defaults] block at all still inherits the default
-            # bundle's notify config for a non-default bundle.
-            config.defaults = Defaults(notify_channels=[NOTIFY_INHERIT_TOKEN])
-
-        job_section = raw.get("job", {})
-        if not isinstance(job_section, dict):
-            raise crony.errors.ConfigError("[job] must be a table")
-        for name, body in job_section.items():
-            # Per-entity ConfigError tolerance: a parse failure on
-            # one job records its error and continues so sibling jobs
-            # still parse. Catching ConfigError (not Exception) keeps
-            # genuine bugs surfacing as tracebacks.
-            try:
-                if not isinstance(body, dict):
-                    raise crony.errors.ConfigError(
-                        f"[job.{name}] must be a table"
-                    )
-                config.jobs[name] = _parse_job(name, body)
-            except crony.errors.ConfigError as exc:
-                config.errored_jobs[name] = str(exc)
-
-        group_section = raw.get("job-group", {})
-        if not isinstance(group_section, dict):
-            raise crony.errors.ConfigError("[job-group] must be a table")
-        for name, body in group_section.items():
-            try:
-                if not isinstance(body, dict):
-                    raise crony.errors.ConfigError(
-                        f"[job-group.{name}] must be a table"
-                    )
-                config.job_groups[name] = _parse_job_group(name, body)
-            except crony.errors.ConfigError as exc:
-                config.errored_job_groups[name] = str(exc)
-
-        target_section = raw.get("target", {})
-        if not isinstance(target_section, dict):
-            raise crony.errors.ConfigError("[target] must be a table")
-        for name, body in target_section.items():
-            if name == "host":
-                # [target.host.<host>] entries
-                if not isinstance(body, dict):
-                    raise crony.errors.ConfigError(
-                        "[target.host] must be a table"
-                    )
-                for hostname, hostbody in body.items():
-                    if not isinstance(hostbody, dict):
-                        raise crony.errors.ConfigError(
-                            f"[target.host.{hostname}] must be a table"
-                        )
-                    config.host_targets[hostname] = _parse_target(
-                        hostname, "host", hostbody
-                    )
-            else:
-                # [target.<platform>] entry
-                if not isinstance(body, dict):
-                    raise crony.errors.ConfigError(
-                        f"[target.{name}] must be a table"
-                    )
-                config.platform_targets[name] = _parse_target(
-                    name, "platform", body
-                )
-
-        _validate_config(config, is_default=is_default)
+        # Record legacy underscore-spelled keys folded anywhere in this
+        # bundle (including nested channel / transport tables) so
+        # validate can warn. Scoped to this call; reset on every exit.
+        seen_legacy: set[str] = set()
+        token = _legacy_keys_seen.set(seen_legacy)
+        try:
+            _parse_bundle_sections(config, raw, is_default=is_default)
+            _validate_config(config, is_default=is_default)
+        finally:
+            _legacy_keys_seen.reset(token)
+        config.legacy_underscore_keys = sorted(seen_legacy)
         return config
 
     @classmethod
@@ -1092,6 +1116,16 @@ def _reject_unknown_keys(
         )
 
 
+# Collects the legacy underscore-spelled field keys folded while parsing
+# one bundle, so `from_raw` can attach them to the config for
+# `crony config validate` to warn about. Set to a fresh set for the
+# duration of a `from_raw` call; None outside one, when folding records
+# nothing.
+_legacy_keys_seen: contextvars.ContextVar[set[str] | None] = (
+    contextvars.ContextVar("crony_legacy_keys", default=None)
+)
+
+
 def _canonical_keys(raw: dict[str, Any], where: str) -> dict[str, Any]:
     """Return `raw` with this table's field keys canonicalized to their
     dash spelling.
@@ -1100,7 +1134,8 @@ def _canonical_keys(raw: dict[str, Any], where: str) -> dict[str, Any]:
     (`keep-awake`, `job-timeout-sec`, ...); the underscore spelling is
     accepted for back-compat and folded onto the dash form here, so the
     rest of the parser reads one spelling. Setting the same field under
-    both spellings is rejected as ambiguous.
+    both spellings is rejected as ambiguous. A folded legacy key is
+    recorded for the deprecation warning `crony config validate` emits.
 
     Only the table's own field keys are rewritten. Values are left
     verbatim -- the keys inside `env`, `headers`, and the host / channel
@@ -1110,11 +1145,15 @@ def _canonical_keys(raw: dict[str, Any], where: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in raw.items():
         canonical = key.replace("_", "-") if isinstance(key, str) else key
-        if canonical != key and canonical in raw:
-            raise crony.errors.ConfigError(
-                f"{where}: {canonical!r} is set under both its dash "
-                f"spelling and the legacy {key!r}; use one"
-            )
+        if canonical != key:
+            if canonical in raw:
+                raise crony.errors.ConfigError(
+                    f"{where}: {canonical!r} is set under both its dash "
+                    f"spelling and the legacy {key!r}; use one"
+                )
+            seen = _legacy_keys_seen.get()
+            if seen is not None:
+                seen.add(key)
         out[canonical] = value
     return out
 

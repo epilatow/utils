@@ -2306,6 +2306,41 @@ class TestDashKeys:
         cfg = _parse({"job": {"j": _job(env={"MY_VAR": "x", "A_B_C": "y"})}})
         assert cfg.jobs["j"].env == {"MY_VAR": "x", "A_B_C": "y"}
 
+    def test_legacy_keys_recorded_for_validate_warning(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {
+                    "keep_awake": True,
+                    "notify_channels": ["email"],
+                    "notify": {
+                        "email": {
+                            "to": "you@example.com",
+                            "smtp_host": "smtp.example.com",
+                            "smtp_user": "you",
+                        }
+                    },
+                },
+                "job": {"j": _job(job_timeout_sec=10)},
+            }
+        )
+        # A nested channel/transport key (smtp-host) is recorded too,
+        # proving the scan reaches every table, not just the top level.
+        assert set(cfg.legacy_underscore_keys) >= {
+            "keep_awake",
+            "notify_channels",
+            "smtp_host",
+            "job_timeout_sec",
+        }
+
+    def test_no_legacy_keys_for_dash_config(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"keep-awake": True},
+                "job": {"j": _job(**{"job-timeout-sec": 10})},
+            }
+        )
+        assert cfg.legacy_underscore_keys == []
+
 
 if __name__ == "__main__":
     from conftest import run_tests
