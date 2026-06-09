@@ -89,6 +89,14 @@ class _JobCommon:
         """The human `<bundle>.<short>` name."""
         return crony.unit.EntityName(self.bundle, self.name)
 
+    @property
+    def full_name(self) -> str:
+        """The `<bundle>.<short>` name as a plain string. Always set
+        for a config-built node; the parallel `JobOrphan.full_name` is
+        `str | None` (a too-corrupt remnant may carry no name), so the
+        two read uniformly across a `Job | JobGroup | JobOrphan`."""
+        return str(self.entity_name)
+
     @classmethod
     def state_dir_from_ref(cls, ref: crony.unit.EntityRef) -> Path:
         """The uuid-keyed state dir for a bare ref:
@@ -647,6 +655,16 @@ class Graph:
             return "group"
         return None
 
+    def job_from_ref(self, ref: crony.unit.EntityRef) -> Job | JobGroup | None:
+        """The job / group `ref` names in THIS graph, or None when
+        this graph doesn't carry it. A single-source lookup: it never
+        consults the other graph or the orphan map. Callers that want a
+        cross-source order compose it explicitly so the preference
+        shows at the call site -- e.g.
+        `config.current.job_from_ref(r) or config.orphans.get(r)` for
+        "current then orphans, never pending"."""
+        return self.jobs.get(ref) or self.groups.get(ref)
+
     @classmethod
     def build_pending(
         cls,
@@ -740,6 +758,14 @@ class JobOrphan:
     @property
     def state_dir(self) -> Path:
         return _JobCommon.state_dir_from_ref(self.entity_ref)
+
+    @property
+    def full_name(self) -> str | None:
+        """The recovered `<bundle>.<short>` name, or None when the
+        remnant is too corrupt to carry one. The `str | None` (vs the
+        node's always-set `str`) is the only shape difference when a
+        `Job | JobGroup | JobOrphan` is read uniformly."""
+        return self.name
 
     @property
     def symlink_state_dir(self) -> Path | None:
@@ -875,25 +901,6 @@ class Config:
         orphan = self.orphans.get(ref)
         if orphan is not None:
             return orphan.name
-        return None
-
-    def alias_dir_for(self, ref: crony.unit.EntityRef) -> Path | None:
-        """The short-name alias dir for `ref`'s entity, recovered from
-        whichever side carries it (current / pending node, or an
-        on-disk orphan), or None when no name is known. The alias path
-        lives on the entity, so destroy reclaims it without re-deriving
-        it from a name string."""
-        node = (
-            self.current.jobs.get(ref)
-            or self.current.groups.get(ref)
-            or self.pending.jobs.get(ref)
-            or self.pending.groups.get(ref)
-        )
-        if node is not None:
-            return node.symlink_state_dir
-        orphan = self.orphans.get(ref)
-        if orphan is not None:
-            return orphan.symlink_state_dir
         return None
 
     def resolve_runnable(self, full_name: str) -> crony.unit.EntityRef | None:

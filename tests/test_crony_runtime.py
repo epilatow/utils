@@ -938,6 +938,54 @@ class TestConfigBroken:
         assert config.config_state(ref) == "broken"
 
 
+class TestConfigSnapshotlessDir:
+    """A uuid dir with no snapshot.json at all is modeled as a
+    nameless, non-broken `JobOrphan` -- leftover junk a sweep or a
+    ref-form destroy reclaims, unless its uuid is a live config entry
+    (then it is that entry's wiped state, surfaced as `stale`).
+    """
+
+    def _plant(self, h: Any, ghost: str) -> Path:
+        sd: Path = h.state / DEFAULT_BUNDLE_NAME / ghost
+        sd.mkdir(parents=True)
+        (sd / "run.log").write_text("stale\n", encoding="utf-8")
+        return sd
+
+    def test_unmodeled_dir_is_nameless_non_broken_orphan(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        ghost = "deadbeef-0000-0000-0000-deadbeef0000"
+        self._plant(h, ghost)
+        config = crony_runtime.load_config()
+        ref = EntityRef(DEFAULT_BUNDLE_NAME, ghost)
+        assert ref in config.orphans
+        orphan = config.orphans[ref]
+        assert orphan.name is None
+        assert not orphan.is_broken
+        assert config.config_state(ref) == "orphan"
+        assert ref not in config.current.jobs
+        assert ref not in config.current.groups
+
+    def test_dir_for_live_config_uuid_is_suppressed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The wiped state dir of an applied entry that is still in
+        # config keeps that entry's uuid; it must not surface as an
+        # `orphan` (the lingering unit already reads as `stale`).
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        (h.state_dir("j", cfg=cfg) / "snapshot.json").unlink()
+        config = crony_runtime.load_config()
+        ref = EntityRef(DEFAULT_BUNDLE_NAME, cfg.jobs["j"].uuid)
+        assert ref not in config.orphans
+
+
 class TestResolveMethods:
     """The three named resolvers encode the operation's intent at
     the call site: `resolve_runnable` for the current-only snapshot

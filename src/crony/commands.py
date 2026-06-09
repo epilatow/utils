@@ -923,30 +923,38 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         # keyed unit safe -- the residue of a live entry is
         # apply_one's job, not the orphan sweep's, so the sweep
         # never unlinks a unit a selected entry is still firing.
-        on_disk = config.current.refs() | set(config.orphans)
         live = config.pending.refs()
-        orphan_refs = sorted(
+        on_disk: list[
+            crony.model.Job | crony.model.JobGroup | crony.model.JobOrphan
+        ] = [
+            *config.current.jobs.values(),
+            *config.current.groups.values(),
+            *config.orphans.values(),
+        ]
+        orphans_to_remove = sorted(
             (
-                r
-                for r in on_disk - live
-                if (bundle is None or r.bundle == bundle)
-                and config.name_for(r) not in selected
+                e
+                for e in on_disk
+                if e.entity_ref not in live
+                and (bundle is None or e.bundle == bundle)
+                and e.full_name not in selected
             ),
-            key=lambda r: (r.bundle, r.uuid),
+            key=lambda e: (e.bundle, e.uuid),
         )
-        for ref in orphan_refs:
-            name = config.name_for(ref)
-            sd = crony.model.Job.state_dir_from_ref(ref)
-            label = name if name is not None else str(ref)
+        for e in orphans_to_remove:
+            sd = e.state_dir
+            label = (
+                e.full_name if e.full_name is not None else str(e.entity_ref)
+            )
             if sd.is_dir() and crony.runtime.run_in_progress(sd):
                 logger.warning(
                     "%s: orphan left in place (run in progress)", label
                 )
                 continue
             crony.runtime.destroy_one(
-                name,
+                e.full_name,
                 sd if sd.is_dir() else None,
-                config.alias_dir_for(ref),
+                e.symlink_state_dir,
             )
             logger.info("%s: orphan removed", label)
 
@@ -981,14 +989,13 @@ def do_destroy(
     name mapping to different uuids in config vs on disk is rejected
     until `crony apply`.
 
-    Also accepts the `<bundle>:<UUID>` input form
-    so an operator can copy the JOB cell from a status row for
-    an entity with no recoverable name (corrupt snapshot, broken
-    entry) and paste it here. The input validates iff the
-    addressed state dir exists; the entity's actual name (used
-    for platform unit cleanup) is recovered from the snapshot
-    when readable, otherwise the platform unit cleanup is
-    dropped and only the state dir is wiped.
+    Also accepts the `<bundle>:<UUID>` input form so an operator can
+    copy the JOB cell from a status row for an entity with no
+    recoverable name (a broken snapshot or a snapshot-less leftover
+    dir) and paste it here. The input validates iff it names a
+    modeled on-disk entity -- a current node or an orphan. The
+    entity's own name keys the platform-unit cleanup; a too-corrupt
+    orphan carries none, so only its state dir is wiped.
     """
     if orphans and jobs:
         raise crony.errors.UsageError(
@@ -997,14 +1004,14 @@ def do_destroy(
     config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
-    # Shadowed collision losers share a live name, so they never
-    # surface in the name-keyed discovery set
-    # (`Config.installed_full_names()`) -- collect them by ref.
-    # They're always orphans (the winner holds the name), so both
-    # factory-reset and `--orphans` reclaim them; surgical
-    # `destroy <name>` doesn't (the operator can paste a
-    # `<bundle>:<UUID>` from status to target one).
-    shadowed_refs: list[crony.unit.EntityRef] = []
+    # State-dir-only residue that the name-keyed discovery set
+    # (`Config.installed_full_names()`) can't reach, swept by ref:
+    # shadowed collision losers (a live name belongs to the winner)
+    # and nameless orphans (a broken snapshot or a snapshot-less dir
+    # with no recoverable name). Both factory-reset and `--orphans`
+    # reclaim these; surgical `destroy <name>` doesn't (the operator
+    # can paste a `<bundle>:<UUID>` from status to target one).
+    residue_refs: list[crony.unit.EntityRef] = []
     if jobs:
         by_full, _ = _selected_full_names_per_bundle(bundles)
         # Defined names span every bundle's full names plus any
@@ -1025,10 +1032,13 @@ def do_destroy(
         for n in normalized:
             if n in known:
                 continue
+            # A `<bundle>:<UUID>` paste is known iff it names a
+            # modeled on-disk entity -- a current node or an orphan
+            # (the only refs `crony status` renders for pasting back).
             syn = crony.unit.EntityRef.from_str(n)
-            if (
-                syn is not None
-                and crony.model.Job.state_dir_from_ref(syn).is_dir()
+            if syn is not None and (
+                config.current.job_from_ref(syn) is not None
+                or syn in config.orphans
             ):
                 continue
             unknown.append(n)
@@ -1043,47 +1053,58 @@ def do_destroy(
         if bundle is not None:
             names = crony.config.bundle_prefix_filter(names, bundle)
         full_names_to_destroy = sorted(names)
-        shadowed_refs = sorted(
-            (
-                r
-                for r in config.shadowed
-                if bundle is None or r.bundle == bundle
-            ),
+        # Nameless orphans have no name to route through the loop
+        # above, so they join the ref-only residue. `--orphans` skips
+        # one whose uuid is a live config entry (a broken snapshot of
+        # an applied entry is `stale` / re-apply, not junk); a
+        # factory reset wipes everything.
+        live = config.pending.refs()
+        residue_refs = sorted(
+            {r for r in config.shadowed if bundle is None or r.bundle == bundle}
+            | {
+                ref
+                for ref, o in config.orphans.items()
+                if o.full_name is None
+                and (bundle is None or ref.bundle == bundle)
+                and (not orphans or ref not in live)
+            },
             key=lambda r: (r.bundle, r.uuid),
         )
 
     explicit = bool(jobs)
     for full in full_names_to_destroy:
-        # The state dir to wipe is the one the installed unit's argv
-        # addresses: the *current* (most-recently-applied) uuid. For an
-        # explicit `destroy <name>`, resolve by uuid so a rename
+        # Resolve the name to the uuid the installed unit's argv
+        # addresses (the *current* / most-recently-applied one). An
+        # explicit `destroy <name>` resolves by uuid so a rename
         # addressed by its new name still wipes the right entity (and a
         # name-swap raises rather than guessing). The `--orphans` /
         # factory-reset path iterates installed (current) names, so it
-        # stays current-only -- a pending fallback there could resolve
-        # an old-name remnant to a uuid still live under its new name
-        # and wipe shared state. A `<bundle>:<UUID>` input lands as
-        # `direct_ref` and is used directly.
+        # stays current-only -- a pending fallback could resolve an
+        # old-name remnant to a uuid live under its new name and wipe
+        # shared state. A `<bundle>:<UUID>` paste lands as `direct_ref`.
         direct_ref = crony.unit.EntityRef.from_str(full)
         if explicit:
             ref = _resolve_addressable(config, full)
         else:
             ref = config.resolve_current(full) or direct_ref
-        sd = (
-            crony.model.Job.state_dir_from_ref(ref) if ref is not None else None
+        # The on-disk entity to wipe -- current node or orphan, never
+        # pending: a pending-only entry has no applied state, and the
+        # entity's own name is the installed unit's name even when the
+        # input addressed it by a not-yet-applied rename. `state_dir` /
+        # `full_name` / `symlink_state_dir` are read off it directly;
+        # a too-corrupt orphan carries no `full_name`, so unit cleanup
+        # is dropped (no name -> no path). An unresolved / pending-only
+        # input falls back to the literal input so a stray same-name
+        # unit is still swept.
+        entity = (
+            config.current.job_from_ref(ref) or config.orphans.get(ref)
+            if ref is not None
+            else None
         )
-        # Recover the entity's actual name for platform unit cleanup:
-        # the unit file is keyed by the installed (current) name, which
-        # a `<bundle>:<UUID>` input or a renamed entry's new name
-        # doesn't carry. `name_for` recovers it (current-first); None
-        # when the snapshot was unparseable or absent, in which case
-        # the platform unit cleanup is dropped (no name -> no path).
-        if direct_ref is not None:
-            name_for_cleanup: str | None = config.name_for(direct_ref)
-        elif explicit and ref is not None:
-            name_for_cleanup = config.name_for(ref) or full
-        else:
-            name_for_cleanup = full
+        sd = entity.state_dir if entity is not None else None
+        name_for_cleanup: str | None = (
+            entity.full_name if entity is not None else full
+        )
         # Refuse if a run is in progress; a partial destroy would
         # leave the running shim with deleted state under it.
         lock_path = sd / "run.lock" if sd is not None else None
@@ -1095,25 +1116,26 @@ def do_destroy(
                 raise crony.errors.LockBusyError(
                     f"{full}: run in progress; will not destroy"
                 ) from None
-        alias_dir = config.alias_dir_for(ref) if ref is not None else None
+        alias_dir = entity.symlink_state_dir if entity is not None else None
         crony.runtime.destroy_one(name_for_cleanup, sd, alias_dir)
         logger.info("%s: destroyed", full)
 
-    # Reclaim shadowed collision residue (state dir only -- the
-    # shared name-keyed unit belongs to the surviving winner and,
-    # in a factory reset, is removed by the winner's own pass
-    # above).
-    for ref in shadowed_refs:
-        sd = crony.model.Job.state_dir_from_ref(ref)
+    # Reclaim the ref-only residue (state dir only): a shadowed
+    # entry's name-keyed unit belongs to its collision winner, and a
+    # nameless orphan has no name to key a unit / alias on, so neither
+    # carries name-keyed cleanup here.
+    for ref in residue_refs:
+        entity = config.current.job_from_ref(ref) or config.orphans.get(ref)
+        if entity is None:
+            continue
+        sd = entity.state_dir
         if not sd.is_dir():
             continue
         if crony.runtime.run_in_progress(sd):
-            logger.warning(
-                "%s: shadowed residue left in place (run in progress)", ref
-            )
+            logger.warning("%s: residue left in place (run in progress)", ref)
             continue
         crony.runtime.destroy_one(None, sd)
-        logger.info("%s: destroyed shadowed residue", ref)
+        logger.info("%s: destroyed residue", ref)
 
 
 def _applied_schedule_state(config: crony.model.Config, full: str) -> str:
@@ -2160,7 +2182,8 @@ def do_status(
         full_names = [crony.config.resolve_cli_name(n, bundle) for n in jobs]
     else:
         errored_full = _errored_full_names(bundles, bundle)
-        # Broken entries with no recoverable name, and current
+        # On-disk orphans with no recoverable name (a broken snapshot
+        # or a bare state dir with no snapshot at all), and current
         # entries whose name is shadowed by a collision, are
         # addressable only through the synthetic `<bundle>:<UUID>`
         # form -- their row carries that form in the JOB / UUID
@@ -2170,9 +2193,7 @@ def do_status(
         ref_form_only = {
             str(b.entity_ref)
             for b in config.orphans.values()
-            if b.is_broken
-            and b.name is None
-            and (bundle is None or b.bundle == bundle)
+            if b.name is None and (bundle is None or b.bundle == bundle)
         }
         ref_form_only |= {
             str(ref)

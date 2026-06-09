@@ -158,18 +158,19 @@ def _build_current_graph(
     """Scan `STATE_DIR/<bundle>/<uuid>/` once. Every uuid-keyed dir
     with a parseable schema-matched `snapshot.json` becomes a
     current-graph node; the rest of the dir contents become its
-    `RuntimeState`. Snapshots that exist but can't be turned into
-    a `Job` / `JobGroup` (corrupt JSON, wrong schema, unrecognized
-    kind, dataclass `TypeError`) become broken `JobOrphan` records
-    (`reason` set) so status / destroy can surface them with a clear
-    "re-apply required" signal instead of treating the entry as
-    silently absent.
+    `RuntimeState`. Dirs that don't yield a node become `JobOrphan`
+    records so status / destroy can surface them instead of treating
+    the entry as silently absent: a snapshot that exists but can't be
+    turned into a `Job` / `JobGroup` (corrupt JSON, wrong schema,
+    unrecognized kind, dataclass `TypeError`) is recorded broken
+    (`reason` set, "re-apply required"); a dir with no snapshot at all
+    is recorded as a nameless, non-broken orphan (leftover junk).
     """
     current = crony.model.Graph()
-    broken: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
+    disk_orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
     runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
     if not state_root.exists():
-        return current, broken, runtime
+        return current, disk_orphans, runtime
     for bundle_dir in state_root.iterdir():
         if not bundle_dir.is_dir():
             continue
@@ -180,14 +181,25 @@ def _build_current_graph(
             # keyed by the short name and double-load the same snapshot.
             if uuid_dir.is_symlink() or not uuid_dir.is_dir():
                 continue
+            ref = crony.unit.EntityRef(bundle_dir.name, uuid_dir.name)
             snap_path = uuid_dir / "snapshot.json"
             if not snap_path.is_file():
+                # A uuid dir with no snapshot at all is leftover state
+                # (an interrupted apply, a hand-wiped snapshot) that no
+                # config models. Record it as a nameless, non-broken
+                # orphan -- not "re-apply" territory (there is nothing
+                # to re-render), just junk a sweep or a ref-form destroy
+                # reclaims.
+                disk_orphans[ref] = crony.model.JobOrphan(
+                    bundle=bundle_dir.name,
+                    uuid=uuid_dir.name,
+                    name=None,
+                )
                 continue
-            ref = crony.unit.EntityRef(bundle_dir.name, uuid_dir.name)
             try:
                 raw = json.loads(snap_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                broken[ref] = crony.model.JobOrphan(
+                disk_orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=None,
@@ -198,7 +210,7 @@ def _build_current_graph(
             raw_name = raw.get("name") if isinstance(raw, dict) else None
             name_hint = raw_name if isinstance(raw_name, str) else None
             if not isinstance(raw, dict):
-                broken[ref] = crony.model.JobOrphan(
+                disk_orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -207,7 +219,7 @@ def _build_current_graph(
                 )
                 continue
             if raw.get("schema") != crony.model.SNAPSHOT_SCHEMA:
-                broken[ref] = crony.model.JobOrphan(
+                disk_orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -243,7 +255,7 @@ def _build_current_graph(
                     else None,
                 )
             except (TypeError, ValueError) as exc:
-                broken[ref] = crony.model.JobOrphan(
+                disk_orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
@@ -274,13 +286,13 @@ def _build_current_graph(
     # current entry, plus the platform unit path. Without this
     # the unit-config / last / last-ran columns render empty
     # for broken rows even when those files are on disk.
-    for ref, broken_entry in broken.items():
-        state_dir = broken_entry.state_dir
+    for ref, orphan in disk_orphans.items():
+        state_dir = orphan.state_dir
         runtime[ref] = _read_runtime_state(
             state_dir,
-            full_name=broken_entry.name,
+            full_name=orphan.name,
         )
-    return current, broken, runtime
+    return current, disk_orphans, runtime
 
 
 def load_config() -> crony.model.Config:
@@ -293,7 +305,7 @@ def load_config() -> crony.model.Config:
 
     toml_config = crony.config.TomlConfig.load_all()
     pending = crony.model.Graph.build_pending(toml_config)
-    current, broken, runtime = _build_current_graph(crony.paths.STATE_DIR)
+    current, disk_orphans, runtime = _build_current_graph(crony.paths.STATE_DIR)
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -318,13 +330,31 @@ def load_config() -> crony.model.Config:
         current.by_full_name[name] = winner
         shadowed.update(r for r in refs if r != winner)
 
+    # A snapshot-less leftover dir whose uuid is still a live config
+    # (pending) entry is that entry's wiped state, not orphan junk: it
+    # reads as `stale` (re-apply) through its lingering unit, so drop
+    # it from the orphan + runtime maps rather than let it shadow the
+    # entry's config axis as `orphan`. A *broken* snapshot of a live
+    # entry stays -- a corrupt snapshot is `broken` / re-apply.
+    wiped_live = {
+        ref
+        for ref, o in disk_orphans.items()
+        if not o.is_broken and ref in pending_refs
+    }
+    for ref in wiped_live:
+        del disk_orphans[ref]
+        runtime.pop(ref, None)
+
     # All on-disk junk lands in one `orphans` map keyed by ref: the
-    # broken snapshots discovered above (real uuid, `reason` set), plus
-    # the pure leftovers found next. `JobOrphan.is_broken` tells them
-    # apart for status (`broken` vs `orphan`).
-    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = dict(broken)
+    # state-dir orphans discovered above (broken snapshots with `reason`
+    # set, and snapshot-less leftover dirs), plus the pure unit / alias
+    # leftovers found next. `JobOrphan.is_broken` tells broken from
+    # orphan for status.
+    orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = dict(
+        disk_orphans
+    )
     orphans_by_full_name: dict[str, crony.unit.EntityRef] = {
-        o.name: ref for ref, o in broken.items() if o.name is not None
+        o.name: ref for ref, o in disk_orphans.items() if o.name is not None
     }
 
     # Names with a leftover platform unit file and / or short-name

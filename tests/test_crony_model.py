@@ -38,6 +38,8 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
+    Graph,
+    JobOrphan,
     _resolve_snapshot_for,
 )
 from crony.unit import (  # noqa: E402
@@ -266,6 +268,39 @@ class TestLogPath:
             base, symlink=(base.symlink_state_dir, "other-uuid")
         )
         assert snap.log_path == snap.log_path_resolved
+
+
+class TestJobFromRefAndFullName:
+    """`Graph.job_from_ref` is the single-source ref->node lookup the
+    reconciliation paths compose to make their source order explicit;
+    `full_name` reads the name uniformly across a node and an orphan.
+    """
+
+    def _snap(self) -> Any:
+        return _resolve_snapshot_for(_parse({"job": {"j": _job()}}), "j")
+
+    def test_job_from_ref_is_single_source(self) -> None:
+        snap = self._snap()
+        ref = snap.entity_ref
+        graph = Graph()
+        graph.jobs[ref] = snap
+        assert graph.job_from_ref(ref) == snap
+        # Single-source: a different (empty) graph never returns it --
+        # callers compose the cross-source order they want.
+        assert Graph().job_from_ref(ref) is None
+        # A ref the graph doesn't carry resolves to None.
+        missing = EntityRef(snap.bundle, "11111111-2222-3333-4444-555555555555")
+        assert graph.job_from_ref(missing) is None
+
+    def test_full_name_uniform_across_node_and_orphan(self) -> None:
+        snap = self._snap()
+        assert snap.full_name == "default.j"
+        named = JobOrphan(bundle="default", uuid=snap.uuid, name="default.j")
+        assert named.full_name == "default.j"
+        # A too-corrupt remnant carries no name -- the only shape
+        # difference from the node's always-set `str`.
+        nameless = JobOrphan(bundle="default", uuid=snap.uuid, name=None)
+        assert nameless.full_name is None
 
 
 if __name__ == "__main__":

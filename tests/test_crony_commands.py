@@ -4600,6 +4600,49 @@ class TestDestroyByEntityRef:
         assert sd.exists()
 
 
+class TestSnapshotlessDirOrphan:
+    """A uuid dir with no snapshot.json is a nameless orphan: it
+    renders as a ref-form `orphan` status row (so the operator can
+    see and paste it) and is reclaimed by `destroy --orphans`.
+    """
+
+    def _plant(self, h: Any) -> tuple[str, Path]:
+        ghost = "deadbeef-0000-0000-0000-deadbeef0000"
+        sd = h.state / DEFAULT_BUNDLE_NAME / ghost
+        sd.mkdir(parents=True)
+        (sd / "run.log").write_text("stale\n", encoding="utf-8")
+        return f"{DEFAULT_BUNDLE_NAME}:{ghost}", sd
+
+    def test_renders_as_ref_form_orphan_row(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        ref_form, _ = self._plant(h)
+        crony_commands.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert any(
+            ref_form in line and "orphan" in line for line in out.splitlines()
+        ), out
+
+    def test_reclaimed_by_destroy_orphans(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        _ref_form, sd = self._plant(h)
+        crony_commands.do_destroy(jobs=[], bundle=None, orphans=True)
+        assert not sd.exists()
+
+
 class TestLogsByEntityRef:
     """`do_logs` accepts a `<bundle>:<UUID>` input and reads the
     state dir's run.log directly via the parsed ref -- the entity
