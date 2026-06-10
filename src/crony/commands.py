@@ -857,7 +857,7 @@ def _reclaim_entity(
         crony.runtime.destroy_one(None, on_disk, None)
     else:
         crony.runtime.destroy_one(
-            entity.full_name, on_disk, entity.symlink_state_dir
+            entity.full_name, on_disk, entity.state_dir_symlink_path
         )
     return True
 

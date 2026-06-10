@@ -257,13 +257,13 @@ def _build_current_graph(
                     else None
                 )
                 alias = (
-                    crony.model.Job.symlink_state_dir_from_name(en)
+                    crony.model.Job.state_dir_symlink_path_from_name(en)
                     if en is not None
                     else None
                 )
                 snap = crony.model.snapshot_from_dict(
                     raw,
-                    symlink=_read_symlink_pair(alias)
+                    state_dir_symlink=_read_symlink_pair(alias)
                     if alias is not None
                     else None,
                 )
@@ -815,7 +815,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         destroy_one(
             str(current_snapshot.entity_name),
             None,
-            current_snapshot.symlink_state_dir,
+            current_snapshot.state_dir_symlink_path,
         )
 
     # Capture runtime state BEFORE we re-render so a hand-disabled
@@ -866,13 +866,13 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
 def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:
     """Point the entry's short-name alias at its uuid dir.
 
-    The alias is `node.symlink_state_dir` and its (relative) target is
+    The alias is `node.state_dir_symlink_path` and its (relative) target is
     the bare uuid, so the state tree stays relocatable. A correctly-
     pointed alias is left untouched; one pointing elsewhere is
     repointed. A non-symlink already sitting at the alias path is left
     alone -- apply never clobbers real state.
     """
-    link = node.symlink_state_dir
+    link = node.state_dir_symlink_path
     if link.is_symlink():
         if os.readlink(link) == node.uuid:
             return
@@ -898,7 +898,7 @@ def destroy_one(
     (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`); pass
     `None` to skip platform unit cleanup (e.g. a ref-form destroy whose
     snapshot is unparseable). `alias_dir` is the entity's
-    `symlink_state_dir` (resolved by the caller from the entity it
+    `state_dir_symlink_path` (resolved by the caller from the entity it
     holds); when it is a symlink it is unlinked, never a real dir. None
     means no alias to clean. `state_dir` is the uuid-keyed dir; None
     means there's no state dir to clean up.

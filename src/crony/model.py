@@ -73,14 +73,14 @@ class _JobCommon:
     without one, so `unit_spec` reads it through the `_unit_priority`
     hook that `Job` overrides to bake in its resolved class.
 
-    `symlink` is the short-name alias as a graph knows it: (alias_path,
-    target). A config-built (pending) node carries the expected pair
-    (alias -> uuid); the current graph fills in the pair read from disk
-    (None when no link exists, the real target when it does). Compared
-    in `==` so a missing / mis-pointed alias surfaces as drift through
-    the same snapshot comparison as any other field -- but excluded
-    from `to_dict` / `from_dict`: it is derived disk / expected state,
-    never persisted into snapshot.json. It is keyword-only so the
+    `state_dir_symlink` is the short-name alias as a graph knows it:
+    (alias_path, target). A config-built (pending) node carries the
+    expected pair (alias -> uuid); the current graph fills in the pair
+    read from disk (None when no link exists, the real target when it
+    does). Compared in `==` so a missing / mis-pointed alias surfaces as
+    drift through the same snapshot comparison as any other field -- but
+    excluded from `to_dict` / `from_dict`: it is derived disk / expected
+    state, never persisted into snapshot.json. It is keyword-only so the
     subclasses can append their own non-default fields after it.
     """
 
@@ -89,7 +89,9 @@ class _JobCommon:
     bundle: str  # the bundle namespace; uuids are unique within it
     name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
-    symlink: tuple[Path, str] | None = field(default=None, kw_only=True)
+    state_dir_symlink: tuple[Path, str] | None = field(
+        default=None, kw_only=True
+    )
     # The per-entry schedule / interval that drove the rendered platform
     # unit, pinned so `crony status` shows the applied schedule
     # independently of any later live-config edit. Default-None
@@ -146,21 +148,23 @@ class _JobCommon:
         return self.state_dir / "snapshot.json"
 
     @classmethod
-    def symlink_state_dir_from_name(cls, name: crony.unit.EntityName) -> Path:
+    def state_dir_symlink_path_from_name(
+        cls, name: crony.unit.EntityName
+    ) -> Path:
         """The short-name alias dir for a name:
         `STATE_DIR/<bundle>/<short>`. The base case for callers that
         hold only a name and no built node -- the current-graph scan
         reading a node's on-disk alias before constructing it. The
-        `symlink_state_dir` property routes through here so the layout
+        `state_dir_symlink_path` property routes through here so the layout
         join lives in one place."""
         return crony.paths.STATE_DIR / name.bundle / name.short
 
     @property
-    def symlink_state_dir(self) -> Path:
+    def state_dir_symlink_path(self) -> Path:
         """The short-name alias dir for this entry
         (`STATE_DIR/<bundle>/<short>`). apply maintains it as a
         relative symlink to `state_dir`."""
-        return self.symlink_state_dir_from_name(self.entity_name)
+        return self.state_dir_symlink_path_from_name(self.entity_name)
 
     @property
     def log_path_resolved(self) -> Path:
@@ -169,14 +173,14 @@ class _JobCommon:
         return self.state_dir / RUN_LOG_NAME
 
     @classmethod
-    def expected_symlink(
+    def state_dir_symlink_expected(
         cls, name: crony.unit.EntityName, uuid: str
     ) -> tuple[Path, str]:
         """The alias pair a config-built node expects on disk: the
         short-name alias dir and its relative target (the bare uuid).
-        A classmethod so `from_config` can set `symlink` at
+        A classmethod so `from_config` can set `state_dir_symlink` at
         construction rather than building the node and replacing it."""
-        return (cls.symlink_state_dir_from_name(name), uuid)
+        return (cls.state_dir_symlink_path_from_name(name), uuid)
 
     @property
     def log_path(self) -> Path:
@@ -186,7 +190,7 @@ class _JobCommon:
         alias); a current node carries the pair read from disk, so a
         missing / mis-pointed link reports the uuid path -- always a
         real on-disk location."""
-        sl = self.symlink
+        sl = self.state_dir_symlink
         if sl is not None and sl[1] == self.uuid:
             return sl[0] / RUN_LOG_NAME
         return self.log_path_resolved
@@ -219,7 +223,7 @@ class _JobCommon:
         d.pop("bundle", None)
         # The alias pair is derived disk / expected state, recomputed on
         # load -- it never belongs in the persisted snapshot.
-        d.pop("symlink", None)
+        d.pop("state_dir_symlink", None)
         # Flags persist as one boolean per member (see
         # `_FLAG_SNAPSHOT_FIELDS`), never the bitmask value itself;
         # folded back in `snapshot_from_dict`. Emitted for jobs and
@@ -331,7 +335,7 @@ class Job(_JobCommon):
             bundle=name.bundle,
             name=name.short,
             uuid=job.uuid,
-            symlink=cls.expected_symlink(name, job.uuid),
+            state_dir_symlink=cls.state_dir_symlink_expected(name, job.uuid),
             command=job.command,
             script=script,
             args=args,
@@ -433,7 +437,7 @@ class JobGroup(_JobCommon):
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
-            symlink=cls.expected_symlink(name, group.uuid),
+            state_dir_symlink=cls.state_dir_symlink_expected(name, group.uuid),
             children=children,
             group_budget_sec=config.resolved_group_timeout_sec(
                 target, group.name
@@ -492,20 +496,20 @@ def _resolve_snapshot_for(
 def snapshot_from_dict(
     raw: dict[str, Any],
     *,
-    symlink: tuple[Path, str] | None = None,
+    state_dir_symlink: tuple[Path, str] | None = None,
 ) -> Job | JobGroup:
     """Construct a snapshot from its JSON dict, parsing the typed
     value-object fields back from their source strings. Raises
     TypeError (wrong shape) or ValueError (bad typed field / unknown
     kind); callers treat both as a broken snapshot.
 
-    `symlink` is the on-disk alias pair the caller read for this entry
+    `state_dir_symlink` is the on-disk alias pair the caller read for this entry
     (None when it has no link, or for a load that doesn't care about
     the alias). It is not part of `raw` -- the alias is derived disk
     state, never serialized -- so the current-graph scan passes the
     pair it read so the frozen node carries it from construction."""
     data = dict(raw)
-    data["symlink"] = symlink
+    data["state_dir_symlink"] = state_dir_symlink
     # snapshot.json stores the full `<bundle>.<short>` name; split it
     # back into the `bundle` + short `name` fields (overriding any
     # legacy `bundle` key a very old snapshot may still carry).
@@ -946,7 +950,7 @@ class JobOrphan:
         return self.name
 
     @property
-    def symlink_state_dir(self) -> Path | None:
+    def state_dir_symlink_path(self) -> Path | None:
         """The short-name alias dir this orphan's name occupies, or
         None when no name was recovered (so destroy can still reclaim
         the alias whenever the name survived)."""
@@ -959,8 +963,8 @@ class JobOrphan:
     def log_path(self) -> Path:
         """Reported log path: the alias path when a stray alias is the
         orphan, else the uuid-keyed path."""
-        if self.has_symlink and self.symlink_state_dir is not None:
-            return self.symlink_state_dir / RUN_LOG_NAME
+        if self.has_symlink and self.state_dir_symlink_path is not None:
+            return self.state_dir_symlink_path / RUN_LOG_NAME
         return self.state_dir / RUN_LOG_NAME
 
 

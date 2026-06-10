@@ -255,7 +255,7 @@ class TestEntityRefInput:
 
 class TestLogPath:
     """`log_path` reports the short-name alias when the node's recorded
-    `symlink` pair resolves to its own uuid, else the uuid-keyed path.
+    `state_dir_symlink` pair resolves to its own uuid, else the uuid-keyed path.
     """
 
     def _snap(self) -> Any:
@@ -265,11 +265,14 @@ class TestLogPath:
     def test_expected_pair_reports_alias(self) -> None:
         snap = self._snap()
         # A config-built node carries the expected pair (alias -> uuid).
-        assert snap.symlink == (snap.symlink_state_dir, snap.uuid)
-        assert snap.log_path == snap.symlink_state_dir / RUN_LOG_NAME
+        assert snap.state_dir_symlink == (
+            snap.state_dir_symlink_path,
+            snap.uuid,
+        )
+        assert snap.log_path == snap.state_dir_symlink_path / RUN_LOG_NAME
 
     def test_missing_pair_reports_uuid_path(self) -> None:
-        snap = dataclasses.replace(self._snap(), symlink=None)
+        snap = dataclasses.replace(self._snap(), state_dir_symlink=None)
         assert snap.log_path == snap.log_path_resolved
 
     def test_mismatched_target_reports_uuid_path(self) -> None:
@@ -277,7 +280,7 @@ class TestLogPath:
         # A link that points at some other uuid is not this node's
         # alias, so the reported path falls back to the uuid dir.
         snap = dataclasses.replace(
-            base, symlink=(base.symlink_state_dir, "other-uuid")
+            base, state_dir_symlink=(base.state_dir_symlink_path, "other-uuid")
         )
         assert snap.log_path == snap.log_path_resolved
 
@@ -336,7 +339,7 @@ class TestJobFlagsBacking:
         group = _resolve_snapshot_for(cfg, "g")
         assert group.flags == JobFlags.KEEP_AWAKE
         assert snapshot_from_dict(group.to_dict()) == dataclasses.replace(
-            group, symlink=None
+            group, state_dir_symlink=None
         )
 
 
@@ -385,7 +388,9 @@ class TestSharedSnapshotSurface:
         # The alias pair is derived disk state, never serialized, so a
         # reloaded node carries no symlink until the current-graph scan
         # supplies one.
-        assert snapshot_from_dict(d) == dataclasses.replace(group, symlink=None)
+        assert snapshot_from_dict(d) == dataclasses.replace(
+            group, state_dir_symlink=None
+        )
 
 
 class TestJobFromRefAndFullName:
