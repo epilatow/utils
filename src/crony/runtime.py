@@ -67,12 +67,13 @@ def load_snapshot(
     name_hint = raw.get("name") if isinstance(raw, dict) else None
     display = name_hint if isinstance(name_hint, str) else ref_str
     schema = raw.get("schema") if isinstance(raw, dict) else None
-    if schema != crony.model.SNAPSHOT_SCHEMA:
+    if schema not in crony.model.COMPAT_SNAPSHOT_SCHEMA:
+        supported = sorted(crony.model.COMPAT_SNAPSHOT_SCHEMA)
         raise crony.errors.PreconditionError(
             f"snapshot for {display!r} has schema {schema!r}, "
-            f"expected {crony.model.SNAPSHOT_SCHEMA} (re-apply required)"
+            f"not a supported version {supported} (re-apply required)"
         )
-    # A schema-matched but otherwise malformed snapshot (extra /
+    # A supported-schema but otherwise malformed snapshot (extra /
     # missing fields, a bad schedule / interval string, or an unknown
     # kind) raises TypeError / ValueError from snapshot_from_dict.
     # `_build_current_graph` already treats that as a broken entity;
@@ -231,14 +232,15 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            if raw.get("schema") != crony.model.SNAPSHOT_SCHEMA:
+            if raw.get("schema") not in crony.model.COMPAT_SNAPSHOT_SCHEMA:
+                supported = sorted(crony.model.COMPAT_SNAPSHOT_SCHEMA)
                 orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,
                     name=name_hint,
                     reason=(
                         f"snapshot schema {raw.get('schema')!r} "
-                        f"(expected {crony.model.SNAPSHOT_SCHEMA})"
+                        f"not a supported version {supported}"
                     ),
                     source_path=snap_path,
                 )

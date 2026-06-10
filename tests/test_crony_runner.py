@@ -54,7 +54,7 @@ from crony.errors import (  # noqa: E402
     UnitNotInstalledError,
 )
 from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,
+    CURRENT_SNAPSHOT_SCHEMA,
     ExitClass,
     GroupChildResult,
     Job,
@@ -286,6 +286,28 @@ class TestRunJobBasics:
         assert rec["exit_code"] == 0
         assert rec["gate"] == "none"
 
+    def test_log_header_reports_timeout_and_pid(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The run.log header reports `timeout=<n>s pid=<pid>` -- the
+        # same shape a group header uses.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "ok": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["ok"],
+        )
+        crony_runner._run_job(h.snap(cfg, "ok"))
+        log = (h.state_dir("ok") / "run.log").read_text(encoding="utf-8")
+        assert f"{h.full('ok')} timeout=300s pid=" in log
+
     def test_command_failure_propagates_rc(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -412,7 +434,7 @@ class TestRunJobBasics:
         sd.mkdir(parents=True)
         # Schema matches, but `kind` is neither "job" nor "group".
         (sd / "snapshot.json").write_text(
-            f'{{"schema": {SNAPSHOT_SCHEMA}, '
+            f'{{"schema": {CURRENT_SNAPSHOT_SCHEMA}, '
             f'"kind": "banana", "name": "default.j"}}',
             encoding="utf-8",
         )
@@ -814,6 +836,12 @@ class TestRunGroup:
         # Children fire in declared order through the platform stub.
         led = crony._ledger
         assert [e["full_name"] for e in led] == [h.full("a"), h.full("b")]
+        # The group run.log header reports `timeout=<n>s pid=<pid>`,
+        # the same shape a job header uses.
+        log = (h.state_dir("g") / "run.log").read_text(encoding="utf-8")
+        assert "timeout=" in log
+        assert "pid=" in log
+        assert f"group {h.full('g')} " in log
 
     def test_group_continues_on_child_failure(
         self, tmp_path: Path, monkeypatch: Any
@@ -1641,10 +1669,8 @@ class TestKeepAwake:
         h = _RunnerHarness(tmp_path, monkeypatch)
         captured: dict[str, Any] = {}
 
-        def fake_exec(
-            *_args: object, job_timeout_sec: Any, **_kwargs: object
-        ) -> Any:
-            captured["job_timeout_sec"] = job_timeout_sec
+        def fake_exec(*_args: object, timeout: Any, **_kwargs: object) -> Any:
+            captured["timeout"] = timeout
             return crony_runner._ExitOutcome(rc=0, signal=None)
 
         monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
@@ -1662,7 +1688,7 @@ class TestKeepAwake:
         )
         assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         # 0 (no cap) reaches the runner as None so proc.wait never caps.
-        assert captured["job_timeout_sec"] is None
+        assert captured["timeout"] is None
 
     def test_run_job_logs_note_when_tool_missing(
         self, tmp_path: Path, monkeypatch: Any

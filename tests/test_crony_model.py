@@ -392,6 +392,35 @@ class TestSharedSnapshotSurface:
             group, state_dir_symlink=None
         )
 
+    def test_timeout_is_a_shared_base_field(self) -> None:
+        base_fields = {f.name for f in dataclasses.fields(_JobCommon)}
+        assert "timeout" in base_fields
+        # A job pins its resolved job-timeout-sec; a group pins its
+        # cumulative child budget -- both through the same field.
+        assert self._job_snap().timeout == 1800
+        assert self._group_snap().timeout > 0
+
+    def test_snapshot_writes_unified_timeout_key(self) -> None:
+        d = self._job_snap().to_dict()
+        assert d["timeout"] == 1800
+        assert "job_timeout_sec" not in d
+        assert "group_budget_sec" not in d
+
+    def test_v4_compat_maps_job_timeout_sec(self) -> None:
+        # Schema 4 keyed a job's deadline as `job_timeout_sec`; the v4
+        # compat in snapshot_from_dict maps it onto `timeout`.
+        d = self._job_snap().to_dict()
+        d["job_timeout_sec"] = d.pop("timeout")
+        assert snapshot_from_dict(d).timeout == 1800
+
+    def test_v4_compat_maps_group_budget_sec(self) -> None:
+        # Schema 4 keyed a group's deadline as `group_budget_sec`; same
+        # forward-map.
+        group = self._group_snap()
+        d = group.to_dict()
+        d["group_budget_sec"] = d.pop("timeout")
+        assert snapshot_from_dict(d).timeout == group.timeout
+
 
 class TestJobFromRefAndFullName:
     """`Graph.job_from_ref` is the single-source ref->node lookup the

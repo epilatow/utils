@@ -42,8 +42,9 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,
+    CURRENT_SNAPSHOT_SCHEMA,
     Job,
+    JobGroup,
 )
 from crony.platform import (  # noqa: E402
     launchd,
@@ -675,7 +676,7 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.gone",
                     "bundle": "default",
@@ -687,7 +688,7 @@ class TestLoadConfig:
                     "gate_script": None,
                     "gate_args": [],
                     "env": {},
-                    "job_timeout_sec": 600,
+                    "timeout": 600,
                     "schedule": "daily",
                     "interval": None,
                     "interactive": False,
@@ -873,7 +874,7 @@ class TestConfigBroken:
             "22222222-2222-2222-2222-222222222222",
             json.dumps(
                 {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": "banana",
                     "name": "default.j",
                 }
@@ -894,7 +895,7 @@ class TestConfigBroken:
             "33333333-3333-3333-3333-333333333333",
             json.dumps(
                 {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.partial",
                 }
@@ -1457,7 +1458,7 @@ class TestSnapshotBackwardLoad:
         snap_dir.mkdir(parents=True)
         # Pre-existing snapshot lacking schedule / interval keys.
         legacy = {
-            "schema": SNAPSHOT_SCHEMA,
+            "schema": CURRENT_SNAPSHOT_SCHEMA,
             "kind": "job",
             "name": full,
             "bundle": DEFAULT_BUNDLE_NAME,
@@ -1469,7 +1470,7 @@ class TestSnapshotBackwardLoad:
             "gate_script": None,
             "gate_args": [],
             "env": {},
-            "job_timeout_sec": 600,
+            "timeout": 600,
         }
         (snap_dir / "snapshot.json").write_text(json.dumps(legacy))
         _ = full
@@ -1478,6 +1479,66 @@ class TestSnapshotBackwardLoad:
         )
         assert isinstance(snap, Job)
         assert snap.timing is None
+
+    def test_v4_snapshot_loads_via_timeout_compat(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Schema 4 keyed the deadline as `job_timeout_sec`; 4 is still
+        # in COMPAT_SNAPSHOT_SCHEMA, so the gate accepts it and the v4
+        # compat maps the key onto the unified `timeout` field.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        full = h.full("j")
+        v4_uuid = "aaaa1111-2222-3333-4444-555566667777"
+        snap_dir = h.state / DEFAULT_BUNDLE_NAME / v4_uuid
+        snap_dir.mkdir(parents=True)
+        v4 = {
+            "schema": 4,
+            "kind": "job",
+            "name": full,
+            "bundle": DEFAULT_BUNDLE_NAME,
+            "uuid": v4_uuid,
+            "command": "true",
+            "script": None,
+            "args": [],
+            "gate": None,
+            "gate_script": None,
+            "gate_args": [],
+            "env": {},
+            "job_timeout_sec": 600,
+        }
+        (snap_dir / "snapshot.json").write_text(json.dumps(v4))
+        snap = crony_runtime.load_snapshot(
+            EntityRef(DEFAULT_BUNDLE_NAME, v4_uuid)
+        )
+        assert isinstance(snap, Job)
+        assert snap.timeout == 600
+
+    def test_v4_group_snapshot_loads_via_timeout_compat(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The v4 group key `group_budget_sec` maps onto `timeout`
+        # through the same gate path as a job.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        full = h.full("g")
+        v4_uuid = "bbbb1111-2222-3333-4444-555566667777"
+        snap_dir = h.state / DEFAULT_BUNDLE_NAME / v4_uuid
+        snap_dir.mkdir(parents=True)
+        v4 = {
+            "schema": 4,
+            "kind": "group",
+            "name": full,
+            "bundle": DEFAULT_BUNDLE_NAME,
+            "uuid": v4_uuid,
+            "children": [],
+            "group_budget_sec": 900,
+            "trigger_timeout_sec": 15,
+        }
+        (snap_dir / "snapshot.json").write_text(json.dumps(v4))
+        snap = crony_runtime.load_snapshot(
+            EntityRef(DEFAULT_BUNDLE_NAME, v4_uuid)
+        )
+        assert isinstance(snap, JobGroup)
+        assert snap.timeout == 900
 
 
 class TestRuntimeUnitLastExit:

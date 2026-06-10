@@ -43,7 +43,7 @@ from crony.config import (  # noqa: E402
     TomlConfig,
 )
 from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,
+    CURRENT_SNAPSHOT_SCHEMA,
     _resolve_snapshot_for,
 )
 from crony.platform import (  # noqa: E402
@@ -344,7 +344,7 @@ class _RunnerHarness:
         # fields (TypeError from Job(**raw)); incomplete fixtures
         # would silently fall out of the current graph.
         snapshot: dict[str, Any] = {
-            "schema": SNAPSHOT_SCHEMA,
+            "schema": CURRENT_SNAPSHOT_SCHEMA,
             "kind": kind,
             "name": f"{bundle}.{short}",
             "bundle": bundle,
@@ -360,7 +360,7 @@ class _RunnerHarness:
                     "gate_script": None,
                     "gate_args": [],
                     "env": {},
-                    "job_timeout_sec": 600,
+                    "timeout": 600,
                     "schedule": "daily",
                     "interval": None,
                     "interactive": False,
@@ -372,7 +372,7 @@ class _RunnerHarness:
             snapshot.update(
                 {
                     "children": [],
-                    "group_budget_sec": 600,
+                    "timeout": 600,
                     "trigger_timeout_sec": 15,
                     "schedule": "daily",
                     "interval": None,
@@ -430,7 +430,7 @@ class _RunnerHarness:
                 # the entity's runtime state; a partial dict would
                 # be skipped by Job(**raw) / JobGroup(**raw).
                 payload: dict[str, Any] = {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": kind,
                     "name": f"{bundle}.{short}",
                     "bundle": bundle,
@@ -446,7 +446,7 @@ class _RunnerHarness:
                             "gate_script": None,
                             "gate_args": [],
                             "env": {},
-                            "job_timeout_sec": 600,
+                            "timeout": 600,
                             "schedule": "daily",
                             "interval": None,
                             "interactive": False,
@@ -458,7 +458,7 @@ class _RunnerHarness:
                     payload.update(
                         {
                             "children": [],
-                            "group_budget_sec": 600,
+                            "timeout": 600,
                             "trigger_timeout_sec": 15,
                             "schedule": "daily",
                             "interval": None,

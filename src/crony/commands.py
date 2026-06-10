@@ -792,9 +792,10 @@ def _topo_apply_order(
     """Order names so each group's children are applied first.
 
     Groups depend on their children (the group's snapshot pulls
-    `group_budget_sec` from the children's resolved timeouts via
-    the live config; ordering leaves-first keeps both pinned and
-    in-progress state consistent within the same apply pass).
+    its cumulative `timeout` budget from the children's resolved
+    timeouts via the live config; ordering leaves-first keeps both
+    pinned and in-progress state consistent within the same apply
+    pass).
 
     `crony.config._validate_config` rejects cycles, so a real cycle is
     defensive: if the in-degree never drops to zero, fall back to

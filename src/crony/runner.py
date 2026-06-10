@@ -179,14 +179,14 @@ def _exec_with_timeout(
     argv: list[str],
     *,
     env: dict[str, str],
-    job_timeout_sec: int | None,
+    timeout: int | None,
     log_file: IO[bytes],
 ) -> _ExitOutcome:
     """Exec argv, piping stdout+stderr into log_file.
 
     On timeout, sends SIGTERM, then SIGKILL after a grace window, and
-    re-raises subprocess.TimeoutExpired. `job_timeout_sec=None` runs the
-    command with no wallclock cap (the caller passes None when the job's
+    re-raises subprocess.TimeoutExpired. `timeout=None` runs the command
+    with no wallclock cap (the caller passes None when the entry's
     resolved timeout is 0).
     """
     proc = subprocess.Popen(
@@ -196,7 +196,7 @@ def _exec_with_timeout(
         env=env,
     )
     try:
-        rc = proc.wait(timeout=job_timeout_sec)
+        rc = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.terminate()
         try:
@@ -402,7 +402,6 @@ def _run_job(
     notify_channels, notify_defaults = crony.notify.resolve_notify_at_runtime(
         full_name
     )
-    job_timeout_sec = snap.job_timeout_sec
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see _runtime_env).
     env = _runtime_env(snap.env)
@@ -426,8 +425,12 @@ def _run_job(
             )
             log_file = open(log_path, "ab", buffering=0)
             try:
+                timeout_label = (
+                    "none" if snap.timeout == 0 else f"{snap.timeout}s"
+                )
                 header = (
-                    f"\n=== {started_iso} {full_name} pid={os.getpid()} ===\n"
+                    f"\n=== {started_iso} {full_name} "
+                    f"timeout={timeout_label} pid={os.getpid()} ===\n"
                 ).encode()
                 log_file.write(header)
 
@@ -522,7 +525,7 @@ def _run_job(
                     rc, sig = _exec_with_timeout(
                         argv,
                         env=env,
-                        job_timeout_sec=job_timeout_sec or None,
+                        timeout=snap.timeout or None,
                         log_file=log_file,
                     )
                     if sig is not None:
@@ -629,22 +632,16 @@ def _child_timeout_from_snapshot(child_ref: crony.unit.EntityRef) -> float:
     Falls back to a generous default if the child snapshot is
     missing -- `crony status` will surface that as a broken or
     stale entry, but the trigger itself will fail fast and the
-    group's group_budget_sec still bounds the wait.
+    group's `timeout` budget still bounds the wait.
 
-    Returns `math.inf` for an uncapped child (`job_timeout_sec = 0`, or
-    a group whose `group_budget_sec` is 0); the caller converts that to
-    "wait with no cap" at the pid-watch.
+    Returns `math.inf` for an uncapped child (a `timeout` of 0); the
+    caller converts that to "wait with no cap" at the pid-watch.
     """
     try:
         cs = crony.runtime.load_snapshot(child_ref)
     except crony.errors.PreconditionError:
         return float(_DEFAULT_CHILD_TIMEOUT_FALLBACK)
-    raw = (
-        cs.job_timeout_sec
-        if isinstance(cs, crony.model.Job)
-        else cs.group_budget_sec
-    )
-    return timeout_to_wait(raw)
+    return timeout_to_wait(cs.timeout)
 
 
 def _child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
@@ -679,14 +676,13 @@ def _run_group(
     sends notifications; each child's own runner handles notify
     per the cascade.
 
-    The cumulative deadline (`snap.group_budget_sec`) was pinned
-    at apply time. Per-child wait cap pulls the child's pinned
-    timeout from its own snapshot so cap and child enforcement
-    agree. A group never applies a run-gate of its own -- each
-    child's runner reads its own snapshot and gates itself.
+    The cumulative deadline (`snap.timeout`) was pinned at apply
+    time. Per-child wait cap pulls the child's pinned timeout from
+    its own snapshot so cap and child enforcement agree. A group
+    never applies a run-gate of its own -- each child's runner reads
+    its own snapshot and gates itself.
     """
     full_name = str(snap.entity_name)
-    group_budget = snap.group_budget_sec
     trigger_timeout = snap.trigger_timeout_sec
 
     sd = snap.state_dir
@@ -732,20 +728,20 @@ def _run_group(
                 header_children = [
                     n if n is not None else str(r) for r, n in resolved_children
                 ]
-                budget_label = (
-                    "none" if group_budget == 0 else f"{group_budget}s"
+                timeout_label = (
+                    "none" if snap.timeout == 0 else f"{snap.timeout}s"
                 )
                 header = (
                     f"\n=== {started_iso} group {full_name} "
-                    f"budget={budget_label} "
-                    f"children={header_children} ===\n"
+                    f"children={header_children} "
+                    f"timeout={timeout_label} pid={os.getpid()} ===\n"
                 ).encode()
                 log_file.write(header)
 
                 deadline = (
                     math.inf
-                    if group_budget == 0
-                    else time.monotonic() + group_budget
+                    if snap.timeout == 0
+                    else time.monotonic() + snap.timeout
                 )
                 for child_ref, child_full_name in resolved_pairs:
                     child_sd = crony.model.Job.state_dir_from_ref(child_ref)

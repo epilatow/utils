@@ -45,7 +45,17 @@ import crony.unit
 # at fire time.
 
 
-SNAPSHOT_SCHEMA: int = 4
+# The schema version current code writes into every snapshot.json.
+# Bump it whenever the serialized shape changes in a way that needs a
+# matching `# v<N> compat` upgrade in `snapshot_from_dict`.
+CURRENT_SNAPSHOT_SCHEMA: int = 5
+
+# Every schema version current code can still load: CURRENT plus each
+# older version a `# v<N> compat` block in `snapshot_from_dict` knows
+# how to read forward. A snapshot whose schema is outside this set is
+# rejected as needing re-apply. Drop a version here (and delete its
+# tagged compat block) once no snapshots at that schema remain.
+COMPAT_SNAPSHOT_SCHEMA: frozenset[int] = frozenset({4, 5})
 
 # The per-entry log file name, kept in one place so no caller inlines
 # the literal. Lives inside the entry's state dir (uuid-keyed) and is
@@ -84,11 +94,19 @@ class _JobCommon:
     subclasses can append their own non-default fields after it.
     """
 
-    schema: int
+    # The snapshot.json format version, serialized under the `schema`
+    # JSON key. Compared in `==`, so a snapshot whose format predates the
+    # current code surfaces as drift (reported `snapshot-schema`).
+    snapshot_schema: int
     kind: str  # "job" or "group"
     bundle: str  # the bundle namespace; uuids are unique within it
     name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
+    # The per-entry deadline in seconds that bounds a run: a job's
+    # resolved job-timeout-sec, or a group's cumulative child budget
+    # (computed once at apply time). 0 means uncapped -- the runner
+    # treats it as an infinite deadline.
+    timeout: int
     state_dir_symlink: tuple[Path, str] | None = field(
         default=None, kw_only=True
     )
@@ -217,6 +235,10 @@ class _JobCommon:
         stays string-keyed regardless of the in-memory types. `Job`
         layers the job-only `priority` on top."""
         d = dataclasses.asdict(self)
+        # The format version persists under the `schema` JSON key; the
+        # in-memory field is `snapshot_schema` (unambiguous at its use
+        # sites and in the DIVERGED column).
+        d["schema"] = d.pop("snapshot_schema")
         # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
         # is redundant with it and recomputed on load.
         d["name"] = str(self.entity_name)
@@ -266,7 +288,6 @@ class Job(_JobCommon):
     gate_script: str | None
     gate_args: list[str]
     env: dict[str, str]
-    job_timeout_sec: int
     # Process-priority class baked into the platform unit (HIGH / LOW /
     # NORMAL / None). Pinned in the snapshot so a change re-renders the
     # unit on the next apply. Default-None for back-compat with
@@ -330,7 +351,7 @@ class Job(_JobCommon):
             else None
         )
         return cls(
-            schema=SNAPSHOT_SCHEMA,
+            snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
             kind="job",
             bundle=name.bundle,
             name=name.short,
@@ -343,7 +364,7 @@ class Job(_JobCommon):
             gate_script=gate_script,
             gate_args=gate_args,
             env=config.resolved_env(job),
-            job_timeout_sec=config.resolved_job_timeout_sec(job),
+            timeout=config.resolved_job_timeout_sec(job),
             timing=job.timing,
             priority=config.resolved_priority(job),
             flags=flags,
@@ -376,13 +397,12 @@ class JobGroup(_JobCommon):
     bundle-scoped uuids; the runner resolves each back to its
     current full name via the child's own snapshot at dispatch
     time so a rename in config doesn't flip the parent's snapshot.
-    `group_budget_sec` is the pre-padded cumulative deadline
+    The inherited `timeout` holds the pre-padded cumulative deadline
     computed once at apply time. 0 means no cap (some child is
     uncapped); the group runner treats it as an infinite deadline.
     """
 
     children: list[str]
-    group_budget_sec: int
     trigger_timeout_sec: int
 
     @classmethod
@@ -395,10 +415,11 @@ class JobGroup(_JobCommon):
         *,
         flags: crony.config.JobFlags | None = None,
     ) -> JobGroup:
-        """Build a JobGroup. `group_budget_sec` is recomputed from
-        the live config (not from children's pinned snapshots), so an
-        apply pass that walks topologically still produces the right
-        parent budget regardless of children's prior applied state.
+        """Build a JobGroup. The cumulative `timeout` budget is
+        recomputed from the live config (not from children's pinned
+        snapshots), so an apply pass that walks topologically still
+        produces the right parent budget regardless of children's prior
+        applied state.
 
         `flags` is the group's resolved cascade value (the defaults
         composed with its ancestor groups and its own delta), supplied
@@ -432,16 +453,14 @@ class JobGroup(_JobCommon):
         if flags is None:
             flags = config.composed_flags(group.flags)
         return cls(
-            schema=SNAPSHOT_SCHEMA,
+            snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
             kind="group",
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
             state_dir_symlink=cls.state_dir_symlink_expected(name, group.uuid),
             children=children,
-            group_budget_sec=config.resolved_group_timeout_sec(
-                target, group.name
-            ),
+            timeout=config.resolved_group_timeout_sec(target, group.name),
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
             timing=group.timing,
             flags=flags,
@@ -510,6 +529,12 @@ def snapshot_from_dict(
     pair it read so the frozen node carries it from construction."""
     data = dict(raw)
     data["state_dir_symlink"] = state_dir_symlink
+    # The format version is keyed `schema` on disk; the field is
+    # `snapshot_schema`. A missing key leaves the kwarg absent so the
+    # dataclass raises a clear "missing snapshot_schema" TypeError, which
+    # callers treat as a broken snapshot.
+    if "schema" in data:
+        data["snapshot_schema"] = data.pop("schema")
     # snapshot.json stores the full `<bundle>.<short>` name; split it
     # back into the `bundle` + short `name` fields (overriding any
     # legacy `bundle` key a very old snapshot may still carry).
@@ -542,6 +567,15 @@ def snapshot_from_dict(
         if enabled or legacy:
             flags |= flag
     data["flags"] = flags
+    # v4 compat: schema 4 stored the per-entry deadline under a
+    # kind-specific key (`job_timeout_sec` for jobs, `group_budget_sec`
+    # for groups); schema 5 unified them into `timeout`. Map the v4 keys
+    # forward so a schema-4 snapshot loads. Drop this block when 4
+    # leaves COMPAT_SNAPSHOT_SCHEMA.
+    legacy_timeout = data.pop("group_budget_sec", None)
+    legacy_timeout = data.pop("job_timeout_sec", legacy_timeout)
+    if "timeout" not in data and legacy_timeout is not None:
+        data["timeout"] = legacy_timeout
     kind = data.get("kind")
     if kind == "job":
         return Job(**data)

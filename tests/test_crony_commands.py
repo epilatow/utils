@@ -60,7 +60,7 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
-    SNAPSHOT_SCHEMA,
+    CURRENT_SNAPSHOT_SCHEMA,
 )
 from crony.platform import (  # noqa: E402
     launchd,
@@ -5043,7 +5043,7 @@ class TestNameCollision:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": full,
                     "bundle": bundle,
@@ -5055,7 +5055,7 @@ class TestNameCollision:
                     "gate_script": None,
                     "gate_args": [],
                     "env": {},
-                    "job_timeout_sec": 600,
+                    "timeout": 600,
                     "schedule": "*-*-* 03:00",
                     "interval": None,
                     "interactive": False,
@@ -5912,8 +5912,8 @@ class TestSnapshotLifecycle:
         assert snap["kind"] == "job"
         assert snap["name"] == h.full("j")
         assert snap["command"] == "true"
-        assert snap["job_timeout_sec"] == 600
-        assert snap["schema"] == SNAPSHOT_SCHEMA
+        assert snap["timeout"] == 600
+        assert snap["schema"] == CURRENT_SNAPSHOT_SCHEMA
 
     def test_apply_state_is_co_located_in_entry_dir(
         self, tmp_path: Path, monkeypatch: Any
@@ -5965,7 +5965,7 @@ class TestSnapshotLifecycle:
             cfg.jobs["b"].uuid,
         ]
         # 1.05 * (100 + 200) = 315
-        assert snap["group_budget_sec"] == 315
+        assert snap["timeout"] == 315
 
     def test_group_snapshot_drops_host_masked_child(
         self, tmp_path: Path, monkeypatch: Any
@@ -6004,7 +6004,7 @@ class TestSnapshotLifecycle:
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
         # Budget reflects only `a`: 1.05 * 100 = 105.
-        assert snap["group_budget_sec"] == 105
+        assert snap["timeout"] == 105
 
     def test_group_snapshot_drops_platform_masked_child(
         self, tmp_path: Path, monkeypatch: Any
@@ -6035,7 +6035,7 @@ class TestSnapshotLifecycle:
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
-        assert snap["group_budget_sec"] == 105
+        assert snap["timeout"] == 105
 
     def test_group_snapshot_drops_masked_child_subgroup(
         self, tmp_path: Path, monkeypatch: Any
@@ -6068,7 +6068,7 @@ class TestSnapshotLifecycle:
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         assert snap["children"] == [cfg.jobs["a"].uuid]
-        assert snap["group_budget_sec"] == 105
+        assert snap["timeout"] == 105
 
     def test_command_edit_flags_drift(
         self, tmp_path: Path, monkeypatch: Any
@@ -6292,7 +6292,7 @@ class TestSnapshotLifecycle:
         (sd / "snapshot.json").write_text(
             json.dumps(
                 {
-                    "schema": SNAPSHOT_SCHEMA,
+                    "schema": CURRENT_SNAPSHOT_SCHEMA,
                     "kind": "job",
                     "name": "default.j",
                     "bogus_field": "unexpected",
@@ -6331,7 +6331,7 @@ class TestSnapshotLifecycle:
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
-        assert snap["group_budget_sec"] == 105
+        assert snap["timeout"] == 105
 
         # Bump leaf to 200; apply the group only and confirm the
         # group's pinned budget tracks the new leaf.
@@ -6351,7 +6351,7 @@ class TestSnapshotLifecycle:
         )
         crony_commands.do_apply(jobs=[h.full("g")], verbose=False, bundle=None)
         snap_after = _cast_dict(snap_path.read_text())
-        assert snap_after["group_budget_sec"] == 210
+        assert snap_after["timeout"] == 210
 
     def test_destroy_removes_snapshot(
         self, tmp_path: Path, monkeypatch: Any
