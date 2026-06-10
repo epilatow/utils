@@ -5514,6 +5514,252 @@ class TestStatusLogFileColumn:
         assert str(h.state / "default" / "foo" / "run.log") in out
 
 
+class TestStatusFlagsColumns:
+    """`crony status` exposes resolved capability flags: a `flags`
+    summary column listing the enabled flags, plus one true / false
+    column per `JobFlags` member. All opt-in (not in the default
+    set); dual-source, so a not-yet-applied flag change flags `^` on
+    the individual flag that diverged.
+    """
+
+    def _status(self, cols: str, **kw: Any) -> None:
+        crony_commands.do_status(
+            jobs=[],
+            cols=cols,
+            show_masked=False,
+            bundle=None,
+            config_current=kw.get("config_current", False),
+            config_pending=kw.get("config_pending", False),
+            exclude_healthy=False,
+        )
+
+    def _row_for(self, out: str, needle: str) -> str:
+        # The single data line mentioning `needle` (header excluded).
+        lines = out.splitlines()
+        return next(ln for ln in lines[1:] if ln.strip() and needle in ln)
+
+    def test_flag_columns_not_in_default(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("default")
+        header = capsys.readouterr().out.splitlines()[0]
+        assert "FLAGS" not in header
+        assert "INTERACTIVE" not in header
+        assert "KEEP-AWAKE" not in header
+
+    def test_flags_summary_lists_enabled_flags(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["interactive", "keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("job,flags")
+        out = capsys.readouterr().out
+        assert "FLAGS" in out.splitlines()[0]
+        # Members render in declaration order (interactive, keep-awake).
+        assert "interactive,keep-awake" in self._row_for(out, h.full("j"))
+
+    def test_flags_summary_empty_when_no_flag_enabled(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("job,flags")
+        out = capsys.readouterr().out
+        row = self._row_for(out, h.full("j"))
+        assert "interactive" not in row
+        assert "keep-awake" not in row
+
+    def test_per_flag_columns_show_true_false(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("job,interactive")
+        out = capsys.readouterr().out
+        assert "INTERACTIVE" in out.splitlines()[0]
+        assert self._row_for(out, h.full("j")).split()[-1] == "false"
+        self._status("job,keep-awake")
+        out = capsys.readouterr().out
+        assert "KEEP-AWAKE" in out.splitlines()[0]
+        assert self._row_for(out, h.full("j")).split()[-1] == "true"
+
+    def test_all_alias_includes_flag_columns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("all")
+        header = capsys.readouterr().out.splitlines()[0]
+        assert "FLAGS" in header
+        assert "INTERACTIVE" in header
+        assert "KEEP-AWAKE" in header
+
+    def test_pending_flag_change_flags_caret(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Apply with the flag off, then turn it on in config without
+        # re-applying: the pending node enables keep-awake while the
+        # applied snapshot still has it off, so the individual flag
+        # diverges. The shared uuid pin makes the second config an
+        # edit of the same entry rather than a replacement.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        # Default (pending-first): keep-awake reads true with a `^`, the
+        # summary lists `keep-awake^`, and the stale footer prints.
+        self._status("job,keep-awake,flags")
+        out = capsys.readouterr().out
+        row = self._row_for(out, h.full("j"))
+        assert "true^" in row
+        assert "keep-awake^" in row
+        assert "One or more flagged cells are stale" in out
+        # --config-current shows the applied (off) value, still `^`-
+        # flagged since the other side differs.
+        self._status("job,keep-awake", config_current=True)
+        out = capsys.readouterr().out
+        assert "false^" in self._row_for(out, h.full("j"))
+
+    def test_summary_midstring_marker_prints_footer(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The summary tags individual flags, so a diverged flag that
+        # isn't the last one enabled leaves the `^` mid-cell (e.g.
+        # `interactive^,keep-awake`). With only the `flags` column shown
+        # that marker is the sole one on screen, so the footer gate must
+        # detect it anywhere in the cell, not just at the end.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["interactive", "keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("flags")
+        out = capsys.readouterr().out
+        row = self._row_for(out, "interactive^,keep-awake")
+        assert not row.rstrip().endswith("^")
+        assert "One or more flagged cells are stale" in out
+
+    def test_group_row_shows_resolved_flags(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A group shows its resolved cascade value the same way a job
+        # does, so the inheritance it seeds into its children is visible
+        # down the column: the group and its child both read keep-awake
+        # true.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["keep-awake"],
+                    }
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        self._status("job,keep-awake,flags")
+        out = capsys.readouterr().out
+        group_row = self._row_for(out, h.full("g"))
+        child_row = self._row_for(out, h.full("a"))
+        assert "true" in group_row
+        assert "keep-awake" in group_row
+        assert "true" in child_row
+        assert "keep-awake" in child_row
+
+
 class TestStatusExcludeHealthy:
     """`crony status --exclude-healthy` drops synced + ok / never /
     gated rows and renders flat (no tree indent). Always exits 0 --

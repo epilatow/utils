@@ -1515,7 +1515,12 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-config": "UNIT CONFIG",
     "unit-timer": "UNIT TIMER",
     "log-file": "LOG FILE",
+    "flags": "FLAGS",
 }
+# One opt-in column per capability flag, keyed by the flag's token, so
+# the set tracks `JobFlags` automatically as members are added.
+for _flag_member in crony.config.JobFlags.members():
+    _STATUS_COL_HEADERS[_flag_member.token] = _flag_member.token.upper()
 _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
     "config",
@@ -1538,6 +1543,30 @@ Columns
                     rejected (e.g. unknown key); the installed unit,
                     if any, is left untouched and `crony apply`
                     refuses the name until the config is fixed.
+  flags             Comma-separated capability flags enabled for the
+                    entry (e.g. `interactive,keep-awake`). Opt-in.
+                    Source-selected like `schedule`: default and
+                    --config-pending list the pending (config) flags,
+                    --config-current the applied ones; an enabled flag
+                    is tagged `^` when the two sides disagree on it
+                    (e.g. `interactive^,keep-awake`). Empty when no
+                    flag is enabled, or for a row with no resolved view
+                    (a masked or orphan entry absent from the graph). A
+                    group shows its resolved cascade value -- the flags
+                    it inherits and seeds into its children -- which has
+                    no runtime effect on the group but makes inheritance
+                    visible. A flag
+                    disabled in config but still enabled in the applied
+                    state (a not-yet-applied removal) isn't listed here
+                    -- it surfaces in that flag's own column (as
+                    `false^`) and in the stale footer.
+  <flag>            One opt-in column per capability flag, each reading
+                    true / false for whether the flag is enabled (one
+                    column per member:
+                    {flag_tokens}). Same source rules and `^`
+                    divergence flag as the `flags` summary; a group
+                    shows its inherited cascade value, the same as a
+                    job.
   groups            Comma-separated full names of groups containing this
                     entry. Same source rules as `schedule`: default and
                     --config-pending show the pending membership,
@@ -1667,6 +1696,7 @@ def _build_status_aliases_block() -> str:
 
 STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
     aliases_block=_build_status_aliases_block(),
+    flag_tokens=", ".join(f.token for f in crony.config.JobFlags.members()),
 )
 
 
@@ -2010,6 +2040,20 @@ def _build_config_group_membership(
     return membership
 
 
+def _node_flags(
+    node: crony.model.Job | crony.model.JobGroup | None,
+) -> crony.config.JobFlags | None:
+    """The resolved per-flag view of a status row's graph node, or
+    None for an absent node (so its flag cells render empty).
+
+    Both jobs and groups carry a resolved flags bitmask. A group's is
+    its cascade value -- shown so the inheritance it hands down to its
+    children is visible, even though group flags have no runtime effect
+    on the group itself.
+    """
+    return node.flags if node is not None else None
+
+
 def _diverged(pending: object, current: object) -> bool:
     """`^`-annotation predicate: the entity exists in both graphs
     AND the values disagree on this field. The annotation never
@@ -2094,9 +2138,10 @@ def do_status(
     the current host (target-unused or excluded by the entry's
     `platforms` / `hosts` filters). `--config-current` and
     `--config-pending` force every dual-source column (name, kind,
-    schedule, groups, unit-name) to a single source; the `^`
-    divergence flag still fires whenever the two sources differ. The
-    two flags are mutually exclusive.
+    schedule, groups, unit-name, log-file, flags and the per-flag
+    columns) to a single source; the `^` divergence flag still fires
+    whenever the two sources differ. The two flags are mutually
+    exclusive.
 
     `--exclude-healthy` drops rows where CONFIG is `synced`,
     UNIT is `enabled` (or `grouped` -- anything that fires), and
@@ -2421,28 +2466,64 @@ def do_status(
         elif row_ref is not None and row_ref in config.orphans:
             current_log = str(config.orphans[row_ref].log_path)
         log_file_cell = _mark(pending_log, current_log)
-        built.append(
-            (
-                config_name,
-                {
-                    "job": job_cell,
-                    "job-or-uuid": job_or_uuid_cell,
-                    "kind": kind,
-                    "config": cfg_state,
-                    "schedule": sched_cell,
-                    "groups": groups_cell,
-                    "unit": unit_state,
-                    "last": last,
-                    "last-ran": last_ran,
-                    "masked-by": mask_reason,
-                    "unit-name": unit_name,
-                    "uuid": uuid_cell,
-                    "unit-config": unit_config_cell,
-                    "unit-timer": unit_timer_cell,
-                    "log-file": log_file_cell,
-                },
+        # FLAGS: per-flag resolved state read off each side's job node.
+        # Each per-flag column is a dual-source true / false cell; the
+        # `flags` summary lists the active source's enabled flags,
+        # tagging each with `^` where the two sides disagree on it.
+        pending_flags = _node_flags(pending_node)
+        current_flags = _node_flags(current_node)
+        if config_source == "current":
+            active_flags = current_flags
+        elif config_source == "pending":
+            active_flags = pending_flags
+        else:
+            active_flags = (
+                pending_flags if pending_flags is not None else current_flags
             )
-        )
+        flag_cells: dict[str, str] = {}
+        flags_summary_parts: list[str] = []
+        for member in crony.config.JobFlags.members():
+            pending_flag = (
+                ("true" if member in pending_flags else "false")
+                if pending_flags is not None
+                else None
+            )
+            current_flag = (
+                ("true" if member in current_flags else "false")
+                if current_flags is not None
+                else None
+            )
+            flag_cells[member.token] = _mark(pending_flag, current_flag)
+            member_diverged = (
+                pending_flags is not None
+                and current_flags is not None
+                and (member in pending_flags) != (member in current_flags)
+            )
+            if active_flags is not None and member in active_flags:
+                token = member.token
+                if member_diverged:
+                    token = f"{token}{_DIVERGENCE_MARKER}"
+                flags_summary_parts.append(token)
+        row_cells: dict[str, str] = {
+            "job": job_cell,
+            "job-or-uuid": job_or_uuid_cell,
+            "kind": kind,
+            "config": cfg_state,
+            "schedule": sched_cell,
+            "groups": groups_cell,
+            "unit": unit_state,
+            "last": last,
+            "last-ran": last_ran,
+            "masked-by": mask_reason,
+            "unit-name": unit_name,
+            "uuid": uuid_cell,
+            "unit-config": unit_config_cell,
+            "unit-timer": unit_timer_cell,
+            "log-file": log_file_cell,
+            "flags": ",".join(flags_summary_parts),
+        }
+        row_cells.update(flag_cells)
+        built.append((config_name, row_cells))
 
     for ref_key, candidate_names in names_by_ref.items():
         _build_row(ref_key, candidate_names)
@@ -2535,12 +2616,10 @@ def do_status(
     # carries the `^` marker -- a column set that shows no flagged cell
     # has nothing for the legend to explain. This keys on what's on
     # screen, so any marker-carrying column counts without a separate
-    # list to keep in sync.
-    if any(
-        row[c].endswith(_DIVERGENCE_MARKER)
-        for row in rows
-        for c in selected_cols
-    ):
+    # list to keep in sync. The marker can sit mid-cell -- the `flags`
+    # summary tags individual flags (e.g. `interactive^,keep-awake`) --
+    # so test for it anywhere in the cell, not only at the end.
+    if any(_DIVERGENCE_MARKER in row[c] for row in rows for c in selected_cols):
         print()
         print(_STALE_VALUE_FOOTER)
 
