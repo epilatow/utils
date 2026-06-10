@@ -2370,6 +2370,12 @@ class TestJobFlagsField:
         assert cfg.jobs["j"].interactive is True
         assert cfg.jobs["j"].platforms == []
 
+    def test_full_disk_access_flag_parses(self) -> None:
+        # full-disk-access has no legacy scalar key; it is set only
+        # through the flags list and recorded in the per-level delta.
+        cfg = _parse(self._cfg(_job(flags=["full-disk-access"])))
+        assert cfg.jobs["j"].flags == {JobFlags.FULL_DISK_ACCESS: True}
+
     def test_scalar_and_flag_for_different_flags_ok(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True, flags=["keep-awake"])))
         assert cfg.jobs["j"].interactive is True
@@ -2604,6 +2610,7 @@ class TestJobFlags:
     def test_token_spellings(self) -> None:
         assert JobFlags.INTERACTIVE.token == "interactive"
         assert JobFlags.KEEP_AWAKE.token == "keep-awake"
+        assert JobFlags.FULL_DISK_ACCESS.token == "full-disk-access"
 
     def test_from_token_rejects_unknown(self) -> None:
         with pytest.raises(ValueError, match="unknown flag"):
@@ -2625,6 +2632,7 @@ class TestJobFlags:
         assert JobFlags.members() == [
             JobFlags.INTERACTIVE,
             JobFlags.KEEP_AWAKE,
+            JobFlags.FULL_DISK_ACCESS,
         ]
 
 

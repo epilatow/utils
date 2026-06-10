@@ -63,6 +63,7 @@ class JobFlags(enum.Flag):
 
     INTERACTIVE = enum.auto()
     KEEP_AWAKE = enum.auto()
+    FULL_DISK_ACCESS = enum.auto()
 
     @property
     def token(self) -> str:

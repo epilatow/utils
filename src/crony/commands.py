@@ -216,10 +216,14 @@ _DEFAULT_CONFIG_TEMPLATE: str = """\
 # #            an idle / on-AC machine doesn't sleep mid-job. NOTE:
 # #            closing the lid on battery still sleeps the machine --
 # #            nothing in userspace prevents that.
-# # flags = ["interactive", "keep-awake"]   # an alternative spelling for
-# #            the per-flag booleans above; "flag=false" turns one off
-# #            (e.g. ["keep-awake=false"]). A flag may be set by its own
-# #            key OR in `flags`, never both at the same level.
+# # flags = ["interactive", "keep-awake", "full-disk-access"]
+# #            an alternative spelling for the per-flag booleans above;
+# #            "flag=false" turns one off (e.g. ["keep-awake=false"]). A
+# #            flag with its own key may be set that way OR in `flags`,
+# #            never both at the same level. full-disk-access (macOS)
+# #            runs the command under a Full Disk Access grant via
+# #            Crony.app: `crony apply` builds the wrapper, then grant it
+# #            in System Settings (apply prints how); a no-op off macOS.
 # # success-exit-codes = [1]     # non-zero exit codes to classify as
 # #            success (exit 0 is always success). A run whose code is
 # #            listed is "ok" -- not failed, no notification -- and the

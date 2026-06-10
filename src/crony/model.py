@@ -330,6 +330,12 @@ class Job(_JobCommon):
         return crony.config.JobFlags.KEEP_AWAKE in self.flags
 
     @property
+    def full_disk_access(self) -> bool:
+        """Whether the job runs through the macOS Full Disk Access
+        wrapper -- the FULL_DISK_ACCESS flag. A no-op off darwin."""
+        return crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
+
+    @property
     def _unit_priority(self) -> crony.unit.PriorityClass:
         """A job's platform unit bakes in its resolved priority class."""
         return self.priority

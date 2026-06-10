@@ -306,6 +306,15 @@ class TestJobFlagsBacking:
         assert snap.flags == JobFlags(0)
         assert snap.interactive is False
         assert snap.keep_awake is False
+        assert snap.full_disk_access is False
+
+    def test_full_disk_access_backs_property_and_round_trips(self) -> None:
+        snap = self._snap(flags=["full-disk-access"])
+        assert snap.full_disk_access is True
+        assert JobFlags.FULL_DISK_ACCESS in snap.flags
+        d = snap.to_dict()
+        assert d["full-disk-access"] is True
+        assert snapshot_from_dict(d).flags == snap.flags
 
     def test_snapshot_serializes_flags_as_booleans(self) -> None:
         snap = self._snap(keep_awake=True)
