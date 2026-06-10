@@ -1598,7 +1598,7 @@ Columns
                     the other). Falls back to the snapshot's recorded kind
                     for rows whose live config no longer defines the entry.
   last              Last-run outcome: ok | fail | timeout | gated | canceled
-                    | running | pending | never | unknown.
+                    | crashed | running | pending | never | unknown.
   last-ran          Compact relative time of the last run, e.g. "5m ago".
   masked-by         `host` and / or `platform` joined with `,`
                     (e.g. `host,platform` when both axes exclude
@@ -1669,7 +1669,8 @@ Color
 -----
   When stdout is a TTY (and NO_COLOR is unset), broken / failed states
   are red -- CONFIG `missing` / `error` / `broken` / `orphan` and LAST
-  `fail` / `timeout` / `canceled` -- and reconcilable drift is yellow --
+  `fail` / `timeout` / `canceled` / `crashed` -- and reconcilable drift
+  is yellow --
   a `stale` CONFIG verdict and any cell carrying the `^` divergence
   marker (the `^` itself stays uncolored). Redirected or piped output
   is always plain.
