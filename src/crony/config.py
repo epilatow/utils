@@ -768,14 +768,22 @@ class TomlBundleConfig:
             return job.job_timeout_sec
         return self.defaults.job_timeout_sec
 
-    def resolved_priority(
-        self, job: TomlJob
-    ) -> crony.unit.PriorityClass | None:
-        """Cascade priority: job > defaults. Targets carry no
-        priority."""
-        if job.priority is not None:
-            return job.priority
-        return self.defaults.priority
+    def resolved_priority(self, job: TomlJob) -> crony.unit.PriorityClass:
+        """Cascade priority: job > defaults > NORMAL. Targets carry no
+        priority.
+
+        Always resolves to a concrete class. `None` is the config-level
+        "unset" that drives the cascade; once resolved, an unset entry is
+        NORMAL, the same neutral class an explicit `priority = "normal"`
+        produces, so the snapshot and unit layers never carry a nullable
+        priority.
+        """
+        resolved = (
+            job.priority if job.priority is not None else self.defaults.priority
+        )
+        if resolved is not None:
+            return resolved
+        return crony.unit.PriorityClass.NORMAL
 
     def resolved_flags_by_name(
         self, target: Target | None

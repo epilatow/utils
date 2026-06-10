@@ -56,6 +56,7 @@ from crony.model import (  # noqa: E402
 from crony.platform import UnitLastExit  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityRef,
+    PriorityClass,
 )
 
 _script_path = REPO_ROOT / "src" / "crony" / "model.py"
@@ -372,13 +373,16 @@ class TestSharedSnapshotSurface:
         snap = self._job_snap()
         spec = snap.unit_spec()
         assert spec.priority == snap.priority
-        assert snap.priority is not None
+        assert snap.priority is PriorityClass.HIGH
         assert spec.timing == snap.timing
 
-    def test_group_unit_spec_has_no_priority(self) -> None:
+    def test_group_unit_spec_is_normal(self) -> None:
+        # Groups request no special scheduling, which resolves to the
+        # neutral NORMAL class (zero platform directives) rather than a
+        # nullable priority.
         group = self._group_snap()
         spec = group.unit_spec()
-        assert spec.priority is None
+        assert spec.priority is PriorityClass.NORMAL
         assert spec.timing == group.timing
 
     def test_group_to_dict_round_trips_without_priority(self) -> None:

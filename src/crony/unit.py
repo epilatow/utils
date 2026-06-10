@@ -387,11 +387,12 @@ class UnitSpec:
     timing      A Schedule, an Interval, or None for an on-demand unit
                 (a transit group, or a job fired only by explicit
                 trigger).
-    priority    The unit's priority class, or None (groups never set
-                one).
+    priority    The unit's priority class. NORMAL when no special
+                scheduling is requested (groups always render NORMAL);
+                only HIGH / LOW emit platform directives.
     """
 
     name: EntityName
     ref: EntityRef
     timing: Timing | None
-    priority: PriorityClass | None
+    priority: PriorityClass

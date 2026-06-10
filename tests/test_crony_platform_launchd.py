@@ -127,14 +127,12 @@ class TestPlistRendering:
         # Each rendered plist must parse back as a well-formed plist
         # (plutil only runs at apply on macOS; this catches structural
         # breakage in CI on any platform).
-        shapes: list[
-            tuple[Schedule | Interval | None, PriorityClass | None]
-        ] = [
-            (Schedule.from_str("daily"), None),
-            (Interval.from_str("30min"), None),
+        shapes: list[tuple[Schedule | Interval | None, PriorityClass]] = [
+            (Schedule.from_str("daily"), PriorityClass.NORMAL),
+            (Interval.from_str("30min"), PriorityClass.NORMAL),
             (Schedule.from_str("Mon *-*-* 09:00"), PriorityClass.HIGH),
             (Schedule.from_str("*-*-* 03:00"), PriorityClass.LOW),
-            (None, None),  # on-demand, normal priority
+            (None, PriorityClass.NORMAL),  # on-demand, normal priority
         ]
         for timing, priority in shapes:
             plist = launchd.render_plist(
@@ -174,22 +172,20 @@ class TestLaunchdPriority:
         assert d["LowPriorityIO"] is True
         assert d["Nice"] == 10
 
-    def test_normal_and_none_emit_nothing(self) -> None:
-        for p in (PriorityClass.NORMAL, None):
-            plist = launchd.render_plist(
-                "j",
-                _REF,
-                Schedule.from_str("daily"),
-                p,
-                uv_path=_UV,
-                crony_path=_CRONY,
-            )
-            d = plistlib.loads(plist.encode("utf-8"))
-            assert "ProcessType" not in d
-            assert "LowPriorityIO" not in d
-            assert "Nice" not in d
+    def test_normal_emits_nothing(self) -> None:
+        plist = launchd.render_plist(
+            "j",
+            _REF,
+            Schedule.from_str("daily"),
+            PriorityClass.NORMAL,
+            uv_path=_UV,
+            crony_path=_CRONY,
+        )
+        d = plistlib.loads(plist.encode("utf-8"))
+        assert "ProcessType" not in d
+        assert "LowPriorityIO" not in d
+        assert "Nice" not in d
         assert launchd._priority_keys(PriorityClass.NORMAL) == {}
-        assert launchd._priority_keys(None) == {}
 
 
 class TestLaunchdScheduler:
@@ -198,7 +194,7 @@ class TestLaunchdScheduler:
             name=EntityName.from_str("default.brew"),
             ref=_REF,
             timing=Schedule.from_str("daily"),
-            priority=None,
+            priority=PriorityClass.NORMAL,
         )
         units = get_scheduler("darwin", _DIR).render(
             spec, uv_path=_UV, crony_path=_CRONY

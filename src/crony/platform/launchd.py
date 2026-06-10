@@ -42,8 +42,8 @@ def plist_filename(name: str) -> str:
     return f"{label(name)}.plist"
 
 
-def _priority_keys(priority: PriorityClass | None) -> dict[str, object]:
-    """LaunchAgent priority keys for a job, or {} for normal.
+def _priority_keys(priority: PriorityClass) -> dict[str, object]:
+    """LaunchAgent priority keys for a job, or {} for NORMAL.
 
     HIGH runs the job at app-like QoS with normal CPU + IO
     (ProcessType=Interactive avoids the Background QoS throttling that
@@ -69,7 +69,7 @@ def render_plist(
     name: str,
     ref: EntityRef,
     timing: Timing | None,
-    priority: PriorityClass | None = None,
+    priority: PriorityClass = PriorityClass.NORMAL,
     *,
     uv_path: Path,
     crony_path: Path,

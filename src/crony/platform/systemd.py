@@ -47,8 +47,8 @@ def timer_filename(name: str) -> str:
     return f"{UNIT_PREFIX}-{name}.timer"
 
 
-def _priority_block(priority: PriorityClass | None) -> str:
-    """[Service] priority directives for a job, or '' for normal.
+def _priority_block(priority: PriorityClass) -> str:
+    """[Service] priority directives for a job, or '' for NORMAL.
 
     Linux has no app-vs-background QoS throttling to undo, so HIGH
     only records intent in a comment (CPU + IO stay at defaults);
@@ -64,7 +64,7 @@ def _priority_block(priority: PriorityClass | None) -> str:
 def render_service(
     name: str,
     ref: EntityRef,
-    priority: PriorityClass | None = None,
+    priority: PriorityClass = PriorityClass.NORMAL,
     *,
     uv_path: Path,
     crony_path: Path,

@@ -214,11 +214,12 @@ class _JobCommon:
         return self.log_path_resolved
 
     @property
-    def _unit_priority(self) -> crony.unit.PriorityClass | None:
+    def _unit_priority(self) -> crony.unit.PriorityClass:
         """The process-priority class baked into this entry's platform
-        unit. None here (groups render without one); `Job` overrides to
-        expose its `priority` field."""
-        return None
+        unit. NORMAL here (groups request no special scheduling, and
+        NORMAL emits no platform directives); `Job` overrides to expose
+        its `priority` field."""
+        return crony.unit.PriorityClass.NORMAL
 
     def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks."""
@@ -289,10 +290,11 @@ class Job(_JobCommon):
     gate_args: list[str]
     env: dict[str, str]
     # Process-priority class baked into the platform unit (HIGH / LOW /
-    # NORMAL / None). Pinned in the snapshot so a change re-renders the
-    # unit on the next apply. Default-None for back-compat with
-    # snapshots written before this field existed.
-    priority: crony.unit.PriorityClass | None = None
+    # NORMAL). Resolution maps an unset config priority to NORMAL, so
+    # this is always concrete. Pinned in the snapshot so a change
+    # re-renders the unit on the next apply. Default-NORMAL so a snapshot
+    # predating the field (which stored no priority) loads as NORMAL.
+    priority: crony.unit.PriorityClass = crony.unit.PriorityClass.NORMAL
     # Non-zero exit codes the runner classifies as success (read at
     # fire time). Default-empty for back-compat with older snapshots.
     success_exit_codes: list[int] = field(default_factory=list)
@@ -319,7 +321,7 @@ class Job(_JobCommon):
         return crony.config.JobFlags.KEEP_AWAKE in self.flags
 
     @property
-    def _unit_priority(self) -> crony.unit.PriorityClass | None:
+    def _unit_priority(self) -> crony.unit.PriorityClass:
         """A job's platform unit bakes in its resolved priority class."""
         return self.priority
 
@@ -385,9 +387,7 @@ class Job(_JobCommon):
         """Extend the shared snapshot dict with the job-only `priority`
         (rendered to its source string)."""
         d = super().to_dict()
-        d["priority"] = (
-            str(self.priority) if self.priority is not None else None
-        )
+        d["priority"] = str(self.priority)
         return d
 
 
@@ -552,8 +552,16 @@ def snapshot_from_dict(
     else:
         timing = None
     data["timing"] = timing
-    if data.get("priority") is not None:
-        data["priority"] = crony.unit.PriorityClass.from_str(data["priority"])
+    # A job snapshot always carries `priority`; an older one stored
+    # `null` for the neutral class, which now loads as NORMAL. A group
+    # snapshot has no priority key, so leave it absent for them.
+    if "priority" in data:
+        pv = data["priority"]
+        data["priority"] = (
+            crony.unit.PriorityClass.from_str(pv)
+            if pv is not None
+            else crony.unit.PriorityClass.NORMAL
+        )
     # The per-flag booleans are stored in the snapshot; fold them back
     # into the bitmask for jobs and groups alike. Current snapshots key
     # by the dash token; older ones used the underscore spelling

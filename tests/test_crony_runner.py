@@ -1457,6 +1457,18 @@ class TestJobPriority:
         )
         assert snap.priority == PriorityClass.HIGH
 
+    def test_snapshot_unset_priority_is_normal(self) -> None:
+        # An unset config priority resolves to the concrete NORMAL class
+        # in the snapshot (never None), and an explicit `normal` yields
+        # the same value -- so the two never spuriously diverge.
+        unset = _parse({"job": {"a": _job()}})
+        explicit = _parse({"job": {"a": _job(priority="normal")}})
+        for cfg in (unset, explicit):
+            snap = Job.from_config(
+                cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+            )
+            assert snap.priority is PriorityClass.NORMAL
+
     def test_job_overrides_default(self) -> None:
         cfg = _parse(
             {

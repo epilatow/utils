@@ -111,7 +111,7 @@ class TestSystemdScheduler:
             name=EntityName.from_str("default.brew"),
             ref=_REF,
             timing=timing,
-            priority=None,
+            priority=PriorityClass.NORMAL,
         )
 
     def test_service_and_timer_when_scheduled(self) -> None:
@@ -223,10 +223,12 @@ class TestSystemdAnalyzeVerify:
         # irrelevant to verify (the unit is never run).
         real = Path(sys.executable)
         sched = get_scheduler("linux", tmp_path)
-        shapes: list[
-            tuple[str, Schedule | Interval | None, PriorityClass | None]
-        ] = [
-            ("default.cal-normal", Schedule.from_str("*-*-* 03:00"), None),
+        shapes: list[tuple[str, Schedule | Interval | None, PriorityClass]] = [
+            (
+                "default.cal-normal",
+                Schedule.from_str("*-*-* 03:00"),
+                PriorityClass.NORMAL,
+            ),
             (
                 "default.cal-high",
                 Schedule.from_str("Mon *-*-* 09:00"),
