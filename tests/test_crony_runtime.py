@@ -1348,7 +1348,7 @@ class TestUnitDriftDetection:
         # re-renders it.
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         assert unit_config.exists()
         msgs = [r.getMessage() for r in caplog.records]

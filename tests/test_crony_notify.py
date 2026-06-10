@@ -1082,7 +1082,7 @@ class TestNotifyTestSubcommand:
             "urlopen",
             lambda *_a, **_k: MagicMock(),
         )
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_notify_test(channel=None, bundle="private")
         messages = [r.getMessage() for r in caplog.records]
         assert any(
@@ -1121,7 +1121,7 @@ class TestNotifyTestSubcommand:
             "urlopen",
             lambda *_a, **_k: MagicMock(),
         )
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_notify_test(channel="ntfy", bundle="private")
         messages = [r.getMessage() for r in caplog.records]
         assert any(
@@ -1157,7 +1157,7 @@ class TestNotifyTestSubcommand:
             "urlopen",
             lambda *_a, **_k: MagicMock(),
         )
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_notify_test(channel=None, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert any("notification sent via default.ntfy" in m for m in messages)

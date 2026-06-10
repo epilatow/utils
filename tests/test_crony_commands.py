@@ -693,7 +693,7 @@ class TestApplyFullSync:
         )
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         # Re-apply with no changes: nothing to print.
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert not any("unchanged" in m for m in messages), messages
@@ -738,7 +738,7 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
-        with caplog.at_level(logging.INFO, logger="crony_app"):
+        with caplog.at_level(logging.INFO, logger="crony"):
             crony_commands.do_apply(jobs=[], verbose=True, bundle=None)
         messages = [r.getMessage() for r in caplog.records]
         assert any("unchanged" in m for m in messages), messages
