@@ -2274,6 +2274,67 @@ class TestStatusUuidColumn:
         assert "orphan" in out
 
 
+class TestStatusDivergenceFooter:
+    """The `^` legend footer prints iff a displayed cell carries the
+    marker -- not merely because the entry is stale in a hidden
+    column."""
+
+    _FOOTER = "One or more flagged cells are stale"
+
+    def _stale_schedule(self, tmp_path: Path, monkeypatch: Any) -> None:
+        # Apply a schedule, then edit it (same uuid, same name) without
+        # re-applying: the entry is stale via `schedule`, but its name /
+        # identity cells do not diverge.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 09:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+
+    def test_footer_prints_when_marker_displayed(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        self._stale_schedule(tmp_path, monkeypatch)
+        crony_commands.do_status(
+            jobs=[],
+            cols="schedule",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "^" in out
+        assert self._FOOTER in out
+
+    def test_footer_suppressed_when_no_marker_displayed(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The divergence is in the (hidden) schedule column; the shown
+        # columns carry no `^`, so the legend has nothing to explain.
+        self._stale_schedule(tmp_path, monkeypatch)
+        crony_commands.do_status(
+            jobs=[],
+            cols="config",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "stale" in out  # the entry is stale (CONFIG cell)
+        assert "^" not in out  # but no displayed cell is flagged
+        assert self._FOOTER not in out  # so the footer is suppressed
+
+
 class TestStatusReport:
     def test_prints_table(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any

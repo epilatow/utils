@@ -2226,13 +2226,10 @@ def do_status(
             names_by_ref.setdefault(r, []).append(full)
 
     built: list[tuple[str, dict[str, str]]] = []
-    any_stale = False
 
     def _build_row(
         ref: crony.unit.EntityRef | None, candidates: list[str]
     ) -> None:
-        nonlocal any_stale
-
         def _mark(pending_val: str | None, current_val: str | None) -> str:
             # A dual-source cell: pick the active source's value and
             # append the divergence flag when the two sides differ.
@@ -2240,8 +2237,6 @@ def do_status(
                 pending_val, current_val, config_source
             )
             if diverged:
-                nonlocal any_stale
-                any_stale = True
                 value = f"{value}{_DIVERGENCE_MARKER}"
             return value
 
@@ -2362,7 +2357,6 @@ def do_status(
             _select_name(pending_name, current_name, config_source) or fallback
         )
         if _diverged(pending_name, current_name):
-            any_stale = True
             display_name = f"{display_name}{_DIVERGENCE_MARKER}"
         # UNIT NAME is the platform label of the source-selected name,
         # flagged when the two names give different labels.
@@ -2381,7 +2375,6 @@ def do_status(
         else:
             unit_name = pending_unit or current_unit or ""
         if _diverged(pending_unit, current_unit):
-            any_stale = True
             unit_name = f"{unit_name}{_DIVERGENCE_MARKER}"
         if is_refform:
             # A ref-form row is addressable only by uuid -- a shadowed
@@ -2528,18 +2521,16 @@ def do_status(
             for c in selected_cols
         )
         print(line.rstrip())
-    # The footer applies to any flagged cell. Suppress when the user
-    # picked a column set that hides every column that can carry the
-    # divergence marker.
-    flaggable_cols = {
-        "job",
-        "job-or-uuid",
-        "kind",
-        "schedule",
-        "groups",
-        "unit-name",
-    }
-    if any_stale and any(c in selected_cols for c in flaggable_cols):
+    # Print the divergence footer only when a displayed cell actually
+    # carries the `^` marker -- a column set that shows no flagged cell
+    # has nothing for the legend to explain. This keys on what's on
+    # screen, so any marker-carrying column counts without a separate
+    # list to keep in sync.
+    if any(
+        row[c].endswith(_DIVERGENCE_MARKER)
+        for row in rows
+        for c in selected_cols
+    ):
         print()
         print(_STALE_VALUE_FOOTER)
 
