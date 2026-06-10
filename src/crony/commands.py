@@ -14,6 +14,7 @@ lifecycle itself (apply_one / destroy_one) lives in crony.runtime.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import logging
 import os
@@ -321,6 +322,92 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     if isinstance(timing, crony.unit.Interval):
         return f"interval={timing}"
     return "grouped"
+
+
+def _timeout_display(
+    node: crony.model.Job | crony.model.JobGroup | None,
+) -> str | None:
+    """The entry's wallclock cap as a status cell (`none` for the
+    uncapped 0 sentinel, else `<n>s`): a job's job-timeout-sec or a
+    group's cumulative budget. None for an absent node (a blank cell)."""
+    if node is None:
+        return None
+    sec = node.timeout
+    return "none" if sec == 0 else f"{sec}s"
+
+
+def _priority_display(
+    node: crony.model.Job | crony.model.JobGroup | None,
+) -> str | None:
+    """A job's scheduling priority as a status cell (`normal`, `high`,
+    or `low`), or None for a group or absent node."""
+    if not isinstance(node, crony.model.Job):
+        return None
+    return str(node.priority)
+
+
+# Snapshot fields whose DIVERGED label isn't a plain underscore-to-dash
+# translation of the dataclass attribute. `timing` serializes as
+# `schedule`/`interval`; `timeout` is the `job-timeout-sec` config knob;
+# the interactive `_sec` snapshot fields store resolved seconds but the
+# config knobs take a time-span string (`interactive-active` /
+# `interactive-delay`). Any field not listed falls back to its
+# dash-translated attribute name (so `snapshot_schema` reads
+# `snapshot-schema`, `state_dir_symlink` reads `state-dir-symlink`).
+_DIVERGED_FIELD_LABELS: dict[str, str] = {
+    "timing": "schedule",
+    "timeout": "job-timeout-sec",
+    "interactive_active_sec": "interactive-active",
+    "interactive_delay_sec": "interactive-delay",
+}
+
+
+def _diverged_fields(
+    pending: crony.model.Job | crony.model.JobGroup | None,
+    current: crony.model.Job | crony.model.JobGroup | None,
+    *,
+    unit_stale: bool = False,
+) -> str:
+    """Comma-joined reasons a `config=stale` entry diverges: the
+    snapshot fields that differ between the pending and applied
+    versions, plus `unit` when the installed unit file has drifted from
+    the snapshot (the two ways `config` reads stale).
+
+    Only `compare=True` fields are diffed, mirroring the dataclass `==`
+    the stale verdict itself uses. A config knob is reported by the name
+    the config file uses for it (see `_DIVERGED_FIELD_LABELS`); any other
+    field falls back to its dash-spelled attribute (`snapshot_schema` ->
+    `snapshot-schema`, `state_dir_symlink` -> `state-dir-symlink`). The
+    `flags` bitmask is expanded to the individual capability flags that
+    changed (e.g. `keep-awake`) rather than the field name. Empty for a
+    synced entry, or a stale verdict with no current snapshot to diff (a
+    missing / unparseable remnant). A kind flip between job and group
+    reports `kind`.
+    """
+    parts: list[str] = []
+    if pending is not None and current is not None:
+        if type(pending) is not type(current):
+            parts.append("kind")
+        else:
+            for f in dataclasses.fields(pending):
+                pv, cv = getattr(pending, f.name), getattr(current, f.name)
+                if not f.compare or pv == cv:
+                    continue
+                if f.name == "flags":
+                    parts.extend(
+                        m.token
+                        for m in crony.config.JobFlags.members()
+                        if (m in pv) != (m in cv)
+                    )
+                else:
+                    parts.append(
+                        _DIVERGED_FIELD_LABELS.get(
+                            f.name, f.name.replace("_", "-")
+                        )
+                    )
+    if unit_stale:
+        parts.append("unit")
+    return ",".join(sorted(parts))
 
 
 # =============================================================================
@@ -1517,6 +1604,9 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "unit-timer": "UNIT TIMER",
     "log-file": "LOG FILE",
     "flags": "FLAGS",
+    "timeout": "TIMEOUT",
+    "priority": "PRIORITY",
+    "diverged": "DIVERGED",
 }
 # One opt-in column per capability flag, keyed by the flag's token, so
 # the set tracks `JobFlags` automatically as members are added.
@@ -1661,6 +1751,24 @@ Columns
                     the config path, --config-current the applied one,
                     flagged with `^` when the two diverge (a not-yet-
                     applied rename).
+  timeout           Entry wallclock cap: `<n>s`, or `none` for uncapped.
+                    A job's job-timeout-sec or a group's cumulative
+                    budget. Opt-in. Source-selected and `^`-flagged like
+                    `schedule`.
+  priority          Job scheduling priority: high | normal | low. Opt-in,
+                    job-only (blank for groups). Source-selected and
+                    `^`-flagged like `schedule`.
+  diverged          Why a `stale` entry diverges: the snapshot fields
+                    that differ between the config and applied versions,
+                    a config knob named as the config file spells it
+                    (e.g. `command,env,job-timeout-sec`), each changed
+                    capability flag by its own token (e.g. `keep-awake`),
+                    plus `unit` when the installed unit file has drifted
+                    from the snapshot -- a direct answer to "why is this
+                    stale?". Opt-in; blank for a synced entry, or a
+                    stale verdict with no current snapshot to diff. Pair
+                    with `--cols all` to see the diverging cells flagged
+                    with `^`.
 
 Aliases
 -------
@@ -2482,6 +2590,22 @@ def do_status(
             active_flags = (
                 pending_flags if pending_flags is not None else current_flags
             )
+        # `timeout` / `priority` are config fields read from the
+        # snapshot; source-selected and `^`-flagged like the other
+        # dual-source cells.
+        timeout_cell = _mark(
+            _timeout_display(pending_node), _timeout_display(current_node)
+        )
+        priority_cell = _mark(
+            _priority_display(pending_node), _priority_display(current_node)
+        )
+        # `diverged` summarizes why an entry reads stale -- the snapshot
+        # fields that differ, plus `unit` for an installed-unit drift.
+        diverged_cell = _diverged_fields(
+            pending_node,
+            current_node,
+            unit_stale=bool(rt is not None and rt.unit_is_stale),
+        )
         flag_cells: dict[str, str] = {}
         flags_summary_parts: list[str] = []
         for member in crony.config.JobFlags.members():
@@ -2523,6 +2647,9 @@ def do_status(
             "unit-timer": unit_timer_cell,
             "log-file": log_file_cell,
             "flags": ",".join(flags_summary_parts),
+            "timeout": timeout_cell,
+            "priority": priority_cell,
+            "diverged": diverged_cell,
         }
         row_cells.update(flag_cells)
         built.append((config_name, row_cells))

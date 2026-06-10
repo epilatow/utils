@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import logging
@@ -61,6 +62,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     CURRENT_SNAPSHOT_SCHEMA,
+    Job,
 )
 from crony.platform import (  # noqa: E402
     launchd,
@@ -2272,6 +2274,228 @@ class TestStatusUuidColumn:
         out = capsys.readouterr().out
         assert ghost_uuid in out
         assert "orphan" in out
+
+
+class TestStatusFieldColumns:
+    """The opt-in `timeout` / `priority` / `diverged` columns surface
+    entry config fields (and which fields make an entry stale)."""
+
+    def _status(self, cols: str, capsys: Any) -> str:
+        crony_commands.do_status(
+            jobs=[],
+            cols=cols,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out: str = capsys.readouterr().out
+        return out
+
+    def test_timeout_column_value_and_divergence(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        assert "300s" in self._status("job,timeout", capsys)
+        # Edit the timeout without re-applying: pending shown, flagged.
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job-timeout-sec": 600,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert "600s^" in self._status("job,timeout", capsys)
+
+    def test_priority_column_value_and_divergence(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "priority": "high",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        assert "high" in self._status("job,priority", capsys)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "priority": "low",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert "low^" in self._status("job,priority", capsys)
+
+    def test_diverged_lists_changed_fields(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        # Synced: nothing diverges.
+        out = self._status("job,diverged", capsys)
+        assert "command" not in out
+        # Change two fields without re-applying.
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "false",
+                        "schedule": "daily",
+                        "job-timeout-sec": 600,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        out = self._status("job,diverged", capsys)
+        # Sorted, reported by config-file name (timeout -> job-timeout-sec).
+        assert "command,job-timeout-sec" in out
+
+    def test_timeout_shows_group_budget_priority_blank(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # timeout is a shared field: a group node yields its cumulative
+        # budget. priority is job-only, so a group yields no cell.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {"j": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["j"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.apply("g")
+        config = crony_runtime.load_config()
+        gnode = config.current.job_from_ref(
+            config.current.by_full_name[h.full("g")]
+        )
+        assert gnode is not None
+        assert gnode.timeout > 0
+        assert crony_commands._timeout_display(gnode) == f"{gnode.timeout}s"
+        assert crony_commands._priority_display(gnode) is None
+
+    def test_diverged_includes_unit_drift(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A synced snapshot whose installed unit file drifted reads
+        # stale via unit_is_stale; diverged reports `unit`.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        # Delete the installed unit file so the load-time integrity
+        # check flags drift while the snapshot is unchanged.
+        (h.agents / f"org.crony.{h.full('j')}.plist").unlink()
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        assert "unit" in self._status("job,diverged", capsys)
+
+    def test_diverged_fields_helper_branches(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "jx": {"command": "true", "schedule": "daily"},
+                    "child": {"command": "true"},
+                },
+                "job-group": {"gx": {"jobs": ["child"], "schedule": "daily"}},
+            },
+            default_target_jobs=["jx", "gx"],
+        )
+        config = crony_runtime.load_config()
+        jnode = config.pending.job_from_ref(
+            config.pending.by_full_name[h.full("jx")]
+        )
+        gnode = config.pending.job_from_ref(
+            config.pending.by_full_name[h.full("gx")]
+        )
+        d = crony_commands._diverged_fields
+        assert d(None, None) == ""
+        assert d(jnode, None) == ""
+        assert d(jnode, gnode) == "kind"  # job vs group
+        assert d(jnode, jnode) == ""  # identical snapshots
+        assert d(jnode, jnode, unit_stale=True) == "unit"
+        # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
+        assert isinstance(jnode, Job)
+        bumped = dataclasses.replace(jnode, snapshot_schema=4)
+        assert d(jnode, bumped) == "snapshot-schema"
+
+    def test_diverged_expands_changed_flag_to_its_token(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A changed capability flag shows its own token, not `flags`.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "flags": ["keep-awake"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        out = self._status("job,diverged", capsys)
+        assert "keep-awake" in out
+        assert "flags" not in out
 
 
 class TestStatusDivergenceFooter:
