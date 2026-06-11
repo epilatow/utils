@@ -366,12 +366,13 @@ def _diverged_fields(
     pending: crony.model.Job | crony.model.JobGroup | None,
     current: crony.model.Job | crony.model.JobGroup | None,
     *,
-    unit_stale: bool = False,
+    unit_drift: frozenset[str] = frozenset(),
 ) -> str:
     """Comma-joined reasons a `config=stale` entry diverges: the
     snapshot fields that differ between the pending and applied
-    versions, plus `unit` when the installed unit file has drifted from
-    the snapshot (the two ways `config` reads stale).
+    versions, plus `unit-config` / `unit-timer` for each installed unit
+    file that has drifted from the snapshot (the two ways `config` reads
+    stale).
 
     Only `compare=True` fields are diffed, mirroring the dataclass `==`
     the stale verdict itself uses. A config knob is reported by the name
@@ -405,8 +406,7 @@ def _diverged_fields(
                             f.name, f.name.replace("_", "-")
                         )
                     )
-    if unit_stale:
-        parts.append("unit")
+    parts.extend(f"unit-{kind}" for kind in unit_drift)
     return ",".join(sorted(parts))
 
 
@@ -1799,12 +1799,12 @@ Columns
                     a config knob named as the config file spells it
                     (e.g. `command,env,job-timeout-sec`), each changed
                     capability flag by its own token (e.g. `keep-awake`),
-                    plus `unit` when the installed unit file has drifted
-                    from the snapshot -- a direct answer to "why is this
-                    stale?". Opt-in; blank for a synced entry, or a
-                    stale verdict with no current snapshot to diff. Pair
-                    with `--cols all` to see the diverging cells flagged
-                    with `^`.
+                    plus `unit-config` / `unit-timer` for each installed
+                    unit file that drifted from the snapshot -- a direct
+                    answer to "why is this stale?". Opt-in; blank for a
+                    synced entry, or a stale verdict with no current
+                    snapshot to diff. Pair with `--cols all` to see the
+                    diverging cells flagged with `^`.
 
 Aliases
 -------
@@ -2033,10 +2033,11 @@ def _unit_name_for(
 _DIVERGENCE_MARKER: str = "^"
 
 _STALE_VALUE_FOOTER: str = (
-    f"{_DIVERGENCE_MARKER} -- One or more flagged cells are stale: the "
-    "pending config value (shown by default) differs from the applied "
-    "one. Use --config-current to see the applied value, or run "
-    "`crony apply` to bring the applied value in sync."
+    f"{_DIVERGENCE_MARKER} -- One or more flagged cells are stale; "
+    "`crony apply` reconciles them. Either the pending config value "
+    "(shown by default) differs from the applied one -- see it with "
+    "--config-current -- or an installed unit file drifted from the "
+    "snapshot."
 )
 
 # ANSI color for the status table, emitted only when stdout is a TTY
@@ -2590,8 +2591,16 @@ def do_status(
         # no runtime, and unit-timer is empty where the platform has no
         # separate timer unit / for an unscheduled entry.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
+        unit_drift = rt.unit_drift if rt is not None else frozenset()
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
+        # Flag the specific unit file whose install drifted from the
+        # snapshot (re-apply re-renders it), mirroring the `diverged`
+        # `unit-config` / `unit-timer` tokens.
+        if unit_config_cell and crony.platform.UNIT_CONFIG in unit_drift:
+            unit_config_cell = f"{unit_config_cell}{_DIVERGENCE_MARKER}"
+        if unit_timer_cell and crony.platform.UNIT_TIMER in unit_drift:
+            unit_timer_cell = f"{unit_timer_cell}{_DIVERGENCE_MARKER}"
         # `log-file`: the reported log path, read off each side's node
         # via the same `log_path` accessor `crony logs` uses. Dual-
         # source, so a not-yet-applied rename flags `^`. An orphan row
@@ -2630,11 +2639,12 @@ def do_status(
             _priority_display(pending_node), _priority_display(current_node)
         )
         # `diverged` summarizes why an entry reads stale -- the snapshot
-        # fields that differ, plus `unit` for an installed-unit drift.
+        # fields that differ, plus `unit-config` / `unit-timer` for an
+        # installed-unit drift.
         diverged_cell = _diverged_fields(
             pending_node,
             current_node,
-            unit_stale=bool(rt is not None and rt.unit_is_stale),
+            unit_drift=unit_drift,
         )
         flag_cells: dict[str, str] = {}
         flags_summary_parts: list[str] = []

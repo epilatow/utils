@@ -789,17 +789,15 @@ class RuntimeState:
     UNIT axis queries `unit_state` on demand, since the scheduler view
     can change between load and read.
 
-    `unit_is_stale` is True when the platform install diverges
-    from what the snapshot would render: missing or hand-edited
-    unit file, missing uv / crony binary baked into the file, or
-    a unit the scheduler no longer has loaded (a schedule-less
-    entry on linux is exempt from that last check -- its static,
-    on-demand `.service` has no timer to load, so being unknown to
-    the scheduler is its resting state, not drift). Drives the
-    CONFIG=stale axis and forces apply to re-render even when
-    the snapshot itself is unchanged. Set only for entries with
-    a parseable snapshot; defaults False for broken / unit-only
-    refs that don't have a snapshot to compare against.
+    `unit_drift` holds the unit-file kinds (`config` / `timer`) whose
+    platform install diverges from what the snapshot would render:
+    missing or hand-edited unit file, missing uv / crony binary baked
+    into the file, or the schedule-bearing unit the scheduler no longer
+    has loaded. The derived `unit_is_stale` (any drift) drives the
+    CONFIG=stale axis and forces apply to re-render even when the
+    snapshot itself is unchanged. Set only for entries with a parseable
+    snapshot; empty for broken / unit-only refs that have no snapshot to
+    compare against.
     """
 
     state_dir: Path
@@ -809,11 +807,16 @@ class RuntimeState:
     has_user_trigger_flag: bool
     unit_config: Path | None = None
     unit_timer: Path | None = None
-    unit_is_stale: bool = False
+    unit_drift: frozenset[str] = frozenset()
     # The scheduler's last-launch outcome, captured at load alongside
     # `last_run`. None when the scheduler has no record (or wasn't
     # queried). Reconciled against `last_run` by `crashed`.
     unit_last_exit: crony.platform.UnitLastExit | None = None
+
+    @property
+    def unit_is_stale(self) -> bool:
+        """True when any unit file has drifted from the snapshot."""
+        return bool(self.unit_drift)
 
     @property
     def crashed(self) -> bool:

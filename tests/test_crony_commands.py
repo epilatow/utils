@@ -2425,18 +2425,26 @@ class TestStatusFieldColumns:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # A synced snapshot whose installed unit file drifted reads
-        # stale via unit_is_stale; diverged reports `unit`.
+        # stale; the launchd plist is the config unit, so diverged
+        # reports `unit-config`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
-        # Delete the installed unit file so the load-time integrity
+        # Hand-edit the installed unit file so the load-time integrity
         # check flags drift while the snapshot is unchanged.
-        (h.agents / f"org.crony.{h.full('j')}.plist").unlink()
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        plist.write_text(plist.read_text() + "\n<!-- edited -->\n")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
-        assert "unit" in self._status("job,diverged", capsys)
+        out = self._status("job,diverged,unit-config", capsys)
+        assert "unit-config" in out
+        # The drifted unit's own column is flagged.
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "^" in row
 
     def test_diverged_fields_helper_branches(
         self, tmp_path: Path, monkeypatch: Any
@@ -2460,11 +2468,18 @@ class TestStatusFieldColumns:
             config.pending.by_full_name[h.full("gx")]
         )
         d = crony_commands._diverged_fields
+        cfg_drift = frozenset({crony_platform.UNIT_CONFIG})
+        both_drift = frozenset(
+            {crony_platform.UNIT_CONFIG, crony_platform.UNIT_TIMER}
+        )
         assert d(None, None) == ""
         assert d(jnode, None) == ""
         assert d(jnode, gnode) == "kind"  # job vs group
         assert d(jnode, jnode) == ""  # identical snapshots
-        assert d(jnode, jnode, unit_stale=True) == "unit"
+        assert d(jnode, jnode, unit_drift=cfg_drift) == "unit-config"
+        assert (
+            d(jnode, jnode, unit_drift=both_drift) == "unit-config,unit-timer"
+        )
         # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
         assert isinstance(jnode, Job)
         bumped = dataclasses.replace(jnode, snapshot_schema=4)

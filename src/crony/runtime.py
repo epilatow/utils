@@ -106,7 +106,7 @@ def _read_runtime_state(
 
     `snapshot` is the parsed `Job` / `JobGroup` for entries in
     `Config.current`; when supplied (with a known `full_name`),
-    the unit-install integrity check runs and `unit_is_stale`
+    the unit-install integrity check runs and `unit_drift`
     reflects the result. Left None for broken refs (no snapshot)
     and unit-only refs (no state dir to read from).
 
@@ -136,12 +136,12 @@ def _read_runtime_state(
 
     unit_config: Path | None = None
     unit_timer: Path | None = None
-    unit_is_stale = False
+    unit_drift: frozenset[str] = frozenset()
     if full_name is not None:
         unit_config = _platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
         if snapshot is not None:
-            unit_is_stale = _unit_is_stale(snapshot)
+            unit_drift = _unit_drift(snapshot)
 
     unit_last_exit = (
         last_exits.get(full_name)
@@ -156,7 +156,7 @@ def _read_runtime_state(
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
         unit_config=unit_config,
         unit_timer=unit_timer,
-        unit_is_stale=unit_is_stale,
+        unit_drift=unit_drift,
         unit_last_exit=unit_last_exit,
     )
 
@@ -526,12 +526,12 @@ def host() -> crony.platform.HostPlatform:
     return crony.platform.get_host(crony.platform.current_platform())
 
 
-def _unit_is_stale(
+def _unit_drift(
     snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
-) -> bool:
-    """True when the platform install diverges from the snapshot --
-    delegates to the scheduler's drift check."""
-    return scheduler(platform).is_stale(snap.unit_spec())
+) -> frozenset[str]:
+    """The unit-file kinds whose platform install diverges from the
+    snapshot -- delegates to the scheduler's per-file drift check."""
+    return scheduler(platform).drifted_units(snap.unit_spec())
 
 
 def recover_full_name(state_dir: Path) -> str | None:

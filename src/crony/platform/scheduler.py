@@ -26,6 +26,15 @@ from crony.unit import UnitSpec
 # the script filename.
 UNIT_PREFIX = "crony"
 
+# The logical unit-file kinds a scheduler manages, reported by
+# `drifted_units` so status can flag the specific stale file. CONFIG is
+# the unit that defines and runs the job (systemd `.service`, launchd
+# plist); TIMER arms its schedule (systemd `.timer`). launchd folds the
+# schedule into the plist, so it has no TIMER. These match the
+# `unit-config` / `unit-timer` status columns.
+UNIT_CONFIG = "config"
+UNIT_TIMER = "timer"
+
 
 class UnitState(enum.Enum):
     """The platform scheduler's enable/disable view of a unit by name.
@@ -173,10 +182,11 @@ class Scheduler(abc.ABC):
         the live outcome."""
 
     @abc.abstractmethod
-    def is_stale(self, spec: UnitSpec) -> bool:
-        """True when the installed units diverge from `spec` -- a file
-        missing or not matching what `render` would produce, or a unit
-        the scheduler has unloaded."""
+    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
+        """The unit-file kinds (UNIT_CONFIG / UNIT_TIMER) whose install
+        diverges from `spec` -- a file missing or not matching what
+        `render` would produce, or the schedule-bearing unit the
+        scheduler has unloaded. Empty when the install is in sync."""
 
     @abc.abstractmethod
     def activate(

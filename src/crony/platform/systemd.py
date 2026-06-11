@@ -16,7 +16,9 @@ import subprocess
 from pathlib import Path
 
 from crony.platform.scheduler import (
+    UNIT_CONFIG,
     UNIT_PREFIX,
+    UNIT_TIMER,
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
@@ -335,40 +337,47 @@ class SystemdScheduler(Scheduler):
             out[name] = UnitLastExit(exit_status=-raw if killed else raw)
         return out
 
-    def is_stale(self, spec: UnitSpec) -> bool:
+    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
         name = str(spec.name)
         expected = set(self.render(spec, uv_path=Path(), crony_path=Path()))
+        drifted: set[str] = set()
         # An orphaned .timer left over from a schedule -> unscheduled
-        # transition is drift even though it's not in `expected`.
+        # transition is timer drift even though it's not in `expected`.
         timer = self.unit_dir / timer_filename(name)
         if timer.is_file() and timer.name not in expected:
-            return True
+            drifted.add(UNIT_TIMER)
         for fname in expected:
+            kind = UNIT_TIMER if fname.endswith(".timer") else UNIT_CONFIG
             path = self.unit_dir / fname
             try:
                 content = path.read_text(encoding="utf-8")
             except OSError:
-                return True
+                drifted.add(kind)
+                continue
             if fname.endswith(".timer"):
                 assert spec.timing is not None
                 if content != render_timer(name, spec.timing):
-                    return True
+                    drifted.add(UNIT_TIMER)
                 continue
             extracted = _extract_exec_paths(content)
             if extracted is None:
-                return True
+                drifted.add(UNIT_CONFIG)
+                continue
             uv_path, crony_path = extracted
             if not uv_path.is_file() or not crony_path.is_file():
-                return True
+                drifted.add(UNIT_CONFIG)
+                continue
             rendered = self.render(spec, uv_path=uv_path, crony_path=crony_path)
             if content != rendered[fname]:
-                return True
-        # A grouped (schedule-less) entry is a static, on-demand
-        # `.service` with no timer to load, so an unloaded scheduler
-        # state is its correct resting state, not drift.
-        if spec.timing is None:
-            return False
-        return self.state(name) == UnitState.NONE
+                drifted.add(UNIT_CONFIG)
+        # A scheduled entry the scheduler has unloaded won't fire: the
+        # .timer is the unit that needs (re)loading, so flag it. A
+        # grouped (schedule-less) entry is a static, on-demand `.service`
+        # with no timer, so being unknown to the scheduler is its
+        # resting state, not drift.
+        if spec.timing is not None and self.state(name) == UnitState.NONE:
+            drifted.add(UNIT_TIMER)
+        return frozenset(drifted)
 
     def activate(
         self, name: str, *, prior_disabled: bool, scheduled: bool

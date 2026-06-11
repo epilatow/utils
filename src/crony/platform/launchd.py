@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from crony.platform.scheduler import (
+    UNIT_CONFIG,
     UNIT_PREFIX,
     Scheduler,
     UnitLastExit,
@@ -130,7 +131,7 @@ def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
     # render_plist wraps the run in `/bin/sh -c 'exec <uv> ...'`;
     # unwrap to the bare runner argv the shared check validates. A
     # plist not in this shape is treated as not-crony (None), which
-    # is_stale reads as drift and re-renders.
+    # drifted_units reads as drift and re-renders.
     if len(args) != 3 or args[:2] != ["/bin/sh", "-c"]:
         return None
     try:
@@ -272,25 +273,30 @@ class LaunchdScheduler(Scheduler):
             out[lbl[len(prefix) :]] = UnitLastExit(exit_status=status)
         return out
 
-    def is_stale(self, spec: UnitSpec) -> bool:
+    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
+        # launchd has only the plist (CONFIG); the schedule lives in it,
+        # so there is never a separate timer to drift.
+        config = frozenset({UNIT_CONFIG})
         name = str(spec.name)
         path = self.unit_dir / plist_filename(name)
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
-            return True
+            return config
         extracted = _extract_exec_paths(content)
         if extracted is None:
-            return True
+            return config
         uv_path, crony_path = extracted
         if not uv_path.is_file() or not crony_path.is_file():
-            return True
+            return config
         rendered = self.render(spec, uv_path=uv_path, crony_path=crony_path)
         if content != rendered[plist_filename(name)]:
-            return True
+            return config
         # A grouped (schedule-less) plist must still be loaded to be
         # kickstartable, so an unloaded unit is drift here too.
-        return self.state(name) == UnitState.NONE
+        if self.state(name) == UnitState.NONE:
+            return config
+        return frozenset()
 
     def _gui(self, name: str) -> str:
         return f"gui/{os.getuid()}/{label(name)}"

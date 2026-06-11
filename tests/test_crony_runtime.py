@@ -1248,6 +1248,11 @@ class TestUnitDriftDetection:
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
+        # The launchd plist is the config unit; the schedule lives in it,
+        # so there is no separate timer to drift.
+        assert config.runtime[ref].unit_drift == frozenset(
+            {crony_platform.UNIT_CONFIG}
+        )
 
     def test_missing_unit_file_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
@@ -1270,6 +1275,61 @@ class TestUnitDriftDetection:
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.runtime[ref].unit_is_stale is True
+        # launchd has only the plist, so its unload flags the config unit.
+        assert config.runtime[ref].unit_drift == frozenset(
+            {crony_platform.UNIT_CONFIG}
+        )
+
+    def _linux_drift(
+        self, tmp_path: Path, monkeypatch: Any, edit: str
+    ) -> frozenset[str]:
+        # Apply a scheduled job on linux (a .service + .timer), edit the
+        # named unit file, and return the per-file drift `load_config`
+        # records.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        path = h.sysd / f"crony-{h.full('j')}.{edit}"
+        path.write_text(path.read_text() + "\n# edited\n")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        result: frozenset[str] = config.runtime[ref].unit_drift
+        return result
+
+    def test_linux_service_edit_is_config_drift(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        assert self._linux_drift(tmp_path, monkeypatch, "service") == frozenset(
+            {crony_platform.UNIT_CONFIG}
+        )
+
+    def test_linux_timer_edit_is_timer_drift(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        assert self._linux_drift(tmp_path, monkeypatch, "timer") == frozenset(
+            {crony_platform.UNIT_TIMER}
+        )
+
+    def test_linux_unloaded_scheduled_is_timer_drift(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A scheduled entry the scheduler unloaded won't fire; the .timer
+        # is the unit that needs reloading, so the drift is the timer.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.runtime[ref].unit_drift == frozenset(
+            {crony_platform.UNIT_TIMER}
+        )
 
     def test_grouped_entry_not_stale_on_linux(
         self, tmp_path: Path, monkeypatch: Any
