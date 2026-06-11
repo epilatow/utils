@@ -3265,10 +3265,16 @@ class TestStatusReport:
         assert "orphan" in row
         assert row.split()[-1] == "unused"
 
-    def test_cols_all_alias_expands_to_every_column(
-        self, tmp_path: Path, monkeypatch: Any, capsys: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
+    def _all_header(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        capsys: Any,
+        *,
+        platform: str,
+        show_masked: bool,
+    ) -> str:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
@@ -3278,22 +3284,155 @@ class TestStatusReport:
         crony_commands.do_status(
             jobs=[],
             cols="all",
-            show_masked=False,
+            show_masked=show_masked,
             config_current=False,
             config_pending=False,
             bundle=None,
             exclude_healthy=False,
         )
-        header = capsys.readouterr().out.splitlines()[0]
-        assert "JOB" in header
-        assert "KIND" in header
-        assert "CONFIG" in header
-        assert "SCHEDULE" in header
-        assert "UNIT" in header
-        assert "LAST" in header
-        assert "LAST RAN" in header
-        assert "MASKED BY" in header
-        assert "UUID" in header
+        out: str = capsys.readouterr().out
+        return out.splitlines()[0]
+
+    def test_cols_all_alias_trims_context_blank_columns(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # On darwin without -a, `all` carries the broad set but drops the
+        # columns that would always be blank here: masked-by (no -a),
+        # unit-timer (launchd has none), and the per-flag columns (FLAGS
+        # covers them).
+        header = self._all_header(
+            tmp_path, monkeypatch, capsys, platform="darwin", show_masked=False
+        )
+        for present in (
+            "JOB",
+            "KIND",
+            "CONFIG",
+            "SCHEDULE",
+            "UNIT",
+            "LAST",
+            "LAST RAN",
+            "UUID",
+            "UNIT CONFIG",
+            "FLAGS",
+            "TIMEOUT",
+            "DIVERGED",
+        ):
+            assert present in header
+        assert "MASKED BY" not in header
+        assert "UNIT TIMER" not in header
+        assert "INTERACTIVE" not in header
+
+    def test_cols_all_alias_includes_masked_by_with_show_masked(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `-a` surfaces a masked entry, whose masked-by cell carries a
+        # reason, so `all` keeps the column.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_status(
+            jobs=[],
+            cols="all",
+            show_masked=True,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        assert "MASKED BY" in capsys.readouterr().out.splitlines()[0]
+
+    def test_cols_all_alias_keeps_masked_by_for_named_masked_job(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Naming a pure-masked entry surfaces it without -a; `all` then
+        # keeps masked-by so its reason stays visible.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_status(
+            jobs=["j"],
+            cols="all",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "MASKED BY" in out.splitlines()[0]
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "host" in row.split()
+
+    def test_cols_all_alias_includes_unit_timer_on_linux(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        header = self._all_header(
+            tmp_path, monkeypatch, capsys, platform="linux", show_masked=False
+        )
+        assert "UNIT TIMER" in header
+
+    def test_cols_all_alias_keeps_masked_by_for_orphan_remnant(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # An applied entry later masked here leaves an orphan-masked
+        # remnant that surfaces its mask reason in the default view, so
+        # `all` keeps masked-by even without -a.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "hosts": ["other"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        crony_commands.do_status(
+            jobs=[],
+            cols="all",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "MASKED BY" in out.splitlines()[0]
+        row = next(
+            line for line in out.splitlines() if line.startswith(h.full("j"))
+        )
+        assert "host" in row.split()
 
     def test_cols_default_alias_matches_no_cols(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3353,6 +3492,54 @@ class TestStatusReport:
         assert "UNIT TIMER" in out
         assert "crony-default.j.service" in out
         assert "crony-default.j.timer" in out
+
+    def test_cols_unit_files_alias_drops_timer_on_darwin(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # launchd pins the schedule in the plist, so there is no timer
+        # file; `unit-files` is just unit-config on darwin.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        crony_commands.do_status(
+            jobs=[],
+            cols="job,unit-files",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        header = capsys.readouterr().out.splitlines()[0]
+        assert "UNIT CONFIG" in header
+        assert "UNIT TIMER" not in header
+
+    def test_explicit_column_overrides_alias_trimming(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `all` drops unit-timer on darwin, but naming it explicitly
+        # alongside the alias still shows it.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        crony_commands.do_status(
+            jobs=[],
+            cols="all,unit-timer",
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        assert "UNIT TIMER" in capsys.readouterr().out.splitlines()[0]
 
     def test_cols_default_combined_with_extra_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -4009,11 +4196,15 @@ class TestStatusReport:
         # block doubles as the documentation of the default set.
         for col in crony_commands._DEFAULT_STATUS_COLS:
             assert col in text
-        # `all` is rendered as a label rather than the full list.
-        assert "  all       all" in text
-        # `unit-files` expands to the two unit-path columns.
+        # The three aliases are each documented.
+        assert "default" in text
+        assert "  all " in text
         assert "unit-files" in text
-        assert "unit-config, unit-timer" in text
+        # The `all` description notes the context-sensitive trimming.
+        assert "Every column except the per-flag columns" in text
+        assert "launchd has no timer file" in text
+        # `unit-files` documents its Linux-only timer.
+        assert "unit-config, plus unit-timer on Linux" in text
 
     def test_schedule_column_renders_cron_interval_and_grouped(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -5853,9 +6044,11 @@ class TestStatusFlagsColumns:
         assert "KEEP-AWAKE" in out.splitlines()[0]
         assert self._row_for(out, h.full("j")).split()[-1] == "true"
 
-    def test_all_alias_includes_flag_columns(
+    def test_all_alias_omits_per_flag_columns_for_flags(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
+        # `all` carries the compact FLAGS column but not the redundant
+        # per-flag columns; those stay reachable by explicit name.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -5866,8 +6059,11 @@ class TestStatusFlagsColumns:
         self._status("all")
         header = capsys.readouterr().out.splitlines()[0]
         assert "FLAGS" in header
-        assert "INTERACTIVE" in header
-        assert "KEEP-AWAKE" in header
+        assert "INTERACTIVE" not in header
+        assert "KEEP-AWAKE" not in header
+        # Explicitly named, a per-flag column still shows.
+        self._status("interactive")
+        assert "INTERACTIVE" in capsys.readouterr().out.splitlines()[0]
 
     def test_pending_flag_change_flags_caret(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any

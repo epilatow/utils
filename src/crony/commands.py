@@ -1619,11 +1619,46 @@ _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "last",
     "last-ran",
 )
-_STATUS_COL_ALIASES: dict[str, tuple[str, ...]] = {
-    "default": _DEFAULT_STATUS_COLS,
-    "all": tuple(_STATUS_COL_HEADERS.keys()),
-    "unit-files": ("unit-config", "unit-timer"),
-}
+_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = ("default", "all", "unit-files")
+
+
+def _expand_status_alias(
+    name: str, *, masked_present: bool, platform: str
+) -> tuple[str, ...]:
+    """Expand a `--cols` alias to its column list for this context.
+
+    `all` and `unit-files` trim columns that would only ever be blank
+    here, so the wide views stay useful rather than padded with dead
+    space:
+
+    - `all` drops the per-flag columns (the compact `flags` column
+      already carries them), `masked-by` when no displayed row carries
+      a mask reason (`masked_present` is false), and `unit-timer` on
+      darwin (launchd pins the schedule in the plist, so there is no
+      timer file).
+    - `unit-files` drops `unit-timer` on darwin for the same reason.
+
+    Trimming applies only to the alias; a column named explicitly is
+    always honored (`--cols all,unit-timer` still shows the timer).
+    """
+    if name == "default":
+        return _DEFAULT_STATUS_COLS
+    is_darwin = platform == "darwin"
+    if name == "unit-files":
+        if is_darwin:
+            return ("unit-config",)
+        return ("unit-config", "unit-timer")
+    flag_tokens = {f.token for f in crony.config.JobFlags.members()}
+    out: list[str] = []
+    for col in _STATUS_COL_HEADERS:
+        if col in flag_tokens:
+            continue
+        if col == "masked-by" and not masked_present:
+            continue
+        if col == "unit-timer" and is_darwin:
+            continue
+        out.append(col)
+    return tuple(out)
 
 
 _STATUS_HELP_EPILOG_TEMPLATE: str = """\
@@ -1657,7 +1692,8 @@ Columns
                     {flag_tokens}). Same source rules and `^`
                     divergence flag as the `flags` summary; a group
                     shows its inherited cascade value, the same as a
-                    job.
+                    job. Request by name; the `all` alias omits these in
+                    favor of the compact `flags` column.
   groups            Comma-separated full names of groups containing this
                     entry. Same source rules as `schedule`: default and
                     --config-pending show the pending membership,
@@ -1772,7 +1808,13 @@ Columns
 
 Aliases
 -------
-{aliases_block}
+  default     {default_cols}
+  all         Every column except the per-flag columns (use the compact
+              `flags` instead), `masked-by` (kept only when a masked
+              entry is present), and -- on macOS -- `unit-timer`
+              (launchd has no timer file). Naming an excluded column
+              explicitly still shows it.
+  unit-files  unit-config, plus unit-timer on Linux.
 
 Color
 -----
@@ -1786,31 +1828,15 @@ Color
 """
 
 
-def _build_status_aliases_block() -> str:
-    """Render the Aliases help block from `_STATUS_COL_ALIASES`.
-
-    Each alias becomes one line: `  <name>  <expansion>`. `all`
-    is rendered with a descriptive label instead of the full
-    column list (which would just enumerate everything in the
-    Columns section above) so the block stays scannable.
-    """
-    lines: list[str] = []
-    for alias, expansion in _STATUS_COL_ALIASES.items():
-        if alias == "all":
-            label = "all"
-        else:
-            label = ", ".join(expansion)
-        lines.append(f"  {alias:<8}  {label}")
-    return "\n".join(lines)
-
-
 STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
-    aliases_block=_build_status_aliases_block(),
+    default_cols=", ".join(_DEFAULT_STATUS_COLS),
     flag_tokens=", ".join(f.token for f in crony.config.JobFlags.members()),
 )
 
 
-def _parse_status_cols(spec: str | None) -> list[str]:
+def _parse_status_cols(
+    spec: str | None, *, masked_present: bool, platform: str
+) -> list[str]:
     """Parse the `--cols` argument into an ordered column list.
 
     Comma-separated; whitespace around names is ignored.
@@ -1818,28 +1844,33 @@ def _parse_status_cols(spec: str | None) -> list[str]:
     column) because everything else is meaningless without an
     entity identity, and it's the one column guaranteed to be
     pasteable back into `crony destroy` even for nameless or
-    name-shadowed rows. `default` and `all` are aliases that
-    expand to the default column set and every column
-    respectively; mixing aliases with explicit names is allowed
-    (`default,masked-by`). Order is preserved across the resolved
-    list with duplicates dropped. Unknown names raise UsageError
-    so a typo is loud, not a silent missing column.
+    name-shadowed rows. `default`, `all`, and `unit-files` are
+    aliases expanded by `_expand_status_alias` (which trims columns
+    that would be blank in this context); mixing aliases with
+    explicit names is allowed (`default,masked-by`), and an
+    explicitly named column is never trimmed. Order is preserved
+    across the resolved list with duplicates dropped. Unknown names
+    raise UsageError so a typo is loud, not a silent missing column.
     """
     if not spec:
         return list(_DEFAULT_STATUS_COLS)
     raw = [c.strip() for c in spec.split(",") if c.strip()]
-    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIASES)
+    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIAS_NAMES)
     unknown = [c for c in raw if c not in valid]
     if unknown:
         raise crony.errors.UsageError(
             f"unknown status column(s): {sorted(unknown)} "
             f"(valid: {sorted(_STATUS_COL_HEADERS)}; "
-            f"aliases: {sorted(_STATUS_COL_ALIASES)})"
+            f"aliases: {sorted(_STATUS_COL_ALIAS_NAMES)})"
         )
     expanded: list[str] = []
     for c in raw:
-        if c in _STATUS_COL_ALIASES:
-            expanded.extend(_STATUS_COL_ALIASES[c])
+        if c in _STATUS_COL_ALIAS_NAMES:
+            expanded.extend(
+                _expand_status_alias(
+                    c, masked_present=masked_present, platform=platform
+                )
+            )
         else:
             expanded.append(c)
     seen: set[str] = set()
@@ -2275,7 +2306,6 @@ def do_status(
         if config_pending
         else "default"
     )
-    selected_cols = _parse_status_cols(cols)
     config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
@@ -2716,6 +2746,14 @@ def do_status(
         for row in sorted(off_tree, key=lambda r: r["job-or-uuid"]):
             ordered.append(row)
         rows = ordered
+
+    # Deferred until the displayed rows exist: the `all` alias's
+    # masked-by trim keys on whether any shown row carries a reason,
+    # which only the built rows can answer.
+    masked_present = any(row["masked-by"] for row in rows)
+    selected_cols = _parse_status_cols(
+        cols, masked_present=masked_present, platform=platform
+    )
 
     # Per-column width: max of the header label and the longest
     # cell, so a long "last-ran" value (`12d ago`) doesn't get
