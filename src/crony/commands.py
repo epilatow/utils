@@ -1821,10 +1821,10 @@ Color
   When stdout is a TTY (and NO_COLOR is unset), broken / failed states
   are red -- CONFIG `missing` / `error` / `broken` / `orphan` and LAST
   `fail` / `timeout` / `canceled` / `crashed` -- and reconcilable drift
-  is yellow --
-  a `stale` CONFIG verdict and any cell carrying the `^` divergence
-  marker (the `^` itself stays uncolored). Redirected or piped output
-  is always plain.
+  is yellow: a `stale` CONFIG verdict and every stale value cell. On a
+  color stream a stale cell is shown by its yellow value alone; the `^`
+  marker is dropped. Redirected or piped output is plain -- there
+  staleness shows as a `^` on each stale cell plus a footnote legend.
 """
 
 
@@ -2098,23 +2098,27 @@ def _status_value_color(col: str, value: str) -> str | None:
 def _render_status_cell(
     col: str, value: str, width: int, use_color: bool
 ) -> str:
-    """Render one status cell padded to `width`, optionally colored.
+    """Render one status cell padded to `width`.
 
-    Width padding is computed from the visible text and kept outside
-    the color codes so zero-width escapes never throw off column
-    alignment. A divergence-flagged value (trailing `^`) is colored
-    yellow on the value only -- the `^` and the padding stay plain.
+    Staleness has two mutually exclusive presentations. On a plain
+    stream the cell keeps its `^` marker(s) verbatim (the footer legend
+    explains them). On a color stream the marker is dropped -- a stale
+    cell is shown by coloring its value yellow instead -- so the `^`
+    never clutters interactive output. Padding is computed from the
+    visible text and kept outside the color codes so zero-width escapes
+    never throw off column alignment.
     """
-    pad = " " * max(0, width - len(value))
     if not use_color:
-        return value + pad
-    if value.endswith(_DIVERGENCE_MARKER):
-        body = value[: -len(_DIVERGENCE_MARKER)]
-        return f"{_ANSI_YELLOW}{body}{_ANSI_RESET}{_DIVERGENCE_MARKER}{pad}"
-    code = _status_value_color(col, value)
+        return value + " " * max(0, width - len(value))
+    stale = _DIVERGENCE_MARKER in value
+    body = value.replace(_DIVERGENCE_MARKER, "")
+    pad = " " * max(0, width - len(body))
+    if stale:
+        return f"{_ANSI_YELLOW}{body}{_ANSI_RESET}{pad}"
+    code = _status_value_color(col, body)
     if code is None:
-        return value + pad
-    return f"{code}{value}{_ANSI_RESET}{pad}"
+        return body + pad
+    return f"{code}{body}{_ANSI_RESET}{pad}"
 
 
 def _build_group_membership(
@@ -2765,13 +2769,19 @@ def do_status(
         cols, masked_present=masked_present, platform=platform
     )
 
+    use_color = _color_supported()
+
     # Per-column width: max of the header label and the longest
-    # cell, so a long "last-ran" value (`12d ago`) doesn't get
-    # squeezed by the 8-char header.
+    # displayed cell, so a long "last-ran" value (`12d ago`) doesn't get
+    # squeezed by the 8-char header. A color stream drops the `^` marker
+    # (color carries the staleness), so its width is measured without it.
+    def _displayed(value: str) -> str:
+        return value.replace(_DIVERGENCE_MARKER, "") if use_color else value
+
     widths: dict[str, int] = {}
     for col in selected_cols:
         header = _STATUS_COL_HEADERS[col]
-        cell_max = max((len(r[col]) for r in rows), default=0)
+        cell_max = max((len(_displayed(r[col])) for r in rows), default=0)
         widths[col] = max(len(header), cell_max)
 
     # Two-space separator: a single space ran headers and cells
@@ -2782,21 +2792,20 @@ def do_status(
         f"{_STATUS_COL_HEADERS[c]:<{widths[c]}}" for c in selected_cols
     )
     print(header_line.rstrip())
-    use_color = _color_supported()
     for row in rows:
         line = sep.join(
             _render_status_cell(c, row[c], widths[c], use_color)
             for c in selected_cols
         )
         print(line.rstrip())
-    # Print the divergence footer only when a displayed cell actually
-    # carries the `^` marker -- a column set that shows no flagged cell
-    # has nothing for the legend to explain. This keys on what's on
-    # screen, so any marker-carrying column counts without a separate
-    # list to keep in sync. The marker can sit mid-cell -- the `flags`
-    # summary tags individual flags (e.g. `interactive^,keep-awake`) --
-    # so test for it anywhere in the cell, not only at the end.
-    if any(_DIVERGENCE_MARKER in row[c] for row in rows for c in selected_cols):
+    # The `^` marker and this legend are the plain-text staleness signal;
+    # a color stream shows staleness by color instead, so the footer
+    # prints only when not coloring and a displayed cell carries `^`.
+    # The marker can sit mid-cell -- the `flags` summary tags individual
+    # flags (e.g. `interactive^,keep-awake`) -- so test for it anywhere.
+    if not use_color and any(
+        _DIVERGENCE_MARKER in row[c] for row in rows for c in selected_cols
+    ):
         print()
         print(_STALE_VALUE_FOOTER)
 

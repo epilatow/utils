@@ -7401,7 +7401,8 @@ class TestStatusRenameUuidModel:
 class TestStatusColor:
     """The status table colors broken / failed states red and drift
     (a `stale` verdict or a divergence-flagged cell) yellow, but only
-    when stdout is a color-capable TTY. The `^` marker stays uncolored.
+    when stdout is a color-capable TTY. On a color stream the `^` marker
+    and its footer legend are dropped -- color is the staleness signal.
     """
 
     R = crony_commands._ANSI_RED
@@ -7445,10 +7446,14 @@ class TestStatusColor:
         out = capsys.readouterr().out
         # `stale` verdict -> yellow.
         assert f"{self.Y}stale{self.X}" in out
-        # Divergence-flagged schedule -> yellow value, `^` left plain.
-        assert f"{self.Y}*-*-* 09:00{self.X}^" in out
+        # Divergence-flagged schedule -> yellow value; on a color stream
+        # the `^` marker is dropped.
+        assert f"{self.Y}*-*-* 09:00{self.X}" in out
+        assert "*-*-* 09:00^" not in out
         # `missing` verdict -> red.
         assert f"{self.R}missing{self.X}" in out
+        # The footer legend is a plain-stream signal only; not on color.
+        assert "flagged cells are stale" not in out
 
     def test_last_fail_is_red(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -7529,6 +7534,10 @@ class TestStatusColor:
         out = capsys.readouterr().out
         assert "stale" in out
         assert "\033[" not in out
+        # On a plain stream staleness shows as the `^` marker plus the
+        # footer legend, not color.
+        assert "*-*-* 09:00^" in out
+        assert "flagged cells are stale" in out
 
     def test_color_supported_respects_no_color_and_tty(
         self, monkeypatch: Any
