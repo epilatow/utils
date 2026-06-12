@@ -716,13 +716,16 @@ class JobStatus(StrEnum):
 
 
 @dataclass
-class JobRunResult:
-    """Recorded as last-run.json for each completed job run.
+class CommonRunResult:
+    """The fields every completed run records, shared by JobRunResult
+    and GroupRunResult.
 
     Identity isn't repeated in the record: the file already lives at
     `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
     `snapshot.json` in the same dir carries the full namespaced name
-    of the entity it was applied as.
+    of the entity it was applied as. The two record kinds extend this
+    with their own fields -- a job's exit detail / gate / notifications,
+    a group's child rollup.
     """
 
     host: str
@@ -731,33 +734,43 @@ class JobRunResult:
     ended_at: str
     duration_sec: float
     exit_class: ExitClass
+    # The code the runner exits the process with -- what the platform
+    # scheduler records as this launch's wait status. Status reconciles
+    # it against the scheduler's report so a launch that ended without
+    # writing this record reads as `crashed` rather than showing the
+    # stale prior outcome. The per-kind value semantics live in each
+    # subclass's docstring.
+    process_exit: int
+    log_path: str
+    # The runner's pid -- the same value it wrote to run.pid at launch.
+    # Captured at construction (in the runner process), so a recorded
+    # result always carries the pid of the launch that produced it.
+    # `RuntimeState.crashed` compares it to the surviving run.pid to spot
+    # a launch that started but died before writing this record.
+    # Keyword-only so the subclasses can append their own non-default
+    # fields after it.
+    pid: int = field(default_factory=os.getpid, kw_only=True)
+
+
+@dataclass
+class JobRunResult(CommonRunResult):
+    """Recorded as last-run.json for each completed job run. Its
+    `process_exit` is 0 for ok / gated / canceled, the job's own code
+    for fail, the timeout code, or 128+sig for a signal-killed child."""
+
     exit_code: int | None
     signal: int | None
-    # The code the runner exits the process with -- what the platform
-    # scheduler records as this launch's wait status (0 for ok / gated /
-    # canceled, the job's code for fail, the timeout code, 128+sig for a
-    # signal-killed child). Status reconciles it against the scheduler's
-    # report so a launch that ended without writing this record reads as
-    # `crashed` rather than showing the stale prior outcome.
-    process_exit: int
     # "none" if no gate ran (no config, or --skip-gate), "passed" on
     # exit 0, "failed" on any non-zero or timeout. The numeric exit
     # code stays in run.log for diagnosis; this field is the binary
     # answer "did the gate let the job run?".
     gate: str
-    log_path: str
     log_bytes_this_run: int
     # Per-channel outcomes. Keys are channel names that were
     # attempted (e.g. "email", "ntfy"); values are NotificationResult
     # records. Empty dict means no external dispatch was attempted
     # (notify_channels resolved to []).
     notifications: dict[str, NotificationResult] = field(default_factory=dict)
-    # The runner's pid -- the same value it wrote to run.pid at launch.
-    # Captured at construction (in the runner process), so a recorded
-    # result always carries the pid of the launch that produced it.
-    # `RuntimeState.crashed` compares it to the surviving run.pid to spot
-    # a launch that started but died before writing this record.
-    pid: int = field(default_factory=os.getpid)
 
 
 @dataclass
@@ -770,13 +783,12 @@ class GroupChildResult:
 
 
 @dataclass
-class GroupRunResult:
-    """Recorded as last-run.json for each completed group run.
-
-    Identity isn't repeated in the record: the file already lives at
-    `STATE_DIR/<bundle>/<uuid>/last-run.json`, and the matching
-    `snapshot.json` in the same dir carries the full namespaced
-    name of the group it was applied as.
+class GroupRunResult(CommonRunResult):
+    """Recorded as last-run.json for each completed group run. Its
+    `process_exit` is always 0 -- a group's rollup lives in `exit_class`,
+    not its process exit -- but it is still reconciled against the
+    scheduler so a group whose parent launch was killed reads as
+    `crashed`.
 
     `exit_class` is a rollup from `jobs_run`: timeout outranks
     fail / signal (which are equally severe), and ok / gated tie
@@ -786,22 +798,7 @@ class GroupRunResult:
     of re-deriving the rollup on every query.
     """
 
-    host: str
-    platform: str
-    started_at: str
-    ended_at: str
-    duration_sec: float
-    exit_class: ExitClass
-    # The code the group runner exits the process with (always 0 -- a
-    # group's rollup lives in `exit_class`, not its process exit). Stored
-    # for the same scheduler reconciliation as JobRunResult.process_exit:
-    # a group whose parent launch was killed reads as `crashed`.
-    process_exit: int
-    log_path: str
     jobs_run: list[GroupChildResult]
-    # The group runner's pid -- the same value it wrote to run.pid at
-    # launch; see `JobRunResult.pid`.
-    pid: int = field(default_factory=os.getpid)
 
 
 @dataclass
