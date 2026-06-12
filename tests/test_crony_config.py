@@ -2345,9 +2345,11 @@ class TestDashKeys:
 
 
 class TestJobFlagsField:
-    """The `flags = [...]` job field is an alternative spelling for the
-    interactive / keep-awake scalars; a flag set both ways at one level
-    is rejected."""
+    """The `flags = [...]` job field and the per-flag scalar keys (one
+    per flag, spelled by its dash token) are two spellings of the same
+    per-level delta; a flag set both ways at one level is rejected. The
+    scalar keys are derived generically from `JobFlags.members()`, so
+    every flag -- current and future -- gets both spellings."""
 
     @staticmethod
     def _cfg(body: dict[str, Any]) -> dict[str, Any]:
@@ -2371,10 +2373,30 @@ class TestJobFlagsField:
         assert cfg.jobs["j"].platforms == []
 
     def test_full_disk_access_flag_parses(self) -> None:
-        # full-disk-access has no legacy scalar key; it is set only
-        # through the flags list and recorded in the per-level delta.
         cfg = _parse(self._cfg(_job(flags=["full-disk-access"])))
         assert cfg.jobs["j"].flags == {JobFlags.FULL_DISK_ACCESS: True}
+
+    def test_full_disk_access_scalar_key(self) -> None:
+        # The standalone scalar spelling, generic for every flag: a new
+        # flag is set as `<token> = true` with no per-flag parser edit.
+        cfg = _parse(self._cfg(_job(**{"full-disk-access": True})))
+        assert cfg.jobs["j"].flags == {JobFlags.FULL_DISK_ACCESS: True}
+
+    def test_full_disk_access_set_both_ways_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg(
+                _job(flags=["full-disk-access"], **{"full-disk-access": True})
+            ),
+            "j",
+            "use one",
+        )
+
+    @pytest.mark.parametrize("flag", list(JobFlags.members()))
+    def test_every_flag_has_a_scalar_key(self, flag: JobFlags) -> None:
+        # The scalar surface is derived from JobFlags.members(), so each
+        # member is accepted as a bare boolean key spelled by its token.
+        cfg = _parse(self._cfg(_job(**{flag.token: True})))
+        assert cfg.jobs["j"].flags == {flag: True}
 
     def test_scalar_and_flag_for_different_flags_ok(self) -> None:
         cfg = _parse(self._cfg(_job(interactive=True, flags=["keep-awake"])))
@@ -2430,8 +2452,9 @@ class TestJobFlagsField:
 
 
 class TestFlagsAtDefaultsAndGroup:
-    """`flags = [...]` is accepted at the defaults and group levels too,
-    recording each level's explicit per-flag delta."""
+    """`flags = [...]` and the per-flag scalar keys are accepted at the
+    defaults and group levels too, recording each level's explicit
+    per-flag delta. The scalar surface is generic across levels."""
 
     def test_defaults_flags_stored_and_keep_awake_derived(self) -> None:
         cfg = _parse({"defaults": {"flags": ["keep-awake", "interactive"]}})
@@ -2439,12 +2462,48 @@ class TestFlagsAtDefaultsAndGroup:
             JobFlags.KEEP_AWAKE: True,
             JobFlags.INTERACTIVE: True,
         }
-        # The legacy scalar this level yields is still derived.
+        # The keep_awake scalar this level yields is still derived.
         assert cfg.defaults.keep_awake is True
+
+    def test_defaults_scalar_flag_key(self) -> None:
+        cfg = _parse({"defaults": {"full-disk-access": True}})
+        assert cfg.defaults.flags == {JobFlags.FULL_DISK_ACCESS: True}
+
+    def test_group_scalar_flag_key(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "full-disk-access": True,
+                    }
+                },
+            }
+        )
+        assert cfg.job_groups["g"].flags == {JobFlags.FULL_DISK_ACCESS: True}
 
     def test_defaults_scalar_and_flag_conflict(self) -> None:
         with pytest.raises(ConfigError, match="use one"):
             _parse({"defaults": {"keep-awake": True, "flags": ["keep-awake"]}})
+
+    def test_group_scalar_and_flag_conflict(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "schedule": "daily",
+                        "interactive": True,
+                        "flags": ["interactive"],
+                    }
+                },
+            },
+            "g",
+            "use one",
+        )
 
     def test_group_flags_stored(self) -> None:
         cfg = _parse(

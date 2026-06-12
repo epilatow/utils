@@ -94,6 +94,19 @@ class JobFlags(enum.Flag):
         return list(cls)
 
 
+# Every flag can be set two ways: inside the `flags = [...]` list, or as
+# a standalone boolean key spelled by its dash token (`keep-awake =
+# true`). The scalar spelling is a user-convenience surface auto-derived
+# from JobFlags.members() -- a new flag gets it (at every level that
+# takes flags) with no edits here. The bitmask is the single backing
+# store; the two spellings are one setting, and giving both for the same
+# flag at one level is rejected.
+_FLAG_SCALAR_KEYS: dict[str, JobFlags] = {
+    flag.token: flag for flag in JobFlags.members()
+}
+_FLAG_TOKENS: frozenset[str] = frozenset(_FLAG_SCALAR_KEYS)
+
+
 def _compose_flags(
     inherited: JobFlags, delta: dict[JobFlags, bool]
 ) -> JobFlags:
@@ -267,10 +280,11 @@ class Defaults:
     priority: crony.unit.PriorityClass | None = None
     keep_awake: bool = False
     # The capability flags this level explicitly sets (true / false),
-    # parsed from `flags = [...]` and the legacy scalar keys. A per-level
-    # delta; the flag cascade composes these across levels. `keep_awake`
-    # above mirrors this level's own delta for that flag (the parser's
-    # per-flag result); the resolved value comes from composing `flags`.
+    # parsed from `flags = [...]` and the per-flag scalar keys. A
+    # per-level delta; the flag cascade composes these across levels.
+    # `keep_awake` above mirrors this level's own delta for that flag
+    # (the parser's per-flag result); the resolved value comes from
+    # composing `flags`.
     flags: dict[JobFlags, bool] = field(default_factory=dict)
     # Base env merged under every job's own `env` (job keys win); see
     # resolved_env. Values are expanded at fire time like a job's env.
@@ -365,9 +379,9 @@ class TomlJob:
     interactive_active_sec: int | None = None
     interactive_delay_sec: int | None = None
     # The capability flags this job explicitly sets (true / false),
-    # parsed from `flags = [...]` and the legacy `interactive` /
-    # `keep-awake` scalar keys. The `interactive` / `keep_awake` fields
-    # above mirror this job's own delta for those two flags (the
+    # parsed from `flags = [...]` and the per-flag scalar keys (one per
+    # flag, spelled by its dash token). The `interactive` / `keep_awake`
+    # fields above mirror this job's own delta for those two flags (the
     # parser's per-flag result); the flag cascade composes these
     # per-level deltas into the resolved value.
     flags: dict[JobFlags, bool] = field(default_factory=dict)
@@ -1131,58 +1145,66 @@ _KNOWN_TOPLEVEL: frozenset[str] = frozenset(
     }
 )
 
-_KNOWN_DEFAULTS: frozenset[str] = frozenset(
-    {
-        "notify-channels",
-        "notify-attach-log",
-        "notify-attach-max-kb",
-        "job-timeout-sec",
-        "trigger-timeout-sec",
-        "log-keep-runs",
-        "priority",
-        "keep-awake",
-        "flags",
-        "env",
-        "notify",
-    }
+# The flag scalar keys (`_FLAG_TOKENS`) are unioned in below rather than
+# listed, so a new flag is accepted at each level with no edit here.
+_KNOWN_DEFAULTS: frozenset[str] = (
+    frozenset(
+        {
+            "notify-channels",
+            "notify-attach-log",
+            "notify-attach-max-kb",
+            "job-timeout-sec",
+            "trigger-timeout-sec",
+            "log-keep-runs",
+            "priority",
+            "flags",
+            "env",
+            "notify",
+        }
+    )
+    | _FLAG_TOKENS
 )
 
-_KNOWN_JOB: frozenset[str] = frozenset(
-    {
-        "uuid",
-        "command",
-        "script",
-        "args",
-        "gate",
-        "gate-script",
-        "gate-args",
-        "schedule",
-        "interval",
-        "priority",
-        "keep-awake",
-        "platforms",
-        "hosts",
-        "job-timeout-sec",
-        "notify-channels",
-        "success-exit-codes",
-        "env",
-        "flags",
-        "interactive",
-        "interactive-active",
-        "interactive-delay",
-    }
+_KNOWN_JOB: frozenset[str] = (
+    frozenset(
+        {
+            "uuid",
+            "command",
+            "script",
+            "args",
+            "gate",
+            "gate-script",
+            "gate-args",
+            "schedule",
+            "interval",
+            "priority",
+            "platforms",
+            "hosts",
+            "job-timeout-sec",
+            "notify-channels",
+            "success-exit-codes",
+            "env",
+            "flags",
+            "interactive-active",
+            "interactive-delay",
+        }
+    )
+    | _FLAG_TOKENS
 )
 
-_KNOWN_JOB_GROUP: frozenset[str] = frozenset(
-    {
-        "uuid",
-        "jobs",
-        "schedule",
-        "interval",
-        "platforms",
-        "hosts",
-        "flags",
-    }
+_KNOWN_JOB_GROUP: frozenset[str] = (
+    frozenset(
+        {
+            "uuid",
+            "jobs",
+            "schedule",
+            "interval",
+            "platforms",
+            "hosts",
+            "flags",
+        }
+    )
+    | _FLAG_TOKENS
 )
 
 _KNOWN_TARGET: frozenset[str] = frozenset(
@@ -1596,7 +1618,8 @@ def _parse_flags_partial(
     scalar_keys: dict[str, JobFlags],
 ) -> dict[JobFlags, bool]:
     """The per-level flag delta: the `flags = [...]` list combined with
-    the legacy boolean scalar keys that map to flags at this level.
+    the standalone boolean scalar keys that map to flags at this level
+    (`scalar_keys`, the dash token -> flag map).
 
     A flag set both in `flags` and via its scalar key is one setting
     expressed two ways at one level, so it is rejected. Returns the map
@@ -1806,9 +1829,7 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
                 f"[defaults.notify.{sub_key}]: must be a table"
             )
         notify_channel_defs[sub_key] = NotifyChannel.from_raw(sub_key, sub_body)
-    flags = _parse_flags_partial(
-        raw, where, scalar_keys={"keep-awake": JobFlags.KEEP_AWAKE}
-    )
+    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     return Defaults(
         notify_channels=channels or [],
         notify_attach_log=_typed_field(
@@ -1898,14 +1919,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     interval_str = _typed_field(raw, "interval", str, where)
     timing = _parse_timing(schedule_str, interval_str, where)
     priority = _parse_priority_field(raw, where)
-    flags = _parse_flags_partial(
-        raw,
-        where,
-        scalar_keys={
-            "interactive": JobFlags.INTERACTIVE,
-            "keep-awake": JobFlags.KEEP_AWAKE,
-        },
-    )
+    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     keep_awake = flags.get(JobFlags.KEEP_AWAKE)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
@@ -1973,8 +1987,7 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     timing = _parse_timing(schedule_str, interval_str, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
-    # A group has no legacy scalar flag keys; only the `flags` list.
-    flags = _parse_flags_partial(raw, where, scalar_keys={})
+    flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     return TomlJobGroup(
         name=name,
         uuid=group_uuid,
