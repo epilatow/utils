@@ -47,9 +47,13 @@ from crony.model import (  # noqa: E402
     JobGroup,
 )
 from crony.platform import (  # noqa: E402
+    fda as crony_fda,
+)
+from crony.platform import (  # noqa: E402
     launchd,
     systemd,
 )
+from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
@@ -190,6 +194,65 @@ class TestConfigState:
         config = crony_runtime.load_config()
         ref = config.current.by_full_name["default.old"]
         assert config.config_state(ref) == "orphan"
+
+
+class TestCurrentGraphFdaWrapper:
+    """`_build_current_graph` stamps each full-disk-access current node
+    with the live Crony.app wrapper state (probed once per load), and
+    never probes when no full-disk-access job is on disk."""
+
+    def _ref(self, config: Any, full: str) -> Any:
+        return config.current.by_full_name.get(full)
+
+    def test_fda_current_node_carries_probed_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        monkeypatch.setattr(crony_fda, "build_wrapper", lambda: None)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.STALE
+        )
+        config = crony_runtime.load_config()
+        node = config.current.job_from_ref(self._ref(config, "default.j"))
+        assert isinstance(node, Job)
+        assert node.fda_wrapper is FDAWrapper.STALE
+        # The drift rides through the snapshot comparison.
+        assert config.config_state(node.entity_ref) == "stale"
+
+    def test_non_fda_load_never_probes(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        probed: list[bool] = []
+
+        def _tracked() -> FDAWrapper:
+            probed.append(True)
+            return FDAWrapper.OK
+
+        monkeypatch.setattr(crony_fda, "wrapper_state", _tracked)
+        config = crony_runtime.load_config()
+        node = config.current.job_from_ref(self._ref(config, "default.j"))
+        assert isinstance(node, Job)
+        assert node.fda_wrapper is None
+        assert probed == [], "wrapper probed for a non-FDA load"
 
 
 class TestResolveStateAxes:

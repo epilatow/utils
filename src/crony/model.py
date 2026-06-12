@@ -27,6 +27,7 @@ import crony.errors
 import crony.paths
 import crony.platform
 import crony.unit
+from crony.platform.fda import FDAWrapper
 
 # =============================================================================
 # APPLIED SNAPSHOT
@@ -316,6 +317,30 @@ class Job(_JobCommon):
     # `interactive` property.)
     interactive_active_sec: int = crony.config.INTERACTIVE_ACTIVE_DEFAULT_SEC
     interactive_delay_sec: int = crony.config.INTERACTIVE_DELAY_DEFAULT_SEC
+    # The Crony.app Full Disk Access wrapper state as this graph knows
+    # it, for a full-disk-access job; None for a job without the flag (a
+    # group never carries it). A config-built (pending) node holds the
+    # expected value (OK -- a built, granted wrapper); the current graph
+    # fills in the live state probed at load. Compared in `==` so a
+    # wrapper that isn't built / granted, or has gone stale, surfaces as
+    # drift through the same snapshot comparison as any other field
+    # (reported `fda-wrapper`) -- but excluded from `to_dict` /
+    # `from_dict`: it is derived runtime state, never persisted into
+    # snapshot.json. Keyword-only so it can follow the defaulted fields.
+    fda_wrapper: FDAWrapper | None = field(default=None, kw_only=True)
+
+    @staticmethod
+    def _fda_wrapper_for(
+        flags: crony.config.JobFlags, state: FDAWrapper | None
+    ) -> FDAWrapper | None:
+        """The `fda_wrapper` value for a job with `flags`: `state` when
+        the job carries the full-disk-access flag (OK as the expected
+        value on a config-built node, the live wrapper state on a
+        current node), else None -- a non-FDA job has no wrapper to
+        track, so the two graphs agree on None and never diverge."""
+        if crony.config.JobFlags.FULL_DISK_ACCESS in flags:
+            return state
+        return None
 
     @property
     def interactive(self) -> bool:
@@ -384,6 +409,7 @@ class Job(_JobCommon):
             name=name.short,
             uuid=job.uuid,
             state_dir_symlink=cls.state_dir_symlink_expected(name, job.uuid),
+            fda_wrapper=cls._fda_wrapper_for(flags, FDAWrapper.OK),
             command=job.command,
             script=script,
             args=args,
@@ -413,6 +439,11 @@ class Job(_JobCommon):
         (rendered to its source string)."""
         d = super().to_dict()
         d["priority"] = str(self.priority)
+        # The wrapper state is derived runtime state (expected on the
+        # config side, probed on the current side), recomputed on load --
+        # never persisted. Job-only, so it is dropped here rather than in
+        # the shared serializer.
+        d.pop("fda_wrapper", None)
         return d
 
 
@@ -541,6 +572,7 @@ def snapshot_from_dict(
     raw: dict[str, Any],
     *,
     state_dir_symlink: tuple[Path, str] | None = None,
+    fda_wrapper: FDAWrapper | None = None,
 ) -> Job | JobGroup:
     """Construct a snapshot from its JSON dict, parsing the typed
     value-object fields back from their source strings. Raises
@@ -551,7 +583,13 @@ def snapshot_from_dict(
     (None when it has no link, or for a load that doesn't care about
     the alias). It is not part of `raw` -- the alias is derived disk
     state, never serialized -- so the current-graph scan passes the
-    pair it read so the frozen node carries it from construction."""
+    pair it read so the frozen node carries it from construction.
+
+    `fda_wrapper` is the live Crony.app wrapper state the caller probed,
+    applied only when the loaded entry carries the full-disk-access flag
+    (None otherwise). Like the alias, it is derived runtime state, never
+    serialized; a load that does not care about the wrapper leaves it
+    None."""
     data = dict(raw)
     data["state_dir_symlink"] = state_dir_symlink
     # The format version is keyed `schema` on disk; the field is
@@ -611,6 +649,11 @@ def snapshot_from_dict(
         data["timeout"] = legacy_timeout
     kind = data.get("kind")
     if kind == "job":
+        # The wrapper state is not serialized (job-only derived runtime
+        # state); stamp the caller's probed value, gated on the
+        # full-disk-access flag, so a current node carries the live
+        # state from construction.
+        data["fda_wrapper"] = Job._fda_wrapper_for(flags, fda_wrapper)
         return Job(**data)
     if kind == "group":
         return JobGroup(**data)

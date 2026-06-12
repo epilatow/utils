@@ -6524,6 +6524,113 @@ class TestStatusFlagsColumns:
         assert "keep-awake" in child_row
 
 
+class TestStatusFullDiskAccess:
+    """`crony status` reads the shared Crony.app wrapper state onto a
+    full-disk-access job's current node and folds it into the CONFIG
+    verdict: a wrapper that can't serve the grant (not built, or
+    ungranted) reads `error`; a stale wrapper reads `stale` (diverged
+    `fda-wrapper`); an ok wrapper leaves the job synced. The wrapper
+    probe is mocked so this runs on any platform."""
+
+    def _status(self, cols: str) -> None:
+        crony_commands.do_status(
+            jobs=[],
+            cols=cols,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+
+    def _row_for(self, out: str, needle: str) -> str:
+        return next(
+            ln for ln in out.splitlines()[1:] if ln.strip() and needle in ln
+        )
+
+    def _applied_fda(self, tmp_path: Path, monkeypatch: Any) -> Any:
+        h = _ApplyHarness(tmp_path, monkeypatch)  # platform -> darwin
+        # Apply writes the snapshot through apply_one; the wrapper build
+        # is irrelevant to that path, so keep it inert.
+        monkeypatch.setattr(crony_fda, "build_wrapper", lambda: None)
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        return h
+
+    def test_missing_wrapper_reads_error(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = self._applied_fda(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING
+        )
+        self._status("job,config")
+        out = capsys.readouterr().out
+        assert "error" in self._row_for(out, h.full("j"))
+
+    def test_ungranted_wrapper_reads_error(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = self._applied_fda(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        self._status("job,config")
+        out = capsys.readouterr().out
+        assert "error" in self._row_for(out, h.full("j"))
+
+    def test_stale_wrapper_reads_stale_with_reason(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = self._applied_fda(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.STALE
+        )
+        self._status("job,config,diverged")
+        out = capsys.readouterr().out
+        row = self._row_for(out, h.full("j"))
+        assert "stale" in row
+        assert "fda-wrapper" in row
+
+    def test_ok_wrapper_leaves_job_synced(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = self._applied_fda(tmp_path, monkeypatch)
+        monkeypatch.setattr(crony_fda, "wrapper_state", lambda: FDAWrapper.OK)
+        self._status("job,config")
+        out = capsys.readouterr().out
+        assert "synced" in self._row_for(out, h.full("j"))
+
+    def test_non_fda_job_unaffected_by_missing_wrapper(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING
+        )
+        self._status("job,config")
+        out = capsys.readouterr().out
+        assert "synced" in self._row_for(out, h.full("j"))
+
+
 class TestStatusExcludeHealthy:
     """`crony status --exclude-healthy` drops synced + ok / never /
     gated rows and renders flat (no tree indent). Always exits 0 --

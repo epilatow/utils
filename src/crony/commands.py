@@ -553,6 +553,23 @@ def _config_axis(
         # is the pre-mask base the mask layer turns into "masked".
         return "missing"
     state = config.config_state(ref)
+    # A full-disk-access entry whose shared Crony.app wrapper can't serve
+    # the grant -- not built, or built but ungranted (`is_missing`) --
+    # can't run as configured. The live wrapper state rides on the
+    # current node's compared `fda_wrapper` field, so an unrunnable
+    # wrapper (which never equals the pending node's expected `OK`)
+    # already made `state` stale; lift those cases to error. A
+    # stale-but-runnable wrapper stays stale (reported `fda-wrapper`). An
+    # entry that isn't applied (no current node) or already broken /
+    # orphan / missing keeps its base verdict.
+    if state == "stale":
+        current = config.current.job_from_ref(ref)
+        if (
+            isinstance(current, crony.model.Job)
+            and current.fda_wrapper is not None
+            and current.fda_wrapper.is_missing
+        ):
+            return "error"
     lingering = config.orphans_by_full_name.get(full)
     if (
         state == "missing"
@@ -1709,7 +1726,12 @@ Columns
                     `error` flags an entry whose bundle config was
                     rejected (e.g. unknown key); the installed unit,
                     if any, is left untouched and `crony apply`
-                    refuses the name until the config is fixed.
+                    refuses the name until the config is fixed. A
+                    full-disk-access job also reads `error` when its
+                    Crony.app wrapper can't serve the grant (not built,
+                    or built without Full Disk Access) and `stale`
+                    (diverged `fda-wrapper`) when the wrapper is out of
+                    date -- `crony apply` builds / rebuilds it.
   flags             Comma-separated capability flags enabled for the
                     entry (e.g. `interactive,keep-awake`). Opt-in.
                     Source-selected like `schedule`: default and
@@ -1730,11 +1752,12 @@ Columns
   <flag>            One opt-in column per capability flag, each reading
                     true / false for whether the flag is enabled (one
                     column per member:
-                    {flag_tokens}). Same source rules and `^`
-                    divergence flag as the `flags` summary; a group
-                    shows its inherited cascade value, the same as a
-                    job. Request by name; the `all` alias omits these in
-                    favor of the compact `flags` column.
+                    {flag_tokens}).
+                    Same source rules and `^` divergence flag as the
+                    `flags` summary; a group shows its inherited cascade
+                    value, the same as a job. Request by name; the `all`
+                    alias omits these in favor of the compact `flags`
+                    column.
   groups            Comma-separated full names of groups containing this
                     entry. Same source rules as `schedule`: default and
                     --config-pending show the pending membership,
@@ -1840,12 +1863,14 @@ Columns
                     a config knob named as the config file spells it
                     (e.g. `command,env,job-timeout-sec`), each changed
                     capability flag by its own token (e.g. `keep-awake`),
-                    plus `unit-config` / `unit-timer` for each installed
-                    unit file that drifted from the snapshot -- a direct
-                    answer to "why is this stale?". Opt-in; blank for a
-                    synced entry, or a stale verdict with no current
-                    snapshot to diff. Pair with `--cols all` to see the
-                    diverging cells flagged with `^`.
+                    `unit-config` / `unit-timer` for each installed
+                    unit file that drifted from the snapshot, and
+                    `fda-wrapper` when a full-disk-access job's Crony.app
+                    wrapper is out of date -- a direct answer to "why is
+                    this stale?". Opt-in; blank for a synced entry, or a
+                    stale verdict with no current snapshot to diff. Pair
+                    with `--cols all` to see the diverging cells flagged
+                    with `^`.
 
 Aliases
 -------

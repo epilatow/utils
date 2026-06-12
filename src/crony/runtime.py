@@ -193,6 +193,25 @@ def _build_current_graph(
     runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
     if not state_root.exists():
         return current, orphans, runtime
+
+    # The Crony.app wrapper is shared by every full-disk-access job, so
+    # its live state is probed at most once per load -- and only when a
+    # full-disk-access job snapshot is actually present (a non-FDA host
+    # never pays for the probe; a group never carries the wrapper). A
+    # current node carries this so wrapper drift shows through the
+    # snapshot comparison.
+    fda_token = crony.config.JobFlags.FULL_DISK_ACCESS.token
+    _fda_state: list[crony.platform.fda.FDAWrapper] = []
+
+    def _fda_wrapper_for(
+        raw: dict[str, Any],
+    ) -> crony.platform.fda.FDAWrapper | None:
+        if raw.get("kind") != "job" or not raw.get(fda_token):
+            return None
+        if not _fda_state:
+            _fda_state.append(host().full_disk_access_state())
+        return _fda_state[0]
+
     for bundle_dir in state_root.iterdir():
         if not bundle_dir.is_dir():
             continue
@@ -276,6 +295,7 @@ def _build_current_graph(
                     state_dir_symlink=_read_symlink_pair(alias)
                     if alias is not None
                     else None,
+                    fda_wrapper=_fda_wrapper_for(raw),
                 )
             except (TypeError, ValueError) as exc:
                 orphans[ref] = crony.model.JobOrphan(

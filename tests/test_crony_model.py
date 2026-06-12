@@ -54,6 +54,7 @@ from crony.model import (  # noqa: E402
     snapshot_from_dict,
 )
 from crony.platform import UnitLastExit  # noqa: E402
+from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityRef,
     PriorityClass,
@@ -351,6 +352,73 @@ class TestJobFlagsBacking:
         assert snapshot_from_dict(group.to_dict()) == dataclasses.replace(
             group, state_dir_symlink=None
         )
+
+
+class TestFdaWrapperField:
+    """`Job.fda_wrapper` carries the Crony.app wrapper state as a graph
+    knows it -- OK (expected) on a config-built node, the probed live
+    state on a current node, None for a non-FDA job. It is compared in
+    `==` (so wrapper drift is caught by the snapshot comparison) but
+    never serialized. It is a job-only field: a group never carries
+    it."""
+
+    def _snap(self, **over: Any) -> Any:
+        return _resolve_snapshot_for(_parse({"job": {"j": _job(**over)}}), "j")
+
+    def test_pending_fda_job_expects_ok(self) -> None:
+        snap = self._snap(flags=["full-disk-access"])
+        assert snap.fda_wrapper is FDAWrapper.OK
+
+    def test_non_fda_job_has_no_wrapper(self) -> None:
+        assert self._snap().fda_wrapper is None
+
+    def test_to_dict_excludes_fda_wrapper(self) -> None:
+        d = self._snap(flags=["full-disk-access"]).to_dict()
+        assert "fda_wrapper" not in d
+        assert "fda-wrapper" not in d
+
+    def test_load_stamps_probed_state_for_fda_job(self) -> None:
+        d = self._snap(flags=["full-disk-access"]).to_dict()
+        loaded = snapshot_from_dict(d, fda_wrapper=FDAWrapper.STALE)
+        assert isinstance(loaded, Job)
+        assert loaded.fda_wrapper is FDAWrapper.STALE
+
+    def test_load_ignores_probed_state_for_non_fda_job(self) -> None:
+        # A probed value passed for a non-FDA job is dropped -- the two
+        # graphs must agree on None so a non-FDA job never drifts.
+        d = self._snap().to_dict()
+        loaded = snapshot_from_dict(d, fda_wrapper=FDAWrapper.STALE)
+        assert isinstance(loaded, Job)
+        assert loaded.fda_wrapper is None
+
+    def test_wrapper_drift_breaks_equality(self) -> None:
+        ok = self._snap(flags=["full-disk-access"])
+        stale = dataclasses.replace(ok, fda_wrapper=FDAWrapper.STALE)
+        assert ok != stale
+
+    def test_round_trip_off_probe_matches_expected_node(self) -> None:
+        # Loaded with no probe (current-graph-less load), the node reads
+        # back with fda_wrapper None; the pending node's expected OK is
+        # the only difference, so equality holds once both derived
+        # fields are normalized.
+        snap = self._snap(flags=["full-disk-access"])
+        loaded = snapshot_from_dict(snap.to_dict())
+        assert loaded == dataclasses.replace(
+            snap, state_dir_symlink=None, fda_wrapper=None
+        )
+
+    def test_group_has_no_fda_wrapper_field(self) -> None:
+        group = _resolve_snapshot_for(
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+                }
+            ),
+            "g",
+        )
+        assert isinstance(group, JobGroup)
+        assert not hasattr(group, "fda_wrapper")
 
 
 class TestSharedSnapshotSurface:
