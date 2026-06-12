@@ -147,6 +147,21 @@ def _gate_argv(snap: crony.model.Job) -> list[str] | None:
     return None
 
 
+def _full_disk_access_argv(argv: list[str], snap: crony.model.Job) -> list[str]:
+    """Wrap `argv` so a full-disk-access job runs with macOS Full Disk
+    Access, via the HostPlatform (Crony.app on darwin, a no-op
+    elsewhere).
+
+    Raises PreconditionError when the wrapper is missing or the grant is
+    not in effect -- the run is recorded `canceled` rather than firing
+    the command without the access it needs. A stale-but-present wrapper
+    still runs. A job without the flag is returned unchanged.
+    """
+    if not snap.full_disk_access:
+        return argv
+    return crony.runtime.host().full_disk_access_argv(argv)
+
+
 def _keep_awake_argv(
     argv: list[str], snap: crony.model.Job
 ) -> tuple[list[str], str | None]:
@@ -497,6 +512,15 @@ def _run_job(
                         )
                         return 0
 
+                # Build and FDA-wrap the command past the gate but before
+                # the interactive prompt: a gated-skip job never reaches
+                # here (FDA is irrelevant when the command won't run),
+                # while a full-disk-access job whose wrapper is missing /
+                # ungranted is canceled now -- without prompting the user
+                # for a run that can't proceed. keep-awake wraps this
+                # outermost at the exec site below.
+                argv = _full_disk_access_argv(_command_argv(snap), snap)
+
                 if snap.interactive:
                     bypass = crony.runtime.consume_user_trigger_flag(sd)
                     if bypass:
@@ -535,7 +559,8 @@ def _run_job(
                             )
                             return 0
 
-                argv = _command_argv(snap)
+                # keep-awake stays outermost so the power assertion is
+                # held for the whole run, the FDA wrapper included.
                 argv, keep_awake_note = _keep_awake_argv(argv, snap)
                 if keep_awake_note is not None:
                     log_file.write(f"{keep_awake_note}\n".encode())

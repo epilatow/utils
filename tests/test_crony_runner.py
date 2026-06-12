@@ -67,6 +67,8 @@ from crony.model import (  # noqa: E402
 from crony.platform import (  # noqa: E402
     PidWait,
 )
+from crony.platform import fda as crony_fda  # noqa: E402
+from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     PriorityClass,
@@ -1764,6 +1766,179 @@ class TestKeepAwake:
         assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         log = (h.state_dir("j") / "run.log").read_text(encoding="utf-8")
         assert "caffeinate not found" in log
+
+
+class TestFullDiskAccess:
+    """A full-disk-access job's command is routed through the host FDA
+    wrapper at fire time (Crony.app on darwin), inside any keep-awake
+    wrap, and a missing wrapper / absent grant cancels the run via
+    PreconditionError. The wrapper state / binary are mocked so this
+    runs on any platform."""
+
+    def _snap(self, **over: Any) -> Any:
+        cfg = _parse({"job": {"a": _job(**over)}})
+        return Job.from_config(
+            cfg, cfg.jobs["a"], EntityName.from_str("default.a")
+        )
+
+    def test_disabled_passthrough(self) -> None:
+        argv = crony_runner._full_disk_access_argv(["true"], self._snap())
+        assert argv == ["true"]
+
+    def test_enabled_delegates_to_host(self, monkeypatch: Any) -> None:
+        seen: dict[str, Any] = {}
+
+        class _FakeHost:
+            def full_disk_access_argv(self, argv: list[str]) -> list[str]:
+                seen["argv"] = argv
+                return ["WRAP", *argv]
+
+        monkeypatch.setattr(crony_runtime, "host", lambda: _FakeHost())
+        argv = crony_runner._full_disk_access_argv(
+            ["true"], self._snap(flags=["full-disk-access"])
+        )
+        assert argv == ["WRAP", "true"]
+        assert seen["argv"] == ["true"]
+
+    def test_run_job_wraps_command_inside_keep_awake(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # On darwin the real DarwinHost routes through Crony.app (state
+        # / binary mocked) and caffeinate; the exec argv must be
+        # caffeinate (outermost) -> Crony.app -> command.
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        monkeypatch.setattr(crony_fda, "wrapper_state", lambda: FDAWrapper.OK)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_binary", lambda: Path("/x/Crony")
+        )
+        monkeypatch.setattr(
+            crony_runtime.shutil,
+            "which",
+            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_exec(argv: list[str], **_kwargs: object) -> Any:
+            captured["argv"] = argv
+            return crony_runner._ExitOutcome(rc=0, signal=None)
+
+        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "keep_awake": True,
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        assert crony_runner._run_job(h.snap(cfg, "j")) == 0
+        assert captured["argv"] == [
+            "/x/caffeinate",
+            "-i",
+            "-s",
+            "/x/Crony",
+            "/bin/sh",
+            "-c",
+            "true",
+        ]
+
+    def test_run_job_raises_when_grant_denied(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(
+            crony_fda, "grant_instructions", lambda: "grant me FDA"
+        )
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(PreconditionError, match="grant me FDA"):
+            crony_runner._run_job(h.snap(cfg, "j"))
+
+    def test_do_run_records_canceled_on_denied_grant(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.write_snap(cfg, "j")
+        ref = str(h.snap(cfg, "j").entity_ref)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING
+        )
+        with pytest.raises(PreconditionError, match="not built"):
+            crony_runner.do_run(ref=ref, dry_run=False, skip_gate=False)
+        sd = h.state_dir("j", cfg=cfg)
+        rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
+        assert rec["exit_class"] == "canceled"
+        assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+
+    def test_denied_grant_cancels_before_interactive_prompt(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The FDA precondition is checked before the interactive prompt,
+        # so an interactive full-disk-access job with a denied grant is
+        # canceled without ever asking the user to approve a run that
+        # can't proceed.
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        prompted: list[bool] = []
+
+        def _fake_prompt(*_a: object, **_k: object) -> str:
+            prompted.append(True)
+            return "run"
+
+        monkeypatch.setattr(
+            crony_runner, "_interactive_wait_and_prompt", _fake_prompt
+        )
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(
+            crony_fda, "grant_instructions", lambda: "grant me FDA"
+        )
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interactive": True,
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(PreconditionError, match="grant me FDA"):
+            crony_runner._run_job(h.snap(cfg, "j"))
+        assert prompted == [], "user was prompted before the FDA cancel"
 
 
 class TestGroupExitClassRollup:
