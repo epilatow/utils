@@ -967,7 +967,15 @@ class RuntimeState:
           written, when run.pid was already unlinked.
 
         Never fires for an in-flight run (it holds the lock) or a clean
-        exit (0)."""
+        exit (0). A scheduler-recorded exit is effectively never
+        LOCK_BUSY: the scheduler coalesces a repeat fire of one unit
+        into a no-op, and crony only ever invokes `_run` from a platform
+        unit (group dispatch goes through the scheduler too), so a
+        scheduled fire is normally the sole contender for its run.lock. A
+        degenerate case that records one (a SIGKILLed guard leaving an
+        orphaned `_run` holding the lock) still reconciles correctly: the
+        orphan keeps the lock so `is_running` short-circuits, or has
+        finished so the mismatch is a genuine `crashed`."""
         if self.is_running:
             return False
         if self.run_pid is not None:
@@ -976,11 +984,6 @@ class RuntimeState:
                 return True
         ule = self.unit_last_exit
         if ule is None or ule.exit_status == 0:
-            return False
-        if ule.exit_status == int(crony.errors.ExitCode.LOCK_BUSY):
-            # A fire coalesced against an in-flight run: the loser exits
-            # LOCK_BUSY and writes no record by design, so the mismatch
-            # is a benign skip, not a crash.
             return False
         recorded = self.last_run.process_exit if self.last_run else None
         return ule.exit_status != recorded

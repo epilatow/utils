@@ -666,15 +666,6 @@ class TestRuntimeStateCrashed:
         )
         assert rs.crashed is False
 
-    def test_lock_busy_skip_is_not_crashed(self) -> None:
-        # A coalesced "already running" skip exits LOCK_BUSY and writes
-        # no record; that benign mismatch must not read as a crash.
-        rs = self._rs(
-            UnitLastExit(exit_status=int(ExitCode.LOCK_BUSY)),
-            last_run=self._last("ok", 0),
-        )
-        assert rs.crashed is False
-
     def test_clean_exit_is_not_crashed(self) -> None:
         rs = self._rs(
             UnitLastExit(exit_status=0),
