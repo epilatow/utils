@@ -240,6 +240,11 @@ class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
 
+    # A reload is `daemon-reload` plus (re)enabling the timer; neither
+    # stops a running `.service`, so a job can rewrite its own unit while
+    # in flight without killing its runner.
+    reload_terminates_running_job = False
+
     @staticmethod
     def default_unit_dir() -> Path:
         return Path.home() / ".config" / "systemd" / "user"

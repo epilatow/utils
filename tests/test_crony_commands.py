@@ -412,6 +412,141 @@ class TestApplyLinux:
         assert "systemctl" in commands
 
 
+class TestApplySelfUpdate:
+    """A job whose own run performs the apply must not reload its own
+    unit out from under itself on a scheduler whose reload terminates the
+    running job (launchd). The runner exports CRONY_RUNNING_REF naming the
+    in-flight entity; apply_one defers the unit change for that entry.
+    """
+
+    def test_darwin_defers_own_unit_change(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        plist_path = h.agents / f"org.crony.{h.full('j')}.plist"
+        before = plist_path.read_text()
+        # The running job re-applies itself with a unit-changing edit.
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("j"))
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.calls.clear()
+        result = h.apply("j")
+        assert result == "deferred"
+        # All-or-nothing: a deferred unit change writes nothing, so the
+        # unit and the snapshot both stay at the pre-edit state and disk
+        # remains internally consistent. A later apply does the full
+        # update via the drift path.
+        assert plist_path.read_text() == before
+        assert all(c[0] != "launchctl" for c in h.calls)
+        snap = json.loads((h.state_dir("j") / "snapshot.json").read_text())
+        assert snap["schedule"] == "*-*-* 03:00"
+
+    def test_darwin_snapshot_only_change_applies_without_reload(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A change that touches only snapshot fields the plist does not
+        # render (the command runs from the snapshot, not the unit) needs
+        # no unit reload, so the self path writes the snapshot and skips
+        # activation entirely rather than deferring.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        plist_path = h.agents / f"org.crony.{h.full('j')}.plist"
+        before = plist_path.read_text()
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("j"))
+        h.config(
+            {"job": {"j": {"command": "false", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.calls.clear()
+        result = h.apply("j")
+        assert result == "updated"
+        assert plist_path.read_text() == before
+        assert all(c[0] != "launchctl" for c in h.calls)
+        snap = json.loads((h.state_dir("j") / "snapshot.json").read_text())
+        assert snap["command"] == "false"
+
+    def test_linux_applies_own_unit_normally(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # systemd's reload does not stop a running service, so a self
+        # apply proceeds normally -- the guard is launchd-specific.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("j"))
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.calls.clear()
+        result = h.apply("j")
+        assert result == "updated"
+        assert any(c[0] == "systemctl" for c in h.calls)
+
+    def test_different_running_entry_does_not_defer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The guard keys on identity: an apply of `j` while a *different*
+        # entry is the running one applies `j` normally.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "k": {"command": "true", "schedule": "*-*-* 03:00"},
+                }
+            },
+            default_target_jobs=["j", "k"],
+        )
+        h.apply("j")
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("k"))
+        h.config(
+            {
+                "job": {
+                    "j": {"command": "true", "schedule": "*-*-* 04:00"},
+                    "k": {"command": "true", "schedule": "*-*-* 03:00"},
+                }
+            },
+            default_target_jobs=["j", "k"],
+        )
+        h.calls.clear()
+        result = h.apply("j")
+        assert result == "updated"
+        assert any(c[0] == "launchctl" for c in h.calls)
+
+    def test_do_apply_exits_warning_on_deferral(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("j"))
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+
+
 class TestApplyFullSync:
     def test_removes_orphans_on_no_arg_apply(
         self, tmp_path: Path, monkeypatch: Any

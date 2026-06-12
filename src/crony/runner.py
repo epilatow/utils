@@ -418,6 +418,10 @@ def _run_job(
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see _runtime_env).
     env = _runtime_env(snap.env)
+    # Name the in-flight entity to descendants so a job whose command
+    # runs `crony apply` can detect an apply targeting its own unit and
+    # decline to reload it mid-run.
+    env[crony.runtime.RUNNING_REF_ENV] = str(snap.entity_ref)
     started = time.time()
     started_iso = crony.runtime.now_iso()
     host = crony.platform.current_host()

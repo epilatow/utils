@@ -197,6 +197,10 @@ def _is_loaded(lbl: str) -> bool:
 class LaunchdScheduler(Scheduler):
     """launchd backend: one LaunchAgent plist per entity."""
 
+    # A reload is unload+load; unload terminates the running job's
+    # process group, so reloading a job's own unit kills its runner.
+    reload_terminates_running_job = True
+
     @staticmethod
     def default_unit_dir() -> Path:
         return Path.home() / "Library" / "LaunchAgents"

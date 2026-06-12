@@ -1102,11 +1102,21 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
             ):
                 logger.info("%s: superseded uuid removed", full)
 
+    deferred = False
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
         result = crony.runtime.apply_one(config, ref)
+        if result == "deferred":
+            # apply_one already logged the why at warning level.
+            deferred = True
         if verbose or result != "unchanged":
             logger.info("%s: %s", full, result)
+    # A deferred apply leaves the entry's on-disk unit and snapshot stale
+    # relative to config (they stay mutually consistent at the old state)
+    # until a later apply reconciles them; exit WARNING so an operator (or
+    # a wrapping script) sees the apply was not fully carried out.
+    if deferred:
+        raise SystemExit(int(crony.errors.ExitCode.WARNING))
 
 
 def do_destroy(

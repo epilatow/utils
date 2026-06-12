@@ -315,6 +315,26 @@ class _RunnerHarness:
         """
         return f"{DEFAULT_BUNDLE_NAME}.{short}"
 
+    def ref(
+        self,
+        short: str,
+        cfg: Any | None = None,
+        *,
+        bundle: str = DEFAULT_BUNDLE_NAME,
+    ) -> str:
+        """The `<bundle>:<uuid>` entity ref for a short name, drawn from
+        the most-recent (or passed) parsed config. Mirrors the runner's
+        `str(snap.entity_ref)` form used for the CRONY_RUNNING_REF env.
+        """
+        cfg = cfg or self._last_cfg
+        assert cfg is not None, "no config built yet for ref lookup"
+        entity_uuid: str = (
+            cfg.jobs[short].uuid
+            if short in cfg.jobs
+            else cfg.job_groups[short].uuid
+        )
+        return f"{bundle}:{entity_uuid}"
+
     def fabricate_orphan(
         self,
         short: str,

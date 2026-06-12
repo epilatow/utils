@@ -36,6 +36,13 @@ import crony.unit
 
 logger = logging.getLogger(__name__)
 
+# Env var the runner exports into a job's command environment naming the
+# entity (`<bundle>:<uuid>`) whose run is in flight. A job whose command
+# shells out to `crony apply` inherits it, letting `apply_one` recognize
+# an apply that targets the running entry's own unit and refuse to reload
+# it out from under itself (see `apply_one`).
+RUNNING_REF_ENV = "CRONY_RUNNING_REF"
+
 
 def load_snapshot(
     ref: crony.unit.EntityRef,
@@ -738,9 +745,39 @@ def _render_units(
     )
 
 
+def _write_apply_state(
+    snapshot: crony.model.Job | crony.model.JobGroup,
+) -> None:
+    """Persist an entry's apply-time state: its uuid-keyed state dir, a
+    seeded run.log, the snapshot.json, and the short-name alias.
+
+    Materializing the state dir and an empty run.log lets an operator
+    `tail -f` from apply time, before the first run; the log is never
+    truncated, so an existing one survives a re-apply. Shared by the
+    normal apply path and the self-update-deferral path, which writes
+    this state but leaves the on-disk unit untouched.
+    """
+    snapshot.state_dir.mkdir(parents=True, exist_ok=True)
+    if not snapshot.log_path_resolved.exists():
+        snapshot.log_path_resolved.touch()
+    snapshot.snapshot_path.write_text(
+        json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _link_alias(snapshot)
+
+
 def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     """Apply one selected entry from the loaded model; return
-    "added", "updated", or "unchanged".
+    "added", "updated", "unchanged", or "deferred".
+
+    "deferred" means the entry's own running job is performing this
+    apply on a scheduler whose reload terminates the running unit
+    (launchd) and the apply would change the unit: nothing is written
+    (snapshot included) so the apply doesn't reload itself to death and
+    disk stays consistent. The caller surfaces a warning and a non-zero
+    exit, and a later apply reconciles the entry. A self-apply that
+    changes only the snapshot (no unit change) is applied normally.
 
     `ref` must be a selected pending entry of `config` -- `do_apply`
     only applies what `config.pending` selected on this host. The
@@ -768,7 +805,6 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     full_name = str(snapshot.entity_name)
     bundle_name = ref.bundle
     timing = snapshot.timing
-    snapshot_path = snapshot.snapshot_path
 
     # The full names the bundle's config currently defines, used to
     # keep the rename cleanup below from unlinking a *different* live
@@ -802,6 +838,30 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         return "unchanged"
     is_update = current_snapshot is not None
 
+    sched = scheduler()
+    # A job whose own run is performing this apply cannot reload its own
+    # unit on a scheduler where the reload terminates the running job
+    # (launchd): doing so would kill this very process. If the unit would
+    # change, defer the whole apply -- write nothing (snapshot included)
+    # so the old snapshot still matches the old unit, and a later apply
+    # not running as this entry does the full update. If the unit would
+    # not change, fall through and apply normally but skip the reload
+    # below (there is nothing to reload). Other schedulers (systemd)
+    # reload without stopping running units, so they apply normally.
+    running_ref = crony.unit.EntityRef.from_str(
+        os.environ.get(RUNNING_REF_ENV, "")
+    )
+    self_reload = running_ref == ref and sched.reload_terminates_running_job
+    if self_reload and _unit_drift(snapshot):
+        logger.warning(
+            "%s: deferring update -- cannot reload the unit of a "
+            "running job without terminating it; re-run "
+            "`crony apply %s` after this run exits",
+            full_name,
+            full_name,
+        )
+        return "deferred"
+
     # Same uuid, new name: the entry was renamed in config. The
     # state dir (uuid-keyed) is reused under the new name, but the
     # old name's platform unit is now stale -- remove it so only
@@ -831,7 +891,6 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # the new job installs fresh -- a uuid change is a new job.
     prior_disabled = unit_state(full_name) == "disabled"
     units = _render_units(snapshot)
-    sched = scheduler()
     target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any previously-installed unit files for this name that
@@ -845,24 +904,17 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # same-uuid re-render; a uuid change reclaimed the old unit first,
     # so the new job loads enabled (it is a new job). `scheduled=False`
     # installs a dormant unit (no .timer on linux) that only fires when
-    # something triggers it.
-    sched.activate(
-        full_name,
-        prior_disabled=prior_disabled,
-        scheduled=timing is not None,
-    )
+    # something triggers it. Skipped for a self-reload that fell through
+    # here: the unit didn't change (a change would have deferred above),
+    # so reloading would only terminate this very run for no benefit.
+    if not self_reload:
+        sched.activate(
+            full_name,
+            prior_disabled=prior_disabled,
+            scheduled=timing is not None,
+        )
 
-    # Materialize the uuid-keyed state dir and seed an empty run.log
-    # so an operator can `tail -f` it from apply time, before the first
-    # run; never truncated, so an existing log survives a re-apply.
-    snapshot.state_dir.mkdir(parents=True, exist_ok=True)
-    if not snapshot.log_path_resolved.exists():
-        snapshot.log_path_resolved.touch()
-    snapshot_path.write_text(
-        json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    _link_alias(snapshot)
+    _write_apply_state(snapshot)
     return "updated" if is_update else "added"
 
 

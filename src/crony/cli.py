@@ -133,6 +133,17 @@ removed, or a scheduled unit the scheduler has unloaded also
 surfaces as `config=stale` so `crony apply` re-renders and
 re-bootstraps it.
 
+One apply case is held back: a job whose own command runs
+`crony apply` (a self-maintaining schedule) cannot reload its own
+unit on launchd, where reloading a unit terminates the job running
+from it. If such an apply would change that unit it makes no change
+at all -- snapshot included, so disk stays consistent -- prints a
+warning, and exits WARNING; the next `crony apply` not run by that
+job reconciles the now-`config=stale` unit. A self-apply that
+changes only the snapshot (no unit change) is applied normally, as
+is any apply under systemd, which reloads without stopping running
+units.
+
 Config bundles:
   ~/.config/crony/config.toml     -> bundle name "default"
   ~/.config/crony/config/<x>.toml -> bundle name "<x>"

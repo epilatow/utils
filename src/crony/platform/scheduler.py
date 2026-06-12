@@ -100,6 +100,15 @@ def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
 class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
 
+    # Whether picking up a changed unit file forces a reload that
+    # terminates an in-flight run of that same unit. True for launchd
+    # (the reload is unload+load, which kills the running job's process
+    # group); False for systemd (`daemon-reload` leaves running units
+    # untouched). `apply_one` reads this to refuse rewriting the unit of
+    # the entry whose own runner is performing the apply, so the apply
+    # can't reload itself to death. Each backend sets it explicitly.
+    reload_terminates_running_job: bool
+
     def __init__(self, unit_dir: Path | None = None) -> None:
         # Directory the host's units live in. Defaults to the backend's
         # `default_unit_dir()` (its standard per-OS location); a caller
