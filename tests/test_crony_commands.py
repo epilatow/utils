@@ -412,6 +412,121 @@ class TestApplyLinux:
         assert "systemctl" in commands
 
 
+class TestApplyHardTimeout:
+    """Apply renders the hard-timeout guard into the unit's run command
+    for a capped entry, with cap = entry timeout + padding, and renders a
+    bare run for an uncapped one. Same backstop on both platforms.
+    """
+
+    _GUARD = crony_runtime.GUARD_SUBCOMMAND
+    _PAD = crony_runtime.HARD_TIMEOUT_PADDING_SEC
+
+    def test_darwin_capped_job_renders_guard(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        assert f"{self._GUARD} {300 + self._PAD} " in plist
+
+    def test_darwin_uncapped_job_renders_bare_run(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job-timeout-sec": 0,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        assert self._GUARD not in plist
+
+    def test_linux_capped_job_renders_guard(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        svc = (h.sysd / f"crony-{h.full('j')}.service").read_text()
+        assert f"{self._GUARD} {300 + self._PAD} " in svc
+
+    def test_interactive_job_renders_no_guard(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An interactive job's pending wait / prompt / re-promptable delay
+        # has no wallclock bound, so the hard guard would kill a healthy
+        # waiting job. It renders unguarded even with a nonzero timeout.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job-timeout-sec": 300,
+                        "interactive": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        assert self._GUARD not in plist
+
+    def test_capped_job_apply_is_idempotent(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The guarded render must round-trip through the drift check: a
+        # second apply of an unchanged capped job sees no drift.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "job-timeout-sec": 300,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        assert h.apply("j") == "unchanged"
+
+
 class TestApplySelfUpdate:
     """A job whose own run performs the apply must not reload its own
     unit out from under itself on a scheduler whose reload terminates the

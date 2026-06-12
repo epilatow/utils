@@ -15,12 +15,14 @@ rolls the children up into the group's result.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import json
 import math
 import os
 import shlex
+import signal
 import string
 import subprocess
 import time
@@ -1143,6 +1145,67 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
     if cls == "gated":
         return 0
     return 0
+
+
+# Grace between the guard's SIGTERM and its escalation to SIGKILL,
+# matching `_exec_with_timeout`'s own command-kill grace.
+_GUARD_KILL_GRACE_SEC = 10
+
+
+def do_run_guard(cap: int, argv: list[str]) -> None:
+    """Hard wallclock backstop wrapping the runner. Platform schedulers
+    invoke this; not user-facing.
+
+    Runs `argv` (a `crony run <ref>` invocation) under a `cap`-second
+    deadline and, if it overruns, kills its whole process group. It is
+    the last resort behind the runner's own soft timeout: a runner that
+    wedges before honoring its deadline (a stuck syscall, a lock it can't
+    take) is killed here instead of holding a unit forever. The cap is
+    `entry timeout + padding`, so on a healthy run the soft timeout fires
+    first and records a clean result; the guard only acts when that
+    didn't happen.
+
+    The child runs in its own session so the kill targets only its
+    process group, never the guard. SIGTERM / SIGINT / SIGHUP are
+    forwarded to that group: the guard is the process the scheduler
+    tracks (launchd's process group, systemd's main pid), so a scheduler
+    stopping the unit signals the guard, which must pass it on to the run
+    that escaped into its own session. The child's exit status propagates
+    unchanged (a signal death as 128 + signum); an overrun exits TIMEOUT.
+    """
+    # start_new_session makes the child a session/group leader, so its
+    # pgid equals its pid -- the target for group signals. Set after the
+    # spawn; the forwarder reads it lazily so it is a no-op for a signal
+    # arriving during the spawn itself (handlers are installed first so
+    # such a signal can't fall through to the default-terminate
+    # disposition and leave the guard dead with a child still starting).
+    pgid: int | None = None
+
+    def _forward(signum: int, _frame: object) -> None:
+        if pgid is None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _forward)
+
+    proc = subprocess.Popen(argv, start_new_session=True)
+    pgid = proc.pid
+
+    try:
+        rc = proc.wait(timeout=cap)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=_GUARD_KILL_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            proc.wait()
+        raise SystemExit(int(crony.errors.ExitCode.TIMEOUT)) from None
+    raise SystemExit(rc if rc >= 0 else 128 - rc)
 
 
 def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import sys
 import time
 import uuid
@@ -2260,6 +2261,100 @@ class TestRunJobInteractive:
         assert rec["exit_class"] == "ok"
         # The flag was consumed during the wait.
         assert not (sd / "user-trigger.flag").exists()
+
+
+def _run_guard_in_child(cap: int, argv: list[str]) -> int:
+    """Run `do_run_guard` in a forked child and return its exit code.
+
+    Forking isolates the guard's signal-handler installation from the
+    pytest process, which would otherwise inherit the SIGTERM/SIGINT/
+    SIGHUP forwarders.
+    """
+    pid = os.fork()
+    if pid == 0:
+        try:
+            crony_runner.do_run_guard(cap, argv)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 0
+            os._exit(code)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+class TestDoRunGuard:
+    """The hard-timeout backstop: propagate a normal exit, and kill the
+    whole run group (not just the direct child) on overrun."""
+
+    def test_propagates_success(self) -> None:
+        assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 0"]) == 0
+
+    def test_propagates_nonzero_exit(self) -> None:
+        assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 7"]) == 7
+
+    def test_overrun_is_killed_and_exits_timeout(self) -> None:
+        start = time.monotonic()
+        code = _run_guard_in_child(1, ["/bin/sh", "-c", "sleep 30"])
+        elapsed = time.monotonic() - start
+        assert code == int(ExitCode.TIMEOUT)
+        # Killed near the cap, not after the full 30s sleep.
+        assert elapsed < 20
+
+    def test_overrun_kills_whole_process_group(self, tmp_path: Path) -> None:
+        # The run's descendants must die too, not just the direct child:
+        # the guard runs the child in its own session and kills the
+        # group. A backgrounded grandchild records its pid; after the
+        # overrun kill it must be gone.
+        pidfile = tmp_path / "grandchild.pid"
+        argv = [
+            "/bin/sh",
+            "-c",
+            f"sleep 30 & echo $! > {pidfile}; wait",
+        ]
+        code = _run_guard_in_child(1, argv)
+        assert code == int(ExitCode.TIMEOUT)
+        gc_pid = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(gc_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"grandchild {gc_pid} survived the group kill")
+
+    def test_forwards_sigterm_to_the_run(self, tmp_path: Path) -> None:
+        # The guard is the scheduler-tracked process; a stop signal it
+        # receives must reach the run that escaped into its own session.
+        pidfile = tmp_path / "grandchild.pid"
+        ready = tmp_path / "ready"
+        argv = [
+            "/bin/sh",
+            "-c",
+            f"sleep 30 & echo $! > {pidfile}; touch {ready}; wait",
+        ]
+        pid = os.fork()
+        if pid == 0:
+            try:
+                crony_runner.do_run_guard(300, argv)
+            except SystemExit as exc:
+                os._exit(exc.code if isinstance(exc.code, int) else 0)
+            os._exit(0)
+        for _ in range(50):
+            if ready.exists():
+                break
+            time.sleep(0.1)
+        gc_pid = int(pidfile.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        for _ in range(50):
+            try:
+                os.kill(gc_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
 
 
 if __name__ == "__main__":

@@ -553,15 +553,53 @@ def run_argv(
     )
 
 
+# Seconds added to a capped entry's timeout to form the hard guard's
+# wallclock cap. The cap is looser than the entry timeout so the runner's
+# own soft timeout fires first (keeping the clean last-run.json
+# reporting); the guard is the last-resort backstop for a runner that
+# wedges before honoring its deadline. The padding covers crony startup
+# plus the soft timeout's SIGTERM->SIGKILL grace.
+HARD_TIMEOUT_PADDING_SEC = 60
+
+# Hidden crony subcommand that wraps a run in a hard wallclock cap: it
+# launches the inner `crony run` in its own session and kills that
+# process group if the cap elapses.
+GUARD_SUBCOMMAND = "_run-guard"
+
+
+def guarded_argv(
+    uv_path: Path,
+    crony_path: Path,
+    ref: crony.unit.EntityRef,
+    timeout: int,
+) -> tuple[str, ...]:
+    """The unit's full run command. A positive `timeout` wraps the base
+    run in the hard-timeout guard (cap = timeout + padding); an uncapped
+    entry (`timeout <= 0`) runs the base argv directly, no guard."""
+    base = run_argv(uv_path, crony_path, ref)
+    if timeout <= 0:
+        return base
+    cap = timeout + HARD_TIMEOUT_PADDING_SEC
+    return (
+        str(uv_path),
+        "run",
+        "--script",
+        str(crony_path),
+        GUARD_SUBCOMMAND,
+        str(cap),
+        *base,
+    )
+
+
 def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
     """Recover the `(uv, crony)` paths a unit's run argv was built with,
     or None when both can't be found.
 
     Scans for the absolute uv / crony executables -- an argument ending
     in `/uv` or `/crony` that names an existing file -- rather than
-    matching a fixed argv position, so any run-command shape carries the
-    same recovery. Only still-present binaries match, so a baked path
-    that's since been removed yields None.
+    matching a fixed argv position, so any run-command shape (bare or
+    guard-wrapped) carries the same recovery. Only still-present binaries
+    match, so a baked path that's since been removed yields None.
     """
     uv_path: Path | None = None
     crony_path: Path | None = None
@@ -595,7 +633,9 @@ def _unit_drift(
     )
     cmd: tuple[str, ...] = ()
     if recovered is not None:
-        cmd = run_argv(recovered[0], recovered[1], snap.entity_ref)
+        cmd = guarded_argv(
+            recovered[0], recovered[1], snap.entity_ref, snap.guard_timeout
+        )
     return sched.drifted_units(snap.unit_spec(cmd))
 
 
@@ -791,11 +831,17 @@ def _render_units(
     """Return {filename: content} for `snap`'s platform units.
 
     Builds the run argv with the live `_uv_executable()` /
-    `_crony_executable()` paths and hands it to the platform Scheduler as
+    `_crony_executable()` paths -- wrapping it in the hard-timeout guard
+    for a capped entry -- and hands it to the platform Scheduler as
     `spec.cmd`. (The drift check recovers the installed unit's own paths
     instead; see `_unit_drift`.)
     """
-    cmd = run_argv(_uv_executable(), _crony_executable(), snap.entity_ref)
+    cmd = guarded_argv(
+        _uv_executable(),
+        _crony_executable(),
+        snap.entity_ref,
+        snap.guard_timeout,
+    )
     return scheduler(platform).render(snap.unit_spec(cmd))
 
 

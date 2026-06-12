@@ -150,6 +150,35 @@ class TestCmdCallbacks(CmdCallbacksBase):
     ]
 
 
+class TestRunGuardDispatch:
+    """The internal `_run-guard` subcommand routes to do_run_guard with
+    the cap parsed as an int and the inner command captured verbatim via
+    REMAINDER -- the inner `--script` / flags must not be parsed as guard
+    options.
+    """
+
+    def test_dispatches_with_cap_and_inner_argv(self) -> None:
+        mock_cb = MagicMock()
+        inner = [
+            "/abs/uv",
+            "run",
+            "--script",
+            "/abs/crony",
+            "run",
+            "x:y",
+        ]
+        with (
+            patch.dict(
+                crony_cli._COMMAND_CALLBACKS,
+                {"_run-guard": mock_cb},
+            ),
+            patch("sys.argv", ["prog", "_run-guard", "180", *inner]),
+        ):
+            result = crony_cli.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(cap=180, argv=inner)
+
+
 class TestConfigSubcommandDispatch:
     """The `config` parent routes its nested actions through the
     "<command> <action>" key in _COMMAND_CALLBACKS. These tests pin

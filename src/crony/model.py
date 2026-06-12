@@ -221,6 +221,15 @@ class _JobCommon:
         its `priority` field."""
         return crony.unit.PriorityClass.NORMAL
 
+    @property
+    def guard_timeout(self) -> int:
+        """The wallclock cap the hard-timeout guard wraps the unit's run
+        in (0 = no guard). The entry's `timeout` here; `Job` overrides to
+        drop the guard for an interactive job, whose pending wait /
+        prompt / delay phase has no wallclock bound for the guard to
+        respect."""
+        return self.timeout
+
     def unit_spec(self, cmd: tuple[str, ...]) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks."""
         return crony.unit.UnitSpec(
@@ -324,6 +333,16 @@ class Job(_JobCommon):
     def _unit_priority(self) -> crony.unit.PriorityClass:
         """A job's platform unit bakes in its resolved priority class."""
         return self.priority
+
+    @property
+    def guard_timeout(self) -> int:
+        """An interactive job has no wallclock-bounded run: its pending
+        wait, prompt, and re-promptable delay can outlast any cap, so the
+        hard guard would kill a healthy waiting job. The guard is dropped
+        (0); the runner's own soft timeout still bounds the command once
+        the user runs it. A non-interactive job is guarded by its
+        timeout."""
+        return 0 if self.interactive else self.timeout
 
     @classmethod
     def from_config(

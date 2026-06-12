@@ -1139,6 +1139,42 @@ class TestExecPathsFromArgv:
         assert crony_runtime.exec_paths_from_argv(argv) is None
 
 
+class TestGuardedArgv:
+    """`runtime.guarded_argv` wraps the base run in the hard-timeout
+    guard for a capped entry; the path scan recovers uv / crony from the
+    guarded shape just as it does from the bare one."""
+
+    _UV = Path("/abs/uv")
+    _CRONY = Path("/abs/crony")
+    _REF = EntityRef("default", "u-test")
+
+    def test_uncapped_is_bare_run(self) -> None:
+        assert crony_runtime.guarded_argv(
+            self._UV, self._CRONY, self._REF, 0
+        ) == crony_runtime.run_argv(self._UV, self._CRONY, self._REF)
+
+    def test_capped_wraps_with_padded_cap(self) -> None:
+        argv = crony_runtime.guarded_argv(self._UV, self._CRONY, self._REF, 120)
+        cap = 120 + crony_runtime.HARD_TIMEOUT_PADDING_SEC
+        assert argv == (
+            "/abs/uv",
+            "run",
+            "--script",
+            "/abs/crony",
+            crony_runtime.GUARD_SUBCOMMAND,
+            str(cap),
+            *crony_runtime.run_argv(self._UV, self._CRONY, self._REF),
+        )
+
+    def test_paths_recover_from_guarded_shape(self, tmp_path: Path) -> None:
+        uv = tmp_path / "uv"
+        uv.write_text("")
+        crony = tmp_path / "crony"
+        crony.write_text("")
+        argv = crony_runtime.guarded_argv(uv, crony, self._REF, 600)
+        assert crony_runtime.exec_paths_from_argv(list(argv)) == (uv, crony)
+
+
 class TestInstalledCmdParsing:
     """The backends parse an on-disk unit back to its run argv
     (`launchd._plist_argv` / `systemd._service_argv`), or None when the

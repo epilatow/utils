@@ -24,6 +24,7 @@ from typing import Any
 import crony.commands
 import crony.errors
 import crony.runner
+import crony.runtime
 from common.argparse_ext import StrictArgumentParser
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
@@ -103,6 +104,15 @@ completion via kernel-level pid-exit notification -- no polling.
 Groups dispatch each child through the same mechanism, with a
 cumulative deadline pinned at apply time as 1.05 *
 sum-of-children's-timeouts.
+
+A capped entry's unit invokes the runner through an internal
+hard-timeout guard that kills the whole run if it exceeds the
+entry's timeout plus a short padding. The runner's own timeout
+normally fires first and records a clean `timeout` result; the
+guard is a last-resort backstop for a runner that wedges before
+honoring its deadline. An uncapped entry (`job-timeout-sec = 0`)
+runs without the guard, as does an interactive job -- its pending
+wait / delay has no wallclock bound for the guard to respect.
 
 Interactive jobs (`interactive = true` on `[job.<name>]`) sit
 pending in the background after their fire and prompt the user
@@ -592,6 +602,23 @@ def _build_parser() -> StrictArgumentParser:
         help="Skip gate check (force run)",
     )
 
+    # _run-guard -- internal hard-timeout backstop wrapping `run`;
+    # rendered into the platform unit by apply, never invoked by hand.
+    # Hidden from `crony --help` for the same reason as `run` (no
+    # `help=`). Takes the cap then the full inner command via REMAINDER
+    # so the inner `--script` / flags aren't parsed as guard options.
+    p_guard = subparsers.add_parser(crony.runtime.GUARD_SUBCOMMAND)
+    p_guard.add_argument(
+        "cap",
+        type=int,
+        help="Hard wallclock cap in seconds (internal-only form)",
+    )
+    p_guard.add_argument(
+        "argv",
+        nargs=argparse.REMAINDER,
+        help="The `crony run` command to run under the cap",
+    )
+
     # notify-test
     p_nt = subparsers.add_parser(
         "notify-test",
@@ -636,6 +663,7 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "status": crony.commands.do_status,
     "logs": crony.commands.do_logs,
     "run": crony.runner.do_run,
+    crony.runtime.GUARD_SUBCOMMAND: crony.runner.do_run_guard,
     "notify-test": crony.commands.do_notify_test,
 }
 
