@@ -43,6 +43,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     CURRENT_SNAPSHOT_SCHEMA,
+    ConfigStatus,
     Job,
     JobGroup,
 )
@@ -165,7 +166,11 @@ class TestConfigState:
         )
         h.apply("j")
         config = crony_runtime.load_config()
-        assert config.config_state(self._ref(config, "default.j")) == "synced"
+        verdict = config.config_state(self._ref(config, "default.j"))
+        assert verdict == "synced"
+        # The verdict is the typed enum, not a bare string, so a
+        # regression back to a raw str return is caught.
+        assert isinstance(verdict, ConfigStatus)
 
     def test_stale_when_config_changes(
         self, tmp_path: Path, monkeypatch: Any

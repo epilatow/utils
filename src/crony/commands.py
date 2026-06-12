@@ -527,7 +527,7 @@ def _config_axis(
     full: str,
     entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
     bn: str,
-) -> str:
+) -> crony.model.ConfigStatus:
     """CONFIG axis (synced / stale / broken / missing / orphan)
     for `full`, derived entirely from the in-memory `Config` --
     no filesystem or scheduler re-query. `error` is handled by
@@ -551,7 +551,7 @@ def _config_axis(
         # in-config-but-host-masked entry (absent from the pending
         # graph) or a bare name with no on-disk state. "missing"
         # is the pre-mask base the mask layer turns into "masked".
-        return "missing"
+        return crony.model.ConfigStatus.MISSING
     state = config.config_state(ref)
     # A full-disk-access entry whose shared Crony.app wrapper can't serve
     # the grant -- not built, or built but ungranted (`is_missing`) --
@@ -562,17 +562,17 @@ def _config_axis(
     # stale-but-runnable wrapper stays stale (reported `fda-wrapper`). An
     # entry that isn't applied (no current node) or already broken /
     # orphan / missing keeps its base verdict.
-    if state == "stale":
+    if state == crony.model.ConfigStatus.STALE:
         current = config.current.job_from_ref(ref)
         if (
             isinstance(current, crony.model.Job)
             and current.fda_wrapper is not None
             and current.fda_wrapper.is_missing
         ):
-            return "error"
+            return crony.model.ConfigStatus.ERROR
     lingering = config.orphans_by_full_name.get(full)
     if (
-        state == "missing"
+        state == crony.model.ConfigStatus.MISSING
         and entry is not None
         and lingering is not None
         and not config.orphans[lingering].is_broken
@@ -583,14 +583,14 @@ def _config_axis(
         # surfaced as drift rather than a clean "not applied." (A
         # broken-snapshot remnant under the name is `broken`, not this
         # case.)
-        return "stale"
-    if state == "synced":
+        return crony.model.ConfigStatus.STALE
+    if state == crony.model.ConfigStatus.SYNCED:
         # Snapshot equality alone isn't enough: a matching
         # snapshot whose unit file is missing / hand-edited /
         # unloaded is still stale and apply must re-render.
         rs = config.runtime.get(ref)
         if rs is not None and rs.unit_is_stale:
-            return "stale"
+            return crony.model.ConfigStatus.STALE
     return state
 
 
@@ -1957,7 +1957,7 @@ def _resolve_state_axes(
     remnants: set[str],
     *,
     mask_reason: str = "",
-) -> tuple[str, str, crony.model.JobStatus]:
+) -> tuple[crony.model.ConfigStatus, str, crony.model.JobStatus]:
     """Compute the (cfg, unit, last) status axes for one full name.
 
     `do_status` is the only consumer; the function is factored
@@ -1997,15 +1997,22 @@ def _resolve_state_axes(
         # An errored entry never parsed into a uuid, so it has no
         # ref to score against the graphs; `error` is top-of-chain
         # and surfaces by name.
-        cfg_state = "error"
+        cfg_state = crony.model.ConfigStatus.ERROR
     else:
         if bundle is not None:
             entry = bundle.config.jobs.get(
                 short
             ) or bundle.config.job_groups.get(short)
         cfg_state = _config_axis(config, full, entry, bn)
-    if mask_reason and cfg_state not in ("error", "broken"):
-        cfg_state = "orphan" if full in remnants else "masked"
+    if mask_reason and cfg_state not in (
+        crony.model.ConfigStatus.ERROR,
+        crony.model.ConfigStatus.BROKEN,
+    ):
+        cfg_state = (
+            crony.model.ConfigStatus.ORPHAN
+            if full in remnants
+            else crony.model.ConfigStatus.MASKED
+        )
     # Schedule shape and the installed-unit name come from the entity
     # by uuid, not by `full`: a rename keeps the uuid, so the grouped
     # check reads the graph node and the platform query targets the
@@ -2018,7 +2025,7 @@ def _resolve_state_axes(
     )
     pending_node = config.pending.job_from_ref(ref) if ref is not None else None
     current_node = config.current.job_from_ref(ref) if ref is not None else None
-    if cfg_state == "missing":
+    if cfg_state == crony.model.ConfigStatus.MISSING:
         unit_state = "none"
     else:
         sched_node = pending_node or current_node
@@ -2120,8 +2127,13 @@ _ANSI_RESET: str = "\033[0m"
 # `crashed` are the other non-clean terminal outcomes (`crashed` = the
 # launch ended without recording a run -- killed, or exited before the
 # runner wrote its record).
-_STATUS_RED_CONFIG: frozenset[str] = frozenset(
-    {"missing", "error", "broken", "orphan"}
+_STATUS_RED_CONFIG: frozenset[crony.model.ConfigStatus] = frozenset(
+    {
+        crony.model.ConfigStatus.MISSING,
+        crony.model.ConfigStatus.ERROR,
+        crony.model.ConfigStatus.BROKEN,
+        crony.model.ConfigStatus.ORPHAN,
+    }
 )
 _STATUS_RED_LAST: frozenset[crony.model.JobStatus] = frozenset(
     {
@@ -2154,7 +2166,7 @@ def _status_value_color(col: str, value: str) -> str | None:
     if col == "config":
         if value in _STATUS_RED_CONFIG:
             return _ANSI_RED
-        if value == "stale":
+        if value == crony.model.ConfigStatus.STALE:
             return _ANSI_YELLOW
     elif col == "last" and value in _STATUS_RED_LAST:
         return _ANSI_RED
@@ -2789,7 +2801,7 @@ def do_status(
             r
             for r in rows
             if not (
-                r["config"] == "synced"
+                r["config"] == crony.model.ConfigStatus.SYNCED
                 and r["unit"] not in unhealthy_unit
                 and r["last"] in healthy_last
             )

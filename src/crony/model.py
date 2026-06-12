@@ -715,6 +715,27 @@ class JobStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ConfigStatus(StrEnum):
+    """The verdict `crony status` shows in its CONFIG column: how the
+    live config view relates to the applied on-disk state. A StrEnum so
+    it compares against and renders as its plain value.
+
+    `Config.config_state` produces the base verdicts that score the
+    pending graph against the current one -- SYNCED / STALE / BROKEN /
+    MISSING / ORPHAN. The status caller layers the two host-filter
+    verdicts on top: ERROR for an entry whose bundle config was
+    rejected, and MASKED for one excluded on this host with no on-disk
+    remnant."""
+
+    SYNCED = "synced"
+    STALE = "stale"
+    BROKEN = "broken"
+    MISSING = "missing"
+    ORPHAN = "orphan"
+    MASKED = "masked"
+    ERROR = "error"
+
+
 @dataclass
 class CommonRunResult:
     """The fields every completed run records, shared by JobRunResult
@@ -1183,7 +1204,7 @@ class Config:
             return
         raise crony.errors.UsageError(f"unknown bundle: {bundle!r}")
 
-    def config_state(self, ref: crony.unit.EntityRef) -> str:
+    def config_state(self, ref: crony.unit.EntityRef) -> ConfigStatus:
         """synced | stale | broken | missing | orphan for `ref`.
 
         `broken` wins over the other axes: if the on-disk
@@ -1208,17 +1229,17 @@ class Config:
         c = self.current.job_from_ref(ref)
         if orphan is not None:
             if orphan.is_broken:
-                return "broken"
+                return ConfigStatus.BROKEN
             if p is None:
-                return "orphan"
-            return "stale"
+                return ConfigStatus.ORPHAN
+            return ConfigStatus.STALE
         if p is None and c is None:
             raise KeyError(ref)
         if p is None:
-            return "orphan"
+            return ConfigStatus.ORPHAN
         if c is None:
-            return "missing"
-        return "synced" if p == c else "stale"
+            return ConfigStatus.MISSING
+        return ConfigStatus.SYNCED if p == c else ConfigStatus.STALE
 
     def name_for(self, ref: crony.unit.EntityRef) -> str | None:
         """Recover the full namespaced name `ref` was last seen
