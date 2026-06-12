@@ -219,6 +219,19 @@ def _wait_for_pid_exit(
     return crony.runtime.host().wait_for_pid_exit(pid, timeout)
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` names a live process. Signal 0 probes existence
+    without delivering anything; a process owned by another user
+    (PermissionError) still exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _wait_for_user_active(
     required_sec: int,
     *,
@@ -816,7 +829,11 @@ def _run_group(
                             job_timeout=child_wait,
                             trigger_timeout=trigger_timeout,
                         )
-                    except crony.errors.TriggerStartTimeout as e:
+                    except crony.errors.JobTimeoutError as e:
+                        # A child that never started (TriggerStartTimeout)
+                        # or that overran / wedged past its wait budget
+                        # (TriggerWaitTimeout): record it timed-out and
+                        # move on rather than letting it stall the group.
                         log_file.write(f"   {e}\n".encode())
                         children.append(
                             crony.model.GroupChildResult(
@@ -989,15 +1006,18 @@ def trigger_unit_sync(
     leaves no phantom remnant behind.
 
     Returns the parsed `last-run.json` dict for the run we observed
-    completing. Raises `TriggerStartTimeout` if no sign of life
-    (no pid file, no fresh last-run.json) appears within
-    `trigger_timeout` seconds of the trigger -- that's the
-    "platform never started anything" detector (broken plist,
-    stalled queue, unloaded unit). Once we've observed activity,
-    the wait is bounded by `job_timeout` (the runner's own
-    wallclock cap; `math.inf` for an uncapped child) rather than
-    `trigger_timeout`, so a long-running job doesn't get spuriously
-    declared a start failure.
+    completing. Raises `TriggerStartTimeout` if no live runner and no
+    fresh last-run.json appears within `trigger_timeout` seconds -- the
+    "platform never started anything" detector (broken plist, stalled
+    queue, unloaded unit), which also covers a launch that wrote run.pid
+    then died without recording (the dead pid no longer counts as a
+    live runner). Raises `JobTimeoutError` when `job_timeout` is finite
+    and the wait reaches that budget without completing; the budget
+    hard-bounds the whole wait. A dead or vanished pid can never spin
+    this loop -- a liveness probe gates the pid-exit wait, so a corpse
+    falls through to the bounded start-timeout poll instead of re-arming
+    the wait. An uncapped child (`job_timeout` is `math.inf`) with a
+    genuinely live runner waits as long as that runner lives.
 
     Mechanism: a pre-trigger timestamp T is taken, the platform
     is asked to fire the unit, and the waiter watches for the
@@ -1032,10 +1052,11 @@ def trigger_unit_sync(
     started_at = time.monotonic()
     while True:
         elapsed = time.monotonic() - started_at
-        pid = crony.runtime.read_pid_file(pid_path)
-        # `last-run.json` check goes first so a sub-second run
-        # whose pid file came and went between iterations is
-        # still observable via the file the runner wrote at exit.
+        # The fresh-result read precedes the budget cap so a child that
+        # completed right at the boundary returns its real record rather
+        # than a spurious timeout. It also covers a sub-second run whose
+        # pid file came and went between iterations, still observable via
+        # the file the runner wrote at exit.
         if last_run_path.exists():
             rec: dict[str, Any] | None
             try:
@@ -1055,13 +1076,20 @@ def trigger_unit_sync(
                     and ended_dt >= pre_trigger_dt
                 ):
                     return rec
-        if pid is not None:
-            # Activity confirmed; trigger_timeout no longer
-            # applies. Block on kernel-level pid-exit, capped at
-            # the runner's own wallclock budget (None = no cap, for an
-            # uncapped child). After the wait, loop back to re-read
-            # last-run.json (the runner writes it just before unlinking
-            # the pid).
+        # Hard cap on the whole wait: a capped child can't hold the
+        # group past its budget regardless of pid state. Bounds a
+        # wedged live child and a dead pid that never yields a fresh
+        # result alike, so this loop can neither block nor spin forever.
+        if not math.isinf(job_timeout) and elapsed > job_timeout:
+            raise crony.errors.JobTimeoutError(
+                f"{full_name!r} did not complete within {job_timeout:.0f}s"
+            )
+        pid = crony.runtime.read_pid_file(pid_path)
+        if pid is not None and _pid_alive(pid):
+            # A live runner: block on kernel-level pid-exit, capped at
+            # the remaining budget (None = no cap, for an uncapped
+            # child). After the wait, loop back to re-read last-run.json
+            # (the runner writes it just before unlinking the pid).
             pid_wait = (
                 None
                 if math.isinf(job_timeout)
@@ -1069,9 +1097,10 @@ def trigger_unit_sync(
             )
             _wait_for_pid_exit(pid, timeout=pid_wait)
             continue
-        # No pid and no fresh result: still in the start window.
-        # Bound this state by trigger_timeout so a broken /
-        # unloaded unit fails fast instead of hanging.
+        # No live runner: not started yet, or it wrote run.pid and died
+        # without a fresh result (a dead pid lingers). Bound this by
+        # trigger_timeout and poll with a sleep -- never re-attach to a
+        # corpse and busy-loop.
         if elapsed > trigger_timeout:
             raise crony.errors.TriggerStartTimeout(
                 f"trigger of {full_name!r} never produced a fresh "

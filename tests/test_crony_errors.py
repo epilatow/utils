@@ -65,8 +65,8 @@ class TestExceptionRelationships:
             assert issubclass(exc, CronyError)
 
     def test_specializations(self) -> None:
-        # The two specializations inherit a parent's exit code rather
-        # than declaring their own.
+        # The specializations inherit a parent's exit code rather than
+        # declaring their own.
         assert issubclass(UnitNotInstalledError, PreconditionError)
         assert "exit_code" not in UnitNotInstalledError.__dict__
         assert UnitNotInstalledError.exit_code is ExitCode.PRECONDITION
