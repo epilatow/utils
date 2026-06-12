@@ -1,0 +1,15 @@
+# C source formatting for the Applications/*.app Mach-O wrappers.
+# Apply with: xcrun clang-format -i <file>.c
+# (clang-format ships in the Xcode toolchain; reachable via xcrun.)
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 75
+BreakBeforeBraces: Linux
+AlignAfterOpenBracket: Align
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+...

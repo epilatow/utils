@@ -24,6 +24,8 @@ from __future__ import annotations
 import abc
 import enum
 
+from crony.platform.fda import FDAWrapper
+
 
 class PidWait(enum.Enum):
     """Outcome of `HostPlatform.wait_for_pid_exit`.
@@ -78,6 +80,31 @@ class HostPlatform(abc.ABC):
         missing inhibitor must never fail the job. `label` names the job
         for the inhibitor's bookkeeping. (Lid-close on battery still
         sleeps the machine; no userspace mechanism prevents that.)"""
+
+    @abc.abstractmethod
+    def full_disk_access_argv(self, argv: list[str]) -> list[str]:
+        """Wrap `argv` so the command runs with macOS Full Disk Access,
+        or return it unchanged where FDA does not apply.
+
+        On darwin the command is routed through Crony.app, the wrapper
+        that holds the grant. The grant is a run precondition: this
+        raises `PreconditionError` when the wrapper is missing or the
+        grant is not in effect -- the standard run-precondition signal,
+        which a blocked fire records as `canceled`. A stale-but-present
+        wrapper still runs. Off darwin FDA is a no-op and `argv` is
+        returned unchanged."""
+
+    @abc.abstractmethod
+    def prepare_full_disk_access(self) -> str | None:
+        """Build the FDA wrapper if needed and check the grant, for
+        `crony apply`. Returns a warning to log (the grant is missing,
+        or the toolchain can't build the wrapper) or None when FDA is
+        ready / not applicable. Off darwin this is a no-op (None)."""
+
+    @abc.abstractmethod
+    def full_disk_access_state(self) -> FDAWrapper:
+        """The FDA wrapper's state for `crony status` (see `FDAWrapper`).
+        Off darwin there is no wrapper, so always `FDAWrapper.OK`."""
 
     @abc.abstractmethod
     def hid_idle_seconds(self) -> float:

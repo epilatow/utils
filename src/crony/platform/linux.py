@@ -16,6 +16,7 @@ import os
 import select
 import shutil
 
+from crony.platform.fda import FDAWrapper
 from crony.platform.host import HostPlatform, PidWait
 
 _NO_INTERACTIVE = "interactive jobs / dialogs are not supported on Linux"
@@ -70,6 +71,17 @@ class LinuxHost(HostPlatform):
             ],
             None,
         )
+
+    def full_disk_access_argv(self, argv: list[str]) -> list[str]:
+        # Full Disk Access is a macOS TCC concept; on Linux a job reads
+        # what its user can read, so the command runs unwrapped.
+        return argv
+
+    def prepare_full_disk_access(self) -> str | None:
+        return None
+
+    def full_disk_access_state(self) -> FDAWrapper:
+        return FDAWrapper.OK
 
     def hid_idle_seconds(self) -> float:
         raise NotImplementedError(_NO_INTERACTIVE)

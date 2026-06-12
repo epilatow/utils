@@ -1107,6 +1107,8 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
                 logger.info("%s: superseded uuid removed", full)
 
     deferred = False
+    _ensure_fda_wrapper(config, full_names_to_apply)
+
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
         result = crony.runtime.apply_one(config, ref)
@@ -1121,6 +1123,31 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # a wrapping script) sees the apply was not fully carried out.
     if deferred:
         raise SystemExit(int(crony.errors.ExitCode.WARNING))
+
+
+def _ensure_fda_wrapper(
+    config: crony.model.Config, full_names_to_apply: list[str]
+) -> None:
+    """Build the Full Disk Access wrapper when any entry being applied
+    needs it, logging any grant / toolchain warning.
+
+    Building is the only point the wrapper is (re)compiled -- a run uses
+    whatever binary is already present (rebuilding changes its cdhash and
+    would void the grant). The host backend decides what the work is: off
+    darwin it is a no-op.
+    """
+    fda_flag = crony.config.JobFlags.FULL_DISK_ACCESS
+    needs_fda = any(
+        (job := config.pending.job_from_ref(config.pending.by_full_name[full]))
+        is not None
+        and fda_flag in job.flags
+        for full in full_names_to_apply
+    )
+    if not needs_fda:
+        return
+    warning = crony.runtime.host().prepare_full_disk_access()
+    if warning is not None:
+        logger.warning("%s", warning)
 
 
 def do_destroy(

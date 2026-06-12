@@ -38,3 +38,8 @@ nohup.out
 Applications/BorgAdm.app/Contents/MacOS/BorgAdm
 Applications/BorgAdm.app/Contents/MacOS/.BorgAdm.source-sha256
 Applications/BorgAdm.app/Contents/_CodeSignature/
+
+# Crony.app build artifacts (binary compiled at crony-apply time)
+Applications/Crony.app/Contents/MacOS/Crony
+Applications/Crony.app/Contents/MacOS/.Crony.source-sha256
+Applications/Crony.app/Contents/_CodeSignature/

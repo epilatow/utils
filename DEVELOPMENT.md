@@ -34,10 +34,14 @@ This repo is a personal-utilities collection. Top-level structure:
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
-  utilities (e.g. BorgAdm.app, the Mach-O wrapper that lets `borgadm` hold a
-  Full Disk Access grant, which a Python script cannot; its `BorgAdm.c`
-  documents the TCC responsible-process handling that keeps the grant working
-  when a scheduler such as crony runs the wrapper).
+  utilities. Each is a Mach-O wrapper that lets a Python script (which can
+  never hold the grant itself) run under a Full Disk Access grant: BorgAdm.app
+  for `borgadm`, and Crony.app, the generic disclaim-and-exec wrapper crony
+  routes a full-disk-access job's command through. Their C source
+  (`BorgAdm.c`, `Crony.c`) documents the TCC responsible-process handling that
+  keeps the grant working when a scheduler such as crony runs the wrapper; the
+  C is kept formatted to the repo's `.clang-format` (apply via
+  `xcrun clang-format -i`).
 - `ruff.toml` -- ruff config shared across all Python in the repo.
 - `tmp/` -- gitignored scratch for plans, review inputs, and other ephemeral
   working files.

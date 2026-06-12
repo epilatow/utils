@@ -64,10 +64,12 @@ from crony.model import (  # noqa: E402
     CURRENT_SNAPSHOT_SCHEMA,
     Job,
 )
+from crony.platform import fda as crony_fda  # noqa: E402
 from crony.platform import (  # noqa: E402
     launchd,
     systemd,
 )
+from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityRef,
 )
@@ -660,6 +662,83 @@ class TestApplySelfUpdate:
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
         assert exc.value.code == int(ExitCode.WARNING)
+
+
+class TestApplyFullDiskAccess:
+    """`crony apply` builds the FDA wrapper exactly when an entry being
+    applied carries the full-disk-access flag, and only then. The
+    fda module's build / state are stubbed so this runs on any
+    platform."""
+
+    def test_builds_wrapper_for_fda_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        built: list[bool] = []
+        monkeypatch.setattr(
+            crony_fda, "build_wrapper", lambda: built.append(True)
+        )
+        monkeypatch.setattr(crony_fda, "wrapper_state", lambda: FDAWrapper.OK)
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert built == [True]
+
+    def test_skips_wrapper_without_fda_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        built: list[bool] = []
+        monkeypatch.setattr(
+            crony_fda, "build_wrapper", lambda: built.append(True)
+        )
+        monkeypatch.setattr(crony_fda, "wrapper_state", lambda: FDAWrapper.OK)
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert built == []
+
+    def test_grant_warning_does_not_fail_apply(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(crony_fda, "build_wrapper", lambda: None)
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(
+            crony_fda, "grant_instructions", lambda: "grant me FDA"
+        )
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with caplog.at_level(logging.WARNING):
+            crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        assert "grant me FDA" in caplog.text
+        # The plist still lands -- a missing grant warns, it does not
+        # abort the apply.
+        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
 
 class TestApplyFullSync:

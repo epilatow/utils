@@ -25,7 +25,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import crony.platform.fda as fda  # noqa: E402
+from crony.errors import PreconditionError  # noqa: E402
 from crony.platform import DarwinHost, PidWait  # noqa: E402
+from crony.platform.fda import FDAWrapper  # noqa: E402
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "darwin.py"
@@ -139,6 +142,68 @@ class TestDarwinKeepAwake:
         argv, note = DarwinHost().keep_awake_argv(["true"], "default.a")
         assert argv == ["true"]
         assert note is not None and "caffeinate not found" in note
+
+
+class TestDarwinFullDiskAccess:
+    """The FDA host methods route through crony.platform.fda; that module
+    is stubbed so these run on any platform. A missing wrapper or denied
+    grant is a run precondition (raises); a stale-but-present wrapper
+    still runs."""
+
+    def test_argv_wraps_through_crony_app(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(fda, "wrapper_state", lambda: FDAWrapper.OK)
+        monkeypatch.setattr(fda, "wrapper_binary", lambda: Path("/x/Crony"))
+        argv = DarwinHost().full_disk_access_argv(["/bin/sh", "-c", "true"])
+        assert argv == ["/x/Crony", "/bin/sh", "-c", "true"]
+
+    def test_argv_stale_wrapper_still_runs(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(fda, "wrapper_state", lambda: FDAWrapper.STALE)
+        monkeypatch.setattr(fda, "wrapper_binary", lambda: Path("/x/Crony"))
+        argv = DarwinHost().full_disk_access_argv(["true"])
+        assert argv == ["/x/Crony", "true"]
+
+    def test_argv_missing_wrapper_raises(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(fda, "wrapper_state", lambda: FDAWrapper.MISSING)
+        with pytest.raises(PreconditionError, match="not built"):
+            DarwinHost().full_disk_access_argv(["true"])
+
+    def test_argv_denied_grant_raises(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(fda, "grant_instructions", lambda: "grant me FDA")
+        with pytest.raises(PreconditionError, match="grant me FDA"):
+            DarwinHost().full_disk_access_argv(["true"])
+
+    def test_prepare_builds_and_returns_none_when_granted(
+        self, monkeypatch: Any
+    ) -> None:
+        built: dict[str, bool] = {}
+        monkeypatch.setattr(
+            fda, "build_wrapper", lambda: built.__setitem__("ran", True)
+        )
+        monkeypatch.setattr(fda, "wrapper_state", lambda: FDAWrapper.OK)
+        assert DarwinHost().prepare_full_disk_access() is None
+        assert built["ran"] is True
+
+    def test_prepare_warns_when_grant_missing(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(fda, "build_wrapper", lambda: None)
+        monkeypatch.setattr(
+            fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(fda, "grant_instructions", lambda: "grant me FDA")
+        assert DarwinHost().prepare_full_disk_access() == "grant me FDA"
+
+    def test_prepare_returns_build_error(self, monkeypatch: Any) -> None:
+        def boom() -> None:
+            raise PreconditionError("no cc")
+
+        monkeypatch.setattr(fda, "build_wrapper", boom)
+        assert DarwinHost().prepare_full_disk_access() == "no cc"
+
+    def test_state_delegates_to_fda(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(fda, "wrapper_state", lambda: FDAWrapper.STALE)
+        assert DarwinHost().full_disk_access_state() is FDAWrapper.STALE
 
 
 class TestDarwinInteractive:

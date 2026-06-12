@@ -15,6 +15,9 @@ import select
 import shutil
 import subprocess
 
+import crony.errors
+import crony.platform.fda
+from crony.platform.fda import FDAWrapper
 from crony.platform.host import HostPlatform, PidWait
 
 
@@ -85,6 +88,36 @@ class DarwinHost(HostPlatform):
         if tool is None:
             return argv, "keep_awake: caffeinate not found; running unwrapped"
         return [tool, "-i", "-s", *argv], None
+
+    def full_disk_access_argv(self, argv: list[str]) -> list[str]:
+        # A missing wrapper or a denied grant is a run precondition --
+        # the job can't read what it needs -- so raise; the runner
+        # records it as canceled. A stale-but-present wrapper still runs
+        # (the old binary keeps its grant); its staleness shows in
+        # status. (`wrapper_state` probes the grant only when current.)
+        state = crony.platform.fda.wrapper_state()
+        if state is FDAWrapper.MISSING:
+            raise crony.errors.PreconditionError(
+                "Crony.app wrapper is not built; run `crony apply` to "
+                "build it before a full-disk-access job runs."
+            )
+        if state is FDAWrapper.MISSING_FDA_GRANT:
+            raise crony.errors.PreconditionError(
+                crony.platform.fda.grant_instructions()
+            )
+        return [str(crony.platform.fda.wrapper_binary()), *argv]
+
+    def prepare_full_disk_access(self) -> str | None:
+        try:
+            crony.platform.fda.build_wrapper()
+        except crony.errors.PreconditionError as exc:
+            return str(exc)
+        if crony.platform.fda.wrapper_state() is FDAWrapper.MISSING_FDA_GRANT:
+            return crony.platform.fda.grant_instructions()
+        return None
+
+    def full_disk_access_state(self) -> FDAWrapper:
+        return crony.platform.fda.wrapper_state()
 
     def hid_idle_seconds(self) -> float:
         # Reads HIDIdleTime (nanoseconds) from IOHIDSystem. Returns 0.0

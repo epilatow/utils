@@ -1,5 +1,5 @@
 /*
- * BorgAdm.app wrapper -- compiled Mach-O binary for Full Disk Access.
+ * Crony.app wrapper -- compiled Mach-O binary for Full Disk Access.
  *
  * Why this exists, and why it re-spawns itself:
  *
@@ -9,30 +9,30 @@
  * the parent and shared by the whole subtree -- it is NOT the program
  * that is actually running. FDA is also only ever granted to a code-
  * signed app bundle's Mach-O executable, never to an interpreted
- * script, which is why borgadm (a `uv run` Python script) cannot hold
- * the grant and this wrapper does.
+ * script, so crony (a `uv run` Python script) cannot hold the grant.
+ * This wrapper does, and crony's runner execs a job's command through
+ * it so the command reads protected files under the grant.
  *
  * The grant is keyed to *this* binary's identity, and only applies
  * when this binary is the responsible process. When launchd launches
  * the wrapper directly, launchd makes it its own responsible process
- * and the grant applies. But when a scheduler such as crony spawns it
- * as a descendant (launchd -> crony -> /bin/sh -> wrapper), the
- * responsible process is the crony launchd job, which has no FDA, so
- * the check_fda() probe below would fail even though FDA is granted.
+ * and the grant applies. But crony runs it as a descendant of its own
+ * launchd job (launchd -> crony -> wrapper), so the responsible
+ * process is the crony job, which has no FDA, and the check_fda()
+ * probe below would fail even though FDA is granted.
  *
  * To be robust to any launcher, the wrapper re-spawns itself once with
  * responsibility_spawnattrs_setdisclaim(), which resets the TCC
  * responsibility chain so the re-spawned process becomes its own
- * responsible process -- carrying this binary's (BorgAdm.app's)
- * identity and therefore its FDA grant. The descendants it then execs
- * and spawns (borgadm, and borg under it) inherit that responsibility,
- * so they read protected files under the grant -- the same
- * responsible-process relationship launchd sets up when it launches an
- * app directly. The re-spawn leaves the original instance waiting on
- * the new one, so it forwards termination signals down to it; a
- * scheduler timeout (a single-PID SIGTERM) or an interactive Ctrl-C
- * then still reaches borgadm, as it did when the wrapper exec'd into
- * borgadm directly, instead of being absorbed by this instance.
+ * responsible process -- carrying this binary's (Crony.app's) identity
+ * and therefore its FDA grant. The command it then execs (and that
+ * command's own children) inherit that responsibility, so they read
+ * protected files under the grant -- the same responsible-process
+ * relationship launchd sets up when it launches an app directly. The
+ * re-spawn leaves the original instance waiting on the new one, so it
+ * forwards termination signals down to it; a scheduler timeout (a
+ * single-PID SIGTERM) or an interactive Ctrl-C then still reaches the
+ * command, instead of being absorbed by this instance.
  *
  * responsibility_spawnattrs_setdisclaim() is undocumented SPI; Apple's
  * own LLDB, Chromium, and Qt Creator rely on it. It is resolved at run
@@ -41,7 +41,20 @@
  * make the wrapper its own responsible process, so the disclaim only
  * matters under a scheduler.
  *
- * Built automatically by: borgadm automate enable
+ * Two modes, both running after the disclaim so they reflect this
+ * binary's grant:
+ *   --check-fda      Probe FDA and exit 0 (granted) or FDA_EXIT_CODE
+ *                    (denied), without running anything. Used by
+ *                    `crony apply` / `crony status` to test the grant.
+ *   <cmd> [args...]  Require FDA, then exec <cmd> with [args...] so it
+ *                    runs with Full Disk Access. <cmd> is whatever
+ *                    crony's runner would have run directly (it builds
+ *                    the argv); the wrapper imposes no restriction on
+ *                    it -- crony is itself a `uv run` script whose
+ *                    interpreter a local user could replace, so a
+ *                    target allowlist here would add no real security.
+ *
+ * Built automatically by `crony apply` when a job needs FDA.
  */
 
 #include <dirent.h>
@@ -53,7 +66,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -61,13 +73,17 @@ extern char **environ;
 
 /* Exit code when FDA is not granted.  77 is the conventional
  * "skip / not configured" code (used by Automake, CMake/CTest,
- * Meson, etc.) and is outside the range used by borgadm itself,
- * making it easy to distinguish in launchd logs. */
+ * Meson, etc.) and is outside crony's own run-outcome range,
+ * making it easy to distinguish in launchd logs and probe results. */
 #define FDA_EXIT_CODE 77
+
+/* First argument that switches the wrapper into probe mode (test FDA,
+ * run nothing); mirrors CHECK_FDA_FLAG in crony.platform.fda. */
+#define CHECK_FDA_FLAG "--check-fda"
 
 /* Env marker set on the re-spawned (disclaimed) instance so its pass
  * through main() skips the re-spawn instead of looping. */
-#define DISCLAIM_ENV "BORGADM_FDA_DISCLAIMED"
+#define DISCLAIM_ENV "CRONY_FDA_DISCLAIMED"
 
 /*
  * Check Full Disk Access by probing a TCC-protected directory.
@@ -95,6 +111,24 @@ static int check_fda(void)
     return 1;
 }
 
+/* Print, to stderr, how to grant Full Disk Access to this bundle. */
+static void print_fda_guidance(const char *app_path)
+{
+    fprintf(stderr,
+            "ERROR: Crony.app does not have Full Disk Access.\n"
+            "\n"
+            "1. Run this command to open System Settings:\n"
+            "\n"
+            "   open \"x-apple.systempreferences:"
+            "com.apple.settings.PrivacySecurity.extension"
+            "?Privacy_AllFiles\"\n"
+            "\n"
+            "2. Click the '+' button\n"
+            "3. Navigate to and add: %s\n"
+            "4. Toggle the switch ON for Crony\n",
+            app_path);
+}
+
 /* PID of the re-spawned child, for the signal-forwarding handler. */
 static volatile sig_atomic_t g_child_pid = 0;
 
@@ -109,7 +143,7 @@ static void forward_signal(int sig)
 
 /*
  * Re-spawn this binary with TCC responsibility disclaimed so the new
- * process becomes its own responsible process -- carrying BorgAdm.app's
+ * process becomes its own responsible process -- carrying Crony.app's
  * identity, which holds the FDA grant -- regardless of how this wrapper
  * was launched.  self is this binary's resolved path; argv is forwarded
  * unchanged.
@@ -121,8 +155,10 @@ static void forward_signal(int sig)
  */
 static void disclaim_respawn(const char *self, char *const argv[])
 {
-    /* SPI, not in any public header.  dlsym keeps the wrapper working
-     * if a future macOS ever drops the symbol (we just run direct). */
+    /*
+     * SPI, not in any public header.  dlsym keeps the wrapper working
+     * if a future macOS ever drops the symbol (we just run direct).
+     */
     union {
         void *obj;
         int (*fn)(posix_spawnattr_t *, int);
@@ -132,8 +168,10 @@ static void disclaim_respawn(const char *self, char *const argv[])
     if (!setdisclaim.obj)
         return;
 
-    /* Read by the re-spawned process to break the loop; harmless if it
-     * reaches borgadm/borg in the environment. */
+    /*
+     * Read by the re-spawned process to break the loop; harmless if it
+     * reaches the command in the environment.
+     */
     if (setenv(DISCLAIM_ENV, "1", 1) != 0)
         return;
 
@@ -145,12 +183,14 @@ static void disclaim_respawn(const char *self, char *const argv[])
         return;
     }
 
-    /* Block the signals we forward before spawning, so none is lost to
+    /*
+     * Block the signals we forward before spawning, so none is lost to
      * the default disposition -- which would kill this waiting instance
      * and orphan the child -- in the window before the handlers are in
-     * place.  The child is given the prior mask so borgadm starts able
-     * to receive them; their dispositions are still the default this
-     * instance holds here, so the child inherits the default too. */
+     * place.  The child is given the prior mask so the command starts
+     * able to receive them; their dispositions are still the default
+     * this instance holds here, so the child inherits the default too.
+     */
     sigset_t forwarded, prev_mask;
     sigemptyset(&forwarded);
     sigaddset(&forwarded, SIGTERM);
@@ -169,11 +209,13 @@ static void disclaim_respawn(const char *self, char *const argv[])
         return;
     }
 
-    /* Child is running borgadm now; never fall back to running it here
-     * too.  Install the forwarders, then unblock: any signal that
+    /*
+     * Child is running the command now; never fall back to running it
+     * here too.  Install the forwarders, then unblock: any signal that
      * arrived during setup is delivered now and forwarded to the child,
      * so this instance stays transparent to a crony timeout's SIGTERM
-     * and to an interactive Ctrl-C. */
+     * and to an interactive Ctrl-C.
+     */
     g_child_pid = pid;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -215,10 +257,10 @@ static void dirname_n(char *path, int count)
 int main(int argc __attribute__((unused)), char *argv[])
 {
     /*
-     * Resolve paths relative to this binary.
-     * Binary:  <repo>/Applications/BorgAdm.app/Contents/MacOS/BorgAdm
-     * App:     <repo>/Applications/BorgAdm.app  (3 levels up)
-     * Repo:    <repo>                           (5 levels up)
+     * Resolve this binary's own path for the disclaim re-spawn, and the
+     * .app bundle path (3 levels up) for the FDA-denied guidance:
+     *   <repo>/Applications/Crony.app/Contents/MacOS/Crony
+     *   <repo>/Applications/Crony.app  (3 levels up)
      */
     char self_buf[4096];
     uint32_t bufsize = sizeof(self_buf);
@@ -226,84 +268,44 @@ int main(int argc __attribute__((unused)), char *argv[])
         fprintf(stderr, "ERROR: Cannot determine executable path\n");
         return 1;
     }
-
     char *real = realpath(self_buf, NULL);
     if (!real) {
         fprintf(stderr, "ERROR: Cannot resolve executable path\n");
         return 1;
     }
-
-    /* Derive the .app bundle path (3 levels up from binary). */
     char app_path[4096];
     snprintf(app_path, sizeof(app_path), "%s", real);
     dirname_n(app_path, 3);
 
     /*
-     * Make BorgAdm.app the responsible process for the FDA check below
-     * and everything it execs.  Skipped on the re-spawned instance
+     * Make Crony.app the responsible process for the FDA check below
+     * and the command it execs.  Skipped on the re-spawned instance
      * (marked via the environment) so this happens at most once.
      */
     if (!getenv(DISCLAIM_ENV))
         disclaim_respawn(real, argv);
-
-    if (!check_fda()) {
-        fprintf(stderr,
-                "ERROR: BorgAdm.app does not have Full Disk Access.\n"
-                "\n"
-                "1. Run this command to open System Settings:\n"
-                "\n"
-                "   open \"x-apple.systempreferences:"
-                "com.apple.settings.PrivacySecurity.extension"
-                "?Privacy_AllFiles\"\n"
-                "\n"
-                "2. Click the '+' button\n"
-                "3. Navigate to and add: %s\n"
-                "4. Toggle the switch ON for BorgAdm\n",
-                app_path);
-        free(real);
-        return FDA_EXIT_CODE;
-    }
-
-    dirname_n(real, 5);
-
-    char borgadm[4096];
-    snprintf(borgadm, sizeof(borgadm), "%s/bin/borgadm", real);
     free(real);
 
-    /*
-     * Security checks on borgadm before exec.
-     *
-     * This binary grants FDA to whatever it execs, so verify that
-     * the target is executable, owned by us, and not writable by
-     * group or others.  This prevents a same-system attacker from
-     * substituting borgadm with a malicious script that would
-     * inherit FDA.
-     */
-    struct stat st;
-    if (stat(borgadm, &st) != 0) {
-        fprintf(stderr, "ERROR: Cannot find borgadm at: %s\n", borgadm);
-        return 1;
+    int probe = argv[1] && strcmp(argv[1], CHECK_FDA_FLAG) == 0;
+
+    if (!check_fda()) {
+        /*
+         * The probe reports denial through its exit code alone; a real
+         * run logs the guidance so a failed launchd job explains itself.
+         */
+        if (!probe)
+            print_fda_guidance(app_path);
+        return FDA_EXIT_CODE;
     }
-    if (st.st_uid != getuid()) {
-        fprintf(stderr,
-                "ERROR: borgadm is not owned by the current user: %s\n",
-                borgadm);
-        return 1;
-    }
-    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
-        fprintf(stderr,
-                "ERROR: borgadm is writable by group or others: %s\n",
-                borgadm);
-        return 1;
-    }
-    if (access(borgadm, X_OK) != 0) {
-        fprintf(stderr, "ERROR: borgadm is not executable: %s\n", borgadm);
+    if (probe)
+        return 0;
+
+    if (!argv[1]) {
+        fprintf(stderr, "ERROR: no command given to Crony.app\n");
         return 1;
     }
 
-    argv[0] = borgadm;
-    execv(borgadm, argv);
-
+    execv(argv[1], &argv[1]);
     perror("execv");
     return 1;
 }

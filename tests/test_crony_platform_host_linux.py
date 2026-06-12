@@ -26,6 +26,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.platform import LinuxHost, PidWait  # noqa: E402
+from crony.platform.fda import FDAWrapper  # noqa: E402
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "linux.py"
@@ -106,6 +107,21 @@ class TestLinuxKeepAwake:
         argv, note = LinuxHost().keep_awake_argv(["true"], "default.a")
         assert argv == ["true"]
         assert note is not None and "systemd-inhibit not found" in note
+
+
+class TestLinuxFullDiskAccess:
+    """Full Disk Access is a macOS TCC concept; on Linux every FDA
+    operation is an inert no-op."""
+
+    def test_argv_unchanged(self) -> None:
+        argv = ["/bin/sh", "-c", "true"]
+        assert LinuxHost().full_disk_access_argv(argv) == argv
+
+    def test_prepare_is_noop(self) -> None:
+        assert LinuxHost().prepare_full_disk_access() is None
+
+    def test_state_is_ok(self) -> None:
+        assert LinuxHost().full_disk_access_state() is FDAWrapper.OK
 
 
 class TestLinuxNoDesktop:
