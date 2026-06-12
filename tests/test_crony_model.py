@@ -477,33 +477,76 @@ class TestJobFromRefAndFullName:
 
 
 class TestRuntimeStateCrashed:
-    """`crashed` reconciles the scheduler's last-launch status against
-    the recorded run: a launch that ended in a way the runner never
-    recorded (killed by signal, or exited nonzero before recording)
-    leaves a stale last-run.json, so status reports `crashed`. A status
-    matching the recorded process exit is a normal result."""
+    """`crashed` flags a launch that ended without recording its result,
+    via two independent signals: a surviving run.pid naming a different
+    pid than the last record wrote (the launch never reached cleanup),
+    or the scheduler's last-launch status disagreeing with the recorded
+    process exit. A status matching the recorded exit, or an in-flight
+    run, is not a crash."""
 
     def _rs(
         self,
-        unit_last_exit: UnitLastExit | None,
+        unit_last_exit: UnitLastExit | None = None,
         *,
         last_run: LastRun | None = None,
+        run_pid: int | None = None,
+        is_running: bool = False,
     ) -> RuntimeState:
         return RuntimeState(
             state_dir=Path("/x"),
             last_run=last_run,
-            is_running=False,
+            is_running=is_running,
             is_pending=False,
             has_user_trigger_flag=False,
             unit_last_exit=unit_last_exit,
+            run_pid=run_pid,
         )
 
-    def _last(self, exit_class: str, process_exit: int | None) -> LastRun:
+    def _last(
+        self,
+        exit_class: str,
+        process_exit: int | None,
+        *,
+        pid: int | None = None,
+    ) -> LastRun:
         return LastRun(
             exit_class=ExitClass(exit_class),
             started_at="2026-01-01T00:00",
             process_exit=process_exit,
+            pid=pid,
         )
+
+    def test_lingering_run_pid_unrecorded_is_crashed(self) -> None:
+        # A launch wrote run.pid (7397) then died; the surviving record
+        # is from an earlier launch (pid 100), so the two pids differ.
+        rs = self._rs(
+            last_run=self._last("ok", 0, pid=100),
+            run_pid=7397,
+        )
+        assert rs.crashed is True
+
+    def test_run_pid_without_any_record_is_crashed(self) -> None:
+        # First-ever launch died before writing any record.
+        rs = self._rs(run_pid=7397)
+        assert rs.crashed is True
+
+    def test_run_pid_matching_record_is_not_crashed(self) -> None:
+        # The record carries the same pid as the surviving run.pid, so
+        # that launch did record (run.pid just wasn't unlinked yet).
+        rs = self._rs(
+            last_run=self._last("ok", 0, pid=7397),
+            run_pid=7397,
+        )
+        assert rs.crashed is False
+
+    def test_run_pid_while_running_is_not_crashed(self) -> None:
+        # An in-flight run holds the lock; its run.pid is expected.
+        rs = self._rs(
+            last_run=self._last("ok", 0, pid=100),
+            run_pid=7397,
+            is_running=True,
+        )
+        assert rs.crashed is False
 
     def test_signal_kill_over_stale_ok_is_crashed(self) -> None:
         # Stale "ok" (process_exit 0) survives a launch the scheduler

@@ -1651,6 +1651,48 @@ class TestRuntimeUnitLastExit:
         assert rt.crashed is False
 
 
+class TestRuntimePidCrashSignal:
+    """A surviving run.pid naming a different pid than the recorded run
+    flags `crashed` even when the scheduler kept no exit record (e.g. the
+    unit was unloaded), which the launchctl-list reconciliation misses."""
+
+    def _ref(self, config: Any, full: str) -> Any:
+        return config.pending.by_full_name.get(
+            full
+        ) or config.current.by_full_name.get(full)
+
+    def test_lingering_run_pid_flags_crashed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j", cfg=cfg)
+        # An earlier launch recorded (pid 100); a later one wrote run.pid
+        # and died without recording. The scheduler has no record.
+        (sd / "last-run.json").write_text(
+            json.dumps(
+                {
+                    "exit_class": "ok",
+                    "started_at": "2026-01-01T00:00:00-08:00",
+                    "process_exit": 0,
+                    "pid": 100,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (sd / "run.pid").write_text("999999\n", encoding="utf-8")
+        monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
+        config = crony_runtime.load_config()
+        rt = config.runtime[self._ref(config, "default.j")]
+        assert rt.run_pid == 999999
+        assert rt.unit_last_exit is None
+        assert rt.crashed is True
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

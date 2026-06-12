@@ -158,6 +158,7 @@ def _read_runtime_state(
         unit_timer=unit_timer,
         unit_drift=unit_drift,
         unit_last_exit=unit_last_exit,
+        run_pid=read_pid_file(state_dir / "run.pid"),
     )
 
 

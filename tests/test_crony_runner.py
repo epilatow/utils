@@ -285,6 +285,9 @@ class TestRunJobBasics:
         assert rec["exit_class"] == "ok"
         assert rec["exit_code"] == 0
         assert rec["gate"] == "none"
+        # The record carries the runner's pid (the run executed in this
+        # process), the basis for the run.pid crash signal.
+        assert rec["pid"] == os.getpid()
 
     def test_log_header_reports_timeout_and_pid(
         self, tmp_path: Path, monkeypatch: Any
