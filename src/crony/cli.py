@@ -221,7 +221,7 @@ def _build_parser() -> StrictArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # `metavar=` overrides argparse's auto-generated `{a,b,c,...}`
-    # choices summary so internal subcommands like `run` (the
+    # choices summary so internal subcommands like `_run` (the
     # platform unit's entry point, not user-facing) don't leak
     # into the top-level help.
     subparsers = parser.add_command_subparsers(
@@ -577,34 +577,41 @@ def _build_parser() -> StrictArgumentParser:
         help="Print only the latest run's entry",
     )
 
-    # run -- internal entry point for platform units; hidden from
+    # _run -- internal entry point for platform units; hidden from
     # `crony --help` since end users should never invoke it directly
     # (use `crony trigger` instead, which goes through the platform
     # scheduler so the run uses the same execution context as a
-    # scheduled fire).
+    # scheduled fire). The leading underscore marks it private, matching
+    # `_run-guard`. The legacy `run` spelling is registered alongside as
+    # a transitional alias so units baked before the rename keep firing
+    # until re-applied (see RUN_SUBCOMMAND_LEGACY).
     # No `help=` here -- argparse omits subparsers without a help
     # string from the top-level subcommand listing. Passing
     # argparse.SUPPRESS surfaces the literal "==SUPPRESS==" string
     # instead of hiding the entry.
-    p_run = subparsers.add_parser("run")
-    p_run.add_argument(
-        "ref",
-        help="Entity address `<bundle>:<uuid>` (internal-only form)",
-    )
-    p_run.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Acquire lock, run gate, but do not exec",
-    )
-    p_run.add_argument(
-        "--skip-gate",
-        action="store_true",
-        help="Skip gate check (force run)",
-    )
+    for _run_name in (
+        crony.runtime.RUN_SUBCOMMAND,
+        crony.runtime.RUN_SUBCOMMAND_LEGACY,
+    ):
+        p_run = subparsers.add_parser(_run_name)
+        p_run.add_argument(
+            "ref",
+            help="Entity address `<bundle>:<uuid>` (internal-only form)",
+        )
+        p_run.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Acquire lock, run gate, but do not exec",
+        )
+        p_run.add_argument(
+            "--skip-gate",
+            action="store_true",
+            help="Skip gate check (force run)",
+        )
 
-    # _run-guard -- internal hard-timeout backstop wrapping `run`;
+    # _run-guard -- internal hard-timeout backstop wrapping `_run`;
     # rendered into the platform unit by apply, never invoked by hand.
-    # Hidden from `crony --help` for the same reason as `run` (no
+    # Hidden from `crony --help` for the same reason as `_run` (no
     # `help=`). Takes the cap then the full inner command via REMAINDER
     # so the inner `--script` / flags aren't parsed as guard options.
     p_guard = subparsers.add_parser(crony.runtime.GUARD_SUBCOMMAND)
@@ -616,7 +623,7 @@ def _build_parser() -> StrictArgumentParser:
     p_guard.add_argument(
         "argv",
         nargs=argparse.REMAINDER,
-        help="The `crony run` command to run under the cap",
+        help="The `crony _run` command to run under the cap",
     )
 
     # notify-test
@@ -662,7 +669,8 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "trigger": crony.commands.do_trigger,
     "status": crony.commands.do_status,
     "logs": crony.commands.do_logs,
-    "run": crony.runner.do_run,
+    crony.runtime.RUN_SUBCOMMAND: crony.runner.do_run,
+    crony.runtime.RUN_SUBCOMMAND_LEGACY: crony.runner.do_run,
     crony.runtime.GUARD_SUBCOMMAND: crony.runner.do_run_guard,
     "notify-test": crony.commands.do_notify_test,
 }
@@ -676,7 +684,7 @@ def cli() -> int:
     try:
         _COMMAND_CALLBACKS[command](**args_dict)
     except SystemExit as e:
-        # `crony run` raises SystemExit(<wrapped-rc>) so an
+        # `crony _run` raises SystemExit(<wrapped-rc>) so an
         # arbitrary exit code from the executed job (0-255) reaches
         # the platform scheduler unmodified rather than being
         # squashed to ExitCode.SUCCESS.

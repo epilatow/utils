@@ -7493,7 +7493,7 @@ class TestInteractiveHelpers:
 
 class TestUserTriggerFlag:
     """The one-shot sentinel file written by `trigger_unit` when
-    the user invokes `crony trigger` and consumed by `crony run` to
+    the user invokes `crony trigger` and consumed by `crony _run` to
     bypass the interactive wait.
     """
 

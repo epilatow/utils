@@ -482,7 +482,7 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
     only via their platform unit, and a second fire of an
     already-running unit is coalesced into a no-op, so a given run.lock
     has a single contender. The raise is therefore incidental
-    single-flight defense against a stray direct `crony run`, not the
+    single-flight defense against a stray direct `crony _run`, not the
     mechanism that prevents concurrent scheduled fires. The lock file is
     left in place across runs.
     """
@@ -555,6 +555,18 @@ def host() -> crony.platform.HostPlatform:
     return crony.platform.get_host(crony.platform.current_platform())
 
 
+# Hidden crony subcommand the platform unit invokes to perform a run.
+# The leading underscore marks it internal (matching `_run-guard`): end
+# users fire jobs via `crony trigger`, never by calling this directly.
+RUN_SUBCOMMAND = "_run"
+
+# Temporary back-compat alias for RUN_SUBCOMMAND. Units installed before
+# the `run` -> `_run` rename bake the old `run` token into their argv;
+# keeping it accepted lets those units keep firing until a `crony apply`
+# re-renders them. Remove once no `run`-baked units remain on any host.
+RUN_SUBCOMMAND_LEGACY = "run"
+
+
 def run_argv(
     uv_path: Path, crony_path: Path, ref: crony.unit.EntityRef
 ) -> tuple[str, ...]:
@@ -569,7 +581,7 @@ def run_argv(
         "run",
         "--script",
         str(crony_path),
-        "run",
+        RUN_SUBCOMMAND,
         str(ref),
     )
 
@@ -583,7 +595,7 @@ def run_argv(
 HARD_TIMEOUT_PADDING_SEC = 60
 
 # Hidden crony subcommand that wraps a run in a hard wallclock cap: it
-# launches the inner `crony run` in its own session and kills that
+# launches the inner `crony _run` in its own session and kills that
 # process group if the cap elapses.
 GUARD_SUBCOMMAND = "_run-guard"
 

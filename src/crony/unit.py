@@ -45,7 +45,7 @@ class EntityRef:
     sets. ``str(ref)`` renders the ``<bundle>:<uuid>`` form and
     ``from_str`` parses it back; the two round-trip. That form is
     both the display token for refs with no recoverable name and
-    ``crony run``'s positional argv. The colon separator
+    ``crony _run``'s positional argv. The colon separator
     distinguishes it from the dot-separated name form.
     """
 

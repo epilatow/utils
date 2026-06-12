@@ -517,7 +517,7 @@ class _RunnerHarness:
         this harness simulates) selecting these jobs.
 
         Persists the raw config to the on-disk file so subprocess
-        re-invocations of `crony run <child>` (group dispatch) load
+        re-invocations of `crony _run <child>` (group dispatch) load
         the same config we hand to _run_group. The target keys on the
         simulated platform so the entries are actually selected when
         a later `load_config()` resolves the host's target.

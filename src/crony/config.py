@@ -361,7 +361,7 @@ class TomlJob:
     # would).
     # Non-zero exit codes to classify as success (exit 0 is always
     # success). A run whose code lands here is "ok" -- not failed, no
-    # notification -- and `crony run` surfaces 0 to the scheduler. For
+    # notification -- and `crony _run` surfaces 0 to the scheduler. For
     # commands that exit non-zero on transient / non-fatal conditions
     # (e.g. borg's exit 1 on backup warnings).
     success_exit_codes: list[int] = field(default_factory=list)
@@ -1002,7 +1002,7 @@ class TomlConfig:
 
         Returns an empty `TomlConfig` when no candidate files exist or
         every candidate file fails -- read-side subcommands
-        (`status`, `destroy`, `logs`, `crony run`) operate on the on-
+        (`status`, `destroy`, `logs`, `crony _run`) operate on the on-
         disk state alone (`current`, `orphans`), so the
         runner keeps firing through a config-broken state and the
         operator can still inspect / clean up the on-disk picture.

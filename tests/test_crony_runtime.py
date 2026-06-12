@@ -1198,7 +1198,7 @@ class TestExecPathsFromArgv:
     def test_none_when_a_binary_is_absent(self) -> None:
         # Ends in /uv and /crony but the files don't exist on disk -- a
         # baked binary that's since been removed.
-        argv = ["/abs/uv", "run", "--script", "/abs/crony", "run", "x:y"]
+        argv = ["/abs/uv", "run", "--script", "/abs/crony", "_run", "x:y"]
         assert crony_runtime.exec_paths_from_argv(argv) is None
 
     def test_none_when_crony_missing(self, tmp_path: Path) -> None:
@@ -1288,7 +1288,7 @@ class TestInstalledCmdParsing:
             '<?xml version="1.0"?><plist><dict>'
             "<key>ProgramArguments</key><array>"
             "<string>/bin/sh</string><string>-c</string>"
-            "<string>/abs/uv run --script /abs/crony run x:y</string>"
+            "<string>/abs/uv run --script /abs/crony _run x:y</string>"
             "</array></dict></plist>"
         )
         assert launchd._plist_argv(bogus) is None
@@ -1300,7 +1300,7 @@ class TestInstalledCmdParsing:
         # Leading non-section content trips configparser.
         assert (
             systemd._service_argv(
-                "ExecStart=/abs/uv run --script /abs/crony run x:y\n",
+                "ExecStart=/abs/uv run --script /abs/crony _run x:y\n",
             )
             is None
         )

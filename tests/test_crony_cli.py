@@ -30,6 +30,8 @@ from conftest_crony import _isolate_home  # noqa: E402, F401
 
 from crony import cli as crony_cli  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
+from crony import runner as crony_runner  # noqa: E402
+from crony import runtime as crony_runtime  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
     ExitCode,
@@ -164,7 +166,7 @@ class TestRunGuardDispatch:
             "run",
             "--script",
             "/abs/crony",
-            "run",
+            "_run",
             "x:y",
         ]
         with (
@@ -177,6 +179,35 @@ class TestRunGuardDispatch:
             result = crony_cli.cli()
         assert result == 0
         mock_cb.assert_called_once_with(cap=180, argv=inner)
+
+
+class TestRunLegacyAlias:
+    """`run` is a transitional alias for the renamed `_run`: units baked
+    with the old token before the rename keep firing, both routing to
+    do_run with identical args, until a re-apply re-renders them."""
+
+    def test_legacy_run_dispatches_to_do_run(self) -> None:
+        mock_cb = MagicMock()
+        with (
+            patch.dict(
+                crony_cli._COMMAND_CALLBACKS,
+                {crony_runtime.RUN_SUBCOMMAND_LEGACY: mock_cb},
+            ),
+            patch("sys.argv", ["prog", "run", "default:u-test"]),
+        ):
+            result = crony_cli.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(
+            ref="default:u-test", dry_run=False, skip_gate=False
+        )
+
+    def test_both_spellings_route_to_the_same_handler(self) -> None:
+        cb = crony_cli._COMMAND_CALLBACKS
+        assert (
+            cb[crony_runtime.RUN_SUBCOMMAND]
+            is cb[crony_runtime.RUN_SUBCOMMAND_LEGACY]
+            is crony_runner.do_run
+        )
 
 
 class TestConfigSubcommandDispatch:

@@ -43,7 +43,7 @@ _REF = EntityRef("default", "u-test")
 _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
 # The run argv the runtime layer hands the backend as `spec.cmd`.
-_CMD = (str(_UV), "run", "--script", str(_CRONY), "run", str(_REF))
+_CMD = (str(_UV), "run", "--script", str(_CRONY), "_run", str(_REF))
 # render() / dispatch don't read the unit dir; pin a placeholder.
 _DIR = Path("/unused")
 
@@ -55,7 +55,7 @@ class TestSystemdRendering:
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
         assert "ExecStart=" in svc
-        assert " run default:u-test" in svc
+        assert " _run default:u-test" in svc
         assert "WorkingDirectory=%h" in svc
 
     def test_timer_oncalendar(self) -> None:
@@ -73,7 +73,7 @@ class TestSystemdRendering:
         # uv's absolute path so the unit doesn't depend on PATH.
         svc = systemd.render_service("j", _CMD)
         assert (
-            "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
+            "ExecStart=/abs/uv run --script /abs/crony _run default:u-test"
             in svc
         )
 
@@ -234,7 +234,7 @@ class TestSystemdAnalyzeVerify:
         ]
         written: list[Path] = []
         for nm, timing, prio in shapes:
-            cmd = (str(real), "run", "--script", str(real), "run", str(_REF))
+            cmd = (str(real), "run", "--script", str(real), "_run", str(_REF))
             spec = UnitSpec(
                 name=EntityName.from_str(nm),
                 cmd=cmd,

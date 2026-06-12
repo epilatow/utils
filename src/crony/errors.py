@@ -51,19 +51,19 @@ class SubprocessError(subprocess.CalledProcessError, CronyError):
 
 
 class LockBusyError(CronyError):
-    """`crony run` could not acquire the per-job lock."""
+    """`crony _run` could not acquire the per-job lock."""
 
     exit_code = ExitCode.LOCK_BUSY
 
 
 class PreconditionError(CronyError):
-    """`crony run` precondition failed before exec."""
+    """`crony _run` precondition failed before exec."""
 
     exit_code = ExitCode.PRECONDITION
 
 
 class JobTimeoutError(CronyError):
-    """`crony run` killed the wrapped command on timeout."""
+    """`crony _run` killed the wrapped command on timeout."""
 
     exit_code = ExitCode.TIMEOUT
 

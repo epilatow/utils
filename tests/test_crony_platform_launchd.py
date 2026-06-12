@@ -40,7 +40,7 @@ _REF = EntityRef("default", "u-test")
 _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
 # The run argv the runtime layer hands the backend as `spec.cmd`.
-_CMD = (str(_UV), "run", "--script", str(_CRONY), "run", str(_REF))
+_CMD = (str(_UV), "run", "--script", str(_CRONY), "_run", str(_REF))
 # render() / dispatch don't read the unit dir; pin a placeholder.
 _DIR = Path("/unused")
 
@@ -110,7 +110,7 @@ class TestPlistRendering:
         # it, exec so sh is replaced by uv, and the bundle:uuid ref
         # (not the name) so the runner locates the state dir.
         assert d["ProgramArguments"][2] == (
-            "exec /abs/uv run --script /abs/crony run default:u-test"
+            "exec /abs/uv run --script /abs/crony _run default:u-test"
         )
 
     def test_every_shape_is_a_valid_plist(self) -> None:

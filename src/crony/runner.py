@@ -2,7 +2,7 @@
 
 """crony's run pipeline.
 
-The `crony run <bundle>:<uuid>` entry the platform scheduler invokes:
+The `crony _run <bundle>:<uuid>` entry the platform scheduler invokes:
 load the pinned snapshot and dispatch to the per-job or per-group
 pipeline. The job pipeline holds a per-entry lock, runs the optional
 gate, execs the command under a wallclock cap (with the interactive
@@ -984,7 +984,7 @@ def trigger_unit(
     use `trigger_unit_sync` instead.
 
     `triggered_by_user` writes a one-shot sentinel flag in the
-    entity's state dir, consumed by `crony run` on startup to
+    entity's state dir, consumed by `crony _run` on startup to
     skip the interactive wait. The caller passes `state_dir`
     (resolved from the entity's `(bundle, uuid)` via Config) so
     the flag lands in the right uuid-keyed dir; when
@@ -1161,7 +1161,7 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
     A run classified "ok" maps to 0 even when its recorded `exit_code`
     is non-zero -- a `success_exit_codes` match preserves the real code
     but classifies the run a success, so `crony trigger --wait` exits 0
-    just like the 0 `crony run` surfaces to the scheduler.
+    just like the 0 `crony _run` surfaces to the scheduler.
 
     `exit_code` is None whenever the job didn't reach a normal exit
     (timeout, signal, gate refusal, lock contention). `... or 0`
@@ -1196,7 +1196,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     """Hard wallclock backstop wrapping the runner. Platform schedulers
     invoke this; not user-facing.
 
-    Runs `argv` (a `crony run <ref>` invocation) under a `cap`-second
+    Runs `argv` (a `crony _run <ref>` invocation) under a `cap`-second
     deadline and, if it overruns, kills its whole process group. It is
     the last resort behind the runner's own soft timeout: a runner that
     wedges before honoring its deadline (a stuck syscall, a lock it can't
@@ -1267,7 +1267,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     surfaces in `crony status` and isn't silently dropped by the
     scheduler. The "canceled" label is shared with interactive-
     job cancels: both have the same operator-facing meaning
-    ("crony run never got to the user's command"). Without this
+    ("crony _run never got to the user's command"). Without this
     record the scheduled fire fails, leaving the prior outcome in
     place: a snapshot-schema bump looks like ordinary
     "edited config, not yet applied" drift, and a per-run precondition
@@ -1276,7 +1276,7 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     parsed = crony.unit.EntityRef.from_str(ref)
     if parsed is None:
         raise crony.errors.UsageError(
-            f"crony run takes <bundle>:<uuid>, got {ref!r}; "
+            f"crony _run takes <bundle>:<uuid>, got {ref!r}; "
             f"this entry point is for platform-unit invocation. "
             f"Use `crony trigger <name>` to fire by name."
         )

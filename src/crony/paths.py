@@ -16,7 +16,7 @@ from pathlib import Path
 from crony import BASENAME
 
 # Path overrides via env so platform-mediated invocations (the
-# scheduler starting `crony run <bundle>:<uuid>`) and tests can redirect
+# scheduler starting `crony _run <bundle>:<uuid>`) and tests can redirect
 # config and state without filesystem games. Names follow the
 # convention CRONY_<KEY>.
 _ENV_PREFIX: str = BASENAME.upper()

@@ -208,7 +208,7 @@ class TestEntityRefInput:
     an entity that has no recoverable config-side name (corrupt
     snapshot.json, broken entity, unit-only orphan) by pasting the
     JOB cell from a status row back into a subcommand. The same
-    form is what platform units pass to `crony run`. The parser
+    form is what platform units pass to `crony _run`. The parser
     validates both pieces so the resulting `EntityRef` is safe
     to compose into a state-dir path.
     """

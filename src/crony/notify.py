@@ -100,7 +100,7 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
     )
 
 
-# Each `crony run` invocation writes a header line to run.log.
+# Each `crony _run` invocation writes a header line to run.log.
 # Two shapes:
 #   === <ISO ts> <full.name> pid=<N> ===
 #       Ordinary run: name resolved, snapshot loaded, pid known.
