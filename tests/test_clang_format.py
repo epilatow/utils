@@ -7,9 +7,9 @@
 
 """Every Applications/*.app wrapper's C source stays clang-format clean.
 
-The Mach-O wrappers under `Applications/` (BorgAdm.c, Crony.c) are kept
-formatted to the repo-root `.clang-format`, so a checked-in source always
-matches what `xcrun clang-format -i` would produce. clang-format ships in
+The Mach-O wrapper C sources under `Applications/` (currently `Crony.c`)
+are kept formatted to the repo-root `.clang-format`, so a checked-in source
+always matches what `xcrun clang-format -i` would produce. clang-format ships in
 the Xcode toolchain and is reached through `xcrun`; where it is
 unavailable (no Xcode), the check skips.
 """

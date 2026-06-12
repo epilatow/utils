@@ -20,7 +20,6 @@ import io
 import json
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -1333,27 +1332,20 @@ class TestAutomate:
     @pytest.fixture
     def automate_env(
         self, tmp_path: Path, monkeypatch: Any
-    ) -> Iterator[tuple[Path, Any, Any]]:
+    ) -> Iterator[tuple[Path, Any]]:
         """Darwin + a temp crony drop-in dir + mocked run_cmd (so crony
-        is never really invoked) + no wrapper rebuild.
+        is never really invoked).
         """
         dropin = tmp_path / "crony-config"
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
         with (
             patch.object(ba.platform, "system", return_value="Darwin"),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(
-                ba,
-                "_wrapper_needs_rebuild",
-                autospec=True,
-                return_value=(False, ""),
-            ),
-            patch.object(ba, "_build_wrapper", autospec=True) as mock_build,
         ):
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
-            yield dropin, mock_run, mock_build
+            yield dropin, mock_run
 
     @staticmethod
     def _crony_calls(mock_run: Any) -> list[list[str]]:
@@ -1361,7 +1353,7 @@ class TestAutomate:
         return [list(call.args[0][1:]) for call in mock_run.call_args_list]
 
     def test_enable_writes_bundle_and_applies(self, automate_env: Any) -> None:
-        dropin, mock_run, _ = automate_env
+        dropin, mock_run = automate_env
         ba.do_automate_enable()
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
@@ -1370,23 +1362,10 @@ class TestAutomate:
             assert f"[job.{op}]" in text
         assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
 
-    def test_enable_builds_wrapper_when_needed(self, automate_env: Any) -> None:
-        _dropin, _mock_run, mock_build = automate_env
-        # The fixture already patched _wrapper_needs_rebuild (so no
-        # autospec here -- can't spec an existing Mock); flip it to
-        # signal a rebuild is needed.
-        with patch.object(
-            ba,
-            "_wrapper_needs_rebuild",
-            return_value=(True, "stale source"),
-        ):
-            ba.do_automate_enable()
-        mock_build.assert_called_once()
-
     def test_disable_destroys_and_removes_bundle(
         self, automate_env: Any
     ) -> None:
-        dropin, mock_run, _ = automate_env
+        dropin, mock_run = automate_env
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
@@ -1397,7 +1376,7 @@ class TestAutomate:
     def test_disable_is_noop_when_not_enabled(self, automate_env: Any) -> None:
         # No bundle file: crony has nothing addressable and exits nonzero,
         # but disable must treat that as a clean no-op, not an error.
-        dropin, mock_run, _ = automate_env
+        dropin, mock_run = automate_env
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=2, stdout="", stderr="unknown bundle"
         )
@@ -1410,7 +1389,7 @@ class TestAutomate:
         # The bundle is installed (file present) but destroy fails for a
         # real reason (a running job holds the lock); that must surface
         # rather than silently leaving the file in place.
-        dropin, mock_run, _ = automate_env
+        dropin, mock_run = automate_env
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
@@ -1422,7 +1401,7 @@ class TestAutomate:
         assert bundle.exists()
 
     def test_status_shells_out_to_crony(self, automate_env: Any) -> None:
-        dropin, mock_run, _ = automate_env
+        dropin, mock_run = automate_env
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
@@ -1434,7 +1413,7 @@ class TestAutomate:
     ) -> None:
         # No bundle file: report the not-enabled state directly instead
         # of shelling out to crony (which would just error).
-        _dropin, mock_run, _ = automate_env
+        _dropin, mock_run = automate_env
         with caplog.at_level(logging.INFO):
             ba.do_automate_status()
         assert ["status", "-b", "borgadm"] not in self._crony_calls(mock_run)
@@ -1468,19 +1447,24 @@ class TestAutomate:
         # checks keep the default (a check warning is a real signal).
         assert doc["job"]["create"]["success-exit-codes"] == [1]
         assert "success-exit-codes" not in doc["job"]["check-age"]
-        # priority, keep-awake, env, and the disabled wallclock cap are
-        # the same for every job, so they live in [defaults] and no job
-        # overrides them. (borgadm caps each borg command itself, so
-        # job-timeout-sec = 0 leaves that timeout the sole authority.)
+        # priority, the keep-awake flag, env, and the disabled wallclock
+        # cap are the same for every job, so they live in [defaults] and
+        # no job overrides them. (borgadm caps each borg command itself,
+        # so job-timeout-sec = 0 leaves that timeout the sole authority.)
         assert doc["defaults"]["priority"] == "high"
-        assert doc["defaults"]["keep-awake"] is True
+        assert doc["defaults"]["flags"] == ["keep-awake"]
         assert doc["defaults"]["job-timeout-sec"] == 0
         assert doc["defaults"]["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
+        # Only create reads protected files, so it alone adds the
+        # full-disk-access flag (composing with the inherited keep-awake);
+        # the checks carry no own flags and inherit keep-awake.
+        assert doc["job"]["create"]["flags"] == ["full-disk-access"]
         for op in self.JOB_OPS:
             assert "priority" not in doc["job"][op]
-            assert "keep-awake" not in doc["job"][op]
             assert "job-timeout-sec" not in doc["job"][op]
             assert "env" not in doc["job"][op]
+            if op != "create":
+                assert "flags" not in doc["job"][op]
         # Target keys on this host.
         host = ba._current_host()
         assert "darwin" not in doc["target"]
@@ -2705,454 +2689,6 @@ class TestRepoRoot:
 
         with patch.object(ba, "__file__", str(launcher_script)):
             assert ba._repo_root() == real_repo.resolve()
-
-
-class TestWrapperRebuild:
-    """Test _wrapper_needs_rebuild() and _build_wrapper()."""
-
-    @pytest.fixture
-    def wrapper_env(self, tmp_path: Path) -> Iterator[tuple[Path, Path, Path]]:
-        """Set up source, binary, and hash paths in tmp_path."""
-        src = tmp_path / "BorgAdm.c"
-        binary = tmp_path / "BorgAdm"
-        hash_file = tmp_path / ".BorgAdm.source-sha256"
-        with (
-            patch.object(
-                ba,
-                "_wrapper_source_path",
-                autospec=True,
-                return_value=src,
-            ),
-            patch.object(
-                ba,
-                "_wrapper_binary_path",
-                autospec=True,
-                return_value=binary,
-            ),
-            patch.object(
-                ba,
-                "_wrapper_hash_path",
-                autospec=True,
-                return_value=hash_file,
-            ),
-        ):
-            yield src, binary, hash_file
-
-    def test_needs_rebuild_no_binary(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Rebuild needed when binary does not exist."""
-        src, _binary, _hash_file = wrapper_env
-        src.write_text("int main(){}")
-        rebuild, reason = ba._wrapper_needs_rebuild()
-        assert rebuild is True
-        assert "binary" in reason
-
-    def test_needs_rebuild_no_hash(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Rebuild needed when hash file does not exist."""
-        src, binary, _hash_file = wrapper_env
-        src.write_text("int main(){}")
-        binary.write_text("binary")
-        rebuild, reason = ba._wrapper_needs_rebuild()
-        assert rebuild is True
-        assert "hash" in reason
-
-    def test_needs_rebuild_hash_mismatch(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Rebuild needed when source hash differs from stored."""
-        src, binary, hash_file = wrapper_env
-        src.write_text("int main(){}")
-        binary.write_text("binary")
-        hash_file.write_text("stale_hash\n")
-        rebuild, reason = ba._wrapper_needs_rebuild()
-        assert rebuild is True
-        assert "mismatch" in reason
-
-    def test_needs_rebuild_current(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """No rebuild when hash matches."""
-        src, binary, hash_file = wrapper_env
-        src.write_text("int main(){}")
-        binary.write_text("binary")
-        hash_file.write_text(ba._source_sha256(src) + "\n")
-        rebuild, reason = ba._wrapper_needs_rebuild()
-        assert rebuild is False
-        assert reason == ""
-
-    def test_needs_rebuild_no_source(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Raises BorgadmError when source is missing."""
-        _src, _binary, _hash_file = wrapper_env
-        # src not created -> doesn't exist
-        with pytest.raises(ba.BorgadmError, match="source missing"):
-            ba._wrapper_needs_rebuild()
-
-    def test_build_calls_cc_and_codesign(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Build compiles source and signs the app bundle."""
-        src, binary, _hash_file = wrapper_env
-        src.write_text("int main(){}")
-        with (
-            patch.object(ba.shutil, "which", return_value="/usr/bin/cc"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(
-                ba,
-                "_wrapper_app_path",
-                autospec=True,
-                return_value=Path("/fake/BorgAdm.app"),
-            ),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
-            ba._build_wrapper()
-
-        calls = [c.args[0] for c in mock_run.call_args_list]
-        # First call: cc
-        assert calls[0][0] == "cc"
-        assert str(src) in calls[0]
-        assert str(binary) in calls[0]
-        # Second call: codesign
-        assert calls[1][0] == "codesign"
-
-    def test_build_writes_hash(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Build writes source hash after compilation."""
-        src, _binary, hash_file = wrapper_env
-        src.write_text("int main(){}")
-        with (
-            patch.object(ba.shutil, "which", return_value="/usr/bin/cc"),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(
-                ba,
-                "_wrapper_app_path",
-                autospec=True,
-                return_value=Path("/fake/BorgAdm.app"),
-            ),
-        ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
-            ba._build_wrapper()
-
-        assert hash_file.exists()
-        assert hash_file.read_text().strip() == ba._source_sha256(src)
-
-    def test_build_raises_without_cc(
-        self, wrapper_env: tuple[Path, Path, Path]
-    ) -> None:
-        """Build raises BorgadmError when cc not found."""
-        src, _binary, _hash_file = wrapper_env
-        src.write_text("int main(){}")
-        with (
-            patch.object(ba.shutil, "which", return_value=None),
-            pytest.raises(ba.BorgadmError, match="cc.*not found"),
-        ):
-            ba._build_wrapper()
-
-
-@pytest.mark.skipif(
-    platform.system() != "Darwin",
-    reason="BorgAdm wrapper uses macOS-specific APIs (mach-o/dyld.h)",
-)
-class TestWrapperBinary:
-    """Integration tests for the compiled BorgAdm wrapper binary."""
-
-    WRAPPER_SOURCE = REPO_ROOT / (
-        "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
-    )
-
-    @pytest.fixture
-    def wrapper_tree(self, tmp_path: Path) -> Iterator[tuple[Path, Path, Path]]:
-        """Build a temp directory tree matching the expected layout.
-
-        Compiles BorgAdm.c, creates a mock borgadm, and yields
-        (binary_path, mock_borgadm_path, fake_home).
-        """
-        # Mirror: tmp/Applications/BorgAdm.app/Contents/MacOS/
-        macos_dir = (
-            tmp_path / "Applications" / "BorgAdm.app" / "Contents" / "MacOS"
-        )
-        macos_dir.mkdir(parents=True)
-        binary = macos_dir / "BorgAdm"
-
-        # Compile the real source into the temp tree
-        result = subprocess.run(
-            [
-                "cc",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-O2",
-                "-o",
-                str(binary),
-                str(self.WRAPPER_SOURCE),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"Compilation failed: {result.stderr}"
-
-        # Create mock borgadm at tmp/bin/borgadm
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        mock_borgadm = bin_dir / "borgadm"
-        # args.txt records the forwarded args; calls.txt appends the
-        # disclaim marker once per invocation, so tests can count runs
-        # (re-spawn must not loop) and confirm the disclaimed instance
-        # is the one that reaches borgadm.
-        mock_borgadm.write_text(
-            "#!/bin/bash\n"
-            'echo "$@" > "$(dirname "$0")/../args.txt"\n'
-            'echo "${BORGADM_FDA_DISCLAIMED:-unset}" >> '
-            '"$(dirname "$0")/../calls.txt"\n'
-        )
-        mock_borgadm.chmod(0o755)
-
-        # Fake HOME (no TCC dir -> FDA check sees ENOENT -> proceeds)
-        fake_home = tmp_path / "fakehome"
-        fake_home.mkdir()
-
-        yield binary, mock_borgadm, fake_home
-
-    def test_source_compiles_to_macho(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Compiled wrapper is a Mach-O binary."""
-        binary, _, _ = wrapper_tree
-        result = subprocess.run(
-            ["file", str(binary)],
-            capture_output=True,
-            text=True,
-        )
-        assert "Mach-O" in result.stdout
-
-    def test_source_compiles_warning_clean(self, tmp_path: Path) -> None:
-        """Source compiles with no warnings under -Wall -Wextra."""
-        binary = tmp_path / "BorgAdm"
-        result = subprocess.run(
-            [
-                "cc",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pedantic",
-                "-O2",
-                "-o",
-                str(binary),
-                str(self.WRAPPER_SOURCE),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"Warnings or errors:\n{result.stderr}"
-
-    def test_forwards_args_to_borgadm(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper forwards command-line arguments to borgadm."""
-        binary, _, fake_home = wrapper_tree
-        args_file = binary.parent.parent.parent.parent.parent / "args.txt"
-        result = subprocess.run(
-            [str(binary), "create", "--dry-run"],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HOME": str(fake_home)},
-        )
-        assert result.returncode == 0, f"Wrapper failed: {result.stderr}"
-        assert args_file.exists()
-        assert args_file.read_text().strip() == "create --dry-run"
-
-    def test_forwards_no_args(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper runs borgadm with no extra args when none given."""
-        binary, _, fake_home = wrapper_tree
-        args_file = binary.parent.parent.parent.parent.parent / "args.txt"
-        result = subprocess.run(
-            [str(binary)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HOME": str(fake_home)},
-        )
-        assert result.returncode == 0
-        assert args_file.exists()
-        # No args -> empty line
-        assert args_file.read_text().strip() == ""
-
-    def test_disclaim_respawn_runs_borgadm_once(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper re-spawns itself once, disclaimed, before exec.
-
-        The disclaimed instance carries the DISCLAIM marker, so the
-        single borgadm invocation must see it set -- proving borgadm
-        runs inside the re-spawn -- and the marker must break the loop,
-        so borgadm runs exactly once.
-        """
-        binary, _, fake_home = wrapper_tree
-        calls_file = binary.parent.parent.parent.parent.parent / "calls.txt"
-        result = subprocess.run(
-            [str(binary)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HOME": str(fake_home)},
-        )
-        assert result.returncode == 0, result.stderr
-        runs = calls_file.read_text().splitlines()
-        assert runs == ["1"], f"expected one disclaimed run, got {runs}"
-
-    def test_disclaim_marker_skips_respawn(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """An already-disclaimed instance does not re-spawn again.
-
-        With the marker pre-set (as the re-spawned instance sees it),
-        the wrapper skips the re-spawn and execs borgadm directly --
-        still exactly once.
-        """
-        binary, _, fake_home = wrapper_tree
-        calls_file = binary.parent.parent.parent.parent.parent / "calls.txt"
-        result = subprocess.run(
-            [str(binary)],
-            capture_output=True,
-            text=True,
-            env={
-                **os.environ,
-                "HOME": str(fake_home),
-                "BORGADM_FDA_DISCLAIMED": "1",
-            },
-        )
-        assert result.returncode == 0, result.stderr
-        runs = calls_file.read_text().splitlines()
-        assert runs == ["1"], f"expected one direct run, got {runs}"
-
-    def test_forwards_termination_signal_to_borgadm(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """SIGTERM to the wrapper reaches borgadm through the re-spawn.
-
-        A scheduler timeout sends a single-PID SIGTERM; borgadm now runs
-        one process below this instance, so the wrapper must forward the
-        signal or borgadm/borg would outlive the timeout. The mock traps
-        SIGTERM and exits 42, so a forwarded signal shows up as both the
-        marker file and the propagated exit code.
-        """
-        binary, mock_borgadm, fake_home = wrapper_tree
-        tmp_root = mock_borgadm.parent.parent
-        started = tmp_root / "borgadm_started"
-        got_term = tmp_root / "borgadm_got_term"
-        # Background the sleep and wait on it: a bare foreground sleep
-        # would defer the trap until it finished, masking forwarding.
-        mock_borgadm.write_text(
-            "#!/bin/bash\n"
-            f'trap \'echo term > "{got_term}"; kill "$SP" 2>/dev/null;'
-            " exit 42' TERM\n"
-            f'touch "{started}"\n'
-            "sleep 30 & SP=$!\n"
-            'wait "$SP"\n'
-        )
-        mock_borgadm.chmod(0o755)
-        proc = subprocess.Popen(
-            [str(binary)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env={**os.environ, "HOME": str(fake_home)},
-        )
-        try:
-            deadline = time.monotonic() + 5
-            while not started.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert started.exists(), "mock borgadm never started"
-            proc.terminate()
-            rc = proc.wait(timeout=5)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        assert got_term.exists(), "SIGTERM did not reach borgadm (orphaned)"
-        assert rc == 42, f"wrapper did not propagate borgadm exit: {rc}"
-
-    def test_fda_check_denied_exits(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper exits with code 77 when FDA is denied."""
-        binary, _, fake_home = wrapper_tree
-        # Create a TCC dir that can't be opened
-        tcc_dir = (
-            fake_home / "Library" / "Application Support" / "com.apple.TCC"
-        )
-        tcc_dir.mkdir(parents=True)
-        tcc_dir.chmod(0o000)
-        try:
-            result = subprocess.run(
-                [str(binary)],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "HOME": str(fake_home)},
-            )
-            assert result.returncode == 77
-            assert "Full Disk Access" in result.stderr
-        finally:
-            tcc_dir.chmod(0o700)
-
-    def test_missing_borgadm_exits_with_error(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper exits with error when borgadm is not found."""
-        binary, mock_borgadm, fake_home = wrapper_tree
-        mock_borgadm.unlink()
-        result = subprocess.run(
-            [str(binary)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HOME": str(fake_home)},
-        )
-        assert result.returncode != 0
-        assert "borgadm" in result.stderr.lower()
-
-    def test_rejects_world_writable_borgadm(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper refuses to exec borgadm if writable by others."""
-        binary, mock_borgadm, fake_home = wrapper_tree
-        mock_borgadm.chmod(0o757)
-        try:
-            result = subprocess.run(
-                [str(binary)],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "HOME": str(fake_home)},
-            )
-            assert result.returncode != 0
-            assert "writable" in result.stderr.lower()
-        finally:
-            mock_borgadm.chmod(0o755)
-
-    def test_rejects_group_writable_borgadm(
-        self, wrapper_tree: tuple[Path, Path, Path]
-    ) -> None:
-        """Wrapper refuses to exec borgadm if writable by group."""
-        binary, mock_borgadm, fake_home = wrapper_tree
-        mock_borgadm.chmod(0o775)
-        try:
-            result = subprocess.run(
-                [str(binary)],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "HOME": str(fake_home)},
-            )
-            assert result.returncode != 0
-            assert "writable" in result.stderr.lower()
-        finally:
-            mock_borgadm.chmod(0o755)
 
 
 @pytest.mark.e2e

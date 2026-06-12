@@ -34,14 +34,14 @@ This repo is a personal-utilities collection. Top-level structure:
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
-  utilities. Each is a Mach-O wrapper that lets a Python script (which can
-  never hold the grant itself) run under a Full Disk Access grant: BorgAdm.app
-  for `borgadm`, and Crony.app, the generic disclaim-and-exec wrapper crony
-  routes a full-disk-access job's command through. Their C source
-  (`BorgAdm.c`, `Crony.c`) documents the TCC responsible-process handling that
-  keeps the grant working when a scheduler such as crony runs the wrapper; the
-  C is kept formatted to the repo's `.clang-format` (apply via
-  `xcrun clang-format -i`).
+  utilities. Crony.app is a Mach-O wrapper that lets a Python script (which
+  can never hold the grant itself) run under a Full Disk Access grant: it is
+  the generic disclaim-and-exec wrapper crony routes a full-disk-access job's
+  command through (borgadm's scheduled backup relies on it via crony rather
+  than carrying its own wrapper). Its C source (`Crony.c`) documents the TCC
+  responsible-process handling that keeps the grant working when a scheduler
+  such as crony runs the wrapper; the C is kept formatted to the repo's
+  `.clang-format` (apply via `xcrun clang-format -i`).
 - `ruff.toml` -- ruff config shared across all Python in the repo.
 - `tmp/` -- gitignored scratch for plans, review inputs, and other ephemeral
   working files.
@@ -69,7 +69,7 @@ gated by platform checks.
   Linux and intermittently cross its 120s per-call timeout, while Linux runs
   the identical suite reliably in under a minute (borg is cross-platform, so
   coverage is the same). The macOS CI leg runs only the non-e2e suite -- which
-  is where the macOS-specific code lives (the BorgAdm C wrapper, the
+  is where the macOS-specific code lives (the Crony.app C wrapper, the
   crony-backed `automate` subcommand) -- so a local `--e2e` run is the way to
   exercise the e2e suite on macOS.
 - `tests/linux-docker-test.sh` reproduces the CI Linux leg from a non-Linux

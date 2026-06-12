@@ -36,6 +36,6 @@ jobs:
         # Linux runs the identical suite reliably in under a minute (borg
         # itself is cross-platform, so coverage is the same). So e2e runs
         # on Linux only; macOS still runs the full non-e2e suite, which
-        # is where the macOS-specific code lives (the BorgAdm C wrapper
+        # is where the macOS-specific code lives (the Crony.app C wrapper
         # and the launchd automate path).
         run: tests/run_all.py ${{ runner.os == 'Linux' && '--e2e' || '' }}

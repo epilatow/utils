@@ -17,7 +17,6 @@ import dataclasses
 import enum
 import fcntl
 import functools
-import hashlib
 import io
 import json
 import logging
@@ -1143,127 +1142,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _wrapper_source_path() -> Path:
-    """Return path to the BorgAdm.app C wrapper source."""
-    return _repo_root() / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c"
-
-
-def _wrapper_binary_path() -> Path:
-    """Return path to the compiled BorgAdm.app wrapper binary."""
-    return _repo_root() / "Applications/BorgAdm.app/Contents/MacOS/BorgAdm"
-
-
-def _wrapper_app_path() -> Path:
-    """Return path to the BorgAdm.app bundle."""
-    return _repo_root() / "Applications/BorgAdm.app"
-
-
-def _wrapper_hash_path() -> Path:
-    """Return path to the stored source hash for the wrapper."""
-    return _wrapper_binary_path().parent / ".BorgAdm.source-sha256"
-
-
-def _source_sha256(path: Path) -> str:
-    """Return hex SHA-256 of a file's contents."""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _wrapper_needs_rebuild() -> tuple[bool, str]:
-    """Check if the compiled BorgAdm wrapper needs rebuilding.
-
-    Returns (needs_rebuild, reason).  Reason is empty when no
-    rebuild is needed.  Raises BorgadmError if the C source is
-    missing (incomplete repo).
-    """
-    src = _wrapper_source_path()
-    if not src.exists():
-        raise BorgadmError(f"BorgAdm wrapper source missing: {src}")
-    binary = _wrapper_binary_path()
-    if not binary.exists():
-        return True, "binary does not exist"
-    hash_file = _wrapper_hash_path()
-    if not hash_file.exists():
-        return True, "source hash file does not exist"
-    if _source_sha256(src) != hash_file.read_text().strip():
-        return True, "source hash mismatch (source changed)"
-    return False, ""
-
-
-def _build_wrapper() -> None:
-    """Compile and sign the BorgAdm.app wrapper binary.
-
-    Requires Xcode Command Line Tools (provides cc and codesign).
-    """
-    if not shutil.which("cc"):
-        raise BorgadmError(
-            "C compiler (cc) not found. "
-            "Install Xcode Command Line Tools: xcode-select --install"
-        )
-    src = _wrapper_source_path()
-    binary = _wrapper_binary_path()
-    app = _wrapper_app_path()
-
-    # Remove stale artifacts so a failed build can't leave a
-    # hash file that masks an outdated or missing binary.
-    hash_file = _wrapper_hash_path()
-    if hash_file.exists():
-        hash_file.unlink()
-    if binary.exists():
-        binary.unlink()
-
-    logger.info(f"Compiling BorgAdm wrapper: {src}")
-    run_cmd(
-        [
-            "cc",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-O2",
-            "-o",
-            str(binary),
-            str(src),
-        ]
-    )
-    run_cmd(
-        [
-            "codesign",
-            "--force",
-            "--deep",
-            "--sign",
-            "-",
-            str(app),
-        ]
-    )
-
-    # Write hash only after successful compile + sign.
-    hash_file.write_text(_source_sha256(src) + "\n")
-    logger.info("BorgAdm wrapper compiled (FDA re-grant may be needed)")
-
-
-def automation_script_path() -> str:
-    """Return the path to the BorgAdm.app wrapper binary.
-
-    `create` reads user files, so it needs Full Disk Access. macOS
-    grants FDA to a code-signed app bundle's Mach-O executable, never
-    to an interpreted script, so `borgadm` (a `uv run` Python script)
-    cannot hold the grant itself -- the wrapper does, and `exec`s
-    borgadm so it inherits the access.
-
-    macOS keys FDA to the TCC *responsible process*, not whatever
-    process is reading files. Under a scheduler the wrapper runs as a
-    descendant (crony -> /bin/sh -> wrapper), which would make the
-    scheduler the responsible process, and it has no FDA. The wrapper
-    re-spawns itself with TCC responsibility disclaimed so BorgAdm.app
-    becomes its own responsible process regardless of launcher; see
-    Applications/BorgAdm.app/Contents/MacOS/BorgAdm.c for the
-    mechanism. The `check` commands read only repo metadata, so they
-    run borgadm directly with no wrapper.
-    """
-    binary = _wrapper_binary_path()
-    logger.debug(f"Using wrapper app: {binary}")
-    return str(binary)
-
-
 def _automate_check_platform() -> None:
     if platform.system() != "Darwin":
         raise BorgadmError("automate subcommand is only supported on osx")
@@ -1283,12 +1161,11 @@ _CRONY_UUID_NAMESPACE = uuid.uuid5(
 )
 
 
-def _direct_script_path() -> str:
-    """Return the path to borgadm itself (no FDA wrapper).
+def _borgadm_script_path() -> str:
+    """Return the path to borgadm itself, for a crony job's command.
 
-    Resolves symlinks so a crony job command points at the real
-    script in the repo rather than a launcher symlink that
-    could later move.
+    Resolves symlinks so the command points at the real script in the
+    repo rather than a launcher symlink that could later move.
     """
     return str(Path(__file__).resolve())
 
@@ -1346,21 +1223,22 @@ def _crony_job_uuid(op: str) -> str:
 def _crony_jobs() -> list[tuple[str, str, str]]:
     """Return (job-name, command, interval) for each automated job.
 
-    `create` reads user files, so it runs through the FDA wrapper; the
-    `check` commands read only repo metadata and run borgadm directly.
-    Each command is a single `/bin/sh -c` string (how crony runs a
-    job's `command`), with paths shell-quoted.
+    Every job runs borgadm directly. `create` reads user files, so its
+    crony job carries the `full-disk-access` flag (set in
+    `_render_crony_bundle`) and crony routes it through Crony.app for the
+    grant; the `check` commands read only repo metadata and need none.
+    Each command is a single `/bin/sh -c` string (how crony runs a job's
+    `command`), with paths shell-quoted.
     """
-    wrapper = automation_script_path()
-    direct = _direct_script_path()
+    script = _borgadm_script_path()
 
     def check(op: str) -> str:
-        return f"{shlex.quote(direct)} check {op} --timestamp-messages"
+        return f"{shlex.quote(script)} check {op} --timestamp-messages"
 
     return [
         (
             "create",
-            f"{shlex.quote(wrapper)} create --timestamp-messages",
+            f"{shlex.quote(script)} create --timestamp-messages",
             "1h",
         ),
         ("check-age", check("age"), "1d"),
@@ -1372,12 +1250,15 @@ def _crony_jobs() -> list[tuple[str, str, str]]:
 def _render_crony_bundle() -> str:
     """Render the crony bundle TOML borgadm installs.
 
-    priority, keep-awake, env, and the wallclock cap are identical for
-    every job, so they live in `[defaults]` (no job overrides them)
-    rather than being repeated per job. The defaults run all jobs
-    un-throttled (`priority = high`), hold the machine awake
-    (`keep-awake`), and extend PATH with ~/.local/bin (`env`) so
-    borgadm's `uv` shebang resolves under the scheduler's minimal PATH.
+    priority, the keep-awake flag, env, and the wallclock cap are
+    identical for every job, so they live in `[defaults]` (no job
+    overrides them) rather than being repeated per job. The defaults run
+    all jobs un-throttled (`priority = high`), hold the machine awake
+    (`flags = ["keep-awake"]`), and extend PATH with ~/.local/bin
+    (`env`) so borgadm's `uv` shebang resolves under the scheduler's
+    minimal PATH. Only `create` reads protected user files, so it alone
+    adds `full-disk-access` to its flags (composing with the inherited
+    keep-awake); crony then routes it through Crony.app for the grant.
     The bundle default `notify-channels` is
     ["default", "dialog-popup"], so a failing check notifies through the
     user's default crony bundle AND pops a desktop dialog. `create`
@@ -1405,13 +1286,14 @@ def _render_crony_bundle() -> str:
         if name == "create":
             job["notify-channels"] = []
             job["success-exit-codes"] = [1]
+            job["flags"] = ["full-disk-access"]
         jobs[name] = job
     doc: dict[str, Any] = {
         "defaults": {
             "notify-channels": ["default", "dialog-popup"],
             "job-timeout-sec": 0,
             "priority": "high",
-            "keep-awake": True,
+            "flags": ["keep-awake"],
             "env": {"PATH": "$HOME/.local/bin:$PATH"},
         },
         "job": jobs,
@@ -1471,14 +1353,11 @@ def do_automate_status() -> None:
             "Automation is not enabled (run 'borgadm automate enable')."
         )
         return
-    # crony owns the per-job state; show its table for the bundle.
+    # crony owns the per-job state (including the Crony.app wrapper
+    # health for the full-disk-access create job); show its table.
     run_cmd(
         [crony, "status", "-b", _CRONY_BUNDLE], allow_output=True, errok=True
     )
-    rebuild, reason = _wrapper_needs_rebuild()
-    if rebuild:
-        logger.info(f"BorgAdm wrapper needs rebuilding: {reason}")
-        logger.info("Run 'borgadm automate enable' to rebuild and re-apply.")
 
 
 def do_automate_disable() -> None:
@@ -1511,41 +1390,16 @@ def do_automate_enable() -> None:
     _automate_check_platform()
     crony = _crony_path()
 
-    # `create` runs through the wrapper for FDA; build it first so the
-    # bundle's command points at a present binary.
-    rebuild, reason = _wrapper_needs_rebuild()
-    if rebuild:
-        logger.info(f"Rebuilding BorgAdm wrapper: {reason}")
-        _build_wrapper()
-
     bundle = _crony_bundle_path()
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.write_text(_render_crony_bundle())
     logger.info(f"Wrote crony bundle: {bundle}")
     # apply reconciles idempotently (deterministic UUIDs), so re-enable
-    # is a no-op update rather than a delete + re-add.
+    # is a no-op update rather than a delete + re-add. The create job's
+    # full-disk-access flag makes crony build Crony.app and print the
+    # Full Disk Access grant instructions itself (forwarded here via
+    # allow_output), so borgadm prints no FDA guidance of its own.
     run_cmd([crony, "apply", "-b", _CRONY_BUNDLE], allow_output=True)
-
-    # Full Disk Access is granted to BorgAdm.app's identity and is what
-    # the `create` job needs to read user files.
-    app = _wrapper_app_path()
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("IMPORTANT: Grant Full Disk Access to enable backups")
-    logger.info("=" * 60)
-    logger.info("")
-    logger.info("1. Run this command to open System Settings:")
-    logger.info("")
-    logger.info(
-        '   open "x-apple.systempreferences:'
-        "com.apple.settings.PrivacySecurity.extension"
-        '?Privacy_AllFiles"'
-    )
-    logger.info("")
-    logger.info("2. Click the '+' button")
-    logger.info(f"3. Navigate to and add: {app}")
-    logger.info("4. Toggle the switch ON for BorgAdm")
-    logger.info("")
 
 
 def do_break_lock() -> None:
