@@ -46,6 +46,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     ExitClass,
+    GateResult,
     JobRunResult,
     NotificationResult,
 )
@@ -183,7 +184,7 @@ class TestEmailNotify:
             exit_code=2,
             signal=None,
             process_exit=2,
-            gate="none",
+            gate=GateResult.NONE,
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notifications={
@@ -373,7 +374,7 @@ class TestNtfyNotify:
             exit_code=2,
             signal=None,
             process_exit=2,
-            gate="none",
+            gate=GateResult.NONE,
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notifications={
@@ -661,7 +662,7 @@ class TestDialogPopupNotify:
             exit_code=2,
             signal=None,
             process_exit=2,
-            gate="none",
+            gate=GateResult.NONE,
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notifications={
@@ -851,7 +852,7 @@ class TestMultiChannelDispatch:
             exit_code=2,
             signal=None,
             process_exit=2,
-            gate="none",
+            gate=GateResult.NONE,
             log_path="/tmp/run.log",
             log_bytes_this_run=42,
             notifications={

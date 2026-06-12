@@ -66,7 +66,9 @@ sys.modules["crony_app"] = crony
 _spec.loader.exec_module(crony)
 
 
-def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
+def _apply(
+    short: str, *, bundle: str = DEFAULT_BUNDLE_NAME
+) -> crony_runtime.ApplyResult:
     """Apply one entry through the production path: build the
     `Config` model (one disk pass) and call `apply_one` with the
     resolved ref -- mirroring what `do_apply` does per entry, so
@@ -77,8 +79,7 @@ def _apply(short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
     config = crony_runtime.load_config()
     ref = config.pending.by_full_name.get(f"{bundle}.{short}")
     assert ref is not None, f"{bundle}.{short} not selected on this host"
-    result: str = crony_runtime.apply_one(config, ref)
-    return result
+    return crony_runtime.apply_one(config, ref)
 
 
 def isolate_crony_home(
@@ -686,7 +687,9 @@ class _ApplyHarness(_RunnerHarness):
         self.agents = agents
         self.sysd = sysd
 
-    def apply(self, short: str, *, bundle: str = DEFAULT_BUNDLE_NAME) -> str:
+    def apply(
+        self, short: str, *, bundle: str = DEFAULT_BUNDLE_NAME
+    ) -> crony_runtime.ApplyResult:
         """Apply one entry through the production path (see the
         module-level `_apply`)."""
         return _apply(short, bundle=bundle)

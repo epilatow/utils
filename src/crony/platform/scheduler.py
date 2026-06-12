@@ -36,14 +36,15 @@ UNIT_CONFIG = "config"
 UNIT_TIMER = "timer"
 
 
-class UnitState(enum.Enum):
+class UnitState(enum.StrEnum):
     """The platform scheduler's enable/disable view of a unit by name.
 
     ENABLED: the scheduler will fire it (loaded on launchd; `enabled` or
     `static` on systemd). DISABLED: instantiated but held off. NONE: the
     scheduler knows no unit by that name -- nothing to flip on or off.
     (Group-only entries, which have no own unit to enable, are the
-    caller's concern, not a value this reports.)
+    caller's concern, not a value this reports.) A StrEnum so the status
+    caller can render and compare it as its plain value.
     """
 
     ENABLED = "enabled"

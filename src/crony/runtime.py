@@ -24,6 +24,7 @@ import os
 import shutil as shutil  # noqa: PLC0414  re-exported for tests
 import uuid
 from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -741,17 +742,19 @@ def _alias_symlink_names() -> set[str]:
     return names
 
 
-def unit_state(name: str, platform: str | None = None) -> str:
+def unit_state(
+    name: str, platform: str | None = None
+) -> crony.platform.UnitState:
     """The platform scheduler's enable state for a stamped entity:
-    `enabled`, `disabled`, or `none`.
+    ENABLED, DISABLED, or NONE.
 
     Distinct from CONFIG: a unit can be configured-and-stamped while
-    being disabled at the platform scheduler. `none` means the
+    being disabled at the platform scheduler. NONE means the
     scheduler doesn't know a unit by this name -- nothing instantiated
     to flip on or off. (The `grouped` UNIT-axis value, for an entry
     with no own unit to enable, is set by the status caller, not here.)
     """
-    return scheduler(platform).state(name).value
+    return scheduler(platform).state(name)
 
 
 def user_trigger_flag_path(state_dir: Path) -> Path:
@@ -887,11 +890,28 @@ def _write_apply_state(
     _link_alias(snapshot)
 
 
-def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
-    """Apply one selected entry from the loaded model; return
-    "added", "updated", "unchanged", or "deferred".
+class ApplyResult(StrEnum):
+    """The outcome of applying one entry, returned by `apply_one`.
 
-    "deferred" means the entry's own running job is performing this
+    ADDED / UPDATED / UNCHANGED are the normal install verdicts.
+    DEFERRED means the entry's own running job is performing this apply
+    on a scheduler whose reload terminates the running unit (launchd)
+    and the apply would change the unit, so nothing is written and a
+    later apply reconciles it. A StrEnum so the apply log line renders
+    it as its plain value."""
+
+    ADDED = "added"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    DEFERRED = "deferred"
+
+
+def apply_one(
+    config: crony.model.Config, ref: crony.unit.EntityRef
+) -> ApplyResult:
+    """Apply one selected entry from the loaded model.
+
+    DEFERRED means the entry's own running job is performing this
     apply on a scheduler whose reload terminates the running unit
     (launchd) and the apply would change the unit: nothing is written
     (snapshot included) so the apply doesn't reload itself to death and
@@ -955,7 +975,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     rt = config.runtime.get(ref)
     unit_stale = rt.unit_is_stale if rt is not None else False
     if current_snapshot == snapshot and not unit_stale:
-        return "unchanged"
+        return ApplyResult.UNCHANGED
     is_update = current_snapshot is not None
 
     sched = scheduler()
@@ -980,7 +1000,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
             full_name,
             full_name,
         )
-        return "deferred"
+        return ApplyResult.DEFERRED
 
     # Same uuid, new name: the entry was renamed in config. The
     # state dir (uuid-keyed) is reused under the new name, but the
@@ -1009,7 +1029,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
     # answer counts and a fresh install still lands enabled. A uuid
     # change clears it: `do_apply` reclaimed the old unit first, so
     # the new job installs fresh -- a uuid change is a new job.
-    prior_disabled = unit_state(full_name) == "disabled"
+    prior_disabled = unit_state(full_name) == crony.platform.UnitState.DISABLED
     units = _render_units(snapshot)
     target_dir = sched.unit_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1035,7 +1055,7 @@ def apply_one(config: crony.model.Config, ref: crony.unit.EntityRef) -> str:
         )
 
     _write_apply_state(snapshot)
-    return "updated" if is_update else "added"
+    return ApplyResult.UPDATED if is_update else ApplyResult.ADDED
 
 
 def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:

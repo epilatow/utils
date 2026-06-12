@@ -27,6 +27,7 @@ import string
 import subprocess
 import time
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 from typing import (
     IO,
@@ -317,34 +318,44 @@ def _delay_or_bypass(
 _INTERACTIVE_BUTTONS = ["Cancel Job", "Delay Job", "Run Job"]
 
 
-def _show_interactive_dialog(job_name: str, message: str) -> str:
-    """Pop the three-button approval dialog. Returns one of
-    'run' / 'delay' / 'cancel'.
+class InteractiveChoice(StrEnum):
+    """An interactive job's resolved decision: run the command now,
+    delay and re-prompt later, or cancel this fire. Logged into the
+    run.log, so a StrEnum that reads as its plain value."""
 
-    Delegates the dialog to the HostPlatform backend and maps the
-    clicked button: Run Job -> 'run', Delay Job -> 'delay'. Clicking
-    the cancel button, dismissing the dialog, or any backend failure
-    yields no choice and maps to 'cancel' -- silently running without
-    user confirmation would defeat the whole point of the flag.
+    RUN = "run"
+    DELAY = "delay"
+    CANCEL = "cancel"
+
+
+def _show_interactive_dialog(job_name: str, message: str) -> InteractiveChoice:
+    """Pop the three-button approval dialog and map the click to a
+    decision.
+
+    Delegates the dialog to the HostPlatform backend: Run Job -> RUN,
+    Delay Job -> DELAY. Clicking the cancel button, dismissing the
+    dialog, or any backend failure yields no choice and maps to CANCEL
+    -- silently running without user confirmation would defeat the
+    whole point of the flag.
     """
     clicked = crony.runtime.host().show_dialog(
         f"crony: {job_name}", message, _INTERACTIVE_BUTTONS
     )
     if clicked == "Run Job":
-        return "run"
+        return InteractiveChoice.RUN
     if clicked == "Delay Job":
-        return "delay"
-    return "cancel"
+        return InteractiveChoice.DELAY
+    return InteractiveChoice.CANCEL
 
 
 def _interactive_wait_and_prompt(
     snap: crony.model.Job, log_file: IO[bytes]
-) -> str:
+) -> InteractiveChoice:
     """Run the wait/prompt/delay loop for an interactive job.
 
-    Returns 'run' or 'cancel'. Logs each phase transition into
-    the run.log so a post-mortem reader can see how long the
-    user took, whether they delayed, etc.
+    Returns RUN or CANCEL. Logs each phase transition into the run.log
+    so a post-mortem reader can see how long the user took, whether
+    they delayed, etc.
 
     Polls `consume_user_trigger_flag` inside both the active-
     wait and the delay-sleep so a `crony trigger` arriving while
@@ -375,14 +386,14 @@ def _interactive_wait_and_prompt(
             log_file.write(
                 b"interactive: bypass (user-triggered during wait)\n"
             )
-            return "run"
+            return InteractiveChoice.RUN
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
             str(snap.entity_name),
             f"crony wants to run '{snap.entity_name}'. Now?",
         )
         log_file.write(f"interactive: user chose {choice}\n".encode())
-        if choice in ("run", "cancel"):
+        if choice in (InteractiveChoice.RUN, InteractiveChoice.CANCEL):
             return choice
         log_file.write(
             f"interactive: delaying for "
@@ -394,7 +405,7 @@ def _interactive_wait_and_prompt(
             log_file.write(
                 b"interactive: bypass (user-triggered during delay)\n"
             )
-            return "run"
+            return InteractiveChoice.RUN
 
 
 def _run_job(
@@ -468,7 +479,7 @@ def _run_job(
                 ).encode()
                 log_file.write(header)
 
-                gate: str = "none"
+                gate = crony.model.GateResult.NONE
                 gate_cmd = _gate_argv(snap)
                 if gate_cmd is not None and not skip_gate:
                     log_file.write(f"gate: {shlex.join(gate_cmd)}\n".encode())
@@ -484,9 +495,13 @@ def _run_job(
                         gate_rc = gate_proc.returncode
                     except subprocess.TimeoutExpired:
                         gate_rc = -1
-                    gate = "passed" if gate_rc == 0 else "failed"
+                    gate = (
+                        crony.model.GateResult.PASSED
+                        if gate_rc == 0
+                        else crony.model.GateResult.FAILED
+                    )
 
-                    if gate == "failed":
+                    if gate == crony.model.GateResult.FAILED:
                         log_file.write(
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
@@ -536,7 +551,7 @@ def _run_job(
                             )
                         finally:
                             pending_flag.unlink(missing_ok=True)
-                        if choice == "cancel":
+                        if choice == InteractiveChoice.CANCEL:
                             result = crony.model.JobRunResult(
                                 host=host,
                                 platform=platform,

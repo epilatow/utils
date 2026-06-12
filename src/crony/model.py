@@ -76,6 +76,16 @@ _FLAG_SNAPSHOT_FIELDS: tuple[tuple[str, crony.config.JobFlags], ...] = tuple(
 )
 
 
+class EntityKind(StrEnum):
+    """Whether a snapshot entry is a single job or a job-group. Pinned
+    in snapshot.json under the `kind` key and used as the discriminator
+    `snapshot_from_dict` branches on. A StrEnum so it serializes as its
+    plain value and on-disk records round-trip unchanged."""
+
+    JOB = "job"
+    GROUP = "group"
+
+
 @dataclass(frozen=True)
 class _JobCommon:
     """Holds the fields both snapshot kinds carry.
@@ -99,7 +109,7 @@ class _JobCommon:
     # JSON key. Compared in `==`, so a snapshot whose format predates the
     # current code surfaces as drift (reported `snapshot-schema`).
     snapshot_schema: int
-    kind: str  # "job" or "group"
+    kind: EntityKind  # whether this entry is a job or a group
     bundle: str  # the bundle namespace; uuids are unique within it
     name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
@@ -404,7 +414,7 @@ class Job(_JobCommon):
         )
         return cls(
             snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
-            kind="job",
+            kind=EntityKind.JOB,
             bundle=name.bundle,
             name=name.short,
             uuid=job.uuid,
@@ -510,7 +520,7 @@ class JobGroup(_JobCommon):
             flags = config.composed_flags(group.flags)
         return cls(
             snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
-            kind="group",
+            kind=EntityKind.GROUP,
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
@@ -647,15 +657,19 @@ def snapshot_from_dict(
     legacy_timeout = data.pop("job_timeout_sec", legacy_timeout)
     if "timeout" not in data and legacy_timeout is not None:
         data["timeout"] = legacy_timeout
+    # The on-disk `kind` is the str the entry was serialized under;
+    # fold it back to the typed discriminator the dataclass field holds.
     kind = data.get("kind")
-    if kind == "job":
+    if kind == EntityKind.JOB:
+        data["kind"] = EntityKind.JOB
         # The wrapper state is not serialized (job-only derived runtime
         # state); stamp the caller's probed value, gated on the
         # full-disk-access flag, so a current node carries the live
         # state from construction.
         data["fda_wrapper"] = Job._fda_wrapper_for(flags, fda_wrapper)
         return Job(**data)
-    if kind == "group":
+    if kind == EntityKind.GROUP:
+        data["kind"] = EntityKind.GROUP
         return JobGroup(**data)
     raise ValueError(f"unknown snapshot kind {kind!r}")
 
@@ -736,6 +750,17 @@ class ConfigStatus(StrEnum):
     ERROR = "error"
 
 
+class GateResult(StrEnum):
+    """A run's gate outcome, recorded as `gate` in last-run.json. NONE
+    when no gate ran (no gate configured, or --skip-gate); PASSED on a
+    gate exit 0; FAILED on any non-zero or timeout. A StrEnum so it
+    serializes as its plain value and reads back unchanged."""
+
+    NONE = "none"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
 @dataclass
 class CommonRunResult:
     """The fields every completed run records, shared by JobRunResult
@@ -781,11 +806,10 @@ class JobRunResult(CommonRunResult):
 
     exit_code: int | None
     signal: int | None
-    # "none" if no gate ran (no config, or --skip-gate), "passed" on
-    # exit 0, "failed" on any non-zero or timeout. The numeric exit
-    # code stays in run.log for diagnosis; this field is the binary
-    # answer "did the gate let the job run?".
-    gate: str
+    # The gate outcome; the numeric exit code stays in run.log for
+    # diagnosis, this field is the binary answer "did the gate let the
+    # job run?".
+    gate: GateResult
     log_bytes_this_run: int
     # Per-channel outcomes. Keys are channel names that were
     # attempted (e.g. "email", "ntfy"); values are NotificationResult
@@ -984,13 +1008,6 @@ class Graph:
         groups). The node-level analogue of `refs()`, for callers that
         want the entities themselves rather than their identities."""
         return [*self.jobs.values(), *self.groups.values()]
-
-    def kind_of(self, ref: crony.unit.EntityRef) -> str | None:
-        if ref in self.jobs:
-            return "job"
-        if ref in self.groups:
-            return "group"
-        return None
 
     def job_from_ref(self, ref: crony.unit.EntityRef) -> Job | JobGroup | None:
         """The job / group `ref` names in THIS graph, or None when

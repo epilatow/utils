@@ -354,6 +354,9 @@ class TestApplyDarwin:
         )
         result = h.apply("j")
         assert result == "added"
+        # The verdict is the typed enum, not a bare string, so a
+        # regression back to a raw str return is caught.
+        assert isinstance(result, crony_runtime.ApplyResult)
         plist_path = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist_path.exists()
         # Activated via launchctl (plus plutil validation)

@@ -1129,10 +1129,10 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
         result = crony.runtime.apply_one(config, ref)
-        if result == "deferred":
+        if result == crony.runtime.ApplyResult.DEFERRED:
             # apply_one already logged the why at warning level.
             deferred = True
-        if verbose or result != "unchanged":
+        if verbose or result != crony.runtime.ApplyResult.UNCHANGED:
             logger.info("%s: %s", full, result)
     # A deferred apply leaves the entry's on-disk unit and snapshot stale
     # relative to config (they stay mutually consistent at the old state)
@@ -2552,28 +2552,18 @@ def do_status(
         # identity column; its plain name belongs to another entity.
         is_refform = ref is not None and ref in refform_refs
 
-        pkind = (
-            "group"
-            if isinstance(pending_node, crony.model.JobGroup)
-            else "job"
-            if pending_node is not None
-            else None
-        )
-        ckind = (
-            "group"
-            if isinstance(current_node, crony.model.JobGroup)
-            else "job"
-            if current_node is not None
-            else None
-        )
+        pkind = pending_node.kind if pending_node is not None else None
+        ckind = current_node.kind if current_node is not None else None
         if pkind is not None or ckind is not None:
             kind = _mark(pkind, ckind)
         elif isinstance(entry, crony.config.TomlJobGroup):
-            kind = "group"
+            kind = crony.model.EntityKind.GROUP
         elif entry is not None:
-            kind = "job"
+            kind = crony.model.EntityKind.JOB
         else:
-            kind = config.current.kind_of(ref) or "" if ref is not None else ""
+            # No node and no live config entry: an off-graph ref whose
+            # kind nothing on this side records, so the cell is blank.
+            kind = ""
 
         # CONFIG / UNIT / LAST are single-source verdicts (not flag-
         # selected); resolve them against the config name so the
@@ -2598,7 +2588,10 @@ def do_status(
             if current_node is not None
             else None
         )
-        if config_source != "pending" and unit_state == "disabled":
+        if (
+            config_source != "pending"
+            and unit_state == crony.platform.UnitState.DISABLED
+        ):
             # A disabled timer won't fire on its schedule, so the cron
             # expression is misleading -- show the runtime fact, with no
             # divergence flag (the cell is no longer the schedule it
@@ -2796,7 +2789,10 @@ def do_status(
             crony.model.JobStatus.NEVER,
             crony.model.JobStatus.GATED,
         }
-        unhealthy_unit = {"none", "disabled"}
+        unhealthy_unit = {
+            crony.platform.UnitState.NONE,
+            crony.platform.UnitState.DISABLED,
+        }
         rows = [
             r
             for r in rows
@@ -3446,7 +3442,7 @@ def _notify_test_one_bundle(
         exit_code=1,
         signal=None,
         process_exit=1,
-        gate="none",
+        gate=crony.model.GateResult.NONE,
         log_path="(synthetic)",
         log_bytes_this_run=0,
         notifications={
