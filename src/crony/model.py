@@ -221,11 +221,11 @@ class _JobCommon:
         its `priority` field."""
         return crony.unit.PriorityClass.NORMAL
 
-    def unit_spec(self) -> crony.unit.UnitSpec:
+    def unit_spec(self, cmd: tuple[str, ...]) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders / drift-checks."""
         return crony.unit.UnitSpec(
             name=self.entity_name,
-            ref=self.entity_ref,
+            cmd=cmd,
             timing=self.timing,
             priority=self._unit_priority,
         )

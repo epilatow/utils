@@ -371,17 +371,18 @@ class TestSharedSnapshotSurface:
 
     def test_job_unit_spec_carries_its_priority(self) -> None:
         snap = self._job_snap()
-        spec = snap.unit_spec()
+        spec = snap.unit_spec(("cmd",))
         assert spec.priority == snap.priority
         assert snap.priority is PriorityClass.HIGH
         assert spec.timing == snap.timing
+        assert spec.cmd == ("cmd",)
 
     def test_group_unit_spec_is_normal(self) -> None:
         # Groups request no special scheduling, which resolves to the
         # neutral NORMAL class (zero platform directives) rather than a
         # nullable priority.
         group = self._group_snap()
-        spec = group.unit_spec()
+        spec = group.unit_spec(("cmd",))
         assert spec.priority is PriorityClass.NORMAL
         assert spec.timing == group.timing
 

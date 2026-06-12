@@ -383,7 +383,7 @@ class UnitSpec:
     """One scheduled unit, described without crony's job/group model.
 
     name        The unit's full name; basis for its platform label.
-    ref         The ``<bundle>:<uuid>`` the unit passes to ``crony run``.
+    cmd         The argv the unit runs.
     timing      A Schedule, an Interval, or None for an on-demand unit
                 (a transit group, or a job fired only by explicit
                 trigger).
@@ -393,6 +393,6 @@ class UnitSpec:
     """
 
     name: EntityName
-    ref: EntityRef
+    cmd: tuple[str, ...]
     timing: Timing | None
     priority: PriorityClass

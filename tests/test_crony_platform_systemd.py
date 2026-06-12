@@ -38,19 +38,19 @@ REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "systemd.py"
 
 _REF = EntityRef("default", "u-test")
-# Absolute paths are normally resolved live at apply time; the renderers
-# take them as explicit args, so the tests pin deterministic values.
+# Absolute paths are normally resolved live at apply time and baked into
+# the run argv by the runtime layer; the tests pin deterministic values.
 _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
+# The run argv the runtime layer hands the backend as `spec.cmd`.
+_CMD = (str(_UV), "run", "--script", str(_CRONY), "run", str(_REF))
 # render() / dispatch don't read the unit dir; pin a placeholder.
 _DIR = Path("/unused")
 
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
-        svc = systemd.render_service(
-            "brew", _REF, uv_path=_UV, crony_path=_CRONY
-        )
+        svc = systemd.render_service("brew", _CMD)
         assert "[Unit]" in svc
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
@@ -71,7 +71,7 @@ class TestSystemdRendering:
     def test_service_invokes_uv_with_absolute_path(self) -> None:
         # systemd user services run with a minimal default PATH; render
         # uv's absolute path so the unit doesn't depend on PATH.
-        svc = systemd.render_service("j", _REF, uv_path=_UV, crony_path=_CRONY)
+        svc = systemd.render_service("j", _CMD)
         assert (
             "ExecStart=/abs/uv run --script /abs/crony run default:u-test"
             in svc
@@ -80,25 +80,19 @@ class TestSystemdRendering:
 
 class TestSystemdPriority:
     def test_high_records_intent(self) -> None:
-        svc = systemd.render_service(
-            "j", _REF, PriorityClass.HIGH, uv_path=_UV, crony_path=_CRONY
-        )
+        svc = systemd.render_service("j", _CMD, PriorityClass.HIGH)
         assert "# crony priority=high" in svc
         # high leaves CPU/IO at the Linux defaults.
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
 
     def test_low_sets_scheduling(self) -> None:
-        svc = systemd.render_service(
-            "j", _REF, PriorityClass.LOW, uv_path=_UV, crony_path=_CRONY
-        )
+        svc = systemd.render_service("j", _CMD, PriorityClass.LOW)
         assert "Nice=10" in svc
         assert "IOSchedulingClass=idle" in svc
 
     def test_normal_emits_nothing(self) -> None:
-        svc = systemd.render_service(
-            "j", _REF, PriorityClass.NORMAL, uv_path=_UV, crony_path=_CRONY
-        )
+        svc = systemd.render_service("j", _CMD, PriorityClass.NORMAL)
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
 
@@ -109,7 +103,7 @@ class TestSystemdScheduler:
     def _spec(self, timing: Schedule | Interval | None) -> UnitSpec:
         return UnitSpec(
             name=EntityName.from_str("default.brew"),
-            ref=_REF,
+            cmd=_CMD,
             timing=timing,
             priority=PriorityClass.NORMAL,
         )
@@ -117,8 +111,6 @@ class TestSystemdScheduler:
     def test_service_and_timer_when_scheduled(self) -> None:
         units = get_scheduler("linux", _DIR).render(
             self._spec(Interval.from_str("1h")),
-            uv_path=_UV,
-            crony_path=_CRONY,
         )
         assert set(units) == {
             "crony-default.brew.service",
@@ -126,9 +118,7 @@ class TestSystemdScheduler:
         }
 
     def test_service_only_when_scheduleless(self) -> None:
-        units = get_scheduler("linux", _DIR).render(
-            self._spec(None), uv_path=_UV, crony_path=_CRONY
-        )
+        units = get_scheduler("linux", _DIR).render(self._spec(None))
         assert list(units) == ["crony-default.brew.service"]
 
     def test_remove_files_unlinks_service_and_timer(
@@ -244,13 +234,14 @@ class TestSystemdAnalyzeVerify:
         ]
         written: list[Path] = []
         for nm, timing, prio in shapes:
+            cmd = (str(real), "run", "--script", str(real), "run", str(_REF))
             spec = UnitSpec(
                 name=EntityName.from_str(nm),
-                ref=_REF,
+                cmd=cmd,
                 timing=timing,
                 priority=prio,
             )
-            units = sched.render(spec, uv_path=real, crony_path=real)
+            units = sched.render(spec)
             for fname, content in units.items():
                 path = tmp_path / fname
                 path.write_text(content, encoding="utf-8")

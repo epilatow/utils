@@ -534,12 +534,69 @@ def host() -> crony.platform.HostPlatform:
     return crony.platform.get_host(crony.platform.current_platform())
 
 
+def run_argv(
+    uv_path: Path, crony_path: Path, ref: crony.unit.EntityRef
+) -> tuple[str, ...]:
+    """The argv a unit uses to invoke the runner for `ref`.
+
+    The absolute uv / crony paths are baked in because platform
+    schedulers start a unit with a minimal PATH that omits uv; the
+    runner is addressed by `<bundle>:<uuid>` so it skips the name lookup.
+    """
+    return (
+        str(uv_path),
+        "run",
+        "--script",
+        str(crony_path),
+        "run",
+        str(ref),
+    )
+
+
+def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
+    """Recover the `(uv, crony)` paths a unit's run argv was built with,
+    or None when both can't be found.
+
+    Scans for the absolute uv / crony executables -- an argument ending
+    in `/uv` or `/crony` that names an existing file -- rather than
+    matching a fixed argv position, so any run-command shape carries the
+    same recovery. Only still-present binaries match, so a baked path
+    that's since been removed yields None.
+    """
+    uv_path: Path | None = None
+    crony_path: Path | None = None
+    for arg in argv:
+        path = Path(arg)
+        if arg.endswith("/uv") and path.is_file():
+            uv_path = path
+        elif arg.endswith("/crony") and path.is_file():
+            crony_path = path
+    if uv_path is None or crony_path is None:
+        return None
+    return uv_path, crony_path
+
+
 def _unit_drift(
     snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
 ) -> frozenset[str]:
     """The unit-file kinds whose platform install diverges from the
-    snapshot -- delegates to the scheduler's per-file drift check."""
-    return scheduler(platform).drifted_units(snap.unit_spec())
+    snapshot.
+
+    Recovers the uv / crony paths baked into the installed config unit
+    and, when both still exist, rebuilds the expected argv with them so a
+    moved-but-present binary isn't flagged. When neither a usable path is
+    recoverable, the expected `cmd` is empty -- a render no installed
+    unit can match -- so the config unit surfaces as drifted.
+    """
+    sched = scheduler(platform)
+    installed = sched.installed_cmd(str(snap.entity_name))
+    recovered = (
+        exec_paths_from_argv(installed) if installed is not None else None
+    )
+    cmd: tuple[str, ...] = ()
+    if recovered is not None:
+        cmd = run_argv(recovered[0], recovered[1], snap.entity_ref)
+    return sched.drifted_units(snap.unit_spec(cmd))
 
 
 def recover_full_name(state_dir: Path) -> str | None:
@@ -733,16 +790,13 @@ def _render_units(
 ) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
-    Delegates to the platform Scheduler with the live `_uv_executable()`
-    / `_crony_executable()` paths baked into the unit argv. (The drift
-    check re-renders inside the scheduler using the paths it recovers
-    from the on-disk unit, so it does not go through here.)
+    Builds the run argv with the live `_uv_executable()` /
+    `_crony_executable()` paths and hands it to the platform Scheduler as
+    `spec.cmd`. (The drift check recovers the installed unit's own paths
+    instead; see `_unit_drift`.)
     """
-    return scheduler(platform).render(
-        snap.unit_spec(),
-        uv_path=_uv_executable(),
-        crony_path=_crony_executable(),
-    )
+    cmd = run_argv(_uv_executable(), _crony_executable(), snap.entity_ref)
+    return scheduler(platform).render(snap.unit_spec(cmd))
 
 
 def _write_apply_state(

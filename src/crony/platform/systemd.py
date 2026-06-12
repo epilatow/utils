@@ -23,10 +23,8 @@ from crony.platform.scheduler import (
     SchedulerWarning,
     UnitLastExit,
     UnitState,
-    exec_paths_from_argv,
 )
 from crony.unit import (
-    EntityRef,
     Interval,
     PriorityClass,
     Timing,
@@ -65,20 +63,14 @@ def _priority_block(priority: PriorityClass) -> str:
 
 def render_service(
     name: str,
-    ref: EntityRef,
+    cmd: tuple[str, ...],
     priority: PriorityClass = PriorityClass.NORMAL,
-    *,
-    uv_path: Path,
-    crony_path: Path,
 ) -> str:
     """Render the systemd `.service` unit. Independent of schedule.
 
-    ExecStart invokes uv with absolute paths and addresses the
-    entity by `<bundle>:<uuid>` so the runner skips the name->uuid
-    lookup -- same reason as for the plist (PATH for a systemd user
-    service is minimal and need not contain uv). The unit description
-    carries the human-readable name. `priority` adds CPU / IO
-    scheduling directives inherited by the spawned command.
+    `cmd` is the argv ExecStart runs. The unit description carries the
+    human-readable name. `priority` adds CPU / IO scheduling directives
+    inherited by the spawned command.
     """
     return (
         "[Unit]\n"
@@ -86,8 +78,7 @@ def render_service(
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={uv_path} run --script {crony_path} run "
-        f"{ref}\n"
+        f"ExecStart={shlex.join(cmd)}\n"
         "WorkingDirectory=%h\n"
         f"{_priority_block(priority)}"
     )
@@ -112,9 +103,11 @@ def render_timer(name: str, timing: Timing) -> str:
     )
 
 
-def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
-    """Recover the `(uv, crony)` paths from a `.service`'s ExecStart, or
-    None when it isn't a crony-shaped service."""
+def _service_argv(content: str) -> list[str] | None:
+    """Recover the argv from a `.service`'s ExecStart, or None when it
+    isn't in the shape `render_service` produces.
+
+    The inverse of `render_service`'s ExecStart embedding."""
     parser = configparser.ConfigParser(
         interpolation=None, delimiters=("=",), strict=False
     )
@@ -126,10 +119,9 @@ def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
     if not isinstance(exec_start, str):
         return None
     try:
-        argv = shlex.split(exec_start)
+        return shlex.split(exec_start)
     except ValueError:
         return None
-    return exec_paths_from_argv(argv)
 
 
 def _is_enabled(unit: str) -> str:
@@ -249,22 +241,26 @@ class SystemdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / ".config" / "systemd" / "user"
 
-    def render(
-        self, spec: UnitSpec, *, uv_path: Path, crony_path: Path
-    ) -> dict[str, str]:
+    def render(self, spec: UnitSpec) -> dict[str, str]:
         name = str(spec.name)
         units = {
             service_filename(name): render_service(
                 name,
-                spec.ref,
+                spec.cmd,
                 spec.priority,
-                uv_path=uv_path,
-                crony_path=crony_path,
             )
         }
         if spec.timing is not None:
             units[timer_filename(name)] = render_timer(name, spec.timing)
         return units
+
+    def installed_cmd(self, name: str) -> list[str] | None:
+        service = self.unit_dir / service_filename(name)
+        try:
+            content = service.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return _service_argv(content)
 
     def unit_config_path(self, name: str) -> Path | None:
         # The `.service` defines and runs the job (every entry has one,
@@ -344,7 +340,8 @@ class SystemdScheduler(Scheduler):
 
     def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
         name = str(spec.name)
-        expected = set(self.render(spec, uv_path=Path(), crony_path=Path()))
+        expected_units = self.render(spec)
+        expected = set(expected_units)
         drifted: set[str] = set()
         # An orphaned .timer left over from a schedule -> unscheduled
         # transition is timer drift even though it's not in `expected`.
@@ -352,8 +349,8 @@ class SystemdScheduler(Scheduler):
         if timer.is_file() and timer.name not in expected:
             drifted.add(UNIT_TIMER)
         for fname in expected:
-            kind = UNIT_TIMER if fname.endswith(".timer") else UNIT_CONFIG
             path = self.unit_dir / fname
+            kind = UNIT_TIMER if fname.endswith(".timer") else UNIT_CONFIG
             try:
                 content = path.read_text(encoding="utf-8")
             except OSError:
@@ -363,17 +360,7 @@ class SystemdScheduler(Scheduler):
                 assert spec.timing is not None
                 if content != render_timer(name, spec.timing):
                     drifted.add(UNIT_TIMER)
-                continue
-            extracted = _extract_exec_paths(content)
-            if extracted is None:
-                drifted.add(UNIT_CONFIG)
-                continue
-            uv_path, crony_path = extracted
-            if not uv_path.is_file() or not crony_path.is_file():
-                drifted.add(UNIT_CONFIG)
-                continue
-            rendered = self.render(spec, uv_path=uv_path, crony_path=crony_path)
-            if content != rendered[fname]:
+            elif content != expected_units[fname]:
                 drifted.add(UNIT_CONFIG)
         # A scheduled entry the scheduler has unloaded won't fire: the
         # .timer is the unit that needs (re)loading, so flag it. A

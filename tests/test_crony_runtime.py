@@ -1100,75 +1100,86 @@ class TestPlatformUnitDiscovery:
         assert crony_runtime._platform_unit_names() == set()
 
 
-class TestExtractUnitExecPaths:
-    """`launchd._extract_exec_paths` / `systemd._extract_exec_paths`
-    parse the on-disk unit file to recover the `(uv, crony)` paths
-    apply baked in. Anything that doesn't match the expected argv
-    shape returns None so the drift check treats the file as stale
-    (apply will re-render it from the snapshot).
+class TestExecPathsFromArgv:
+    """`runtime.exec_paths_from_argv` scans a unit's argv for the still-
+    present absolute uv / crony executables; the drift check rebuilds the
+    expected command from them (a moved-but-present binary isn't flagged)
+    or, finding neither, treats the unit as stale.
     """
 
-    def test_extracts_paths_from_plist(self) -> None:
-        plist = launchd.render_plist(
-            "j",
-            EntityRef("default", "u-test"),
-            None,
-            uv_path=Path("/abs/uv"),
-            crony_path=Path("/abs/crony"),
-        )
-        assert launchd._extract_exec_paths(plist) == (
-            Path("/abs/uv"),
-            Path("/abs/crony"),
-        )
+    @staticmethod
+    def _bin(tmp_path: Path, leaf: str) -> Path:
+        p = tmp_path / leaf
+        p.write_text("")
+        return p
 
-    def test_extracts_paths_from_systemd_service(self) -> None:
-        svc = systemd.render_service(
-            "j",
-            EntityRef("default", "u-test"),
-            uv_path=Path("/abs/uv"),
-            crony_path=Path("/abs/crony"),
-        )
-        assert systemd._extract_exec_paths(svc) == (
-            Path("/abs/uv"),
-            Path("/abs/crony"),
-        )
+    def test_recovers_present_paths(self, tmp_path: Path) -> None:
+        uv = self._bin(tmp_path, "uv")
+        crony = self._bin(tmp_path, "crony")
+        argv = crony_runtime.run_argv(uv, crony, EntityRef("d", "u-test"))
+        assert crony_runtime.exec_paths_from_argv(list(argv)) == (uv, crony)
 
-    def test_returns_none_for_malformed_plist(self) -> None:
-        assert launchd._extract_exec_paths("not xml") is None
+    def test_finds_paths_regardless_of_position(self, tmp_path: Path) -> None:
+        # The scan keys on the path name, not the argv position, so a
+        # wrapper that repeats uv / crony elsewhere still recovers them.
+        uv = self._bin(tmp_path, "uv")
+        crony = self._bin(tmp_path, "crony")
+        argv = [str(uv), "x", str(crony), "y", "z", str(uv)]
+        assert crony_runtime.exec_paths_from_argv(argv) == (uv, crony)
 
-    def test_returns_none_for_plist_missing_program_arguments(self) -> None:
+    def test_none_when_a_binary_is_absent(self) -> None:
+        # Ends in /uv and /crony but the files don't exist on disk -- a
+        # baked binary that's since been removed.
+        argv = ["/abs/uv", "run", "--script", "/abs/crony", "run", "x:y"]
+        assert crony_runtime.exec_paths_from_argv(argv) is None
+
+    def test_none_when_crony_missing(self, tmp_path: Path) -> None:
+        uv = self._bin(tmp_path, "uv")
+        argv = [str(uv), "run", "x:y"]  # no /crony entry
+        assert crony_runtime.exec_paths_from_argv(argv) is None
+
+
+class TestInstalledCmdParsing:
+    """The backends parse an on-disk unit back to its run argv
+    (`launchd._plist_argv` / `systemd._service_argv`), or None when the
+    file isn't the shape `render` produces. Interpreting the argv is the
+    runtime layer's job (see `TestExecPathsFromArgv`).
+    """
+
+    _CMD = ("/abs/uv", "run", "--script", "/abs/crony", "run", "x:y")
+
+    def test_plist_round_trips(self) -> None:
+        plist = launchd.render_plist("j", self._CMD, None)
+        assert launchd._plist_argv(plist) == list(self._CMD)
+
+    def test_service_round_trips(self) -> None:
+        svc = systemd.render_service("j", self._CMD)
+        assert systemd._service_argv(svc) == list(self._CMD)
+
+    def test_none_for_malformed_plist(self) -> None:
+        assert launchd._plist_argv("not xml") is None
+
+    def test_none_for_plist_missing_program_arguments(self) -> None:
         assert (
-            launchd._extract_exec_paths(
+            launchd._plist_argv(
                 '<?xml version="1.0"?><plist><dict>'
                 "<key>Label</key><string>x</string></dict></plist>",
             )
             is None
         )
 
-    def test_returns_none_for_plist_wrong_argv_shape(self) -> None:
+    def test_none_for_plist_without_sh_wrapper(self) -> None:
+        # render wraps the argv in `/bin/sh -c 'exec ...'`; a bare argv
+        # array isn't the shape installed_cmd recognizes.
         bogus = (
             '<?xml version="1.0"?><plist><dict>'
             "<key>ProgramArguments</key><array>"
-            "<string>/abs/uv</string><string>weird</string>"
-            "<string>--script</string><string>/abs/crony</string>"
-            "<string>run</string><string>x:y</string>"
+            "<string>/abs/uv</string><string>run</string>"
             "</array></dict></plist>"
         )
-        assert launchd._extract_exec_paths(bogus) is None
+        assert launchd._plist_argv(bogus) is None
 
-    def test_returns_none_for_plist_sh_wrapper_bad_inner(self) -> None:
-        # /bin/sh -c wrapper whose inner argv isn't the runner shape.
-        bogus = (
-            '<?xml version="1.0"?><plist><dict>'
-            "<key>ProgramArguments</key><array>"
-            "<string>/bin/sh</string><string>-c</string>"
-            "<string>exec /abs/uv weird /abs/crony</string>"
-            "</array></dict></plist>"
-        )
-        assert launchd._extract_exec_paths(bogus) is None
-
-    def test_returns_none_for_plist_sh_wrapper_without_exec(self) -> None:
-        # Wrapper command must start with `exec`.
+    def test_none_for_plist_sh_wrapper_without_exec(self) -> None:
         bogus = (
             '<?xml version="1.0"?><plist><dict>'
             "<key>ProgramArguments</key><array>"
@@ -1176,26 +1187,19 @@ class TestExtractUnitExecPaths:
             "<string>/abs/uv run --script /abs/crony run x:y</string>"
             "</array></dict></plist>"
         )
-        assert launchd._extract_exec_paths(bogus) is None
+        assert launchd._plist_argv(bogus) is None
 
-    def test_returns_none_for_systemd_missing_exec_start(self) -> None:
-        no_exec = "[Service]\nType=oneshot\n"
-        assert systemd._extract_exec_paths(no_exec) is None
+    def test_none_for_systemd_missing_exec_start(self) -> None:
+        assert systemd._service_argv("[Service]\nType=oneshot\n") is None
 
-    def test_returns_none_for_systemd_unparseable_ini(self) -> None:
+    def test_none_for_systemd_unparseable_ini(self) -> None:
         # Leading non-section content trips configparser.
         assert (
-            systemd._extract_exec_paths(
+            systemd._service_argv(
                 "ExecStart=/abs/uv run --script /abs/crony run x:y\n",
             )
             is None
         )
-
-    def test_returns_none_for_systemd_wrong_argv_shape(self) -> None:
-        bogus = (
-            "[Service]\nExecStart=/abs/uv weird --script /abs/crony run x:y\n"
-        )
-        assert systemd._extract_exec_paths(bogus) is None
 
 
 class TestUnitDriftDetection:

@@ -21,10 +21,8 @@ from crony.platform.scheduler import (
     Scheduler,
     UnitLastExit,
     UnitState,
-    exec_paths_from_argv,
 )
 from crony.unit import (
-    EntityRef,
     Interval,
     PriorityClass,
     Schedule,
@@ -68,18 +66,14 @@ def _priority_keys(priority: PriorityClass) -> dict[str, object]:
 
 def render_plist(
     name: str,
-    ref: EntityRef,
+    cmd: tuple[str, ...],
     timing: Timing | None,
     priority: PriorityClass = PriorityClass.NORMAL,
-    *,
-    uv_path: Path,
-    crony_path: Path,
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
     The Label uses the full namespaced name for human readability;
-    the runner gets the entity's `<bundle>:<uuid>` ref so it can
-    locate the state dir directly without scanning.
+    `cmd` is the argv the unit executes.
 
     Serialized with `plistlib` so the XML is well-formed by
     construction (escaping, typed values, DOCTYPE); `sort_keys`
@@ -93,12 +87,9 @@ def render_plist(
     # until something relaunches it. Going through /bin/sh (a
     # platform binary that always launches) makes uv an ordinary
     # exec, like a terminal invocation, which the constraint check
-    # doesn't reach. `exec` so sh is replaced by uv (one process;
-    # uv's pid and exit code propagate straight to launchd). uv's
-    # absolute path because launchd's per-agent PATH omits it.
-    inner = shlex.join(
-        [str(uv_path), "run", "--script", str(crony_path), "run", str(ref)]
-    )
+    # doesn't reach. `exec` so sh is replaced by the command (one
+    # process; its pid and exit code propagate straight to launchd).
+    inner = shlex.join(cmd)
     contents: dict[str, object] = {
         "Label": label(name),
         "ProgramArguments": ["/bin/sh", "-c", f"exec {inner}"],
@@ -116,9 +107,12 @@ def render_plist(
     ).decode("utf-8")
 
 
-def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
-    """Recover the `(uv, crony)` paths baked into a plist's argv, or
-    None when it isn't a crony-shaped plist."""
+def _plist_argv(content: str) -> list[str] | None:
+    """Recover the argv embedded in a plist, or None when it isn't in the
+    shape `render_plist` produces.
+
+    The inverse of `render_plist`'s embedding: it unwraps the
+    `/bin/sh -c 'exec <argv>'` ProgramArguments back to the argv list."""
     try:
         data = plistlib.loads(content.encode("utf-8"))
     except (plistlib.InvalidFileException, ValueError, OSError):
@@ -128,10 +122,6 @@ def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
     args = data.get("ProgramArguments")
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         return None
-    # render_plist wraps the run in `/bin/sh -c 'exec <uv> ...'`;
-    # unwrap to the bare runner argv the shared check validates. A
-    # plist not in this shape is treated as not-crony (None), which
-    # drifted_units reads as drift and re-renders.
     if len(args) != 3 or args[:2] != ["/bin/sh", "-c"]:
         return None
     try:
@@ -140,7 +130,7 @@ def _extract_exec_paths(content: str) -> tuple[Path, Path] | None:
         return None
     if not inner or inner[0] != "exec":
         return None
-    return exec_paths_from_argv(inner[1:])
+    return inner[1:]
 
 
 def _launchctl_print_disabled() -> str:
@@ -205,20 +195,24 @@ class LaunchdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / "Library" / "LaunchAgents"
 
-    def render(
-        self, spec: UnitSpec, *, uv_path: Path, crony_path: Path
-    ) -> dict[str, str]:
+    def render(self, spec: UnitSpec) -> dict[str, str]:
         name = str(spec.name)
         return {
             plist_filename(name): render_plist(
                 name,
-                spec.ref,
+                spec.cmd,
                 spec.timing,
                 spec.priority,
-                uv_path=uv_path,
-                crony_path=crony_path,
             )
         }
+
+    def installed_cmd(self, name: str) -> list[str] | None:
+        p = self.unit_dir / plist_filename(name)
+        try:
+            content = p.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return _plist_argv(content)
 
     def unit_config_path(self, name: str) -> Path | None:
         p = self.unit_dir / plist_filename(name)
@@ -287,14 +281,7 @@ class LaunchdScheduler(Scheduler):
             content = path.read_text(encoding="utf-8")
         except OSError:
             return config
-        extracted = _extract_exec_paths(content)
-        if extracted is None:
-            return config
-        uv_path, crony_path = extracted
-        if not uv_path.is_file() or not crony_path.is_file():
-            return config
-        rendered = self.render(spec, uv_path=uv_path, crony_path=crony_path)
-        if content != rendered[plist_filename(name)]:
+        if content != self.render(spec)[plist_filename(name)]:
             return config
         # A grouped (schedule-less) plist must still be loaded to be
         # kickstartable, so an unloaded unit is drift here too.

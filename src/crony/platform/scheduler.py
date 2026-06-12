@@ -82,21 +82,6 @@ class SchedulerWarning(Exception):
     emit `str(exc)` verbatim."""
 
 
-def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
-    """Validate a crony unit's argv and return its `(uv, crony)` paths.
-
-    Returns None unless `argv` is the expected
-    `[uv, "run", "--script", crony, "run", "<bundle>:<uuid>"]` shape.
-    The backends recover `argv` from their own file format (plist
-    ProgramArguments / systemd ExecStart) and share this check.
-    """
-    if len(argv) != 6:
-        return None
-    if argv[1] != "run" or argv[2] != "--script" or argv[4] != "run":
-        return None
-    return Path(argv[0]), Path(argv[3])
-
-
 class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
 
@@ -125,16 +110,20 @@ class Scheduler(abc.ABC):
         user's home. Used when no explicit dir is given."""
 
     @abc.abstractmethod
-    def render(
-        self, spec: UnitSpec, *, uv_path: Path, crony_path: Path
-    ) -> dict[str, str]:
+    def render(self, spec: UnitSpec) -> dict[str, str]:
         """Return `{filename: content}` for `spec`'s platform units.
 
-        `uv_path` / `crony_path` are baked into the unit's argv so it
-        runs crony without relying on PATH -- platform schedulers start
-        units with a minimal PATH that omits uv, and the caller resolves
-        the live paths (or, for the drift check, the paths recovered from
-        the installed unit) and passes them in.
+        Embeds `spec.cmd` as the unit's command and adds the schedule /
+        priority directives.
+        """
+
+    @abc.abstractmethod
+    def installed_cmd(self, name: str) -> list[str] | None:
+        """The command argv embedded in `name`'s installed config unit,
+        or None when no unit in the format `render` produces is present
+        (missing, unreadable, or a different shape).
+
+        The inverse of the `spec.cmd` embedding `render` performs.
         """
 
     @abc.abstractmethod

@@ -186,14 +186,15 @@ class TestSchedule:
 
 class TestUnitSpec:
     def test_construction(self) -> None:
+        cmd = ("/abs/uv", "run", "--script", "/abs/crony", "run", "x:y")
         spec = UnitSpec(
             name=EntityName("default", "job"),
-            ref=EntityRef("default", _UUID),
+            cmd=cmd,
             timing=Schedule.from_str("daily"),
             priority=PriorityClass.NORMAL,
         )
         assert str(spec.name) == "default.job"
-        assert str(spec.ref) == f"default:{_UUID}"
+        assert spec.cmd == cmd
         assert isinstance(spec.timing, Schedule)
 
 
