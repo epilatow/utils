@@ -2609,7 +2609,7 @@ class TestStatusUuidColumn:
 
 
 class TestStatusFieldColumns:
-    """The opt-in `timeout` / `priority` / `diverged` columns surface
+    """The opt-in `timeout` / `priority` / `stale` columns surface
     entry config fields (and which fields make an entry stale)."""
 
     def _status(self, cols: str, capsys: Any) -> str:
@@ -2692,7 +2692,7 @@ class TestStatusFieldColumns:
         )
         assert "low^" in self._status("job,priority", capsys)
 
-    def test_diverged_lists_changed_fields(
+    def test_stale_lists_changed_fields(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2711,7 +2711,7 @@ class TestStatusFieldColumns:
         h.apply("j")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
         # Synced: nothing diverges.
-        out = self._status("job,diverged", capsys)
+        out = self._status("job,stale", capsys)
         assert "command" not in out
         # Change two fields without re-applying.
         h.config(
@@ -2726,7 +2726,7 @@ class TestStatusFieldColumns:
             },
             default_target_jobs=["j"],
         )
-        out = self._status("job,diverged", capsys)
+        out = self._status("job,stale", capsys)
         # Sorted, reported by config-file name (timeout -> job-timeout-sec).
         assert "command,job-timeout-sec" in out
 
@@ -2753,12 +2753,12 @@ class TestStatusFieldColumns:
         assert crony_commands._timeout_display(gnode) == f"{gnode.timeout}s"
         assert crony_commands._priority_display(gnode) is None
 
-    def test_diverged_includes_unit_drift(
+    def test_stale_includes_unit_drift(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # A synced snapshot whose installed unit file drifted reads
-        # stale; the launchd plist is the config unit, so diverged
-        # reports `unit-config`.
+        # stale; the launchd plist is the config unit, so the stale
+        # column reports `unit-config`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "daily"}}},
@@ -2770,7 +2770,7 @@ class TestStatusFieldColumns:
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         plist.write_text(plist.read_text() + "\n<!-- edited -->\n")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
-        out = self._status("job,diverged,unit-config", capsys)
+        out = self._status("job,stale,unit-config", capsys)
         assert "unit-config" in out
         # The drifted unit's own column is flagged.
         row = next(
@@ -2778,7 +2778,7 @@ class TestStatusFieldColumns:
         )
         assert "^" in row
 
-    def test_diverged_fields_helper_branches(
+    def test_stale_fields_helper_branches(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2799,7 +2799,7 @@ class TestStatusFieldColumns:
         gnode = config.pending.job_from_ref(
             config.pending.by_full_name[h.full("gx")]
         )
-        d = crony_commands._diverged_fields
+        d = crony_commands._stale_fields
         cfg_drift = frozenset({crony_platform.UNIT_CONFIG})
         both_drift = frozenset(
             {crony_platform.UNIT_CONFIG, crony_platform.UNIT_TIMER}
@@ -2817,7 +2817,7 @@ class TestStatusFieldColumns:
         bumped = dataclasses.replace(jnode, snapshot_schema=4)
         assert d(jnode, bumped) == "snapshot-schema"
 
-    def test_diverged_expands_changed_flag_to_its_token(
+    def test_stale_expands_changed_flag_to_its_token(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # A changed capability flag shows its own token, not `flags`.
@@ -2840,7 +2840,7 @@ class TestStatusFieldColumns:
             },
             default_target_jobs=["j"],
         )
-        out = self._status("job,diverged", capsys)
+        out = self._status("job,stale", capsys)
         assert "keep-awake" in out
         assert "flags" not in out
 
@@ -2930,7 +2930,7 @@ class TestStatusReport:
         assert "JOB" in out
         assert "CONFIG" in out
         assert "SCHEDULE" in out
-        assert "LAST" in out
+        assert "STATUS" in out
         assert "j" in out
         assert "synced" in out
 
@@ -2997,7 +2997,7 @@ class TestStatusReport:
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
         crony_commands.do_status(
             jobs=[],
-            cols="job,last,last-ran",
+            cols="job,status,last-ran",
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -3007,7 +3007,7 @@ class TestStatusReport:
         out = capsys.readouterr().out
         header = out.splitlines()[0]
         assert "JOB" in header
-        assert "LAST" in header
+        assert "STATUS" in header
         assert "LAST RAN" in header
         # Columns omitted from --cols are absent.
         assert "CONFIG" not in header
@@ -3656,13 +3656,13 @@ class TestStatusReport:
             "CONFIG",
             "SCHEDULE",
             "UNIT",
-            "LAST",
+            "STATUS",
             "LAST RAN",
             "UUID",
             "UNIT CONFIG",
             "FLAGS",
             "TIMEOUT",
-            "DIVERGED",
+            "STALE",
         ):
             assert present in header
         assert "MASKED BY" not in header
@@ -3917,7 +3917,7 @@ class TestStatusReport:
             "JOB",
             "CONFIG",
             "SCHEDULE",
-            "LAST",
+            "STATUS",
             "LAST RAN",
             "MASKED BY",
         ]
@@ -4532,7 +4532,7 @@ class TestStatusReport:
             "config",
             "schedule",
             "unit",
-            "last",
+            "status",
             "last-ran",
             "masked-by",
             "unit-name",
@@ -6601,7 +6601,7 @@ class TestStatusFullDiskAccess:
         monkeypatch.setattr(
             crony_fda, "wrapper_state", lambda: FDAWrapper.STALE
         )
-        self._status("job,config,diverged")
+        self._status("job,config,stale")
         out = capsys.readouterr().out
         row = self._row_for(out, h.full("j"))
         assert "stale" in row
@@ -7757,7 +7757,7 @@ class TestStatusRenameUuidModel:
         h, group_uuid, member_uuid = self._renamed_config(tmp_path, monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid,schedule,last,last-ran",
+            cols="job,uuid,schedule,status,last-ran",
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -7894,7 +7894,7 @@ class TestStatusColor:
         # The footer legend is a plain-stream signal only; not on color.
         assert "flagged cells are stale" not in out
 
-    def test_last_fail_is_red(
+    def test_status_fail_is_red(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -7916,7 +7916,7 @@ class TestStatusColor:
         self._force_color(monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,last",
+            cols="job,status",
             show_masked=False,
             bundle=None,
             config_current=False,

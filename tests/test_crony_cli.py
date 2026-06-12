@@ -102,7 +102,7 @@ class TestHelpOutput:
         # Design block documents the default status columns.
         assert "CONFIG    synced" in text
         assert "SCHEDULE  the cron" in text
-        assert "LAST      ok" in text
+        assert "STATUS    ok" in text
         # Exit codes still rendered.
         assert "exit codes:" in text
         # Design block is appended *after* the exit codes -- the

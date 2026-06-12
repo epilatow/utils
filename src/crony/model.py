@@ -258,7 +258,7 @@ class _JobCommon:
         d = dataclasses.asdict(self)
         # The format version persists under the `schema` JSON key; the
         # in-memory field is `snapshot_schema` (unambiguous at its use
-        # sites and in the DIVERGED column).
+        # sites and in the STALE column).
         d["schema"] = d.pop("snapshot_schema")
         # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
         # is redundant with it and recomputed on load.
@@ -710,7 +710,7 @@ class ExitClass(StrEnum):
 
 
 class JobStatus(StrEnum):
-    """The verdict `crony status` shows in its LAST column: the run
+    """The verdict `crony status` shows in its STATUS column: the run
     outcomes that actually reach the cell plus the display-only states
     derived at read time. Shares string values with `ExitClass` for the
     outcomes it carries (so the two compare and serialize alike); it
@@ -839,7 +839,7 @@ class GroupRunResult(CommonRunResult):
     fail / signal (which are equally severe), and ok / gated tie
     at the bottom (gating is "intentionally not run", not a
     group-level outcome). The status / list readers
-    consult this single field for the group's LAST axis instead
+    consult this single field for the group's STATUS axis instead
     of re-deriving the rollup on every query.
     """
 

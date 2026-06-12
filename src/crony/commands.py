@@ -350,15 +350,15 @@ def _priority_display(
     return str(node.priority)
 
 
-# Snapshot fields whose DIVERGED label isn't a plain underscore-to-dash
-# translation of the dataclass attribute. `timing` serializes as
+# Snapshot fields whose STALE-column label isn't a plain underscore-to-
+# dash translation of the dataclass attribute. `timing` serializes as
 # `schedule`/`interval`; `timeout` is the `job-timeout-sec` config knob;
 # the interactive `_sec` snapshot fields store resolved seconds but the
 # config knobs take a time-span string (`interactive-active` /
 # `interactive-delay`). Any field not listed falls back to its
 # dash-translated attribute name (so `snapshot_schema` reads
 # `snapshot-schema`, `state_dir_symlink` reads `state-dir-symlink`).
-_DIVERGED_FIELD_LABELS: dict[str, str] = {
+_STALE_FIELD_LABELS: dict[str, str] = {
     "timing": "schedule",
     "timeout": "job-timeout-sec",
     "interactive_active_sec": "interactive-active",
@@ -366,7 +366,7 @@ _DIVERGED_FIELD_LABELS: dict[str, str] = {
 }
 
 
-def _diverged_fields(
+def _stale_fields(
     pending: crony.model.Job | crony.model.JobGroup | None,
     current: crony.model.Job | crony.model.JobGroup | None,
     *,
@@ -380,7 +380,7 @@ def _diverged_fields(
 
     Only `compare=True` fields are diffed, mirroring the dataclass `==`
     the stale verdict itself uses. A config knob is reported by the name
-    the config file uses for it (see `_DIVERGED_FIELD_LABELS`); any other
+    the config file uses for it (see `_STALE_FIELD_LABELS`); any other
     field falls back to its dash-spelled attribute (`snapshot_schema` ->
     `snapshot-schema`, `state_dir_symlink` -> `state-dir-symlink`). The
     `flags` bitmask is expanded to the individual capability flags that
@@ -406,7 +406,7 @@ def _diverged_fields(
                     )
                 else:
                     parts.append(
-                        _DIVERGED_FIELD_LABELS.get(
+                        _STALE_FIELD_LABELS.get(
                             f.name, f.name.replace("_", "-")
                         )
                     )
@@ -424,7 +424,7 @@ def _diverged_fields(
 # off when the user runs `crony apply` to push other changes.
 
 
-# Maps a recorded ExitClass to the JobStatus shown in the LAST cell:
+# Maps a recorded ExitClass to the JobStatus shown in the STATUS cell:
 # `signal` folds to `fail`; `dispatched` (absent here) and an
 # unparseable class fall through to UNKNOWN at the call site.
 _EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
@@ -440,7 +440,7 @@ _EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
 def _last_run_state(
     config: crony.model.Config, full_name: str
 ) -> crony.model.JobStatus:
-    """Return LAST axis value for a stamped entity.
+    """Return STATUS axis value for a stamped entity.
 
     Lock-held implies a run is currently in flight: "pending" when
     the in-flight run is an interactive job sitting in its wait
@@ -1653,7 +1653,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "schedule": "SCHEDULE",
     "groups": "GROUPS",
     "unit": "UNIT",
-    "last": "LAST",
+    "status": "STATUS",
     "last-ran": "LAST RAN",
     "masked-by": "MASKED BY",
     "unit-name": "UNIT NAME",
@@ -1664,7 +1664,7 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "flags": "FLAGS",
     "timeout": "TIMEOUT",
     "priority": "PRIORITY",
-    "diverged": "DIVERGED",
+    "stale": "STALE",
 }
 # One opt-in column per capability flag, keyed by the flag's token, so
 # the set tracks `JobFlags` automatically as members are added.
@@ -1674,7 +1674,7 @@ _DEFAULT_STATUS_COLS: tuple[str, ...] = (
     "job-or-uuid",
     "config",
     "schedule",
-    "last",
+    "status",
     "last-ran",
 )
 _STATUS_COL_ALIAS_NAMES: tuple[str, ...] = ("default", "all", "unit-files")
@@ -1788,7 +1788,7 @@ Columns
                     the rare divergence (a uuid redefined from one kind to
                     the other). Falls back to the snapshot's recorded kind
                     for rows whose live config no longer defines the entry.
-  last              Last-run outcome: ok | fail | timeout | gated | canceled
+  status            Last-run outcome: ok | fail | timeout | gated | canceled
                     | crashed | running | pending | never | unknown.
   last-ran          Compact relative time of the last run, e.g. "5m ago".
   masked-by         `host` and / or `platform` joined with `,`
@@ -1858,7 +1858,7 @@ Columns
   priority          Job scheduling priority: high | normal | low. Opt-in,
                     job-only (blank for groups). Source-selected and
                     `^`-flagged like `schedule`.
-  diverged          Why a `stale` entry diverges: the snapshot fields
+  stale             Why a `stale` entry diverges: the snapshot fields
                     that differ between the config and applied versions,
                     a config knob named as the config file spells it
                     (e.g. `command,env,job-timeout-sec`), each changed
@@ -1885,7 +1885,7 @@ Aliases
 Color
 -----
   When stdout is a TTY (and NO_COLOR is unset), broken / failed states
-  are red -- CONFIG `missing` / `error` / `broken` / `orphan` and LAST
+  are red -- CONFIG `missing` / `error` / `broken` / `orphan` and STATUS
   `fail` / `timeout` / `canceled` / `crashed` -- and reconcilable drift
   is yellow: a `stale` CONFIG verdict and every stale value cell. On a
   color stream a stale cell is shown by its yellow value alone; the `^`
@@ -2122,11 +2122,7 @@ _ANSI_RED: str = "\033[31m"
 _ANSI_YELLOW: str = "\033[33m"
 _ANSI_RESET: str = "\033[0m"
 
-# CONFIG values worth a red flag. `last` is folded so `signal` never
-# reaches the cell (it renders as `fail`); `timeout` / `canceled` /
-# `crashed` are the other non-clean terminal outcomes (`crashed` = the
-# launch ended without recording a run -- killed, or exited before the
-# runner wrote its record).
+# CONFIG values worth a red flag.
 _STATUS_RED_CONFIG: frozenset[crony.model.ConfigStatus] = frozenset(
     {
         crony.model.ConfigStatus.MISSING,
@@ -2135,7 +2131,12 @@ _STATUS_RED_CONFIG: frozenset[crony.model.ConfigStatus] = frozenset(
         crony.model.ConfigStatus.ORPHAN,
     }
 )
-_STATUS_RED_LAST: frozenset[crony.model.JobStatus] = frozenset(
+# STATUS values worth a red flag. `signal` never reaches the cell (it
+# renders as `fail`); `timeout` / `canceled` / `crashed` are the other
+# non-clean terminal outcomes (`crashed` = the launch ended without
+# recording a run -- killed, or exited before the runner wrote its
+# record).
+_STATUS_RED_STATUS: frozenset[crony.model.JobStatus] = frozenset(
     {
         crony.model.JobStatus.FAIL,
         crony.model.JobStatus.TIMEOUT,
@@ -2168,7 +2169,7 @@ def _status_value_color(col: str, value: str) -> str | None:
             return _ANSI_RED
         if value == crony.model.ConfigStatus.STALE:
             return _ANSI_YELLOW
-    elif col == "last" and value in _STATUS_RED_LAST:
+    elif col == "status" and value in _STATUS_RED_STATUS:
         return _ANSI_RED
     return None
 
@@ -2369,7 +2370,7 @@ def do_status(
 
     `--exclude-healthy` drops rows where CONFIG is `synced`,
     UNIT is `enabled` (or `grouped` -- anything that fires), and
-    LAST is `ok` / `never` / `gated`. A disabled unit is
+    STATUS is `ok` / `never` / `gated`. A disabled unit is
     unhealthy (it isn't firing), so it survives the filter.
     Output is flat (no tree indent). Always exits 0 -- this is a
     filter on the display, not a gate.
@@ -2565,7 +2566,7 @@ def do_status(
             # kind nothing on this side records, so the cell is blank.
             kind = ""
 
-        # CONFIG / UNIT / LAST are single-source verdicts (not flag-
+        # CONFIG / UNIT / STATUS are single-source verdicts (not flag-
         # selected); resolve them against the config name so the
         # TOML-entry-based grouped check and errored detection land.
         cfg_state, unit_state, last = _resolve_state_axes(
@@ -2670,8 +2671,8 @@ def do_status(
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
         # Flag the specific unit file whose install drifted from the
-        # snapshot (re-apply re-renders it), mirroring the `diverged`
-        # `unit-config` / `unit-timer` tokens.
+        # snapshot (re-apply re-renders it), mirroring the `stale`
+        # column's `unit-config` / `unit-timer` tokens.
         if unit_config_cell and crony.platform.UNIT_CONFIG in unit_drift:
             unit_config_cell = f"{unit_config_cell}{_DIVERGENCE_MARKER}"
         if unit_timer_cell and crony.platform.UNIT_TIMER in unit_drift:
@@ -2713,10 +2714,10 @@ def do_status(
         priority_cell = _mark(
             _priority_display(pending_node), _priority_display(current_node)
         )
-        # `diverged` summarizes why an entry reads stale -- the snapshot
-        # fields that differ, plus `unit-config` / `unit-timer` for an
-        # installed-unit drift.
-        diverged_cell = _diverged_fields(
+        # The `stale` column summarizes why an entry reads stale -- the
+        # snapshot fields that differ, plus `unit-config` / `unit-timer`
+        # for an installed-unit drift.
+        stale_cell = _stale_fields(
             pending_node,
             current_node,
             unit_drift=unit_drift,
@@ -2753,7 +2754,7 @@ def do_status(
             "schedule": sched_cell,
             "groups": groups_cell,
             "unit": unit_state,
-            "last": last,
+            "status": last,
             "last-ran": last_ran,
             "masked-by": mask_reason,
             "unit-name": unit_name,
@@ -2764,7 +2765,7 @@ def do_status(
             "flags": ",".join(flags_summary_parts),
             "timeout": timeout_cell,
             "priority": priority_cell,
-            "diverged": diverged_cell,
+            "stale": stale_cell,
         }
         row_cells.update(flag_cells)
         built.append((config_name, row_cells))
@@ -2781,10 +2782,10 @@ def do_status(
         # indent, since the surviving rows won't reconstruct the
         # tree anyway and a half-indented subtree is more
         # confusing than a flat list. Healthy: `config == synced`
-        # AND `unit` not in {none, disabled} AND `last` in
+        # AND `unit` not in {none, disabled} AND `status` in
         # {ok, never, gated}. A disabled unit is unhealthy
         # because it isn't firing.
-        healthy_last = {
+        healthy_status = {
             crony.model.JobStatus.OK,
             crony.model.JobStatus.NEVER,
             crony.model.JobStatus.GATED,
@@ -2799,7 +2800,7 @@ def do_status(
             if not (
                 r["config"] == crony.model.ConfigStatus.SYNCED
                 and r["unit"] not in unhealthy_unit
-                and r["last"] in healthy_last
+                and r["status"] in healthy_status
             )
         ]
         rows = sorted(rows, key=lambda r: r["job-or-uuid"])

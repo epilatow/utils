@@ -491,11 +491,11 @@ class TestRunJobBasics:
         assert "script not found" in rec["reason"]
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
 
-    def test_canceled_surfaces_in_status_last_column(
+    def test_canceled_surfaces_in_status_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # The whole point of writing last-run.json: `crony status`
-        # shows the canceled label in the LAST column on the next
+        # shows the canceled label in the STATUS column on the next
         # refresh, so a scheduled fire that bailed on a schema
         # mismatch becomes visible.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -524,7 +524,7 @@ class TestRunJobBasics:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        # LAST column carries the canceled label; not silently
+        # STATUS column carries the canceled label; not silently
         # turned into "unknown" by the legacy mapping.
         assert "canceled" in out
 
