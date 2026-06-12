@@ -447,6 +447,42 @@ class TestRunJobBasics:
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
 
+    def test_run_records_canceled_on_dispatch_precondition(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A precondition that fails inside _run_job (here a missing
+        # script), after the snapshot loads, records `canceled` the
+        # same way a snapshot-load failure does -- otherwise the fire
+        # leaves no record and surfaces only as an unexplained
+        # `crashed` launch.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "script": "/nonexistent/script",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        h.write_snap(cfg, "j")
+        uuid_value = cfg.jobs["j"].uuid
+        sd = h.state_dir("j", cfg=cfg)
+        with pytest.raises(PreconditionError, match="script not found"):
+            crony_runner.do_run(
+                ref=f"default:{uuid_value}",
+                dry_run=False,
+                skip_gate=False,
+            )
+        rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
+        assert rec["exit_class"] == "canceled"
+        assert rec["exit_code"] == int(ExitCode.PRECONDITION)
+        assert rec["process_exit"] == int(ExitCode.PRECONDITION)
+        assert "script not found" in rec["reason"]
+        assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+
     def test_canceled_surfaces_in_status_last_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:

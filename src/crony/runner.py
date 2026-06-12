@@ -1123,17 +1123,19 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     surfaced via SystemExit so it propagates to the platform
     scheduler; cli() converts that into the process exit.
 
-    When the pinned snapshot can't be loaded (missing, unreadable,
-    wrong schema, unknown kind), the runner records a
-    `last-run.json` with `exit_class="canceled"` so the failure
+    When a run precondition fails before the command runs -- the
+    pinned snapshot can't be loaded (missing, unreadable, wrong
+    schema, unknown kind), or the job/group dispatch raises a
+    `PreconditionError` (e.g. a missing script) -- the runner records
+    a `last-run.json` with `exit_class="canceled"` so the failure
     surfaces in `crony status` and isn't silently dropped by the
     scheduler. The "canceled" label is shared with interactive-
     job cancels: both have the same operator-facing meaning
     ("crony run never got to the user's command"). Without this
-    record, a snapshot-schema bump -- which makes every entity's
-    pinned snapshot unloadable until the user re-applies -- looks
-    the same in `crony status` as an ordinary "edited config,
-    not yet applied" drift while scheduled fires silently fail.
+    record the scheduled fire fails, leaving the prior outcome in
+    place: a snapshot-schema bump looks like ordinary
+    "edited config, not yet applied" drift, and a per-run precondition
+    surfaces only as a `crashed` launch with no explanation.
     """
     parsed = crony.unit.EntityRef.from_str(ref)
     if parsed is None:
@@ -1144,29 +1146,31 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
         )
     try:
         snap = crony.runtime.load_snapshot(parsed)
+        if isinstance(snap, crony.model.Job):
+            rc = _run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
+        else:
+            rc = _run_group(snap, dry_run=dry_run)
     except crony.errors.PreconditionError as exc:
-        _record_snapshot_load_failure(parsed, exc)
+        _record_precondition_cancel(parsed, exc)
         raise
-    if isinstance(snap, crony.model.Job):
-        rc = _run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
-    else:
-        rc = _run_group(snap, dry_run=dry_run)
     raise SystemExit(rc)
 
 
-def _record_snapshot_load_failure(
+def _record_precondition_cancel(
     ref: crony.unit.EntityRef, exc: crony.errors.PreconditionError
 ) -> None:
-    """Write a minimal `last-run.json` recording a snapshot-load
-    failure so the cancel surfaces in `crony status` -- same
-    `canceled` label interactive-job cancels use.
+    """Write a minimal `last-run.json` recording a precondition
+    failure as `canceled` so it surfaces in `crony status` -- same
+    `canceled` label interactive-job cancels use. Covers any
+    `PreconditionError` raised before the command runs (snapshot
+    load, missing script, and other per-run preconditions).
 
     Skipped when the state dir doesn't exist on disk: creating it
     just to hold the error record would leave an orphaned dir
     that subsequently has to be cleaned up. In that case the
     operator discovers the issue via the platform scheduler's
-    own exit-code surface (and, with later commits, the
-    unit-only orphan that surfaces in `crony status`).
+    own exit-code surface and the unit-only orphan that surfaces
+    in `crony status`.
 
     A run.log line accompanies the JSON so `crony logs` shows
     the underlying reason -- the JSON keeps the schema flat
