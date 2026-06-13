@@ -31,16 +31,14 @@ markers = [
 wrap = 78
 
 [tool.repo-shared.code-quality]
-# bin/* are shebang-based scripts without ``.py`` extensions, so
-# ruff's directory auto-discovery skips them. List them in
-# ``python-targets`` (additive to discovery) so ruff + mypy cover
-# the same Python surface. ``bin/binfiles`` is a symlink to
-# ``bin/dotfiles`` and rejected by the validator -- it's left out.
+# Most bin/* entries are shebang scripts without a ``.py`` extension,
+# which ruff/mypy auto-discovery (it globs ``*.py``) can't see. Each is
+# exposed to discovery -- and made importable as a typed module by the
+# tests -- via a ``src/<module>.py`` symlink to it, resolved against
+# ``[tool.mypy] mypy_path = ["src"]``. ``bin/crony`` is the exception:
+# its logic lives in the ``src/crony`` package, so a ``src/crony.py``
+# alias would collide with that package; it stays a manual target here.
 # ``tests/`` is picked up by discovery automatically.
 python-targets = [
-    "bin/borgadm",
     "bin/crony",
-    "bin/dotfiles",
-    "bin/firefox-cookies",
-    "bin/secure-archiver",
 ]

@@ -39,10 +39,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
-import os
-import platform
-import signal
-import subprocess
+import os as os  # noqa: PLC0414  re-exported for tests
+import platform as platform  # noqa: PLC0414  re-exported for tests
+import signal as signal  # noqa: PLC0414  re-exported for tests
+import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
 from pathlib import Path
 
@@ -153,9 +153,7 @@ def _process_start_epoch(pid: int) -> float:
         text=True,
     )
     if proc.returncode != 0:
-        raise WatchdogError(
-            f"ps failed for pid {pid}: {proc.stderr.strip()!r}"
-        )
+        raise WatchdogError(f"ps failed for pid {pid}: {proc.stderr.strip()!r}")
     line = proc.stdout.strip()
     if not line:
         raise WatchdogError(f"ps returned no lstart for pid {pid}")
@@ -187,9 +185,7 @@ def _restart_uea_aqua(pid: int) -> None:
     except ProcessLookupError:
         return
     except PermissionError as exc:
-        raise WatchdogError(
-            f"kill({pid}, SIGTERM) refused: {exc}"
-        ) from exc
+        raise WatchdogError(f"kill({pid}, SIGTERM) refused: {exc}") from exc
 
 
 # =============================================================================
@@ -199,9 +195,11 @@ def _restart_uea_aqua(pid: int) -> None:
 
 def _format_epoch(epoch: float) -> str:
     """Format an epoch as local time for human-readable diagnostics."""
-    return datetime.datetime.fromtimestamp(epoch).strftime(
-        "%Y-%m-%d %H:%M:%S %Z"
-    ).rstrip()
+    return (
+        datetime.datetime.fromtimestamp(epoch)
+        .strftime("%Y-%m-%d %H:%M:%S %Z")
+        .rstrip()
+    )
 
 
 def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
@@ -272,9 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help=(
-            "Report what would happen without signaling the agent."
-        ),
+        help=("Report what would happen without signaling the agent."),
     )
     return parser
 

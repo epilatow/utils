@@ -11,13 +11,11 @@ Comprehensive unit tests for dotfiles
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -31,17 +29,12 @@ from conftest import (
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# Import dotfiles module from bin/ (works with or without .py extension)
+import dotfiles as df  # noqa: E402
+
+# The bin script under test, for run_tests' coverage module name.
 _script_path = REPO_ROOT / "bin" / "dotfiles"
-if not _script_path.exists():
-    _script_path = REPO_ROOT / "bin" / "dotfiles.py"
-_loader = importlib.machinery.SourceFileLoader("dotfiles", str(_script_path))
-_spec = importlib.util.spec_from_loader("dotfiles", _loader)
-assert _spec and _spec.loader
-df = importlib.util.module_from_spec(_spec)
-sys.modules["dotfiles"] = df
-_spec.loader.exec_module(df)
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +43,7 @@ def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
 
 
 class TestIsolateHomeFixture(IsolateHomeFixtureBase):
-    MODULE = df
+    MODULE: ClassVar[Any] = df
     SOURCE_NAME = "vimrc"
     PROFILE_ATTR = "DOTFILES_PROFILE"
 

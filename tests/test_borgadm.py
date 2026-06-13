@@ -14,8 +14,6 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
-import importlib.machinery
-import importlib.util
 import io
 import json
 import logging
@@ -32,7 +30,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -54,16 +52,13 @@ _REAL_UV_CACHE_DIR = os.environ.get(
     "UV_CACHE_DIR", os.path.expanduser("~/.cache/uv")
 )
 
-# Import borgadm module from bin/ (works with or without .py extension)
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import borgadm as ba  # noqa: E402
+
+# The bin script under test, for run_tests' coverage module name and the
+# e2e subprocess fixtures.
 _script_path = REPO_ROOT / "bin" / "borgadm"
-if not _script_path.exists():
-    _script_path = REPO_ROOT / "bin" / "borgadm.py"
-_loader = importlib.machinery.SourceFileLoader("borgadm", str(_script_path))
-_spec = importlib.util.spec_from_loader("borgadm", _loader)
-assert _spec and _spec.loader
-ba = importlib.util.module_from_spec(_spec)
-sys.modules["borgadm"] = ba
-_spec.loader.exec_module(ba)
 
 
 @pytest.fixture(autouse=True)
@@ -2413,20 +2408,11 @@ class TestBrokenPipeHandling:
     # stderr handlers using BrokenPipeAwareStreamHandler, mirroring
     # initialize_logger() but without needing a config file.
     _SETUP = """
-import importlib.machinery
-import importlib.util
 import logging
 import sys
 
-script_path = {script!r}
-loader = importlib.machinery.SourceFileLoader("borgadm", script_path)
-spec = importlib.util.spec_from_loader("borgadm", loader)
-borgadm = importlib.util.module_from_spec(spec)
-# Register before exec_module: @dataclass resolves field annotations
-# against sys.modules[cls.__module__], so the module must be findable
-# there by the time the class body runs.
-sys.modules["borgadm"] = borgadm
-spec.loader.exec_module(borgadm)
+sys.path.insert(0, {src!r})
+import borgadm
 
 logger = logging.getLogger("test_pipe")
 logger.setLevel(logging.DEBUG)
@@ -2445,7 +2431,7 @@ logger.addHandler(stderr_handler)
 
     def _run(self, tmp_path: Path, body: str, shell_cmd: str) -> Any:
         script_file = tmp_path / "test_pipe.py"
-        setup = self._SETUP.format(script=str(REPO_ROOT / "bin" / "borgadm"))
+        setup = self._SETUP.format(src=str(REPO_ROOT / "src"))
         script_file.write_text(setup + body)
         return subprocess.run(
             shell_cmd.format(script=script_file),
@@ -2583,7 +2569,9 @@ logger.info("end-sentinel")
         src = io.StringIO("".join(f"line {i}\n" for i in range(100)))
         acc = io.StringIO()
         sink = BrokenSink(fail_after=3)
-        ba.pump_stream(src, sink, acc, allow_output=True)
+        # The fake sink implements only write/flush, not the full
+        # TextIO surface pump_stream's signature asks for.
+        ba.pump_stream(src, cast(Any, sink), acc, allow_output=True)
 
         # Source fully drained into the accumulator.
         assert acc.getvalue().count("\n") == 100
@@ -2604,7 +2592,7 @@ logger.info("end-sentinel")
 
         src = io.StringIO("a\nb\nc\n")
         acc = io.StringIO()
-        ba.pump_stream(src, ExplodingSink(), acc, allow_output=False)
+        ba.pump_stream(src, cast(Any, ExplodingSink()), acc, allow_output=False)
         assert acc.getvalue() == "a\nb\nc\n"
 
 

@@ -11,8 +11,6 @@ Comprehensive unit tests for firefox-cookies
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import shutil
 import sqlite3
@@ -32,19 +30,12 @@ from conftest import (
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# Import firefox_cookies module from bin/
+import firefox_cookies as fc  # noqa: E402
+
+# The bin script under test, for run_tests' coverage module name.
 _script_path = REPO_ROOT / "bin" / "firefox-cookies"
-if not _script_path.exists():
-    _script_path = REPO_ROOT / "bin" / "firefox-cookies.py"
-_loader = importlib.machinery.SourceFileLoader(
-    "firefox_cookies", str(_script_path)
-)
-_spec = importlib.util.spec_from_loader("firefox_cookies", _loader)
-assert _spec and _spec.loader
-fc = importlib.util.module_from_spec(_spec)
-sys.modules["firefox_cookies"] = fc
-_spec.loader.exec_module(fc)
 
 
 # =============================================================================

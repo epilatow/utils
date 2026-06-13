@@ -11,8 +11,6 @@ Comprehensive unit tests for secure_archiver
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -28,19 +26,12 @@ from conftest import (
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# Import secure_archiver module from bin/ (works with or without .py extension)
+import secure_archiver as sa  # noqa: E402
+
+# The bin script under test, for run_tests' coverage module name.
 _script_path = REPO_ROOT / "bin" / "secure-archiver"
-if not _script_path.exists():
-    _script_path = REPO_ROOT / "bin" / "secure-archiver.py"
-_loader = importlib.machinery.SourceFileLoader(
-    "secure_archiver", str(_script_path)
-)
-_spec = importlib.util.spec_from_loader("secure_archiver", _loader)
-assert _spec and _spec.loader
-sa = importlib.util.module_from_spec(_spec)
-sys.modules["secure_archiver"] = sa
-_spec.loader.exec_module(sa)
 
 
 class TestConfigFinding:

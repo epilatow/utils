@@ -13,7 +13,7 @@ import argparse
 import configparser
 import json
 import logging
-import platform
+import platform as platform  # noqa: PLC0414  re-exported for tests
 import re
 import shutil
 import signal
@@ -29,7 +29,7 @@ if hasattr(signal, "SIGPIPE"):
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path as Path  # noqa: PLC0414  re-exported for tests
 from typing import Any
 
 # First-party shared helpers live under <repo>/src. The entry script's

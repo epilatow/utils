@@ -1,0 +1,1 @@
+../bin/secure-archiver

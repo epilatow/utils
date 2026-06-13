@@ -24,13 +24,24 @@ This repo is a personal-utilities collection. Top-level structure:
   shebangs. An entry is usually a single file; some also import shared
   first-party code from `src/` (see below).
 - `src/` -- first-party importable Python packages (e.g. `common`), shared
-  across utilities. These carry no shebang and are never executed directly.
-  Each `bin/` entry that uses them prepends `<repo>/src` to `sys.path` -- via
-  `Path(__file__).resolve()`, which follows any symlink to the real file so
-  the repo-root walk is correct even when the entry is invoked through a
-  symlink -- before importing `common`. `[tool.mypy] mypy_path = ["src"]` in
-  `pyproject.toml` lets the code-quality gate's `mypy --strict` resolve these
-  imports statically.
+  across utilities. These packages carry no shebang and are never executed
+  directly (the `src/<module>.py` alias symlinks below are the exception --
+  they point at executable `bin/` scripts). Each `bin/` entry that uses them
+  prepends `<repo>/src` to `sys.path` -- via `Path(__file__).resolve()`, which
+  follows any symlink to the real file so the repo-root walk is correct even
+  when the entry is invoked through a symlink -- before importing `common`.
+  `[tool.mypy] mypy_path = ["src"]` in `pyproject.toml` lets the code-quality
+  gate's `mypy --strict` resolve these imports statically.
+- `src/<module>.py` alias symlinks -- each extension-less `bin/` entry has a
+  matching `src/<module>.py` symlink pointing at it (e.g.
+  `src/dotfiles.py -> ../bin/dotfiles`,
+  `src/firefox_cookies.py -> ../bin/firefox-cookies`). The alias gives the
+  script an importable, `mypy`-resolvable module name, so the test suite
+  imports it as a typed module (`import dotfiles`) instead of loading it
+  through `SourceFileLoader`, and so ruff/mypy auto-discover it as a `.py`
+  file instead of needing a manual `python-targets` entry. `crony` is the
+  exception -- its logic already lives in the `src/crony` package, so it has
+  no alias and `bin/crony` stays a manual `python-targets` entry.
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the

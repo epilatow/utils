@@ -10,25 +10,17 @@ Unit tests for tests/run_all.py
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import run_all as ra
 
 # Repository root directory (parent of tests/)
 REPO_ROOT = Path(__file__).parent.parent
 
-# Import run_all module from tests/
+# The script under test, for run_tests' coverage module name.
 _script_path = REPO_ROOT / "tests" / "run_all.py"
-_loader = importlib.machinery.SourceFileLoader("run_all", str(_script_path))
-_spec = importlib.util.spec_from_loader("run_all", _loader)
-assert _spec and _spec.loader
-ra = importlib.util.module_from_spec(_spec)
-sys.modules["run_all"] = ra
-_spec.loader.exec_module(ra)
 
 
 # =============================================================

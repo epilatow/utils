@@ -20,15 +20,15 @@ import functools
 import io
 import json
 import logging
-import os
-import platform
+import os as os  # noqa: PLC0414  re-exported for tests
+import platform as platform  # noqa: PLC0414  re-exported for tests
 import re
 import shlex
 import shutil
 import signal
 import socket
 import stat
-import subprocess
+import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
 import tempfile
 import threading

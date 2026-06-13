@@ -17,7 +17,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import subprocess
+import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
 from dataclasses import dataclass
 from pathlib import Path

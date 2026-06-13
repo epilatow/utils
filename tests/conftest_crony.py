@@ -13,8 +13,6 @@ plugin; it carries no test classes and is never run as a test.
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import re
 import subprocess
@@ -51,19 +49,11 @@ from crony.platform import (  # noqa: E402
     systemd,
 )
 
-# Load the bin/crony script under a module name other than "crony" so
-# the "crony" import name stays bound to the src/crony package that
-# bin/crony imports from (crony.unit, ...). Helpers reach the loaded
-# script through the `crony` variable below (e.g. patching crony._ledger).
-_script_path = REPO_ROOT / "bin" / "crony"
-if not _script_path.exists():
-    _script_path = REPO_ROOT / "bin" / "crony.py"
-_loader = importlib.machinery.SourceFileLoader("crony_app", str(_script_path))
-_spec = importlib.util.spec_from_loader("crony_app", _loader)
-assert _spec and _spec.loader
-crony = importlib.util.module_from_spec(_spec)
-sys.modules["crony_app"] = crony
-_spec.loader.exec_module(crony)
+# Scratch namespace published to the crony test files. The runner
+# harness's `trigger_unit_sync` stub records each dispatched call on
+# `crony._ledger` (installed via monkeypatch), and test_crony_runner
+# reads it back to assert on what was dispatched.
+crony = SimpleNamespace()
 
 
 def _apply(

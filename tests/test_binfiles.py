@@ -18,12 +18,10 @@ each subcommand under the binfiles profile.
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -35,17 +33,15 @@ from conftest import (
 )
 
 REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-# Load via the binfiles symlink under a distinct module name so this
-# test file gets its own module object (separate ACTIVE_PROFILE state
-# from test_dotfiles.py's import).
+# binfiles is the same source as dotfiles (bin/binfiles symlinks to
+# bin/dotfiles), imported under its own module name so this test gets a
+# module object with ACTIVE_PROFILE state distinct from test_dotfiles.
+import binfiles as bf  # noqa: E402
+
+# The bin script under test, for run_tests' coverage module name.
 _script_path = REPO_ROOT / "bin" / "binfiles"
-_loader = importlib.machinery.SourceFileLoader("binfiles", str(_script_path))
-_spec = importlib.util.spec_from_loader("binfiles", _loader)
-assert _spec and _spec.loader
-bf = importlib.util.module_from_spec(_spec)
-sys.modules["binfiles"] = bf
-_spec.loader.exec_module(bf)
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +56,7 @@ def _make_executable(path: Path) -> None:
 
 
 class TestIsolateHomeFixture(IsolateHomeFixtureBase):
-    MODULE = bf
+    MODULE: ClassVar[Any] = bf
     SOURCE_NAME = "tool"
     PROFILE_ATTR = "BINFILES_PROFILE"
 
