@@ -678,6 +678,14 @@ class _ApplyHarness(_RunnerHarness):
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         monkeypatch.setattr(launchd, "_is_disabled", lambda _label: False)
+        # activate's reload waits for the booted-out label to clear by
+        # polling `_is_loaded` -- which is stubbed True above, so the
+        # bounded wait would otherwise spin to its timeout every apply.
+        # The settle's real behavior is covered in the launchd backend
+        # tests; here it is a no-op so apply/destroy stay fast.
+        monkeypatch.setattr(
+            launchd.LaunchdScheduler, "_await_unloaded", lambda _self, _n: None
+        )
         # load_config issues one bulk scheduler query for last-launch
         # outcomes; stub its primitives so it stays off the captured
         # subprocess path (tests asserting a no-start override these).

@@ -12,8 +12,11 @@ from __future__ import annotations
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -215,6 +218,165 @@ class TestLaunchdScheduler:
         # launchd auto-loads a logged-in user's agents; there is no
         # logout-survival toggle to warn about, so verify never raises.
         assert get_scheduler("darwin", _DIR).verify() is None
+
+
+class TestLaunchdReload:
+    """activate / enable / disable reload via bootout + bootstrap. The
+    bootstrap settles the asynchronous teardown (poll until the label is
+    gone) and retries the spurious errno-5 race; a disabled unit is never
+    bootstrapped, since a disabled label's bootstrap fails with that same
+    errno 5 and the retry could not clear it."""
+
+    def _setup(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        *,
+        bootstrap_rcs: tuple[int, ...] = (0,),
+        loaded_seq: list[bool] | None = None,
+    ) -> tuple[Any, list[list[str]]]:
+        sched = get_scheduler("darwin", tmp_path)
+        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        calls: list[list[str]] = []
+        rcs = list(bootstrap_rcs)
+
+        def fake_run(
+            cmd: Any, *, check: bool = False, **_kw: Any
+        ) -> subprocess.CompletedProcess[str]:
+            argv = list(cmd)
+            calls.append(argv)
+            rc = 0
+            if argv[:2] == ["launchctl", "bootstrap"]:
+                rc = rcs.pop(0) if rcs else 0
+            if check and rc != 0:
+                raise subprocess.CalledProcessError(rc, argv)
+            return subprocess.CompletedProcess(
+                argv, rc, stdout="", stderr=("boom" if rc else "")
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+        seq = iter([] if loaded_seq is None else loaded_seq)
+        monkeypatch.setattr(
+            launchd, "_is_loaded", lambda _lbl: next(seq, False)
+        )
+        return sched, calls
+
+    @staticmethod
+    def _subs(calls: list[list[str]]) -> list[str]:
+        return [c[1] for c in calls if c and c[0] == "launchctl"]
+
+    def test_active_reload_boots_out_then_bootstraps(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        assert self._subs(calls) == ["bootout", "bootstrap"]
+        # No deprecated load/unload anywhere.
+        assert "load" not in self._subs(calls)
+        assert "unload" not in self._subs(calls)
+
+    def test_disabled_reload_never_bootstraps(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        sched.activate("default.j", prior_disabled=True, scheduled=True)
+        subs = self._subs(calls)
+        assert "bootstrap" not in subs
+        assert subs == ["bootout", "disable"]
+
+    def test_enable_enables_then_bootstraps(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        sched.enable("default.j")
+        assert self._subs(calls) == ["enable", "bootout", "bootstrap"]
+
+    def test_disable_boots_out_then_disables(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        sched.disable("default.j")
+        assert self._subs(calls) == ["bootout", "disable"]
+
+    def test_bootstrap_retries_spurious_eio(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # First bootstrap returns errno 5, second succeeds: the reload
+        # re-settles and retries rather than surfacing the race.
+        sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(5, 0))
+        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        assert self._subs(calls).count("bootstrap") == 2
+        assert self._subs(calls).count("bootout") == 2
+
+    def test_bootstrap_raises_after_exhausting_retries(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        sched, calls = self._setup(
+            monkeypatch, tmp_path, bootstrap_rcs=(5, 5, 5)
+        )
+        with pytest.raises(subprocess.CalledProcessError):
+            sched.activate("default.j", prior_disabled=False, scheduled=True)
+        assert (
+            self._subs(calls).count("bootstrap") == launchd._BOOTSTRAP_ATTEMPTS
+        )
+
+    def test_genuine_failure_raises_without_retry(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # A non-errno-5 bootstrap failure is genuine, not the race, so it
+        # surfaces at once rather than burning the retry budget.
+        sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(1,))
+        with pytest.raises(subprocess.CalledProcessError):
+            sched.activate("default.j", prior_disabled=False, scheduled=True)
+        assert self._subs(calls).count("bootstrap") == 1
+
+    def test_settle_waits_for_label_to_clear(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # _is_loaded reports the label still present twice, then gone:
+        # the bootstrap waits for it rather than racing the teardown.
+        polled: list[int] = []
+        seq = [True, True, False]
+
+        def is_loaded(_lbl: str) -> bool:
+            polled.append(1)
+            return seq[len(polled) - 1] if len(polled) <= len(seq) else False
+
+        sched = get_scheduler("darwin", tmp_path)
+        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: Any, **_k: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+        monkeypatch.setattr(launchd, "_is_loaded", is_loaded)
+        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        # Polled until the label cleared, then bootstrapped.
+        assert len(polled) >= 3
+        assert self._subs(calls) == ["bootout", "bootstrap"]
+
+    def test_settle_is_bounded_when_label_never_clears(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # A label that never deregisters must not hang the reload: the
+        # settle is time-bounded and bootstrap still runs.
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _lbl: True)
+        # Each monotonic() jumps well past the settle timeout, so the
+        # bounded wait gives up immediately and bootstrap still runs.
+        elapsed = [0.0]
+
+        def fake_monotonic() -> float:
+            elapsed[0] += 100.0
+            return elapsed[0]
+
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        assert "bootstrap" in self._subs(calls)
 
 
 class TestLaunchdUnitLastExits:

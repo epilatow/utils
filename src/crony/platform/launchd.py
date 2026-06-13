@@ -13,6 +13,7 @@ import os
 import plistlib
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 from crony.platform.scheduler import (
@@ -184,10 +185,26 @@ def _is_loaded(lbl: str) -> bool:
     return False
 
 
+# `launchctl bootout` is asynchronous: it returns before launchd has
+# finished deregistering the label, and `bootstrap` of a label still
+# present in the domain fails with errno 5 (Input/output error). So a
+# reload boots out, waits for the label to disappear (bounded), then
+# bootstraps -- retrying the whole sequence a few times to absorb any
+# residual teardown lag before surfacing a genuine failure.
+_BOOTOUT_SETTLE_TIMEOUT_SEC = 5.0
+_BOOTOUT_POLL_INTERVAL_SEC = 0.02
+_BOOTSTRAP_ATTEMPTS = 3
+_BOOTSTRAP_BACKOFF_SEC = 0.1
+# errno launchctl returns when a label is still present in the domain
+# (the asynchronous-teardown race) -- the one bootstrap failure a retry
+# can clear. Other exit codes are genuine and surface at once.
+_LAUNCHD_EIO = 5
+
+
 class LaunchdScheduler(Scheduler):
     """launchd backend: one LaunchAgent plist per entity."""
 
-    # A reload is unload+load; unload terminates the running job's
+    # A reload is bootout+bootstrap; bootout terminates the running job's
     # process group, so reloading a job's own unit kills its runner.
     reload_terminates_running_job = True
 
@@ -292,32 +309,80 @@ class LaunchdScheduler(Scheduler):
     def _gui(self, name: str) -> str:
         return f"gui/{os.getuid()}/{label(name)}"
 
+    def _gui_domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    def _bootout(self, name: str) -> None:
+        """Remove `name`'s service from the GUI domain. Tolerant of an
+        already-absent service (a never-loaded or already-removed unit
+        boots out non-zero, which is not an error here)."""
+        subprocess.run(
+            ["launchctl", "bootout", self._gui(name)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _await_unloaded(self, name: str) -> None:
+        """Block until `name`'s label is no longer registered in the
+        domain, bounded by a timeout. `bootout` returns before launchd
+        finishes deregistering the label, and a `bootstrap` of a
+        still-present label fails with errno 5; a stuck teardown can't
+        hang the caller past the bound."""
+        lbl = label(name)
+        deadline = time.monotonic() + _BOOTOUT_SETTLE_TIMEOUT_SEC
+        while _is_loaded(lbl) and time.monotonic() < deadline:
+            time.sleep(_BOOTOUT_POLL_INTERVAL_SEC)
+
+    def _bootstrap(self, name: str, plist: Path) -> None:
+        """Load `plist` into the GUI domain, settling and retrying around
+        the asynchronous-teardown errno-5 race: boot out any leftover
+        instance, wait for the label to clear, then bootstrap; on the
+        spurious errno 5 re-settle and retry before surfacing a genuine
+        failure. The caller must have enabled the label first -- a
+        disabled label's bootstrap fails with the same errno 5 and is not
+        a transient the retry can clear, so this never runs on one."""
+        cmd = ["launchctl", "bootstrap", self._gui_domain(), str(plist)]
+        result: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(_BOOTSTRAP_ATTEMPTS):
+            self._bootout(name)
+            self._await_unloaded(name)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return
+            # Only the errno-5 race is a transient worth re-settling and
+            # retrying; any other failure is genuine and surfaces now.
+            if result.returncode != _LAUNCHD_EIO:
+                break
+            if attempt + 1 < _BOOTSTRAP_ATTEMPTS:
+                time.sleep(_BOOTSTRAP_BACKOFF_SEC * (attempt + 1))
+        assert result is not None  # the loop ran at least once
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, result.stdout, result.stderr
+        )
+
     def activate(
         self, name: str, *, prior_disabled: bool, scheduled: bool
     ) -> None:
         del scheduled  # a plist with no Start* keys loads fine, dormant
         plist = self.unit_dir / plist_filename(name)
         # Validate before asking launchd to load (`-s` keeps stdout
-        # quiet on success). unload-then-load tolerates "not loaded".
+        # quiet on success).
         subprocess.run(["plutil", "-s", str(plist)], check=True)
-        subprocess.run(
-            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
-        )
-        subprocess.run(["launchctl", "load", str(plist)], check=True)
         if prior_disabled:
-            subprocess.run(
-                ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
-            )
+            # A hand-disabled unit stays disabled and unloaded across the
+            # reload: bootstrapping a disabled label only fails (errno
+            # 5), so boot it out and re-assert the disable override
+            # instead.
+            self._bootout(name)
             subprocess.run(
                 ["launchctl", "disable", self._gui(name)], check=True
             )
+        else:
+            self._bootstrap(name, plist)
 
     def deactivate(self, name: str) -> None:
-        plist = self.unit_dir / plist_filename(name)
-        if plist.exists():
-            subprocess.run(
-                ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
-            )
+        if (self.unit_dir / plist_filename(name)).exists():
+            self._bootout(name)
 
     def remove_files(self, name: str) -> None:
         self.deactivate(name)
@@ -331,18 +396,12 @@ class LaunchdScheduler(Scheduler):
     def enable(self, name: str) -> None:
         plist = self.unit_dir / plist_filename(name)
         subprocess.run(["launchctl", "enable", self._gui(name)], check=True)
-        subprocess.run(
-            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
-        )
-        subprocess.run(["launchctl", "load", str(plist)], check=True)
+        self._bootstrap(name, plist)
 
     def disable(self, name: str) -> None:
-        plist = self.unit_dir / plist_filename(name)
-        # Unload first so the persistent disable record takes effect;
-        # otherwise the still-loaded plist keeps firing.
-        subprocess.run(
-            ["launchctl", "unload", str(plist)], stderr=subprocess.DEVNULL
-        )
+        # Boot out first so the persistent disable record governs the
+        # next load; a still-loaded plist would keep firing otherwise.
+        self._bootout(name)
         subprocess.run(["launchctl", "disable", self._gui(name)], check=True)
 
     def trigger(self, name: str) -> None:

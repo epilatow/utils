@@ -1855,7 +1855,7 @@ class TestEnableDisable:
         h.calls.clear()
         crony_commands.do_disable(jobs=["j"], bundle=None)
         verbs = [c[1] if len(c) > 1 else "" for c in h.calls]
-        assert "unload" in verbs
+        assert "bootout" in verbs
         assert "disable" in verbs
 
     def test_unknown_name_rejected(
