@@ -44,8 +44,12 @@ import platform
 import signal
 import subprocess
 import sys
-import traceback
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from common.cli import cli_entrypoint  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # Configure logging to stderr so notification output (decision /
 # action) stays in stdout when piped.
@@ -74,8 +78,11 @@ PS_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
 # Exit codes
 # =============================================================================
 
-EXIT_OK = 0
-EXIT_ERROR = 1
+
+class ExitCode(ExitCodeBase):
+    SUCCESS = CommonExitCode.SUCCESS
+    ERROR = CommonExitCode.ERROR
+    CRASHED = CommonExitCode.CRASHED
 
 
 # =============================================================================
@@ -213,7 +220,7 @@ def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
         # this state.
         if verbose:
             print(f"noop: {UEA_AQUA_LABEL} not loaded")
-        return EXIT_OK
+        return ExitCode.SUCCESS
 
     tz_mtime = _tz_mtime()
     start_epoch = _process_start_epoch(pid)
@@ -226,14 +233,14 @@ def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
         print(f"stale:       {is_stale}")
 
     if not is_stale:
-        return EXIT_OK
+        return ExitCode.SUCCESS
 
     if dry_run:
         print(
             f"would restart {UEA_AQUA_LABEL} "
             f"(tz mtime newer than process start)"
         )
-        return EXIT_OK
+        return ExitCode.SUCCESS
 
     _restart_uea_aqua(pid)
     print(
@@ -241,7 +248,7 @@ def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
         f"(was started {_format_epoch(start_epoch)}, "
         f"tz updated {_format_epoch(tz_mtime)})"
     )
-    return EXIT_OK
+    return ExitCode.SUCCESS
 
 
 # =============================================================================
@@ -272,12 +279,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@cli_entrypoint
 def main(argv: list[str] | None = None) -> int:
     # Bail before argparse on non-darwin: the script has nothing
     # to do, and skipping --help / unknown-arg errors means
     # cross-platform scheduling can invoke it unconditionally.
     if platform.system() != "Darwin":
-        return EXIT_OK
+        return ExitCode.SUCCESS
     args = _build_parser().parse_args(argv)
     try:
         return check_and_restart(
@@ -286,13 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except WatchdogError as exc:
         logger.error("tz-agent-watchdog: %s", exc)
-        return EXIT_ERROR
-    except Exception:
-        # Last-resort guard so crony notifications carry a
-        # traceback instead of silent exit codes when something
-        # the script didn't anticipate breaks.
-        traceback.print_exc(file=sys.stderr)
-        return EXIT_ERROR
+        return ExitCode.ERROR
 
 
 if __name__ == "__main__":

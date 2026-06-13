@@ -33,7 +33,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import typing
 import uuid
 
@@ -67,6 +66,7 @@ from typing import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # -----------------------------------------------------------------------------
@@ -84,6 +84,7 @@ class ExitCode(ExitCodeBase):
     CONFIG = CommonExitCode.CONFIG
     ERROR = CommonExitCode.ERROR
     SUBPROCESS = CommonExitCode.SUBPROCESS
+    CRASHED = CommonExitCode.CRASHED
     CHECK_NO_BACKUPS = 10, "Check failed: no full backups"
     CHECK_AGE = 11, "Check failed: backup too old"
     CHECK_REPO = 12, "Check failed: repo metadata"
@@ -2608,6 +2609,7 @@ def main(
             logger.info(f"borgadm {cmd_label}: finished (elapsed: {elapsed})")
 
 
+@cli_entrypoint
 def cli() -> int:
     parser = args_parser()
     args = parser.parse_command()
@@ -2628,9 +2630,6 @@ def cli() -> int:
         )
     except BorgadmError as e:
         return e.exit_code
-    except Exception:
-        traceback.print_exc()
-        return ExitCode.ERROR
 
     if _warning_occurred:
         return ExitCode.WARNING

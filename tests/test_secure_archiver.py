@@ -1527,7 +1527,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             sa.ExitCode.SUBPROCESS,
         ),
         (sa.CollisionError("t"), sa.ExitCode.ERROR),
-        (RuntimeError("t"), sa.ExitCode.ERROR),
+        (RuntimeError("t"), sa.ExitCode.CRASHED),
     ]
 
 
@@ -2153,6 +2153,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
     EXCLUDED_CODES = {
         sa.ExitCode.SUCCESS,
         sa.ExitCode.WARNING,
+        sa.ExitCode.CRASHED,
     }
 
 

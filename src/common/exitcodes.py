@@ -6,16 +6,26 @@ renders an argparse exit-codes block from whatever members the subclass
 declares), while ``CommonExitCode`` is the single source of truth for
 the codes shared by every utility: a subclass references those for its
 common members and adds its own codes starting at 10. Values 0-9 are
-reserved -- 0-6 in use, 7-9 held for future common codes -- so utility
+reserved -- 0-7 in use, 8-9 held for future common codes -- so utility
 specifics never collide with a later shared code. SUCCESS..SUBPROCESS
-are carried by every utility; the rest (e.g. TIMEOUT) are used only
-where they apply.
+and CRASHED are carried by every utility; the rest (e.g. TIMEOUT) are
+used only where they apply.
 """
 
 from __future__ import annotations
 
 import enum
+import signal
 from typing import Self
+
+# Exit status a CLI returns when interrupted by Ctrl-C: the shell
+# convention of 128 + the signal number, so `$?` reads as a SIGINT
+# death. The shared cli_entrypoint decorator catches KeyboardInterrupt
+# and returns this rather than letting it escape to a traceback. Not an
+# ExitCode member -- it is the signal convention, not an application
+# status, so it stays out of the per-tool exit-code listing and the
+# exception map.
+SIGINT_EXIT_CODE: int = 128 + int(signal.SIGINT)
 
 
 class ExitCodeBase(enum.IntEnum):
@@ -58,3 +68,4 @@ class CommonExitCode:
     ERROR = (4, "General error")
     SUBPROCESS = (5, "Subprocess error")
     TIMEOUT = (6, "Operation timed out")
+    CRASHED = (7, "Crashed (unhandled exception)")

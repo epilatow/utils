@@ -148,7 +148,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             JobTimeoutError("t"),
             ExitCode.TIMEOUT,
         ),
-        (RuntimeError("t"), ExitCode.ERROR),
+        (RuntimeError("t"), ExitCode.CRASHED),
     ]
 
 

@@ -31,6 +31,7 @@ dtw = importlib.util.module_from_spec(_spec)
 sys.modules["darwin_tz_watchdog"] = dtw
 _spec.loader.exec_module(dtw)
 
+from common.exitcodes import SIGINT_EXIT_CODE  # noqa: E402
 
 # =============================================================================
 # Helpers
@@ -230,7 +231,7 @@ def test_no_pid_means_nothing_to_restart(
     )
 
     rc = dtw.check_and_restart(dry_run=False, verbose=False)
-    assert rc == dtw.EXIT_OK
+    assert rc == dtw.ExitCode.SUCCESS
     assert capsys.readouterr().out == ""
 
 
@@ -246,7 +247,7 @@ def test_fresh_agent_is_noop(
     monkeypatch.setattr(dtw, "_restart_uea_aqua", kick)
 
     rc = dtw.check_and_restart(dry_run=False, verbose=False)
-    assert rc == dtw.EXIT_OK
+    assert rc == dtw.ExitCode.SUCCESS
     kick.assert_not_called()
 
 
@@ -261,7 +262,7 @@ def test_stale_agent_triggers_restart(
     monkeypatch.setattr(dtw, "_restart_uea_aqua", kick)
 
     rc = dtw.check_and_restart(dry_run=False, verbose=False)
-    assert rc == dtw.EXIT_OK
+    assert rc == dtw.ExitCode.SUCCESS
     kick.assert_called_once_with(1030)
     out = capsys.readouterr().out
     assert "restarted" in out
@@ -280,7 +281,7 @@ def test_dry_run_does_not_restart(
     monkeypatch.setattr(dtw, "_restart_uea_aqua", kick)
 
     rc = dtw.check_and_restart(dry_run=True, verbose=False)
-    assert rc == dtw.EXIT_OK
+    assert rc == dtw.ExitCode.SUCCESS
     kick.assert_not_called()
     assert "would restart" in capsys.readouterr().out
 
@@ -295,7 +296,7 @@ def test_verbose_prints_diagnostics(
 
     rc = dtw.check_and_restart(dry_run=True, verbose=True)
     out = capsys.readouterr().out
-    assert rc == dtw.EXIT_OK
+    assert rc == dtw.ExitCode.SUCCESS
     assert "pid:" in out
     assert "agent start:" in out
     assert "tz mtime:" in out
@@ -322,7 +323,7 @@ def test_main_exits_zero_on_non_darwin_without_parsing_args(
     sentinel = create_autospec(dtw.check_and_restart)
     monkeypatch.setattr(dtw, "check_and_restart", sentinel)
 
-    assert dtw.main(["--no-such-flag"]) == dtw.EXIT_OK
+    assert dtw.main(["--no-such-flag"]) == dtw.ExitCode.SUCCESS
     sentinel.assert_not_called()
 
 
@@ -334,18 +335,36 @@ def test_main_propagates_watchdog_error_to_exit_code(
         raise dtw.WatchdogError("kaboom")
 
     monkeypatch.setattr(dtw, "check_and_restart", _raise)
-    assert dtw.main([]) == dtw.EXIT_ERROR
+    assert dtw.main([]) == dtw.ExitCode.ERROR
 
 
 @pytest.mark.usefixtures("fake_darwin")
 def test_main_propagates_unexpected_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A non-WatchdogError escapes main()'s own handler and reaches the
+    # cli_entrypoint decorator, which returns the crash code -- distinct
+    # from the deliberate ERROR a WatchdogError yields.
     def _raise(**_kw: Any) -> int:
         raise RuntimeError("surprise")
 
     monkeypatch.setattr(dtw, "check_and_restart", _raise)
-    assert dtw.main([]) == dtw.EXIT_ERROR
+    assert dtw.main([]) == dtw.ExitCode.CRASHED
+
+
+@pytest.mark.usefixtures("fake_darwin")
+def test_main_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C exits on the SIGINT convention, not a traceback.
+    KeyboardInterrupt is a BaseException, so main() must catch it
+    explicitly -- the `except Exception` guard lets it escape."""
+
+    def _raise(**_kw: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dtw, "check_and_restart", _raise)
+    assert dtw.main([]) == SIGINT_EXIT_CODE
 
 
 @pytest.mark.usefixtures("fake_darwin")
@@ -359,7 +378,7 @@ def test_main_dispatches_args(
         return 0
 
     monkeypatch.setattr(dtw, "check_and_restart", _capture)
-    assert dtw.main(["--dry-run", "--verbose"]) == dtw.EXIT_OK
+    assert dtw.main(["--dry-run", "--verbose"]) == dtw.ExitCode.SUCCESS
     assert seen == {"dry_run": True, "verbose": True}
 
 

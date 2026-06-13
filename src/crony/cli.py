@@ -17,7 +17,6 @@ import logging
 import os
 import signal
 import sys
-import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -26,6 +25,7 @@ import crony.errors
 import crony.runner
 import crony.runtime
 from common.argparse_ext import StrictArgumentParser
+from common.cli import cli_entrypoint
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -676,6 +676,7 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 }
 
 
+@cli_entrypoint
 def cli() -> int:
     """CLI entry point with exception handling."""
     args_dict = vars(_build_parser().parse_command())
@@ -698,10 +699,4 @@ def cli() -> int:
     except crony.errors.CronyError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
-    except Exception:
-        # Catch-all so an internal bug surfaces a traceback to the
-        # user with a stable exit code rather than crashing the
-        # process and leaving the scheduler with no exit code at all.
-        traceback.print_exc()
-        return crony.errors.ExitCode.ERROR
     return crony.errors.ExitCode.SUCCESS

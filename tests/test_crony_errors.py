@@ -44,6 +44,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
     EXCLUDED_CODES = {
         ExitCode.SUCCESS,
         ExitCode.WARNING,
+        ExitCode.CRASHED,
     }
 
 

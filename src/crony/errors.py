@@ -22,6 +22,7 @@ class ExitCode(ExitCodeBase):
     ERROR = CommonExitCode.ERROR
     SUBPROCESS = CommonExitCode.SUBPROCESS
     TIMEOUT = CommonExitCode.TIMEOUT
+    CRASHED = CommonExitCode.CRASHED
     LOCK_BUSY = 10, "run.lock held by another instance"
     PRECONDITION = 11, "run precondition failed before exec"
 

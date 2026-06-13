@@ -95,8 +95,8 @@ class ExceptionHierarchyBase:
     def test_common_exit_codes_match_canon(self) -> None:
         """Common codes a utility declares match the canonical subset
         (value + description), so they can't drift. SUCCESS..SUBPROCESS
-        are mandatory; the rest (e.g. TIMEOUT) are used where they
-        apply. Utility-specific codes start at 10."""
+        and CRASHED are mandatory; the rest (e.g. TIMEOUT) are used
+        where they apply. Utility-specific codes start at 10."""
         from common.exitcodes import CommonExitCode
 
         canon = {
@@ -112,6 +112,7 @@ class ExceptionHierarchyBase:
             "CONFIG",
             "ERROR",
             "SUBPROCESS",
+            "CRASHED",
         }
         assert mandatory <= set(members), (
             f"missing mandatory common codes: {mandatory - set(members)}"
@@ -396,6 +397,51 @@ class CmdCallbacksBase:
             result = type(self).CLI_FUNC()
         assert result == 0
         assert mock_cb.called
+
+    def test_cli_keyboard_interrupt(self) -> None:
+        """Ctrl-C exits on the SIGINT convention (128 + SIGINT), not a
+        traceback. KeyboardInterrupt is a BaseException, so cli() must
+        catch it explicitly -- a plain `except Exception` lets it
+        escape."""
+        from common.exitcodes import SIGINT_EXIT_CODE
+
+        mock_cb = MagicMock(side_effect=KeyboardInterrupt())
+        subcommand = type(self).TEST_SUBCOMMAND
+        with (
+            patch.dict(
+                type(self).CALLBACKS,
+                {subcommand: mock_cb},
+            ),
+            patch(
+                "sys.argv",
+                ["prog", subcommand],
+            ),
+        ):
+            result = type(self).CLI_FUNC()
+        assert result == SIGINT_EXIT_CODE
+
+    def test_cli_unexpected_exception(self) -> None:
+        """An exception escaping the entry point's own handlers is
+        turned into the dedicated crash exit code (with a traceback),
+        not a raw traceback exit. The shared cli_entrypoint decorator
+        owns this fallback, and the crash code is distinct from a
+        deliberate ERROR."""
+        from common.exitcodes import CommonExitCode
+
+        mock_cb = MagicMock(side_effect=RuntimeError("boom"))
+        subcommand = type(self).TEST_SUBCOMMAND
+        with (
+            patch.dict(
+                type(self).CALLBACKS,
+                {subcommand: mock_cb},
+            ),
+            patch(
+                "sys.argv",
+                ["prog", subcommand],
+            ),
+        ):
+            result = type(self).CLI_FUNC()
+        assert result == CommonExitCode.CRASHED[0]
 
 
 class UnknownArgRoutedToSubparserBase:

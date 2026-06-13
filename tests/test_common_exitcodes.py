@@ -58,6 +58,7 @@ class TestCommonExitCode:
         assert CommonExitCode.SUCCESS == (0, "Success")
         assert CommonExitCode.USAGE == (2, "Usage/argument error")
         assert CommonExitCode.TIMEOUT == (6, "Operation timed out")
+        assert CommonExitCode.CRASHED == (7, "Crashed (unhandled exception)")
 
     def test_codes_distinct_and_within_reserved_range(self) -> None:
         values = [

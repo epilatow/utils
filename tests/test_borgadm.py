@@ -497,7 +497,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             ba.ExitCode.CHECK_PRUNE,
         ),
         (ba.BorgadmError("t"), ba.ExitCode.ERROR),
-        (RuntimeError("t"), ba.ExitCode.ERROR),
+        (RuntimeError("t"), ba.ExitCode.CRASHED),
     ]
     POPPED_ARGS = {
         "config",
@@ -4064,6 +4064,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         ba.ExitCode.SUCCESS,
         ba.ExitCode.WARNING,
         ba.ExitCode.USAGE,
+        ba.ExitCode.CRASHED,
     }
 
 

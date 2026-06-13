@@ -14,7 +14,6 @@ import fnmatch
 import logging
 import os
 import sys
-import traceback
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # =============================================================================
@@ -214,6 +214,7 @@ class ExitCode(ExitCodeBase):
     CONFIG = CommonExitCode.CONFIG
     ERROR = CommonExitCode.ERROR
     SUBPROCESS = CommonExitCode.SUBPROCESS
+    CRASHED = CommonExitCode.CRASHED
     CONFLICTS = 10, "Conflicts or missing entries"
     MISSING_DIR = 11, "Missing source directory"
 
@@ -1421,6 +1422,7 @@ def _activate_profile(profile: Profile) -> None:
     INSTALLED_FILE = profile.installed_file()
 
 
+@cli_entrypoint
 def cli() -> int:
     """CLI entry point with exception handling."""
     _activate_profile(select_profile(sys.argv[0]))
@@ -1436,9 +1438,6 @@ def cli() -> int:
     except DotfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
-    except Exception:
-        traceback.print_exc()
-        return ExitCode.ERROR
     return ExitCode.SUCCESS
 
 

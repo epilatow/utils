@@ -406,7 +406,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             bf.MissingDotfilesDirectory("t"),
             bf.ExitCode.MISSING_DIR,
         ),
-        (RuntimeError("t"), bf.ExitCode.ERROR),
+        (RuntimeError("t"), bf.ExitCode.CRASHED),
     ]
 
 
@@ -418,6 +418,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         bf.ExitCode.WARNING,
         bf.ExitCode.CONFIG,
         bf.ExitCode.SUBPROCESS,
+        bf.ExitCode.CRASHED,
     }
 
 

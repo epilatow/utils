@@ -2362,7 +2362,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             df.MissingDotfilesDirectory("t"),
             df.ExitCode.MISSING_DIR,
         ),
-        (RuntimeError("t"), df.ExitCode.ERROR),
+        (RuntimeError("t"), df.ExitCode.CRASHED),
     ]
 
 
@@ -2436,6 +2436,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         df.ExitCode.WARNING,
         df.ExitCode.CONFIG,
         df.ExitCode.SUBPROCESS,
+        df.ExitCode.CRASHED,
     }
 
 

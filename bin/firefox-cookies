@@ -21,7 +21,6 @@ import sqlite3
 import struct
 import sys
 import tempfile
-import traceback
 
 # Handle broken pipes gracefully (e.g., when piping to `head`).
 # Restore default SIGPIPE behavior so the process exits cleanly.
@@ -41,6 +40,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # Configure logging to stderr
@@ -64,6 +64,7 @@ class ExitCode(ExitCodeBase):
     CONFIG = CommonExitCode.CONFIG
     ERROR = CommonExitCode.ERROR
     SUBPROCESS = CommonExitCode.SUBPROCESS
+    CRASHED = CommonExitCode.CRASHED
 
 
 # =============================================================================
@@ -1081,6 +1082,7 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 }
 
 
+@cli_entrypoint
 def cli() -> int:
     """CLI entry point with exception handling."""
     parser = build_parser()
@@ -1095,9 +1097,6 @@ def cli() -> int:
     except FirefoxCookiesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
-    except Exception:
-        traceback.print_exc()
-        return ExitCode.ERROR
     return ExitCode.SUCCESS
 
 

@@ -1330,7 +1330,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
             fc.ExitCode.ERROR,
         ),
         (fc.UsageError("t"), fc.ExitCode.USAGE),
-        (RuntimeError("t"), fc.ExitCode.ERROR),
+        (RuntimeError("t"), fc.ExitCode.CRASHED),
     ]
 
 
@@ -2039,6 +2039,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         fc.ExitCode.SUCCESS,
         fc.ExitCode.WARNING,
         fc.ExitCode.SUBPROCESS,
+        fc.ExitCode.CRASHED,
     }
 
 
