@@ -943,42 +943,18 @@ class TestApplyFullSync:
     def test_uuid_change_does_not_inherit_old_units_disabled_state(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A uuid change is a new job: it does NOT inherit the old
-        # uuid's unit state. A hand-disabled job re-keyed to a new
-        # uuid comes back enabled, because the old unit is reclaimed
-        # first and the new one installs fresh. (Same-uuid drift
+        # A uuid change is a new job: it does NOT inherit the old uuid's
+        # disabled overlay. A disabled job re-keyed to a new uuid comes
+        # back enabled -- the new uuid has no prior snapshot for
+        # load_config to mirror the disable from. (Same-uuid re-apply
         # preserves the disable -- covered separately.)
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
-        recorded: dict[str, bool] = {}
-
-        def spy_activate(
-            _self: Any,
-            name: str,
-            *,
-            prior_disabled: bool,
-            scheduled: bool,
-        ) -> None:
-            del scheduled
-            recorded[name] = prior_disabled
-
-        # The disable lives on the unit file: read as disabled while
-        # its plist exists, gone once the plist is removed.
-        def fake_unit_state(name: str, platform: str | None = None) -> str:
-            del platform
-            plist = h.agents / f"org.crony.{name}.plist"
-            return "disabled" if plist.exists() else "none"
-
-        monkeypatch.setattr(
-            crony_platform.LaunchdScheduler, "activate", spy_activate
-        )
-        monkeypatch.setattr(crony_runtime, "unit_state", fake_unit_state)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
-        # The job now reads disabled (its plist is on disk).
-        assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
+        crony_commands.do_disable(jobs=["j"], bundle=None)
         h.config(
             {
                 "job": {
@@ -991,9 +967,14 @@ class TestApplyFullSync:
             },
             default_target_jobs=["j"],
         )
-        recorded.clear()
         crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
-        assert recorded[h.full("j")] is False
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled is False
+        # The fresh unit is armed (schedule intact, not stripped).
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert "StartCalendarInterval" in plist.read_text()
 
     def test_surgical_apply_leaves_unrelated_broken_orphan(
         self, tmp_path: Path, monkeypatch: Any
@@ -1863,18 +1844,22 @@ class TestUvExecutable:
 
 
 class TestEnableDisable:
-    def test_enable_invokes_systemctl_on_linux(
+    def test_enable_restores_timer_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # disable removes the .timer (schedule-less re-render); enable
+        # re-renders it and arms it via `systemctl enable --now`.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
+        crony_commands.do_disable(jobs=["j"], bundle=None)
+        assert not (h.sysd / f"crony-{h.full('j')}.timer").exists()
         h.calls.clear()
         crony_commands.do_enable(jobs=["j"], bundle=None)
-        cmd = next(c for c in h.calls if c[0] == "systemctl")
+        cmd = next(c for c in h.calls if c[0] == "systemctl" and "enable" in c)
         assert cmd == [
             "systemctl",
             "--user",
@@ -1883,21 +1868,60 @@ class TestEnableDisable:
             "--now",
             f"crony-{h.full('j')}.timer",
         ]
+        assert (h.sysd / f"crony-{h.full('j')}.timer").exists()
 
-    def test_disable_invokes_launchctl_on_darwin(
+    def test_disable_strips_schedule_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # disable re-renders the plist with no schedule and reloads
+        # (bootout + bootstrap) -- a loaded-but-dormant, still-triggerable
+        # unit, with no launchctl `disable` record involved.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        assert "StartCalendarInterval" in plist.read_text()
         h.calls.clear()
         crony_commands.do_disable(jobs=["j"], bundle=None)
         verbs = [c[1] if len(c) > 1 else "" for c in h.calls]
-        assert "bootout" in verbs
-        assert "disable" in verbs
+        assert "bootout" in verbs and "bootstrap" in verbs
+        assert "disable" not in verbs
+        assert "StartCalendarInterval" not in plist.read_text()
+
+    def test_disabled_job_synced_triggerable_and_shown_disabled(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # End to end: disabling a scheduled job leaves it config=synced
+        # (the disable is a runtime overlay, not drift), shown UNIT=
+        # disabled, and still triggerable -- kickstart fires the loaded
+        # schedule-less unit (the original disabled-trigger bug).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        crony_commands.do_disable(jobs=["j"], bundle=None)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.config_state(ref) == "synced"
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled is True
+        _cfg, unit, _last = crony_commands._resolve_state_axes(
+            config, h.full("j"), set()
+        )
+        assert unit == crony_platform.UnitState.DISABLED
+        h.calls.clear()
+        crony_commands.do_trigger(
+            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        )
+        cmd = next(
+            c for c in h.calls if c[0] == "launchctl" and c[1] == "kickstart"
+        )
+        assert cmd[2].endswith(f"org.crony.{h.full('j')}")
 
     def test_unknown_name_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -2269,28 +2293,30 @@ class TestEnableDisable:
     def test_enable_renamed_entry_by_new_name(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # enable by the new name acts on the installed (old-name) unit.
+        # enable by the new name re-renders the installed (old-name) unit.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         self._rename_keeping_uuid(h, "j", "k")
+        crony_commands.do_disable(jobs=["k"], bundle=None)
+        plist = h.agents / "org.crony.default.j.plist"
+        assert "StartCalendarInterval" not in plist.read_text()
         h.calls.clear()
         crony_commands.do_enable(jobs=["k"], bundle=None)
-        enable = next(
-            c for c in h.calls if c[0] == "launchctl" and c[1] == "enable"
-        )
-        assert any("org.crony.default.j" in part for part in enable)
+        # The reload targets the old-name label, and the schedule is back.
+        assert any("org.crony.default.j" in part for c in h.calls for part in c)
+        assert "StartCalendarInterval" in plist.read_text()
 
     def test_disable_renamed_entry_by_new_name(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # disable by the new name acts on the installed (old-name) unit.
+        # disable by the new name re-renders the installed (old-name) unit
+        # schedule-less.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         self._rename_keeping_uuid(h, "j", "k")
         h.calls.clear()
         crony_commands.do_disable(jobs=["k"], bundle=None)
-        disable = next(
-            c for c in h.calls if c[0] == "launchctl" and c[1] == "disable"
-        )
-        assert any("org.crony.default.j" in part for part in disable)
+        plist = h.agents / "org.crony.default.j.plist"
+        assert any("org.crony.default.j" in part for c in h.calls for part in c)
+        assert "StartCalendarInterval" not in plist.read_text()
 
     def test_destroy_renamed_entry_by_new_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -2387,58 +2413,36 @@ class TestEnableDisable:
     def test_apply_preserves_disabled_state_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # The disabled flag lives on the snapshot, so a same-uuid re-apply
+        # (here a schedule edit) carries it forward: load_config mirrors
+        # it onto the pending node, the entry re-renders schedule-less, and
+        # the timer is never re-armed.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "disabled")
+        crony_commands.do_disable(jobs=["j"], bundle=None)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 04:00"}}},
             default_target_jobs=["j"],
         )
         h.calls.clear()
         h.apply("j")
-        # Strip leading flags (`--user`, `--quiet`, etc.) and pull
-        # the systemctl subcommand verb so the test isn't tied to
-        # flag ordering.
+        # Strip leading flags (`--user`, `--quiet`, etc.) and pull the
+        # systemctl subcommand verb so the test isn't tied to flag order.
         verbs = [
             next((a for a in c[1:] if not a.startswith("-")), "")
             for c in h.calls
         ]
         assert "daemon-reload" in verbs
         assert "enable" not in verbs
-
-    def test_apply_after_state_wipe_preserves_disabled_unit(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # State-dir wipe + surviving platform unit + scheduler
-        # reporting `disabled`: re-apply must consult the live
-        # scheduler state, not the absent snapshot, to decide
-        # whether to preserve the disable. The unit can outlive
-        # its state dir, so the disable signal lives only in the
-        # scheduler view.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        h.apply("j")
-        # Wipe state; the timer file under sysd survives.
-        shutil.rmtree(h.state)
-        timer = h.sysd / f"crony-{h.full('j')}.timer"
-        assert timer.exists()
-        # Scheduler reports the unit as disabled (user disabled it
-        # by hand before the state wipe).
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "disabled")
-        h.calls.clear()
-        h.apply("j")
-        verbs = [
-            next((a for a in c[1:] if not a.startswith("-")), "")
-            for c in h.calls
-        ]
-        assert "enable" not in verbs
+        assert not (h.sysd / f"crony-{h.full('j')}.timer").exists()
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled is True
 
     def test_bundle_unknown_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -2488,6 +2492,9 @@ class TestEnableDisable:
         h.apply("a")
         h.apply("b")
         h.apply("g")
+        # Disable the scheduled entries first so the re-enable below has
+        # observable work (an enable of an already-enabled entry no-ops).
+        crony_commands.do_disable(jobs=[], bundle="default")
         h.calls.clear()
         crony_commands.do_enable(jobs=[], bundle="default")
         # Only b and g (scheduled) get enable invocations.
@@ -2552,12 +2559,15 @@ class TestEnableDisable:
             "this is not [valid toml", encoding="utf-8"
         )
 
+        # Disable first (re-renders the installed unit), then enable
+        # (re-renders it back) -- each acts on borgadm's installed entry;
+        # enabling an already-enabled entry would no-op with no calls.
         h.calls.clear()
-        crony_commands.do_enable(jobs=[], bundle="borgadm")
+        crony_commands.do_disable(jobs=[], bundle="borgadm")
         assert any("borgadm.k" in str(c) for c in h.calls)
 
         h.calls.clear()
-        crony_commands.do_disable(jobs=[], bundle="borgadm")
+        crony_commands.do_enable(jobs=[], bundle="borgadm")
         assert any("borgadm.k" in str(c) for c in h.calls)
 
         h.calls.clear()

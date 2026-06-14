@@ -298,16 +298,22 @@ class SystemdScheduler(Scheduler):
         return names
 
     def state(self, name: str) -> UnitState:
-        st = _is_enabled(timer_filename(name))
-        if st == "enabled":
-            return UnitState.ENABLED
-        if st in ("disabled", "masked"):
-            return UnitState.DISABLED
-        # A schedule-less entry has only a static `.service` (no timer to
-        # enable); systemd reports it `static`, which counts as known.
-        if st == "static":
-            return UnitState.ENABLED
-        return UnitState.NONE
+        # A scheduled entry arms an enabled `.timer`; a schedule-less one
+        # (grouped / transit or disabled) installs no timer, only a
+        # static `.service`. Query the timer when it is installed, else
+        # fall back to the service (systemd reports a unit with no
+        # [Install] section `static`), so a grouped / disabled entry
+        # still reads loaded. Anything else is NONE. The operator-disabled
+        # state is not read here -- it is flagged off the snapshot, not
+        # the scheduler.
+        timer = self.unit_dir / timer_filename(name)
+        unit = (
+            timer_filename(name) if timer.exists() else service_filename(name)
+        )
+        st = _is_enabled(unit)
+        return (
+            UnitState.ENABLED if st in ("enabled", "static") else UnitState.NONE
+        )
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # The `.service` is the unit that runs the job; query it (not
@@ -337,17 +343,16 @@ class SystemdScheduler(Scheduler):
             out[name] = UnitLastExit(exit_status=-raw if killed else raw)
         return out
 
-    def activate(
-        self, name: str, *, prior_disabled: bool, scheduled: bool
-    ) -> None:
+    def activate(self, name: str, *, scheduled: bool) -> None:
         # --quiet suppresses systemctl's success-path "Created symlink"
         # chatter; real errors still print.
         subprocess.run(
             ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
         )
-        # enable --now only applies to the .timer, rendered only for
-        # scheduled entries; a schedule-less .service sits dormant.
-        if scheduled and not prior_disabled:
+        # enable --now only applies to the .timer, rendered only for a
+        # scheduled entry; a schedule-less .service (grouped or disabled)
+        # sits dormant.
+        if scheduled:
             subprocess.run(
                 _SYSTEMCTL_ENABLE + [timer_filename(name)], check=True
             )
@@ -387,12 +392,6 @@ class SystemdScheduler(Scheduler):
             "scheduled jobs may only fire while you have an active login "
             "session"
         )
-
-    def enable(self, name: str) -> None:
-        subprocess.run(_SYSTEMCTL_ENABLE + [timer_filename(name)], check=True)
-
-    def disable(self, name: str) -> None:
-        subprocess.run(_SYSTEMCTL_DISABLE + [timer_filename(name)], check=True)
 
     def trigger(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.

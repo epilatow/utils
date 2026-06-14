@@ -57,9 +57,9 @@ state via `crony status`. The default columns are:
             name or its name is shadowed by a collision; indented
             two spaces per group-nesting level when the entry is in
             an active target's dispatch tree, in execution order
-  CONFIG    synced  | stale    | missing | orphan  | masked | error
+  CONFIG    synced | stale | broken | missing | orphan | masked | error
   SCHEDULE  the cron / interval / `grouped` value for the entry,
-            or `disabled` when the unit is off at the scheduler
+            or `disabled` when the operator has turned it off
   STATUS    ok      | fail     | timeout  | gated   | canceled |
             crashed | running  | pending  | never   | unknown
   LAST RAN  compact relative time of the last run (e.g. `5m ago`)
@@ -83,7 +83,9 @@ remaining lifecycle commands (`enable`, `disable`, `trigger`)
 operate on the installed unit as usual since they need no
 parsed config field. Several
 opt-in columns are available via `--cols`, including `unit`
-(scheduler-side state: enabled / disabled / grouped / none),
+(UNIT axis: enabled / disabled / grouped / none, where
+`disabled` -- the operator-disable -- is read from the snapshot,
+not the scheduler),
 `groups` (group memberships), `kind` (job vs group), `masked-by`
 (why the entry is filter-excluded on this host: `host` and / or
 `platform` joined with `,`, or one of `unused` / `empty`),
@@ -138,10 +140,14 @@ reads the snapshot, never the live config: editing the toml without `apply`
 therefore has no effect on running units, and `crony status`
 reports any divergence between live config and on-disk snapshot
 as `config=stale` via direct dataclass equality. The platform
-unit file gets the same drift treatment: a missing / hand-edited
-unit file, or one referencing a uv / crony binary that's since
-been removed, surfaces as `config=stale` so `crony apply`
-re-renders it.
+unit file gets the same drift treatment: a hand-edited unit file
+surfaces as `config=stale`, while one whose baked uv / crony
+binary is gone, that the scheduler has no unit loaded for (so it
+can't be triggered at all), or whose schedule-arming timer file is
+gone (so a scheduled entry never fires) reads `config=broken`; a
+deleted config unit reads `broken` while still loaded, `missing`
+once unloaded. Either way `crony apply` re-renders / re-installs /
+reloads it.
 
 One apply case is held back: a job whose own command runs
 `crony apply` (a self-maintaining schedule) cannot reload its own
@@ -373,7 +379,7 @@ def _build_parser() -> StrictArgumentParser:
     # enable
     p_enable = subparsers.add_parser(
         "enable",
-        help="Tell the platform scheduler to fire the named jobs",
+        help="Re-arm the named jobs' schedules",
     )
     p_enable.add_argument(
         "jobs",
@@ -398,7 +404,7 @@ def _build_parser() -> StrictArgumentParser:
     # disable
     p_disable = subparsers.add_parser(
         "disable",
-        help="Tell the platform scheduler to skip the named jobs",
+        help="Disarm the named jobs' schedules (still triggerable)",
     )
     p_disable.add_argument(
         "jobs",

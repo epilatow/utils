@@ -413,11 +413,12 @@ def _stale_fields(
 # =============================================================================
 # RUNTIME STATE (enable / disable / status / linger)
 # =============================================================================
-# Runtime state is the platform scheduler's "will I fire this unit?"
-# answer. It's orthogonal to CONFIG state: a unit can be `synced` with
-# config but `disabled` at runtime because the user paused it. apply
-# preserves this state across re-renders so a hand-disabled job stays
-# off when the user runs `crony apply` to push other changes.
+# Runtime state is the UNIT axis: whether the scheduler has the unit
+# loaded, plus the operator-disable overlay crony records on the
+# snapshot. It's orthogonal to CONFIG state: a unit can be `synced` with
+# config while the operator has paused it (`disabled`). apply preserves
+# the disable across re-renders so a paused job stays off when the user
+# runs `crony apply` to push other changes.
 
 
 # Maps a recorded ExitClass to the JobStatus shown in the STATUS cell:
@@ -535,9 +536,10 @@ def _config_axis(
     orphan). `Config.config_state` reduces the pending and current
     graphs -- both built once at load -- to a single verdict. Each
     node carries its normalized config / timer units, so a hand-edited
-    / missing / moved-away unit already surfaces as `stale` through
-    that node comparison; this function layers the FDA-wrapper and
-    lingering-unit signals on top.
+    / missing / drifted unit already surfaces as `stale` (and a gone
+    binary or unloaded unit as `broken`) through that node comparison;
+    this function layers the FDA-wrapper and lingering-unit signals on
+    top.
     """
     if entry is not None:
         ref: crony.unit.EntityRef | None = crony.unit.EntityRef(bn, entry.uuid)
@@ -582,16 +584,6 @@ def _config_axis(
         # case.)
         return crony.model.ConfigStatus.STALE
     return state
-
-
-def _enable_unit(name: str, platform: str | None = None) -> None:
-    """Move the scheduler to the `enabled` state for `name` (delegates)."""
-    crony.runtime.scheduler(platform).enable(name)
-
-
-def _disable_unit(name: str, platform: str | None = None) -> None:
-    """Move the scheduler to the `disabled` state for `name` (delegates)."""
-    crony.runtime.scheduler(platform).disable(name)
 
 
 # =============================================================================
@@ -1413,14 +1405,15 @@ def _refuse_unscheduled_full(
 
 
 def do_enable(jobs: list[str], bundle: str | None) -> None:
-    """Move the platform scheduler into `enabled` for the named jobs.
+    """Re-arm the named jobs' schedules (clear the operator-disable).
 
-    Names are full namespaced (`<bundle>.<short>`); bare input is
-    shorthand for `default.<short>`. A rename (same uuid, new config
-    name) is addressable by either name; a name mapping to different
-    uuids in config vs on disk is rejected until `crony apply`.
-    Refuses names not stamped on this host and ones with no
-    schedule (no platform timer to enable / disable).
+    Re-renders each installed unit with its pinned schedule and reloads
+    it, then clears `unit_disabled` on its snapshot. Names are full
+    namespaced (`<bundle>.<short>`); bare input is shorthand for
+    `default.<short>`. A rename (same uuid, new config name) is
+    addressable by either name; a name mapping to different uuids in
+    config vs on disk is rejected until `crony apply`. Refuses names not
+    stamped on this host and ones with no schedule (nothing to disarm).
 
     With `--bundle <name>` and no positional args, enables every
     scheduled stamped entry in `<name>` (unscheduled entries in
@@ -1436,20 +1429,22 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     )
     targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "enable")
-    for full, _ref, unit_name in targets:
-        _enable_unit(unit_name)
+    for full, ref, _unit_name in targets:
+        crony.runtime.set_disabled(config, ref, disabled=False)
         logger.info("%s: enabled", full)
 
 
 def do_disable(jobs: list[str], bundle: str | None) -> None:
-    """Move the platform scheduler into `disabled` for the named jobs.
+    """Disarm the named jobs' schedules (operator-disable).
 
-    Names are full namespaced (`<bundle>.<short>`); bare input is
-    shorthand for `default.<short>`. A rename (same uuid, new config
-    name) is addressable by either name; a name mapping to different
-    uuids in config vs on disk is rejected until `crony apply`.
-    Refuses names not stamped on this host and ones with no
-    schedule (no platform timer to enable / disable).
+    Re-renders each installed unit with no schedule -- loaded and
+    triggerable, but not firing on its own -- and records `unit_disabled`
+    on its snapshot so a later `crony apply` preserves it. Names are full
+    namespaced (`<bundle>.<short>`); bare input is shorthand for
+    `default.<short>`. A rename (same uuid, new config name) is
+    addressable by either name; a name mapping to different uuids in
+    config vs on disk is rejected until `crony apply`. Refuses names not
+    stamped on this host and ones with no schedule (nothing to disarm).
 
     With `--bundle <name>` and no positional args, disables every
     scheduled stamped entry in `<name>` (unscheduled entries in
@@ -1465,8 +1460,8 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     )
     targets = _resolve_action_targets(config, normalized)
     _refuse_unscheduled_full(config, normalized, "disable")
-    for full, _ref, unit_name in targets:
-        _disable_unit(unit_name)
+    for full, ref, _unit_name in targets:
+        crony.runtime.set_disabled(config, ref, disabled=True)
         logger.info("%s: disabled", full)
 
 
@@ -1712,12 +1707,20 @@ def _expand_status_alias(
 _STATUS_HELP_EPILOG_TEMPLATE: str = """\
 Columns
 -------
-  config            synced | stale | missing | orphan | masked | error.
-                    `error` flags an entry whose bundle config was
-                    rejected (e.g. unknown key); the installed unit,
+  config            synced | stale | broken | missing | orphan | masked
+                    | error. `error` flags an entry whose bundle config
+                    was rejected (e.g. unknown key); the installed unit,
                     if any, is left untouched and `crony apply`
-                    refuses the name until the config is fixed. A
-                    full-disk-access job also reads `error` when its
+                    refuses the name until the config is fixed. `broken`
+                    flags an applied entry that can't run as installed:
+                    its on-disk snapshot won't load, the uv / crony
+                    executable baked into its unit is gone, its config
+                    unit file was deleted while the scheduler still has it
+                    loaded, the scheduler has no unit loaded for it at all
+                    (it can't be triggered), or a scheduled entry's timer
+                    file is gone (it will never fire) -- `crony apply`
+                    re-renders / re-installs / reloads it.
+                    A full-disk-access job also reads `error` when its
                     Crony.app wrapper can't serve the grant (not built,
                     or built without Full Disk Access) and `stale`
                     (diverged `fda-wrapper`) when the wrapper is out of
@@ -1802,16 +1805,19 @@ Columns
                     table pointing at `crony apply`. --config-current shows
                     the applied schedule, --config-pending the pending one;
                     the `^` fires on any divergence regardless of mode.
-                    When the unit is disabled at the platform scheduler
-                    the cell renders as `disabled` -- the cron expression
-                    is misleading there since the unit won't fire. Add the
-                    opt-in `unit` column to see the platform-scheduler
-                    state for the rest of the rows. --config-pending
-                    suppresses this override (the pending schedule is
-                    a config fact, independent of runtime state).
-  unit              Platform scheduler view: enabled | disabled | grouped
-                    | none. `grouped` means the entry has no schedule
-                    (parent group dispatches it); `none` means the
+                    When the entry is disabled the cell renders as
+                    `disabled` -- the cron expression is misleading there
+                    since the unit is installed schedule-less and won't
+                    fire. Add the opt-in `unit` column to see the state
+                    for the rest of the rows. --config-pending suppresses
+                    this override (the pending schedule is a config fact,
+                    independent of runtime state).
+  unit              UNIT axis: enabled | disabled | grouped | none.
+                    `disabled` means the operator turned it off (`crony
+                    disable`) -- installed and triggerable, but
+                    schedule-less; read from the snapshot, not the
+                    scheduler. `grouped` means the entry has no schedule
+                    (a parent group dispatches it); `none` means the
                     scheduler doesn't see a unit by this name.
   unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
                     `crony-<name>.timer` (scheduled) or
@@ -1964,10 +1970,14 @@ def _resolve_state_axes(
 
     `error` and `broken` are top-of-chain. `error` reports an
     entry whose TOML failed to parse; `broken` reports an entry
-    whose on-disk snapshot can't be loaded. Either way the
-    operator's next action is "fix this specific thing," and the
-    mask-reason / synced-stale-missing axes are uninteresting
-    until then.
+    whose on-disk snapshot can't be loaded, or whose installed unit
+    can't run -- its baked uv / crony binary is gone, its config unit
+    file was deleted while the scheduler still has it loaded, the
+    scheduler has no unit loaded for it at all, or a scheduled entry's
+    timer file is gone. Either way the operator's next action is "fix
+    this specific thing," and the mask-reason / synced-stale-missing
+    axes are uninteresting until
+    then.
 
     The synced / stale / missing / orphan / broken base comes
     from `_config_axis`, which scores the entity against the
@@ -2027,6 +2037,11 @@ def _resolve_state_axes(
             grouped = False
         if grouped:
             unit_state = "grouped"
+        elif current_node is not None and current_node.unit_disabled:
+            # A disabled entry installs an ordinary loaded unit (just
+            # schedule-less), so the scheduler reports it ENABLED; the
+            # disabled overlay rides on the snapshot, not the scheduler.
+            unit_state = crony.platform.UnitState.DISABLED
         else:
             installed_name = (
                 str(current_node.entity_name)

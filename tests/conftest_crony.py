@@ -658,16 +658,13 @@ class _ApplyHarness(_RunnerHarness):
             )
 
         monkeypatch.setattr(crony_commands.subprocess, "run", fake_run)
-        # The default empty-subprocess path resolves
-        # `unit_state` to "none", which the unit-drift check
-        # treats as "scheduler unloaded the unit." Stub the
-        # underlying primitives so a freshly-applied unit reads
-        # back as `enabled`. Tests that assert a specific
-        # scheduler state override these at the same level (e.g.
-        # `systemd._is_enabled` -> "disabled").
+        # The default empty-subprocess path resolves `unit_state` to
+        # "none". Stub the underlying primitives so a freshly-applied
+        # unit reads back as `enabled` (loaded). Tests that assert a
+        # specific scheduler state override these at the same level (e.g.
+        # `systemd._is_enabled` -> "").
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
-        monkeypatch.setattr(launchd, "_is_disabled", lambda _label: False)
         # activate's reload waits for the booted-out label to clear by
         # polling `_is_loaded` -- which is stubbed True above, so the
         # bounded wait would otherwise spin to its timeout every apply.

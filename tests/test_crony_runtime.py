@@ -86,28 +86,15 @@ def _install_units(snap: Any) -> None:
 
 
 class TestUnitStateDarwin:
+    # `state` reports only loaded (ENABLED) vs not (NONE); the disabled
+    # overlay rides on the snapshot, not the scheduler.
     def test_loaded_label_is_enabled(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
         monkeypatch.setattr(
             launchd, "_launchctl_list", lambda: "-\t0\torg.crony.default.j\n"
         )
         assert crony_runtime.unit_state("default.j", "darwin") == "enabled"
 
-    def test_disabled_record_takes_precedence(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(
-            launchd,
-            "_launchctl_print_disabled",
-            lambda: '"org.crony.default.j" => disabled',
-        )
-        monkeypatch.setattr(
-            launchd, "_launchctl_list", lambda: "-\t0\torg.crony.default.j\n"
-        )
-        assert crony_runtime.unit_state("default.j", "darwin") == "disabled"
-
-    def test_none_when_neither_loaded_nor_disabled(
-        self, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
+    def test_none_when_not_loaded(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
         assert crony_runtime.unit_state("default.j", "darwin") == "none"
 
@@ -117,9 +104,10 @@ class TestUnitStateLinux:
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         assert crony_runtime.unit_state("default.j", "linux") == "enabled"
 
-    def test_disabled(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "disabled")
-        assert crony_runtime.unit_state("default.j", "linux") == "disabled"
+    def test_static_is_enabled(self, monkeypatch: Any) -> None:
+        # A schedule-less entry's static `.service` counts as loaded.
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "static")
+        assert crony_runtime.unit_state("default.j", "linux") == "enabled"
 
     def test_none_on_empty(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
@@ -136,7 +124,6 @@ class TestUnitNameDelegatesTolerateRefForm:
     _REF_FORM = "default:11111111-1111-1111-1111-111111111111"
 
     def test_unit_state_none_for_ref_form(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(launchd, "_launchctl_print_disabled", lambda: "")
         monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
         assert crony_runtime.unit_state(self._REF_FORM, "darwin") == "none"
@@ -1342,11 +1329,11 @@ class TestUnitDriftDetection:
     """`load_config` bakes each node's normalized config / timer units, so
     a divergence between the rendered pending node and the on-disk current
     node surfaces as `config=stale` through the plain node `==`. A
-    hand-edited unit, a deleted unit file, and a gone baked uv / crony
-    binary (none of which the install can reproduce) all read `stale`; the
-    uv / crony paths render blank, so a moved-but-present binary reads
-    `synced`. The next apply re-renders a drifted unit even if the
-    snapshot is unchanged.
+    hand-edited unit reads `stale`; a gone baked uv / crony binary or a
+    deleted-but-loaded unit reads `broken`; a deleted-and-unloaded unit
+    reads `missing`. The uv / crony paths render blank, so a
+    moved-but-present binary reads `synced`. The next apply re-renders /
+    re-installs a drifted unit even if the snapshot is unchanged.
     """
 
     def _apply_and_load(
@@ -1399,18 +1386,41 @@ class TestUnitDriftDetection:
             config.current.job_from_ref(ref),
         )
 
-    def test_deleted_unit_flags_stale(
+    def test_deleted_unit_loaded_flags_broken(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Unit file deleted while the snapshot survives: there is nothing
-        # on disk to reproduce, so the current node's normalized config is
-        # None, unequal to the pending render -> stale (re-apply
-        # re-installs it).
+        # Unit file deleted while the scheduler still has it loaded (the
+        # harness stubs `_is_loaded` True): works now, dies on reboot ->
+        # broken.
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "stale"
+        assert config.config_state(ref) == "broken"
+
+    def test_deleted_unit_unloaded_flags_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Unit file deleted and the scheduler no longer has it loaded:
+        # the apply artifacts are gone -> missing (re-apply).
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        unit_config.unlink()
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.config_state(ref) == "missing"
+
+    def test_unloaded_scheduled_flags_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The plist is intact but the scheduler has it unloaded (e.g. a
+        # hand `launchctl bootout`): an entry the scheduler can't trigger
+        # reads broken (re-apply reloads it), not synced.
+        h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.config_state(ref) == "broken"
 
     def _linux_stale_reasons(
         self, tmp_path: Path, monkeypatch: Any, edit: str
@@ -1449,6 +1459,23 @@ class TestUnitDriftDetection:
             == "unit-timer"
         )
 
+    def test_linux_deleted_timer_flags_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A scheduled entry's `.timer` arms its schedule; deleted, the
+        # job never fires even though the `.service` is still loaded ->
+        # broken, not just stale (re-apply re-renders the timer).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        (h.sysd / f"crony-{h.full('j')}.timer").unlink()
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.config_state(ref) == "broken"
+
     def test_grouped_entry_is_synced_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -1472,21 +1499,22 @@ class TestUnitDriftDetection:
         assert config.config_state(g_ref) == "synced"
         assert config.config_state(a_ref) == "synced"
 
-    def test_gone_baked_binary_flags_stale(
+    def test_missing_baked_uv_path_flags_broken(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         # Replace the baked uv path with one pointing at a nonexistent
-        # file. The extracted path no longer resolves, so the current node
-        # can't render its normalized unit -> None, unequal to the pending
-        # render -> stale (re-apply re-renders it with the live binary).
+        # file. The extracted path no longer resolves, so `uv_path` reads
+        # None -- the unit can't run as installed, which is `broken`.
         content = unit_config.read_text()
         live_uv = str(crony_runtime._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "stale"
+        assert config.config_state(ref) == "broken"
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.uv_path is None
 
     def test_moved_but_present_binary_is_synced(
         self, tmp_path: Path, monkeypatch: Any

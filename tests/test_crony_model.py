@@ -526,6 +526,46 @@ class TestSharedSnapshotSurface:
         assert snapshot_from_dict(d).timeout == group.timeout
 
 
+class TestUnitDisabled:
+    """`unit_disabled` is the operator-disable overlay: it drops the
+    schedule from `unit_spec` (so the unit loads dormant) while leaving
+    the `timing` field intact, and it round-trips through snapshot.json
+    (it is real applied state, not derived)."""
+
+    def _snap(self) -> Any:
+        cfg = _parse({"job": {"j": _job(schedule="daily")}})
+        # `unit_spec` builds the command from the node's executables, so
+        # the node has to carry them.
+        return dataclasses.replace(
+            _resolve_snapshot_for(cfg, "j"),
+            uv_path=Path("/uv"),
+            crony_path=Path("/crony"),
+        )
+
+    def test_default_is_enabled(self) -> None:
+        assert self._snap().unit_disabled is False
+
+    def test_disabled_strips_schedule_but_keeps_timing(self) -> None:
+        snap = dataclasses.replace(self._snap(), unit_disabled=True)
+        assert snap.timing is not None  # pinned, so `enable` restores it
+        assert snap.unit_spec().timing is None  # rendered dormant
+
+    def test_enabled_renders_with_schedule(self) -> None:
+        snap = self._snap()
+        assert snap.unit_spec().timing == snap.timing
+
+    def test_round_trips_through_snapshot(self) -> None:
+        snap = dataclasses.replace(self._snap(), unit_disabled=True)
+        d = snap.to_dict()
+        assert d["unit_disabled"] is True
+        assert snapshot_from_dict(d).unit_disabled is True
+
+    def test_absent_in_old_snapshot_loads_false(self) -> None:
+        d = self._snap().to_dict()
+        d.pop("unit_disabled", None)  # a snapshot written before the field
+        assert snapshot_from_dict(d).unit_disabled is False
+
+
 class TestJobFromRefAndFullName:
     """`Graph.job_from_ref` is the single-source ref->node lookup the
     reconciliation paths compose to make their source order explicit;

@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import crony.config
 import crony.errors
@@ -49,16 +49,23 @@ from crony.platform.fda import FDAWrapper
 
 
 # The schema version current code writes into every snapshot.json.
-# Bump it whenever the serialized shape changes in a way that needs a
-# matching `# v<N> compat` upgrade in `snapshot_from_dict`.
-CURRENT_SNAPSHOT_SCHEMA: int = 5
+# Bump it whenever the persisted shape changes -- a new / renamed /
+# dropped key -- so an older crony rejects a newer snapshot cleanly via
+# the schema gate instead of failing to construct it. A change current
+# code must read back from an older shape (a key rename) also needs a
+# `# v<N> compat` block in `snapshot_from_dict`; one that only older
+# code can't read forward (a new defaulted field) does not.
+CURRENT_SNAPSHOT_SCHEMA: int = 6
 
 # Every schema version current code can still load: CURRENT plus each
-# older version a `# v<N> compat` block in `snapshot_from_dict` knows
-# how to read forward. A snapshot whose schema is outside this set is
-# rejected as needing re-apply. Drop a version here (and delete its
-# tagged compat block) once no snapshots at that schema remain.
-COMPAT_SNAPSHOT_SCHEMA: frozenset[int] = frozenset({4, 5})
+# older version it reads forward -- via the field defaults, or a
+# `# v<N> compat` block in `snapshot_from_dict` for a shape it has to
+# translate. A snapshot whose schema is outside this set is rejected as
+# needing re-apply. Drop a version here (and delete any tagged compat
+# block) once no snapshots at that schema remain. v6 added the persisted
+# `unit_disabled` flag; v4 / v5 snapshots predate it and load with it
+# defaulted False, so they need no compat block.
+COMPAT_SNAPSHOT_SCHEMA: frozenset[int] = frozenset({4, 5, 6})
 
 # The per-entry log file name, kept in one place so no caller inlines
 # the literal. Lives inside the entry's state dir (uuid-keyed) and is
@@ -253,15 +260,26 @@ class _JobCommon:
     flags: crony.config.JobFlags = field(
         default=crony.config.JobFlags(0), kw_only=True
     )
+    # Whether the operator turned this scheduled entry off (`crony
+    # disable`). The schedule stays pinned in `timing` (so `enable`
+    # restores it), but a disabled entry renders its unit with no
+    # schedule (`unit_spec` drops the timing) -- loaded and triggerable,
+    # just not firing on its own. Persisted in snapshot.json (it is real
+    # applied state, not derived), and defaulted False so config-built
+    # nodes start enabled (config has no disabled notion). `load_config`
+    # mirrors a disabled current node's flag onto its pending node so the
+    # operator overlay reads `synced`, not stale. Keyword-only.
+    unit_disabled: bool = field(default=False, kw_only=True)
     # The uv / crony executable paths this entry's unit runs, baked onto
     # the node so unit rendering is self-contained -- `unit_spec` reads
     # them, and nothing re-derives the executables per render / drift
     # check. A config-built (pending) node carries the live executables
     # (resolved once at load); the current graph carries the paths
     # extracted from the on-disk unit, or None when they can't be parsed
-    # or no longer exist. `compare=False`: a binary that merely moved
-    # must not read as drift (the normalized units render the paths
-    # blank). Derived, never serialized. Keyword-only.
+    # or no longer exist (a gone binary, which `config_state` reads as
+    # broken). `compare=False`: a binary that merely moved must not read
+    # as drift (the normalized units render the paths blank). Derived,
+    # never serialized. Keyword-only.
     uv_path: Path | None = field(default=None, compare=False, kw_only=True)
     crony_path: Path | None = field(default=None, compare=False, kw_only=True)
     # The entry's platform units (config: launchd plist / systemd
@@ -272,11 +290,21 @@ class _JobCommon:
     # the blank-path render only when the install matches, else None. The
     # blank-path normalization makes the form independent of where the
     # binaries live, so a moved-but-present binary doesn't read as drift.
-    # Compared in `==` so a hand-edited / drifted / gone-binary unit
-    # surfaces as `config=stale` through the same snapshot comparison as
-    # any field difference. Derived, never serialized. Keyword-only.
+    # Compared in `==` so a hand-edited / drifted unit surfaces as
+    # `config=stale` through the same snapshot comparison as any field
+    # difference. Derived, never serialized. Keyword-only.
     unit_config_normalized: str | None = field(default=None, kw_only=True)
     unit_timer_normalized: str | None = field(default=None, kw_only=True)
+    # Live on-disk / scheduler facts the current graph pins so
+    # `config_state` can tell `broken` from `missing` for a unit whose
+    # file is gone: whether the config unit (launchd plist / systemd
+    # `.service`) is on disk, and whether the scheduler has the entry's
+    # unit loaded -- the schedule-bearing one a backend arms (the
+    # plist on launchd, the `.timer` on systemd, falling back to the
+    # static `.service`). `compare=False` (they are runtime facts, not
+    # config); a pending node leaves the defaults. Keyword-only.
+    unit_config_exists: bool = field(default=False, compare=False, kw_only=True)
+    unit_loaded: bool = field(default=False, compare=False, kw_only=True)
 
     @property
     def entity_ref(self) -> crony.unit.EntityRef:
@@ -386,7 +414,10 @@ class _JobCommon:
         """The platform UnitSpec the scheduler renders for this node's
         real unit -- self-contained: the run command is built from the
         uv / crony executables the node carries (a pending node's live
-        ones, a re-render's stamped ones).
+        ones, a re-render's stamped ones). A disabled entry renders
+        schedule-less (`timing` dropped) -- loaded and triggerable, but
+        not firing on its own -- while keeping its schedule pinned in the
+        `timing` field so `enable` restores it.
 
         Requires those paths; a node only ever compared, never installed
         (a bare snapshot load), has no unit to render and raises. The
@@ -403,8 +434,32 @@ class _JobCommon:
         return crony.unit.UnitSpec(
             name=self.entity_name,
             cmd=cmd,
-            timing=self.timing,
+            timing=None if self.unit_disabled else self.timing,
             priority=self._unit_priority,
+        )
+
+    def with_unit_disabled(
+        self, disabled: bool, platform: str | None = None
+    ) -> Self:
+        """A copy with `unit_disabled` set and its normalized units
+        re-rendered (blank paths) for the resulting schedule shape, so a
+        pending node mirrored onto a disabled current node reads
+        `synced` rather than stale."""
+        node = dataclasses.replace(self, unit_disabled=disabled)
+        config, timer = _render_normalized_units(
+            platform,
+            node.entity_name,
+            node.entity_ref,
+            None if disabled else node.timing,
+            node._unit_priority,
+            node.guard_timeout,
+            uv=Path(""),
+            crony_path=Path(""),
+        )
+        return dataclasses.replace(
+            node,
+            unit_config_normalized=config,
+            unit_timer_normalized=timer,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -424,13 +479,17 @@ class _JobCommon:
         # The alias pair is derived disk / expected state, recomputed on
         # load -- it never belongs in the persisted snapshot.
         d.pop("state_dir_symlink", None)
-        # The executable paths and normalized units are derived render /
-        # disk state, recomputed on load.
+        # The unit paths, normalized units, and on-disk / scheduler facts
+        # are all derived render / disk state, recomputed on load.
+        # `unit_disabled` is NOT here: it is real applied state, persisted
+        # so a re-apply preserves the operator's disable.
         for k in (
             "uv_path",
             "crony_path",
             "unit_config_normalized",
             "unit_timer_normalized",
+            "unit_config_exists",
+            "unit_loaded",
         ):
             d.pop(k, None)
         # Flags persist as one boolean per member (see
@@ -806,6 +865,7 @@ def snapshot_from_dict(
     unit_timer_disk: str | None = None,
     installed_uv: Path | None = None,
     installed_crony: Path | None = None,
+    unit_loaded: bool = False,
 ) -> Job | JobGroup:
     """Construct a snapshot from its JSON dict, parsing the typed
     value-object fields back from their source strings. Raises
@@ -825,15 +885,17 @@ def snapshot_from_dict(
     None.
 
     The current-graph scan passes the on-disk unit contents
-    (`unit_config_disk` / `unit_timer_disk`) and the uv / crony
-    executable paths it extracted from the installed run command and
-    confirmed still exist (`installed_uv` / `installed_crony`, None when
-    a baked binary is gone). The node's normalized config unit is the
-    blank-path render only when a render with those installed paths
-    reproduces the on-disk file -- so a hand-edited / drifted unit, or
-    one whose binary is gone, gets None and reads `stale` against the
-    pending node. A load that doesn't supply them (the runner reading
-    its own snapshot) leaves the normalized fields None."""
+    (`unit_config_disk` / `unit_timer_disk`), the uv / crony executable
+    paths it extracted from the installed run command and confirmed
+    still exist (`installed_uv` / `installed_crony`, None when a baked
+    binary is gone), and whether the scheduler has the unit loaded
+    (`unit_loaded`). The node's normalized config unit is the blank-path
+    render only when a render with those installed paths reproduces the
+    on-disk file -- so a hand-edited / drifted unit, or one whose binary
+    is gone, gets None and reads `stale` against the pending node; the
+    extracted paths, file presence, and loaded flag let `config_state`
+    tell `broken` from `missing`. A load that doesn't supply them (the
+    runner reading its own snapshot) leaves the derived fields empty."""
     data = dict(raw)
     data["state_dir_symlink"] = state_dir_symlink
     # The format version is keyed `schema` on disk; the field is
@@ -891,10 +953,17 @@ def snapshot_from_dict(
     legacy_timeout = data.pop("job_timeout_sec", legacy_timeout)
     if "timeout" not in data and legacy_timeout is not None:
         data["timeout"] = legacy_timeout
-    # The executables extracted from the installed unit (None for a bare
-    # reload, or when a baked binary is gone) ride on the current node.
+    # Current-graph disk facts (empty for a bare reload): the extracted
+    # executables, whether the config unit is on disk, and whether the
+    # scheduler has the unit loaded. `config_state` reads them to tell
+    # `broken` from `missing`.
     data["uv_path"] = installed_uv
     data["crony_path"] = installed_crony
+    data["unit_config_exists"] = unit_config_disk is not None
+    data["unit_loaded"] = unit_loaded
+    # A disabled entry installs its unit schedule-less, so a render that
+    # reproduces the on-disk file must drop the timing too.
+    eff_timing = None if data.get("unit_disabled") else timing
 
     def _current_normalized(
         priority: crony.unit.PriorityClass, guard_timeout: int
@@ -916,7 +985,7 @@ def snapshot_from_dict(
                 platform,
                 name_obj,
                 ref,
-                timing,
+                eff_timing,
                 priority,
                 guard_timeout,
                 uv=installed_uv,
@@ -927,7 +996,7 @@ def snapshot_from_dict(
                     platform,
                     name_obj,
                     ref,
-                    timing,
+                    eff_timing,
                     priority,
                     guard_timeout,
                     uv=Path(""),
@@ -1202,14 +1271,14 @@ class RuntimeState:
     config unit carries its own schedule, and for an unscheduled entry).
     Both are captured here so subcommands read them from Config rather
     than walking the platform unit directory themselves; `unit_config is
-    not None` is the "a config unit exists on disk" test. The platform
-    unit *file* presence is captured here at load time; the live
-    scheduler enable/disable state is not -- status' UNIT axis queries
-    `unit_state` on demand, since the scheduler view can change between
-    load and read. Unit-file drift lives on the current `Job` /
-    `JobGroup` node (`unit_config_normalized` / `unit_timer_normalized`),
-    so a stale check is a pure node comparison that needs no RuntimeState
-    lookup.
+    not None` is the "a config unit exists on disk" test. No scheduler
+    state lives on RuntimeState: the current `Job` / `JobGroup` node pins
+    both the unit-file drift (`unit_config_normalized` /
+    `unit_timer_normalized`) and the load-time scheduler-loaded fact
+    (`unit_loaded`) that `config_state` scores, so a config verdict is a
+    pure node comparison that needs no RuntimeState lookup. status' UNIT
+    axis queries `unit_state` on demand for its live enabled / disabled /
+    grouped / none display.
     """
 
     state_dir: Path
@@ -1301,6 +1370,16 @@ class Graph:
         `config.current.job_from_ref(r) or config.orphans.get(r)` for
         "current then orphans, never pending"."""
         return self.jobs.get(ref) or self.groups.get(ref)
+
+    def replace_node(self, node: Job | JobGroup) -> None:
+        """Store `node` under its ref, in whichever of `jobs` / `groups`
+        matches its kind -- so a caller holding a `Job | JobGroup` from
+        `job_from_ref` can write the updated node back without branching
+        on type itself."""
+        if isinstance(node, Job):
+            self.jobs[node.entity_ref] = node
+        else:
+            self.groups[node.entity_ref] = node
 
     @classmethod
     def build_pending(
@@ -1525,19 +1604,24 @@ class Config:
     def config_state(self, ref: crony.unit.EntityRef) -> ConfigStatus:
         """synced | stale | broken | missing | orphan for `ref`.
 
-        `broken` wins over the other axes: if the on-disk
-        snapshot can't be loaded the entity is reported as
-        broken regardless of whether pending also defines it
-        (apply will overwrite the broken snapshot with a fresh
-        one). The remaining axes mirror graph membership:
-        `synced` if both graphs hold the entity and the two
-        instances are field-equal (the normalized units
-        included); `stale` if both hold it but differ -- including
-        a hand-edited or moved-away unit whose normalized form no
-        longer matches; `missing` if only `pending` has it and
-        nothing is on disk (never applied); `orphan` if only
-        `current` / `orphans` has it (config-side removed,
-        disk-side lingers).
+        `broken` wins over the other axes: an on-disk snapshot that
+        can't be loaded, or an applied entry whose installed unit can't
+        run -- its baked uv / crony binary is gone, its config unit file
+        was deleted while the scheduler still has it loaded (it works now
+        but dies on reboot), the scheduler has no unit loaded for it (it
+        can't be triggered, by schedule, group, or hand), or a scheduled
+        entry's schedule-arming timer file is gone (it will never fire) --
+        is reported broken regardless of whether pending also defines it
+        (apply re-renders / re-installs / reloads it).
+
+        The remaining axes mirror graph membership and on-disk health:
+        `synced` if both graphs hold the entity and the two instances are
+        field-equal (the normalized units included); `stale` if both hold
+        it but differ -- including a hand-edited or moved-away unit whose
+        normalized form no longer matches; `missing` if only `pending`
+        has it and nothing usable is on disk (never applied, or the unit
+        file is gone and unloaded); `orphan` if only `current` /
+        `orphans` has it (config-side removed, disk-side lingers).
 
         A non-broken on-disk remnant (a snapshot-less / wiped dir)
         whose ref is still a live pending entry reads `stale`, not
@@ -1560,6 +1644,35 @@ class Config:
             return ConfigStatus.ORPHAN
         if c is None:
             return ConfigStatus.MISSING
+        # Both graphs hold the entity (a live applied entry): score the
+        # installed unit's on-disk health, pinned on the current node at
+        # load. A unit that can't run is `broken`; a unit whose file is
+        # gone and unloaded is `missing` (apply re-installs it). These
+        # rank ahead of the snapshot field comparison.
+        if not c.unit_config_exists:
+            return (
+                ConfigStatus.BROKEN if c.unit_loaded else ConfigStatus.MISSING
+            )
+        if c.uv_path is None or c.crony_path is None:
+            return ConfigStatus.BROKEN
+        # A unit the scheduler has no record of can't be triggered -- by
+        # schedule, as part of a group, or by hand -- so it is broken
+        # regardless of whether it is scheduled or disabled (a disabled
+        # entry installs a loaded-but-schedule-less unit, which still
+        # reads loaded). Re-apply reloads it.
+        if not c.unit_loaded:
+            return ConfigStatus.BROKEN
+        # A scheduled, enabled entry fires through its schedule-arming
+        # timer: when the pending node renders one (only systemd does --
+        # launchd carries the schedule in the config unit) but it is gone
+        # from disk, the entry never fires on its schedule -- broken
+        # (re-apply re-renders it). A disabled / grouped entry renders no
+        # timer, so this does not trip for them.
+        if (
+            p.unit_timer_normalized is not None
+            and c.unit_timer_normalized is None
+        ):
+            return ConfigStatus.BROKEN
         return ConfigStatus.SYNCED if p == c else ConfigStatus.STALE
 
     def name_for(self, ref: crony.unit.EntityRef) -> str | None:

@@ -28,14 +28,15 @@ UNIT_PREFIX = "crony"
 
 
 class UnitState(enum.StrEnum):
-    """The platform scheduler's enable/disable view of a unit by name.
+    """The UNIT-axis value `crony status` shows for an entry.
 
-    ENABLED: the scheduler will fire it (loaded on launchd; `enabled` or
-    `static` on systemd). DISABLED: instantiated but held off. NONE: the
-    scheduler knows no unit by that name -- nothing to flip on or off.
-    (Group-only entries, which have no own unit to enable, are the
-    caller's concern, not a value this reports.) A StrEnum so the status
-    caller can render and compare it as its plain value.
+    `Scheduler.state` reports only ENABLED (the scheduler has the unit
+    loaded / registered) or NONE (it knows no unit by that name).
+    DISABLED is not a scheduler fact: a disabled entry is installed as an
+    ordinary loaded-but-schedule-less unit, so the status caller derives
+    the DISABLED value from the entry's snapshot (`Job.unit_disabled`),
+    not from `state`. A StrEnum so the status caller can render and
+    compare it as its plain value.
     """
 
     ENABLED = "enabled"
@@ -179,7 +180,11 @@ class Scheduler(abc.ABC):
 
     @abc.abstractmethod
     def state(self, name: str) -> UnitState:
-        """The scheduler's enable/disable state for the unit `name`."""
+        """Whether the scheduler knows `name`'s unit: ENABLED when it is
+        loaded / registered, NONE when it isn't. The operator-disabled
+        state is not a scheduler fact -- it rides on the entry's snapshot
+        (`Job.unit_disabled`), since a disabled entry installs an ordinary
+        loaded-but-schedule-less unit."""
 
     @abc.abstractmethod
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
@@ -194,13 +199,11 @@ class Scheduler(abc.ABC):
         the live outcome."""
 
     @abc.abstractmethod
-    def activate(
-        self, name: str, *, prior_disabled: bool, scheduled: bool
-    ) -> None:
+    def activate(self, name: str, *, scheduled: bool) -> None:
         """Load the unit (whose files the caller has already written)
-        into the scheduler. `prior_disabled` restores a hand-disabled
-        state across the reload; `scheduled` is False for a
-        schedule-less entry that registers but does not arm."""
+        into the scheduler. `scheduled` is False for a schedule-less
+        entry -- a grouped / transit unit or a disabled one -- that
+        registers (loaded, triggerable) but does not arm a schedule."""
 
     @abc.abstractmethod
     def deactivate(self, name: str) -> None:
@@ -220,14 +223,6 @@ class Scheduler(abc.ABC):
         with any recommended fix) for a non-fatal problem that would let
         scheduled jobs silently misbehave. Status / validate call this
         and surface the message."""
-
-    @abc.abstractmethod
-    def enable(self, name: str) -> None:
-        """Move the scheduler to the `enabled` state for `name`."""
-
-    @abc.abstractmethod
-    def disable(self, name: str) -> None:
-        """Move the scheduler to the `disabled` state for `name`."""
 
     @abc.abstractmethod
     def trigger(self, name: str) -> None:

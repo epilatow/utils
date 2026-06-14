@@ -221,11 +221,10 @@ class TestLaunchdScheduler:
 
 
 class TestLaunchdReload:
-    """activate / enable / disable reload via bootout + bootstrap. The
-    bootstrap settles the asynchronous teardown (poll until the label is
-    gone) and retries the spurious errno-5 race; a disabled unit is never
-    bootstrapped, since a disabled label's bootstrap fails with that same
-    errno 5 and the retry could not clear it."""
+    """activate reloads via bootout + bootstrap. The bootstrap settles
+    the asynchronous teardown (poll until the label is gone) and retries
+    the spurious errno-5 race. A disabled entry installs a schedule-less
+    plist and is bootstrapped like any other (loaded, dormant)."""
 
     def _setup(
         self,
@@ -270,34 +269,11 @@ class TestLaunchdReload:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        sched.activate("default.j", scheduled=True)
         assert self._subs(calls) == ["bootout", "bootstrap"]
         # No deprecated load/unload anywhere.
         assert "load" not in self._subs(calls)
         assert "unload" not in self._subs(calls)
-
-    def test_disabled_reload_never_bootstraps(
-        self, monkeypatch: Any, tmp_path: Path
-    ) -> None:
-        sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.activate("default.j", prior_disabled=True, scheduled=True)
-        subs = self._subs(calls)
-        assert "bootstrap" not in subs
-        assert subs == ["bootout", "disable"]
-
-    def test_enable_enables_then_bootstraps(
-        self, monkeypatch: Any, tmp_path: Path
-    ) -> None:
-        sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.enable("default.j")
-        assert self._subs(calls) == ["enable", "bootout", "bootstrap"]
-
-    def test_disable_boots_out_then_disables(
-        self, monkeypatch: Any, tmp_path: Path
-    ) -> None:
-        sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.disable("default.j")
-        assert self._subs(calls) == ["bootout", "disable"]
 
     def test_bootstrap_retries_spurious_eio(
         self, monkeypatch: Any, tmp_path: Path
@@ -305,7 +281,7 @@ class TestLaunchdReload:
         # First bootstrap returns errno 5, second succeeds: the reload
         # re-settles and retries rather than surfacing the race.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(5, 0))
-        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        sched.activate("default.j", scheduled=True)
         assert self._subs(calls).count("bootstrap") == 2
         assert self._subs(calls).count("bootout") == 2
 
@@ -316,7 +292,7 @@ class TestLaunchdReload:
             monkeypatch, tmp_path, bootstrap_rcs=(5, 5, 5)
         )
         with pytest.raises(subprocess.CalledProcessError):
-            sched.activate("default.j", prior_disabled=False, scheduled=True)
+            sched.activate("default.j", scheduled=True)
         assert (
             self._subs(calls).count("bootstrap") == launchd._BOOTSTRAP_ATTEMPTS
         )
@@ -328,7 +304,7 @@ class TestLaunchdReload:
         # surfaces at once rather than burning the retry budget.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(1,))
         with pytest.raises(subprocess.CalledProcessError):
-            sched.activate("default.j", prior_disabled=False, scheduled=True)
+            sched.activate("default.j", scheduled=True)
         assert self._subs(calls).count("bootstrap") == 1
 
     def test_settle_waits_for_label_to_clear(
@@ -354,7 +330,7 @@ class TestLaunchdReload:
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
         monkeypatch.setattr(launchd, "_is_loaded", is_loaded)
-        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        sched.activate("default.j", scheduled=True)
         # Polled until the label cleared, then bootstrapped.
         assert len(polled) >= 3
         assert self._subs(calls) == ["bootout", "bootstrap"]
@@ -375,7 +351,7 @@ class TestLaunchdReload:
             return elapsed[0]
 
         monkeypatch.setattr(time, "monotonic", fake_monotonic)
-        sched.activate("default.j", prior_disabled=False, scheduled=True)
+        sched.activate("default.j", scheduled=True)
         assert "bootstrap" in self._subs(calls)
 
 

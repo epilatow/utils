@@ -17,6 +17,7 @@ live here.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import fcntl
 import json
@@ -288,10 +289,10 @@ def _build_current_graph(
                     if en is not None
                     else None
                 )
-                config_disk, timer_disk, inst_uv, inst_crony = (
+                config_disk, timer_disk, inst_uv, inst_crony, loaded = (
                     _current_unit_disk_inputs(str(en), sched)
                     if en is not None
-                    else (None, None, None, None)
+                    else (None, None, None, None, False)
                 )
                 snap = crony.model.snapshot_from_dict(
                     raw,
@@ -304,6 +305,7 @@ def _build_current_graph(
                     unit_timer_disk=timer_disk,
                     installed_uv=inst_uv,
                     installed_crony=inst_crony,
+                    unit_loaded=loaded,
                 )
             except (TypeError, ValueError) as exc:
                 orphans[ref] = crony.model.JobOrphan(
@@ -367,6 +369,20 @@ def load_config() -> crony.model.Config:
     current, orphans, runtime = _build_current_graph(
         crony.paths.STATE_DIR, last_exits, platform
     )
+
+    # `disabled` is a runtime overlay the config has no notion of, so a
+    # disabled current entry's pending node would otherwise render with a
+    # schedule and read stale. Mirror the flag onto the matching pending
+    # node and re-render its normalized units so the overlay reads synced
+    # and a re-apply preserves the disable.
+    for node in current.nodes():
+        if not node.unit_disabled:
+            continue
+        pending_node = pending.job_from_ref(node.entity_ref)
+        if pending_node is not None:
+            pending.replace_node(
+                pending_node.with_unit_disabled(True, platform)
+            )
 
     # Resolve same-name collisions among current entries. Two state
     # dirs can recover the same full name (uuid-edit residue that
@@ -576,13 +592,14 @@ def _read_unit_file(path: Path | None) -> str | None:
 
 def _current_unit_disk_inputs(
     name: str, sched: crony.platform.Scheduler
-) -> tuple[str | None, str | None, Path | None, Path | None]:
-    """The on-disk inputs `snapshot_from_dict` needs to bake a current
-    node's normalized config / timer units: the config and timer unit
-    contents, and the uv / crony executable paths extracted from the
-    installed run command and confirmed still present on disk (None when
-    a baked binary is gone, so the model can't reproduce the unit and the
-    entry reads `stale`)."""
+) -> tuple[str | None, str | None, Path | None, Path | None, bool]:
+    """The on-disk / scheduler inputs `snapshot_from_dict` needs to bake
+    a current node: the config and timer unit contents, the uv / crony
+    executable paths extracted from the installed run command and
+    confirmed still present on disk (None when a baked binary is gone),
+    and whether the scheduler has the unit loaded. `config_state` reads
+    these to tell a reproducible unit from a `stale` / `broken` / gone
+    one."""
     config_disk = _read_unit_file(sched.unit_config_path(name))
     timer_disk = _read_unit_file(sched.unit_timer_path(name))
     uv_s, crony_s = crony.model.exec_path_strings(
@@ -592,7 +609,8 @@ def _current_unit_disk_inputs(
     installed_crony = (
         Path(crony_s) if crony_s and Path(crony_s).is_file() else None
     )
-    return config_disk, timer_disk, installed_uv, installed_crony
+    unit_loaded = sched.state(name) != crony.platform.UnitState.NONE
+    return config_disk, timer_disk, installed_uv, installed_crony, unit_loaded
 
 
 def _unit_config_changing(
@@ -702,14 +720,15 @@ def _alias_symlink_names() -> set[str]:
 def unit_state(
     name: str, platform: str | None = None
 ) -> crony.platform.UnitState:
-    """The platform scheduler's enable state for a stamped entity:
-    ENABLED, DISABLED, or NONE.
+    """Whether the platform scheduler has a unit by this name loaded:
+    ENABLED or NONE.
 
-    Distinct from CONFIG: a unit can be configured-and-stamped while
-    being disabled at the platform scheduler. NONE means the
-    scheduler doesn't know a unit by this name -- nothing instantiated
-    to flip on or off. (The `grouped` UNIT-axis value, for an entry
-    with no own unit to enable, is set by the status caller, not here.)
+    NONE means the scheduler doesn't know a unit by this name. The
+    operator-disabled state is not a scheduler fact -- a disabled entry
+    installs an ordinary loaded unit (just schedule-less), so the status
+    caller derives the DISABLED UNIT-axis value from the snapshot
+    (`Job.unit_disabled`), and the `grouped` value for an entry with no
+    own unit, neither here.
     """
     return scheduler(platform).state(name)
 
@@ -897,7 +916,6 @@ def apply_one(
         )
     full_name = str(snapshot.entity_name)
     bundle_name = ref.bundle
-    timing = snapshot.timing
 
     # The full names the bundle's config currently defines, used to
     # keep the rename cleanup below from unlinking a *different* live
@@ -971,41 +989,79 @@ def apply_one(
             current_snapshot.state_dir_symlink_path,
         )
 
-    # Capture runtime state BEFORE we re-render so a hand-disabled
-    # unit stays disabled across the re-load. The scheduler view
-    # is the source of truth here (the platform unit can outlive
-    # the state-dir snapshot); unit_state returns "none" for a
-    # not-yet-installed unit, so only an explicit "disabled"
-    # answer counts and a fresh install still lands enabled. A uuid
-    # change clears it: `do_apply` reclaimed the old unit first, so
-    # the new job installs fresh -- a uuid change is a new job.
-    prior_disabled = unit_state(full_name) == crony.platform.UnitState.DISABLED
+    # The operator-disabled state is preserved across a re-apply by
+    # `load_config`, which mirrors a disabled current entry's flag onto
+    # the pending node -- so `snapshot.unit_disabled` is already correct
+    # here, and a fresh install (no current node) lands enabled. A uuid
+    # change clears it: `do_apply` reclaimed the old unit first, so the
+    # new job installs fresh. `activate` is skipped for a self-reload
+    # that fell through here: the unit didn't change (a change would have
+    # deferred above), so reloading would only terminate this very run
+    # for no benefit.
+    _install_unit(snapshot, sched, activate=not self_reload)
+    return ApplyResult.UPDATED if is_update else ApplyResult.ADDED
+
+
+def _install_unit(
+    snapshot: crony.model.Job | crony.model.JobGroup,
+    sched: crony.platform.Scheduler,
+    *,
+    activate: bool = True,
+) -> None:
+    """Render `snapshot`'s platform unit(s), write them to the scheduler's
+    unit dir (pruning any stale files a schedule -> unscheduled or
+    enable -> disable transition leaves behind), optionally load them, and
+    persist the apply-time state (snapshot.json, seeded run.log, alias).
+
+    Shared by `apply_one` and `set_disabled`. A disabled or schedule-less
+    snapshot renders with no schedule (`unit_spec` drops the timing), so
+    it loads dormant (`scheduled=False`) -- registered and triggerable,
+    just not armed."""
+    full_name = str(snapshot.entity_name)
     units = _render_units(snapshot)
-    target_dir = sched.unit_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    # Clean up any previously-installed unit files for this name that
-    # aren't in the current render set (handles a scheduled ->
-    # unscheduled transition where the .timer should be removed).
+    sched.unit_dir.mkdir(parents=True, exist_ok=True)
     sched.prune_units(full_name, set(units))
     for fname, content in units.items():
-        (target_dir / fname).write_text(content, encoding="utf-8")
-    # Load the unit into the scheduler. `prior_disabled` re-applies a
-    # hand-disable after the reload so a `crony disable` survives a
-    # same-uuid re-render; a uuid change reclaimed the old unit first,
-    # so the new job loads enabled (it is a new job). `scheduled=False`
-    # installs a dormant unit (no .timer on linux) that only fires when
-    # something triggers it. Skipped for a self-reload that fell through
-    # here: the unit didn't change (a change would have deferred above),
-    # so reloading would only terminate this very run for no benefit.
-    if not self_reload:
-        sched.activate(
-            full_name,
-            prior_disabled=prior_disabled,
-            scheduled=timing is not None,
-        )
-
+        (sched.unit_dir / fname).write_text(content, encoding="utf-8")
+    if activate:
+        scheduled = snapshot.timing is not None and not snapshot.unit_disabled
+        sched.activate(full_name, scheduled=scheduled)
     _write_apply_state(snapshot)
-    return ApplyResult.UPDATED if is_update else ApplyResult.ADDED
+
+
+def set_disabled(
+    config: crony.model.Config,
+    ref: crony.unit.EntityRef,
+    *,
+    disabled: bool,
+) -> bool:
+    """Flip one applied entry's operator-disabled state: re-render its
+    unit (schedule-stripped when disabling, with its schedule when
+    enabling), reload it, and re-persist its snapshot with the new
+    `unit_disabled`. Returns True when it changed something, False when
+    the entry was already in the requested state. The entry must be
+    currently applied; the `enable` / `disable` commands resolve only
+    installed entries.
+
+    Like an apply, the re-render bakes the live uv / crony executables --
+    stamped onto the node here, since the current graph carries the paths
+    extracted from the existing unit (which a binary move would leave
+    stale) -- so a disabled entry stays runnable across a binary move."""
+    current = config.current.job_from_ref(ref)
+    if current is None:
+        raise crony.errors.PreconditionError(
+            f"{ref} has no applied snapshot to enable / disable"
+        )
+    if current.unit_disabled == disabled:
+        return False
+    snapshot = dataclasses.replace(
+        current,
+        unit_disabled=disabled,
+        uv_path=_uv_executable(),
+        crony_path=_crony_executable(),
+    )
+    _install_unit(snapshot, scheduler())
+    return True
 
 
 def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:

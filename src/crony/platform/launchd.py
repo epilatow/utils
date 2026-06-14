@@ -133,20 +133,6 @@ def _plist_argv(content: str) -> list[str] | None:
     return inner[1:]
 
 
-def _launchctl_print_disabled() -> str:
-    """Stdout of `launchctl print-disabled gui/<uid>`; empty on failure."""
-    try:
-        r = subprocess.run(
-            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout
-
-
 def _launchctl_list() -> str:
     """Stdout of `launchctl list`; empty on failure."""
     try:
@@ -159,12 +145,6 @@ def _launchctl_list() -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
     return r.stdout
-
-
-def _is_disabled(lbl: str) -> bool:
-    """True if `launchctl print-disabled` reports `lbl` disabled."""
-    out = _launchctl_print_disabled()
-    return f'"{lbl}" => disabled' in out or f'"{lbl}" => true' in out
 
 
 def _is_loaded(lbl: str) -> bool:
@@ -261,12 +241,7 @@ class LaunchdScheduler(Scheduler):
         return names
 
     def state(self, name: str) -> UnitState:
-        lbl = label(name)
-        if _is_disabled(lbl):
-            return UnitState.DISABLED
-        if _is_loaded(lbl):
-            return UnitState.ENABLED
-        return UnitState.NONE
+        return UnitState.ENABLED if _is_loaded(label(name)) else UnitState.NONE
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # `launchctl list` lines are `<pid>\t<status>\t<label>`. The
@@ -344,25 +319,14 @@ class LaunchdScheduler(Scheduler):
             result.returncode, cmd, result.stdout, result.stderr
         )
 
-    def activate(
-        self, name: str, *, prior_disabled: bool, scheduled: bool
-    ) -> None:
+    def activate(self, name: str, *, scheduled: bool) -> None:
         del scheduled  # a plist with no Start* keys loads fine, dormant
         plist = self.unit_dir / plist_filename(name)
         # Validate before asking launchd to load (`-s` keeps stdout
-        # quiet on success).
+        # quiet on success). A disabled entry's plist is schedule-less
+        # but still bootstrapped -- loaded and triggerable, just dormant.
         subprocess.run(["plutil", "-s", str(plist)], check=True)
-        if prior_disabled:
-            # A hand-disabled unit stays disabled and unloaded across the
-            # reload: bootstrapping a disabled label only fails (errno
-            # 5), so boot it out and re-assert the disable override
-            # instead.
-            self._bootout(name)
-            subprocess.run(
-                ["launchctl", "disable", self._gui(name)], check=True
-            )
-        else:
-            self._bootstrap(name, plist)
+        self._bootstrap(name, plist)
 
     def deactivate(self, name: str) -> None:
         if (self.unit_dir / plist_filename(name)).exists():
@@ -376,17 +340,6 @@ class LaunchdScheduler(Scheduler):
         # launchd loads a logged-in user's agents automatically; there is
         # no logout-survival toggle to check, so nothing to warn about.
         return
-
-    def enable(self, name: str) -> None:
-        plist = self.unit_dir / plist_filename(name)
-        subprocess.run(["launchctl", "enable", self._gui(name)], check=True)
-        self._bootstrap(name, plist)
-
-    def disable(self, name: str) -> None:
-        # Boot out first so the persistent disable record governs the
-        # next load; a still-loaded plist would keep firing otherwise.
-        self._bootout(name)
-        subprocess.run(["launchctl", "disable", self._gui(name)], check=True)
 
     def trigger(self, name: str) -> None:
         # kickstart invokes now; `start` only queues the next fire.
