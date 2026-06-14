@@ -38,9 +38,7 @@ from crony.platform.host import HostPlatform, PidWait
 from crony.platform.launchd import LaunchdScheduler
 from crony.platform.linux import LinuxHost
 from crony.platform.scheduler import (
-    UNIT_CONFIG,
     UNIT_PREFIX,
-    UNIT_TIMER,
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
@@ -49,9 +47,7 @@ from crony.platform.scheduler import (
 from crony.platform.systemd import SystemdScheduler
 
 __all__ = [
-    "UNIT_CONFIG",
     "UNIT_PREFIX",
-    "UNIT_TIMER",
     "DarwinHost",
     "HostPlatform",
     "LaunchdScheduler",

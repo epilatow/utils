@@ -22,6 +22,7 @@ from typing import Any
 
 import crony.commands
 import crony.errors
+import crony.model
 import crony.runner
 import crony.runtime
 from common.argparse_ext import StrictArgumentParser
@@ -138,10 +139,9 @@ therefore has no effect on running units, and `crony status`
 reports any divergence between live config and on-disk snapshot
 as `config=stale` via direct dataclass equality. The platform
 unit file gets the same drift treatment: a missing / hand-edited
-unit file, one referencing a uv / crony binary that's since been
-removed, or a scheduled unit the scheduler has unloaded also
-surfaces as `config=stale` so `crony apply` re-renders and
-re-bootstraps it.
+unit file, or one referencing a uv / crony binary that's since
+been removed, surfaces as `config=stale` so `crony apply`
+re-renders it.
 
 One apply case is held back: a job whose own command runs
 `crony apply` (a self-maintaining schedule) cannot reload its own
@@ -590,8 +590,8 @@ def _build_parser() -> StrictArgumentParser:
     # argparse.SUPPRESS surfaces the literal "==SUPPRESS==" string
     # instead of hiding the entry.
     for _run_name in (
-        crony.runtime.RUN_SUBCOMMAND,
-        crony.runtime.RUN_SUBCOMMAND_LEGACY,
+        crony.model.RUN_SUBCOMMAND,
+        crony.model.RUN_SUBCOMMAND_LEGACY,
     ):
         p_run = subparsers.add_parser(_run_name)
         p_run.add_argument(
@@ -614,7 +614,7 @@ def _build_parser() -> StrictArgumentParser:
     # Hidden from `crony --help` for the same reason as `_run` (no
     # `help=`). Takes the cap then the full inner command via REMAINDER
     # so the inner `--script` / flags aren't parsed as guard options.
-    p_guard = subparsers.add_parser(crony.runtime.GUARD_SUBCOMMAND)
+    p_guard = subparsers.add_parser(crony.model.GUARD_SUBCOMMAND)
     p_guard.add_argument(
         "cap",
         type=int,
@@ -669,9 +669,9 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "trigger": crony.commands.do_trigger,
     "status": crony.commands.do_status,
     "logs": crony.commands.do_logs,
-    crony.runtime.RUN_SUBCOMMAND: crony.runner.do_run,
-    crony.runtime.RUN_SUBCOMMAND_LEGACY: crony.runner.do_run,
-    crony.runtime.GUARD_SUBCOMMAND: crony.runner.do_run_guard,
+    crony.model.RUN_SUBCOMMAND: crony.runner.do_run,
+    crony.model.RUN_SUBCOMMAND_LEGACY: crony.runner.do_run,
+    crony.model.GUARD_SUBCOMMAND: crony.runner.do_run_guard,
     "notify-test": crony.commands.do_notify_test,
 }
 

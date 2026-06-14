@@ -16,9 +16,7 @@ import subprocess
 from pathlib import Path
 
 from crony.platform.scheduler import (
-    UNIT_CONFIG,
     UNIT_PREFIX,
-    UNIT_TIMER,
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
@@ -241,18 +239,19 @@ class SystemdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / ".config" / "systemd" / "user"
 
-    def render(self, spec: UnitSpec) -> dict[str, str]:
+    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
         name = str(spec.name)
-        units = {
-            service_filename(name): render_service(
-                name,
-                spec.cmd,
-                spec.priority,
-            )
-        }
-        if spec.timing is not None:
-            units[timer_filename(name)] = render_timer(name, spec.timing)
-        return units
+        return Path(service_filename(name)), render_service(
+            name,
+            spec.cmd,
+            spec.priority,
+        )
+
+    def render_timer(self, spec: UnitSpec) -> tuple[Path, str] | None:
+        if spec.timing is None:
+            return None
+        name = str(spec.name)
+        return Path(timer_filename(name)), render_timer(name, spec.timing)
 
     def installed_cmd(self, name: str) -> list[str] | None:
         service = self.unit_dir / service_filename(name)
@@ -337,39 +336,6 @@ class SystemdScheduler(Scheduler):
             killed = blk.get("Result", "") not in ("success", "exit-code")
             out[name] = UnitLastExit(exit_status=-raw if killed else raw)
         return out
-
-    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
-        name = str(spec.name)
-        expected_units = self.render(spec)
-        expected = set(expected_units)
-        drifted: set[str] = set()
-        # An orphaned .timer left over from a schedule -> unscheduled
-        # transition is timer drift even though it's not in `expected`.
-        timer = self.unit_dir / timer_filename(name)
-        if timer.is_file() and timer.name not in expected:
-            drifted.add(UNIT_TIMER)
-        for fname in expected:
-            path = self.unit_dir / fname
-            kind = UNIT_TIMER if fname.endswith(".timer") else UNIT_CONFIG
-            try:
-                content = path.read_text(encoding="utf-8")
-            except OSError:
-                drifted.add(kind)
-                continue
-            if fname.endswith(".timer"):
-                assert spec.timing is not None
-                if content != render_timer(name, spec.timing):
-                    drifted.add(UNIT_TIMER)
-            elif content != expected_units[fname]:
-                drifted.add(UNIT_CONFIG)
-        # A scheduled entry the scheduler has unloaded won't fire: the
-        # .timer is the unit that needs (re)loading, so flag it. A
-        # grouped (schedule-less) entry is a static, on-demand `.service`
-        # with no timer, so being unknown to the scheduler is its
-        # resting state, not drift.
-        if spec.timing is not None and self.state(name) == UnitState.NONE:
-            drifted.add(UNIT_TIMER)
-        return frozenset(drifted)
 
     def activate(
         self, name: str, *, prior_disabled: bool, scheduled: bool

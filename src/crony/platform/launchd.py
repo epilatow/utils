@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 
 from crony.platform.scheduler import (
-    UNIT_CONFIG,
     UNIT_PREFIX,
     Scheduler,
     UnitLastExit,
@@ -212,16 +211,19 @@ class LaunchdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / "Library" / "LaunchAgents"
 
-    def render(self, spec: UnitSpec) -> dict[str, str]:
+    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
         name = str(spec.name)
-        return {
-            plist_filename(name): render_plist(
-                name,
-                spec.cmd,
-                spec.timing,
-                spec.priority,
-            )
-        }
+        return Path(plist_filename(name)), render_plist(
+            name,
+            spec.cmd,
+            spec.timing,
+            spec.priority,
+        )
+
+    def render_timer(self, _spec: UnitSpec) -> tuple[Path, str] | None:
+        # A LaunchAgent carries its own schedule keys in the plist; there
+        # is no separate timer unit.
+        return None
 
     def installed_cmd(self, name: str) -> list[str] | None:
         p = self.unit_dir / plist_filename(name)
@@ -287,24 +289,6 @@ class LaunchdScheduler(Scheduler):
                 continue
             out[lbl[len(prefix) :]] = UnitLastExit(exit_status=status)
         return out
-
-    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
-        # launchd has only the plist (CONFIG); the schedule lives in it,
-        # so there is never a separate timer to drift.
-        config = frozenset({UNIT_CONFIG})
-        name = str(spec.name)
-        path = self.unit_dir / plist_filename(name)
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            return config
-        if content != self.render(spec)[plist_filename(name)]:
-            return config
-        # A grouped (schedule-less) plist must still be loaded to be
-        # kickstartable, so an unloaded unit is drift here too.
-        if self.state(name) == UnitState.NONE:
-            return config
-        return frozenset()
 
     def _gui(self, name: str) -> str:
         return f"gui/{os.getuid()}/{label(name)}"

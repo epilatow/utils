@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import shutil
@@ -30,6 +31,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony import commands as crony_commands  # noqa: E402
 from crony import config as crony_config  # noqa: E402
+from crony import model as crony_model  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
@@ -62,6 +64,25 @@ from crony.unit import (  # noqa: E402
 )
 
 _script_path = REPO_ROOT / "src" / "crony" / "runtime.py"
+
+
+def _install_units(snap: Any) -> None:
+    """Write `snap`'s rendered platform units to the scheduler's unit
+    dir -- the on-disk side a hand-planted snapshot otherwise lacks, so
+    its current node reads a healthy (not broken / missing) unit.
+
+    Stamps the live uv / crony executables onto the node first, the way
+    `load_config` does for a pending node, so rendering is self-contained
+    (a hand-built `from_config` node carries no paths)."""
+    snap = dataclasses.replace(
+        snap,
+        uv_path=crony_runtime._uv_executable(),
+        crony_path=crony_runtime._crony_executable(),
+    )
+    sched = crony_runtime.scheduler()
+    sched.unit_dir.mkdir(parents=True, exist_ok=True)
+    for fname, content in crony_runtime._render_units(snap).items():
+        (sched.unit_dir / fname).write_text(content, encoding="utf-8")
 
 
 class TestUnitStateDarwin:
@@ -797,6 +818,11 @@ class TestLoadConfig:
         # apply also plants the short-name alias; without it the
         # current node's recorded link diverges from the expected one.
         (crony_paths.STATE_DIR / "default" / "a").symlink_to(uuid_a)
+        # Install the rendered unit and report it loaded: a current node
+        # with no / unloaded unit reads broken / missing, so isolating
+        # the snapshot-field comparison needs a healthy on-disk unit.
+        _install_units(snap)
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "synced"
@@ -859,6 +885,11 @@ class TestLoadConfig:
         (sd / "snapshot.json").write_text(
             json.dumps(diverged), encoding="utf-8"
         )
+        # Install a healthy, loaded unit (the command isn't baked into
+        # it, so the render matches) -- the divergence is the snapshot
+        # `command` field, which must read stale through the comparison.
+        _install_units(snap)
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
         assert config.config_state(ref) == "stale"
@@ -1168,47 +1199,49 @@ class TestPlatformUnitDiscovery:
         assert crony_runtime._platform_unit_names() == set()
 
 
-class TestExecPathsFromArgv:
-    """`runtime.exec_paths_from_argv` scans a unit's argv for the still-
-    present absolute uv / crony executables; the drift check rebuilds the
-    expected command from them (a moved-but-present binary isn't flagged)
-    or, finding neither, treats the unit as stale.
+class TestExecPathStrings:
+    """`model.exec_path_strings` recovers the absolute uv / crony
+    executable path strings baked into a unit's argv -- by name, not
+    position, and regardless of whether they still exist on disk
+    (rendering the normalized unit and checking the paths' existence on
+    disk are separate concerns).
     """
 
-    @staticmethod
-    def _bin(tmp_path: Path, leaf: str) -> Path:
-        p = tmp_path / leaf
-        p.write_text("")
-        return p
+    def test_recovers_paths(self) -> None:
+        argv = crony_model._run_argv(
+            Path("/abs/uv"), Path("/abs/crony"), EntityRef("d", "u-test")
+        )
+        assert crony_model.exec_path_strings(list(argv)) == (
+            "/abs/uv",
+            "/abs/crony",
+        )
 
-    def test_recovers_present_paths(self, tmp_path: Path) -> None:
-        uv = self._bin(tmp_path, "uv")
-        crony = self._bin(tmp_path, "crony")
-        argv = crony_runtime.run_argv(uv, crony, EntityRef("d", "u-test"))
-        assert crony_runtime.exec_paths_from_argv(list(argv)) == (uv, crony)
-
-    def test_finds_paths_regardless_of_position(self, tmp_path: Path) -> None:
+    def test_finds_paths_regardless_of_position(self) -> None:
         # The scan keys on the path name, not the argv position, so a
         # wrapper that repeats uv / crony elsewhere still recovers them.
-        uv = self._bin(tmp_path, "uv")
-        crony = self._bin(tmp_path, "crony")
-        argv = [str(uv), "x", str(crony), "y", "z", str(uv)]
-        assert crony_runtime.exec_paths_from_argv(argv) == (uv, crony)
+        argv = ["/a/uv", "x", "/b/crony", "y", "z", "/a/uv"]
+        assert crony_model.exec_path_strings(argv) == ("/a/uv", "/b/crony")
 
-    def test_none_when_a_binary_is_absent(self) -> None:
-        # Ends in /uv and /crony but the files don't exist on disk -- a
-        # baked binary that's since been removed.
-        argv = ["/abs/uv", "run", "--script", "/abs/crony", "_run", "x:y"]
-        assert crony_runtime.exec_paths_from_argv(argv) is None
+    def test_recovers_even_when_absent_on_disk(self) -> None:
+        # The strings are returned even for a baked path that's since been
+        # removed; the filesystem check that decides whether the unit can
+        # be reproduced happens elsewhere (the current-graph scan).
+        argv = ["/gone/uv", "run", "--script", "/gone/crony", "_run", "x:y"]
+        assert crony_model.exec_path_strings(argv) == (
+            "/gone/uv",
+            "/gone/crony",
+        )
 
-    def test_none_when_crony_missing(self, tmp_path: Path) -> None:
-        uv = self._bin(tmp_path, "uv")
-        argv = [str(uv), "run", "x:y"]  # no /crony entry
-        assert crony_runtime.exec_paths_from_argv(argv) is None
+    def test_none_for_missing_element(self) -> None:
+        assert crony_model.exec_path_strings(["/abs/uv", "run", "x:y"]) == (
+            "/abs/uv",
+            None,
+        )
+        assert crony_model.exec_path_strings(["run", "x:y"]) == (None, None)
 
 
 class TestGuardedArgv:
-    """`runtime.guarded_argv` wraps the base run in the hard-timeout
+    """`model._guarded_argv` wraps the base run in the hard-timeout
     guard for a capped entry; the path scan recovers uv / crony from the
     guarded shape just as it does from the bare one."""
 
@@ -1217,30 +1250,29 @@ class TestGuardedArgv:
     _REF = EntityRef("default", "u-test")
 
     def test_uncapped_is_bare_run(self) -> None:
-        assert crony_runtime.guarded_argv(
+        assert crony_model._guarded_argv(
             self._UV, self._CRONY, self._REF, 0
-        ) == crony_runtime.run_argv(self._UV, self._CRONY, self._REF)
+        ) == crony_model._run_argv(self._UV, self._CRONY, self._REF)
 
     def test_capped_wraps_with_padded_cap(self) -> None:
-        argv = crony_runtime.guarded_argv(self._UV, self._CRONY, self._REF, 120)
-        cap = 120 + crony_runtime.HARD_TIMEOUT_PADDING_SEC
+        argv = crony_model._guarded_argv(self._UV, self._CRONY, self._REF, 120)
+        cap = 120 + crony_model._HARD_TIMEOUT_PADDING_SEC
         assert argv == (
             "/abs/uv",
             "run",
             "--script",
             "/abs/crony",
-            crony_runtime.GUARD_SUBCOMMAND,
+            crony_model.GUARD_SUBCOMMAND,
             str(cap),
-            *crony_runtime.run_argv(self._UV, self._CRONY, self._REF),
+            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
         )
 
-    def test_paths_recover_from_guarded_shape(self, tmp_path: Path) -> None:
-        uv = tmp_path / "uv"
-        uv.write_text("")
-        crony = tmp_path / "crony"
-        crony.write_text("")
-        argv = crony_runtime.guarded_argv(uv, crony, self._REF, 600)
-        assert crony_runtime.exec_paths_from_argv(list(argv)) == (uv, crony)
+    def test_paths_recover_from_guarded_shape(self) -> None:
+        argv = crony_model._guarded_argv(self._UV, self._CRONY, self._REF, 600)
+        assert crony_model.exec_path_strings(list(argv)) == (
+            "/abs/uv",
+            "/abs/crony",
+        )
 
 
 class TestInstalledCmdParsing:
@@ -1307,13 +1339,14 @@ class TestInstalledCmdParsing:
 
 
 class TestUnitDriftDetection:
-    """`load_config` runs a per-entity integrity check on the
-    installed platform unit: file present, content matches what
-    apply would render given the embedded uv / crony paths, the
-    embedded paths still resolve to files, and the scheduler has
-    the unit loaded. Any divergence sets `RuntimeState.unit_is_stale
-    = True` so status reports `config=stale` and the next apply
-    re-renders even if the snapshot is unchanged.
+    """`load_config` bakes each node's normalized config / timer units, so
+    a divergence between the rendered pending node and the on-disk current
+    node surfaces as `config=stale` through the plain node `==`. A
+    hand-edited unit, a deleted unit file, and a gone baked uv / crony
+    binary (none of which the install can reproduce) all read `stale`; the
+    uv / crony paths render blank, so a moved-but-present binary reads
+    `synced`. The next apply re-renders a drifted unit even if the
+    snapshot is unchanged.
     """
 
     def _apply_and_load(
@@ -1330,70 +1363,61 @@ class TestUnitDriftDetection:
         if platform == "darwin":
             unit_config = unit_dir / f"org.crony.{h.full('j')}.plist"
         else:
-            unit_config = unit_dir / f"crony-{h.full('j')}.timer"
+            unit_config = unit_dir / f"crony-{h.full('j')}.service"
         return h, config, unit_config
 
-    def test_clean_apply_is_not_stale(
+    def test_clean_apply_is_synced(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         _, config, _ = self._apply_and_load(tmp_path, monkeypatch)
         ref = config.current.by_full_name["default.j"]
-        assert config.runtime[ref].unit_is_stale is False
+        assert config.config_state(ref) == "synced"
 
     def test_hand_edited_plist_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
-        content = unit_config.read_text()
-        # Flip Hour 3 -> Hour 5: snapshot still says 03:00, but the
-        # on-disk plist now says 05:00. apply / load_config should
-        # notice and flag the install stale. (Hour is the only
-        # integer 3 in the rendered plist, so this is unambiguous
-        # without depending on the serializer's indentation.)
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        content = plist.read_text()
+        # Flip Hour 3 -> Hour 5: the snapshot still says 03:00, so a
+        # render with the unit's own paths no longer matches the on-disk
+        # plist -> normalized config None -> stale. (Hour is the only
+        # integer 3 in the rendered plist.)
         munged = content.replace("<integer>3</integer>", "<integer>5</integer>")
         assert munged != content
-        unit_config.write_text(munged)
+        plist.write_text(munged)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_is_stale is True
-        # The launchd plist is the config unit; the schedule lives in it,
-        # so there is no separate timer to drift.
-        assert config.runtime[ref].unit_drift == frozenset(
-            {crony_platform.UNIT_CONFIG}
+        assert config.config_state(ref) == "stale"
+        assert "unit-config" in crony_commands._stale_fields(
+            config.pending.job_from_ref(ref),
+            config.current.job_from_ref(ref),
         )
 
-    def test_missing_unit_file_flags_stale(
+    def test_deleted_unit_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # Unit file deleted while the snapshot survives: there is nothing
+        # on disk to reproduce, so the current node's normalized config is
+        # None, unequal to the pending render -> stale (re-apply
+        # re-installs it).
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_is_stale is True
+        assert config.config_state(ref) == "stale"
 
-    def test_unloaded_unit_flags_stale(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
-        # Simulate the scheduler having unloaded the unit (e.g.
-        # the user ran `launchctl bootout` directly). File on
-        # disk still intact but the launchd probe reports the unit
-        # as not loaded, so the drift check reads "none".
-        monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
-        config = crony_runtime.load_config()
-        ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_is_stale is True
-        # launchd has only the plist, so its unload flags the config unit.
-        assert config.runtime[ref].unit_drift == frozenset(
-            {crony_platform.UNIT_CONFIG}
-        )
-
-    def _linux_drift(
+    def _linux_stale_reasons(
         self, tmp_path: Path, monkeypatch: Any, edit: str
-    ) -> frozenset[str]:
+    ) -> str:
         # Apply a scheduled job on linux (a .service + .timer), edit the
-        # named unit file, and return the per-file drift `load_config`
-        # records.
+        # named unit file, and return the comma-joined stale reasons
+        # `load_config` records for it.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -1404,49 +1428,33 @@ class TestUnitDriftDetection:
         path.write_text(path.read_text() + "\n# edited\n")
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        result: frozenset[str] = config.runtime[ref].unit_drift
-        return result
+        return crony_commands._stale_fields(
+            config.pending.job_from_ref(ref),
+            config.current.job_from_ref(ref),
+        )
 
     def test_linux_service_edit_is_config_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        assert self._linux_drift(tmp_path, monkeypatch, "service") == frozenset(
-            {crony_platform.UNIT_CONFIG}
+        assert (
+            self._linux_stale_reasons(tmp_path, monkeypatch, "service")
+            == "unit-config"
         )
 
     def test_linux_timer_edit_is_timer_drift(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        assert self._linux_drift(tmp_path, monkeypatch, "timer") == frozenset(
-            {crony_platform.UNIT_TIMER}
+        assert (
+            self._linux_stale_reasons(tmp_path, monkeypatch, "timer")
+            == "unit-timer"
         )
 
-    def test_linux_unloaded_scheduled_is_timer_drift(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # A scheduled entry the scheduler unloaded won't fire; the .timer
-        # is the unit that needs reloading, so the drift is the timer.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
-        config = crony_runtime.load_config()
-        ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_drift == frozenset(
-            {crony_platform.UNIT_TIMER}
-        )
-
-    def test_grouped_entry_not_stale_on_linux(
+    def test_grouped_entry_is_synced_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A grouped (schedule-less) entry installs only a .service on
-        # linux -- no .timer. `unit_state` queries the timer, so a
-        # grouped entry reads "none" at the scheduler, but that is its
-        # correct resting state (a static, on-demand service), not
-        # drift. A clean apply must leave it unit_is_stale=False.
+        # linux -- no .timer. Its config unit matches and it expects no
+        # timer, so a clean apply reads `synced`.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {
@@ -1458,38 +1466,53 @@ class TestUnitDriftDetection:
             default_target_jobs=["g"],
         )
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
-        # Faithful systemctl: a unit is "enabled" only if its file is
-        # present. The grouped child has no .timer, so its timer query
-        # returns "" -> unit_state "none" -- the real linux behavior
-        # the harness's blanket `enabled` stub hides.
-        monkeypatch.setattr(
-            systemd,
-            "_is_enabled",
-            lambda u: "enabled" if (h.sysd / u).is_file() else "",
-        )
         config = crony_runtime.load_config()
         a_ref = config.current.by_full_name[h.full("a")]
         g_ref = config.current.by_full_name[h.full("g")]
-        # The scheduled group keeps its loaded timer (sanity); the
-        # grouped child must not be flagged stale for lacking one.
-        assert config.runtime[g_ref].unit_is_stale is False
-        assert config.runtime[a_ref].unit_is_stale is False
+        assert config.config_state(g_ref) == "synced"
+        assert config.config_state(a_ref) == "synced"
 
-    def test_missing_baked_uv_path_flags_stale(
+    def test_gone_baked_binary_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
-        # Replace the baked uv path with one pointing at a
-        # nonexistent file. The unit-drift check resolves the
-        # extracted paths against the filesystem and flags the
-        # install as broken when either's gone.
+        # Replace the baked uv path with one pointing at a nonexistent
+        # file. The extracted path no longer resolves, so the current node
+        # can't render its normalized unit -> None, unequal to the pending
+        # render -> stale (re-apply re-renders it with the live binary).
         content = unit_config.read_text()
         live_uv = str(crony_runtime._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_is_stale is True
+        assert config.config_state(ref) == "stale"
+
+    def test_moved_but_present_binary_is_synced(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The baked uv / crony paths differ from the live ones but still
+        # exist on disk (a binary that moved). The normalized unit renders
+        # with blank paths, so the install reads synced -- no needless
+        # re-apply for a cosmetic path change.
+        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
+        alt = tmp_path / "moved"
+        alt.mkdir()
+        alt_uv = alt / "uv"
+        alt_uv.write_text("")
+        alt_crony = alt / "crony"
+        alt_crony.write_text("")
+        content = unit_config.read_text()
+        content = content.replace(
+            str(crony_runtime._uv_executable()), str(alt_uv)
+        )
+        content = content.replace(
+            str(crony_runtime._crony_executable()), str(alt_crony)
+        )
+        unit_config.write_text(content)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.config_state(ref) == "synced"
 
     def test_apply_refreshes_stale_install(
         self, tmp_path: Path, monkeypatch: Any
@@ -1510,11 +1533,10 @@ class TestUnitDriftDetection:
     def test_do_apply_refreshes_stale_install_via_model(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
-        # `do_apply` reads the unit-drift verdict from the Config it
-        # loaded once at start (apply_one's `model` path), not by
-        # re-probing disk per entry. A unit deleted after the first
-        # apply is `unit_is_stale` at load time, so the no-arg apply
-        # re-renders it.
+        # `do_apply` reads the drift verdict from the Config it loaded
+        # once at start (apply_one's `model` path), not by re-probing disk
+        # per entry. A unit deleted after the first apply diverges from
+        # its pending node at load time, so the no-arg apply re-renders it.
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
         with caplog.at_level(logging.INFO, logger="crony"):
@@ -1526,8 +1548,16 @@ class TestUnitDriftDetection:
     def test_status_reports_stale_for_drifted_install(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
-        unit_config.unlink()
+        h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
+        # Hand-edit the plist (Hour 3 -> 5) so it diverges from what the
+        # snapshot would render -> config=stale (a deleted unit would
+        # read broken / missing instead).
+        plist = h.agents / f"org.crony.{h.full('j')}.plist"
+        plist.write_text(
+            plist.read_text().replace(
+                "<integer>3</integer>", "<integer>5</integer>"
+            )
+        )
         crony_commands.do_status(
             jobs=[],
             cols=None,
@@ -1606,7 +1636,9 @@ class TestUnitDriftDetection:
         )
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("transit")]
-        assert config.runtime[ref].unit_is_stale is True
+        # The transit group renders no timer (pending timer None), but
+        # one is on disk -- the timer comparison catches it as drift.
+        assert config.config_state(ref) == "stale"
 
 
 class TestSnapshotBackwardLoad:

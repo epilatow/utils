@@ -26,15 +26,6 @@ from crony.unit import UnitSpec
 # the script filename.
 UNIT_PREFIX = "crony"
 
-# The logical unit-file kinds a scheduler manages, reported by
-# `drifted_units` so status can flag the specific stale file. CONFIG is
-# the unit that defines and runs the job (systemd `.service`, launchd
-# plist); TIMER arms its schedule (systemd `.timer`). launchd folds the
-# schedule into the plist, so it has no TIMER. These match the
-# `unit-config` / `unit-timer` status columns.
-UNIT_CONFIG = "config"
-UNIT_TIMER = "timer"
-
 
 class UnitState(enum.StrEnum):
     """The platform scheduler's enable/disable view of a unit by name.
@@ -110,13 +101,35 @@ class Scheduler(abc.ABC):
         """The backend's standard on-disk unit directory under the
         user's home. Used when no explicit dir is given."""
 
-    @abc.abstractmethod
     def render(self, spec: UnitSpec) -> dict[str, str]:
-        """Return `{filename: content}` for `spec`'s platform units.
+        """`{filename: content}` for `spec`'s platform units, composed
+        from `render_config` plus `render_timer`.
 
         Embeds `spec.cmd` as the unit's command and adds the schedule /
-        priority directives.
+        priority directives. Callers that need one unit specifically
+        reach for `render_config` / `render_timer` directly rather than
+        re-splitting this dict by filename.
         """
+        fname, content = self.render_config(spec)
+        units = {str(fname): content}
+        timer = self.render_timer(spec)
+        if timer is not None:
+            units[str(timer[0])] = timer[1]
+        return units
+
+    @abc.abstractmethod
+    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
+        """The (filename, content) of `spec`'s config unit -- the one
+        that defines and runs the job (systemd `.service`, launchd
+        plist). Always present. `filename` is the bare basename; the
+        caller joins it onto the unit dir."""
+
+    @abc.abstractmethod
+    def render_timer(self, spec: UnitSpec) -> tuple[Path, str] | None:
+        """The (filename, content) of `spec`'s schedule-arming timer unit
+        (systemd `.timer`), or None when the backend has no separate
+        timer (launchd embeds the schedule in the config unit) or `spec`
+        is unscheduled."""
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:
@@ -179,13 +192,6 @@ class Scheduler(abc.ABC):
         (killed, or exited before the runner wrote `last-run.json`)
         from a clean run, so a stale `last-run.json` isn't reported as
         the live outcome."""
-
-    @abc.abstractmethod
-    def drifted_units(self, spec: UnitSpec) -> frozenset[str]:
-        """The unit-file kinds (UNIT_CONFIG / UNIT_TIMER) whose install
-        diverges from `spec` -- a file missing or not matching what
-        `render` would produce, or the schedule-bearing unit the
-        scheduler has unloaded. Empty when the install is in sync."""
 
     @abc.abstractmethod
     def activate(

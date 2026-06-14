@@ -45,6 +45,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony import cli as crony_cli  # noqa: E402
 from crony import commands as crony_commands  # noqa: E402
+from crony import model as crony_model  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony import runner as crony_runner  # noqa: E402
@@ -423,8 +424,8 @@ class TestApplyHardTimeout:
     bare run for an uncapped one. Same backstop on both platforms.
     """
 
-    _GUARD = crony_runtime.GUARD_SUBCOMMAND
-    _PAD = crony_runtime.HARD_TIMEOUT_PADDING_SEC
+    _GUARD = crony_model.GUARD_SUBCOMMAND
+    _PAD = crony_model._HARD_TIMEOUT_PADDING_SEC
 
     def test_darwin_capped_job_renders_guard(
         self, tmp_path: Path, monkeypatch: Any
@@ -1813,9 +1814,49 @@ class TestSchedulerVerifyEmission:
 
 
 class TestUvExecutable:
-    def test_uv_executable_errors_when_uv_not_on_path(
-        self, monkeypatch: Any
+    """`_uv_executable` locates the uv binary baked into platform units.
+
+    crony always runs under uv, which exports its own absolute path as
+    `$UV`, so that is the authoritative source independent of PATH; a
+    PATH lookup is the fallback for the rare run outside uv.
+    """
+
+    def test_prefers_env_uv(self, tmp_path: Path, monkeypatch: Any) -> None:
+        uv = tmp_path / "real-uv"
+        uv.write_text("")
+        monkeypatch.setenv("UV", str(uv))
+        # PATH would answer differently; $UV must win.
+        monkeypatch.setattr(
+            crony_runtime.shutil, "which", lambda _name: "/usr/bin/uv"
+        )
+        assert crony_runtime._uv_executable() == uv.resolve()
+
+    def test_falls_back_to_path_when_env_uv_missing_file(
+        self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # $UV set but pointing at a path that no longer exists (uv moved):
+        # fall back to the PATH lookup rather than baking a dead path.
+        monkeypatch.setenv("UV", str(tmp_path / "gone" / "uv"))
+        path_uv = tmp_path / "path-uv"
+        path_uv.write_text("")
+        monkeypatch.setattr(
+            crony_runtime.shutil, "which", lambda _name: str(path_uv)
+        )
+        assert crony_runtime._uv_executable() == path_uv.resolve()
+
+    def test_falls_back_to_path_when_env_uv_unset(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("UV", raising=False)
+        path_uv = tmp_path / "path-uv"
+        path_uv.write_text("")
+        monkeypatch.setattr(
+            crony_runtime.shutil, "which", lambda _name: str(path_uv)
+        )
+        assert crony_runtime._uv_executable() == path_uv.resolve()
+
+    def test_errors_when_uv_not_found(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("UV", raising=False)
         monkeypatch.setattr(crony_runtime.shutil, "which", lambda _name: None)
         with pytest.raises(PreconditionError, match="uv not found"):
             crony_runtime._uv_executable()
@@ -2753,20 +2794,21 @@ class TestStatusFieldColumns:
         assert crony_commands._timeout_display(gnode) == f"{gnode.timeout}s"
         assert crony_commands._priority_display(gnode) is None
 
-    def test_stale_includes_unit_drift(
+    def test_stale_includes_unit_config_drift(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # A synced snapshot whose installed unit file drifted reads
-        # stale; the launchd plist is the config unit, so the stale
-        # column reports `unit-config`.
+        # A snapshot whose installed unit file drifted reads stale; the
+        # launchd plist is the config unit, so the stale column reports
+        # `unit-config`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
-        # Hand-edit the installed unit file so the load-time integrity
-        # check flags drift while the snapshot is unchanged.
+        # Hand-edit the installed unit file so its normalized form no
+        # longer matches the pending node's render, while the snapshot is
+        # unchanged.
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         plist.write_text(plist.read_text() + "\n<!-- edited -->\n")
         monkeypatch.setattr(crony_runtime, "unit_state", lambda _n: "enabled")
@@ -2800,20 +2842,20 @@ class TestStatusFieldColumns:
             config.pending.by_full_name[h.full("gx")]
         )
         d = crony_commands._stale_fields
-        cfg_drift = frozenset({crony_platform.UNIT_CONFIG})
-        both_drift = frozenset(
-            {crony_platform.UNIT_CONFIG, crony_platform.UNIT_TIMER}
-        )
+        assert isinstance(jnode, Job)
         assert d(None, None) == ""
         assert d(jnode, None) == ""
         assert d(jnode, gnode) == "kind"  # job vs group
         assert d(jnode, jnode) == ""  # identical snapshots
-        assert d(jnode, jnode, unit_drift=cfg_drift) == "unit-config"
-        assert (
-            d(jnode, jnode, unit_drift=both_drift) == "unit-config,unit-timer"
+        # The normalized units are ordinary compared fields, so a
+        # divergent one reports `unit-config` / `unit-timer`.
+        cfg_drift = dataclasses.replace(jnode, unit_config_normalized="edited")
+        assert d(jnode, cfg_drift) == "unit-config"
+        both = dataclasses.replace(
+            jnode, unit_config_normalized="x", unit_timer_normalized="y"
         )
+        assert d(jnode, both) == "unit-config,unit-timer"
         # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
-        assert isinstance(jnode, Job)
         bumped = dataclasses.replace(jnode, snapshot_schema=4)
         assert d(jnode, bumped) == "snapshot-schema"
 

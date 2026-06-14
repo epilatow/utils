@@ -8,9 +8,10 @@ RuntimeState), loads and schema-checks applied snapshots, applies and
 destroys individual entries (apply_one / destroy_one -- rendering,
 installing, and removing platform units, alias symlinks, and state
 dirs), writes last-run records, holds the run-lock, and answers
-scheduler queries (install paths, drift, enable state) through the
-per-host platform backend. All disk reads, mutations, locks, and
-scheduler queries the pure crony.model deliberately omits live here.
+scheduler queries (install paths, installed units, enable state)
+through the per-host platform backend. All disk reads, mutations,
+locks, and scheduler queries the pure crony.model deliberately omits
+live here.
 """
 
 from __future__ import annotations
@@ -101,7 +102,6 @@ def _read_runtime_state(
     state_dir: Path,
     *,
     full_name: str | None,
-    snapshot: crony.model.Job | crony.model.JobGroup | None = None,
     last_exits: dict[str, crony.platform.UnitLastExit] | None = None,
 ) -> crony.model.RuntimeState:
     """Snapshot the runtime-only state inside one state dir: the
@@ -111,12 +111,6 @@ def _read_runtime_state(
     RuntimeState instead of walking the unit dirs ad-hoc.
     `full_name` is None only for a broken entry whose snapshot
     didn't yield a recoverable name.
-
-    `snapshot` is the parsed `Job` / `JobGroup` for entries in
-    `Config.current`; when supplied (with a known `full_name`),
-    the unit-install integrity check runs and `unit_drift`
-    reflects the result. Left None for broken refs (no snapshot)
-    and unit-only refs (no state dir to read from).
 
     `last_exits` is the scheduler's bulk last-launch map (keyed by
     full name); the entry for `full_name`, if any, is stored so
@@ -144,12 +138,9 @@ def _read_runtime_state(
 
     unit_config: Path | None = None
     unit_timer: Path | None = None
-    unit_drift: frozenset[str] = frozenset()
     if full_name is not None:
         unit_config = _platform_unit_config_path(full_name)
         unit_timer = _platform_unit_timer_path(full_name)
-        if snapshot is not None:
-            unit_drift = _unit_drift(snapshot)
 
     unit_last_exit = (
         last_exits.get(full_name)
@@ -164,7 +155,6 @@ def _read_runtime_state(
         has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
         unit_config=unit_config,
         unit_timer=unit_timer,
-        unit_drift=unit_drift,
         unit_last_exit=unit_last_exit,
         run_pid=read_pid_file(state_dir / "run.pid"),
     )
@@ -173,6 +163,7 @@ def _read_runtime_state(
 def _build_current_graph(
     state_root: Path,
     last_exits: dict[str, crony.platform.UnitLastExit],
+    platform: str | None = None,
 ) -> tuple[
     crony.model.Graph,
     dict[crony.unit.EntityRef, crony.model.JobOrphan],
@@ -188,7 +179,13 @@ def _build_current_graph(
     unrecognized kind, dataclass `TypeError`) is recorded broken
     (`reason` set, "re-apply required"); a dir with no snapshot at all
     is recorded as a nameless, non-broken orphan (leftover junk).
+
+    Each node's normalized config / timer units are baked from the
+    entry's on-disk unit files and installed run command (read here,
+    rendered by `snapshot_from_dict` against `platform`) so a
+    `config=stale` verdict is a pure node comparison.
     """
+    sched = scheduler(platform)
     current = crony.model.Graph()
     orphans: dict[crony.unit.EntityRef, crony.model.JobOrphan] = {}
     runtime: dict[crony.unit.EntityRef, crony.model.RuntimeState] = {}
@@ -291,12 +288,22 @@ def _build_current_graph(
                     if en is not None
                     else None
                 )
+                config_disk, timer_disk, inst_uv, inst_crony = (
+                    _current_unit_disk_inputs(str(en), sched)
+                    if en is not None
+                    else (None, None, None, None)
+                )
                 snap = crony.model.snapshot_from_dict(
                     raw,
                     state_dir_symlink=_read_symlink_pair(alias)
                     if alias is not None
                     else None,
                     fda_wrapper=_fda_wrapper_for(raw),
+                    platform=platform,
+                    unit_config_disk=config_disk,
+                    unit_timer_disk=timer_disk,
+                    installed_uv=inst_uv,
+                    installed_crony=inst_crony,
                 )
             except (TypeError, ValueError) as exc:
                 orphans[ref] = crony.model.JobOrphan(
@@ -310,22 +317,14 @@ def _build_current_graph(
             full = str(snap.entity_name)
             if isinstance(snap, crony.model.Job):
                 current.jobs[snap.entity_ref] = snap
-                current.by_full_name[full] = snap.entity_ref
-                runtime[snap.entity_ref] = _read_runtime_state(
-                    uuid_dir,
-                    full_name=full,
-                    snapshot=snap,
-                    last_exits=last_exits,
-                )
             else:
                 current.groups[snap.entity_ref] = snap
-                current.by_full_name[full] = snap.entity_ref
-                runtime[snap.entity_ref] = _read_runtime_state(
-                    uuid_dir,
-                    full_name=full,
-                    snapshot=snap,
-                    last_exits=last_exits,
-                )
+            current.by_full_name[full] = snap.entity_ref
+            runtime[snap.entity_ref] = _read_runtime_state(
+                uuid_dir,
+                full_name=full,
+                last_exits=last_exits,
+            )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
     # run.lock / pending.flag / user-trigger.flag) as a normal
@@ -351,13 +350,22 @@ def load_config() -> crony.model.Config:
     platform = crony.platform.current_platform()
 
     toml_config = crony.config.TomlConfig.load_all()
-    pending = crony.model.Graph.build_pending(toml_config)
+    # Resolve the live uv / crony executables once and stamp them onto
+    # every pending node, so a node renders its real unit self-contained
+    # (an apply bakes the current binaries; nothing re-derives them per
+    # render or self-reload check). crony always runs under uv, so this
+    # never fails for a real invocation.
+    pending = crony.model.Graph.build_pending(
+        toml_config,
+        uv_path=_uv_executable(),
+        crony_path=_crony_executable(),
+    )
     # One bulk scheduler query feeds every entry's `unit_last_exit`, so
     # status can tell a launch killed before it recorded anything from
     # the stale `last-run.json` that survives such a kill.
     last_exits = scheduler(platform).unit_last_exits()
     current, orphans, runtime = _build_current_graph(
-        crony.paths.STATE_DIR, last_exits
+        crony.paths.STATE_DIR, last_exits, platform
     )
 
     # Resolve same-name collisions among current entries. Two state
@@ -555,121 +563,58 @@ def host() -> crony.platform.HostPlatform:
     return crony.platform.get_host(crony.platform.current_platform())
 
 
-# Hidden crony subcommand the platform unit invokes to perform a run.
-# The leading underscore marks it internal (matching `_run-guard`): end
-# users fire jobs via `crony trigger`, never by calling this directly.
-RUN_SUBCOMMAND = "_run"
-
-# Temporary back-compat alias for RUN_SUBCOMMAND. Units installed before
-# the `run` -> `_run` rename bake the old `run` token into their argv;
-# keeping it accepted lets those units keep firing until a `crony apply`
-# re-renders them. Remove once no `run`-baked units remain on any host.
-RUN_SUBCOMMAND_LEGACY = "run"
-
-
-def run_argv(
-    uv_path: Path, crony_path: Path, ref: crony.unit.EntityRef
-) -> tuple[str, ...]:
-    """The argv a unit uses to invoke the runner for `ref`.
-
-    The absolute uv / crony paths are baked in because platform
-    schedulers start a unit with a minimal PATH that omits uv; the
-    runner is addressed by `<bundle>:<uuid>` so it skips the name lookup.
-    """
-    return (
-        str(uv_path),
-        "run",
-        "--script",
-        str(crony_path),
-        RUN_SUBCOMMAND,
-        str(ref),
-    )
-
-
-# Seconds added to a capped entry's timeout to form the hard guard's
-# wallclock cap. The cap is looser than the entry timeout so the runner's
-# own soft timeout fires first (keeping the clean last-run.json
-# reporting); the guard is the last-resort backstop for a runner that
-# wedges before honoring its deadline. The padding covers crony startup
-# plus the soft timeout's SIGTERM->SIGKILL grace.
-HARD_TIMEOUT_PADDING_SEC = 60
-
-# Hidden crony subcommand that wraps a run in a hard wallclock cap: it
-# launches the inner `crony _run` in its own session and kills that
-# process group if the cap elapses.
-GUARD_SUBCOMMAND = "_run-guard"
-
-
-def guarded_argv(
-    uv_path: Path,
-    crony_path: Path,
-    ref: crony.unit.EntityRef,
-    timeout: int,
-) -> tuple[str, ...]:
-    """The unit's full run command. A positive `timeout` wraps the base
-    run in the hard-timeout guard (cap = timeout + padding); an uncapped
-    entry (`timeout <= 0`) runs the base argv directly, no guard."""
-    base = run_argv(uv_path, crony_path, ref)
-    if timeout <= 0:
-        return base
-    cap = timeout + HARD_TIMEOUT_PADDING_SEC
-    return (
-        str(uv_path),
-        "run",
-        "--script",
-        str(crony_path),
-        GUARD_SUBCOMMAND,
-        str(cap),
-        *base,
-    )
-
-
-def exec_paths_from_argv(argv: list[str]) -> tuple[Path, Path] | None:
-    """Recover the `(uv, crony)` paths a unit's run argv was built with,
-    or None when both can't be found.
-
-    Scans for the absolute uv / crony executables -- an argument ending
-    in `/uv` or `/crony` that names an existing file -- rather than
-    matching a fixed argv position, so any run-command shape (bare or
-    guard-wrapped) carries the same recovery. Only still-present binaries
-    match, so a baked path that's since been removed yields None.
-    """
-    uv_path: Path | None = None
-    crony_path: Path | None = None
-    for arg in argv:
-        path = Path(arg)
-        if arg.endswith("/uv") and path.is_file():
-            uv_path = path
-        elif arg.endswith("/crony") and path.is_file():
-            crony_path = path
-    if uv_path is None or crony_path is None:
+def _read_unit_file(path: Path | None) -> str | None:
+    """The content of an on-disk unit file, or None when absent /
+    unreadable (or the backend reports no such unit)."""
+    if path is None:
         return None
-    return uv_path, crony_path
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
-def _unit_drift(
-    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
-) -> frozenset[str]:
-    """The unit-file kinds whose platform install diverges from the
-    snapshot.
-
-    Recovers the uv / crony paths baked into the installed config unit
-    and, when both still exist, rebuilds the expected argv with them so a
-    moved-but-present binary isn't flagged. When neither a usable path is
-    recoverable, the expected `cmd` is empty -- a render no installed
-    unit can match -- so the config unit surfaces as drifted.
-    """
-    sched = scheduler(platform)
-    installed = sched.installed_cmd(str(snap.entity_name))
-    recovered = (
-        exec_paths_from_argv(installed) if installed is not None else None
+def _current_unit_disk_inputs(
+    name: str, sched: crony.platform.Scheduler
+) -> tuple[str | None, str | None, Path | None, Path | None]:
+    """The on-disk inputs `snapshot_from_dict` needs to bake a current
+    node's normalized config / timer units: the config and timer unit
+    contents, and the uv / crony executable paths extracted from the
+    installed run command and confirmed still present on disk (None when
+    a baked binary is gone, so the model can't reproduce the unit and the
+    entry reads `stale`)."""
+    config_disk = _read_unit_file(sched.unit_config_path(name))
+    timer_disk = _read_unit_file(sched.unit_timer_path(name))
+    uv_s, crony_s = crony.model.exec_path_strings(
+        sched.installed_cmd(name) or []
     )
-    cmd: tuple[str, ...] = ()
-    if recovered is not None:
-        cmd = guarded_argv(
-            recovered[0], recovered[1], snap.entity_ref, snap.guard_timeout
-        )
-    return sched.drifted_units(snap.unit_spec(cmd))
+    installed_uv = Path(uv_s) if uv_s and Path(uv_s).is_file() else None
+    installed_crony = (
+        Path(crony_s) if crony_s and Path(crony_s).is_file() else None
+    )
+    return config_disk, timer_disk, installed_uv, installed_crony
+
+
+def _unit_config_changing(
+    snapshot: crony.model.Job | crony.model.JobGroup,
+    sched: crony.platform.Scheduler,
+) -> bool:
+    """Whether applying `snapshot` would rewrite its config unit -- the
+    content a fresh apply would render (with the live uv / crony paths it
+    would bake in) differs from what's installed. Drives the launchd
+    self-apply defer; launchd's config unit (the plist) carries the
+    schedule, so comparing it is sufficient there.
+
+    `snapshot` is the pending node, which carries the live executables an
+    apply would bake in -- not the installed unit's existing paths -- so
+    a moved binary is a real change the defer must honor (re-rendering it
+    would terminate the running job on launchd)."""
+    name = str(snapshot.entity_name)
+    installed = _read_unit_file(sched.unit_config_path(name))
+    if installed is None:
+        return True
+    _, rendered = sched.render_config(snapshot.unit_spec())
+    return rendered != installed
 
 
 def recover_full_name(state_dir: Path) -> str | None:
@@ -837,25 +782,28 @@ def _crony_executable() -> Path:
 def _uv_executable() -> Path:
     """Absolute path to `uv`, baked into platform unit files.
 
-    The platform scheduler starts a unit's program
-    with a minimal PATH that does not include $HOME/.local/bin or
-    /opt/homebrew/bin. Crony's PEP 723 shebang `env -S uv run
-    --script` therefore can't find uv and exits 127 before the
-    script even starts. Resolving uv to an absolute path at apply
-    time and writing it directly into the unit's argv sidesteps
-    PATH entirely.
+    The platform scheduler starts a unit's program with a minimal PATH
+    that omits $HOME/.local/bin and /opt/homebrew/bin, so the absolute
+    path is written into the unit's argv to sidestep PATH at run time.
 
-    Errors clearly if uv isn't on the agent's PATH at apply time;
-    a misconfigured environment shouldn't silently render a unit
-    that will fail at run time.
+    crony only ever runs under uv (its shebang is `uv run --script`), and
+    uv exports its own absolute path as `$UV` to every process it
+    launches -- so that is the authoritative source, independent of PATH.
+    Falls back to a PATH lookup for the rare invocation outside uv (a
+    direct `python bin/crony`), and errors only when neither answers,
+    since a misconfigured environment shouldn't silently render a unit
+    that fails at run time.
     """
+    env_uv = os.environ.get("UV")
+    if env_uv and Path(env_uv).is_file():
+        return Path(env_uv).resolve()
     path = shutil.which("uv")
     if path is None:
         raise crony.errors.PreconditionError(
-            "uv not found on PATH; install it (https://docs.astral.sh/uv/) "
-            "before running `crony apply`. Platform units bake uv's "
-            "absolute path so the scheduler doesn't have to find it "
-            "on its minimal PATH."
+            "uv not found via $UV or PATH; install it "
+            "(https://docs.astral.sh/uv/) before running `crony apply`. "
+            "Platform units bake uv's absolute path so the scheduler "
+            "doesn't have to find it on its minimal PATH."
         )
     return Path(path).resolve()
 
@@ -865,19 +813,12 @@ def _render_units(
 ) -> dict[str, str]:
     """Return {filename: content} for `snap`'s platform units.
 
-    Builds the run argv with the live `_uv_executable()` /
-    `_crony_executable()` paths -- wrapping it in the hard-timeout guard
-    for a capped entry -- and hands it to the platform Scheduler as
-    `spec.cmd`. (The drift check recovers the installed unit's own paths
-    instead; see `_unit_drift`.)
+    `snap.unit_spec()` builds the run command from the executables the
+    node already carries (the live ones for a pending node), so nothing
+    re-derives them here. (Drift detection renders with blank uv / crony
+    paths instead, so a moved-but-present binary doesn't read as drift.)
     """
-    cmd = guarded_argv(
-        _uv_executable(),
-        _crony_executable(),
-        snap.entity_ref,
-        snap.guard_timeout,
-    )
-    return scheduler(platform).render(snap.unit_spec(cmd))
+    return scheduler(platform).render(snap.unit_spec())
 
 
 def _write_apply_state(
@@ -944,10 +885,10 @@ def apply_one(
     apply cleans up a stale .timer if an entry transitions
     scheduled -> unscheduled.
 
-    The entity's prior snapshot and unit-drift verdict come from
-    the loaded model (`current` / `runtime`): the entry's own state
-    is untouched by the apply loop until this call, so the loaded
-    view still matches disk.
+    The entity's prior snapshot (with its pinned normalized units)
+    comes from the loaded model (`current`): the entry's own state is
+    untouched by the apply loop until this call, so the loaded view
+    still matches disk.
     """
     snapshot = config.pending.job_from_ref(ref)
     if snapshot is None:
@@ -977,16 +918,13 @@ def apply_one(
     # pending one. Both sides are the same dataclass shape, so
     # equality is a single Python `==`. A missing / unparseable /
     # wrong-schema prior snapshot is absent from `current` and so
-    # "not equal", triggering a fresh write. Equality alone isn't
-    # enough though: the unit-install integrity check (pinned on
-    # `runtime` at load) catches a hand-edited / missing unit file
-    # (or a scheduled unit the scheduler unloaded) whose snapshot
-    # still matches, so an otherwise-clean apply still re-renders
-    # and re-bootstraps the platform side.
+    # "not equal", triggering a fresh write. Unit-file drift is folded
+    # into that same `==`: both nodes carry their normalized config /
+    # timer units (pinned at load), so a hand-edited / missing / drifted
+    # unit leaves them unequal even when the other snapshot fields match,
+    # and an otherwise-clean apply still re-renders the platform side.
     current_snapshot = config.current.job_from_ref(ref)
-    rt = config.runtime.get(ref)
-    unit_stale = rt.unit_is_stale if rt is not None else False
-    if current_snapshot == snapshot and not unit_stale:
+    if current_snapshot == snapshot:
         return ApplyResult.UNCHANGED
     is_update = current_snapshot is not None
 
@@ -1004,7 +942,7 @@ def apply_one(
         os.environ.get(RUNNING_REF_ENV, "")
     )
     self_reload = running_ref == ref and sched.reload_terminates_running_job
-    if self_reload and _unit_drift(snapshot):
+    if self_reload and _unit_config_changing(snapshot, sched):
         logger.warning(
             "%s: deferring update -- cannot reload the unit of a "
             "running job without terminating it; re-run "

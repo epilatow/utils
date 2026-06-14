@@ -363,20 +363,17 @@ _STALE_FIELD_LABELS: dict[str, str] = {
     "timeout": "job-timeout-sec",
     "interactive_active_sec": "interactive-active",
     "interactive_delay_sec": "interactive-delay",
+    "unit_config_normalized": "unit-config",
+    "unit_timer_normalized": "unit-timer",
 }
 
 
 def _stale_fields(
     pending: crony.model.Job | crony.model.JobGroup | None,
     current: crony.model.Job | crony.model.JobGroup | None,
-    *,
-    unit_drift: frozenset[str] = frozenset(),
 ) -> str:
     """Comma-joined reasons a `config=stale` entry diverges: the
-    snapshot fields that differ between the pending and applied
-    versions, plus `unit-config` / `unit-timer` for each installed unit
-    file that has drifted from the snapshot (the two ways `config` reads
-    stale).
+    snapshot fields that differ between the pending and applied versions.
 
     Only `compare=True` fields are diffed, mirroring the dataclass `==`
     the stale verdict itself uses. A config knob is reported by the name
@@ -410,7 +407,6 @@ def _stale_fields(
                             f.name, f.name.replace("_", "-")
                         )
                     )
-    parts.extend(f"unit-{kind}" for kind in unit_drift)
     return ",".join(sorted(parts))
 
 
@@ -537,10 +533,11 @@ def _config_axis(
     is still in config, otherwise whatever the on-disk side
     recovered (current snapshot, broken snapshot, or unit-only
     orphan). `Config.config_state` reduces the pending and current
-    graphs -- both built once at load -- to a single verdict;
-    `unit_is_stale` (the load-time unit-install integrity check)
-    and a lingering-unit check layer drift signals on top of a
-    bare snapshot comparison.
+    graphs -- both built once at load -- to a single verdict. Each
+    node carries its normalized config / timer units, so a hand-edited
+    / missing / moved-away unit already surfaces as `stale` through
+    that node comparison; this function layers the FDA-wrapper and
+    lingering-unit signals on top.
     """
     if entry is not None:
         ref: crony.unit.EntityRef | None = crony.unit.EntityRef(bn, entry.uuid)
@@ -584,13 +581,6 @@ def _config_axis(
         # broken-snapshot remnant under the name is `broken`, not this
         # case.)
         return crony.model.ConfigStatus.STALE
-    if state == crony.model.ConfigStatus.SYNCED:
-        # Snapshot equality alone isn't enough: a matching
-        # snapshot whose unit file is missing / hand-edited /
-        # unloaded is still stale and apply must re-render.
-        rs = config.runtime.get(ref)
-        if rs is not None and rs.unit_is_stale:
-            return crony.model.ConfigStatus.STALE
     return state
 
 
@@ -2667,16 +2657,27 @@ def do_status(
         # no runtime, and unit-timer is empty where the platform has no
         # separate timer unit / for an unscheduled entry.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
-        unit_drift = rt.unit_drift if rt is not None else frozenset()
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
         # Flag the specific unit file whose install drifted from the
         # snapshot (re-apply re-renders it), mirroring the `stale`
-        # column's `unit-config` / `unit-timer` tokens.
-        if unit_config_cell and crony.platform.UNIT_CONFIG in unit_drift:
-            unit_config_cell = f"{unit_config_cell}{_DIVERGENCE_MARKER}"
-        if unit_timer_cell and crony.platform.UNIT_TIMER in unit_drift:
-            unit_timer_cell = f"{unit_timer_cell}{_DIVERGENCE_MARKER}"
+        # column's `unit-config` / `unit-timer` tokens. Drift is the
+        # normalized unit differing between the pending and current
+        # nodes; an orphan / broken / pending-only row lacks one side and
+        # goes unflagged.
+        if pending_node is not None and current_node is not None:
+            if (
+                unit_config_cell
+                and pending_node.unit_config_normalized
+                != current_node.unit_config_normalized
+            ):
+                unit_config_cell = f"{unit_config_cell}{_DIVERGENCE_MARKER}"
+            if (
+                unit_timer_cell
+                and pending_node.unit_timer_normalized
+                != current_node.unit_timer_normalized
+            ):
+                unit_timer_cell = f"{unit_timer_cell}{_DIVERGENCE_MARKER}"
         # `log-file`: the reported log path, read off each side's node
         # via the same `log_path` accessor `crony logs` uses. Dual-
         # source, so a not-yet-applied rename flags `^`. An orphan row
@@ -2715,13 +2716,9 @@ def do_status(
             _priority_display(pending_node), _priority_display(current_node)
         )
         # The `stale` column summarizes why an entry reads stale -- the
-        # snapshot fields that differ, plus `unit-config` / `unit-timer`
-        # for an installed-unit drift.
-        stale_cell = _stale_fields(
-            pending_node,
-            current_node,
-            unit_drift=unit_drift,
-        )
+        # snapshot fields that differ, including `unit-config` /
+        # `unit-timer` for an installed-unit drift.
+        stale_cell = _stale_fields(pending_node, current_node)
         flag_cells: dict[str, str] = {}
         flags_summary_parts: list[str] = []
         for member in crony.config.JobFlags.members():

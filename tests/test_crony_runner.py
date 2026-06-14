@@ -1604,7 +1604,7 @@ class TestJobPriority:
         unit.write_text(munged)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.runtime[ref].unit_is_stale is True
+        assert config.config_state(ref) == "stale"
 
 
 class TestKeepAwake:

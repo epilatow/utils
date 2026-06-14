@@ -349,8 +349,13 @@ class TestJobFlagsBacking:
         )
         group = _resolve_snapshot_for(cfg, "g")
         assert group.flags == JobFlags.KEEP_AWAKE
+        # The alias pair and the normalized units are derived state, never
+        # serialized, so a bare reload (no disk inputs) carries neither.
         assert snapshot_from_dict(group.to_dict()) == dataclasses.replace(
-            group, state_dir_symlink=None
+            group,
+            state_dir_symlink=None,
+            unit_config_normalized=None,
+            unit_timer_normalized=None,
         )
 
 
@@ -404,7 +409,11 @@ class TestFdaWrapperField:
         snap = self._snap(flags=["full-disk-access"])
         loaded = snapshot_from_dict(snap.to_dict())
         assert loaded == dataclasses.replace(
-            snap, state_dir_symlink=None, fda_wrapper=None
+            snap,
+            state_dir_symlink=None,
+            fda_wrapper=None,
+            unit_config_normalized=None,
+            unit_timer_normalized=None,
         )
 
     def test_group_has_no_fda_wrapper_field(self) -> None:
@@ -447,19 +456,29 @@ class TestSharedSnapshotSurface:
         assert self._group_snap().timing is not None
 
     def test_job_unit_spec_carries_its_priority(self) -> None:
-        snap = self._job_snap()
-        spec = snap.unit_spec(("cmd",))
+        # `unit_spec` builds the command itself from the node's
+        # executables, so the node has to carry them.
+        snap = dataclasses.replace(
+            self._job_snap(),
+            uv_path=Path("/uv"),
+            crony_path=Path("/crony"),
+        )
+        spec = snap.unit_spec()
         assert spec.priority == snap.priority
         assert snap.priority is PriorityClass.HIGH
         assert spec.timing == snap.timing
-        assert spec.cmd == ("cmd",)
+        assert spec.cmd[0] == "/uv"
 
     def test_group_unit_spec_is_normal(self) -> None:
         # Groups request no special scheduling, which resolves to the
         # neutral NORMAL class (zero platform directives) rather than a
         # nullable priority.
-        group = self._group_snap()
-        spec = group.unit_spec(("cmd",))
+        group = dataclasses.replace(
+            self._group_snap(),
+            uv_path=Path("/uv"),
+            crony_path=Path("/crony"),
+        )
+        spec = group.unit_spec()
         assert spec.priority is PriorityClass.NORMAL
         assert spec.timing == group.timing
 
@@ -467,11 +486,14 @@ class TestSharedSnapshotSurface:
         group = self._group_snap()
         d = group.to_dict()
         assert "priority" not in d
-        # The alias pair is derived disk state, never serialized, so a
-        # reloaded node carries no symlink until the current-graph scan
-        # supplies one.
+        # The alias pair and the normalized units are derived state, never
+        # serialized, so a reloaded node carries neither until the
+        # current-graph scan supplies them.
         assert snapshot_from_dict(d) == dataclasses.replace(
-            group, state_dir_symlink=None
+            group,
+            state_dir_symlink=None,
+            unit_config_normalized=None,
+            unit_timer_normalized=None,
         )
 
     def test_timeout_is_a_shared_base_field(self) -> None:

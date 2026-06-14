@@ -29,9 +29,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from conftest_crony import _isolate_home  # noqa: E402, F401
 
 from crony import cli as crony_cli  # noqa: E402
+from crony import model as crony_model  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import runner as crony_runner  # noqa: E402
-from crony import runtime as crony_runtime  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
     ExitCode,
@@ -191,7 +191,7 @@ class TestRunLegacyAlias:
         with (
             patch.dict(
                 crony_cli._COMMAND_CALLBACKS,
-                {crony_runtime.RUN_SUBCOMMAND_LEGACY: mock_cb},
+                {crony_model.RUN_SUBCOMMAND_LEGACY: mock_cb},
             ),
             patch("sys.argv", ["prog", "run", "default:u-test"]),
         ):
@@ -204,8 +204,8 @@ class TestRunLegacyAlias:
     def test_both_spellings_route_to_the_same_handler(self) -> None:
         cb = crony_cli._COMMAND_CALLBACKS
         assert (
-            cb[crony_runtime.RUN_SUBCOMMAND]
-            is cb[crony_runtime.RUN_SUBCOMMAND_LEGACY]
+            cb[crony_model.RUN_SUBCOMMAND]
+            is cb[crony_model.RUN_SUBCOMMAND_LEGACY]
             is crony_runner.do_run
         )
 
