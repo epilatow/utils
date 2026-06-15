@@ -1953,7 +1953,11 @@ def _resolve_state_axes(
     remnants: set[str],
     *,
     mask_reason: str = "",
-) -> tuple[crony.model.ConfigStatus, str, crony.model.JobStatus]:
+) -> tuple[
+    crony.model.ConfigStatus,
+    crony.model.UnitStatus,
+    crony.model.JobStatus,
+]:
     """Compute the (cfg, unit, last) status axes for one full name.
 
     `do_status` is the only consumer; the function is factored
@@ -2025,8 +2029,10 @@ def _resolve_state_axes(
     )
     pending_node = config.pending.job_from_ref(ref) if ref is not None else None
     current_node = config.current.job_from_ref(ref) if ref is not None else None
+    us = crony.model.UnitStatus
+    unit_state: crony.model.UnitStatus
     if cfg_state == crony.model.ConfigStatus.MISSING:
-        unit_state = "none"
+        unit_state = us.NONE
     else:
         sched_node = pending_node or current_node
         if sched_node is not None:
@@ -2036,19 +2042,23 @@ def _resolve_state_axes(
         else:
             grouped = False
         if grouped:
-            unit_state = "grouped"
+            unit_state = us.GROUPED
         elif current_node is not None and current_node.unit_disabled:
             # A disabled entry installs an ordinary loaded unit (just
-            # schedule-less), so the scheduler reports it ENABLED; the
+            # schedule-less), so the scheduler reports it loaded; the
             # disabled overlay rides on the snapshot, not the scheduler.
-            unit_state = crony.platform.UnitState.DISABLED
+            unit_state = us.DISABLED
         else:
             installed_name = (
                 str(current_node.entity_name)
                 if current_node is not None
                 else full
             )
-            unit_state = crony.runtime.unit_state(installed_name)
+            unit_state = (
+                us.ENABLED
+                if crony.runtime.is_loaded(installed_name)
+                else us.NONE
+            )
     last_state = _last_run_state(config, full)
     return cfg_state, unit_state, last_state
 
@@ -2596,7 +2606,7 @@ def do_status(
         )
         if (
             config_source != "pending"
-            and unit_state == crony.platform.UnitState.DISABLED
+            and unit_state == crony.model.UnitStatus.DISABLED
         ):
             # A disabled timer won't fire on its schedule, so the cron
             # expression is misleading -- show the runtime fact, with no
@@ -2803,8 +2813,8 @@ def do_status(
             crony.model.JobStatus.GATED,
         }
         unhealthy_unit = {
-            crony.platform.UnitState.NONE,
-            crony.platform.UnitState.DISABLED,
+            crony.model.UnitStatus.NONE,
+            crony.model.UnitStatus.DISABLED,
         }
         rows = [
             r

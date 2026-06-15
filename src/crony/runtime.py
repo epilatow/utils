@@ -609,7 +609,7 @@ def _current_unit_disk_inputs(
     installed_crony = (
         Path(crony_s) if crony_s and Path(crony_s).is_file() else None
     )
-    unit_loaded = sched.state(name) != crony.platform.UnitState.NONE
+    unit_loaded = sched.is_loaded(name)
     return config_disk, timer_disk, installed_uv, installed_crony, unit_loaded
 
 
@@ -717,20 +717,16 @@ def _alias_symlink_names() -> set[str]:
     return names
 
 
-def unit_state(
-    name: str, platform: str | None = None
-) -> crony.platform.UnitState:
-    """Whether the platform scheduler has a unit by this name loaded:
-    ENABLED or NONE.
-
-    NONE means the scheduler doesn't know a unit by this name. The
-    operator-disabled state is not a scheduler fact -- a disabled entry
-    installs an ordinary loaded unit (just schedule-less), so the status
-    caller derives the DISABLED UNIT-axis value from the snapshot
-    (`Job.unit_disabled`), and the `grouped` value for an entry with no
-    own unit, neither here.
+def is_loaded(name: str, platform: str | None = None) -> bool:
+    """Whether the platform scheduler has a unit by this name loaded
+    (and so triggerable). False means the scheduler doesn't know a unit
+    by this name. The operator-disabled state is not a scheduler fact -- a
+    disabled entry installs an ordinary loaded unit (just schedule-less),
+    so the status caller derives the `disabled` UNIT-axis value from the
+    snapshot (`Job.unit_disabled`), and the `grouped` value for an entry
+    with no own unit, neither here.
     """
-    return scheduler(platform).state(name)
+    return scheduler(platform).is_loaded(name)
 
 
 def user_trigger_flag_path(state_dir: Path) -> Path:

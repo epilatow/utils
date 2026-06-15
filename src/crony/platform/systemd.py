@@ -20,7 +20,6 @@ from crony.platform.scheduler import (
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
-    UnitState,
 )
 from crony.unit import (
     Interval,
@@ -297,23 +296,20 @@ class SystemdScheduler(Scheduler):
                     names.add(p.name[len(prefix) : -len(suffix)])
         return names
 
-    def state(self, name: str) -> UnitState:
+    def is_loaded(self, name: str) -> bool:
         # A scheduled entry arms an enabled `.timer`; a schedule-less one
         # (grouped / transit or disabled) installs no timer, only a
         # static `.service`. Query the timer when it is installed, else
         # fall back to the service (systemd reports a unit with no
         # [Install] section `static`), so a grouped / disabled entry
-        # still reads loaded. Anything else is NONE. The operator-disabled
-        # state is not read here -- it is flagged off the snapshot, not
-        # the scheduler.
+        # still reads loaded. Anything else means the scheduler has no
+        # unit. The operator-disabled state is not read here -- it is
+        # flagged off the snapshot, not the scheduler.
         timer = self.unit_dir / timer_filename(name)
         unit = (
             timer_filename(name) if timer.exists() else service_filename(name)
         )
-        st = _is_enabled(unit)
-        return (
-            UnitState.ENABLED if st in ("enabled", "static") else UnitState.NONE
-        )
+        return _is_enabled(unit) in ("enabled", "static")
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # The `.service` is the unit that runs the job; query it (not

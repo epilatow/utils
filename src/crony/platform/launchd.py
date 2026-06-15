@@ -20,7 +20,6 @@ from crony.platform.scheduler import (
     UNIT_PREFIX,
     Scheduler,
     UnitLastExit,
-    UnitState,
 )
 from crony.unit import (
     Interval,
@@ -240,8 +239,8 @@ class LaunchdScheduler(Scheduler):
                 names.add(p.name[len(prefix) : -len(suffix)])
         return names
 
-    def state(self, name: str) -> UnitState:
-        return UnitState.ENABLED if _is_loaded(label(name)) else UnitState.NONE
+    def is_loaded(self, name: str) -> bool:
+        return _is_loaded(label(name))
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # `launchctl list` lines are `<pid>\t<status>\t<label>`. The

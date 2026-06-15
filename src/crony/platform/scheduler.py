@@ -13,7 +13,6 @@ the running host.
 from __future__ import annotations
 
 import abc
-import enum
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,23 +24,6 @@ from crony.unit import UnitSpec
 # how the entry script is invoked, and is deliberately not derived from
 # the script filename.
 UNIT_PREFIX = "crony"
-
-
-class UnitState(enum.StrEnum):
-    """The UNIT-axis value `crony status` shows for an entry.
-
-    `Scheduler.state` reports only ENABLED (the scheduler has the unit
-    loaded / registered) or NONE (it knows no unit by that name).
-    DISABLED is not a scheduler fact: a disabled entry is installed as an
-    ordinary loaded-but-schedule-less unit, so the status caller derives
-    the DISABLED value from the entry's snapshot (`Job.unit_disabled`),
-    not from `state`. A StrEnum so the status caller can render and
-    compare it as its plain value.
-    """
-
-    ENABLED = "enabled"
-    DISABLED = "disabled"
-    NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -179,12 +161,13 @@ class Scheduler(abc.ABC):
         """
 
     @abc.abstractmethod
-    def state(self, name: str) -> UnitState:
-        """Whether the scheduler knows `name`'s unit: ENABLED when it is
-        loaded / registered, NONE when it isn't. The operator-disabled
-        state is not a scheduler fact -- it rides on the entry's snapshot
-        (`Job.unit_disabled`), since a disabled entry installs an ordinary
-        loaded-but-schedule-less unit."""
+    def is_loaded(self, name: str) -> bool:
+        """Whether the scheduler has a unit by `name` loaded / registered
+        (so it can be triggered). The operator-disabled state is not a
+        scheduler fact -- a disabled entry installs an ordinary
+        loaded-but-schedule-less unit, so it still reads loaded; the
+        disabled overlay rides on the entry's snapshot
+        (`Job.unit_disabled`)."""
 
     @abc.abstractmethod
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
