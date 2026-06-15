@@ -204,18 +204,19 @@ class TestInit:
     def test_template_parses_when_uncommented(self) -> None:
         """The example schema in the template must be valid TOML.
 
-        Extract section headers (`# [foo]`) and simple key = value
-        lines (`# foo = ...`), strip the leading `# `, and feed the
-        result to from_raw. Prose comments, dividers, and
-        double-commented variants (`# # foo`) don't match the
-        strict patterns and are skipped.
+        Commented-out directives carry a bare `#` (no space); prose
+        carries `# ` (a space). Extract the directive lines (section
+        headers `#[foo]` and `#foo = ...`), strip the single leading
+        `#`, and feed the result to from_raw. Prose, dividers, and
+        inline-comment continuations all keep the space, so the
+        strict patterns skip them.
         """
         extracted: list[str] = []
-        section_re = re.compile(r"^# \[[\w.\-]+\]\s*$")
-        kv_re = re.compile(r"^# [A-Za-z_][\w.\-]*\s*=")
+        section_re = re.compile(r"^#\[[\w.\-]+\]\s*$")
+        kv_re = re.compile(r"^#[A-Za-z_][\w.\-]*\s*=")
         for line in crony_commands._default_config_template().splitlines():
             if section_re.match(line) or kv_re.match(line):
-                extracted.append(line[2:])
+                extracted.append(line[1:])
         text = "\n".join(extracted)
         _parse(tomlkit.loads(text))
 
