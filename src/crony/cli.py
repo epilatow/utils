@@ -82,10 +82,7 @@ accepted so a prior install can still be cleaned up; the
 remaining lifecycle commands (`enable`, `disable`, `trigger`)
 operate on the installed unit as usual since they need no
 parsed config field. Several
-opt-in columns are available via `--cols`, including `unit`
-(UNIT axis: enabled / disabled / grouped / none, where
-`disabled` -- the operator-disable -- is read from the snapshot,
-not the scheduler),
+opt-in columns are available via `--cols`, including
 `groups` (group memberships), `kind` (job vs group), `masked-by`
 (why the entry is filter-excluded on this host: `host` and / or
 `platform` joined with `,`, or one of `unused` / `empty`),

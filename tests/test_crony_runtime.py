@@ -86,32 +86,37 @@ def _install_units(snap: Any) -> None:
 
 
 class TestIsLoadedDarwin:
-    # `is_loaded` reports only whether the scheduler has the unit; the
-    # disabled overlay rides on the snapshot, not the scheduler.
+    # `Scheduler.is_loaded` reports only whether the scheduler has the
+    # unit; the disabled overlay rides on the snapshot, not the scheduler.
     def test_loaded_label_is_true(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(
             launchd, "_launchctl_list", lambda: "-\t0\torg.crony.default.j\n"
         )
-        assert crony_runtime.is_loaded("default.j", "darwin") is True
+        sched = crony_runtime.scheduler("darwin")
+        assert sched.is_loaded("default.j") is True
 
     def test_false_when_not_loaded(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
-        assert crony_runtime.is_loaded("default.j", "darwin") is False
+        sched = crony_runtime.scheduler("darwin")
+        assert sched.is_loaded("default.j") is False
 
 
 class TestIsLoadedLinux:
     def test_enabled_timer_is_loaded(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
-        assert crony_runtime.is_loaded("default.j", "linux") is True
+        sched = crony_runtime.scheduler("linux")
+        assert sched.is_loaded("default.j") is True
 
     def test_static_service_is_loaded(self, monkeypatch: Any) -> None:
         # A schedule-less entry's static `.service` counts as loaded.
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "static")
-        assert crony_runtime.is_loaded("default.j", "linux") is True
+        sched = crony_runtime.scheduler("linux")
+        assert sched.is_loaded("default.j") is True
 
     def test_false_on_empty(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
-        assert crony_runtime.is_loaded("default.j", "linux") is False
+        sched = crony_runtime.scheduler("linux")
+        assert sched.is_loaded("default.j") is False
 
 
 class TestUnitNameDelegatesTolerateRefForm:
@@ -126,8 +131,12 @@ class TestUnitNameDelegatesTolerateRefForm:
     def test_is_loaded_false_for_ref_form(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
-        assert crony_runtime.is_loaded(self._REF_FORM, "darwin") is False
-        assert crony_runtime.is_loaded(self._REF_FORM, "linux") is False
+        assert crony_runtime.scheduler("darwin").is_loaded(self._REF_FORM) is (
+            False
+        )
+        assert crony_runtime.scheduler("linux").is_loaded(self._REF_FORM) is (
+            False
+        )
 
     def test_unit_config_path_none_for_ref_form(self) -> None:
         for platform in ("darwin", "linux"):
@@ -278,88 +287,46 @@ class TestResolveStateAxes:
     def test_orphan_when_stamp_present_without_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # Stamped on disk but not in any bundle -> orphan.
         h = _ApplyHarness(tmp_path, monkeypatch)
-        # Stamped on disk but not in any bundle -> orphan; no
-        # entry to consult so the unit axis falls through to the
-        # scheduler (stubbed loaded to surface the `enabled` branch).
         ghost = h.full("ghost")
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
         config = crony_runtime.load_config()
-        cfg, sched, last = crony_commands._resolve_state_axes(
+        cfg, last = crony_commands._resolve_state_axes(
             config, ghost, config.installed_full_names()
         )
         assert cfg == "orphan"
-        assert sched == "enabled"
         assert last == "never"
 
-    def test_missing_short_circuits_unit_to_none(
+    def test_missing_when_no_stamp_no_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # No stamp, no bundle entry -> missing; unit short-
-        # circuits to "none" without consulting the scheduler.
+        # No stamp, no bundle entry -> missing.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
-        called: list[str] = []
-
-        def _stub_sched(n: str) -> bool:
-            called.append(n)
-            return True
-
-        monkeypatch.setattr(crony_runtime, "is_loaded", _stub_sched)
         config = crony_runtime.load_config()
-        cfg, unit_state, last = crony_commands._resolve_state_axes(
+        cfg, last = crony_commands._resolve_state_axes(
             config, h.full("ghost"), set()
         )
         assert cfg == "missing"
-        assert unit_state == "none"
         assert last == "never"
-        assert not called  # short-circuit honored
 
-    def test_grouped_when_entry_has_no_schedule_or_interval(
+    def test_applied_leaf_is_synced(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Group-only job (no schedule / interval, fires only via
-        # parent group) -> sched = "grouped" without consulting the
-        # scheduler.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {
-                "job": {"a": {"command": "true"}},
-                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
-            },
-            default_target_jobs=["g"],
-        )
-        h.apply("a")
-        h.apply("g")
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
-        config = crony_runtime.load_config()
-        _, sched, _ = crony_commands._resolve_state_axes(
-            config, h.full("a"), config.installed_full_names()
-        )
-        assert sched == "grouped"
-
-    def test_leaf_with_schedule_consults_is_loaded(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # Scheduled, enabled leaf -> the unit-axis display reads the
-        # scheduler's live load fact via `runtime.is_loaded`. Stub it
-        # False (distinct from the harness's loaded-at-bake stub, which
-        # keeps CONFIG synced) so the display alone flips to `none`.
+        # A freshly applied scheduled leaf reads CONFIG synced.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
         h.apply("j")
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: False)
         config = crony_runtime.load_config()
-        cfg_state, sched, _ = crony_commands._resolve_state_axes(
+        cfg_state, _ = crony_commands._resolve_state_axes(
             config, h.full("j"), config.installed_full_names()
         )
         assert cfg_state == "synced"
-        assert sched == "none"
 
 
 class TestPerEntityConfigErrors:
@@ -511,7 +478,6 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=["good"],
         )
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
         crony_commands.do_status(
             jobs=[],
             cols=None,
@@ -629,7 +595,6 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=[],
         )
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
         crony_commands.do_status(
             jobs=[],
             cols=None,
@@ -660,10 +625,8 @@ class TestPerEntityConfigErrors:
             default_target_jobs=[],
         )
         config = crony_runtime.load_config()
-        cfg_state, _unit_state, _last_state = (
-            crony_commands._resolve_state_axes(
-                config, h.full("bad"), config.installed_full_names()
-            )
+        cfg_state, _last_state = crony_commands._resolve_state_axes(
+            config, h.full("bad"), config.installed_full_names()
         )
         assert cfg_state == "error"
 

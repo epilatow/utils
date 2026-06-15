@@ -318,8 +318,9 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
 
     A Schedule shows its OnCalendar source; an Interval shows
     `interval=<spec>`. An entry with no timing -- a transit group or a
-    group-only job -- displays as `grouped` to mirror the UNIT axis
-    value for the same condition.
+    group-only job -- displays as `grouped`. This renders only the
+    schedule shape; the caller overrides the cell with `disabled` for an
+    operator-disabled entry (it has the snapshot's disable flag).
     """
     if isinstance(timing, crony.unit.Schedule):
         return str(timing)
@@ -413,12 +414,12 @@ def _stale_fields(
 # =============================================================================
 # RUNTIME STATE (enable / disable / status / linger)
 # =============================================================================
-# Runtime state is the UNIT axis: whether the scheduler has the unit
-# loaded, plus the operator-disable overlay crony records on the
+# Runtime state is the operator-disable overlay crony records on the
 # snapshot. It's orthogonal to CONFIG state: a unit can be `synced` with
-# config while the operator has paused it (`disabled`). apply preserves
-# the disable across re-renders so a paused job stays off when the user
-# runs `crony apply` to push other changes.
+# config while the operator has paused it (`disabled`, surfaced in
+# status' SCHEDULE cell). apply preserves the disable across re-renders
+# so a paused job stays off when the user runs `crony apply` to push
+# other changes.
 
 
 # Maps a recorded ExitClass to the JobStatus shown in the STATUS cell:
@@ -1579,7 +1580,6 @@ _STATUS_COL_HEADERS: dict[str, str] = {
     "config": "CONFIG",
     "schedule": "SCHEDULE",
     "groups": "GROUPS",
-    "unit": "UNIT",
     "status": "STATUS",
     "last-ran": "LAST RAN",
     "masked-by": "MASKED BY",
@@ -1747,22 +1747,13 @@ Columns
                     table pointing at `crony apply`. --config-current shows
                     the applied schedule, --config-pending the pending one;
                     the `^` fires on any divergence regardless of mode.
-                    When the entry is disabled the cell renders as
-                    `disabled` -- the cron expression is misleading there
-                    since the unit is installed schedule-less and won't
-                    fire. Add the opt-in `unit` column to see the state
-                    for the rest of the rows. --config-pending suppresses
-                    this override (the pending schedule is a config fact,
-                    independent of runtime state).
-  unit              UNIT axis: enabled | disabled | grouped | none.
-                    `disabled` means the operator turned it off (`crony
-                    disable`) -- still installed and triggerable, but
-                    not run automatically (neither on its schedule nor
-                    as part of a group); `disabled` wins over `grouped`
-                    in this column. `grouped` means the entry has no
-                    schedule and is enabled (a parent group dispatches
-                    it); `none` means the scheduler doesn't see a unit
-                    by this name.
+                    When the entry is disabled (`crony disable`) the cell
+                    renders `disabled` (red on a color stream): it is
+                    still installed and triggerable but not run
+                    automatically -- neither on its schedule nor as part
+                    of a group. The disable is shown in every mode,
+                    including --config-pending, since the pending config
+                    carries the same disable.
   unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
                     `crony-<name>.timer` (scheduled) or
                     `crony-<name>.service` (grouped) on Linux. Source-
@@ -1899,15 +1890,14 @@ def _resolve_state_axes(
     mask_reason: str = "",
 ) -> tuple[
     crony.model.ConfigStatus,
-    crony.model.UnitStatus,
     crony.model.JobStatus,
 ]:
-    """Compute the (cfg, unit, last) status axes for one full name.
+    """Compute the (cfg, last) status axes for one full name.
 
     `do_status` is the only consumer; the function is factored
     out so the axis derivation has a single home and the
     renderer-side filter (`--exclude-healthy`) reads the same
-    triple as the default tree view. Returns the values straight
+    pair as the default tree view. Returns the values straight
     from the underlying state readers -- no opinion about whether
     a given combination is "bad" -- so the caller applies its own
     filtering / display logic on top.
@@ -1961,53 +1951,8 @@ def _resolve_state_axes(
             if full in remnants
             else crony.model.ConfigStatus.MASKED
         )
-    # Schedule shape and the installed-unit name come from the entity
-    # by uuid, not by `full`: a rename keeps the uuid, so the grouped
-    # check reads the graph node and the platform query targets the
-    # unit installed under the *current* (applied) name -- which may
-    # differ from `full` for a not-yet-applied rename.
-    ref = (
-        crony.unit.EntityRef(bn, entry.uuid)
-        if entry is not None
-        else config.resolve_current(full) or config.resolve_pending(full)
-    )
-    pending_node = config.pending.job_from_ref(ref) if ref is not None else None
-    current_node = config.current.job_from_ref(ref) if ref is not None else None
-    us = crony.model.UnitStatus
-    unit_state: crony.model.UnitStatus
-    if cfg_state == crony.model.ConfigStatus.MISSING:
-        unit_state = us.NONE
-    else:
-        sched_node = pending_node or current_node
-        if sched_node is not None:
-            grouped = sched_node.timing is None
-        elif entry is not None:
-            grouped = entry.timing is None
-        else:
-            grouped = False
-        if current_node is not None and current_node.unit_disabled:
-            # A disabled entry installs an ordinary loaded unit (just
-            # schedule-less), so the scheduler reports it loaded; the
-            # disabled overlay rides on the snapshot, not the scheduler.
-            # Disabled wins over grouped: a grouped child can be
-            # operator-disabled, and `disabled` is the salient state
-            # (its parent's dispatch now skips it).
-            unit_state = us.DISABLED
-        elif grouped:
-            unit_state = us.GROUPED
-        else:
-            installed_name = (
-                str(current_node.entity_name)
-                if current_node is not None
-                else full
-            )
-            unit_state = (
-                us.ENABLED
-                if crony.runtime.is_loaded(installed_name)
-                else us.NONE
-            )
     last_state = _last_run_state(config, full)
-    return cfg_state, unit_state, last_state
+    return cfg_state, last_state
 
 
 def _entry_is_scheduled(
@@ -2077,7 +2022,8 @@ _STALE_VALUE_FOOTER: str = (
 
 # ANSI color for the status table, emitted only when stdout is a TTY
 # and NO_COLOR is unset (https://no-color.org/). Red flags a broken or
-# failed state; yellow flags drift the operator can reconcile with
+# failed state -- including a `disabled` SCHEDULE cell, where the entry
+# isn't firing; yellow flags drift the operator can reconcile with
 # `crony apply` (a `stale` config verdict, or any divergence-flagged
 # cell). The `^` marker itself is never colored.
 _ANSI_RED: str = "\033[31m"
@@ -2132,6 +2078,8 @@ def _status_value_color(col: str, value: str) -> str | None:
         if value == crony.model.ConfigStatus.STALE:
             return _ANSI_YELLOW
     elif col == "status" and value in _STATUS_RED_STATUS:
+        return _ANSI_RED
+    elif col == "schedule" and value == "disabled":
         return _ANSI_RED
     return None
 
@@ -2330,12 +2278,11 @@ def do_status(
     whenever the two sources differ. The two flags are mutually
     exclusive.
 
-    `--exclude-healthy` drops rows where CONFIG is `synced`,
-    UNIT is `enabled` (or `grouped` -- anything that fires), and
-    STATUS is `ok` / `never` / `gated`. A disabled unit is
-    unhealthy (it isn't firing), so it survives the filter.
-    Output is flat (no tree indent). Always exits 0 -- this is a
-    filter on the display, not a gate.
+    `--exclude-healthy` drops rows where CONFIG is `synced`, the
+    entry is not disabled, and STATUS is `ok` / `never` / `gated`.
+    A disabled entry is unhealthy (it isn't firing), so it survives
+    the filter. Output is flat (no tree indent). Always exits 0 --
+    this is a filter on the display, not a gate.
 
     On a color-capable TTY (NO_COLOR unset) broken / failed verdicts
     render red and reconcilable drift renders yellow; see the
@@ -2528,13 +2475,19 @@ def do_status(
             # kind nothing on this side records, so the cell is blank.
             kind = ""
 
-        # CONFIG / UNIT / STATUS are single-source verdicts (not flag-
-        # selected); resolve them against the config name so the
-        # TOML-entry-based grouped check and errored detection land.
-        cfg_state, unit_state, last = _resolve_state_axes(
+        # CONFIG / STATUS are single-source verdicts (not flag-selected);
+        # resolve them against the config name so the errored detection
+        # lands on the right entry.
+        cfg_state, last = _resolve_state_axes(
             config, config_name, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, config_name)
+        # The operator-disable rides on the applied snapshot, so it reads
+        # off the current node (a disable always follows an apply). The
+        # override below keys off this in every --config-* view -- the
+        # pending side, which load mirrors to the same value, shows
+        # `disabled` too rather than the schedule it would compare to.
+        disabled = current_node is not None and current_node.unit_disabled
 
         # SCHEDULE / GROUPS / name are dual-source: read each side by
         # uuid and let the active source pick (default pending-first).
@@ -2551,14 +2504,12 @@ def do_status(
             if current_node is not None
             else None
         )
-        if (
-            config_source != "pending"
-            and unit_state == crony.model.UnitStatus.DISABLED
-        ):
-            # A disabled timer won't fire on its schedule, so the cron
-            # expression is misleading -- show the runtime fact, with no
-            # divergence flag (the cell is no longer the schedule it
-            # would compare against).
+        if disabled:
+            # A disabled entry won't fire on its schedule (and a disabled
+            # group child is skipped by its parent), so the cron
+            # expression is misleading -- show the disable instead, in
+            # every view: the pending config carries the same disable, so
+            # the schedule it would compare against is "disabled" too.
             sched_cell = "disabled"
         else:
             sched_cell = _mark(pending_sched, current_sched)
@@ -2722,7 +2673,6 @@ def do_status(
             "config": cfg_state,
             "schedule": sched_cell,
             "groups": groups_cell,
-            "unit": unit_state,
             "status": last,
             "last-ran": last_ran,
             "masked-by": mask_reason,
@@ -2751,24 +2701,21 @@ def do_status(
         # indent, since the surviving rows won't reconstruct the
         # tree anyway and a half-indented subtree is more
         # confusing than a flat list. Healthy: `config == synced`
-        # AND `unit` not in {none, disabled} AND `status` in
-        # {ok, never, gated}. A disabled unit is unhealthy
-        # because it isn't firing.
+        # AND not disabled AND `status` in {ok, never, gated}. A
+        # disabled entry is unhealthy because it isn't firing; its
+        # SCHEDULE cell reads `disabled`. (A not-loaded unit is
+        # already excluded by `config != synced` -- it reads broken.)
         healthy_status = {
             crony.model.JobStatus.OK,
             crony.model.JobStatus.NEVER,
             crony.model.JobStatus.GATED,
-        }
-        unhealthy_unit = {
-            crony.model.UnitStatus.NONE,
-            crony.model.UnitStatus.DISABLED,
         }
         rows = [
             r
             for r in rows
             if not (
                 r["config"] == crony.model.ConfigStatus.SYNCED
-                and r["unit"] not in unhealthy_unit
+                and r["schedule"] != "disabled"
                 and r["status"] in healthy_status
             )
         ]
@@ -2829,7 +2776,7 @@ def do_status(
         widths[col] = max(len(header), cell_max)
 
     # Two-space separator: a single space ran headers and cells
-    # together at narrow column widths (e.g. CONFIG=6 vs UNIT=8
+    # together at narrow column widths (e.g. CONFIG=6 vs STATUS=6
     # produced columns visually flush against each other).
     sep = "  "
     header_line = sep.join(

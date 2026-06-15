@@ -1112,25 +1112,6 @@ class ConfigStatus(StrEnum):
     ERROR = "error"
 
 
-class UnitStatus(StrEnum):
-    """The verdict `crony status` shows in its UNIT column: how the
-    entry's platform unit is armed. A StrEnum so it compares against and
-    renders as its plain value.
-
-    Derived by the status caller from the entry's schedule shape, its
-    snapshot, and the scheduler's load fact (`Scheduler.is_loaded`):
-    GROUPED when the entry has no schedule of its own (a parent group
-    dispatches it); DISABLED when the operator turned it off (`crony
-    disable`) -- installed and triggerable, just schedule-less; ENABLED
-    when the scheduler has its schedule-arming unit loaded; NONE when the
-    scheduler knows no unit by that name."""
-
-    ENABLED = "enabled"
-    DISABLED = "disabled"
-    GROUPED = "grouped"
-    NONE = "none"
-
-
 class GateResult(StrEnum):
     """A run's gate outcome, recorded as `gate` in last-run.json. NONE
     when no gate ran (no gate configured, or --skip-gate); PASSED on a
@@ -1295,9 +1276,7 @@ class RuntimeState:
     both the unit-file drift (`unit_config_normalized` /
     `unit_timer_normalized`) and the load-time scheduler-loaded fact
     (`unit_loaded`) that `config_state` scores, so a config verdict is a
-    pure node comparison that needs no RuntimeState lookup. status' UNIT
-    axis queries `runtime.is_loaded` on demand for its live enabled /
-    disabled / grouped / none display.
+    pure node comparison that needs no RuntimeState lookup.
     """
 
     state_dir: Path

@@ -717,18 +717,6 @@ def _alias_symlink_names() -> set[str]:
     return names
 
 
-def is_loaded(name: str, platform: str | None = None) -> bool:
-    """Whether the platform scheduler has a unit by this name loaded
-    (and so triggerable). False means the scheduler doesn't know a unit
-    by this name. The operator-disabled state is not a scheduler fact -- a
-    disabled entry installs an ordinary loaded unit (just schedule-less),
-    so the status caller derives the `disabled` UNIT-axis value from the
-    snapshot (`Job.unit_disabled`), and the `grouped` value for an entry
-    with no own unit, neither here.
-    """
-    return scheduler(platform).is_loaded(name)
-
-
 def user_trigger_flag_path(state_dir: Path) -> Path:
     """Filesystem path of the one-shot user-trigger sentinel."""
     return state_dir / "user-trigger.flag"

@@ -513,7 +513,6 @@ class TestRunJobBasics:
             '"reason": "snapshot has schema 3 expected 4"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
         crony_commands.do_status(
             jobs=[],
             cols=None,
@@ -546,7 +545,6 @@ class TestRunJobBasics:
             '"2026-01-01T00:00:00-08:00", "exit_code": 64}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(crony_runtime, "is_loaded", lambda _n: True)
         crony_commands.do_status(
             jobs=[],
             cols=None,
