@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "tomlkit"]
+# dependencies = ["pytest", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 
@@ -41,13 +41,13 @@ from crony.config import (  # noqa: E402
     TomlConfig,
 )
 from crony.model import (  # noqa: E402
-    CURRENT_SNAPSHOT_SCHEMA,
     _resolve_snapshot_for,
 )
 from crony.platform import (  # noqa: E402
     launchd,
     systemd,
 )
+from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 
 # Scratch namespace published to the crony test files. The runner
 # harness's `trigger_unit_sync` stub records each dispatched call on

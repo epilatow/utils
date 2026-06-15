@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tomlkit"]
+# dependencies = ["tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 #

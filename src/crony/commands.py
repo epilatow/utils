@@ -2219,9 +2219,9 @@ def do_status(
         if pkind is not None or ckind is not None:
             kind = _mark(pkind, ckind)
         elif isinstance(entry, crony.config.TomlJobGroup):
-            kind = crony.model.EntityKind.GROUP
+            kind = crony.unit.EntityKind.GROUP
         elif entry is not None:
-            kind = crony.model.EntityKind.JOB
+            kind = crony.unit.EntityKind.JOB
         else:
             # No node and no live config entry: an off-graph ref whose
             # kind nothing on this side records, so the cell is blank.

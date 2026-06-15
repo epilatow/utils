@@ -6,7 +6,10 @@ The Job / JobGroup entities and the Config graph that ties the pending
 config view to the current applied view, plus the runtime-state and
 last-run value types those graphs reference. Holds the pure
 config->graph construction (cascade resolution + host/platform
-selection) and the model<->dict serialization that backs snapshot.json.
+selection) and the translation between a node and its snapshot.json
+form (`snapshot_from_dict` / `<node>.to_snapshot`). The on-disk format
+itself -- the typed model, migration, and schema versions -- lives in
+crony.snapshot.
 
 The model does no I/O of its own: no disk reads, no locks, no live
 scheduler-state queries -- those live in crony.runtime. It may render
@@ -28,6 +31,7 @@ import crony.config
 import crony.errors
 import crony.paths
 import crony.platform
+import crony.snapshot
 import crony.unit
 from crony.platform.fda import FDAWrapper
 
@@ -48,41 +52,15 @@ from crony.platform.fda import FDAWrapper
 # at fire time.
 
 
-# The schema version current code writes into every snapshot.json.
-# Bump it whenever the persisted shape changes -- a new / renamed /
-# dropped key -- so an older crony rejects a newer snapshot cleanly via
-# the schema gate instead of failing to construct it. A change current
-# code must read back from an older shape (a key rename) also needs a
-# `# v<N> compat` block in `snapshot_from_dict`; one that only older
-# code can't read forward (a new defaulted field) does not.
-CURRENT_SNAPSHOT_SCHEMA: int = 6
-
-# Every schema version current code can still load: CURRENT plus each
-# older version it reads forward -- via the field defaults, or a
-# `# v<N> compat` block in `snapshot_from_dict` for a shape it has to
-# translate. A snapshot whose schema is outside this set is rejected as
-# needing re-apply. Drop a version here (and delete any tagged compat
-# block) once no snapshots at that schema remain. v6 added the persisted
-# `unit_disabled` flag; v4 / v5 snapshots predate it and load with it
-# defaulted False, so they need no compat block.
-COMPAT_SNAPSHOT_SCHEMA: frozenset[int] = frozenset({4, 5, 6})
-
 # The per-entry log file name, kept in one place so no caller inlines
 # the literal. Lives inside the entry's state dir (uuid-keyed) and is
 # reachable through the short-name alias.
 RUN_LOG_NAME: str = "run.log"
 
-# Flags persist in the snapshot as one boolean per member rather than
-# the bitmask value (JSON has no IntFlag), keyed by the flag's dash
-# token (`keep-awake`) so the snapshot spelling matches the config one.
-# `snapshot_from_dict` also reads the legacy underscore spelling
-# (`keep_awake`) that older snapshots used, so they still load; that
-# fallback goes once no underscore-keyed snapshots remain. Derived from
-# `JobFlags.members()`, so a new flag needs no edit to `to_dict` /
-# `snapshot_from_dict`.
-_FLAG_SNAPSHOT_FIELDS: tuple[tuple[str, crony.config.JobFlags], ...] = tuple(
-    (flag.token, flag) for flag in crony.config.JobFlags.members()
-)
+# The on-disk snapshot format -- the `JobSnapshot` / `GroupSnapshot`
+# models and the `CURRENT_SNAPSHOT_SCHEMA` / `COMPAT_SNAPSHOT_SCHEMA`
+# constants -- lives in `crony.snapshot`. The node <-> snapshot
+# translation (`snapshot_from_dict`, `<node>.to_snapshot`) is below.
 
 
 # Hidden crony subcommand the platform unit invokes to perform a run.
@@ -200,16 +178,6 @@ def _render_normalized_units(
     return config, timer[1] if timer is not None else None
 
 
-class EntityKind(StrEnum):
-    """Whether a snapshot entry is a single job or a job-group. Pinned
-    in snapshot.json under the `kind` key and used as the discriminator
-    `snapshot_from_dict` branches on. A StrEnum so it serializes as its
-    plain value and on-disk records round-trip unchanged."""
-
-    JOB = "job"
-    GROUP = "group"
-
-
 @dataclass(frozen=True)
 class _JobCommon:
     """Holds the fields both snapshot kinds carry.
@@ -233,7 +201,7 @@ class _JobCommon:
     # JSON key. Compared in `==`, so a snapshot whose format predates the
     # current code surfaces as drift (reported `snapshot-schema`).
     snapshot_schema: int
-    kind: EntityKind  # whether this entry is a job or a group
+    kind: crony.unit.EntityKind  # whether this entry is a job or a group
     bundle: str  # the bundle namespace; uuids are unique within it
     name: str  # the short name (the part after the bundle)
     uuid: str  # the entry's identity within the bundle (matches state-dir name)
@@ -462,54 +430,39 @@ class _JobCommon:
             unit_timer_normalized=timer,
         )
 
+    def _schedule_str(self) -> str | None:
+        """This entry's schedule as its source string (None unless its
+        timing is a Schedule)."""
+        return (
+            str(self.timing)
+            if isinstance(self.timing, crony.unit.Schedule)
+            else None
+        )
+
+    def _interval_str(self) -> str | None:
+        """This entry's interval as its source string (None unless its
+        timing is an Interval)."""
+        return (
+            str(self.timing)
+            if isinstance(self.timing, crony.unit.Interval)
+            else None
+        )
+
+    def to_snapshot(
+        self,
+    ) -> crony.snapshot.JobSnapshot | crony.snapshot.GroupSnapshot:
+        """The on-disk snapshot model for this entry (`Job` / `JobGroup`
+        each build their kind). The model holds only the persisted fields,
+        the value objects rendered to their source strings, and the flags
+        as their per-member booleans."""
+        raise NotImplementedError
+
     def to_dict(self) -> dict[str, Any]:
-        """Serialize this entry to its JSON dict, rendering the typed
-        value-object fields back to their source strings so snapshot.json
-        stays string-keyed regardless of the in-memory types. `Job`
-        layers the job-only `priority` on top."""
-        d = dataclasses.asdict(self)
-        # The format version persists under the `schema` JSON key; the
-        # in-memory field is `snapshot_schema` (unambiguous at its use
-        # sites and in the STALE column).
-        d["schema"] = d.pop("snapshot_schema")
-        # snapshot.json stores the full `<bundle>.<short>` name; `bundle`
-        # is redundant with it and recomputed on load.
-        d["name"] = str(self.entity_name)
-        d.pop("bundle", None)
-        # The alias pair is derived disk / expected state, recomputed on
-        # load -- it never belongs in the persisted snapshot.
-        d.pop("state_dir_symlink", None)
-        # The unit paths, normalized units, and on-disk / scheduler facts
-        # are all derived render / disk state, recomputed on load.
-        # `unit_disabled` is NOT here: it is real applied state, persisted
-        # so a re-apply preserves the operator's disable.
-        for k in (
-            "uv_path",
-            "crony_path",
-            "unit_config_normalized",
-            "unit_timer_normalized",
-            "unit_config_exists",
-            "unit_loaded",
-        ):
-            d.pop(k, None)
-        # Flags persist as one boolean per member (see
-        # `_FLAG_SNAPSHOT_FIELDS`), never the bitmask value itself;
-        # folded back in `snapshot_from_dict`. Emitted for jobs and
-        # groups alike so a group's resolved cascade value round-trips
-        # -- it has no runtime effect but stays visible for tracing
-        # inheritance.
-        d.pop("flags", None)
-        for key, flag in _FLAG_SNAPSHOT_FIELDS:
-            d[key] = flag in self.flags
-        timing = self.timing
-        d.pop("timing", None)
-        d["schedule"] = (
-            str(timing) if isinstance(timing, crony.unit.Schedule) else None
-        )
-        d["interval"] = (
-            str(timing) if isinstance(timing, crony.unit.Interval) else None
-        )
-        return d
+        """Serialize this entry to its snapshot.json dict, via the typed
+        snapshot model -- which keys the fields by their on-disk names and
+        drops everything the model doesn't carry (the derived,
+        never-persisted state)."""
+        return self.to_snapshot().model_dump(by_alias=True, mode="json")
 
 
 @dataclass(frozen=True)
@@ -662,8 +615,8 @@ class Job(_JobCommon):
             crony_path=Path(""),
         )
         return cls(
-            snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
-            kind=EntityKind.JOB,
+            snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
+            kind=crony.unit.EntityKind.JOB,
             bundle=name.bundle,
             name=name.short,
             uuid=job.uuid,
@@ -697,17 +650,104 @@ class Job(_JobCommon):
             ),
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        """Extend the shared snapshot dict with the job-only `priority`
-        (rendered to its source string)."""
-        d = super().to_dict()
-        d["priority"] = str(self.priority)
-        # The wrapper state is derived runtime state (expected on the
-        # config side, probed on the current side), recomputed on load --
-        # never persisted. Job-only, so it is dropped here rather than in
-        # the shared serializer.
-        d.pop("fda_wrapper", None)
-        return d
+    def to_snapshot(self) -> crony.snapshot.JobSnapshot:
+        return crony.snapshot.JobSnapshot(
+            snapshot_schema=self.snapshot_schema,
+            kind=crony.unit.EntityKind.JOB,
+            name=str(self.entity_name),
+            uuid=self.uuid,
+            timeout=self.timeout,
+            schedule=self._schedule_str(),
+            interval=self._interval_str(),
+            unit_disabled=self.unit_disabled,
+            interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
+            keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
+            full_disk_access=(
+                crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
+            ),
+            command=self.command,
+            script=self.script,
+            args=self.args,
+            gate=self.gate,
+            gate_script=self.gate_script,
+            gate_args=self.gate_args,
+            env=self.env,
+            priority=str(self.priority),
+            success_exit_codes=self.success_exit_codes,
+            interactive_active_sec=self.interactive_active_sec,
+            interactive_delay_sec=self.interactive_delay_sec,
+        )
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snap: crony.snapshot.JobSnapshot,
+        *,
+        state_dir_symlink: tuple[Path, str] | None = None,
+        fda_wrapper: FDAWrapper | None = None,
+        platform: str | None = None,
+        unit_config_disk: str | None = None,
+        unit_timer_disk: str | None = None,
+        installed_uv: Path | None = None,
+        installed_crony: Path | None = None,
+        unit_loaded: bool = False,
+    ) -> Job:
+        """Build a Job from its on-disk snapshot model, parsing the typed
+        value-object fields back from their source strings, plus the
+        derived runtime state the caller probed (see `snapshot_from_dict`
+        for what the current-graph scan supplies)."""
+        en = snap.entity_name()
+        timing = snap.timing()
+        flags = snap.job_flags()
+        priority = snap.priority_class()
+        # A disabled entry installs its unit schedule-less, so a render
+        # that reproduces the on-disk file must drop the timing too.
+        eff_timing = None if snap.unit_disabled else timing
+        interactive = crony.config.JobFlags.INTERACTIVE in flags
+        config_norm, timer_norm = _current_normalized(
+            name=en,
+            ref=snap.entity_ref(),
+            eff_timing=eff_timing,
+            priority=priority,
+            guard_timeout=0 if interactive else snap.timeout,
+            platform=platform,
+            unit_config_disk=unit_config_disk,
+            unit_timer_disk=unit_timer_disk,
+            installed_uv=installed_uv,
+            installed_crony=installed_crony,
+        )
+        return cls(
+            snapshot_schema=snap.snapshot_schema,
+            kind=snap.kind,
+            bundle=en.bundle,
+            name=en.short,
+            uuid=snap.uuid,
+            timeout=snap.timeout,
+            command=snap.command,
+            script=snap.script,
+            args=snap.args,
+            gate=snap.gate,
+            gate_script=snap.gate_script,
+            gate_args=snap.gate_args,
+            env=snap.env,
+            priority=priority,
+            success_exit_codes=snap.success_exit_codes,
+            interactive_active_sec=snap.interactive_active_sec,
+            interactive_delay_sec=snap.interactive_delay_sec,
+            timing=timing,
+            flags=flags,
+            unit_disabled=snap.unit_disabled,
+            # Wrapper state is derived (job-only): stamp the caller's
+            # probed value, gated on the full-disk-access flag.
+            fda_wrapper=cls._fda_wrapper_for(flags, fda_wrapper),
+            uv_path=installed_uv,
+            crony_path=installed_crony,
+            unit_config_normalized=config_norm,
+            unit_timer_normalized=timer_norm,
+            unit_config_exists=unit_config_disk is not None,
+            unit_loaded=unit_loaded,
+            state_dir_symlink=state_dir_symlink,
+        )
 
 
 @dataclass(frozen=True)
@@ -792,8 +832,8 @@ class JobGroup(_JobCommon):
             crony_path=Path(""),
         )
         return cls(
-            snapshot_schema=CURRENT_SNAPSHOT_SCHEMA,
-            kind=EntityKind.GROUP,
+            snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
+            kind=crony.unit.EntityKind.GROUP,
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
@@ -807,6 +847,78 @@ class JobGroup(_JobCommon):
             crony_path=crony_path,
             unit_config_normalized=norm_config,
             unit_timer_normalized=norm_timer,
+        )
+
+    def to_snapshot(self) -> crony.snapshot.GroupSnapshot:
+        return crony.snapshot.GroupSnapshot(
+            snapshot_schema=self.snapshot_schema,
+            kind=crony.unit.EntityKind.GROUP,
+            name=str(self.entity_name),
+            uuid=self.uuid,
+            timeout=self.timeout,
+            schedule=self._schedule_str(),
+            interval=self._interval_str(),
+            unit_disabled=self.unit_disabled,
+            interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
+            keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
+            full_disk_access=(
+                crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
+            ),
+            children=self.children,
+            trigger_timeout_sec=self.trigger_timeout_sec,
+        )
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snap: crony.snapshot.GroupSnapshot,
+        *,
+        state_dir_symlink: tuple[Path, str] | None = None,
+        platform: str | None = None,
+        unit_config_disk: str | None = None,
+        unit_timer_disk: str | None = None,
+        installed_uv: Path | None = None,
+        installed_crony: Path | None = None,
+        unit_loaded: bool = False,
+    ) -> JobGroup:
+        """Build a JobGroup from its on-disk snapshot model plus the
+        derived runtime state the caller probed (see `snapshot_from_dict`
+        for what the current-graph scan supplies)."""
+        en = snap.entity_name()
+        timing = snap.timing()
+        flags = snap.job_flags()
+        eff_timing = None if snap.unit_disabled else timing
+        config_norm, timer_norm = _current_normalized(
+            name=en,
+            ref=snap.entity_ref(),
+            eff_timing=eff_timing,
+            priority=crony.unit.PriorityClass.NORMAL,
+            guard_timeout=snap.timeout,
+            platform=platform,
+            unit_config_disk=unit_config_disk,
+            unit_timer_disk=unit_timer_disk,
+            installed_uv=installed_uv,
+            installed_crony=installed_crony,
+        )
+        return cls(
+            snapshot_schema=snap.snapshot_schema,
+            kind=snap.kind,
+            bundle=en.bundle,
+            name=en.short,
+            uuid=snap.uuid,
+            timeout=snap.timeout,
+            children=snap.children,
+            trigger_timeout_sec=snap.trigger_timeout_sec,
+            timing=timing,
+            flags=flags,
+            unit_disabled=snap.unit_disabled,
+            uv_path=installed_uv,
+            crony_path=installed_crony,
+            unit_config_normalized=config_norm,
+            unit_timer_normalized=timer_norm,
+            unit_config_exists=unit_config_disk is not None,
+            unit_loaded=unit_loaded,
+            state_dir_symlink=state_dir_symlink,
         )
 
 
@@ -855,6 +967,64 @@ def _resolve_snapshot_for(
     raise crony.errors.PreconditionError(f"unknown job/group: {short!r}")
 
 
+# =============================================================================
+# SNAPSHOT <-> NODE
+# =============================================================================
+# `crony.snapshot` owns the on-disk format (the typed model, migration,
+# and schema versions); these translate between that model and the
+# in-memory Job / JobGroup. The per-kind work lives on the nodes
+# (`to_snapshot` / `from_snapshot`); `snapshot_from_dict` is the load
+# entry point the runtime / runner call.
+
+
+def _current_normalized(
+    *,
+    name: crony.unit.EntityName,
+    ref: crony.unit.EntityRef,
+    eff_timing: crony.unit.Timing | None,
+    priority: crony.unit.PriorityClass,
+    guard_timeout: int,
+    platform: str | None,
+    unit_config_disk: str | None,
+    unit_timer_disk: str | None,
+    installed_uv: Path | None,
+    installed_crony: Path | None,
+) -> tuple[str | None, str | None]:
+    """The current node's (config, timer) normalized units from the
+    on-disk inputs. The config unit is the blank-path render only when a
+    render with the installed paths reproduces the on-disk file; the
+    timer carries no uv / crony paths, so its normalized form is the
+    on-disk content as-is (None when absent)."""
+    config_norm: str | None = None
+    if (
+        unit_config_disk is not None
+        and installed_uv is not None
+        and installed_crony is not None
+    ):
+        rendered, _ = _render_normalized_units(
+            platform,
+            name,
+            ref,
+            eff_timing,
+            priority,
+            guard_timeout,
+            uv=installed_uv,
+            crony_path=installed_crony,
+        )
+        if rendered == unit_config_disk:
+            config_norm, _ = _render_normalized_units(
+                platform,
+                name,
+                ref,
+                eff_timing,
+                priority,
+                guard_timeout,
+                uv=Path(""),
+                crony_path=Path(""),
+            )
+    return config_norm, unit_timer_disk
+
+
 def snapshot_from_dict(
     raw: dict[str, Any],
     *,
@@ -867,173 +1037,59 @@ def snapshot_from_dict(
     installed_crony: Path | None = None,
     unit_loaded: bool = False,
 ) -> Job | JobGroup:
-    """Construct a snapshot from its JSON dict, parsing the typed
-    value-object fields back from their source strings. Raises
-    TypeError (wrong shape) or ValueError (bad typed field / unknown
-    kind); callers treat both as a broken snapshot.
+    """Build a snapshot's node from its JSON dict: parse the on-disk shape
+    (`crony.snapshot.parse`), then construct the Job / JobGroup, baking in
+    the derived runtime state the caller probed. A wrong shape / unknown
+    key / unknown kind / bad typed field raises ValueError (a pydantic
+    ValidationError); a non-mapping top-level raises TypeError or
+    ValueError (from `dict()`). Callers treat either as a broken snapshot.
 
-    `state_dir_symlink` is the on-disk alias pair the caller read for this entry
-    (None when it has no link, or for a load that doesn't care about
-    the alias). It is not part of `raw` -- the alias is derived disk
-    state, never serialized -- so the current-graph scan passes the
-    pair it read so the frozen node carries it from construction.
+    `state_dir_symlink` is the on-disk alias pair the caller read for this
+    entry (None when it has no link, or for a load that doesn't care about
+    the alias). It is not part of `raw` -- the alias is derived disk state,
+    never serialized -- so the current-graph scan passes the pair it read
+    so the frozen node carries it from construction.
 
     `fda_wrapper` is the live Crony.app wrapper state the caller probed,
     applied only when the loaded entry carries the full-disk-access flag
-    (None otherwise). Like the alias, it is derived runtime state, never
-    serialized; a load that does not care about the wrapper leaves it
-    None.
+    (None otherwise; ignored for a group). Like the alias, it is derived
+    runtime state, never serialized.
 
     The current-graph scan passes the on-disk unit contents
     (`unit_config_disk` / `unit_timer_disk`), the uv / crony executable
-    paths it extracted from the installed run command and confirmed
-    still exist (`installed_uv` / `installed_crony`, None when a baked
-    binary is gone), and whether the scheduler has the unit loaded
-    (`unit_loaded`). The node's normalized config unit is the blank-path
-    render only when a render with those installed paths reproduces the
-    on-disk file -- so a hand-edited / drifted unit, or one whose binary
-    is gone, gets None and reads `stale` against the pending node; the
-    extracted paths, file presence, and loaded flag let `cfg_status`
-    tell `broken` from `missing`. A load that doesn't supply them (the
-    runner reading its own snapshot) leaves the derived fields empty."""
-    data = dict(raw)
-    data["state_dir_symlink"] = state_dir_symlink
-    # The format version is keyed `schema` on disk; the field is
-    # `snapshot_schema`. A missing key leaves the kwarg absent so the
-    # dataclass raises a clear "missing snapshot_schema" TypeError, which
-    # callers treat as a broken snapshot.
-    if "schema" in data:
-        data["snapshot_schema"] = data.pop("schema")
-    # snapshot.json stores the full `<bundle>.<short>` name; split it
-    # back into the `bundle` + short `name` fields (overriding any
-    # legacy `bundle` key a very old snapshot may still carry).
-    if isinstance(data.get("name"), str):
-        en = crony.unit.EntityName.from_str(data["name"])
-        data["bundle"] = en.bundle
-        data["name"] = en.short
-    schedule_str = data.pop("schedule", None)
-    interval_str = data.pop("interval", None)
-    timing: crony.unit.Timing | None
-    if schedule_str is not None:
-        timing = crony.unit.Schedule.from_str(schedule_str)
-    elif interval_str is not None:
-        timing = crony.unit.Interval.from_str(interval_str)
-    else:
-        timing = None
-    data["timing"] = timing
-    # A job snapshot always carries `priority`; an older one stored
-    # `null` for the neutral class, which now loads as NORMAL. A group
-    # snapshot has no priority key, so leave it absent for them.
-    if "priority" in data:
-        pv = data["priority"]
-        data["priority"] = (
-            crony.unit.PriorityClass.from_str(pv)
-            if pv is not None
-            else crony.unit.PriorityClass.NORMAL
+    paths it extracted from the installed run command and confirmed still
+    exist (`installed_uv` / `installed_crony`, None when a baked binary is
+    gone), and whether the scheduler has the unit loaded (`unit_loaded`).
+    The node's normalized config unit is the blank-path render only when a
+    render with those installed paths reproduces the on-disk file -- so a
+    hand-edited / drifted unit, or one whose binary is gone, gets None and
+    reads `stale` against the pending node; the extracted paths, file
+    presence, and loaded flag let `cfg_status` tell `broken` from
+    `missing`. A load that doesn't supply them (the runner reading its own
+    snapshot) leaves the derived fields empty."""
+    model = crony.snapshot.parse(raw)
+    if isinstance(model, crony.snapshot.JobSnapshot):
+        return Job.from_snapshot(
+            model,
+            state_dir_symlink=state_dir_symlink,
+            fda_wrapper=fda_wrapper,
+            platform=platform,
+            unit_config_disk=unit_config_disk,
+            unit_timer_disk=unit_timer_disk,
+            installed_uv=installed_uv,
+            installed_crony=installed_crony,
+            unit_loaded=unit_loaded,
         )
-    # The per-flag booleans are stored in the snapshot; fold them back
-    # into the bitmask for jobs and groups alike. Current snapshots key
-    # by the dash token; older ones used the underscore spelling
-    # (`keep_awake`), so read both (the legacy alias goes once none
-    # remain). Absent keys default off, so a pre-flags snapshot loads
-    # without a schema bump.
-    flags = crony.config.JobFlags(0)
-    for key, flag in _FLAG_SNAPSHOT_FIELDS:
-        enabled = data.pop(key, False)
-        legacy = data.pop(key.replace("-", "_"), False)
-        if enabled or legacy:
-            flags |= flag
-    data["flags"] = flags
-    # v4 compat: schema 4 stored the per-entry deadline under a
-    # kind-specific key (`job_timeout_sec` for jobs, `group_budget_sec`
-    # for groups); schema 5 unified them into `timeout`. Map the v4 keys
-    # forward so a schema-4 snapshot loads. Drop this block when 4
-    # leaves COMPAT_SNAPSHOT_SCHEMA.
-    legacy_timeout = data.pop("group_budget_sec", None)
-    legacy_timeout = data.pop("job_timeout_sec", legacy_timeout)
-    if "timeout" not in data and legacy_timeout is not None:
-        data["timeout"] = legacy_timeout
-    # Current-graph disk facts (empty for a bare reload): the extracted
-    # executables, whether the config unit is on disk, and whether the
-    # scheduler has the unit loaded. `cfg_status` reads them to tell
-    # `broken` from `missing`.
-    data["uv_path"] = installed_uv
-    data["crony_path"] = installed_crony
-    data["unit_config_exists"] = unit_config_disk is not None
-    data["unit_loaded"] = unit_loaded
-    # A disabled entry installs its unit schedule-less, so a render that
-    # reproduces the on-disk file must drop the timing too.
-    eff_timing = None if data.get("unit_disabled") else timing
-
-    def _current_normalized(
-        priority: crony.unit.PriorityClass, guard_timeout: int
-    ) -> tuple[str | None, str | None]:
-        """The current node's (config, timer) normalized units from the
-        on-disk inputs. The config unit is the blank-path render only
-        when a render with the installed paths reproduces the on-disk
-        file; the timer carries no uv / crony paths, so its normalized
-        form is the on-disk content as-is (None when absent)."""
-        config_norm: str | None = None
-        if (
-            unit_config_disk is not None
-            and installed_uv is not None
-            and installed_crony is not None
-        ):
-            ref = crony.unit.EntityRef(data["bundle"], data["uuid"])
-            name_obj = crony.unit.EntityName(data["bundle"], data["name"])
-            rendered, _ = _render_normalized_units(
-                platform,
-                name_obj,
-                ref,
-                eff_timing,
-                priority,
-                guard_timeout,
-                uv=installed_uv,
-                crony_path=installed_crony,
-            )
-            if rendered == unit_config_disk:
-                config_norm, _ = _render_normalized_units(
-                    platform,
-                    name_obj,
-                    ref,
-                    eff_timing,
-                    priority,
-                    guard_timeout,
-                    uv=Path(""),
-                    crony_path=Path(""),
-                )
-        return config_norm, unit_timer_disk
-
-    # The on-disk `kind` is the str the entry was serialized under;
-    # fold it back to the typed discriminator the dataclass field holds.
-    kind = data.get("kind")
-    if kind == EntityKind.JOB:
-        data["kind"] = EntityKind.JOB
-        # The wrapper state is not serialized (job-only derived runtime
-        # state); stamp the caller's probed value, gated on the
-        # full-disk-access flag, so a current node carries the live
-        # state from construction.
-        data["fda_wrapper"] = Job._fda_wrapper_for(flags, fda_wrapper)
-        interactive = crony.config.JobFlags.INTERACTIVE in flags
-        job_priority = data.get("priority", crony.unit.PriorityClass.NORMAL)
-        (
-            data["unit_config_normalized"],
-            data["unit_timer_normalized"],
-        ) = _current_normalized(
-            job_priority,
-            0 if interactive else data.get("timeout", 0),
-        )
-        return Job(**data)
-    if kind == EntityKind.GROUP:
-        data["kind"] = EntityKind.GROUP
-        (
-            data["unit_config_normalized"],
-            data["unit_timer_normalized"],
-        ) = _current_normalized(
-            crony.unit.PriorityClass.NORMAL, data.get("timeout", 0)
-        )
-        return JobGroup(**data)
-    raise ValueError(f"unknown snapshot kind {kind!r}")
+    return JobGroup.from_snapshot(
+        model,
+        state_dir_symlink=state_dir_symlink,
+        platform=platform,
+        unit_config_disk=unit_config_disk,
+        unit_timer_disk=unit_timer_disk,
+        installed_uv=installed_uv,
+        installed_crony=installed_crony,
+        unit_loaded=unit_loaded,
+    )
 
 
 @dataclass

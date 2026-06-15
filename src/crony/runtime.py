@@ -35,6 +35,7 @@ import crony.errors
 import crony.model
 import crony.paths
 import crony.platform
+import crony.snapshot
 import crony.unit
 
 logger = logging.getLogger(__name__)
@@ -77,8 +78,8 @@ def load_snapshot(
     name_hint = raw.get("name") if isinstance(raw, dict) else None
     display = name_hint if isinstance(name_hint, str) else ref_str
     schema = raw.get("schema") if isinstance(raw, dict) else None
-    if schema not in crony.model.COMPAT_SNAPSHOT_SCHEMA:
-        supported = sorted(crony.model.COMPAT_SNAPSHOT_SCHEMA)
+    if schema not in crony.snapshot.COMPAT_SNAPSHOT_SCHEMA:
+        supported = sorted(crony.snapshot.COMPAT_SNAPSHOT_SCHEMA)
         raise crony.errors.PreconditionError(
             f"snapshot for {display!r} has schema {schema!r}, "
             f"not a supported version {supported} (re-apply required)"
@@ -258,8 +259,8 @@ def _build_current_graph(
                     source_path=snap_path,
                 )
                 continue
-            if raw.get("schema") not in crony.model.COMPAT_SNAPSHOT_SCHEMA:
-                supported = sorted(crony.model.COMPAT_SNAPSHOT_SCHEMA)
+            if raw.get("schema") not in crony.snapshot.COMPAT_SNAPSHOT_SCHEMA:
+                supported = sorted(crony.snapshot.COMPAT_SNAPSHOT_SCHEMA)
                 orphans[ref] = crony.model.JobOrphan(
                     bundle=bundle_dir.name,
                     uuid=uuid_dir.name,

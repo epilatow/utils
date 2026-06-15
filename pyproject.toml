@@ -5,6 +5,11 @@ requires-python = ">=3.11"
 dependencies = [
     "epilatow-repo-shared",
     "pytest>=9.0.3",
+    # crony's snapshot model. A real project dep (not just bin/crony's
+    # PEP 723 block) so the gate's `mypy --strict src/crony/*.py`, which
+    # runs in this project venv, resolves it -- unlike tomlkit, pydantic
+    # is not pulled in transitively.
+    "pydantic>=2",
 ]
 
 [tool.uv.sources]

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov", "tomlkit"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 
@@ -57,7 +57,6 @@ from crony.errors import (  # noqa: E402
     UnitNotInstalledError,
 )
 from crony.model import (  # noqa: E402
-    CURRENT_SNAPSHOT_SCHEMA,
     ExitClass,
     GroupChildResult,
     Job,
@@ -69,6 +68,7 @@ from crony.platform import (  # noqa: E402
 )
 from crony.platform import fda as crony_fda  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
+from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     PriorityClass,
@@ -446,7 +446,9 @@ class TestRunJobBasics:
             f'"kind": "banana", "name": "default.j"}}',
             encoding="utf-8",
         )
-        with pytest.raises(PreconditionError, match="unknown snapshot kind"):
+        # The discriminated-union validator rejects the unknown tag, so
+        # the entry loads as a malformed (broken) snapshot.
+        with pytest.raises(PreconditionError, match="malformed fields"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
                 dry_run=False,

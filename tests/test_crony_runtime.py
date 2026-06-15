@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov", "tomlkit"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 
@@ -44,7 +44,6 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
-    CURRENT_SNAPSHOT_SCHEMA,
     ConfigStatus,
     Job,
     JobGroup,
@@ -57,6 +56,7 @@ from crony.platform import (  # noqa: E402
     systemd,
 )
 from crony.platform.fda import FDAWrapper  # noqa: E402
+from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,

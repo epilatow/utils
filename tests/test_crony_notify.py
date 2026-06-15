@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov", "tomlkit"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 

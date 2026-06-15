@@ -118,6 +118,17 @@ class EntityName:
         return cls(bundle, short)
 
 
+class EntityKind(enum.StrEnum):
+    """Whether an entry is a single job or a job-group. The in-memory
+    `kind` field's type on the constructed node, and on disk the `kind`
+    key the snapshot model discriminates the job vs group shape on. A
+    StrEnum so it serializes as its plain value and on-disk records
+    round-trip unchanged."""
+
+    JOB = "job"
+    GROUP = "group"
+
+
 class PriorityClass(enum.Enum):
     """A unit's scheduling priority.
 

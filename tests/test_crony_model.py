@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest", "pytest-cov", "tomlkit"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 
@@ -55,7 +55,18 @@ from crony.model import (  # noqa: E402
 )
 from crony.platform import UnitLastExit  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
+from crony.snapshot import (  # noqa: E402
+    _COMPAT_FLOOR_SCHEMA,
+    COMPAT_SNAPSHOT_SCHEMA,
+    CURRENT_SNAPSHOT_SCHEMA,
+    GroupSnapshot,
+    JobSnapshot,
+    _Since,
+    parse,
+)
 from crony.unit import (  # noqa: E402
+    EntityKind,
+    EntityName,
     EntityRef,
     PriorityClass,
 )
@@ -773,6 +784,181 @@ class TestStatusEnums:
         assert "signal" not in values
         assert "dispatched" not in values
         assert "crashed" in values
+
+
+class TestSnapshotSchemaVersioning:
+    """The snapshot schema constants derive from the model's per-field
+    version tags, and the strict model stays in lockstep with the
+    runtime flag set."""
+
+    def _job_snapshot_dict(self) -> dict[str, Any]:
+        cfg = _parse({"job": {"j": _job()}})
+        return _resolve_snapshot_for(cfg, "j").to_dict()
+
+    def test_current_schema_is_the_newest_field_version(self) -> None:
+        versions = [
+            meta.version
+            for model in (JobSnapshot, GroupSnapshot)
+            for info in model.model_fields.values()
+            for meta in info.metadata
+            if isinstance(meta, _Since)
+        ]
+        assert CURRENT_SNAPSHOT_SCHEMA == max(versions)
+
+    def test_every_field_carries_exactly_one_version(self) -> None:
+        # A persisted field with no version tag would leave
+        # CURRENT_SNAPSHOT_SCHEMA unable to see it.
+        for model in (JobSnapshot, GroupSnapshot):
+            for name, info in model.model_fields.items():
+                tags = [m for m in info.metadata if isinstance(m, _Since)]
+                assert len(tags) == 1, f"{model.__name__}.{name}: {tags}"
+
+    def test_compat_is_floor_through_current(self) -> None:
+        assert COMPAT_SNAPSHOT_SCHEMA == frozenset(
+            range(_COMPAT_FLOOR_SCHEMA, CURRENT_SNAPSHOT_SCHEMA + 1)
+        )
+
+    def test_model_has_a_field_for_every_flag(self) -> None:
+        # Adding a JobFlags member without a matching model field (aliased
+        # to its token) would silently drop the flag from the snapshot.
+        keys = {
+            info.serialization_alias or name
+            for name, info in JobSnapshot.model_fields.items()
+        }
+        for flag in JobFlags.members():
+            assert flag.token in keys, f"no model field for {flag.token}"
+
+    def test_unknown_key_is_a_broken_snapshot(self) -> None:
+        # extra="forbid": an unrecognized key fails validation, which the
+        # loaders treat as a broken snapshot (ValidationError is a
+        # ValueError).
+        d = self._job_snapshot_dict()
+        d["bogus_key"] = 1
+        with pytest.raises(ValueError):
+            snapshot_from_dict(d)
+
+
+class TestSnapshotFieldSync:
+    """Every persisted snapshot field must be wired into both
+    `<node>.to_snapshot` and `<node>.from_snapshot`. The mapping is not
+    mechanical -- a source string becomes a value object, the per-flag
+    booleans become a bitmask -- so there is no `**`-splat keeping the two
+    directions in lockstep; this round-trip is the guard instead. A
+    snapshot dict with every field at a distinctive non-default value must
+    survive a node load and re-dump unchanged: a field that
+    `from_snapshot` drops (or `to_snapshot` fails to re-emit) shows up as a
+    diff. The companion census tests assert the maximal dict still covers
+    the full field set, so adding a field forces this coverage (and thus
+    the round-trip) to be extended for it."""
+
+    def _persisted_keys(self, model: Any) -> set[str]:
+        return {
+            info.serialization_alias or name
+            for name, info in model.model_fields.items()
+        }
+
+    def _maximal_job_dict(self) -> dict[str, Any]:
+        cfg = _parse(
+            {
+                "job": {
+                    "j": _job(
+                        priority="high",
+                        flags=["interactive", "keep-awake"],
+                        **{"success-exit-codes": [3, 7]},
+                    )
+                }
+            }
+        )
+        d = _resolve_snapshot_for(cfg, "j").to_dict()
+        # Push every remaining persisted field off its default so a
+        # dropped one surfaces as a round-trip diff. `interval` stays the
+        # schedule's mutually-exclusive null twin.
+        d.update(
+            {
+                "args": ["a", "b"],
+                "env": {"K": "V"},
+                "gate": "true",
+                "gate_script": "/g",
+                "gate_args": ["x"],
+                "script": "/s",
+                "interactive_active_sec": 11,
+                "interactive_delay_sec": 22,
+                "full-disk-access": True,
+                "unit_disabled": True,
+            }
+        )
+        return d
+
+    def _maximal_group_dict(self) -> dict[str, Any]:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {
+                    "g": {
+                        "jobs": ["a"],
+                        "interval": "1h",
+                        "flags": ["keep-awake"],
+                    }
+                },
+            }
+        )
+        d = _resolve_snapshot_for(cfg, "g").to_dict()
+        d["unit_disabled"] = True
+        return d
+
+    def test_job_dict_round_trips_unchanged(self) -> None:
+        d = self._maximal_job_dict()
+        assert snapshot_from_dict(d).to_dict() == d
+
+    def test_group_dict_round_trips_unchanged(self) -> None:
+        d = self._maximal_group_dict()
+        assert snapshot_from_dict(d).to_dict() == d
+
+    def test_job_dict_covers_every_persisted_field(self) -> None:
+        assert set(self._maximal_job_dict()) == self._persisted_keys(
+            JobSnapshot
+        )
+
+    def test_group_dict_covers_every_persisted_field(self) -> None:
+        assert set(self._maximal_group_dict()) == self._persisted_keys(
+            GroupSnapshot
+        )
+
+
+class TestSnapshotIdentityRehydration:
+    """`kind` is a typed `EntityKind` field (pydantic decodes the on-disk
+    string at validation), and `entity_name()` / `entity_ref()` rehydrate
+    the stored name / uuid into their value objects -- so `crony.model`
+    consumes typed identity without re-parsing the on-disk encoding. The
+    on-disk `kind` stays the plain string so an older crony reads it
+    unchanged."""
+
+    def _job_dict(self) -> dict[str, Any]:
+        cfg = _parse({"job": {"j": _job()}})
+        return _resolve_snapshot_for(cfg, "j").to_dict()
+
+    def _group_dict(self) -> dict[str, Any]:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            }
+        )
+        return _resolve_snapshot_for(cfg, "g").to_dict()
+
+    def test_kind_decodes_to_entity_kind(self) -> None:
+        assert parse(self._job_dict()).kind is EntityKind.JOB
+        assert parse(self._group_dict()).kind is EntityKind.GROUP
+
+    def test_kind_serializes_as_plain_string(self) -> None:
+        assert self._job_dict()["kind"] == "job"
+        assert self._group_dict()["kind"] == "group"
+
+    def test_entity_name_and_ref_rehydrate(self) -> None:
+        snap = parse(self._job_dict())
+        en = EntityName.from_str(snap.name)
+        assert snap.entity_name() == en
+        assert snap.entity_ref() == EntityRef(en.bundle, snap.uuid)
 
 
 if __name__ == "__main__":
