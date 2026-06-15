@@ -276,7 +276,7 @@ class _JobCommon:
     # check. A config-built (pending) node carries the live executables
     # (resolved once at load); the current graph carries the paths
     # extracted from the on-disk unit, or None when they can't be parsed
-    # or no longer exist (a gone binary, which `config_state` reads as
+    # or no longer exist (a gone binary, which `cfg_status` reads as
     # broken). `compare=False`: a binary that merely moved must not read
     # as drift (the normalized units render the paths blank). Derived,
     # never serialized. Keyword-only.
@@ -296,7 +296,7 @@ class _JobCommon:
     unit_config_normalized: str | None = field(default=None, kw_only=True)
     unit_timer_normalized: str | None = field(default=None, kw_only=True)
     # Live on-disk / scheduler facts the current graph pins so
-    # `config_state` can tell `broken` from `missing` for a unit whose
+    # `cfg_status` can tell `broken` from `missing` for a unit whose
     # file is gone: whether the config unit (launchd plist / systemd
     # `.service`) is on disk, and whether the scheduler has the entry's
     # unit loaded -- the schedule-bearing one a backend arms (the
@@ -893,7 +893,7 @@ def snapshot_from_dict(
     render only when a render with those installed paths reproduces the
     on-disk file -- so a hand-edited / drifted unit, or one whose binary
     is gone, gets None and reads `stale` against the pending node; the
-    extracted paths, file presence, and loaded flag let `config_state`
+    extracted paths, file presence, and loaded flag let `cfg_status`
     tell `broken` from `missing`. A load that doesn't supply them (the
     runner reading its own snapshot) leaves the derived fields empty."""
     data = dict(raw)
@@ -955,7 +955,7 @@ def snapshot_from_dict(
         data["timeout"] = legacy_timeout
     # Current-graph disk facts (empty for a bare reload): the extracted
     # executables, whether the config unit is on disk, and whether the
-    # scheduler has the unit loaded. `config_state` reads them to tell
+    # scheduler has the unit loaded. `cfg_status` reads them to tell
     # `broken` from `missing`.
     data["uv_path"] = installed_uv
     data["crony_path"] = installed_crony
@@ -1096,7 +1096,7 @@ class ConfigStatus(StrEnum):
     live config view relates to the applied on-disk state. A StrEnum so
     it compares against and renders as its plain value.
 
-    `Config.config_state` produces the base verdicts that score the
+    `Config.cfg_status` produces the base verdicts that score the
     pending graph against the current one -- SYNCED / STALE / BROKEN /
     MISSING / ORPHAN. The status caller layers the two host-filter
     verdicts on top: ERROR for an entry whose bundle config was
@@ -1201,7 +1201,7 @@ class GroupRunResult(CommonRunResult):
     fail / signal (which are equally severe), and ok / gated tie
     at the bottom (gating is "intentionally not run", not a
     group-level outcome). The status / list readers
-    consult this single field for the group's STATUS axis instead
+    consult this single field for the group's STATUS value instead
     of re-deriving the rollup on every query.
     """
 
@@ -1275,7 +1275,7 @@ class RuntimeState:
     state lives on RuntimeState: the current `Job` / `JobGroup` node pins
     both the unit-file drift (`unit_config_normalized` /
     `unit_timer_normalized`) and the load-time scheduler-loaded fact
-    (`unit_loaded`) that `config_state` scores, so a config verdict is a
+    (`unit_loaded`) that `cfg_status` scores, so a config verdict is a
     pure node comparison that needs no RuntimeState lookup.
     """
 
@@ -1599,10 +1599,10 @@ class Config:
             return
         raise crony.errors.UsageError(f"unknown bundle: {bundle!r}")
 
-    def config_state(self, ref: crony.unit.EntityRef) -> ConfigStatus:
+    def cfg_status(self, ref: crony.unit.EntityRef) -> ConfigStatus:
         """synced | stale | broken | missing | orphan for `ref`.
 
-        `broken` wins over the other axes: an on-disk snapshot that
+        `broken` wins over the other states: an on-disk snapshot that
         can't be loaded, or an applied entry whose installed unit can't
         run -- its baked uv / crony binary is gone, its config unit file
         was deleted while the scheduler still has it loaded (it works now
@@ -1612,7 +1612,7 @@ class Config:
         is reported broken regardless of whether pending also defines it
         (apply re-renders / re-installs / reloads it).
 
-        The remaining axes mirror graph membership and on-disk health:
+        The remaining states mirror graph membership and on-disk health:
         `synced` if both graphs hold the entity and the two instances are
         field-equal (the normalized units included); `stale` if both hold
         it but differ -- including a hand-edited or moved-away unit whose

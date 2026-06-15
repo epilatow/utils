@@ -1639,7 +1639,7 @@ class TestJobPriority:
         unit.write_text(munged)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "stale"
+        assert config.cfg_status(ref) == "stale"
 
 
 class TestKeepAwake:
@@ -1977,9 +1977,9 @@ class TestFullDiskAccess:
 
 
 class TestGroupExitClassRollup:
-    """Direct unit tests for `_rollup_group_exit_class`. Status
-    and the LAST axis read this rolled-up value from the
-    group's last-run.json instead of re-deriving it; coverage
+    """Direct unit tests for `_rollup_group_exit_class`. The
+    STATUS column reads this rolled-up value from the group's
+    last-run.json instead of re-deriving it; coverage
     here keeps the precedence ladder honest as new exit_class
     values get introduced.
     """
@@ -2036,7 +2036,7 @@ class TestGroupExitClassRollup:
 
     def test_timeout_outranks_fail(self) -> None:
         # Group with both a fail and a timeout: timeout wins so
-        # the LAST axis surfaces the more severe condition.
+        # the STATUS column surfaces the more severe condition.
         assert (
             crony_runner._rollup_group_exit_class(
                 self._children("fail", "timeout", "ok")

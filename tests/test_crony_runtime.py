@@ -152,7 +152,7 @@ class TestUnitNameDelegatesTolerateRefForm:
 
 
 class TestConfigState:
-    """`Config.config_state` classification driven through the real
+    """`Config.cfg_status` classification driven through the real
     apply -> load_config path (vs `TestConfigStateInMemory`, which
     plants snapshots by hand). Confirms apply_one writes a snapshot
     that load_config scores as synced, and that a config edit
@@ -173,7 +173,7 @@ class TestConfigState:
             default_target_jobs=["j"],
         )
         config = crony_runtime.load_config()
-        assert config.config_state(self._ref(config, "default.j")) == "missing"
+        assert config.cfg_status(self._ref(config, "default.j")) == "missing"
 
     def test_synced_after_apply(self, tmp_path: Path, monkeypatch: Any) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -183,7 +183,7 @@ class TestConfigState:
         )
         h.apply("j")
         config = crony_runtime.load_config()
-        verdict = config.config_state(self._ref(config, "default.j"))
+        verdict = config.cfg_status(self._ref(config, "default.j"))
         assert verdict == "synced"
         # The verdict is the typed enum, not a bare string, so a
         # regression back to a raw str return is caught.
@@ -204,7 +204,7 @@ class TestConfigState:
             default_target_jobs=["j"],
         )
         config = crony_runtime.load_config()
-        assert config.config_state(self._ref(config, "default.j")) == "stale"
+        assert config.cfg_status(self._ref(config, "default.j")) == "stale"
 
     def test_orphan_stamped_not_in_config(
         self, tmp_path: Path, monkeypatch: Any
@@ -215,7 +215,7 @@ class TestConfigState:
         h.config({}, default_target_jobs=[])
         config = crony_runtime.load_config()
         ref = config.current.by_full_name["default.old"]
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
 
 
 class TestCurrentGraphFdaWrapper:
@@ -252,7 +252,7 @@ class TestCurrentGraphFdaWrapper:
         assert isinstance(node, Job)
         assert node.fda_wrapper is FDAWrapper.STALE
         # The drift rides through the snapshot comparison.
-        assert config.config_state(node.entity_ref) == "stale"
+        assert config.cfg_status(node.entity_ref) == "stale"
 
     def test_non_fda_load_never_probes(
         self, tmp_path: Path, monkeypatch: Any
@@ -277,8 +277,8 @@ class TestCurrentGraphFdaWrapper:
         assert probed == [], "wrapper probed for a non-FDA load"
 
 
-class TestResolveStateAxes:
-    """Direct unit tests for `_resolve_state_axes`. `do_status` is
+class TestResolveStates:
+    """Direct unit tests for `_resolve_states`. `do_status` is
     the only consumer; the helper is unit-tested separately so
     a future refactor can rely on its branch semantics being
     pinned without re-deriving them from the renderer.
@@ -293,11 +293,11 @@ class TestResolveStateAxes:
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
         config = crony_runtime.load_config()
-        cfg, last = crony_commands._resolve_state_axes(
+        cfg, job_status = crony_commands._resolve_states(
             config, ghost, config.installed_full_names()
         )
         assert cfg == "orphan"
-        assert last == "never"
+        assert job_status == "never"
 
     def test_missing_when_no_stamp_no_bundle(
         self, tmp_path: Path, monkeypatch: Any
@@ -306,11 +306,11 @@ class TestResolveStateAxes:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         config = crony_runtime.load_config()
-        cfg, last = crony_commands._resolve_state_axes(
+        cfg, job_status = crony_commands._resolve_states(
             config, h.full("ghost"), set()
         )
         assert cfg == "missing"
-        assert last == "never"
+        assert job_status == "never"
 
     def test_applied_leaf_is_synced(
         self, tmp_path: Path, monkeypatch: Any
@@ -323,10 +323,10 @@ class TestResolveStateAxes:
         )
         h.apply("j")
         config = crony_runtime.load_config()
-        cfg_state, _ = crony_commands._resolve_state_axes(
+        cfg_status, _ = crony_commands._resolve_states(
             config, h.full("j"), config.installed_full_names()
         )
-        assert cfg_state == "synced"
+        assert cfg_status == "synced"
 
 
 class TestPerEntityConfigErrors:
@@ -608,7 +608,7 @@ class TestPerEntityConfigErrors:
         assert h.full("bad") in out
         assert "error" in out
 
-    def test_resolve_state_axes_returns_error(
+    def test_resolve_states_returns_error(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -625,10 +625,10 @@ class TestPerEntityConfigErrors:
             default_target_jobs=[],
         )
         config = crony_runtime.load_config()
-        cfg_state, _last_state = crony_commands._resolve_state_axes(
+        cfg_status, _job_status = crony_commands._resolve_states(
             config, h.full("bad"), config.installed_full_names()
         )
-        assert cfg_state == "error"
+        assert cfg_status == "error"
 
 
 class TestConfigResolveEntityRef:
@@ -703,7 +703,7 @@ class TestLoadConfig:
         )
         # No on-disk snapshot yet -> nothing in current.
         assert ref not in config.current.jobs
-        assert config.config_state(ref) == "missing"
+        assert config.cfg_status(ref) == "missing"
 
     def test_current_only_entry_is_orphan(
         self, tmp_path: Path, monkeypatch: Any
@@ -742,7 +742,7 @@ class TestLoadConfig:
         )
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_g)
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
         assert ref in config.runtime
 
     def test_synced_when_pending_matches_current(
@@ -778,7 +778,7 @@ class TestLoadConfig:
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
-        assert config.config_state(ref) == "synced"
+        assert config.cfg_status(ref) == "synced"
 
     def test_scan_skips_alias_symlink(
         self, tmp_path: Path, monkeypatch: Any
@@ -845,7 +845,7 @@ class TestLoadConfig:
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
         config = crony_runtime.load_config()
         ref = EntityRef("default", uuid_a)
-        assert config.config_state(ref) == "stale"
+        assert config.cfg_status(ref) == "stale"
 
     def test_resolve_finds_by_pending_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -868,9 +868,9 @@ class TestConfigBroken:
     """`Config.orphans` carries the entities whose on-disk snapshot
     can't be loaded by this crony binary, flagged `is_broken`.
     `_build_current_graph` records them instead of silently dropping
-    the state dir; `Config.config_state` returns `"broken"` for refs
+    the state dir; `Config.cfg_status` returns `"broken"` for refs
     that land there, beating the synced / stale / orphan / missing
-    axes.
+    states.
     """
 
     def _setup(self, tmp_path: Path, monkeypatch: Any) -> Path:
@@ -914,7 +914,7 @@ class TestConfigBroken:
         assert ref in config.runtime
         assert config.orphans[ref].name == "default.legacy"
         assert "schema 999" in (config.orphans[ref].reason or "")
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
         # Name-recovery let it land in orphans_by_full_name.
         assert config.orphans_by_full_name.get("default.legacy") == ref
 
@@ -935,7 +935,7 @@ class TestConfigBroken:
         config = crony_runtime.load_config()
         assert ref in config.orphans
         assert "banana" in (config.orphans[ref].reason or "")
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
 
     def test_dataclass_type_error_recorded_as_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -988,7 +988,7 @@ class TestConfigBroken:
             ),
         )
         config = crony_runtime.load_config()
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
 
 
 class TestConfigSnapshotlessDir:
@@ -1017,7 +1017,7 @@ class TestConfigSnapshotlessDir:
         orphan = config.orphans[ref]
         assert orphan.name is None
         assert not orphan.is_broken
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
         assert ref not in config.current.jobs
         assert ref not in config.current.groups
 
@@ -1026,7 +1026,7 @@ class TestConfigSnapshotlessDir:
     ) -> None:
         # The wiped state dir of an applied entry that is still in
         # config keeps that entry's uuid. It stays a (nameless)
-        # orphan so destroy / apply can reclaim it, but `config_state`
+        # orphan so destroy / apply can reclaim it, but `cfg_status`
         # reads it `stale` (re-apply) -- not `orphan` -- because the
         # ref is still a live pending entry.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -1040,7 +1040,7 @@ class TestConfigSnapshotlessDir:
         ref = EntityRef(DEFAULT_BUNDLE_NAME, cfg.jobs["j"].uuid)
         assert ref in config.orphans
         assert config.orphans[ref].name is None
-        assert config.config_state(ref) == "stale"
+        assert config.cfg_status(ref) == "stale"
 
 
 class TestResolveMethods:
@@ -1324,7 +1324,7 @@ class TestUnitDriftDetection:
     ) -> None:
         _, config, _ = self._apply_and_load(tmp_path, monkeypatch)
         ref = config.current.by_full_name["default.j"]
-        assert config.config_state(ref) == "synced"
+        assert config.cfg_status(ref) == "synced"
 
     def test_hand_edited_plist_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
@@ -1346,7 +1346,7 @@ class TestUnitDriftDetection:
         plist.write_text(munged)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "stale"
+        assert config.cfg_status(ref) == "stale"
         assert "unit-config" in crony_commands._stale_fields(
             config.pending.job_from_ref(ref),
             config.current.job_from_ref(ref),
@@ -1362,7 +1362,7 @@ class TestUnitDriftDetection:
         unit_config.unlink()
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
 
     def test_deleted_unit_unloaded_flags_missing(
         self, tmp_path: Path, monkeypatch: Any
@@ -1374,7 +1374,7 @@ class TestUnitDriftDetection:
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "missing"
+        assert config.cfg_status(ref) == "missing"
 
     def test_unloaded_scheduled_flags_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -1386,7 +1386,7 @@ class TestUnitDriftDetection:
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
 
     def _linux_stale_reasons(
         self, tmp_path: Path, monkeypatch: Any, edit: str
@@ -1440,7 +1440,7 @@ class TestUnitDriftDetection:
         (h.sysd / f"crony-{h.full('j')}.timer").unlink()
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
 
     def test_grouped_entry_is_synced_on_linux(
         self, tmp_path: Path, monkeypatch: Any
@@ -1462,8 +1462,8 @@ class TestUnitDriftDetection:
         config = crony_runtime.load_config()
         a_ref = config.current.by_full_name[h.full("a")]
         g_ref = config.current.by_full_name[h.full("g")]
-        assert config.config_state(g_ref) == "synced"
-        assert config.config_state(a_ref) == "synced"
+        assert config.cfg_status(g_ref) == "synced"
+        assert config.cfg_status(a_ref) == "synced"
 
     def test_missing_baked_uv_path_flags_broken(
         self, tmp_path: Path, monkeypatch: Any
@@ -1478,7 +1478,7 @@ class TestUnitDriftDetection:
         unit_config.write_text(content.replace(live_uv, bogus_uv))
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "broken"
+        assert config.cfg_status(ref) == "broken"
         node = config.current.job_from_ref(ref)
         assert node is not None and node.uv_path is None
 
@@ -1506,7 +1506,7 @@ class TestUnitDriftDetection:
         unit_config.write_text(content)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "synced"
+        assert config.cfg_status(ref) == "synced"
 
     def test_apply_refreshes_stale_install(
         self, tmp_path: Path, monkeypatch: Any
@@ -1575,7 +1575,7 @@ class TestUnitDriftDetection:
     ) -> None:
         # Entry still in config and its platform unit on disk, but
         # the state-dir snapshot was wiped. The in-memory model
-        # records this as a unit-only orphan; `_config_axis`
+        # records this as a unit-only orphan; `_cfg_status`
         # upgrades the in-config "missing" verdict to "stale" so
         # the operator is steered to re-apply rather than seeing a
         # bare "not applied."
@@ -1632,7 +1632,7 @@ class TestUnitDriftDetection:
         ref = config.current.by_full_name[h.full("transit")]
         # The transit group renders no timer (pending timer None), but
         # one is on disk -- the timer comparison catches it as drift.
-        assert config.config_state(ref) == "stale"
+        assert config.cfg_status(ref) == "stale"
 
 
 class TestSnapshotBackwardLoad:

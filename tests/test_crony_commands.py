@@ -1354,7 +1354,7 @@ class TestApplyAlias:
         assert os.readlink(alias) == sd.name
         assert alias.resolve() == sd.resolve()
         assert (
-            crony_runtime.load_config().config_state(
+            crony_runtime.load_config().cfg_status(
                 EntityRef("default", sd.name)
             )
             == "synced"
@@ -1373,10 +1373,10 @@ class TestApplyAlias:
         ref = EntityRef("default", sd.name)
         alias = h.state / "default" / "j"
         alias.unlink()
-        assert crony_runtime.load_config().config_state(ref) == "stale"
+        assert crony_runtime.load_config().cfg_status(ref) == "stale"
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         assert alias.is_symlink()
-        assert crony_runtime.load_config().config_state(ref) == "synced"
+        assert crony_runtime.load_config().cfg_status(ref) == "synced"
 
     def test_mispointed_alias_reads_stale_and_apply_repairs(
         self, tmp_path: Path, monkeypatch: Any
@@ -1392,10 +1392,10 @@ class TestApplyAlias:
         alias = h.state / "default" / "j"
         alias.unlink()
         alias.symlink_to("00000000-0000-0000-0000-000000000000")
-        assert crony_runtime.load_config().config_state(ref) == "stale"
+        assert crony_runtime.load_config().cfg_status(ref) == "stale"
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         assert os.readlink(alias) == sd.name
-        assert crony_runtime.load_config().config_state(ref) == "synced"
+        assert crony_runtime.load_config().cfg_status(ref) == "synced"
 
 
 class TestDestroy:
@@ -1907,7 +1907,7 @@ class TestEnableDisable:
         crony_commands.do_disable(jobs=["j"], bundle=None)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
-        assert config.config_state(ref) == "synced"
+        assert config.cfg_status(ref) == "synced"
         node = config.current.job_from_ref(ref)
         assert node is not None and node.unit_disabled is True
         crony_commands.do_status(
@@ -4536,7 +4536,7 @@ class TestStatusReport:
         assert "UNIT NAME" not in header
         # KIND and UNIT moved to opt-in -- the schedule column
         # surfaces "disabled" inline when the unit is off, so
-        # the standalone runtime axis isn't load-bearing for
+        # the standalone runtime state isn't load-bearing for
         # day-to-day reading.
         assert "KIND" not in header
         # `UNIT` is a substring of `UNIT NAME`; check the bare header
@@ -5975,9 +5975,9 @@ class TestUnitOnlyOrphan:
         # The platform unit path is captured in RuntimeState.
         rt = config.runtime[ref]
         assert rt.unit_config == plist
-        # `config_state` reports orphan, not broken / synced /
+        # `cfg_status` reports orphan, not broken / synced /
         # stale.
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
 
     def test_destroy_wipes_unit_only_orphan(
         self, tmp_path: Path, monkeypatch: Any
@@ -6007,7 +6007,7 @@ class TestUnitOnlyOrphan:
         config = crony_runtime.load_config()
         ref = config.orphans_by_full_name.get("default.ghost")
         assert ref is not None
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
         rt = config.runtime[ref]
         # The orphan is the timer with no config unit on disk.
         assert rt.unit_timer == timer
@@ -6053,7 +6053,7 @@ class TestAliasOrphan:
         orphan = config.orphans[ref]
         assert orphan.has_symlink
         assert not orphan.has_unit_file
-        assert config.config_state(ref) == "orphan"
+        assert config.cfg_status(ref) == "orphan"
 
     def test_destroy_orphans_unlinks_stray_alias(
         self, tmp_path: Path, monkeypatch: Any
@@ -7531,8 +7531,8 @@ class TestUserTriggerFlag:
         assert not (sd / "user-trigger.flag").exists()
 
 
-class TestLastRunStateInteractive:
-    """`_last_run_state` reports `pending` for an interactive job
+class TestJobStatusInteractive:
+    """`_job_status` reports `pending` for an interactive job
     sitting in its wait loop, and `canceled` for a completed run
     whose user clicked Cancel Job.
     """
@@ -7547,7 +7547,7 @@ class TestLastRunStateInteractive:
         (sd / "pending.flag").write_bytes(b"")
         with crony_runtime.acquire_lock(sd / "run.lock"):
             config = crony_runtime.load_config()
-            assert crony_commands._last_run_state(config, full) == "pending"
+            assert crony_commands._job_status(config, full) == "pending"
 
     def test_running_when_lock_held_without_flag(
         self, tmp_path: Path, monkeypatch: Any
@@ -7558,7 +7558,7 @@ class TestLastRunStateInteractive:
         sd = h.fabricate_orphan("iv")
         with crony_runtime.acquire_lock(sd / "run.lock"):
             config = crony_runtime.load_config()
-            assert crony_commands._last_run_state(config, full) == "running"
+            assert crony_commands._job_status(config, full) == "running"
 
     def test_canceled_from_last_run_json(
         self, tmp_path: Path, monkeypatch: Any
@@ -7578,13 +7578,13 @@ class TestLastRunStateInteractive:
             encoding="utf-8",
         )
         config = crony_runtime.load_config()
-        assert crony_commands._last_run_state(config, full) == "canceled"
+        assert crony_commands._job_status(config, full) == "canceled"
 
 
-class TestLastRunStateCrashed:
+class TestJobStatusCrashed:
     """When the scheduler's last launch ended without recording (killed,
     or exited nonzero before the runner wrote its record), the surviving
-    last-run.json is stale: LAST reads `crashed` and LAST RAN reads
+    last-run.json is stale: STATUS reads `crashed` and LAST RAN reads
     `unknown`. A status matching the recorded process exit is a normal
     result and is left alone."""
 
@@ -7636,7 +7636,7 @@ class TestLastRunStateCrashed:
             tmp_path, monkeypatch, status=-9, record=self._STALE_OK
         )
         config = crony_runtime.load_config()
-        assert crony_commands._last_run_state(config, full) == "crashed"
+        assert crony_commands._job_status(config, full) == "crashed"
         assert crony_commands._last_ran_at(config, full) == "unknown"
 
     def test_nonzero_exit_without_record_is_crashed(
@@ -7646,7 +7646,7 @@ class TestLastRunStateCrashed:
             tmp_path, monkeypatch, status=127, record=self._STALE_OK
         )
         config = crony_runtime.load_config()
-        assert crony_commands._last_run_state(config, full) == "crashed"
+        assert crony_commands._job_status(config, full) == "crashed"
 
     def test_recorded_failure_is_not_crashed(
         self, tmp_path: Path, monkeypatch: Any
@@ -7655,7 +7655,7 @@ class TestLastRunStateCrashed:
             tmp_path, monkeypatch, status=1, record=self._RECORDED_FAIL
         )
         config = crony_runtime.load_config()
-        assert crony_commands._last_run_state(config, full) == "fail"
+        assert crony_commands._job_status(config, full) == "fail"
 
 
 class TestStatusRenameUuidModel:

@@ -5,7 +5,7 @@
 The do_* verbs behind the CLI -- apply / destroy / enable / disable /
 trigger / status / logs / config / validate / notify-test -- plus the
 name-resolution and apply-ordering helpers and the status renderer (its
-column model, divergence and color handling, and per-axis state
+column model, divergence and color handling, and per-column state
 derivation). This is the in-process API a caller drives instead of
 shelling out to the crony CLI; it orchestrates the lower layers
 (config, model, runtime, notify, runner). The per-entry on-disk unit
@@ -435,10 +435,16 @@ _EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
 }
 
 
-def _last_run_state(
+def _job_status(
     config: crony.model.Config, full_name: str
 ) -> crony.model.JobStatus:
-    """Return STATUS axis value for a stamped entity.
+    """Return the STATUS-column value (a `JobStatus`) for a stamped
+    entity.
+
+    `JobStatus` is a superset of a run's exit outcome: beyond the
+    mapped exit classes it also reports the no-run states (`never`,
+    `pending`, `running`, `crashed`), so this is the entry's current
+    run status, not strictly its last recorded exit.
 
     Lock-held implies a run is currently in flight: "pending" when
     the in-flight run is an interactive job sitting in its wait
@@ -520,13 +526,13 @@ def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
     return f"{secs // 86400}d ago"
 
 
-def _config_axis(
+def _cfg_status(
     config: crony.model.Config,
     full: str,
     entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
     bn: str,
 ) -> crony.model.ConfigStatus:
-    """CONFIG axis (synced / stale / broken / missing / orphan)
+    """CONFIG-column value (synced / stale / broken / missing / orphan)
     for `full`, derived entirely from the in-memory `Config` --
     no filesystem or scheduler re-query. `error` is handled by
     the caller (it's name-based; an errored entry has no ref).
@@ -534,7 +540,7 @@ def _config_axis(
     The ref to score is the entry's own `<bundle>:<uuid>` when it
     is still in config, otherwise whatever the on-disk side
     recovered (current snapshot, broken snapshot, or unit-only
-    orphan). `Config.config_state` reduces the pending and current
+    orphan). `Config.cfg_status` reduces the pending and current
     graphs -- both built once at load -- to a single verdict. Each
     node carries its normalized config / timer units, so a hand-edited
     / missing / drifted unit already surfaces as `stale` (and a gone
@@ -552,7 +558,7 @@ def _config_axis(
         # graph) or a bare name with no on-disk state. "missing"
         # is the pre-mask base the mask layer turns into "masked".
         return crony.model.ConfigStatus.MISSING
-    state = config.config_state(ref)
+    state = config.cfg_status(ref)
     # A full-disk-access entry whose shared Crony.app wrapper can't serve
     # the grant -- not built, or built but ungranted (`is_missing`) --
     # can't run as configured. The live wrapper state rides on the
@@ -840,7 +846,7 @@ def _selected_and_masked_full_names_per_bundle(
             full = b.full_name(short)
             by_full[full] = (b, short)
             # Errored entries get the same `unused` label as
-            # genuinely-unused ones at this layer; `_resolve_state_axes`
+            # genuinely-unused ones at this layer; `_resolve_states`
             # promotes them back to `error` so the user sees the
             # actual problem instead of a generic mask.
             masked_by_full[full] = "unused"
@@ -1882,7 +1888,7 @@ def _parse_status_cols(
     return ["job-or-uuid"] + cols
 
 
-def _resolve_state_axes(
+def _resolve_states(
     config: crony.model.Config,
     full: str,
     remnants: set[str],
@@ -1892,17 +1898,16 @@ def _resolve_state_axes(
     crony.model.ConfigStatus,
     crony.model.JobStatus,
 ]:
-    """Compute the (cfg, last) status axes for one full name.
+    """Compute the (cfg_status, job_status) pair for one full name.
 
     `do_status` is the only consumer; the function is factored
-    out so the axis derivation has a single home and the
-    renderer-side filter (`--exclude-healthy`) reads the same
-    pair as the default tree view. Returns the values straight
-    from the underlying state readers -- no opinion about whether
-    a given combination is "bad" -- so the caller applies its own
-    filtering / display logic on top.
+    out so the derivation has a single home and the renderer-side
+    filter (`--exclude-healthy`) reads the same pair as the default
+    tree view. Returns the values straight from the underlying state
+    readers -- no opinion about whether a given combination is "bad"
+    -- so the caller applies its own filtering / display logic on top.
 
-    CONFIG-axis precedence:
+    CONFIG precedence:
 
         error / broken  >  orphan  >  masked  >  synced / stale / missing
 
@@ -1914,14 +1919,13 @@ def _resolve_state_axes(
     scheduler has no unit loaded for it at all, or a scheduled entry's
     timer file is gone. Either way the operator's next action is "fix
     this specific thing," and the mask-reason / synced-stale-missing
-    axes are uninteresting until
-    then.
+    states are uninteresting until then.
 
     The synced / stale / missing / orphan / broken base comes
-    from `_config_axis`, which scores the entity against the
+    from `_cfg_status`, which scores the entity against the
     in-memory `Config` (no disk re-query). `mask_reason` is the
     entry's filter-exclusion reason on this host; when non-empty,
-    the cfg axis becomes `"orphan"` if on-disk remnants exist and
+    the cfg value becomes `"orphan"` if on-disk remnants exist and
     `"masked"` otherwise. The orphan-on-mask rule encodes
     "cleanup needed wins over passive-not-for-this-host."
     """
@@ -1935,24 +1939,24 @@ def _resolve_state_axes(
         # An errored entry never parsed into a uuid, so it has no
         # ref to score against the graphs; `error` is top-of-chain
         # and surfaces by name.
-        cfg_state = crony.model.ConfigStatus.ERROR
+        cfg_status = crony.model.ConfigStatus.ERROR
     else:
         if bundle is not None:
             entry = bundle.config.jobs.get(
                 short
             ) or bundle.config.job_groups.get(short)
-        cfg_state = _config_axis(config, full, entry, bn)
-    if mask_reason and cfg_state not in (
+        cfg_status = _cfg_status(config, full, entry, bn)
+    if mask_reason and cfg_status not in (
         crony.model.ConfigStatus.ERROR,
         crony.model.ConfigStatus.BROKEN,
     ):
-        cfg_state = (
+        cfg_status = (
             crony.model.ConfigStatus.ORPHAN
             if full in remnants
             else crony.model.ConfigStatus.MASKED
         )
-    last_state = _last_run_state(config, full)
-    return cfg_state, last_state
+    job_status = _job_status(config, full)
+    return cfg_status, job_status
 
 
 def _entry_is_scheduled(
@@ -2478,7 +2482,7 @@ def do_status(
         # CONFIG / STATUS are single-source verdicts (not flag-selected);
         # resolve them against the config name so the errored detection
         # lands on the right entry.
-        cfg_state, last = _resolve_state_axes(
+        cfg_status, job_status = _resolve_states(
             config, config_name, remnants, mask_reason=mask_reason
         )
         last_ran = _last_ran_at(config, config_name)
@@ -2670,10 +2674,10 @@ def do_status(
             "job": job_cell,
             "job-or-uuid": job_or_uuid_cell,
             "kind": kind,
-            "config": cfg_state,
+            "config": cfg_status,
             "schedule": sched_cell,
             "groups": groups_cell,
-            "status": last,
+            "status": job_status,
             "last-ran": last_ran,
             "masked-by": mask_reason,
             "unit-name": unit_name,

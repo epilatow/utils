@@ -412,7 +412,7 @@ def load_config() -> crony.model.Config:
     # dirs); the pure unit / alias leftovers found next join it.
     # `JobOrphan.is_broken` tells broken from orphan for status. A
     # snapshot-less dir whose uuid is still a live pending entry stays
-    # in the map -- `config_state` reads it `stale` (re-apply), and
+    # in the map -- `cfg_status` reads it `stale` (re-apply), and
     # destroy / apply reclaim it through the entity.
     orphans_by_full_name: dict[str, crony.unit.EntityRef] = {
         o.name: ref for ref, o in orphans.items() if o.name is not None
@@ -597,7 +597,7 @@ def _current_unit_disk_inputs(
     a current node: the config and timer unit contents, the uv / crony
     executable paths extracted from the installed run command and
     confirmed still present on disk (None when a baked binary is gone),
-    and whether the scheduler has the unit loaded. `config_state` reads
+    and whether the scheduler has the unit loaded. `cfg_status` reads
     these to tell a reproducible unit from a `stale` / `broken` / gone
     one."""
     config_disk = _read_unit_file(sched.unit_config_path(name))
