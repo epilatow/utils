@@ -717,6 +717,20 @@ def _child_is_interactive(child_ref: crony.unit.EntityRef) -> bool:
     return isinstance(cs, crony.model.Job) and cs.interactive
 
 
+def _child_is_disabled(child_ref: crony.unit.EntityRef) -> bool:
+    """True iff the child's pinned snapshot is operator-disabled
+    (`crony disable`). The parent group skips a disabled child instead
+    of dispatching it. A missing snapshot returns False so the absent
+    child still flows to the synthetic-FAIL / UnitNotInstalledError path
+    that surfaces the missing unit.
+    """
+    try:
+        cs = crony.runtime.load_snapshot(child_ref)
+    except crony.errors.PreconditionError:
+        return False
+    return cs.unit_disabled
+
+
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
@@ -804,6 +818,22 @@ def _run_group(
                 )
                 for child_ref, child_full_name in resolved_pairs:
                     child_sd = crony.model.Job.state_dir_from_ref(child_ref)
+                    if _child_is_disabled(child_ref):
+                        # An operator-disabled child is intentionally not
+                        # run; record it `gated` (rolls up `ok`, like any
+                        # not-run child) and move on.
+                        log_file.write(
+                            f"-> {child_full_name}: skipped "
+                            f"(disabled)\n".encode()
+                        )
+                        children.append(
+                            crony.model.GroupChildResult(
+                                name=child_full_name,
+                                exit_class=crony.model.ExitClass.GATED,
+                                exit_code=0,
+                            )
+                        )
+                        continue
                     if _child_is_interactive(child_ref):
                         # Interactive children fire async (no wait,
                         # no budget deduction). Their own runner does

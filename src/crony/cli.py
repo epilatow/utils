@@ -386,7 +386,7 @@ def _build_parser() -> StrictArgumentParser:
         nargs="*",
         help=(
             "Job names to enable. Omit when --bundle is given to "
-            "enable every scheduled stamped entry in that bundle."
+            "enable every stamped entry in that bundle."
         ),
     )
     p_enable.add_argument(
@@ -395,7 +395,7 @@ def _build_parser() -> StrictArgumentParser:
         default=None,
         help=(
             "Scope the enable to one bundle. With no positional "
-            "args, enables every scheduled stamped entry in "
+            "args, enables every stamped entry in "
             "<bundle>; with positional args, bare names resolve in "
             "<bundle> and qualified names must match it."
         ),
@@ -411,7 +411,7 @@ def _build_parser() -> StrictArgumentParser:
         nargs="*",
         help=(
             "Job names to disable. Omit when --bundle is given to "
-            "disable every scheduled stamped entry in that bundle."
+            "disable every stamped entry in that bundle."
         ),
     )
     p_disable.add_argument(
@@ -420,7 +420,7 @@ def _build_parser() -> StrictArgumentParser:
         default=None,
         help=(
             "Scope the disable to one bundle. With no positional "
-            "args, disables every scheduled stamped entry in "
+            "args, disables every stamped entry in "
             "<bundle>; with positional args, bare names resolve in "
             "<bundle> and qualified names must match it."
         ),

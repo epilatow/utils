@@ -1246,34 +1246,6 @@ def do_destroy(
         _reclaim(config, bundle, only_unselected=orphans)
 
 
-def _applied_schedule_state(config: crony.model.Config, full: str) -> str:
-    """Return 'unresolved' / 'unscheduled' / 'scheduled' for `full`
-    from the APPLIED snapshot.
-
-    enable / disable arm or disarm the installed platform unit,
-    which was rendered from the current (applied) snapshot -- so
-    whether there's a timer to act on is the applied snapshot's
-    schedule / interval, not the (possibly edited, not-yet-applied)
-    pending config. `unresolved` covers a name with no current
-    snapshot (a unit-only or broken remnant): nothing applied to
-    read a schedule from. `unscheduled` is an applied entry with
-    neither schedule nor interval (a grouped entry). `scheduled`
-    has a schedule or interval.
-    """
-    # Resolve by uuid (current-first, pending-fallback) so a renamed-
-    # but-not-applied entry addressed by its new name still reads its
-    # applied snapshot at the unchanged uuid.
-    ref = config.resolve_current(full) or config.resolve_pending(full)
-    if ref is None:
-        return "unresolved"
-    snap = config.current.job_from_ref(ref)
-    if snap is None:
-        return "unresolved"
-    if snap.timing is None:
-        return "unscheduled"
-    return "scheduled"
-
-
 def _installed_refs(config: crony.model.Config) -> set[crony.unit.EntityRef]:
     """The uuids with on-disk presence (a current snapshot, a broken
     snapshot, or a leftover platform unit) -- the set an action
@@ -1360,48 +1332,20 @@ def _resolve_bulk_names(
     jobs: list[str],
     bundle: str | None,
     stamped: set[str],
-    config: crony.model.Config,
-    scheduled_only: bool,
 ) -> list[str]:
     """Derive the operate-on name set for enable / disable / trigger.
 
     With positional `jobs`, normalize each via `resolve_cli_name`
     (which honors `-b`'s bundle-scoping rules). With no positionals,
-    `bundle` is required and the set expands to that bundle's
-    stamped names; `scheduled_only` drops unscheduled entries (by
-    their applied snapshot) so a bulk `enable -b foo` skips
-    schedule-less group containers rather than rejecting the whole
-    call.
+    `bundle` is required and the set expands to that bundle's stamped
+    names -- every kind (scheduled, grouped, group container), since a
+    disable / enable / trigger applies to all of them.
     """
     if jobs:
         return [crony.config.resolve_cli_name(arg, bundle) for arg in jobs]
     if bundle is None:
         raise crony.errors.UsageError("specify job names or --bundle")
-    expanded = sorted(crony.config.bundle_prefix_filter(stamped, bundle))
-    if scheduled_only:
-        expanded = [
-            n
-            for n in expanded
-            if _applied_schedule_state(config, n) == "scheduled"
-        ]
-    return expanded
-
-
-def _refuse_unscheduled_full(
-    config: crony.model.Config, full_names: list[str], verb: str
-) -> None:
-    """Reject entries with no schedule (nothing to enable/disable)."""
-    unscheduled = [
-        full
-        for full in full_names
-        if _applied_schedule_state(config, full) == "unscheduled"
-    ]
-    if unscheduled:
-        raise crony.errors.UsageError(
-            f"cannot {verb} grouped entries: {sorted(unscheduled)}. "
-            f"Grouped entries are triggered by parent jobs with their "
-            f"own schedule."
-        )
+    return sorted(crony.config.bundle_prefix_filter(stamped, bundle))
 
 
 def do_enable(jobs: list[str], bundle: str | None) -> None:
@@ -1413,22 +1357,22 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     `default.<short>`. A rename (same uuid, new config name) is
     addressable by either name; a name mapping to different uuids in
     config vs on disk is rejected until `crony apply`. Refuses names not
-    stamped on this host and ones with no schedule (nothing to disarm).
+    stamped on this host.
+
+    A grouped entry (no schedule of its own) can be enabled / disabled
+    too: its `unit_disabled` flag gates whether the parent group's
+    dispatch skips it, so the operator-disable is meaningful even with
+    no timer to disarm.
 
     With `--bundle <name>` and no positional args, enables every
-    scheduled stamped entry in `<name>` (unscheduled entries in
-    that bundle are skipped, not rejected). With `--bundle` plus
-    positional args, bare names resolve in `<name>` and qualified
-    names must match it.
+    stamped entry in `<name>`. With `--bundle` plus positional args,
+    bare names resolve in `<name>` and qualified names must match it.
     """
     config = crony.runtime.load_config()
     config.require_addressable(bundle)
     installed = config.installed_full_names()
-    normalized = _resolve_bulk_names(
-        jobs, bundle, installed, config, scheduled_only=True
-    )
+    normalized = _resolve_bulk_names(jobs, bundle, installed)
     targets = _resolve_action_targets(config, normalized)
-    _refuse_unscheduled_full(config, normalized, "enable")
     for full, ref, _unit_name in targets:
         crony.runtime.set_disabled(config, ref, disabled=False)
         logger.info("%s: enabled", full)
@@ -1444,22 +1388,22 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     `default.<short>`. A rename (same uuid, new config name) is
     addressable by either name; a name mapping to different uuids in
     config vs on disk is rejected until `crony apply`. Refuses names not
-    stamped on this host and ones with no schedule (nothing to disarm).
+    stamped on this host.
+
+    A grouped entry (no schedule of its own) can be disabled too: with
+    no timer to disarm, its `unit_disabled` flag instead makes the
+    parent group's dispatch skip it, so the child stays installed but
+    no longer runs as part of the group.
 
     With `--bundle <name>` and no positional args, disables every
-    scheduled stamped entry in `<name>` (unscheduled entries in
-    that bundle are skipped, not rejected). With `--bundle` plus
-    positional args, bare names resolve in `<name>` and qualified
-    names must match it.
+    stamped entry in `<name>`. With `--bundle` plus positional args,
+    bare names resolve in `<name>` and qualified names must match it.
     """
     config = crony.runtime.load_config()
     config.require_addressable(bundle)
     installed = config.installed_full_names()
-    normalized = _resolve_bulk_names(
-        jobs, bundle, installed, config, scheduled_only=True
-    )
+    normalized = _resolve_bulk_names(jobs, bundle, installed)
     targets = _resolve_action_targets(config, normalized)
-    _refuse_unscheduled_full(config, normalized, "disable")
     for full, ref, _unit_name in targets:
         crony.runtime.set_disabled(config, ref, disabled=True)
         logger.info("%s: disabled", full)
@@ -1513,9 +1457,7 @@ def do_trigger(
     bundles = config.toml_config
     config.require_addressable(bundle)
     stamped = config.installed_full_names()
-    normalized = _resolve_bulk_names(
-        jobs, bundle, stamped, config, scheduled_only=False
-    )
+    normalized = _resolve_bulk_names(jobs, bundle, stamped)
     targets = _resolve_action_targets(config, normalized, runnable_only=True)
 
     if not wait:
@@ -1814,11 +1756,13 @@ Columns
                     independent of runtime state).
   unit              UNIT axis: enabled | disabled | grouped | none.
                     `disabled` means the operator turned it off (`crony
-                    disable`) -- installed and triggerable, but
-                    schedule-less; read from the snapshot, not the
-                    scheduler. `grouped` means the entry has no schedule
-                    (a parent group dispatches it); `none` means the
-                    scheduler doesn't see a unit by this name.
+                    disable`) -- still installed and triggerable, but
+                    not run automatically (neither on its schedule nor
+                    as part of a group); `disabled` wins over `grouped`
+                    in this column. `grouped` means the entry has no
+                    schedule and is enabled (a parent group dispatches
+                    it); `none` means the scheduler doesn't see a unit
+                    by this name.
   unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
                     `crony-<name>.timer` (scheduled) or
                     `crony-<name>.service` (grouped) on Linux. Source-
@@ -2041,13 +1985,16 @@ def _resolve_state_axes(
             grouped = entry.timing is None
         else:
             grouped = False
-        if grouped:
-            unit_state = us.GROUPED
-        elif current_node is not None and current_node.unit_disabled:
+        if current_node is not None and current_node.unit_disabled:
             # A disabled entry installs an ordinary loaded unit (just
             # schedule-less), so the scheduler reports it loaded; the
             # disabled overlay rides on the snapshot, not the scheduler.
+            # Disabled wins over grouped: a grouped child can be
+            # operator-disabled, and `disabled` is the salient state
+            # (its parent's dispatch now skips it).
             unit_state = us.DISABLED
+        elif grouped:
+            unit_state = us.GROUPED
         else:
             installed_name = (
                 str(current_node.entity_name)

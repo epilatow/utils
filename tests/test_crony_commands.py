@@ -1939,9 +1939,14 @@ class TestEnableDisable:
         with pytest.raises(UsageError, match="not stamped"):
             crony_commands.do_disable(jobs=["ghost"], bundle=None)
 
-    def test_unscheduled_entry_rejected(
+    def test_grouped_entry_disable_enable_round_trips(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # A grouped (schedule-less) child can be operator-disabled: with
+        # no timer to disarm, disable just records `unit_disabled` on the
+        # child's snapshot so the parent group skips it. The UNIT axis
+        # reads `disabled` (it wins over `grouped`); enable clears the
+        # flag and the entry reads `grouped` again.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -1951,40 +1956,24 @@ class TestEnableDisable:
             default_target_jobs=["g"],
         )
         h.apply("a")
-        with pytest.raises(UsageError, match="grouped entries"):
-            crony_commands.do_enable(jobs=["a"], bundle=None)
-        with pytest.raises(UsageError, match="grouped entries"):
-            crony_commands.do_disable(jobs=["a"], bundle=None)
-
-    def test_enable_keys_off_applied_schedule_not_pending(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # `a` is applied as a grouped (schedule-less) entry, so its
-        # installed unit has no timer. A later config edit gives
-        # `a` its own schedule but is NOT applied. enable must
-        # still refuse: it arms the *installed* unit, and the
-        # applied snapshot -- not the pending edit -- decides
-        # whether there's a timer to arm.
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {
-                "job": {"a": {"command": "true"}},
-                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
-            },
-            default_target_jobs=["g"],
+        crony_commands.do_disable(jobs=["a"], bundle=None)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("a")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled is True
+        _cfg, unit, _last = crony_commands._resolve_state_axes(
+            config, h.full("a"), set()
         )
-        h.apply("a")
-        # Pending edit: `a` gains its own schedule (still grouped
-        # under g too), not applied.
-        h.config(
-            {
-                "job": {"a": {"command": "true", "schedule": "*-*-* 05:00"}},
-                "job-group": {"g": {"jobs": ["a"], "schedule": "*-*-* 03:00"}},
-            },
-            default_target_jobs=["g", "a"],
+        assert unit == crony_model.UnitStatus.DISABLED
+        crony_commands.do_enable(jobs=["a"], bundle=None)
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("a")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.unit_disabled is False
+        _cfg, unit, _last = crony_commands._resolve_state_axes(
+            config, h.full("a"), set()
         )
-        with pytest.raises(UsageError, match="grouped entries"):
-            crony_commands.do_enable(jobs=["a"], bundle=None)
+        assert unit == crony_model.UnitStatus.GROUPED
 
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
@@ -2472,12 +2461,16 @@ class TestEnableDisable:
                 jobs=[], wait=False, trigger_timeout=None, bundle=None
             )
 
-    def test_enable_bulk_skips_unscheduled_in_bundle(
+    def test_enable_disable_bulk_includes_grouped_in_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # TomlBundle has one scheduled job and one schedule-less group
-        # member. `enable -b foo` enables the scheduled one and
-        # silently skips the unscheduled one rather than aborting.
+        # member. A bulk `-b foo` disable / enable acts on every stamped
+        # entry, including the grouped one: `a` gains / loses its
+        # `unit_disabled` flag alongside the scheduled `b` and `g`. The
+        # scheduled entries also disarm / re-arm their `.timer`; the
+        # grouped entry has no timer to disarm, so its only observable is
+        # the snapshot flag.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {
@@ -2492,20 +2485,26 @@ class TestEnableDisable:
         h.apply("a")
         h.apply("b")
         h.apply("g")
-        # Disable the scheduled entries first so the re-enable below has
-        # observable work (an enable of an already-enabled entry no-ops).
+
+        def disabled_flags() -> dict[str, bool]:
+            config = crony_runtime.load_config()
+            out: dict[str, bool] = {}
+            for short in ("a", "b", "g"):
+                ref = config.current.by_full_name[h.full(short)]
+                node = config.current.job_from_ref(ref)
+                assert node is not None
+                out[short] = node.unit_disabled
+            return out
+
         crony_commands.do_disable(jobs=[], bundle="default")
-        h.calls.clear()
+        assert disabled_flags() == {"a": True, "b": True, "g": True}
+        assert not (h.sysd / f"crony-{h.full('b')}.timer").exists()
+        assert not (h.sysd / f"crony-{h.full('g')}.timer").exists()
+
         crony_commands.do_enable(jobs=[], bundle="default")
-        # Only b and g (scheduled) get enable invocations.
-        timers = [
-            c[-1]
-            for c in h.calls
-            if c and c[0] == "systemctl" and "enable" in c
-        ]
-        assert f"crony-{h.full('b')}.timer" in timers
-        assert f"crony-{h.full('g')}.timer" in timers
-        assert f"crony-{h.full('a')}.timer" not in timers
+        assert disabled_flags() == {"a": False, "b": False, "g": False}
+        assert (h.sysd / f"crony-{h.full('b')}.timer").exists()
+        assert (h.sysd / f"crony-{h.full('g')}.timer").exists()
 
     def test_trigger_bulk_includes_unscheduled_in_bundle(
         self, tmp_path: Path, monkeypatch: Any

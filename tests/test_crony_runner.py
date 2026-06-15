@@ -958,6 +958,43 @@ class TestRunGroup:
         rec = h.last_run("g")
         assert rec["exit_class"] == "ok"
 
+    def test_group_skips_disabled_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child whose snapshot is operator-disabled is not dispatched;
+        # it records `gated` (which rolls up `ok`) and the group fires
+        # only the enabled children.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["a", "b"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a", disabled=True)
+        h.write_snap(cfg, "b")
+        _stub_trigger_sync(
+            monkeypatch,
+            {h.full("b"): {"exit_code": 0, "exit_class": "ok"}},
+        )
+        rc = crony_runner._run_group(h.snap(cfg, "g"))
+        assert rc == 0
+        rec = h.last_run("g")
+        rows = {c["name"]: c for c in rec["jobs_run"]}
+        assert rows[h.full("a")]["exit_class"] == "gated"
+        assert rows[h.full("b")]["exit_class"] == "ok"
+        # Only the enabled child actually fired through the platform.
+        assert [e["full_name"] for e in crony._ledger] == [h.full("b")]
+        assert rec["exit_class"] == "ok"
+        log = (h.state_dir("g") / "run.log").read_text(encoding="utf-8")
+        assert f"{h.full('a')}: skipped (disabled)" in log
+
     def test_group_dry_run_skips_children(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

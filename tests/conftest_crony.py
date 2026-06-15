@@ -485,11 +485,17 @@ class _RunnerHarness:
         """
         return _resolve_snapshot_for(cfg, short)
 
-    def write_snap(self, cfg: Any, short: str) -> None:
+    def write_snap(
+        self, cfg: Any, short: str, *, disabled: bool = False
+    ) -> None:
         """Write a snapshot to disk so `load_snapshot` finds it.
         Used by group runner tests where children are loaded from
-        their own snapshot files (not from the parent's config)."""
+        their own snapshot files (not from the parent's config).
+        With `disabled=True`, marks the snapshot operator-disabled so
+        a parent group's dispatch skips it."""
         snap = self.snap(cfg, short)
+        if disabled:
+            snap = snap.with_unit_disabled(True)
         sd = self.state_dir(short, cfg=cfg)
         p = sd / "snapshot.json"
         p.parent.mkdir(parents=True, exist_ok=True)
