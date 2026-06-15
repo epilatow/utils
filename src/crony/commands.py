@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import importlib.resources
 import logging
 import os
 import re
@@ -44,273 +45,21 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # DEFAULT CONFIG TEMPLATE
 # =============================================================================
-# Emitted by `crony config init`. Every section is commented out so a user can
-# uncomment the bits they want without touching the explanatory prose.
-
-_DEFAULT_CONFIG_TEMPLATE: str = """\
-# ============================================================================
-# crony config bundle
-# ============================================================================
-# crony reads bundles from:
-#   ~/.config/crony/config.toml      -> bundle name "default"
-#   ~/.config/crony/config/<x>.toml  -> bundle name "<x>"
-#                                       (filename stem matches
-#                                       [A-Za-z0-9][A-Za-z0-9_-]*)
-# Each bundle is independent: its [defaults], targets, groups, and
-# notify config apply only to the jobs defined in the same file. The
-# one cross-bundle tie is notification inheritance: a non-default
-# bundle can borrow the default bundle's notify config (see the
-# defaults section below).
-# Job and group names are namespaced as <bundle>.<short>; on the
-# CLI, a bare name (`crony trigger foo`) is shorthand for
-# `default.foo` and never falls through to other bundles. The
-# `-b/--bundle <name>` flag on multi-job subcommands (apply,
-# destroy, status, enable, disable, trigger) scopes the operation
-# to <name>, so a bare arg resolves there instead of `default`.
-#
-# Schedules use systemd OnCalendar syntax; intervals use systemd
-# time-span syntax. See:
-#   https://www.freedesktop.org/software/systemd/man/systemd.time.html
-# ============================================================================
+# `crony config init` writes the starting bundle config from the
+# shipped `default_config.toml` package-data file (every section
+# commented out, so a user uncomments the bits they want without
+# touching the explanatory prose). Read lazily so a packaging mishap
+# surfaces on `config init` rather than at import.
 
 
-# ----------------------------------------------------------------------------
-# defaults section
-# ----------------------------------------------------------------------------
-# Settings cascaded to every job in THIS bundle. Per-job and
-# per-target settings can override anything here. Defaults from
-# other bundles never apply -- each bundle has its own.
-
-# [defaults]
-# notify-channels      = []           # names defined below, or "dialog-popup"
-# notify-attach-log    = true         # include log content in notifications
-# notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
-# job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
-# trigger-timeout-sec  = 15           # `crony trigger --wait` deadline
-# log-keep-runs        = 30
-# priority             = "high"       # priority class; jobs may override
-# keep-awake           = true         # default; jobs may override
-# # flags = ["keep-awake"]            # capability flags set here cascade
-# #            to every job; a group or a job overrides with its own
-# #            `flags` ("flag=false" turns one off). Same flags as the
-# #            per-job example below. Settable at [defaults],
-# #            [job-group.*], and [job.*].
-#
-# [defaults.env]
-# PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
-
-# Notification inheritance. The reserved channel name `default` in a
-# NON-default bundle's `notify-channels` pulls in the default bundle's
-# channel list, definitions, and attach settings. Alone
-# (`notify-channels = ["default"]`) the bundle notifies exactly as the
-# default bundle would, so it can omit every [defaults.notify.*] block
-# of its own. Combined with explicit siblings
-# (`notify-channels = ["default", "dialog-popup"]`) it notifies as the
-# default bundle would PLUS those channels -- de-duped, so a channel in
-# both fires once. Those siblings must be channels defined in THIS
-# bundle or zero-config built-ins (e.g. dialog-popup); the sentinel
-# already pulls in the whole default set, so there is no need to
-# re-list the default bundle's channels by name. `default` is also the
-# implicit default: a
-# non-default bundle that says nothing about notify config inherits the
-# default bundle's. Opt back out with an explicit `notify-channels = []`
-# (silence). The default bundle cannot inherit itself, and `default` is
-# a reserved channel name (no [defaults.notify.default] block).
-
-# Each notify channel is a [defaults.notify.<name>] block. The name
-# is whatever the user lists in `notify-channels`. The `transport`
-# field selects the underlying sender ("email", "ntfy", or
-# "dialog-popup"); when omitted, transport defaults to the channel
-# name (so a block named `email`, `ntfy`, or `dialog-popup` picks up
-# its like-named transport automatically). Optional `headers` is a
-# table of arbitrary message headers crony attaches to email / ntfy
-# -- crony-controlled headers (To/From/Subject for email;
-# Authorization/Tags/Title for ntfy) are reserved and rejected.
-#
-# `dialog-popup` is a zero-config built-in -- it needs no block at
-# all. Just list "dialog-popup" in `notify-channels` and a failing
-# job pops a native desktop dialog (macOS) showing the failure
-# summary and latest log. An explicit block is allowed but only ever
-# sets `transport`.
-
-# Embedded SMTP channel.
-# [defaults.notify.email]
-# # transport defaults to "email" since the channel is named "email"
-# to                         = "you@example.com"
-# from                       = "crony@example.com"
-# smtp-host                  = "smtp.gmail.com"
-# smtp-port                  = 587
-# smtp-user                  = "you@gmail.com"
-# smtp-starttls              = true
-# # Password retrieval -- first match wins. On macOS prefer the
-# # keychain item (the optional -account narrows the lookup when
-# # multiple items share a service name); on Linux fall back to a
-# # 0600 secrets file.
-# smtp-pass-keychain-service = "crony-smtp"
-# smtp-pass-keychain-account = "you@gmail.com"   # optional
-# smtp-pass-file             = "~/.config/crony/secrets/smtp-password"
-# headers                    = { "Reply-To" = "you@example.com" }
-
-# ntfy channel.
-# [defaults.notify.ntfy]
-# url                    = "https://ntfy.example.com/automation"
-# token-keychain-service = "ntfy-automation"
-# token-keychain-account = "edp"                 # optional
-# token-file             = "~/.config/crony/secrets/ntfy-token"
-
-# Custom-named ntfy channel that also relays through ntfy's email
-# integration. The transport field is required because the channel
-# name `ntfy-email` doesn't match a built-in transport.
-# [defaults.notify.ntfy-email]
-# transport              = "ntfy"
-# url                    = "https://ntfy.example.com/automation"
-# token-keychain-service = "ntfy-automation"
-# headers                = { "Email" = "you@example.com", "Priority" = "high" }
-
-# Native desktop dialog (macOS). Zero-config -- normally you just put
-# "dialog-popup" in notify-channels with no block at all; this
-# explicit form is equivalent and only names the transport.
-# [defaults.notify.dialog-popup]
-# transport = "dialog-popup"
-
-
-# ----------------------------------------------------------------------------
-# job sections
-# ----------------------------------------------------------------------------
-# A schedulable unit of work. Either `command` (one-line shell) or
-# `script` (path under the dotfiles repo) is required. Schedule and
-# interval are optional; a job with neither fires only when a
-# scheduled group dispatches it. Validation rejects a target chain
-# that reaches a job through a path with no schedule anywhere.
-#
-# `uuid` is the stable per-bundle identity of the entry, decoupled
-# from `name` so that renaming a job in this file is recognized as
-# a rename rather than a delete plus an unrelated add. Hand-edit a
-# new entry without it and run `crony config update` to fill the
-# field in place; the same `update` action works on `[job-group.*]`
-# blocks below. `crony config generate-uuid` prints one fresh UUID
-# for editor seeding when `update` can't yet parse the file.
-
-# [job.brew-update]
-# uuid      = "aabbccdd-1234-5678-9abc-aabbccddeeff"   # `crony config update`
-# command   = "brew update && brew upgrade && brew cleanup"
-# platforms = ["darwin"]               # filter: skip on non-darwin hosts
-# # hosts   = ["mymac"]                # filter: only on listed hostnames
-# # hosts   = ["!noisyhost"]           # or: every host except listed
-# #                                    #   (all entries must use `!`, or none)
-# schedule  = "*-*-* 03:15"            # OnCalendar; daily at 03:15
-# gate      = "command -v brew"        # skip benignly if absent
-# # Optional per-job overrides of [defaults]:
-# # notify-channels = ["email"]   # or [] to silence just this job
-# # job-timeout-sec = 7200        # 0 = no cap (job manages its own timeout)
-# # priority = "high"             # process-priority class for the unit:
-# #   "high"   un-throttle: macOS ProcessType=Interactive + normal CPU/IO
-# #            (avoids the QoS throttling that slows IO-bound work); on
-# #            Linux there is no such throttle to undo, so it has no
-# #            runtime effect (recorded as a unit comment).
-# #   "low"    throttle: macOS Background + low-priority IO + Nice 10;
-# #            Linux Nice 10 + idle IO scheduling.
-# #   "normal" (default) emit nothing. Applies on every fire path
-# #            (scheduled, `crony trigger`, parent-group dispatch).
-# # keep-awake = true            # hold a power assertion for the run so
-# #            an idle / on-AC machine doesn't sleep mid-job. NOTE:
-# #            closing the lid on battery still sleeps the machine --
-# #            nothing in userspace prevents that.
-# # flags = ["interactive", "keep-awake", "full-disk-access"]
-# #            an alternative spelling for the per-flag booleans above;
-# #            "flag=false" turns one off (e.g. ["keep-awake=false"]). A
-# #            flag with its own key may be set that way OR in `flags`,
-# #            never both at the same level. full-disk-access (macOS)
-# #            runs the command under a Full Disk Access grant via
-# #            Crony.app: `crony apply` builds the wrapper, then grant it
-# #            in System Settings (apply prints how); a no-op off macOS.
-# # success-exit-codes = [1]     # non-zero exit codes to classify as
-# #            success (exit 0 is always success). A run whose code is
-# #            listed is "ok" -- not failed, no notification -- and the
-# #            unit sees a 0 exit. For commands that exit non-zero on
-# #            transient / non-fatal conditions (e.g. borg's exit 1 on
-# #            backup warnings).
-# # env supports $VAR / ${VAR} expansion against the running env, so
-# # `PATH = "$HOME/.local/bin:$PATH"` extends the inherited PATH.
-# # Unresolved vars stay literal; `$$` is a literal `$`. Merges over
-# # [defaults.env] -- a key set here wins for this job.
-# # env = { "PATH" = "$HOME/.local/bin:$PATH", "RUST_BACKTRACE" = "1" }
-
-# [job.git-pull-utils]
-# script   = "scripts/git-pull.sh"     # path under the dotfiles repo
-# args     = ["~/utils"]               # `~` and `$VAR` expanded
-# interval = "30min"                   # 30 min after each completion
-
-# Group-only job: no schedule, only fires via [job-group.*].
-# [job.uv-update]
-# command = "uv self update && uv tool upgrade --all"
-# gate    = "command -v uv"
-
-# Interactive job: sits pending after its fire and pops a
-# desktop dialog (Run / Delay / Cancel) once the user has been
-# active continuously for `interactive-active` (default 10min).
-# Interactive needs the macOS dialog, so the job runs only on
-# darwin -- a non-darwin host silently skips it (and an explicit
-# non-darwin `platforms` just never selects). May live in a
-# [job-group.*]; the group dispatches it async (no wait) and the
-# child's interactive wait runs independently of the group's deadline.
-# [job.weekly-prompt]
-# command            = "/usr/local/bin/some-interactive-task"
-# schedule           = "Sun *-*-* 12:00"  # weekly at noon
-# interactive        = true
-# # Optional knobs (defaults shown):
-# # interactive-active = "10min"          # required user-active window
-# # interactive-delay  = "1h"             # sleep after "Delay Job"
-
-
-# ----------------------------------------------------------------------------
-# job-group sections
-# ----------------------------------------------------------------------------
-# A sequencer that fires named jobs (or other groups) in order.
-# Schedule / interval are optional: a group with no schedule is a
-# "transit" group that fires only when a parent group dispatches it.
-# Every chain from a target down through groups to a leaf job must
-# contain a schedule somewhere, or validation rejects it.
-
-# [job-group.daily-updates]
-# uuid      = "11223344-5566-7788-99aa-bbccddeeff00"
-# schedule  = "*-*-* 03:00"
-# jobs      = ["brew-update", "uv-update", "git-pull-utils"]
-# # platforms = ["darwin"]             # filter: as on jobs
-# # hosts     = ["mymac"]              # filter: as on jobs
-# # hosts     = ["!noisyhost"]         # `!` negation also supported here
-
-# Nested group: this one has no schedule of its own; it fires only
-# when the daily-updates group above (or some other scheduled
-# parent) dispatches it.
-# [job-group.uv-updates]
-# jobs = ["uv-update"]
-
-
-# ----------------------------------------------------------------------------
-# target sections
-# ----------------------------------------------------------------------------
-# Selects which jobs and groups install on which hosts. A host
-# target replaces the platform target when both apply; the explicit
-# `jobs` list IS the selection (no inherits / exclude / add).
-#
-# Single-parent rule: within one target's subtree, each name has
-# at most one parent. Listing both a group and one of its children
-# from the same target -- or two groups that share a child -- is
-# rejected at parse time.
-
-# [target.darwin]
-# jobs            = ["daily-updates"]
-# notify-channels = ["email"]
-
-# [target.linux]
-# jobs            = ["git-pull-utils"]
-# notify-channels = ["ntfy"]
-
-# [target.host.work-laptop]
-# jobs            = ["brew-update", "git-pull-utils"]
-# notify-channels = []   # no external dispatch (run.log + last-run.json only)
-"""
+def _default_config_template() -> str:
+    """Contents of the shipped `default_config.toml`, the starting
+    bundle config `crony config init` writes."""
+    return (
+        importlib.resources.files("crony")
+        .joinpath("default_config.toml")
+        .read_text(encoding="utf-8")
+    )
 
 
 def _schedule_display(timing: crony.unit.Timing | None) -> str:
@@ -608,6 +357,7 @@ def do_init(force: bool, bundle: str | None) -> None:
     With `--bundle <name>`, writes `config/<name>.toml` (creating
     the dropin dir if missing). Otherwise writes `config.toml`.
     """
+    template = _default_config_template()
     if bundle is not None:
         if bundle == crony.config.DEFAULT_BUNDLE_NAME:
             raise crony.errors.UsageError(
@@ -625,7 +375,7 @@ def do_init(force: bool, bundle: str | None) -> None:
                 f"{target} already exists; pass --force to overwrite"
             )
         crony.paths.CONFIG_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
-        target.write_text(_DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
+        target.write_text(template, encoding="utf-8")
         logger.info("wrote bundle config to %s", target)
         return
     if crony.paths.CONFIG_FILE.exists() and not force:
@@ -634,9 +384,7 @@ def do_init(force: bool, bundle: str | None) -> None:
             "pass --force to overwrite"
         )
     crony.paths.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    crony.paths.CONFIG_FILE.write_text(
-        _DEFAULT_CONFIG_TEMPLATE, encoding="utf-8"
-    )
+    crony.paths.CONFIG_FILE.write_text(template, encoding="utf-8")
     logger.info("wrote default config to %s", crony.paths.CONFIG_FILE)
 
 

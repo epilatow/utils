@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.resources
 import io
 import json
 import logging
@@ -133,11 +134,32 @@ class TestInit:
         assert "user content" not in body
         assert "[defaults]" in body
 
+    def test_shipped_template_file_exists(self) -> None:
+        """The package ships `default_config.toml` as data beside the
+        code; `crony config init` reads it. Guard against the file (or
+        the package-relative path to it) going missing."""
+        res = importlib.resources.files("crony").joinpath("default_config.toml")
+        assert res.is_file()
+
     def test_template_is_ascii_only(self) -> None:
         """All persistent files in this repo are ASCII; the template
         we ship as a starting point must be too.
         """
-        crony_commands._DEFAULT_CONFIG_TEMPLATE.encode("ascii")  # raises if not
+        crony_commands._default_config_template().encode("ascii")  # raises
+
+    def test_init_emits_shipped_template_verbatim(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """`do_init` writes the shipped file's exact bytes, so what the
+        validation tests check is what a user actually gets."""
+        cfg_file = self._redirect_config(monkeypatch, tmp_path)
+        crony_commands.do_init(force=False, bundle=None)
+        shipped = (
+            importlib.resources.files("crony")
+            .joinpath("default_config.toml")
+            .read_text(encoding="utf-8")
+        )
+        assert cfg_file.read_text(encoding="utf-8") == shipped
 
     def test_bundle_writes_to_dropin(
         self, tmp_path: Path, monkeypatch: Any
@@ -191,7 +213,7 @@ class TestInit:
         extracted: list[str] = []
         section_re = re.compile(r"^# \[[\w.\-]+\]\s*$")
         kv_re = re.compile(r"^# [A-Za-z_][\w.\-]*\s*=")
-        for line in crony_commands._DEFAULT_CONFIG_TEMPLATE.splitlines():
+        for line in crony_commands._default_config_template().splitlines():
             if section_re.match(line) or kv_re.match(line):
                 extracted.append(line[2:])
         text = "\n".join(extracted)
