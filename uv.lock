@@ -65,7 +65,7 @@ wheels = [
 [[package]]
 name = "epilatow-repo-shared"
 version = "0.1.0"
-source = { git = "https://github.com/epilatow/repo-shared?rev=ef6cbb229981b711f1b06735b19a8ddfc4d23f6d#ef6cbb229981b711f1b06735b19a8ddfc4d23f6d" }
+source = { git = "https://github.com/epilatow/repo-shared?rev=37f0e825acf71451a1adc3c7572a5401df09e5cd#37f0e825acf71451a1adc3c7572a5401df09e5cd" }
 dependencies = [
     { name = "mdformat" },
     { name = "mdformat-gfm" },
@@ -526,7 +526,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=ef6cbb229981b711f1b06735b19a8ddfc4d23f6d" },
+    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=37f0e825acf71451a1adc3c7572a5401df09e5cd" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pytest", specifier = ">=9.0.3" },
 ]
