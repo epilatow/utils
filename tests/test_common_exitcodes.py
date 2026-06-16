@@ -39,12 +39,26 @@ class TestExitCodeBase:
         assert _SampleExit.OK.description == "All good"  # type: ignore[attr-defined]
         assert isinstance(_SampleExit.OK, enum.IntEnum)
 
+    def test_entries_are_value_description_pairs(self) -> None:
+        assert _SampleExit.entries() == [
+            (0, "All good"),
+            (1, "A warning"),
+            (4, "Boom"),
+        ]
+
     def test_epilog_lists_every_member(self) -> None:
         epilog = _SampleExit.epilog()
-        assert epilog.startswith("exit codes:")
+        assert epilog.startswith("Exit Status:")
         assert "0  All good" in epilog
         assert "1  A warning" in epilog
         assert "4  Boom" in epilog
+
+    def test_epilog_excludes_given_codes(self) -> None:
+        # A utility hides its internal codes from the user-facing block.
+        epilog = _SampleExit.epilog(exclude={4})
+        assert "0  All good" in epilog
+        assert "1  A warning" in epilog
+        assert "Boom" not in epilog
 
 
 class _RefExit(ExitCodeBase):

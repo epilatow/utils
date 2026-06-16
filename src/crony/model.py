@@ -1131,7 +1131,30 @@ class ExitClass(StrEnum):
             return None
 
 
-class JobStatus(StrEnum):
+class DescribedStrEnum(StrEnum):
+    """StrEnum whose members are ``(value, description)`` pairs, where
+    the description is the human-facing meaning of the value.
+
+    Subclasses assign members as ``(value, description)`` tuples (e.g.
+    ``SYNCED = "synced", "..."``); the value may be a plain string or
+    another StrEnum member (`JobStatus` reuses `ExitClass` members as its
+    values). A member assigned a bare value with no description gets an
+    empty one. The base has no members of its own, which is what lets it
+    be subclassed. Giving the description one home on the member keeps
+    the `crony status` `--help` reference from drifting across
+    hand-maintained copies -- mirroring `common.exitcodes.ExitCodeBase`."""
+
+    description: str
+
+    def __new__(cls, value: str, description: str = "") -> Self:
+        text = str(value)
+        obj = str.__new__(cls, text)
+        obj._value_ = text
+        obj.description = description
+        return obj
+
+
+class JobStatus(DescribedStrEnum):
     """The verdict `crony status` shows in its STATUS column: the run
     outcomes that actually reach the cell plus the display-only states
     derived at read time. Shares string values with `ExitClass` for the
@@ -1139,22 +1162,43 @@ class JobStatus(StrEnum):
     omits `signal` (folded to `fail`) and `dispatched` (shown as
     `unknown`), which never surface in the cell."""
 
-    OK = ExitClass.OK
-    FAIL = ExitClass.FAIL
-    TIMEOUT = ExitClass.TIMEOUT
-    GATED = ExitClass.GATED
-    CANCELED = ExitClass.CANCELED
-    CRASHED = "crashed"
-    RUNNING = "running"
-    PENDING = "pending"
-    NEVER = "never"
-    UNKNOWN = "unknown"
+    OK = ExitClass.OK, "The job's last run completed successfully."
+    FAIL = (
+        ExitClass.FAIL,
+        "The job's last run failed (exited with a non-zero status).",
+    )
+    TIMEOUT = (
+        ExitClass.TIMEOUT,
+        "The job was killed after exceeding its wallclock execution timeout.",
+    )
+    GATED = (
+        ExitClass.GATED,
+        "The job was skipped due to an execution gate. This is not "
+        "considered as a job failure.",
+    )
+    CANCELED = (
+        ExitClass.CANCELED,
+        "An interactive job run that was canceled / skipped by the user.",
+    )
+    CRASHED = (
+        "crashed",
+        "The scheduler failed to launch a job, or the job was "
+        "killed/crashed before it could save its exit status to disk.",
+    )
+    RUNNING = "running", "The job is currently running."
+    PENDING = (
+        "pending",
+        "An interactive job is either waiting for an active user, or "
+        "waiting for that user to confirm execution (via a pop-up "
+        "dialog).",
+    )
+    NEVER = "never", "A newly deployed job that hasn't been run yet."
+    UNKNOWN = "unknown", "We're unable to determine the job status."
 
 
-class ConfigStatus(StrEnum):
+class ConfigStatus(DescribedStrEnum):
     """The verdict `crony status` shows in its CONFIG column: how the
-    live config view relates to the applied on-disk state. A StrEnum so
-    it compares against and renders as its plain value.
+    live config view relates to the applied on-disk state.
 
     `Config.cfg_status` produces the base verdicts that score the
     pending graph against the current one -- SYNCED / STALE / BROKEN /
@@ -1163,13 +1207,76 @@ class ConfigStatus(StrEnum):
     rejected, and MASKED for one excluded on this host with no on-disk
     remnant."""
 
-    SYNCED = "synced"
-    STALE = "stale"
-    BROKEN = "broken"
-    MISSING = "missing"
-    ORPHAN = "orphan"
-    MASKED = "masked"
-    ERROR = "error"
+    SYNCED = "synced", "A deployed job's configuration is up-to-date."
+    STALE = (
+        "stale",
+        "A deployed job's configuration has diverged from its "
+        "configuration file definition, but the job is still runnable. "
+        "Run `apply` to update the deployed configuration.",
+    )
+    BROKEN = (
+        "broken",
+        "A deployed job's configuration is broken and un-runnable. Run "
+        "`apply` to fix the deployed configuration.",
+    )
+    MISSING = (
+        "missing",
+        "A job exists in the config file but has not yet been deployed.",
+    )
+    ORPHAN = (
+        "orphan",
+        "A deployed job (or some job-related resource) is not defined in "
+        "any configuration file. Run `destroy --orphans` to clean up the "
+        "deployed configuration.",
+    )
+    MASKED = (
+        "masked",
+        "A job can't be deployed on the current host due to "
+        "configuration filters (usually a mismatched `platform` or "
+        "`host` directive).",
+    )
+    ERROR = (
+        "error",
+        "The job configuration file definition (i.e. the pending or "
+        "requested configuration) is broken, or its dependencies can't "
+        "be met (e.g. full-disk-access has been requested on "
+        "macOS/darwin, but the Crony.app wrapper doesn't have "
+        "full-disk-access). If the job was previously deployed, it will "
+        "continue to run and can be managed, but the deployed "
+        "configuration can't be updated with `apply` until the pending "
+        "configuration issue is fixed.",
+    )
+
+
+class ScheduleValue(DescribedStrEnum):
+    """The kinds of value the `crony status` SCHEDULE column shows. Each
+    member's value is its `--help` display label. GROUPED and DISABLED's
+    values are also the literal cell strings the renderer emits;
+    INTERVAL's value is the cell template, whose `<x>` the renderer
+    replaces with the actual time span. All three thus have a single home
+    here. SCHEDULE is a pure category label -- a scheduled entry renders
+    its raw OnCalendar string."""
+
+    SCHEDULE = (
+        "OnCalendar schedule",
+        "A (restricted) systemd OnCalendar schedule for job execution.",
+    )
+    INTERVAL = (
+        "interval=<x>",
+        "A systemd time-span interval for job execution.",
+    )
+    GROUPED = (
+        "grouped",
+        "A job/group with no schedule of its own, it runs when triggered "
+        "by a parent job group.",
+    )
+    DISABLED = (
+        "disabled",
+        "A job that has been disabled via the `disable` subcommand; it "
+        "will not be run via any schedule. It can be run manually via the "
+        "`trigger` subcommand, and re-enabled via the `enable` "
+        "subcommand.",
+    )
 
 
 class GateResult(StrEnum):

@@ -22,9 +22,12 @@ import os
 import re
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys as sys  # noqa: PLC0414  re-exported for tests
+import textwrap
 import time as time  # noqa: PLC0414  re-exported for tests
 import uuid
+from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 import tomlkit
 import tomlkit.exceptions
@@ -74,8 +77,10 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     if isinstance(timing, crony.unit.Schedule):
         return str(timing)
     if isinstance(timing, crony.unit.Interval):
-        return f"interval={timing}"
-    return "grouped"
+        return crony.model.ScheduleValue.INTERVAL.value.replace(
+            "<x>", str(timing)
+        )
+    return crony.model.ScheduleValue.GROUPED.value
 
 
 def _timeout_display(
@@ -161,7 +166,7 @@ def _stale_fields(
 
 
 # =============================================================================
-# RUNTIME STATE (enable / disable / status / linger)
+# RUNTIME STATE (enable / disable / status)
 # =============================================================================
 # Runtime state is the operator-disable overlay crony records on the
 # snapshot. It's orthogonal to CONFIG state: a unit can be `synced` with
@@ -597,7 +602,7 @@ def _selected_and_masked_full_names_per_bundle(
             # genuinely-unused ones at this layer; `_resolve_states`
             # promotes them back to `error` so the user sees the
             # actual problem instead of a generic mask.
-            masked_by_full[full] = "unused"
+            masked_by_full[full] = crony.config.MaskReason.UNUSED.value
     return by_full, selected, masked_by_full
 
 
@@ -1327,38 +1332,373 @@ def _build_status_tree(
     return order, depth
 
 
+class StatusCols(StrEnum):
+    """The selectable `crony status` column names, in `--cols all`
+    display order. This is the authoritative column set: a column has to
+    appear here to be documented (`_STATUS_COLUMNS`), rendered
+    (`row_cells`), or named in an alias's expansion. The per-flag
+    columns are not members -- they are a dynamic family keyed by each
+    `JobFlags` token (the `<flag>` doc entry covers them)."""
+
+    JOB = "job"
+    JOB_OR_UUID = "job-or-uuid"
+    KIND = "kind"
+    CONFIG = "config"
+    SCHEDULE = "schedule"
+    GROUPS = "groups"
+    STATUS = "status"
+    LAST_RAN = "last-ran"
+    MASKED_BY = "masked-by"
+    UNIT_NAME = "unit-name"
+    UUID = "uuid"
+    UNIT_CONFIG = "unit-config"
+    UNIT_TIMER = "unit-timer"
+    LOG_FILE = "log-file"
+    FLAGS = "flags"
+    TIMEOUT = "timeout"
+    PRIORITY = "priority"
+    STALE = "stale"
+
+
+# Documentation entry for the per-flag column family (one opt-in
+# true/false column per `JobFlags` token); not a selectable name.
+_FLAG_COL_DOC = "<flag>"
+
+
+class ColVisibility(StrEnum):
+    """When an alias expansion keeps a column. `ALWAYS` is unconditional;
+    the others are dropped from an alias's columns in a context where the
+    column would only ever be blank (an explicitly named column is always
+    honored regardless). The condition is an intrinsic property of the
+    column, so it lives on its `StatusColumn` rather than being hand-coded
+    per alias."""
+
+    ALWAYS = "always"
+    IF_MASKED_PRESENT = "if-masked-present"
+    IF_PLATFORM_HAS_TIMER = "if-platform-has-timer"
+
+
+class StatusColumn(NamedTuple):
+    """One `crony status` column: its `--cols` name, its table HEADER,
+    the prose the `--help` column reference renders, and when an alias
+    keeps it (`visibility`). The single description home keeps the help
+    text from drifting from the column set. The `_FLAG_COL_DOC`
+    (`<flag>`) entry is a documentation entry for the per-flag column
+    family, not a selectable name."""
+
+    name: str
+    header: str
+    description: str
+    visibility: ColVisibility = ColVisibility.ALWAYS
+
+
+_STATUS_COLUMNS: tuple[StatusColumn, ...] = (
+    StatusColumn(
+        StatusCols.JOB,
+        "JOB",
+        "Full job name: `<bundle>.<short>`. This name may not be usable "
+        "with subcommands if a pending configuration update will assign "
+        "this name to a new job, in which case you can use the "
+        "`<bundle>:<UUID>` name to directly address this job. May be "
+        "empty for a broken job with no recoverable name.",
+    ),
+    StatusColumn(
+        StatusCols.JOB_OR_UUID,
+        "JOB / UUID",
+        "Normally the full job name `<bundle>.<short>`, but in the case "
+        "of a job naming conflict or a broken job with no recoverable "
+        "name this column may report `<bundle>:<UUID>`.",
+    ),
+    StatusColumn(
+        StatusCols.KIND,
+        "KIND",
+        'Job type: "job" or "group".',
+    ),
+    StatusColumn(
+        StatusCols.CONFIG,
+        "CONFIG",
+        'See "CONFIG values".',
+    ),
+    StatusColumn(
+        StatusCols.SCHEDULE,
+        "SCHEDULE",
+        'See "SCHEDULE values".',
+    ),
+    StatusColumn(
+        StatusCols.GROUPS,
+        "GROUPS",
+        "Comma-separated list of job groups containing this job. A job "
+        "can only have one unmasked parent, but can have multiple masked "
+        "parents. Empty when the job isn't part of any group.",
+    ),
+    StatusColumn(
+        StatusCols.STATUS,
+        "STATUS",
+        'See "STATUS values".',
+    ),
+    StatusColumn(
+        StatusCols.LAST_RAN,
+        "LAST RAN",
+        'Relative time of the last job run, e.g. "5m ago".',
+    ),
+    StatusColumn(
+        StatusCols.MASKED_BY,
+        "MASKED BY",
+        "A comma-separated list of reasons why a job is masked (CONFIG = "
+        'masked) on the current host. See "MASKED values".',
+        ColVisibility.IF_MASKED_PRESENT,
+    ),
+    StatusColumn(
+        StatusCols.UNIT_NAME,
+        "UNIT NAME",
+        "Platform unit identifier.",
+    ),
+    StatusColumn(
+        StatusCols.UUID,
+        "UUID",
+        "The job's `<bundle>:<UUID>` name.",
+    ),
+    StatusColumn(
+        StatusCols.UNIT_CONFIG,
+        "UNIT CONFIG",
+        "Filesystem path of the platform config unit. Empty when no "
+        "config unit exists on disk.",
+    ),
+    StatusColumn(
+        StatusCols.UNIT_TIMER,
+        "UNIT TIMER",
+        "Filesystem path of the platform timer unit. Empty for an "
+        "unscheduled / grouped job. Only used by systemd, and always "
+        "empty on macOS/darwin.",
+        ColVisibility.IF_PLATFORM_HAS_TIMER,
+    ),
+    StatusColumn(
+        StatusCols.LOG_FILE,
+        "LOG FILE",
+        "Filesystem path of the job's log file.",
+    ),
+    StatusColumn(
+        StatusCols.FLAGS,
+        "FLAGS",
+        "Comma-separated list of capability flags enabled for the job. "
+        'See "FLAG values".',
+    ),
+    StatusColumn(
+        _FLAG_COL_DOC,
+        "",
+        "One opt-in true/false column per capability flag (`--cols "
+        "interactive`, etc.). Request by name; the `all` alias omits "
+        'these in favor of the compact `flags` column. See "FLAG values".',
+    ),
+    StatusColumn(
+        StatusCols.TIMEOUT,
+        "TIMEOUT",
+        "Job wallclock cap: `<n>s`. The job will be killed if its "
+        "wallclock execution time exceeds this cap. May be `none` for "
+        "uncapped jobs.",
+    ),
+    StatusColumn(
+        StatusCols.PRIORITY,
+        "PRIORITY",
+        "Job scheduling priority: high | normal | low. Empty for groups.",
+    ),
+    StatusColumn(
+        StatusCols.STALE,
+        "STALE",
+        "A comma-separated list of the snapshot fields that have "
+        "diverged between the pending config and the applied unit "
+        "(CONFIG = stale). Each is named the way that field is known -- "
+        "the config-file knob, a capability flag, a status column, or "
+        "its dash-spelled snapshot attribute.",
+    ),
+)
+# Every `StatusCols` member must carry exactly one registry entry, so
+# the help reference and headers can't diverge from the column set.
+_documented_cols = [
+    col.name for col in _STATUS_COLUMNS if not col.name.startswith("<")
+]
+assert sorted(_documented_cols) == sorted(StatusCols), (
+    "`_STATUS_COLUMNS` must document every `StatusCols` member exactly "
+    f"once: {sorted(_documented_cols)} != {sorted(StatusCols)}"
+)
+
+# The per-flag column family: one opt-in column per capability flag,
+# keyed by the flag's token, so the set tracks `JobFlags` as members are
+# added. These are selectable but not `StatusCols` members.
+_FLAG_COL_TOKENS: frozenset[str] = frozenset(
+    f.token for f in crony.config.JobFlags.members()
+)
+
+# Selectable columns map name -> HEADER (the `<...>` doc entries are not
+# selectable). The per-flag columns are appended after the `StatusCols`.
 _STATUS_COL_HEADERS: dict[str, str] = {
-    "job": "JOB",
-    "job-or-uuid": "JOB / UUID",
-    "kind": "KIND",
-    "config": "CONFIG",
-    "schedule": "SCHEDULE",
-    "groups": "GROUPS",
-    "status": "STATUS",
-    "last-ran": "LAST RAN",
-    "masked-by": "MASKED BY",
-    "unit-name": "UNIT NAME",
-    "uuid": "UUID",
-    "unit-config": "UNIT CONFIG",
-    "unit-timer": "UNIT TIMER",
-    "log-file": "LOG FILE",
-    "flags": "FLAGS",
-    "timeout": "TIMEOUT",
-    "priority": "PRIORITY",
-    "stale": "STALE",
+    col.name: col.header
+    for col in _STATUS_COLUMNS
+    if not col.name.startswith("<")
 }
-# One opt-in column per capability flag, keyed by the flag's token, so
-# the set tracks `JobFlags` automatically as members are added.
 for _flag_member in crony.config.JobFlags.members():
     _STATUS_COL_HEADERS[_flag_member.token] = _flag_member.token.upper()
-_DEFAULT_STATUS_COLS: tuple[str, ...] = (
-    "job-or-uuid",
-    "config",
-    "schedule",
-    "status",
-    "last-ran",
+
+# Each selectable column's alias visibility, so `_expand_status_alias`
+# trims by column property rather than by hand-coded column name.
+_COL_VISIBILITY: dict[str, ColVisibility] = {
+    col.name: col.visibility
+    for col in _STATUS_COLUMNS
+    if not col.name.startswith("<")
+}
+
+
+# Wrap width for the `crony status --help` epilog text. Each section's
+# body is indented two spaces under its `Title:` header (matching the
+# top-level `crony --help` epilog), so content wraps at 76 to stay within
+# 78 once indented. The man page renders the same reference from
+# structured data (it reflows at display width), so this only governs the
+# terminal --help layout.
+_STATUS_HELP_WIDTH = 76
+
+
+def _help_definition_list(
+    items: list[tuple[str, str]], label_width: int
+) -> str:
+    """Render `(label, description)` pairs as a `--help` definition list:
+    each label in a left column, its description wrapped and
+    hanging-indented beside it."""
+    out: list[str] = []
+    for label, description in items:
+        out.append(
+            textwrap.fill(
+                description,
+                width=_STATUS_HELP_WIDTH,
+                initial_indent=f"{label:<{label_width}}",
+                subsequent_indent=" " * label_width,
+                break_on_hyphens=False,
+                break_long_words=False,
+            )
+        )
+    return "\n".join(out)
+
+
+def _column_items(*, default: bool) -> list[tuple[str, str]]:
+    """The `_STATUS_COLUMNS` reference items, split into the default set
+    (shown when `--cols` is omitted, in display order) and the opt-in
+    remainder (sorted alphabetically; `<...>` documentation entries like
+    `<flag>` sort by their bare name)."""
+    defaults = set(_DEFAULT_STATUS_COLS)
+    cols = [c for c in _STATUS_COLUMNS if (c.name in defaults) == default]
+    if not default:
+        cols.sort(key=lambda c: c.name.strip("<>"))
+    return [(c.name, c.description) for c in cols]
+
+
+def _value_reference(items: list[tuple[str, str]]) -> str:
+    """A `--help` value reference -- the same `<value>  <description>`
+    layout as the column / alias blocks, with the label column sized to
+    the widest value."""
+    width = max(len(label) for label, _ in items) + 2
+    return _help_definition_list(items, width)
+
+
+# The Colors lead-in, stored raw (unwrapped) so each consumer wraps to
+# its own width: the `--help` epilog fills it, the man-page renderer lets
+# the formatter reflow.
+_COLOR_LEAD = (
+    "On a color-capable TTY (and NO_COLOR unset) some cells are colored; "
+    "redirected or piped output is plain, where drift shows as a trailing "
+    "`^` plus a footnote legend instead."
 )
-_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = ("default", "all", "unit-files")
+
+
+def _color_items() -> list[tuple[str, str]]:
+    """The red / yellow palette as reference items, rendered from
+    `_RED_CELLS` / `_YELLOW_CELLS` so the documented colors track what
+    `_status_value_color` paints."""
+
+    def palette(table: dict[str, frozenset[str]]) -> str:
+        parts: list[str] = []
+        for col, values in table.items():
+            header = _STATUS_COL_HEADERS.get(col, col.upper())
+            parts.append(f"{header} {' / '.join(sorted(values))}")
+        return "; ".join(parts)
+
+    return [
+        ("red", f"{palette(_RED_CELLS)}."),
+        (
+            "yellow",
+            f"{palette(_YELLOW_CELLS)}, plus any cell that diverged from "
+            "the applied state (on a color stream its `^` marker is "
+            "dropped in favor of the color).",
+        ),
+    ]
+
+
+class StatusAliases(StrEnum):
+    """The `--cols` alias names. Each expands to a list of `StatusCols`
+    via its `_STATUS_ALIASES` entry."""
+
+    DEFAULT = "default"
+    ALL = "all"
+    UNIT_FILES = "unit-files"
+
+
+class StatusAlias(NamedTuple):
+    """A `--cols` alias: its name, the `StatusCols` it expands to (before
+    the context trim `_expand_status_alias` applies), and the prose the
+    `--help` Aliases section renders. The single `cols` home keeps the
+    expansion and its documentation from drifting from each other."""
+
+    name: StatusAliases
+    cols: tuple[StatusCols, ...]
+    description: str
+
+
+_DEFAULT_STATUS_COLS: tuple[StatusCols, ...] = (
+    StatusCols.JOB_OR_UUID,
+    StatusCols.CONFIG,
+    StatusCols.SCHEDULE,
+    StatusCols.STATUS,
+    StatusCols.LAST_RAN,
+)
+_STATUS_ALIASES: tuple[StatusAlias, ...] = (
+    StatusAlias(
+        StatusAliases.DEFAULT,
+        _DEFAULT_STATUS_COLS,
+        "The columns shown when `--cols` is omitted: "
+        + ", ".join(_DEFAULT_STATUS_COLS)
+        + ".",
+    ),
+    StatusAlias(
+        StatusAliases.ALL,
+        tuple(StatusCols),
+        "Every column except the per-flag columns (use the compact "
+        "`flags` instead), `masked-by` (kept only when a masked entry is "
+        "present), and -- on macOS -- `unit-timer` (launchd has no timer "
+        "file). Naming an excluded column explicitly still shows it.",
+    ),
+    StatusAlias(
+        StatusAliases.UNIT_FILES,
+        (StatusCols.UNIT_CONFIG, StatusCols.UNIT_TIMER),
+        "unit-config, plus unit-timer on Linux.",
+    ),
+)
+_STATUS_ALIAS_BY_NAME: dict[str, StatusAlias] = {
+    a.name: a for a in _STATUS_ALIASES
+}
+_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(StatusAliases)
+
+
+def _column_in_context(
+    col: str, *, masked_present: bool, platform: str
+) -> bool:
+    """Whether a column's `ColVisibility` keeps it in this context. A
+    column would only ever be blank here when its condition fails -- a
+    masked-reason column with no masked row shown, or a timer-file column
+    on a platform (darwin) with no timer unit."""
+    visibility = _COL_VISIBILITY[col]
+    if visibility is ColVisibility.IF_MASKED_PRESENT:
+        return masked_present
+    if visibility is ColVisibility.IF_PLATFORM_HAS_TIMER:
+        return platform != "darwin"
+    return True
 
 
 def _expand_status_alias(
@@ -1366,222 +1706,133 @@ def _expand_status_alias(
 ) -> tuple[str, ...]:
     """Expand a `--cols` alias to its column list for this context.
 
-    `all` and `unit-files` trim columns that would only ever be blank
-    here, so the wide views stay useful rather than padded with dead
-    space:
-
-    - `all` drops the per-flag columns (the compact `flags` column
-      already carries them), `masked-by` when no displayed row carries
-      a mask reason (`masked_present` is false), and `unit-timer` on
-      darwin (launchd pins the schedule in the plist, so there is no
-      timer file).
-    - `unit-files` drops `unit-timer` on darwin for the same reason.
-
-    Trimming applies only to the alias; a column named explicitly is
-    always honored (`--cols all,unit-timer` still shows the timer).
+    A column whose `ColVisibility` condition fails here would only ever
+    be blank, so the alias drops it to keep the wide views useful rather
+    than padded with dead space. The rule is the column's own property,
+    so the same pass serves every alias and a future conditional column
+    is trimmed without touching this function. Trimming applies only to
+    the alias; a column named explicitly is always honored (`--cols
+    all,unit-timer` still shows the timer).
     """
-    if name == "default":
-        return _DEFAULT_STATUS_COLS
-    is_darwin = platform == "darwin"
-    if name == "unit-files":
-        if is_darwin:
-            return ("unit-config",)
-        return ("unit-config", "unit-timer")
-    flag_tokens = {f.token for f in crony.config.JobFlags.members()}
-    out: list[str] = []
-    for col in _STATUS_COL_HEADERS:
-        if col in flag_tokens:
-            continue
-        if col == "masked-by" and not masked_present:
-            continue
-        if col == "unit-timer" and is_darwin:
-            continue
-        out.append(col)
-    return tuple(out)
+    return tuple(
+        col
+        for col in _STATUS_ALIAS_BY_NAME[name].cols
+        if _column_in_context(
+            col, masked_present=masked_present, platform=platform
+        )
+    )
 
 
-_STATUS_HELP_EPILOG_TEMPLATE: str = """\
-Columns
--------
-  config            synced | stale | broken | missing | orphan | masked
-                    | error. `error` flags an entry whose bundle config
-                    was rejected (e.g. unknown key); the installed unit,
-                    if any, is left untouched and `crony apply`
-                    refuses the name until the config is fixed. `broken`
-                    flags an applied entry that can't run as installed:
-                    its on-disk snapshot won't load, the uv / crony
-                    executable baked into its unit is gone, its config
-                    unit file was deleted while the scheduler still has it
-                    loaded, the scheduler has no unit loaded for it at all
-                    (it can't be triggered), or a scheduled entry's timer
-                    file is gone (it will never fire) -- `crony apply`
-                    re-renders / re-installs / reloads it.
-                    A full-disk-access job also reads `error` when its
-                    Crony.app wrapper can't serve the grant (not built,
-                    or built without Full Disk Access) and `stale`
-                    (diverged `fda-wrapper`) when the wrapper is out of
-                    date -- `crony apply` builds / rebuilds it.
-  flags             Comma-separated capability flags enabled for the
-                    entry (e.g. `interactive,keep-awake`). Opt-in.
-                    Source-selected like `schedule`: default and
-                    --config-pending list the pending (config) flags,
-                    --config-current the applied ones; an enabled flag
-                    is tagged `^` when the two sides disagree on it
-                    (e.g. `interactive^,keep-awake`). Empty when no
-                    flag is enabled, or for a row with no resolved view
-                    (a masked or orphan entry absent from the graph). A
-                    group shows its resolved cascade value -- the flags
-                    it inherits and seeds into its children -- which has
-                    no runtime effect on the group but makes inheritance
-                    visible. A flag
-                    disabled in config but still enabled in the applied
-                    state (a not-yet-applied removal) isn't listed here
-                    -- it surfaces in that flag's own column (as
-                    `false^`) and in the stale footer.
-  <flag>            One opt-in column per capability flag, each reading
-                    true / false for whether the flag is enabled (one
-                    column per member:
-                    {flag_tokens}).
-                    Same source rules and `^` divergence flag as the
-                    `flags` summary; a group shows its inherited cascade
-                    value, the same as a job. Request by name; the `all`
-                    alias omits these in favor of the compact `flags`
-                    column.
-  groups            Comma-separated full names of groups containing this
-                    entry. Same source rules as `schedule`: default and
-                    --config-pending show the pending membership,
-                    --config-current the applied one, flagged with `^`
-                    when the two diverge. Empty when the entry isn't a
-                    member of any group.
-  job               Full namespaced name `<bundle>.<short>`. Opt-in. Always
-                    the name, even for a row whose name collides with another
-                    entry's (so you can see what the name was). Flagged with
-                    `^` when the config and applied names differ (a not-yet-
-                    applied rename). Empty for a broken entry with no
-                    recoverable name.
-  job-or-uuid       Identity column shown by default. The full namespaced
-                    name when it unambiguously identifies the row; the
-                    `<bundle>:<UUID>` form when the row has no recoverable
-                    name (a corrupt snapshot) or its name is shadowed by a
-                    collision -- so the cell is (modulo a trailing `^`)
-                    pasteable into `crony destroy` / `crony logs`. A rename
-                    (same uuid, new config name) is one row, shown under its
-                    config name by default / --config-pending and its applied
-                    name under --config-current, flagged with `^` since the
-                    two names differ. Rows in an active target's
-                    dispatch tree are indented two spaces per group-nesting
-                    level and ordered by the target / group `jobs` lists
-                    (execution order). Off-tree rows (orphans, names not in
-                    any active target) follow below, unindented, sorted.
-  kind              "job" or "group". Source-selected; flagged with `^` on
-                    the rare divergence (a uuid redefined from one kind to
-                    the other). Falls back to the snapshot's recorded kind
-                    for rows whose live config no longer defines the entry.
-  status            Last-run outcome: ok | fail | timeout | gated | canceled
-                    | crashed | running | pending | never | unknown.
-  last-ran          Compact relative time of the last run, e.g. "5m ago".
-  masked-by         `host` and / or `platform` joined with `,`
-                    (e.g. `host,platform` when both axes exclude
-                    the entry), or one of `unused` / `empty`. Set
-                    when the entry is filter-excluded on this host
-                    -- which surfaces as `config=masked` for
-                    entries with no on-disk state, and as
-                    `config=orphan` for entries with leftover
-                    units / state dirs from a prior apply
-                    (the same `destroy --orphans` cleanup path
-                    applies in both cases). `unused` means defined
-                    in config but not listed in the host's
-                    resolved target.jobs. `empty` means a group
-                    whose every direct child is itself masked on
-                    this host -- the reference is a no-op here,
-                    so the group is masked too.
-  schedule          Default mode shows the pending (config) schedule. When
-                    the applied schedule differs, the cell carries a
-                    trailing `^` (no space) and a footer prints below the
-                    table pointing at `crony apply`. --config-current shows
-                    the applied schedule, --config-pending the pending one;
-                    the `^` fires on any divergence regardless of mode.
-                    When the entry is disabled (`crony disable`) the cell
-                    renders `disabled` (red on a color stream): it is
-                    still installed and triggerable but not run
-                    automatically -- neither on its schedule nor as part
-                    of a group. The disable is shown in every mode,
-                    including --config-pending, since the pending config
-                    carries the same disable.
-  unit-name         Platform unit identifier: `org.crony.<name>` on macOS;
-                    `crony-<name>.timer` (scheduled) or
-                    `crony-<name>.service` (grouped) on Linux. Source-
-                    selected like `schedule`; flagged with `^` when the
-                    config and applied labels differ -- a not-yet-applied
-                    rename, or (on Linux) a schedule gained/lost that
-                    flips `.timer` <-> `.service`. Empty when neither
-                    config nor snapshot describes the entry.
-  uuid              The entry's stable identity in `<bundle>:<UUID>` form
-                    (directly pasteable into `crony destroy` / `crony logs`).
-                    Sourced from the live config when the entry is still
-                    defined, else from the on-disk snapshot for orphan rows.
-                    Empty when neither side has a uuid to report.
-  unit-config       Filesystem path of the platform config unit -- the
-                    unit that defines and runs the job
-                    (`org.crony.<name>.plist` on macOS;
-                    `crony-<name>.service` on Linux). Empty when no
-                    config unit exists on disk.
-  unit-timer        Filesystem path of the schedule-arming timer unit
-                    (`crony-<name>.timer` on Linux). Always empty on
-                    macOS (the plist carries its own schedule) and for
-                    an unscheduled / grouped entry.
-  log-file          Filesystem path of the entry's log file (the path
-                    `crony logs <name>` reads). Opt-in. Source-selected
-                    like `schedule`: default and --config-pending show
-                    the config path, --config-current the applied one,
-                    flagged with `^` when the two diverge (a not-yet-
-                    applied rename).
-  timeout           Entry wallclock cap: `<n>s`, or `none` for uncapped.
-                    A job's job-timeout-sec or a group's cumulative
-                    budget. Opt-in. Source-selected and `^`-flagged like
-                    `schedule`.
-  priority          Job scheduling priority: high | normal | low. Opt-in,
-                    job-only (blank for groups). Source-selected and
-                    `^`-flagged like `schedule`.
-  stale             Why a `stale` entry diverges: the snapshot fields
-                    that differ between the config and applied versions,
-                    a config knob named as the config file spells it
-                    (e.g. `command,env,job-timeout-sec`), each changed
-                    capability flag by its own token (e.g. `keep-awake`),
-                    `unit-config` / `unit-timer` for each installed
-                    unit file that drifted from the snapshot, and
-                    `fda-wrapper` when a full-disk-access job's Crony.app
-                    wrapper is out of date -- a direct answer to "why is
-                    this stale?". Opt-in; blank for a synced entry, or a
-                    stale verdict with no current snapshot to diff. Pair
-                    with `--cols all` to see the diverging cells flagged
-                    with `^`.
+# ANSI color for the status table, emitted only when stdout is a TTY
+# and NO_COLOR is unset (https://no-color.org/). Red flags a broken or
+# failed state -- including a `disabled` SCHEDULE cell, where the entry
+# isn't firing; yellow flags drift the operator can reconcile with
+# `crony apply` (a `stale` config verdict, or any divergence-flagged
+# cell). The `^` marker itself is never colored.
+_ANSI_RED: str = "\033[31m"
+_ANSI_YELLOW: str = "\033[33m"
+_ANSI_RESET: str = "\033[0m"
 
-Aliases
--------
-  default     {default_cols}
-  all         Every column except the per-flag columns (use the compact
-              `flags` instead), `masked-by` (kept only when a masked
-              entry is present), and -- on macOS -- `unit-timer`
-              (launchd has no timer file). Naming an excluded column
-              explicitly still shows it.
-  unit-files  unit-config, plus unit-timer on Linux.
-
-Color
------
-  When stdout is a TTY (and NO_COLOR is unset), broken / failed states
-  are red -- CONFIG `missing` / `error` / `broken` / `orphan` and STATUS
-  `fail` / `timeout` / `canceled` / `crashed` -- and reconcilable drift
-  is yellow: a `stale` CONFIG verdict and every stale value cell. On a
-  color stream a stale cell is shown by its yellow value alone; the `^`
-  marker is dropped. Redirected or piped output is plain -- there
-  staleness shows as a `^` on each stale cell plus a footnote legend.
-"""
+# Per-column cell values that take a color, keyed by `--cols` name.
+# `_status_value_color` reads these to paint the table and the `--help`
+# Color section renders its palette from them, so what the docs claim
+# can't drift from what renders. Red flags a broken or failed state
+# (`signal` never reaches the STATUS cell -- it renders as `fail`);
+# yellow flags reconcilable `stale` drift. Each value is a `ConfigStatus`
+# / `JobStatus` member (both StrEnums, so plain strings) or a literal
+# cell string.
+_RED_CELLS: dict[str, frozenset[str]] = {
+    StatusCols.CONFIG: frozenset(
+        {
+            crony.model.ConfigStatus.MISSING,
+            crony.model.ConfigStatus.ERROR,
+            crony.model.ConfigStatus.BROKEN,
+            crony.model.ConfigStatus.ORPHAN,
+        }
+    ),
+    StatusCols.STATUS: frozenset(
+        {
+            crony.model.JobStatus.FAIL,
+            crony.model.JobStatus.TIMEOUT,
+            crony.model.JobStatus.CANCELED,
+            crony.model.JobStatus.CRASHED,
+        }
+    ),
+    StatusCols.SCHEDULE: frozenset({crony.model.ScheduleValue.DISABLED.value}),
+}
+_YELLOW_CELLS: dict[str, frozenset[str]] = {
+    StatusCols.CONFIG: frozenset({crony.model.ConfigStatus.STALE}),
+}
 
 
-STATUS_HELP_EPILOG: str = _STATUS_HELP_EPILOG_TEMPLATE.format(
-    default_cols=", ".join(_DEFAULT_STATUS_COLS),
-    flag_tokens=", ".join(f.token for f in crony.config.JobFlags.members()),
+class ReferenceSection(NamedTuple):
+    """One `crony status` reference section: a heading, optional lead
+    paragraph, and `(label, description)` items. The single source for
+    both the `--help` epilog text and the man page's STATUS COLUMNS
+    section, so the two can't drift."""
+
+    title: str
+    items: list[tuple[str, str]]
+    lead: str = ""
+
+
+def status_reference_sections() -> list[ReferenceSection]:
+    """The `crony status` column / value / alias / color reference as
+    structured sections, sourced from the registries and enums."""
+    return [
+        ReferenceSection("Default Columns", _column_items(default=True)),
+        ReferenceSection("Optional Columns", _column_items(default=False)),
+        ReferenceSection(
+            "Column Aliases",
+            [(a.name, a.description) for a in _STATUS_ALIASES],
+        ),
+        ReferenceSection(
+            "CONFIG values",
+            [(m.value, m.description) for m in crony.model.ConfigStatus],
+        ),
+        ReferenceSection(
+            "SCHEDULE values",
+            [(m.value, m.description) for m in crony.model.ScheduleValue],
+        ),
+        ReferenceSection(
+            "STATUS values",
+            [(m.value, m.description) for m in crony.model.JobStatus],
+        ),
+        ReferenceSection(
+            "FLAG values",
+            [(f.token, f.description) for f in crony.config.JobFlags.members()],
+        ),
+        ReferenceSection(
+            "MASKED values",
+            [(r.value, r.description) for r in crony.config.MaskReason],
+        ),
+        ReferenceSection("Colors", _color_items(), lead=_COLOR_LEAD),
+    ]
+
+
+def _reference_section_text(section: ReferenceSection) -> str:
+    """A reference section as `--help` text: a `Title:` header with the
+    body indented two spaces beneath it, matching the top-level `crony
+    --help` epilog. The body is an optional wrapped lead, then the value
+    reference."""
+    body: list[str] = []
+    if section.lead:
+        body.append(
+            textwrap.fill(
+                section.lead,
+                width=_STATUS_HELP_WIDTH,
+                break_on_hyphens=False,
+                break_long_words=False,
+            )
+        )
+        body.append("")
+    body.append(_value_reference(section.items))
+    return f"{section.title}:\n" + textwrap.indent("\n".join(body), "  ")
+
+
+STATUS_HELP_EPILOG: str = (
+    "\n\n".join(_reference_section_text(s) for s in status_reference_sections())
+    + "\n"
 )
 
 
@@ -1631,9 +1882,9 @@ def _parse_status_cols(
             continue
         seen.add(c)
         cols.append(c)
-    if "job-or-uuid" in cols:
-        cols.remove("job-or-uuid")
-    return ["job-or-uuid"] + cols
+    if StatusCols.JOB_OR_UUID in cols:
+        cols.remove(StatusCols.JOB_OR_UUID)
+    return [StatusCols.JOB_OR_UUID] + cols
 
 
 def _resolve_states(
@@ -1772,39 +2023,6 @@ _STALE_VALUE_FOOTER: str = (
     "snapshot."
 )
 
-# ANSI color for the status table, emitted only when stdout is a TTY
-# and NO_COLOR is unset (https://no-color.org/). Red flags a broken or
-# failed state -- including a `disabled` SCHEDULE cell, where the entry
-# isn't firing; yellow flags drift the operator can reconcile with
-# `crony apply` (a `stale` config verdict, or any divergence-flagged
-# cell). The `^` marker itself is never colored.
-_ANSI_RED: str = "\033[31m"
-_ANSI_YELLOW: str = "\033[33m"
-_ANSI_RESET: str = "\033[0m"
-
-# CONFIG values worth a red flag.
-_STATUS_RED_CONFIG: frozenset[crony.model.ConfigStatus] = frozenset(
-    {
-        crony.model.ConfigStatus.MISSING,
-        crony.model.ConfigStatus.ERROR,
-        crony.model.ConfigStatus.BROKEN,
-        crony.model.ConfigStatus.ORPHAN,
-    }
-)
-# STATUS values worth a red flag. `signal` never reaches the cell (it
-# renders as `fail`); `timeout` / `canceled` / `crashed` are the other
-# non-clean terminal outcomes (`crashed` = the launch ended without
-# recording a run -- killed, or exited before the runner wrote its
-# record).
-_STATUS_RED_STATUS: frozenset[crony.model.JobStatus] = frozenset(
-    {
-        crony.model.JobStatus.FAIL,
-        crony.model.JobStatus.TIMEOUT,
-        crony.model.JobStatus.CANCELED,
-        crony.model.JobStatus.CRASHED,
-    }
-)
-
 
 def _color_supported() -> bool:
     """Return True if ANSI color escape sequences should be emitted.
@@ -1819,20 +2037,14 @@ def _color_supported() -> bool:
 
 
 def _status_value_color(col: str, value: str) -> str | None:
-    """ANSI code for a status cell by (column, value), or None.
-
-    Only the verdict columns carry a value-based color; the
-    divergence marker is handled separately by the renderer.
-    """
-    if col == "config":
-        if value in _STATUS_RED_CONFIG:
-            return _ANSI_RED
-        if value == crony.model.ConfigStatus.STALE:
-            return _ANSI_YELLOW
-    elif col == "status" and value in _STATUS_RED_STATUS:
+    """ANSI code for a status cell by (column, value), or None, from the
+    `_RED_CELLS` / `_YELLOW_CELLS` palette. Only the verdict columns
+    carry a value-based color; the divergence marker is handled
+    separately by the renderer."""
+    if value in _RED_CELLS.get(col, frozenset()):
         return _ANSI_RED
-    elif col == "schedule" and value == "disabled":
-        return _ANSI_RED
+    if value in _YELLOW_CELLS.get(col, frozenset()):
+        return _ANSI_YELLOW
     return None
 
 
@@ -2261,7 +2473,7 @@ def do_status(
             # expression is misleading -- show the disable instead, in
             # every view: the pending config carries the same disable, so
             # the schedule it would compare against is "disabled" too.
-            sched_cell = "disabled"
+            sched_cell = crony.model.ScheduleValue.DISABLED.value
         else:
             sched_cell = _mark(pending_sched, current_sched)
 
@@ -2418,26 +2630,36 @@ def do_status(
                     token = f"{token}{_DIVERGENCE_MARKER}"
                 flags_summary_parts.append(token)
         row_cells: dict[str, str] = {
-            "job": job_cell,
-            "job-or-uuid": job_or_uuid_cell,
-            "kind": kind,
-            "config": cfg_status,
-            "schedule": sched_cell,
-            "groups": groups_cell,
-            "status": job_status,
-            "last-ran": last_ran,
-            "masked-by": mask_reason,
-            "unit-name": unit_name,
-            "uuid": uuid_cell,
-            "unit-config": unit_config_cell,
-            "unit-timer": unit_timer_cell,
-            "log-file": log_file_cell,
-            "flags": ",".join(flags_summary_parts),
-            "timeout": timeout_cell,
-            "priority": priority_cell,
-            "stale": stale_cell,
+            StatusCols.JOB: job_cell,
+            StatusCols.JOB_OR_UUID: job_or_uuid_cell,
+            StatusCols.KIND: kind,
+            StatusCols.CONFIG: cfg_status,
+            StatusCols.SCHEDULE: sched_cell,
+            StatusCols.GROUPS: groups_cell,
+            StatusCols.STATUS: job_status,
+            StatusCols.LAST_RAN: last_ran,
+            StatusCols.MASKED_BY: mask_reason,
+            StatusCols.UNIT_NAME: unit_name,
+            StatusCols.UUID: uuid_cell,
+            StatusCols.UNIT_CONFIG: unit_config_cell,
+            StatusCols.UNIT_TIMER: unit_timer_cell,
+            StatusCols.LOG_FILE: log_file_cell,
+            StatusCols.FLAGS: ",".join(flags_summary_parts),
+            StatusCols.TIMEOUT: timeout_cell,
+            StatusCols.PRIORITY: priority_cell,
+            StatusCols.STALE: stale_cell,
         }
         row_cells.update(flag_cells)
+        # Every selectable column must produce a cell, and no row may
+        # carry a cell for an undocumented column -- the registry and
+        # the renderer stay in lockstep so `--cols` can never select a
+        # column the row lacks (a KeyError at print time) or render one
+        # the help reference omits.
+        assert set(row_cells) == set(StatusCols) | _FLAG_COL_TOKENS, (
+            "`row_cells` keys must equal the selectable column set: "
+            f"{sorted(set(row_cells))} != "
+            f"{sorted(set(StatusCols) | _FLAG_COL_TOKENS)}"
+        )
         built.append((config_name, row_cells))
 
     for ref_key, candidate_names in names_by_ref.items():
@@ -2465,12 +2687,13 @@ def do_status(
             r
             for r in rows
             if not (
-                r["config"] == crony.model.ConfigStatus.SYNCED
-                and r["schedule"] != "disabled"
-                and r["status"] in healthy_status
+                r[StatusCols.CONFIG] == crony.model.ConfigStatus.SYNCED
+                and r[StatusCols.SCHEDULE]
+                != crony.model.ScheduleValue.DISABLED.value
+                and r[StatusCols.STATUS] in healthy_status
             )
         ]
-        rows = sorted(rows, key=lambda r: r["job-or-uuid"])
+        rows = sorted(rows, key=lambda r: r[StatusCols.JOB_OR_UUID])
     else:
         # Order rows by tree DFS to surface execution order rather
         # than alphabetical: roots from each active target first, then
@@ -2494,19 +2717,21 @@ def do_status(
             consumed.add(id(tree_row))
             tree_row = dict(tree_row)
             indent = "  " * tree_depth[full]
-            tree_row["job-or-uuid"] = indent + tree_row["job-or-uuid"]
-            if tree_row["job"]:
-                tree_row["job"] = indent + tree_row["job"]
+            tree_row[StatusCols.JOB_OR_UUID] = (
+                indent + tree_row[StatusCols.JOB_OR_UUID]
+            )
+            if tree_row[StatusCols.JOB]:
+                tree_row[StatusCols.JOB] = indent + tree_row[StatusCols.JOB]
             ordered.append(tree_row)
         off_tree = [row for _, row in built if id(row) not in consumed]
-        for row in sorted(off_tree, key=lambda r: r["job-or-uuid"]):
+        for row in sorted(off_tree, key=lambda r: r[StatusCols.JOB_OR_UUID]):
             ordered.append(row)
         rows = ordered
 
     # Deferred until the displayed rows exist: the `all` alias's
     # masked-by trim keys on whether any shown row carries a reason,
     # which only the built rows can answer.
-    masked_present = any(row["masked-by"] for row in rows)
+    masked_present = any(row[StatusCols.MASKED_BY] for row in rows)
     selected_cols = _parse_status_cols(
         cols, masked_present=masked_present, platform=platform
     )
@@ -2553,7 +2778,7 @@ def do_status(
 
 
 def do_logs(
-    name: str,
+    job: str,
     n: int | None,
     since: str | None,
     tail: bool,
@@ -2562,7 +2787,7 @@ def do_logs(
 ) -> None:
     """Print a job's recent log output.
 
-    `name` is the full namespaced name (`<bundle>.<short>`); bare
+    `job` is the full namespaced name (`<bundle>.<short>`); bare
     input is shorthand for `default.<short>`. Also accepts the
     `<bundle>:<UUID>` ref form for entities with no recoverable
     name (corrupt snapshot, broken entry) so the operator can
@@ -2588,7 +2813,7 @@ def do_logs(
                 follow appended output (-f semantics) until
                 interrupted.
     """
-    full = crony.config.normalize_full_name(name)
+    full = crony.config.normalize_full_name(job)
     try:
         config = crony.runtime.load_config()
     except crony.errors.ConfigError:

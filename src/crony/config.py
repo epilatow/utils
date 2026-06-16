@@ -76,6 +76,15 @@ class JobFlags(enum.Flag):
         assert name is not None  # a single-bit member always has a name
         return name.lower().replace("_", "-")
 
+    @property
+    def description(self) -> str:
+        """The human-facing meaning of a single flag member, shown in
+        the `crony status --help` FLAG values reference. Not defined for
+        a combined value -- callers describe members individually."""
+        if self.value.bit_count() != 1:
+            raise ValueError("description is defined only for a single flag")
+        return _FLAG_DESCRIPTIONS[self]
+
     @classmethod
     def from_token(cls, token: str) -> JobFlags:
         """The flag member named by `token` (its dash spelling)."""
@@ -92,6 +101,54 @@ class JobFlags(enum.Flag):
         """The individual flag members in declaration order (a combined
         value is never in it)."""
         return list(cls)
+
+
+# The meaning of each flag, shown in `crony status --help`'s FLAG values
+# reference. Keyed by member so a new flag without an entry trips the
+# coverage test rather than rendering blank.
+_FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
+    JobFlags.INTERACTIVE: (
+        "macOS/Darwin only. Delay job execution until an active user is "
+        "detected, and then request the user to confirm execution of the "
+        "job via a pop-up."
+    ),
+    JobFlags.KEEP_AWAKE: (
+        "Prevent the system from sleeping while the job is executing."
+    ),
+    JobFlags.FULL_DISK_ACCESS: (
+        "macOS/Darwin only. Execute the job with TCC Full Disk Access "
+        "permissions."
+    ),
+}
+
+
+class MaskReason(enum.StrEnum):
+    """Why an entry is masked (excluded) on the current host -- the
+    values that fill the status MASKED BY column. The selection code in
+    this module emits HOST / PLATFORM / EMPTY; the status caller emits
+    UNUSED. Sourcing the literals here keeps them and the `--help`
+    MASKED values reference in one place."""
+
+    HOST = "host"
+    PLATFORM = "platform"
+    UNUSED = "unused"
+    EMPTY = "empty"
+
+    @property
+    def description(self) -> str:
+        """The human-facing meaning, shown in the `crony status --help`
+        MASKED values reference."""
+        return _MASK_REASON_DESCRIPTIONS[self]
+
+
+_MASK_REASON_DESCRIPTIONS: dict[MaskReason, str] = {
+    MaskReason.HOST: "The job has been scoped to a different host.",
+    MaskReason.PLATFORM: "The job has been scoped to a different platform.",
+    MaskReason.UNUSED: (
+        "The job is not scheduled to run (directly or via a job group)."
+    ),
+    MaskReason.EMPTY: ("The job group doesn't contain any unmasked jobs."),
+}
 
 
 # Every flag can be set two ways: inside the `flags = [...]` list, or as
@@ -711,7 +768,7 @@ class TomlBundleConfig:
                     and JobFlags.INTERACTIVE in flag_map.get(name, JobFlags(0))
                     and platform != "darwin"
                 ):
-                    own_reason = "platform"
+                    own_reason = MaskReason.PLATFORM.value
                 effective = own_reason or parent_mask
                 if effective is None:
                     jobs.add(name)
@@ -752,7 +809,7 @@ class TomlBundleConfig:
                 break
             for gname in empties:
                 groups.discard(gname)
-                masked[gname] = "empty"
+                masked[gname] = MaskReason.EMPTY.value
         return jobs, groups, masked
 
     def resolved_notify_channels(
@@ -2370,9 +2427,9 @@ def _mask_reason(
         listed = host in hosts.names
         masked = listed if hosts.negated else not listed
         if masked:
-            parts.append("host")
+            parts.append(MaskReason.HOST.value)
     if platforms and platform not in platforms:
-        parts.append("platform")
+        parts.append(MaskReason.PLATFORM.value)
     if not parts:
         return None
     return ",".join(parts)

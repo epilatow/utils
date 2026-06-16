@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from conftest import ExceptionHierarchyBase  # noqa: E402
 
 from crony.errors import (  # noqa: E402
+    INTERNAL_EXIT_CODES,
     ConfigError,
     CronyError,
     ExitCode,
@@ -46,6 +47,16 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         ExitCode.WARNING,
         ExitCode.CRASHED,
     }
+
+
+class TestInternalExitCodes:
+    def test_internal_codes_are_the_run_only_ones(self) -> None:
+        # The `_run`-only codes are internal; everything else is
+        # user-facing (and thus documented).
+        assert INTERNAL_EXIT_CODES == {
+            ExitCode.LOCK_BUSY,
+            ExitCode.PRECONDITION,
+        }
 
 
 class TestExceptionRelationships:

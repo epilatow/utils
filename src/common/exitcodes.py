@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import enum
 import signal
+from collections.abc import Container
 from typing import Self
 
 # Exit status a CLI returns when interrupted by Ctrl-C: the shell
@@ -43,12 +44,26 @@ class ExitCodeBase(enum.IntEnum):
         return obj
 
     @classmethod
-    def epilog(cls) -> str:
-        lines = ["exit codes:"]
-        for member in cls:
-            lines.append(
-                f"  {member.value}  {member.description}"  # type: ignore[attr-defined]
-            )
+    def entries(cls) -> list[tuple[int, str]]:
+        """The members as `(value, description)` pairs, in definition
+        order. The typed view of the codes, for callers that render them
+        themselves (e.g. a man-page generator) rather than via
+        `epilog()`."""
+        return [
+            (member.value, member.description)  # type: ignore[attr-defined]
+            for member in cls
+        ]
+
+    @classmethod
+    def epilog(cls, exclude: Container[int] = ()) -> str:
+        """The argparse exit-status block. `exclude` drops codes a
+        utility treats as internal (never surfaced to users), mirroring
+        whatever filtering its user-facing docs apply."""
+        lines = ["Exit Status:"]
+        for value, description in cls.entries():
+            if value in exclude:
+                continue
+            lines.append(f"  {value}  {description}")
         return "\n".join(lines)
 
 

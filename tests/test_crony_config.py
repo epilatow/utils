@@ -44,6 +44,7 @@ from crony import platform as crony_platform  # noqa: E402
 from crony.config import (  # noqa: E402
     NOTIFY_INHERIT_TOKEN,
     JobFlags,
+    MaskReason,
     TomlBundle,
     TomlBundleConfig,
     TomlConfig,
@@ -2354,6 +2355,18 @@ class TestJobFlagsField:
     @staticmethod
     def _cfg(body: dict[str, Any]) -> dict[str, Any]:
         return {"job": {"j": body}}
+
+    def test_every_flag_is_documented(self) -> None:
+        # The `crony status --help` FLAG values reference renders each
+        # flag's `.description`; a flag without one would show blank.
+        # Adding a flag without documenting it fails here.
+        for flag in JobFlags.members():
+            assert flag.description, f"{flag!r} has no description"
+
+    def test_every_mask_reason_is_documented(self) -> None:
+        # The MASKED values reference renders each reason's description.
+        for reason in MaskReason:
+            assert reason.description, f"{reason!r} has no description"
 
     def test_flag_enables(self) -> None:
         cfg = _parse(self._cfg(_job(flags=["keep-awake"])))

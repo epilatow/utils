@@ -53,6 +53,8 @@ from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
+    JobFlags,
+    MaskReason,
     TomlConfig,
 )
 from crony.errors import (  # noqa: E402
@@ -4577,10 +4579,14 @@ class TestStatusReport:
         )
         status_parser = subparsers_action.choices["status"]
         text = status_parser.format_help()
-        # Two sections: every column documented in Columns; aliases
-        # documented as their expansions in Aliases.
-        assert "Columns\n-------" in text
-        assert "Aliases\n-------" in text
+        # The generated reference wraps prose, so check whitespace-flat
+        # for multi-word phrases.
+        flat = re.sub(r"\s+", " ", text)
+        # Every section header present (Columns / values / Aliases / Color),
+        # rendered as a `Title:` header with the body indented beneath it.
+        assert "Default Columns:\n" in text
+        assert "Optional Columns:\n" in text
+        assert "Column Aliases:\n" in text
         for col in [
             "job",
             "kind",
@@ -4593,19 +4599,219 @@ class TestStatusReport:
             "uuid",
         ]:
             assert col in text
-        # `default` alias enumerates its expansion verbatim so the
-        # block doubles as the documentation of the default set.
+        # `default` alias enumerates its expansion so the block doubles as
+        # the documentation of the default set.
         for col in crony_commands._DEFAULT_STATUS_COLS:
             assert col in text
-        # The three aliases are each documented.
+        # The three aliases are each documented (each at the start of its
+        # indented definition-list line).
         assert "default" in text
-        assert "  all " in text
+        assert "\n  all " in text
         assert "unit-files" in text
         # The `all` description notes the context-sensitive trimming.
-        assert "Every column except the per-flag columns" in text
-        assert "launchd has no timer file" in text
+        assert "Every column except the per-flag columns" in flat
+        assert "launchd has no timer file" in flat
         # `unit-files` documents its Linux-only timer.
-        assert "unit-config, plus unit-timer on Linux" in text
+        assert "unit-config, plus unit-timer on Linux" in flat
+
+    def test_status_reference_sections_are_well_formed(self) -> None:
+        # `status_reference_sections()` is the structured single source
+        # behind both the `--help` epilog and the man page's STATUS
+        # COLUMNS section. Assert the shape directly (the epilog test
+        # only exercises it transitively).
+        sections = crony_commands.status_reference_sections()
+        titles = [s.title for s in sections]
+        assert titles == [
+            "Default Columns",
+            "Optional Columns",
+            "Column Aliases",
+            "CONFIG values",
+            "SCHEDULE values",
+            "STATUS values",
+            "FLAG values",
+            "MASKED values",
+            "Colors",
+        ]
+        # Every entry carries a non-empty label and description -- the
+        # single-source guarantee that nothing renders blank.
+        for section in sections:
+            assert section.items, f"{section.title} has no items"
+            for label, description in section.items:
+                assert label, f"empty label in {section.title}"
+                assert description, f"empty description for {label!r}"
+        # Only the Colors section carries a lead paragraph.
+        assert [s.title for s in sections if s.lead] == ["Colors"]
+        # The CONFIG section covers every `ConfigStatus` verdict.
+        config_labels = {
+            label
+            for s in sections
+            if s.title == "CONFIG values"
+            for label, _ in s.items
+        }
+        assert config_labels == {m.value for m in crony_model.ConfigStatus}
+
+    def test_every_selectable_column_is_documented(self) -> None:
+        # `StatusCols` is the authoritative column set: the registry must
+        # document every member exactly once (with a non-empty
+        # description), and the selectable headers must be exactly the
+        # members plus the per-flag tokens. Adding a `StatusCols` member
+        # without a registry entry, or vice versa, fails here.
+        documented = {
+            c.name
+            for c in crony_commands._STATUS_COLUMNS
+            if not c.name.startswith("<")
+        }
+        assert documented == set(crony_commands.StatusCols)
+        flag_tokens = {f.token for f in JobFlags.members()}
+        assert (
+            set(crony_commands._STATUS_COL_HEADERS)
+            == set(crony_commands.StatusCols) | flag_tokens
+        )
+        # Per-flag columns share the `<flag>` documentation entry.
+        assert crony_commands._FLAG_COL_DOC in {
+            c.name for c in crony_commands._STATUS_COLUMNS
+        }
+        for col in crony_commands._STATUS_COLUMNS:
+            assert col.description, f"column {col.name!r} has no description"
+
+    def test_every_alias_is_documented(self) -> None:
+        # `StatusAliases` is the authoritative alias set: `_STATUS_ALIASES`
+        # documents every member, each with a description, and every
+        # alias expands only to `StatusCols` members.
+        documented = {a.name for a in crony_commands._STATUS_ALIASES}
+        assert documented == set(crony_commands.StatusAliases)
+        assert set(crony_commands._STATUS_COL_ALIAS_NAMES) == set(
+            crony_commands.StatusAliases
+        )
+        for alias in crony_commands._STATUS_ALIASES:
+            assert alias.description, f"alias {alias.name!r} has no desc"
+            for col in alias.cols:
+                assert col in crony_commands.StatusCols, (
+                    f"alias {alias.name!r} expands to non-column {col!r}"
+                )
+
+    def test_expand_status_alias_yields_only_columns(self) -> None:
+        # Every alias expansion, under either platform and masked state,
+        # is a subset of the selectable column set -- so an alias can
+        # never select a column the renderer doesn't produce.
+        selectable = set(crony_commands.StatusCols)
+        for alias in crony_commands.StatusAliases:
+            for platform in ("linux", "darwin"):
+                for masked in (False, True):
+                    cols = crony_commands._expand_status_alias(
+                        alias, masked_present=masked, platform=platform
+                    )
+                    assert set(cols) <= selectable
+
+    def test_alias_expansion_trims_by_column_visibility(self) -> None:
+        # The `all` alias lists every column but drops the conditional
+        # ones whose `ColVisibility` fails: `masked-by` only when a masked
+        # row is shown, `unit-timer` only off darwin. The trim is driven
+        # by the column property, so the expansion tracks each context.
+        StatusCols = crony_commands.StatusCols
+
+        def expand(masked: bool, platform: str) -> set[str]:
+            return set(
+                crony_commands._expand_status_alias(
+                    crony_commands.StatusAliases.ALL,
+                    masked_present=masked,
+                    platform=platform,
+                )
+            )
+
+        assert StatusCols.MASKED_BY in expand(True, "linux")
+        assert StatusCols.MASKED_BY not in expand(False, "linux")
+        assert StatusCols.UNIT_TIMER in expand(True, "linux")
+        assert StatusCols.UNIT_TIMER not in expand(True, "darwin")
+        # An unconditional column rides through every context.
+        for masked in (False, True):
+            for platform in ("linux", "darwin"):
+                assert StatusCols.CONFIG in expand(masked, platform)
+
+    def test_every_column_visibility_value_is_used(self) -> None:
+        # Each `ColVisibility` value is exercised by at least one column,
+        # so a value can't be added without a column that needs it (and
+        # the corresponding `_column_in_context` branch stays covered).
+        used = {col.visibility for col in crony_commands._STATUS_COLUMNS}
+        assert used == set(crony_commands.ColVisibility)
+
+    def test_status_renders_every_selectable_column(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Render with every selectable column named explicitly (`all`
+        # omits the per-flag columns, so add each flag token too). Each
+        # selected column does `row[col]`, so a column the registry lists
+        # but `row_cells` doesn't build would KeyError here -- and the
+        # `_build_row` assert that the two sets match fires first.
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        flag_tokens = [f.token for f in JobFlags.members()]
+        cols = ",".join(["all", *flag_tokens])
+        crony_commands.do_status(
+            jobs=[],
+            cols=cols,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "default.j" in out
+
+    def test_color_section_lists_the_painted_values(self) -> None:
+        # The Color section is generated from `_RED_CELLS` / `_YELLOW_CELLS`,
+        # so every value those tables paint appears in the help -- guarding
+        # against the docs drifting from `_status_value_color` (e.g. the
+        # `disabled` SCHEDULE cell that renders red).
+        parser = crony_cli._build_parser()
+        subparsers_action = next(
+            a
+            for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        )
+        text = subparsers_action.choices["status"].format_help()
+        color = text[text.index("Colors:") :]
+        for table in (
+            crony_commands._RED_CELLS,
+            crony_commands._YELLOW_CELLS,
+        ):
+            for values in table.values():
+                for value in values:
+                    assert value in color, f"{value!r} missing from Color"
+
+    def test_value_sections_list_every_enum_value(self) -> None:
+        # The CONFIG / SCHEDULE / STATUS / FLAG value sections render
+        # from the enums (and JobFlags), in the same `<value>
+        # <description>` layout as the columns. Each value's label and
+        # its description appear -- so a new value / flag can't be added
+        # without it surfacing in the help.
+        parser = crony_cli._build_parser()
+        subparsers_action = next(
+            a
+            for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        )
+        text = subparsers_action.choices["status"].format_help()
+        flat = re.sub(r"\s+", " ", text)
+        described = (
+            *crony_model.ConfigStatus,
+            *crony_model.JobStatus,
+            *crony_model.ScheduleValue,
+        )
+        for member in described:
+            assert member.value in flat
+            assert member.description.rstrip(".") in flat
+        for flag in JobFlags.members():
+            assert flag.token in flat
+            assert flag.description.rstrip(".") in flat
+        for reason in MaskReason:
+            assert reason.value in flat
+            assert reason.description.rstrip(".") in flat
 
     def test_schedule_column_renders_cron_interval_and_grouped(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -5153,7 +5359,7 @@ class TestLogs:
             encoding="utf-8",
         )
         crony_commands.do_logs(
-            name="j", n=5, since=None, tail=False, path=False, latest=False
+            job="j", n=5, since=None, tail=False, path=False, latest=False
         )
         out = capsys.readouterr().out
         assert "line 19" in out
@@ -5177,7 +5383,7 @@ class TestLogs:
             encoding="utf-8",
         )
         crony_commands.do_logs(
-            name="j",
+            job="j",
             n=None,
             since=None,
             tail=False,
@@ -5215,7 +5421,7 @@ class TestLogs:
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="no log"):
             crony_commands.do_logs(
-                name="ghost",
+                job="ghost",
                 n=10,
                 since=None,
                 tail=False,
@@ -5235,7 +5441,7 @@ class TestLogs:
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("hello\n", encoding="utf-8")
         crony_commands.do_logs(
-            name="j", n=0, since=None, tail=False, path=True, latest=False
+            job="j", n=0, since=None, tail=False, path=True, latest=False
         )
         out = capsys.readouterr().out.strip()
         assert out == str(log)
@@ -5254,7 +5460,7 @@ class TestLogs:
         )
         # No log file written; --path should still succeed.
         crony_commands.do_logs(
-            name="j", n=0, since=None, tail=False, path=True, latest=False
+            job="j", n=0, since=None, tail=False, path=True, latest=False
         )
         out = capsys.readouterr().out.strip()
         expected = h.state_dir("j") / "run.log"
@@ -5270,7 +5476,7 @@ class TestLogs:
         )
         h.apply("j")
         crony_commands.do_logs(
-            name="j", n=0, since=None, tail=False, path=True, latest=False
+            job="j", n=0, since=None, tail=False, path=True, latest=False
         )
         out = capsys.readouterr().out.strip()
         # The applied entry has a short-name alias, so -p reports the
@@ -5293,7 +5499,7 @@ class TestLogs:
         # it still resolves to a real location.
         (h.state / "default" / "j").unlink()
         crony_commands.do_logs(
-            name="j", n=0, since=None, tail=False, path=True, latest=False
+            job="j", n=0, since=None, tail=False, path=True, latest=False
         )
         out = capsys.readouterr().out.strip()
         uuid_log = h.state_dir("j", ensure_snapshot=False) / "run.log"
@@ -5321,7 +5527,7 @@ class TestLogs:
             encoding="utf-8",
         )
         crony_commands.do_logs(
-            name="j", n=0, since="1h", tail=False, path=False, latest=False
+            job="j", n=0, since="1h", tail=False, path=False, latest=False
         )
         out = capsys.readouterr().out
         assert "new-line" in out
@@ -5413,7 +5619,7 @@ class TestLogs:
             encoding="utf-8",
         )
         crony_commands.do_logs(
-            name="j",
+            job="j",
             n=0,
             since=None,
             tail=False,
@@ -5439,7 +5645,7 @@ class TestLogs:
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("orphan content with no === header\n", encoding="utf-8")
         crony_commands.do_logs(
-            name="j",
+            job="j",
             n=0,
             since=None,
             tail=False,
@@ -5462,7 +5668,7 @@ class TestLogs:
         log.write_text("=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n")
         with pytest.raises(UsageError, match="mutually exclusive"):
             crony_commands.do_logs(
-                name="j",
+                job="j",
                 n=0,
                 since=None,
                 tail=True,
@@ -5655,7 +5861,7 @@ class TestLogsByEntityRef:
         (sd / "run.log").write_text("hello\n", encoding="utf-8")
         ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         crony_commands.do_logs(
-            name=ref_input,
+            job=ref_input,
             n=200,
             since=None,
             tail=False,
@@ -5673,7 +5879,7 @@ class TestLogsByEntityRef:
         ghost_uuid = "deadbeef-1111-1111-1111-deadbeef1111"
         ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
         crony_commands.do_logs(
-            name=ref_input,
+            job=ref_input,
             n=None,
             since=None,
             tail=False,

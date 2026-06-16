@@ -41,6 +41,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
+    ConfigStatus,
     ExitClass,
     Graph,
     Job,
@@ -49,6 +50,7 @@ from crony.model import (  # noqa: E402
     JobStatus,
     LastRun,
     RuntimeState,
+    ScheduleValue,
     _JobCommon,
     _resolve_snapshot_for,
     snapshot_from_dict,
@@ -784,6 +786,13 @@ class TestStatusEnums:
         assert "signal" not in values
         assert "dispatched" not in values
         assert "crashed" in values
+
+    def test_every_status_value_is_documented(self) -> None:
+        # The `status` --help CONFIG / STATUS value reference renders
+        # these descriptions; a member without one would surface as a
+        # blank entry. Adding a value without documenting it fails here.
+        for member in (*ConfigStatus, *JobStatus, *ScheduleValue):
+            assert member.description, f"{member!r} has no description"
 
 
 class TestSnapshotSchemaVersioning:

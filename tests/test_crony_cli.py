@@ -96,21 +96,31 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
 
 
 class TestHelpOutput:
-    """`crony --help` surfaces the design block appended to the epilog."""
+    """`crony --help` surfaces the overview appended to the epilog."""
 
-    def test_help_includes_design_block(self) -> None:
+    def test_help_includes_overview(self) -> None:
         parser = crony_cli._build_parser()
         text = parser.format_help()
-        # Design block documents the default status columns.
-        assert "CONFIG    synced" in text
-        assert "SCHEDULE  the cron" in text
-        assert "STATUS    ok" in text
-        # Exit codes still rendered.
-        assert "exit codes:" in text
-        # Design block is appended *after* the exit codes -- the
-        # short tagline lives in description, design lives in
-        # epilog after the exit-code list.
-        assert text.index("exit codes:") < text.index("CONFIG    synced")
+        # The overview is a concise summary: the subcommand categories
+        # and the bundle-config layout, not per-column / per-subcommand
+        # detail (that lives in each subcommand's own --help).
+        assert "Subcommands fall into categories:" in text
+        assert "configuration (config)" in text
+        assert "deployment (apply, destroy)" in text
+        # The epilog's Title-Case section headers are present.
+        for header in (
+            "Exit Status:",
+            "Description:",
+            "Getting Started:",
+            "Platform Specifics:",
+        ):
+            assert header in text
+        # The Exit Status section leads the epilog, before the overview.
+        assert text.index("Exit Status:") < text.index("Subcommands fall")
+        # The internal `_run` exit codes are hidden from --help, like the
+        # man page filters them.
+        assert "run.lock held by another" not in text
+        assert "run precondition failed" not in text
 
 
 class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):

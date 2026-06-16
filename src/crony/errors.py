@@ -27,6 +27,12 @@ class ExitCode(ExitCodeBase):
     PRECONDITION = 11, "run precondition failed before exec"
 
 
+# Exit codes returned only by the internal `crony _run` path, never by a
+# user-facing subcommand. Omitted from user documentation (the man page),
+# the same way `_run` itself is.
+INTERNAL_EXIT_CODES = frozenset({ExitCode.LOCK_BUSY, ExitCode.PRECONDITION})
+
+
 class CronyError(RuntimeError):
     """Base exception for crony errors."""
 
