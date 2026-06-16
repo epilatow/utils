@@ -961,6 +961,48 @@ class TestSnapshotIdentityRehydration:
         assert snap.entity_ref() == EntityRef(en.bundle, snap.uuid)
 
 
+class TestGroupChildRefs:
+    """A JobGroup carries its children as bundle-scoped `EntityRef`s (the
+    parent's bundle paired with each child uuid). On disk they persist as
+    the bare uuids, and `GroupSnapshot.child_refs` rebuilds the refs on
+    load so a child rename never flips the parent."""
+
+    _CHILD_UUID = "11111111-1111-1111-1111-111111111111"
+
+    def _group_dict(self) -> dict[str, Any]:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            }
+        )
+        d = _resolve_snapshot_for(cfg, "g").to_dict()
+        d["children"] = [self._CHILD_UUID]
+        return d
+
+    def test_child_uuids_load_as_bundle_scoped_refs(self) -> None:
+        loaded = snapshot_from_dict(self._group_dict())
+        assert isinstance(loaded, JobGroup)
+        assert loaded.children == [EntityRef(loaded.bundle, self._CHILD_UUID)]
+
+    def test_children_persist_back_as_uuids(self) -> None:
+        # The node holds refs but the on-disk edge stays the bare uuid,
+        # so an older crony reads it unchanged.
+        loaded = snapshot_from_dict(self._group_dict())
+        assert loaded.to_dict()["children"] == [self._CHILD_UUID]
+
+    def test_child_refs_decode_drives_the_node(self) -> None:
+        d = self._group_dict()
+        snap = parse(d)
+        assert isinstance(snap, GroupSnapshot)
+        assert snap.child_refs() == [
+            EntityRef(snap.entity_name().bundle, self._CHILD_UUID)
+        ]
+        loaded = snapshot_from_dict(d)
+        assert isinstance(loaded, JobGroup)
+        assert loaded.children == snap.child_refs()
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

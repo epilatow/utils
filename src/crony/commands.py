@@ -1872,12 +1872,12 @@ def _build_group_membership(
 
     Returns `(pending, current)` where `<table>[<child_ref>]` lists
     the full names of every group whose `children` list contains
-    the child in that graph. The `children` lists hold uuids (the
-    apply-time edge), so the table is keyed by the child's
-    `EntityRef` -- a rename leaves the uuid unchanged, so the row
-    still finds its membership regardless of which name it displays
-    under. The parent names come from the same graph, so the two
-    sides diverge when a group has been edited but not re-applied.
+    the child in that graph. The `children` lists hold the child
+    `EntityRef`s (the apply-time edge), so the table is keyed by that
+    ref -- the uuid in it survives a rename, so the row still finds
+    its membership regardless of which name it displays under. The
+    parent names come from the same graph, so the two sides diverge
+    when a group has been edited but not re-applied.
     Each value list is sorted for stable display order.
     """
 
@@ -1886,8 +1886,7 @@ def _build_group_membership(
     ) -> dict[crony.unit.EntityRef, list[str]]:
         table: dict[crony.unit.EntityRef, list[str]] = {}
         for parent in graph.groups.values():
-            for child_uuid in parent.children:
-                child_ref = crony.unit.EntityRef(parent.bundle, child_uuid)
+            for child_ref in parent.children:
                 if (
                     child_ref not in graph.jobs
                     and child_ref not in graph.groups

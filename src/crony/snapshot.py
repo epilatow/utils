@@ -149,8 +149,19 @@ class JobSnapshot(_SnapshotCommon):
 
 class GroupSnapshot(_SnapshotCommon):
     kind: Annotated[Literal[crony.unit.EntityKind.GROUP], _Since(4)]
+    # Bundle-scoped child uuids on disk (bundle implicit: a group only
+    # references children in its own bundle). `child_refs` pairs each
+    # with that bundle into the EntityRef the node carries. Stored as
+    # uuids -- not full names -- so a child rename doesn't flip the
+    # parent's snapshot.
     children: Annotated[list[str], _Since(4)]
     trigger_timeout_sec: Annotated[int, _Since(4)]
+
+    def child_refs(self) -> list[crony.unit.EntityRef]:
+        """This group's children as their value objects: each on-disk
+        uuid scoped to this group's own bundle."""
+        bundle = self.entity_name().bundle
+        return [crony.unit.EntityRef(bundle, u) for u in self.children]
 
 
 # Validates a migrated dict into the right model by its `kind`

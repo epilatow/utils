@@ -664,14 +664,14 @@ def _run_job(
 
 
 def _child_full_name_from_uuid(child_ref: crony.unit.EntityRef) -> str | None:
-    """Resolve a child's ref (as stored in a parent's
-    `snapshot.children` -- uuids paired with the parent's bundle)
-    to its full namespaced name by reading the child's own
-    snapshot. The runner dispatches each child via the platform
-    unit label, which is keyed by full name; storing uuids on the
-    parent keeps the parent's snapshot stable across child renames,
-    at the cost of one snapshot read per child at dispatch time.
-    Returns None when the child snapshot is missing or unreadable.
+    """Resolve a child's ref (one of the parent node's `children`,
+    each the parent's bundle paired with a child uuid) to its full
+    namespaced name by reading the child's own snapshot. The runner
+    dispatches each child via the platform unit label, which is keyed
+    by full name; keying the parent's children by uuid keeps its
+    snapshot stable across child renames, at the cost of one snapshot
+    read per child at dispatch time. Returns None when the child
+    snapshot is missing or unreadable.
     """
     snap_p = crony.model.Job.state_dir_from_ref(child_ref) / "snapshot.json"
     if not snap_p.is_file():
@@ -779,21 +779,15 @@ def _run_group(
             log_file = open(log_path, "ab", buffering=0)
             children: list[crony.model.GroupChildResult] = []
             try:
-                # snap.children stores uuids; resolve each to its
-                # current full name via the child's own snapshot.
-                # A None resolution means the child has no state
-                # dir on this host -- log and treat as a fail row
-                # so the group rollup catches it.
+                # Resolve each child ref to its current full name via
+                # the child's own snapshot. A None resolution means the
+                # child has no state dir on this host -- log and treat
+                # as a fail row so the group rollup catches it.
                 resolved_children: list[
                     tuple[crony.unit.EntityRef, str | None]
                 ] = [
-                    (
-                        crony.unit.EntityRef(snap.bundle, child_uuid),
-                        _child_full_name_from_uuid(
-                            crony.unit.EntityRef(snap.bundle, child_uuid)
-                        ),
-                    )
-                    for child_uuid in snap.children
+                    (child_ref, _child_full_name_from_uuid(child_ref))
+                    for child_ref in snap.children
                 ]
                 resolved_pairs = [
                     (r, n) for r, n in resolved_children if n is not None

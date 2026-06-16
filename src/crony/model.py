@@ -753,15 +753,16 @@ class Job(_JobCommon):
 @dataclass(frozen=True)
 class JobGroup(_JobCommon):
     """Resolved runtime parameters for a job-group. `children` are
-    bundle-scoped uuids; the runner resolves each back to its
+    bundle-scoped `EntityRef`s; the runner resolves each back to its
     current full name via the child's own snapshot at dispatch
-    time so a rename in config doesn't flip the parent's snapshot.
-    The inherited `timeout` holds the pre-padded cumulative deadline
-    computed once at apply time. 0 means no cap (some child is
+    time so a rename in config doesn't flip the parent's snapshot
+    (the snapshot persists only the uuids -- the bundle is the
+    parent's). The inherited `timeout` holds the pre-padded cumulative
+    deadline computed once at apply time. 0 means no cap (some child is
     uncapped); the group runner treats it as an infinite deadline.
     """
 
-    children: list[str]
+    children: list[crony.unit.EntityRef]
     trigger_timeout_sec: int
 
     @classmethod
@@ -807,17 +808,20 @@ class JobGroup(_JobCommon):
         dispatcher trying to trigger a unit that wasn't installed.
         """
         sel_jobs, sel_groups = config.selected_jobs_and_groups(target)
-        # Children are stored as uuids (not full names) so renaming a
-        # child in config doesn't flip the parent's snapshot -- the
-        # uuid edge is unchanged. The runner resolves each child uuid
-        # to its current full name by reading the child's snapshot at
-        # dispatch time.
-        children: list[str] = []
+        # Each child edge is the child's bundle-scoped ref (the parent's
+        # bundle, since a group only references children in its own
+        # bundle). Keyed by uuid -- not full name -- so renaming a child
+        # in config doesn't flip the parent's snapshot; the runner
+        # resolves each ref to its current full name at dispatch time.
+        children: list[crony.unit.EntityRef] = []
         for c in group.jobs:
             if c in sel_jobs:
-                children.append(config.jobs[c].uuid)
+                child_uuid = config.jobs[c].uuid
             elif c in sel_groups:
-                children.append(config.job_groups[c].uuid)
+                child_uuid = config.job_groups[c].uuid
+            else:
+                continue
+            children.append(crony.unit.EntityRef(name.bundle, child_uuid))
         if flags is None:
             flags = config.composed_flags(group.flags)
         timeout = config.resolved_group_timeout_sec(target, group.name)
@@ -864,7 +868,7 @@ class JobGroup(_JobCommon):
             full_disk_access=(
                 crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
             ),
-            children=self.children,
+            children=[r.uuid for r in self.children],
             trigger_timeout_sec=self.trigger_timeout_sec,
         )
 
@@ -907,7 +911,7 @@ class JobGroup(_JobCommon):
             name=en.short,
             uuid=snap.uuid,
             timeout=snap.timeout,
-            children=snap.children,
+            children=snap.child_refs(),
             trigger_timeout_sec=snap.trigger_timeout_sec,
             timing=timing,
             flags=flags,
