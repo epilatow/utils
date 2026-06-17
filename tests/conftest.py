@@ -223,6 +223,11 @@ class CmdCallbacksBase:
     EXIT_CODE_USAGE: ClassVar[int]
     POPPED_ARGS: ClassVar[set[str]] = set()
     TEST_SUBCOMMAND: ClassVar[str] = ""
+    # argv[0] the cli() tests run under. cli() re-selects the profile
+    # (and thus its callback table) from this name, so a tool whose
+    # dispatch table is profile-specific overrides it to the name that
+    # selects the table under test.
+    CLI_ARGV0: ClassVar[str] = "prog"
     EXCEPTION_EXIT_CODE_MAP: ClassVar[list[tuple[Exception, int]]] = []
 
     @staticmethod
@@ -337,7 +342,7 @@ class CmdCallbacksBase:
     def test_no_args_shows_help(self, capsys: Any) -> None:
         """No arguments prints help and exits USAGE."""
         with (
-            patch("sys.argv", ["prog"]),
+            patch("sys.argv", [type(self).CLI_ARGV0]),
             pytest.raises(SystemExit) as exc_info,
         ):
             type(self).CLI_FUNC()
@@ -348,7 +353,7 @@ class CmdCallbacksBase:
     def test_help_exits_success(self) -> None:
         """--help exits with code 0."""
         with (
-            patch("sys.argv", ["prog", "--help"]),
+            patch("sys.argv", [type(self).CLI_ARGV0, "--help"]),
             pytest.raises(SystemExit) as exc_info,
         ):
             type(self).CLI_FUNC()
@@ -371,7 +376,7 @@ class CmdCallbacksBase:
                 ),
                 patch(
                     "sys.argv",
-                    ["prog", subcommand],
+                    [type(self).CLI_ARGV0, subcommand],
                 ),
             ):
                 result = type(self).CLI_FUNC()
@@ -391,7 +396,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                ["prog", subcommand],
+                [type(self).CLI_ARGV0, subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()
@@ -414,7 +419,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                ["prog", subcommand],
+                [type(self).CLI_ARGV0, subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()
@@ -437,7 +442,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                ["prog", subcommand],
+                [type(self).CLI_ARGV0, subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()

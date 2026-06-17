@@ -18,7 +18,6 @@ each subcommand under the binfiles profile.
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -79,8 +78,8 @@ class TestSelectProfile:
     def test_dotfiles_name_returns_dotfiles_profile(self) -> None:
         assert bf.select_profile("dotfiles") is bf.DOTFILES_PROFILE
 
-    def test_unknown_name_defaults_to_dotfiles(self) -> None:
-        assert bf.select_profile("anything-else") is bf.DOTFILES_PROFILE
+    def test_unknown_name_defaults_to_linkfiles(self) -> None:
+        assert bf.select_profile("anything-else") is bf.LINKFILES_PROFILE
 
 
 class TestBinfilesProfileFields:
@@ -102,9 +101,6 @@ class TestBinfilesProfileFields:
     def test_flat_is_true(self) -> None:
         assert bf.BINFILES_PROFILE.flat is True
 
-    def test_executable_only_is_true(self) -> None:
-        assert bf.BINFILES_PROFILE.executable_only is True
-
 
 class TestBinfilesEntryTargetPath:
     """DotfileEntry under the binfiles profile uses the no-dot transform."""
@@ -119,36 +115,9 @@ class TestBinfilesEntryTargetPath:
         assert entry.target_path == Path("/home/u/.local/bin/mytool")
 
 
-class TestIsExecutable:
-    """_is_executable returns True only for files with the +x bit."""
-
-    def test_executable_file(self, tmp_path: Path) -> None:
-        f = tmp_path / "tool"
-        _make_executable(f)
-        assert bf._is_executable(f) is True
-
-    def test_non_executable_file(self, tmp_path: Path) -> None:
-        f = tmp_path / "readme"
-        f.write_text("docs")
-        f.chmod(0o644)
-        assert bf._is_executable(f) is False
-
-    def test_broken_symlink_is_not_executable(self, tmp_path: Path) -> None:
-        link = tmp_path / "broken"
-        link.symlink_to(tmp_path / "missing")
-        assert bf._is_executable(link) is False
-
-    def test_executable_symlink(self, tmp_path: Path) -> None:
-        target = tmp_path / "real"
-        _make_executable(target)
-        link = tmp_path / "link"
-        link.symlink_to(target)
-        assert bf._is_executable(link) is True
-
-
 class TestBinfilesDiscovery:
-    """discover_dotfiles under BINFILES_PROFILE applies flat /
-    executable-only rules."""
+    """discover_dotfiles under BINFILES_PROFILE applies the flat rule
+    (top-level entries only) and links every file, executable or not."""
 
     def test_flat_skips_subdirectories(self, tmp_path: Path) -> None:
         src = tmp_path / "binfiles"
@@ -164,9 +133,7 @@ class TestBinfilesDiscovery:
         assert Path("subdir/tool2") not in names
         assert len(entries) == 1
 
-    def test_executable_only_skips_non_executable(
-        self, tmp_path: Path, caplog: Any
-    ) -> None:
+    def test_links_non_executable_files(self, tmp_path: Path) -> None:
         src = tmp_path / "binfiles"
         src.mkdir()
         _make_executable(src / "tool")
@@ -174,13 +141,10 @@ class TestBinfilesDiscovery:
         readme.write_text("docs\n")
         readme.chmod(0o644)
 
-        with caplog.at_level(logging.WARNING, logger=bf.logger.name):
-            entries = bf.discover_dotfiles(src, profile=bf.BINFILES_PROFILE)
-
+        entries = bf.discover_dotfiles(src, profile=bf.BINFILES_PROFILE)
         names = {e.relative_path for e in entries}
         assert Path("tool") in names
-        assert Path("readme") not in names
-        assert "skipping non-executable" in caplog.text
+        assert Path("readme") in names
 
     def test_includes_executable_symlinks(self, tmp_path: Path) -> None:
         src = tmp_path / "binfiles"
@@ -374,7 +338,7 @@ class TestBinfilesCli:
             assert bf.ACTIVE_PROFILE is bf.BINFILES_PROFILE
             assert bf.INSTALLED_FILE == home / ".binfiles.installed"
 
-    def test_cli_activates_dotfiles_profile_for_unknown_name(
+    def test_cli_activates_linkfiles_profile_for_unknown_name(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         monkeypatch.setattr(bf, "ACTIVE_PROFILE", bf.ACTIVE_PROFILE)
@@ -384,7 +348,7 @@ class TestBinfilesCli:
         with patch.object(Path, "home", return_value=home):
             with patch("sys.argv", ["prog", "audit"]):
                 bf.cli()
-            assert bf.ACTIVE_PROFILE is bf.DOTFILES_PROFILE
+            assert bf.ACTIVE_PROFILE is bf.LINKFILES_PROFILE
 
 
 class TestCmdCallbacks(CmdCallbacksBase):
@@ -395,6 +359,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(bf.cli)
     EXIT_CODE_USAGE = bf.ExitCode.USAGE
     TEST_SUBCOMMAND = "audit"
+    CLI_ARGV0 = "binfiles"
     EXCEPTION_EXIT_CODE_MAP = [
         (bf.ConflictsFound("t"), bf.ExitCode.CONFLICTS),
         (bf.UsageError("t"), bf.ExitCode.USAGE),

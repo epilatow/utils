@@ -345,16 +345,13 @@ class TestDotfileDiscovery:
         paths = [e.relative_path for e in entries]
         assert paths == sorted(paths)
 
-    def test_discover_dotfiles_skips_vcs_directories(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        """Test that VCS directories are skipped."""
-        monkeypatch.setattr(df, "VCS_DIRS", {".testvcs"})
-
+    def test_discover_dotfiles_skips_hidden_dirs(self, tmp_path: Path) -> None:
+        """A leading-'.' directory (.git, .hg, any .foo) and everything
+        under it is skipped at any depth."""
         dotfile_dir = tmp_path / "dotfiles"
         dotfile_dir.mkdir()
         (dotfile_dir / "vimrc").write_text("content")
-        vcs_dir = dotfile_dir / ".testvcs"
+        vcs_dir = dotfile_dir / ".git"
         vcs_dir.mkdir()
         (vcs_dir / "config").write_text("vcs config")
         (vcs_dir / "nested").mkdir()
@@ -365,7 +362,7 @@ class TestDotfileDiscovery:
         paths = {e.relative_path for e in entries}
         assert Path("vimrc") in paths
         assert len(entries) == 1
-        assert not any(".testvcs" in str(p) for p in paths)
+        assert not any(".git" in str(p) for p in paths)
 
 
 class TestLoadIgnorePatterns:
@@ -775,17 +772,20 @@ class TestDiscoverDotfilesIgnoreFeatures:
         assert Path(".gitignore") not in paths
         assert Path(".hgignore") not in paths
 
-    def test_includes_nested_dotfiles(self, tmp_path: Path) -> None:
-        """Test that nested dotfiles are NOT skipped."""
+    def test_skips_nested_dotfiles(self, tmp_path: Path) -> None:
+        """A dotfile in a subdirectory is skipped too -- the leading-'.'
+        rule applies at any depth, not just the source root."""
         dotfile_dir = tmp_path / "dotfiles"
         dotfile_dir.mkdir()
         (dotfile_dir / "config").mkdir()
         (dotfile_dir / "config" / ".hidden").write_text("content")
+        (dotfile_dir / "config" / "visible").write_text("content")
 
         entries = df.discover_dotfiles(dotfile_dir)
 
         paths = {e.relative_path for e in entries}
-        assert Path("config/.hidden") in paths
+        assert Path("config/.hidden") not in paths
+        assert Path("config/visible") in paths
 
     def test_respects_gitignore_patterns(self, tmp_path: Path) -> None:
         """Test that .gitignore patterns are respected."""
@@ -2348,6 +2348,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(df.cli)
     EXIT_CODE_USAGE = df.ExitCode.USAGE
     TEST_SUBCOMMAND = "audit"
+    CLI_ARGV0 = "dotfiles"
     EXCEPTION_EXIT_CODE_MAP = [
         (df.ConflictsFound("t"), df.ExitCode.CONFLICTS),
         (df.UsageError("t"), df.ExitCode.USAGE),
