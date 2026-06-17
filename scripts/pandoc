@@ -1,0 +1,129 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "tomlkit",
+#     "pydantic>=2",
+#     "mdformat",
+#     "mdformat-gfm",
+#     "mdformat-tables",
+# ]
+# ///
+# This is AI generated code
+"""Manage the pinned pandoc the man-page gate renders with.
+
+The freshness gate (`tests/test_render_docs.py`) renders the roff with
+pandoc and byte-compares it to the checked-in page. pandoc's roff output
+varies between versions, so one version is pinned
+(`render_docs.PANDOC_VERSION`) and fetched into `.tools/` (gitignored),
+independent of any system / Homebrew pandoc.
+
+    pandoc install        Fetch the pinned version into .tools/.
+
+`install` is idempotent (a no-op when the pinned version is already
+present); CI and the Linux docker test run it so every environment
+renders with the identical binary.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import platform
+import sys
+import tarfile
+import urllib.request
+import zipfile
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+import render_docs  # noqa: E402  (import after the src/ path insert above)
+
+_RELEASE = "https://github.com/jgm/pandoc/releases/download"
+
+
+def _bin(version: str) -> Path:
+    return _REPO_ROOT / ".tools" / f"pandoc-{version}" / "bin" / "pandoc"
+
+
+def _asset(version: str) -> tuple[str, str]:
+    """The (release-asset filename, archive kind) for the host platform."""
+    system, machine = platform.system(), platform.machine()
+    if system == "Linux":
+        arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
+            machine
+        )
+        if arch is None:
+            raise SystemExit(f"unsupported Linux architecture: {machine}")
+        return f"pandoc-{version}-linux-{arch}.tar.gz", "tar"
+    if system == "Darwin":
+        arch = {"arm64": "arm64", "x86_64": "x86_64"}.get(machine)
+        if arch is None:
+            raise SystemExit(f"unsupported macOS architecture: {machine}")
+        return f"pandoc-{version}-{arch}-macOS.zip", "zip"
+    raise SystemExit(f"unsupported OS: {system}")
+
+
+def _extract(blob: bytes, kind: str, dest: Path) -> None:
+    """Write the `pandoc` binary out of the downloaded archive to `dest`."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "tar":
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tf:
+            member = next(
+                m
+                for m in tf.getmembers()
+                if m.isfile() and Path(m.name).name == "pandoc"
+            )
+            extracted = tf.extractfile(member)
+            if extracted is None:
+                raise SystemExit("pandoc binary missing from the tarball")
+            dest.write_bytes(extracted.read())
+    else:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            name = next(n for n in zf.namelist() if Path(n).name == "pandoc")
+            dest.write_bytes(zf.read(name))
+    dest.chmod(0o755)
+
+
+def _fetch(version: str) -> None:
+    """Fetch `version` into `.tools/`, unless it is already present."""
+    dest = _bin(version)
+    if render_docs._pandoc_version(str(dest)) == version:
+        print(f"pandoc {version} already installed at {dest}")
+        return
+    asset, kind = _asset(version)
+    url = f"{_RELEASE}/{version}/{asset}"
+    print(f"downloading {url}")
+    with urllib.request.urlopen(url) as resp:
+        blob = resp.read()
+    _extract(blob, kind, dest)
+    got = render_docs._pandoc_version(str(dest))
+    if got != version:
+        raise SystemExit(
+            f"installed pandoc reports {got!r}, expected {version!r}"
+        )
+    print(f"installed pandoc {version} at {dest}")
+
+
+def _install() -> None:
+    _fetch(render_docs.PANDOC_VERSION)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Manage the pinned pandoc the man-page gate uses."
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser(
+        "install", help="Fetch the pinned pandoc into .tools/ (idempotent)."
+    )
+    args = parser.parse_args()
+    if args.cmd == "install":
+        _install()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

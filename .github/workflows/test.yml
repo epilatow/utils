@@ -28,6 +28,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y borgbackup
 
+      # The pinned pandoc that test_render_docs.py renders the roff man
+      # page with. Fetched into .tools/ by the same installer local devs
+      # use, so every environment renders with the identical binary
+      # (pandoc's roff output is version-sensitive). Needed on both legs
+      # -- the man-page gate runs in the non-e2e suite too.
+      - name: Install pinned pandoc
+        run: uv run scripts/pandoc install
+
       - name: Run tests
         # The borgadm e2e suite forks uv+python+borgadm+borg per test --
         # a process-spawn-heavy workload. GitHub's hosted macOS runners

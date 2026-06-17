@@ -16,6 +16,9 @@
 #     TestSystemdAnalyzeVerify, which validates rendered systemd units --
 #     it is skipped (not run) without systemd-analyze.
 #   - borgbackup: the borgadm `--e2e` suite forks the real borg binary.
+#   - pandoc 3.10: test_render_docs.py renders the roff man page and
+#     compares it to the checked-in copy; the version is pinned because
+#     pandoc's roff output varies between versions.
 #   - Node >= 20 (from the base image): the repo-shared markdown gate runs
 #     `npx markdownlint-cli2`, and markdownlint-cli2 requires Node >= 20.
 #   - git: uv builds the repo-shared gate from its `git+https://` source
@@ -58,6 +61,8 @@ chown -R tester:tester /app
 echo "### $(uname -srm)  node=$(node --version)  uv=$(uv --version)"
 echo "### systemd-analyze=$(command -v systemd-analyze)  borg=$(command -v borg)"
 # Non-root, with uv's project venv outside /app (see header for both).
+# Fetch the pinned pandoc into /app/.tools (the same installer local devs
+# and CI use) before the suite, so the man-page gate renders with it.
 sudo -u tester env HOME=/home/tester UV_PROJECT_ENVIRONMENT=/home/tester/uvenv \
-    bash -c "cd /app && exec uv run tests/run_all.py $RUN_ARGS"
+    bash -c "cd /app && uv run scripts/pandoc install && exec uv run tests/run_all.py $RUN_ARGS"
 IN_CONTAINER

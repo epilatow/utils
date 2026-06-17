@@ -32,7 +32,8 @@ markers = [
 [tool.repo-shared.markdown]
 # Repo's pre-existing markdown was wrapped at 78. Pinned here so a
 # repo-shared bump that changed the shared default to 79 doesn't
-# reflow every line in the repo's *.md content.
+# reflow every line in the repo's *.md content. `scripts/render-docs`
+# reads this width so the generated `docs/*.md` stays mdformat-canonical.
 wrap = 78
 
 [tool.repo-shared.code-quality]

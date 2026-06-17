@@ -34,6 +34,9 @@ Thumbs.db
 tmp/
 nohup.out
 
+# Pinned dev tools fetched by scripts/pandoc install
+.tools/
+
 # Crony.app build artifacts (binary compiled at crony-apply time)
 Applications/Crony.app/Contents/MacOS/Crony
 Applications/Crony.app/Contents/MacOS/.Crony.source-sha256

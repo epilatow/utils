@@ -16,6 +16,15 @@ Development conventions for working in this repo are layered:
 - **Do not update DEVELOPMENT_SHARED.md and DEVELOPMENT_SHARED_AGENT.md.**
   Updates to these files are mechanically synced and will be overwritten.
 
+## Prerequisites
+
+- `uv` (the test suite and every PEP 723 script run through it).
+- A pinned pandoc, fetched into `.tools/` (gitignored) by
+  **`scripts/pandoc install`** -- run it once after cloning. The man-page
+  freshness gate renders with this exact binary and nothing else (not a system
+  / Homebrew pandoc), so the gate fails until it is installed. See Testing for
+  why the version is pinned.
+
 ## Repo layout
 
 This repo is a personal-utilities collection. Top-level structure:
@@ -26,22 +35,41 @@ This repo is a personal-utilities collection. Top-level structure:
 - `src/` -- first-party importable Python packages (e.g. `common`), shared
   across utilities. These packages carry no shebang and are never executed
   directly (the `src/<module>.py` alias symlinks below are the exception --
-  they point at executable `bin/` scripts). Each `bin/` entry that uses them
-  prepends `<repo>/src` to `sys.path` -- via `Path(__file__).resolve()`, which
-  follows any symlink to the real file so the repo-root walk is correct even
-  when the entry is invoked through a symlink -- before importing `common`.
-  `[tool.mypy] mypy_path = ["src"]` in `pyproject.toml` lets the code-quality
-  gate's `mypy --strict` resolve these imports statically.
-- `src/<module>.py` alias symlinks -- each extension-less `bin/` entry has a
-  matching `src/<module>.py` symlink pointing at it (e.g.
-  `src/linkfiles.py -> ../bin/linkfiles`,
-  `src/firefox_cookies.py -> ../bin/firefox-cookies`). The alias gives the
-  script an importable, `mypy`-resolvable module name, so the test suite
-  imports it as a typed module (`import linkfiles`) instead of loading it
-  through `SourceFileLoader`, and so ruff/mypy auto-discover it as a `.py`
-  file instead of needing a manual `python-targets` entry. `crony` is the
-  exception -- its logic already lives in the `src/crony` package, so it has
-  no alias and `bin/crony` stays a manual `python-targets` entry.
+  they point at executable `bin/` and `scripts/` entries). Each `bin/` entry
+  that uses them prepends `<repo>/src` to `sys.path` -- via
+  `Path(__file__).resolve()`, which follows any symlink to the real file so
+  the repo-root walk is correct even when the entry is invoked through a
+  symlink -- before importing `common`. `[tool.mypy] mypy_path = ["src"]` in
+  `pyproject.toml` lets the code-quality gate's `mypy --strict` resolve these
+  imports statically.
+- `src/<module>.py` alias symlinks -- each extension-less executable entry
+  (under `bin/` or `scripts/`) has a matching `src/<module>.py` symlink
+  pointing at it (e.g. `src/linkfiles.py -> ../bin/linkfiles`,
+  `src/firefox_cookies.py -> ../bin/firefox-cookies`,
+  `src/render_docs.py -> ../scripts/render-docs`). The alias gives the script
+  an importable, `mypy`-resolvable module name, so the test suite imports it
+  as a typed module (`import linkfiles`) instead of loading it through
+  `SourceFileLoader`, and so ruff/mypy auto-discover it as a `.py` file
+  instead of needing a manual `python-targets` entry. `crony` is the exception
+  -- its logic already lives in the `src/crony` package, so it has no alias
+  and `bin/crony` stays a manual `python-targets` entry.
+- `scripts/` -- developer/build tooling, not user-facing utilities.
+  `scripts/render-docs` generates docs from the utilities' argparse parsers (a
+  roff man page and a GitHub-browsable GFM doc; see Testing); each utility is
+  a `ManSpec`, and adding one is appending to the script's `_SPECS`.
+  `scripts/pandoc` manages the pinned pandoc the man-page gate needs
+  (`pandoc install` fetches it into `.tools/`; see Testing). Like `bin/`
+  entries these are PEP 723 executables with a `src/<module>.py` alias for
+  import + lint coverage.
+- `share/man/man<N>/` -- roff man pages generated from the argparse parsers
+  via pandoc (currently `share/man/man1/crony.1`). Generated build artifacts,
+  never hand-edited.
+- `docs/` -- GitHub-browsable GFM docs generated from the argparse parsers
+  (currently `docs/crony.md`), for browsing on GitHub and eventual linking
+  from a README. Built in pure Python (no pandoc) and run through mdformat, so
+  they satisfy the prose mdformat / markdownlint gates like any hand-written
+  doc. Generated build artifacts, never hand-edited; the freshness gate (see
+  Testing) fails if they drift.
 - `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
   suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
@@ -68,6 +96,23 @@ gated by platform checks.
   `uv run pytest _repo_shared/tests`.
 - The test suite owns ruff and mypy enforcement -- a green run is the gate for
   "ready to commit".
+- `tests/test_render_docs.py` is a freshness gate: for each utility it
+  re-renders the roff man page (e.g. `share/man/man1/crony.1`) and the GFM doc
+  (e.g. `docs/crony.md`) from the argparse parser and fails if either
+  checked-in file differs. The GFM doc is built in pure Python (plus
+  mdformat), so its comparison needs no pandoc; the roff comparison shells out
+  to pandoc, so **pandoc is a required dev/CI dependency** -- a missing pinned
+  pandoc fails the gate rather than skipping it. pandoc's roff output varies
+  by version, so the version is pinned (`render_docs.PANDOC_VERSION`): run
+  **`scripts/pandoc install`** to fetch exactly that release into `.tools/`
+  (gitignored). The tooling and the gate use **only** that binary -- never a
+  `PATH` pandoc -- so the rendered man page can't vary with whatever pandoc
+  happens to be installed; run the installer once before the gate will pass
+  locally. CI and `tests/linux-docker-test.sh` run the same installer on Linux
+  and macOS, so every environment renders with the identical binary (and CI
+  exercises the installer as a side effect). After any change to a utility's
+  CLI surface or `--help` text, run `scripts/render-docs` to regenerate the
+  man page and GFM doc, and commit them alongside the code.
 - Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
   subprocess the script under test (currently just the borgadm suite under
   `tests/test_borgadm.py`). They are slow (tens of minutes serially) and are
@@ -89,10 +134,11 @@ gated by platform checks.
   discovers only `test_*.py` and CI invokes `run_all.py` directly, so it never
   runs automatically. The container adds what the GitHub runner supplies
   implicitly -- Node 20+ (the markdownlint gate), systemd-analyze (the
-  systemd-unit verify test), borg (the e2e suite), and git (uv builds the
-  repo-shared gate from a git source) -- and runs as a non-root user (the
-  secure_archiver permission test); the script header maps each dep to the
-  test that needs it. It tests the committed HEAD, not the working tree.
+  systemd-unit verify test), borg (the e2e suite), pandoc 3.10 (the
+  `test_render_docs` man-page gate), and git (uv builds the repo-shared gate
+  from a git source) -- and runs as a non-root user (the secure_archiver
+  permission test); the script header maps each dep to the test that needs it.
+  It tests the committed HEAD, not the working tree.
 
 ## Conventions
 

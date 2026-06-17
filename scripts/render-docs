@@ -1,0 +1,739 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "tomlkit",
+#     "pydantic>=2",
+#     "mdformat",
+#     "mdformat-gfm",
+#     "mdformat-tables",
+# ]
+# ///
+# This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_render_docs.py
+"""Generate reference docs for the repo's argparse-based utilities.
+
+A utility is described by a `ManSpec`; the generic machinery renders it
+from its argparse parser into two final docs, by two format-specific
+renderers off the one spec so neither can drift from the CLI:
+
+    parser (ManSpec) -+-> share/man/man<N>/<prog>.<section>  (roff man page)
+                      +-> docs/<prog>.md                     (GFM doc)
+
+There is no committed intermediate. The man page goes through a transient
+pandoc-Markdown form (definition lists, the idiomatic man layout) piped
+straight to pandoc; the GFM doc is built directly in GitHub-idiomatic
+shapes (bold-term bullets with the description indented beneath, a
+code-span heading per subcommand, EXIT STATUS as a table) and run through
+mdformat. The two are rendered separately because the definition lists
+that read well in roff have no native GFM equivalent (pandoc's GFM writer
+flattens them), so a single shared source can't serve both.
+
+Each `ManSpec` supplies the per-utility bits the parser doesn't carry:
+the NAME one-liner, the DESCRIPTION overview, authored COMMON ARGUMENTS
+(cross-cutting args documented once), an optional reference section
+(structured `(label, description)` data, e.g. crony's status columns),
+and an EXIT STATUS table. Everything else -- SYNOPSIS, the SUBCOMMANDS
+list, and the data-driven detection of options shared across subcommands
+-- is derived generically. Add a utility by appending a `ManSpec` to
+`_SPECS`.
+
+Run with no arguments to (re)write every utility's man page and GFM doc
+(pandoc required for the roff). `--check` re-renders the GFM doc -- which
+is pure Python plus mdformat -- and exits non-zero on drift without
+writing (no pandoc needed); the pandoc-built roff is gated by the pytest
+freshness test instead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import tomllib
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import mdformat
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+# First-party packages live under <repo>/src; put it on the path before
+# importing any utility's parser, the same way each bin/ entry does.
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+# pandoc renders the Markdown to roff. Its roff output varies between
+# versions, so the version is pinned: `scripts/pandoc install` fetches
+# exactly this release into `.tools/`, and the freshness gate compares
+# against a render from it. Single-sourced here; the installer and the
+# gate both read it.
+PANDOC_VERSION = "3.10"
+_PANDOC_DIR = _REPO_ROOT / ".tools" / f"pandoc-{PANDOC_VERSION}"
+
+_MD_SPECIAL = set("\\`*_[]<>#|")
+
+
+def _md(text: str) -> str:
+    """Backslash-escape Markdown inline metacharacters so parser-derived
+    text renders verbatim (as `--help` shows it)."""
+    return "".join("\\" + c if c in _MD_SPECIAL else c for c in text)
+
+
+# GitHub renders backtick code spans, so the GFM escaper -- unlike `_md`,
+# which escapes backticks too (roff has no code span) -- leaves them alone
+# and escapes only the prose around them.
+_GFM_SPECIAL = _MD_SPECIAL - {"`"}
+# A code span: a run of N backticks closed by a run of N (the `(?<!`)` /
+# `(?!`)` guards make each run maximal), with the inner text in between.
+_GFM_CODE_SPAN = re.compile(r"(?<!`)(`+)(?:.+?)\1(?!`)", re.S)
+
+
+def _gfm_escape(text: str) -> str:
+    return "".join("\\" + c if c in _GFM_SPECIAL else c for c in text)
+
+
+def _gfm_inline(text: str) -> str:
+    """Escape GFM inline metacharacters in `text`, but pass backtick code
+    spans through verbatim so authored `code` renders as code on GitHub."""
+    out: list[str] = []
+    last = 0
+    for match in _GFM_CODE_SPAN.finditer(text):
+        out.append(_gfm_escape(text[last : match.start()]))
+        out.append(match.group(0))
+        last = match.end()
+    out.append(_gfm_escape(text[last:]))
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Per-utility specification
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ManSpec:
+    """One utility's man page. `build_parser` returns its argparse parser;
+    the rest supplies what the parser doesn't carry."""
+
+    prog: str
+    section: int
+    build_parser: Callable[[], argparse.ArgumentParser]
+    name_description: str
+    # DESCRIPTION body; falls back to the parser's own `description`.
+    description: str = ""
+    # Extra top-level prose sections rendered after DESCRIPTION and
+    # before COMMON ARGUMENTS, as `(SECTION TITLE, body)`. The body is
+    # prose (reflowed like DESCRIPTION).
+    extra_sections: list[tuple[str, str]] = field(default_factory=list)
+    # Cross-cutting args documented once under COMMON ARGUMENTS and
+    # dropped from each subcommand. `(label, description)`, authored
+    # Markdown; a bare label (e.g. ``job``) also prunes the matching
+    # per-subcommand argument.
+    common_args: list[tuple[str, str]] = field(default_factory=list)
+    # An optional trailing reference section (e.g. crony's status
+    # columns): a heading, an intro paragraph, and structured subsections.
+    reference_title: str = ""
+    reference_intro: str = ""
+    reference_sections: list[tuple[str, str, list[tuple[str, str]]]] = field(
+        default_factory=list
+    )
+    # EXIT STATUS as `(code, description)` items, or [] to omit it.
+    exit_status: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def man_path(self) -> Path:
+        return (
+            _REPO_ROOT
+            / "share"
+            / "man"
+            / f"man{self.section}"
+            / f"{self.prog}.{self.section}"
+        )
+
+    @property
+    def docs_path(self) -> Path:
+        return _REPO_ROOT / "docs" / f"{self.prog}.md"
+
+
+# ---------------------------------------------------------------------------
+# Generic parser introspection
+# ---------------------------------------------------------------------------
+#
+# argparse exposes no public API for walking a built parser, so a few
+# internal accesses are unavoidable -- the same ones argparse-manpage
+# relies on: `parser._actions` (the action list has no public iterator),
+# `argparse._SubParsersAction` (to recognise the subparsers action), and
+# its `_choices_actions` (the only place a subcommand's help string and
+# its listed-in-`--help` status live). Everything else here is built from
+# public `Action` attributes (`option_strings`, `metavar`, `nargs`,
+# `dest`, `choices`, `help`) rather than argparse's formatter internals.
+
+
+def _has_subcommands(parser: argparse.ArgumentParser) -> bool:
+    return any(
+        isinstance(a, argparse._SubParsersAction) for a in parser._actions
+    )
+
+
+def _build_parser(spec: ManSpec) -> argparse.ArgumentParser:
+    """Build the spec's parser with `prog` forced (argparse otherwise
+    takes it from `sys.argv[0]`, which varies by how this is invoked)."""
+    saved_argv0 = sys.argv[0]
+    sys.argv[0] = spec.prog
+    try:
+        parser = spec.build_parser()
+    finally:
+        sys.argv[0] = saved_argv0
+    return parser
+
+
+def _signature(parser: argparse.ArgumentParser) -> str:
+    """The option / argument part of a parser's usage, collapsed to one
+    logical line so the man renderer -- not argparse's width-based usage
+    formatter -- handles wrapping. `-h` is dropped: every parser has it,
+    so repeating it in each signature is noise."""
+    usage = " ".join(parser.format_usage().split())
+    prefix = f"usage: {parser.prog} "
+    sig = usage[len(prefix) :] if usage.startswith(prefix) else usage
+    return sig.removeprefix("[-h] ").removeprefix("[-h]").strip()
+
+
+def _metavar(action: argparse.Action, default: str) -> str:
+    """The display name for an action's value: an explicit `metavar`, else
+    the `{a,b,c}` choices set, else `default`. Mirrors argparse's own
+    metavar selection without reaching into its formatter."""
+    if action.metavar is not None:
+        return (
+            action.metavar
+            if isinstance(action.metavar, str)
+            else " ".join(action.metavar)
+        )
+    if action.choices is not None:
+        return "{" + ",".join(str(c) for c in action.choices) + "}"
+    return default
+
+
+def _format_args(action: argparse.Action, metavar: str) -> str:
+    """An option's value placeholder, accounting for `nargs` (e.g. `X`,
+    `[X]`, `[X ...]`)."""
+    nargs = action.nargs
+    if nargs is None:
+        return metavar
+    if nargs == argparse.OPTIONAL:
+        return f"[{metavar}]"
+    if nargs == argparse.ZERO_OR_MORE:
+        return f"[{metavar} ...]"
+    if nargs == argparse.ONE_OR_MORE:
+        return f"{metavar} [{metavar} ...]"
+    if nargs == argparse.REMAINDER:
+        return "..."
+    if isinstance(nargs, int):
+        return " ".join([metavar] * nargs)
+    return metavar
+
+
+def _invocation(action: argparse.Action) -> str:
+    """An action's invocation as `--help` shows it (`-b, --bundle BUNDLE`
+    for value options, joined flags for switches, the metavar for
+    positionals), built from public attributes. Matches argparse's
+    Python 3.13+ formatting, which prints the value placeholder once after
+    the joined option strings rather than after each."""
+    if not action.option_strings:
+        return _metavar(action, action.dest)
+    if action.nargs == 0:
+        return ", ".join(action.option_strings)
+    args = _format_args(action, _metavar(action, action.dest.upper()))
+    return ", ".join(action.option_strings) + " " + args
+
+
+def _options(
+    parser: argparse.ArgumentParser,
+) -> list[tuple[str, str]]:
+    """(invocation, help) for each documented option / positional,
+    skipping the universal `-h/--help` and the subparsers pseudo-action."""
+    out: list[tuple[str, str]] = []
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        if "-h" in action.option_strings:
+            continue
+        out.append((_invocation(action), action.help or ""))
+    return out
+
+
+def _walk_subcommands(
+    parser: argparse.ArgumentParser,
+    acc: list[tuple[argparse.ArgumentParser, str]],
+) -> None:
+    """Collect `(subparser, summary)` for every leaf subcommand,
+    depth-first, so nested verbs follow their parent. Intermediary
+    parents (which just group their actions) are recursed through but not
+    documented -- their leaves carry the full path. Subcommands registered
+    without a help string (internal entry points argparse omits from
+    `--help`) are skipped. The summary prefers the subparser's
+    `description` (the fuller text, which carries any subcommand-specific
+    argument behavior) over the short list `help`."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            help_by_name = {
+                ca.dest: ca.help or "" for ca in action._choices_actions
+            }
+            for name, sub in action.choices.items():
+                if name not in help_by_name:
+                    continue
+                if not _has_subcommands(sub):
+                    acc.append((sub, sub.description or help_by_name[name]))
+                _walk_subcommands(sub, acc)
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
+
+def _code_block(text: str) -> list[str]:
+    """Pre-formatted text as a fenced code block (pandoc renders it as a
+    verbatim roff block, preserving hand-aligned columns)."""
+    return ["```text", *text.splitlines(), "```", ""]
+
+
+def _overview_md(
+    overview: str,
+    inline: Callable[[str], str] = _md,
+) -> list[str]:
+    """A description / overview as Markdown: prose paragraphs reflow,
+    while a block containing any indented line (an aligned table) is kept
+    verbatim as a code block. `inline` escapes prose for the target dialect
+    (`_md` for pandoc/man, `_gfm_inline` for GFM)."""
+    out: list[str] = []
+    for block in overview.split("\n\n"):
+        lines = block.strip("\n").split("\n")
+        if not any(lines):
+            continue
+        if any(line[:1].isspace() for line in lines):
+            out += _code_block("\n".join(lines))
+        else:
+            out += [" ".join(inline(line) for line in lines), ""]
+    return out
+
+
+def _definition(term: str, description: str, *, indent: str = "") -> list[str]:
+    """A pandoc definition-list entry (`term` / `: description`), at an
+    optional indent so it can nest under another definition."""
+    return [
+        f"{indent}{term}",
+        "",
+        f"{indent}:   {description}",
+        "",
+    ]
+
+
+def _shared_options(
+    spec: ManSpec,
+    subs: list[tuple[argparse.ArgumentParser, str]],
+) -> tuple[set[str], set[tuple[str, str]]]:
+    """The two sets that drive COMMON ARGUMENTS, shared by both renderers
+    so they agree on what is hoisted out of the per-subcommand listing.
+
+    `authored` is the bare labels in `common_args` (e.g. ``job``); an
+    authored label also prunes the matching per-subcommand argument and is
+    excluded from detection so its own entry isn't joined by a re-detected
+    one. `common` is every (invocation, help) pair identical across two or
+    more subcommands -- documented once and dropped from each subcommand,
+    detected from the parser so it can't drift."""
+    authored = {label.strip("`") for label, _ in spec.common_args}
+    counts: dict[tuple[str, str], int] = {}
+    for sub, _ in subs:
+        for invocation, opt_help in _options(sub):
+            if invocation in authored:
+                continue
+            counts[(invocation, opt_help)] = (
+                counts.get((invocation, opt_help), 0) + 1
+            )
+    common = {opt for opt, count in counts.items() if count >= 2}
+    return authored, common
+
+
+def build_markdown(spec: ManSpec) -> str:
+    """Render a utility's man page as pandoc Markdown. Pure and
+    deterministic. Transient: piped to pandoc for the roff man page, not
+    committed."""
+    parser = _build_parser(spec)
+    # The pandoc title block carries no date, so pandoc renders an empty
+    # `.TH` date field. That is deliberate: the page is a build artifact
+    # gated for byte-equality, and a real date would make every render
+    # differ. man renders the blank date slot without complaint.
+    out: list[str] = [
+        f"% {spec.prog}({spec.section}) {spec.prog} | {spec.prog} manual",
+        "",
+        "# NAME",
+        "",
+        f"{spec.prog} - {spec.name_description}",
+        "",
+        "# SYNOPSIS",
+        "",
+        f"**{spec.prog}** {_md(_signature(parser))}".rstrip(),
+        "",
+        "# DESCRIPTION",
+        "",
+    ]
+    out += _overview_md(spec.description or parser.description or "")
+
+    for title, body in spec.extra_sections:
+        out += [f"# {title}", ""]
+        out += _overview_md(body)
+
+    subs: list[tuple[argparse.ArgumentParser, str]] = []
+    _walk_subcommands(parser, subs)
+    authored, common = _shared_options(spec, subs)
+
+    if spec.common_args or common:
+        out += ["# COMMON ARGUMENTS", ""]
+        for label, description in spec.common_args:
+            out += _definition(label, description)
+        for invocation, opt_help in sorted(common):
+            out += _definition(f"`{invocation}`", _md(opt_help))
+
+    out += ["# SUBCOMMANDS", ""]
+    for sub, summary in subs:
+        path = sub.prog.removeprefix(f"{spec.prog} ")
+        # rstrip so a no-argument subcommand (empty signature) doesn't
+        # leave a trailing space after the bold name.
+        out += [f"**{path}** {_md(_signature(sub))}".rstrip(), ""]
+        out += [f":   {_md(summary)}", ""]
+        for invocation, opt_help in _options(sub):
+            if (invocation, opt_help) in common or invocation in authored:
+                continue
+            out += _definition(f"`{invocation}`", _md(opt_help), indent="    ")
+
+    if spec.reference_sections:
+        out += [f"# {spec.reference_title}", ""]
+        if spec.reference_intro:
+            out += [_md(spec.reference_intro), ""]
+        for title, lead, items in spec.reference_sections:
+            out += [f"## {title}", ""]
+            if lead:
+                out += [_md(lead), ""]
+            for label, description in items:
+                # Emphasis (italic -> underline in a terminal) sets the
+                # key apart from its description when both share a line.
+                out += _definition(f"*{_md(label)}*", _md(description))
+
+    if spec.exit_status:
+        out += ["# EXIT STATUS", ""]
+        # A compact definition list: the term and definition adjacent (no
+        # blank between them) renders each as a tight `.TP` with no gap,
+        # since the codes are short and loose spacing wastes vertical room.
+        for code, description in spec.exit_status:
+            out += [f"`{code}`", f":   {_md(description)}", ""]
+
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _pandoc_version(pandoc: str) -> str | None:
+    """The version a pandoc binary reports (e.g. `3.10`), or None if it
+    can't be run."""
+    try:
+        out = subprocess.run(
+            [pandoc, "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    first = out.splitlines()[0].split() if out else []
+    return first[1] if len(first) >= 2 and first[0] == "pandoc" else None
+
+
+def _pinned_pandoc() -> str | None:
+    """The pinned pandoc to render with: the repo-local `.tools/` binary
+    placed by `scripts/pandoc install`, or None if it isn't installed.
+    Only this binary is used -- never a `PATH` pandoc -- so the rendered
+    roff can't vary with whatever pandoc happens to be on `PATH`."""
+    local = _PANDOC_DIR / "bin" / "pandoc"
+    return str(local) if local.exists() else None
+
+
+def _render_roff(markdown: str) -> str:
+    """pandoc-render Markdown to a standalone man page."""
+    pandoc = _pinned_pandoc()
+    if pandoc is None:
+        raise SystemExit(
+            f"pandoc {PANDOC_VERSION} not found; run scripts/pandoc install "
+            "to fetch the pinned version into .tools/."
+        )
+    result = subprocess.run(
+        # `-smart` keeps pandoc from rewriting `--` as an en-dash and
+        # `'`/`"` as curly quotes -- option spellings must stay literal.
+        # `--wrap=none` doesn't word-wrap the roff, so the man renderer
+        # reflows prose at its own width instead of baking in pandoc's
+        # wrap. (Inter-sentence spacing is handled below.)
+        [
+            pandoc,
+            "--standalone",
+            "--from=markdown-smart",
+            "--to=man",
+            "--wrap=none",
+        ],
+        input=markdown,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    src = [
+        line
+        for line in result.stdout.splitlines()
+        if not line.startswith('.\\" Automatically generated by Pandoc')
+    ]
+    # pandoc precedes a code block with a bare `.IP` (indented paragraph),
+    # which double-indents the following `.EX` verbatim block. Swap it for
+    # `.PP`: that keeps the paragraph break separating the block from its
+    # neighbors but drops the extra indent, so the block sits at its
+    # section's one indent level.
+    lines = [
+        ".PP"
+        if (line == ".IP" and i + 1 < len(src) and src[i + 1] == ".EX")
+        else line
+        for i, line in enumerate(src)
+    ]
+    # pandoc writes one sentence per roff line; roff then inserts a double
+    # space wherever a line ends in sentence punctuation. Append `\&`
+    # (zero-width) to those line ends so roff keeps a single space. roff
+    # looks through trailing closing delimiters (`)`, `]`, `'`, `"`) to
+    # find the punctuation, so a line ending `etc.)` counts too.
+    # Verbatim (.EX/.EE) blocks print literally, so skip them.
+    out: list[str] = []
+    in_verbatim = False
+    for line in lines:
+        if line == ".EX":
+            in_verbatim = True
+        elif line == ".EE":
+            in_verbatim = False
+        elif (
+            not in_verbatim
+            and line[:1] not in (".", "'")
+            and line.rstrip(")]'\"").endswith((".", "!", "?"))
+        ):
+            line += "\\&"
+        out.append(line)
+        # EXIT STATUS is a list of short codes; `.PD 0` zeroes the
+        # paragraph distance so mandoc renders the entries compactly
+        # instead of with `.TP`'s default blank line between each. It is
+        # the last section, so no reset is needed.
+        if line == ".SH EXIT STATUS":
+            out.append(".PD 0")
+    return "\n".join(out).strip("\n") + "\n"
+
+
+def _md_wrap() -> int:
+    """The prose wrap width the repo's markdown gates enforce, read from
+    `[tool.repo-shared.markdown]` in pyproject.toml so the GFM render stays
+    mdformat-canonical without a second copy of the number."""
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    return int(pyproject["tool"]["repo-shared"]["markdown"]["wrap"])
+
+
+def _gfm_item(term: str, description: str) -> str:
+    """A definition as a bulleted list item: the bold inline-code term on
+    its own line (a `\\` hard break), the description indented beneath it.
+    Preferred over a table for wide keys (option / value names), which a
+    GitHub table wraps across lines."""
+    return f"- **`{term.strip('`')}`**\\\n  {_gfm_inline(description)}"
+
+
+def _gfm_table(
+    items: list[tuple[str, str]],
+    term_header: str,
+    desc_header: str,
+) -> list[str]:
+    """A two-column GFM table -- the term in inline code, its description
+    as prose -- which is GitHub's native way to render a definition list
+    (aligned columns, a reflowing description, code spans that render as
+    code). Explicit left-align (`:---`) so GitHub left-aligns the header
+    cells too, not just the body."""
+    rows = [
+        f"| {term_header} | {desc_header} |",
+        "| :--- | :--- |",
+    ]
+    rows += [f"| `{term}` | {_gfm_inline(desc)} |" for term, desc in items]
+    rows.append("")
+    return rows
+
+
+def build_gfm(spec: ManSpec) -> str:
+    """Render a utility's doc as GitHub-Flavored Markdown: a single
+    `# <prog> - <summary>` title (the man page's NAME line, which a
+    GitHub doc needs no separate section for) with man-style sections
+    demoted to `##`, option / argument / reference entries as bulleted
+    definitions (bold-code term, description indented beneath), a code-span
+    heading per subcommand carrying its signature, and EXIT STATUS as a
+    table (its single-digit codes never wrap). Run through mdformat so the
+    result satisfies the repo's prose mdformat / markdownlint gates. Pure
+    Python (no pandoc); deterministic."""
+    parser = _build_parser(spec)
+    out: list[str] = [
+        f"# {spec.prog} - {spec.name_description}",
+        "",
+        "## SYNOPSIS",
+        "",
+        *_code_block(f"{spec.prog} {_signature(parser)}".rstrip()),
+        "## DESCRIPTION",
+        "",
+    ]
+    out += _overview_md(
+        spec.description or parser.description or "", _gfm_inline
+    )
+
+    for title, body in spec.extra_sections:
+        out += [f"## {title}", ""]
+        out += _overview_md(body, _gfm_inline)
+
+    subs: list[tuple[argparse.ArgumentParser, str]] = []
+    _walk_subcommands(parser, subs)
+    authored, common = _shared_options(spec, subs)
+
+    if spec.common_args or common:
+        out += ["## COMMON ARGUMENTS", ""]
+        # `_gfm_item` strips the authored backticks and escapes the help.
+        items = [(label.strip("`"), desc) for label, desc in spec.common_args]
+        items += sorted(common)
+        out += [_gfm_item(term, desc) for term, desc in items]
+        out.append("")
+
+    out += ["## SUBCOMMANDS", ""]
+    for sub, summary in subs:
+        path = sub.prog.removeprefix(f"{spec.prog} ")
+        # The command and its signature go in the one heading (so it reads
+        # once and still anchors in GitHub's outline), not a heading plus a
+        # repeated usage block. The heading is a code span so the command
+        # and its arguments render in the monospace font.
+        signature = f"{path} {_signature(sub)}".rstrip()
+        out += [f"### `{signature}`", ""]
+        out += [_gfm_inline(summary), ""]
+        own = [
+            (invocation, opt_help)
+            for invocation, opt_help in _options(sub)
+            if (invocation, opt_help) not in common
+            and invocation not in authored
+        ]
+        if own:
+            out += [_gfm_item(inv, opt_help) for inv, opt_help in own]
+            out.append("")
+
+    if spec.reference_sections:
+        out += [f"## {spec.reference_title}", ""]
+        if spec.reference_intro:
+            out += [_gfm_inline(spec.reference_intro), ""]
+        for title, lead, items in spec.reference_sections:
+            out += [f"### {title}", ""]
+            if lead:
+                out += [_gfm_inline(lead), ""]
+            out += [_gfm_item(label, desc) for label, desc in items]
+            out.append("")
+
+    if spec.exit_status:
+        out += ["## EXIT STATUS", ""]
+        out += _gfm_table(spec.exit_status, "Code", "Meaning")
+
+    return mdformat.text(
+        "\n".join(out),
+        options={"wrap": _md_wrap(), "number": True},
+        extensions={"gfm", "tables"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Utility specs
+# ---------------------------------------------------------------------------
+
+
+def _crony_spec() -> ManSpec:
+    import crony.cli
+    import crony.commands
+    import crony.errors
+
+    job = (
+        "`job`",
+        "A job (or group) identity: the full namespaced name "
+        "`<bundle>.<name>`, or the `<bundle>:<uuid>` form for an entry "
+        "with no recoverable name. A bare `name` is shorthand for "
+        "`default.<name>`. Subcommands that accept more than one take a "
+        "space-separated list (shown as `[job ...]`).",
+    )
+    internal = {code.value for code in crony.errors.INTERNAL_EXIT_CODES}
+    exit_status = [
+        (str(value), description)
+        for value, description in crony.errors.ExitCode.entries()
+        if value not in internal
+    ]
+    sections = [
+        (s.title, s.lead, s.items)
+        for s in crony.commands.status_reference_sections()
+    ]
+    return ManSpec(
+        prog="crony",
+        section=1,
+        build_parser=crony.cli._build_parser,
+        name_description="user-level scheduled-job manager",
+        description=crony.cli._OVERVIEW,
+        extra_sections=[
+            ("GETTING STARTED", crony.cli._GETTING_STARTED),
+            ("PLATFORM SPECIFICS", crony.cli._PLATFORM_SPECIFICS),
+        ],
+        common_args=[job],
+        reference_title="STATUS COLUMNS",
+        reference_sections=sections,
+        exit_status=exit_status,
+    )
+
+
+_SPECS: list[Callable[[], ManSpec]] = [_crony_spec]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Generate reference docs (man page + GFM) from the "
+        "utilities' argparse parsers."
+    )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if any checked-in GFM doc is stale; do not "
+        "write (no pandoc needed).",
+    )
+    args = ap.parse_args()
+
+    stale: list[Path] = []
+    for make_spec in _SPECS:
+        spec = make_spec()
+        # The GFM doc is pure Python (plus mdformat), so --check verifies
+        # it without pandoc; the roff man page needs pandoc and is gated by
+        # the pytest freshness test instead.
+        gfm = build_gfm(spec)
+        if args.check:
+            current = (
+                spec.docs_path.read_text() if spec.docs_path.exists() else ""
+            )
+            if current != gfm:
+                stale.append(spec.docs_path)
+            continue
+        roff = _render_roff(build_markdown(spec))
+        for path in (spec.man_path, spec.docs_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        spec.man_path.write_text(roff)
+        spec.docs_path.write_text(gfm)
+        print(f"wrote {spec.man_path}\nwrote {spec.docs_path}")
+
+    if stale:
+        for path in stale:
+            print(f"{path} is stale", file=sys.stderr)
+        print("run scripts/render-docs to refresh", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

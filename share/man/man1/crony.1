@@ -1,0 +1,406 @@
+.\"
+.TH "crony" "1" "" "crony" "crony manual"
+.SH NAME
+crony \- user\-level scheduled\-job manager
+.SH SYNOPSIS
+\f[B]crony\f[R] <command> ...\&
+.SH DESCRIPTION
+Crony is a multi\-platform user\-level scheduled\-job manager.\&
+It supports jobs on macOS/darwin (via launchd) and linux (via systemd).\&
+It reads one or more TOML config bundles and can deploy the corresponding platform units.\&
+It runs jobs through a uniform shim, which provides consistent logging, execution gates, timeouts, environment management, etc.\&
+Jobs can be grouped, and groups or jobs run on a schedule.\&
+Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gatrigger\(ga subcommand).\&
+Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
+.PP
+.EX
+Subcommands fall into categories:
+  \- configuration (config):              manage config files
+  \- deployment (apply, destroy):         deploy configured jobs
+  \- runtime state (enable, disable):     manage scheduler arming
+  \- operational (status, logs, trigger): manage deployed jobs
+.EE
+.PP
+.EX
+Configuration is managed via bundles:
+  \(ti/.config/crony/config.toml     \-> bundle name \(dqdefault\(dq
+  \(ti/.config/crony/config/<x>.toml \-> bundle name \(dq<x>\(dq
+.EE
+.PP
+Bundles are independent.\&
+Job and group names are namespaced as <bundle>.<name>; bare CLI input (\(gacrony trigger foo\(ga) is shorthand for \(gadefault.foo\(ga.\&
+The \(ga\-b/\-\-bundle <name>\(ga flag on various subcommands scopes name resolution to that bundle.\&
+.SH GETTING STARTED
+To use crony, start by generating a crony config file with \(gacrony config init\(ga.\&
+Then edit the config file to define jobs and notification mechanisms.\&
+You can validate the config file with \(gacrony config validate\(ga.\&
+Internally, crony tracks jobs via UUIDs, so every job needs one.\&
+You can auto\-assign UUIDs in a config file with \(gacrony config update\(ga (or generate one with \(gacrony config generate\-uuid\(ga and add it manually).\&
+.PP
+Once a crony config exists you can inspect defined and deployed jobs (and their execution status) with \(gacrony status\(ga.\&
+To deploy configured jobs run \(gacrony apply\(ga.\&
+If you change the configuration for a deployed job, \(gacrony status\(ga will report that the job is \(gastale\(ga and you can update the deployed configuration by running \(gacrony apply\(ga again.\&
+To see execution logs (file path, content, etc.)\&
+for a job use \(gacrony logs\(ga.\&
+To manually trigger a job run use \(gacrony trigger\(ga.\&
+To disable a job (without destroying it), use \(gacrony disable\(ga (you can subsequently re\-enable it with \(gacrony enable\(ga).\&
+To remove deployed jobs run \(gacrony destroy\(ga.\&
+(Destroying jobs removes all previous job state: log files, last run information, etc.)\&
+.SH PLATFORM SPECIFICS
+On systemd\-based platforms, for scheduled jobs to execute when a user is not logged in, \(dqlinger\(dq must be enabled.\&
+Enabling linger requires sudo access and can be done via the following command: \(gasudo loginctl enable\-linger $USER\(ga.\&
+The \(gacrony status\(ga and \(gacrony config validate\(ga commands will check if systemd linger is enabled, and if not will emit a warning asking the user to enable it.\&
+While linger is disabled, a scheduled job whose time arrives while the user is logged out will not run then; instead it runs immediately the next time the user logs in.\&
+.SH COMMON ARGUMENTS
+.TP
+\f[CR]job\f[R]
+A job (or group) identity: the full namespaced name \f[CR]<bundle>.<name>\f[R], or the \f[CR]<bundle>:<uuid>\f[R] form for an entry with no recoverable name.\&
+A bare \f[CR]name\f[R] is shorthand for \f[CR]default.<name>\f[R].\&
+Subcommands that accept more than one take a space\-separated list (shown as \f[CR][job ...]\f[R]).\&
+.TP
+\f[CR]\-b, \-\-bundle BUNDLE\f[R]
+Operate on config bundle BUNDLE.\&
+Where the subcommand takes names, bare names resolve within BUNDLE and a qualified name must match it.\&
+.SH SUBCOMMANDS
+.TP
+\f[B]config init\f[R] [\-\-force] [\-b BUNDLE]
+Generate a default config file.\&
+With \-\-bundle, write config/<bundle>.toml instead of config.toml.\&
+.RS
+.TP
+\f[CR]\-\-force\f[R]
+Overwrite an existing config file.\&
+.RE
+.TP
+\f[B]config validate\f[R] [\-b BUNDLE | \-\-file PATH]
+Lint config; report orphans, linger, etc.\&
+With \-\-bundle, cross\-host checks (orphans, linger) are skipped.\&
+.RS
+.TP
+\f[CR]\-\-file PATH\f[R]
+Structurally validate a single TOML file as a bundle (named after its stem, or \(aqdefault\(aq for the installed config.toml), independent of the config dir.\&
+Exits non\-zero on any error.\&
+Lets a tool pre\-flight a bundle.\&
+.RE
+.TP
+\f[B]config update\f[R] [\-b BUNDLE]
+Assign UUIDs to jobs and groups that lack one.\&
+Without \-\-bundle every bundle file is scanned; with it, only that bundle\(aqs file.\&
+.TP
+\f[B]config generate\-uuid\f[R]
+Print one freshly\-minted UUID.\&
+.TP
+\f[B]apply\f[R] [\-v] [\-b BUNDLE] [job ...]\&
+Render and activate platform units to match config.\&
+With no job arguments this is a full sync (install missing, fix drift, remove orphans); with names it surgically updates just those entries.\&
+.RS
+.TP
+\f[CR]\-v, \-\-verbose\f[R]
+Also print \(aqunchanged\(aq lines (default: suppressed).\&
+.RE
+.TP
+\f[B]destroy\f[R] [\-\-orphans] [\-b BUNDLE] [job ...]\&
+Remove platform units.\&
+With no job arguments this is a factory reset; with names it surgically removes just those entries.\&
+.RS
+.TP
+\f[CR]\-\-orphans\f[R]
+Limit removal to entries with on\-disk remnants that no config selects on this host.\&
+Combinable with \-b/\-\-bundle; mutually exclusive with positional names.\&
+.RE
+.TP
+\f[B]enable\f[R] [\-b BUNDLE] [job ...]\&
+Re\-arm the named jobs\(aq schedules.\&
+Omit the job arguments with \-\-bundle to enable every stamped entry in that bundle.\&
+.TP
+\f[B]disable\f[R] [\-b BUNDLE] [job ...]\&
+Disarm the named jobs\(aq schedules (still triggerable).\&
+Omit the job arguments with \-\-bundle to disable every stamped entry in that bundle.\&
+.TP
+\f[B]trigger\f[R] [\-b BUNDLE] [\-w] [\-\-trigger\-timeout TRIGGER_TIMEOUT] [job ...]\&
+Ask the platform scheduler to fire the named jobs now.\&
+Omit the job arguments with \-\-bundle to fire every stamped entry in that bundle.\&
+.RS
+.TP
+\f[CR]\-w, \-\-wait\f[R]
+Block until each named entry\(aqs next completion and exit with that exit code (worst across multiple names).\&
+.TP
+\f[CR]\-\-trigger\-timeout TRIGGER_TIMEOUT\f[R]
+Override [defaults].trigger_timeout_sec (seconds to wait for a runner to come online after kickstart).\&
+Only meaningful with \-\-wait.\&
+.RE
+.TP
+\f[B]status\f[R] [\-a] [\-\-cols COLS] [\-b BUNDLE] [\-\-config\-current] [\-\-config\-pending] [\-\-exclude\-healthy] [job ...]\&
+Print resolved state per job.\&
+With no job arguments every job is shown; pass job names to restrict the table.\&
+Many columns are source\-selected \-\- they show the pending (config) value by default, or the applied value under \-\-config\-current \-\- and a trailing \(ga\(ha\(ga on a value marks a divergence between the two.\&
+.RS
+.TP
+\f[CR]\-a, \-\-all\f[R]
+List all defined entries, including ones masked on the current host.\&
+Entries can be masked because they are unused or associated with a different platform and/or host.\&
+.TP
+\f[CR]\-\-cols COLS\f[R]
+Comma\-separated columns to display.\&
+See the Status Columns reference for valid names, aliases, and descriptions.\&
+.TP
+\f[CR]\-\-config\-current\f[R]
+For dual\-source columns (name, schedule, groups, ...), show the currently\-active (applied) value.\&
+.TP
+\f[CR]\-\-config\-pending\f[R]
+For dual\-source columns (name, schedule, groups, ...), show the pending value from the config (the default).\&
+.TP
+\f[CR]\-\-exclude\-healthy\f[R]
+Drop rows that are config=synced, enabled in the scheduler, and last in ok/never/gated.\&
+Output is flat (no tree indent).\&
+Always exits 0 \-\- this is a filter on the display, not a gate.\&
+.RE
+.TP
+\f[B]logs\f[R] [\-n N] [\-s SINCE] [\-t] [\-p] [\-l] job
+Print a job\(aqs recent log output.\&
+.RS
+.TP
+\f[CR]\-n N\f[R]
+Print the last N lines (default: 200, or 10 with \-\-tail).\&
+.TP
+\f[CR]\-s, \-\-since SINCE\f[R]
+\(dq1h\(dq, \(dq2d\(dq, or ISO timestamp.\&
+.TP
+\f[CR]\-t, \-\-tail\f[R]
+Follow appended output.\&
+.TP
+\f[CR]\-p, \-\-path\f[R]
+Print the log file path and exit (no content).\&
+.TP
+\f[CR]\-l, \-\-latest\f[R]
+Print only the latest run\(aqs entry.\&
+.RE
+.TP
+\f[B]notify\-test\f[R] [\-\-channel CHANNEL] [\-b BUNDLE]
+Send a synthetic failure notification.\&
+.RS
+.TP
+\f[CR]\-\-channel CHANNEL\f[R]
+Send through one specific channel.\&
+Bare name (\(gantfy\(ga) resolves against the selected bundle; fully qualified \(ga<bundle>.<channel>\(ga overrides \-\-bundle.\&
+.RE
+.SH STATUS COLUMNS
+.SS Default Columns
+.TP
+\f[I]job\-or\-uuid\f[R]
+Normally the full job name \(ga<bundle>.<short>\(ga, but in the case of a job naming conflict or a broken job with no recoverable name this column may report \(ga<bundle>:<UUID>\(ga.\&
+.TP
+\f[I]config\f[R]
+See \(dqCONFIG values\(dq.\&
+.TP
+\f[I]schedule\f[R]
+See \(dqSCHEDULE values\(dq.\&
+.TP
+\f[I]status\f[R]
+See \(dqSTATUS values\(dq.\&
+.TP
+\f[I]last\-ran\f[R]
+Relative time of the last job run, e.g.\&
+\(dq5m ago\(dq.\&
+.SS Optional Columns
+.TP
+\f[I]<flag>\f[R]
+One opt\-in true/false column per capability flag (\(ga\-\-cols interactive\(ga, etc.).\&
+Request by name; the \(gaall\(ga alias omits these in favor of the compact \(gaflags\(ga column.\&
+See \(dqFLAG values\(dq.\&
+.TP
+\f[I]flags\f[R]
+Comma\-separated list of capability flags enabled for the job.\&
+See \(dqFLAG values\(dq.\&
+.TP
+\f[I]groups\f[R]
+Comma\-separated list of job groups containing this job.\&
+A job can only have one unmasked parent, but can have multiple masked parents.\&
+Empty when the job isn\(aqt part of any group.\&
+.TP
+\f[I]job\f[R]
+Full job name: \(ga<bundle>.<short>\(ga.\&
+This name may not be usable with subcommands if a pending configuration update will assign this name to a new job, in which case you can use the \(ga<bundle>:<UUID>\(ga name to directly address this job.\&
+May be empty for a broken job with no recoverable name.\&
+.TP
+\f[I]kind\f[R]
+Job type: \(dqjob\(dq or \(dqgroup\(dq.\&
+.TP
+\f[I]log\-file\f[R]
+Filesystem path of the job\(aqs log file.\&
+.TP
+\f[I]masked\-by\f[R]
+A comma\-separated list of reasons why a job is masked (CONFIG = masked) on the current host.\&
+See \(dqMASKED values\(dq.\&
+.TP
+\f[I]priority\f[R]
+Job scheduling priority: high | normal | low.\&
+Empty for groups.\&
+.TP
+\f[I]stale\f[R]
+A comma\-separated list of the snapshot fields that have diverged between the pending config and the applied unit (CONFIG = stale).\&
+Each is named the way that field is known \-\- the config\-file knob, a capability flag, a status column, or its dash\-spelled snapshot attribute.\&
+.TP
+\f[I]timeout\f[R]
+Job wallclock cap: \(ga<n>s\(ga.\&
+The job will be killed if its wallclock execution time exceeds this cap.\&
+May be \(ganone\(ga for uncapped jobs.\&
+.TP
+\f[I]unit\-config\f[R]
+Filesystem path of the platform config unit.\&
+Empty when no config unit exists on disk.\&
+.TP
+\f[I]unit\-name\f[R]
+Platform unit identifier.\&
+.TP
+\f[I]unit\-timer\f[R]
+Filesystem path of the platform timer unit.\&
+Empty for an unscheduled / grouped job.\&
+Only used by systemd, and always empty on macOS/darwin.\&
+.TP
+\f[I]uuid\f[R]
+The job\(aqs \(ga<bundle>:<UUID>\(ga name.\&
+.SS Column Aliases
+.TP
+\f[I]default\f[R]
+The columns shown when \(ga\-\-cols\(ga is omitted: job\-or\-uuid, config, schedule, status, last\-ran.\&
+.TP
+\f[I]all\f[R]
+Every column except the per\-flag columns (use the compact \(gaflags\(ga instead), \(gamasked\-by\(ga (kept only when a masked entry is present), and \-\- on macOS \-\- \(gaunit\-timer\(ga (launchd has no timer file).\&
+Naming an excluded column explicitly still shows it.\&
+.TP
+\f[I]unit\-files\f[R]
+unit\-config, plus unit\-timer on Linux.\&
+.SS CONFIG values
+.TP
+\f[I]synced\f[R]
+A deployed job\(aqs configuration is up\-to\-date.\&
+.TP
+\f[I]stale\f[R]
+A deployed job\(aqs configuration has diverged from its configuration file definition, but the job is still runnable.\&
+Run \(gaapply\(ga to update the deployed configuration.\&
+.TP
+\f[I]broken\f[R]
+A deployed job\(aqs configuration is broken and un\-runnable.\&
+Run \(gaapply\(ga to fix the deployed configuration.\&
+.TP
+\f[I]missing\f[R]
+A job exists in the config file but has not yet been deployed.\&
+.TP
+\f[I]orphan\f[R]
+A deployed job (or some job\-related resource) is not defined in any configuration file.\&
+Run \(gadestroy \-\-orphans\(ga to clean up the deployed configuration.\&
+.TP
+\f[I]masked\f[R]
+A job can\(aqt be deployed on the current host due to configuration filters (usually a mismatched \(gaplatform\(ga or \(gahost\(ga directive).\&
+.TP
+\f[I]error\f[R]
+The job configuration file definition (i.e.\&
+the pending or requested configuration) is broken, or its dependencies can\(aqt be met (e.g.\&
+full\-disk\-access has been requested on macOS/darwin, but the Crony.app wrapper doesn\(aqt have full\-disk\-access).\&
+If the job was previously deployed, it will continue to run and can be managed, but the deployed configuration can\(aqt be updated with \(gaapply\(ga until the pending configuration issue is fixed.\&
+.SS SCHEDULE values
+.TP
+\f[I]OnCalendar schedule\f[R]
+A (restricted) systemd OnCalendar schedule for job execution.\&
+.TP
+\f[I]interval=<x>\f[R]
+A systemd time\-span interval for job execution.\&
+.TP
+\f[I]grouped\f[R]
+A job/group with no schedule of its own, it runs when triggered by a parent job group.\&
+.TP
+\f[I]disabled\f[R]
+A job that has been disabled via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
+It can be run manually via the \(gatrigger\(ga subcommand, and re\-enabled via the \(gaenable\(ga subcommand.\&
+.SS STATUS values
+.TP
+\f[I]ok\f[R]
+The job\(aqs last run completed successfully.\&
+.TP
+\f[I]fail\f[R]
+The job\(aqs last run failed (exited with a non\-zero status).\&
+.TP
+\f[I]timeout\f[R]
+The job was killed after exceeding its wallclock execution timeout.\&
+.TP
+\f[I]gated\f[R]
+The job was skipped due to an execution gate.\&
+This is not considered as a job failure.\&
+.TP
+\f[I]canceled\f[R]
+An interactive job run that was canceled / skipped by the user.\&
+.TP
+\f[I]crashed\f[R]
+The scheduler failed to launch a job, or the job was killed/crashed before it could save its exit status to disk.\&
+.TP
+\f[I]running\f[R]
+The job is currently running.\&
+.TP
+\f[I]pending\f[R]
+An interactive job is either waiting for an active user, or waiting for that user to confirm execution (via a pop\-up dialog).\&
+.TP
+\f[I]never\f[R]
+A newly deployed job that hasn\(aqt been run yet.\&
+.TP
+\f[I]unknown\f[R]
+We\(aqre unable to determine the job status.\&
+.SS FLAG values
+.TP
+\f[I]interactive\f[R]
+macOS/Darwin only.\&
+Delay job execution until an active user is detected, and then request the user to confirm execution of the job via a pop\-up.\&
+.TP
+\f[I]keep\-awake\f[R]
+Prevent the system from sleeping while the job is executing.\&
+.TP
+\f[I]full\-disk\-access\f[R]
+macOS/Darwin only.\&
+Execute the job with TCC Full Disk Access permissions.\&
+.SS MASKED values
+.TP
+\f[I]host\f[R]
+The job has been scoped to a different host.\&
+.TP
+\f[I]platform\f[R]
+The job has been scoped to a different platform.\&
+.TP
+\f[I]unused\f[R]
+The job is not scheduled to run (directly or via a job group).\&
+.TP
+\f[I]empty\f[R]
+The job group doesn\(aqt contain any unmasked jobs.\&
+.SS Colors
+On a color\-capable TTY (and NO_COLOR unset) some cells are colored; redirected or piped output is plain, where drift shows as a trailing \(ga\(ha\(ga plus a footnote legend instead.\&
+.TP
+\f[I]red\f[R]
+CONFIG broken / error / missing / orphan; STATUS canceled / crashed / fail / timeout; SCHEDULE disabled.\&
+.TP
+\f[I]yellow\f[R]
+CONFIG stale, plus any cell that diverged from the applied state (on a color stream its \(ga\(ha\(ga marker is dropped in favor of the color).\&
+.SH EXIT STATUS
+.PD 0
+.TP
+\f[CR]0\f[R]
+Success
+.TP
+\f[CR]1\f[R]
+Warning
+.TP
+\f[CR]2\f[R]
+Usage/argument error
+.TP
+\f[CR]3\f[R]
+Configuration error
+.TP
+\f[CR]4\f[R]
+General error
+.TP
+\f[CR]5\f[R]
+Subprocess error
+.TP
+\f[CR]6\f[R]
+Operation timed out
+.TP
+\f[CR]7\f[R]
+Crashed (unhandled exception)
