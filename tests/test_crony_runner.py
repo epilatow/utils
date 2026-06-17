@@ -353,8 +353,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="no snapshot"):
             crony_runner.do_run(
                 ref="default:11111111-2222-3333-4444-999999999999",
-                dry_run=False,
-                skip_gate=False,
             )
 
     def test_run_records_last_run_on_schema_mismatch(
@@ -379,8 +377,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="schema 999"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
-                dry_run=False,
-                skip_gate=False,
             )
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
@@ -408,8 +404,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="no snapshot"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
-                dry_run=False,
-                skip_gate=False,
             )
         assert not sd.exists()
 
@@ -426,8 +420,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="unreadable"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
-                dry_run=False,
-                skip_gate=False,
             )
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
@@ -451,8 +443,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="malformed fields"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
-                dry_run=False,
-                skip_gate=False,
             )
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
@@ -483,8 +473,6 @@ class TestRunJobBasics:
         with pytest.raises(PreconditionError, match="script not found"):
             crony_runner.do_run(
                 ref=f"default:{uuid_value}",
-                dry_run=False,
-                skip_gate=False,
             )
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
@@ -559,26 +547,6 @@ class TestRunJobBasics:
         out = capsys.readouterr().out
         assert h.full("j") in out
         assert "canceled" in out
-
-    def test_dry_run_does_not_exec(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _RunnerHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {
-                "job": {
-                    "ok": {
-                        "command": "exit 5",
-                        "schedule": "daily",
-                    }
-                }
-            },
-            default_target_jobs=["ok"],
-        )
-        rc = crony_runner._run_job(h.snap(cfg, "ok"), dry_run=True)
-        assert rc == 0
-        # No last-run.json written on dry-run
-        assert not (h.state_dir("ok") / "last-run.json").exists()
 
 
 class TestSuccessExitCodes:
@@ -749,28 +717,6 @@ class TestRunJobGate:
         assert rec["exit_code"] == 0
         log = (h.state_dir("g") / "run.log").read_text()
         assert "skipping job" in log
-
-    def test_skip_gate_runs_command_anyway(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _RunnerHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {
-                "job": {
-                    "g": {
-                        "command": "true",
-                        "gate": "false",  # would normally skip
-                        "schedule": "daily",
-                    }
-                }
-            },
-            default_target_jobs=["g"],
-        )
-        rc = crony_runner._run_job(h.snap(cfg, "g"), skip_gate=True)
-        assert rc == 0
-        rec = h.last_run("g")
-        assert rec["exit_class"] == "ok"
-        assert rec["gate"] == "none"
 
 
 class TestRunJobLockContention:
@@ -994,26 +940,6 @@ class TestRunGroup:
         assert rec["exit_class"] == "ok"
         log = (h.state_dir("g") / "run.log").read_text(encoding="utf-8")
         assert f"{h.full('a')}: skipped (disabled)" in log
-
-    def test_group_dry_run_skips_children(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _RunnerHarness(tmp_path, monkeypatch)
-        cfg = h.config(
-            {
-                "job": {"a": {"command": "exit 1"}},
-                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
-            },
-            default_target_jobs=["g"],
-        )
-        _stub_trigger_sync(monkeypatch, {})
-        rc = crony_runner._run_group(h.snap(cfg, "g"), dry_run=True)
-        assert rc == 0
-        # No last-run.json for either group or child on dry-run.
-        # The stub was never called.
-        assert not (h.state_dir("g") / "last-run.json").exists()
-        assert not (h.state_dir("a") / "last-run.json").exists()
-        assert crony._ledger == []
 
     def test_group_budget_exhausted_skips_remaining(
         self, tmp_path: Path, monkeypatch: Any
@@ -1931,7 +1857,7 @@ class TestFullDiskAccess:
             crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING
         )
         with pytest.raises(PreconditionError, match="not built"):
-            crony_runner.do_run(ref=ref, dry_run=False, skip_gate=False)
+            crony_runner.do_run(ref=ref)
         sd = h.state_dir("j", cfg=cfg)
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"

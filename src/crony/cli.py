@@ -601,16 +601,6 @@ def _build_parser() -> StrictArgumentParser:
             "ref",
             help="Entity address `<bundle>:<uuid>` (internal-only form)",
         )
-        p_run.add_argument(
-            "--dry-run",
-            action="store_true",
-            help="Acquire lock, run gate, but do not exec",
-        )
-        p_run.add_argument(
-            "--skip-gate",
-            action="store_true",
-            help="Skip gate check (force run)",
-        )
 
     # _run-guard -- internal hard-timeout backstop wrapping `_run`;
     # rendered into the platform unit by apply, never invoked by hand.

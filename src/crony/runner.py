@@ -408,20 +408,15 @@ def _interactive_wait_and_prompt(
             return InteractiveChoice.RUN
 
 
-def _run_job(
-    snap: crony.model.Job,
-    *,
-    dry_run: bool = False,
-    skip_gate: bool = False,
-) -> int:
+def _run_job(snap: crony.model.Job) -> int:
     """Run a single job from its applied snapshot.
 
     Returns an exit code suitable for the platform scheduler: the
     wrapped command's exit code on completion (0 on success or any
     nonzero code from the command), ExitCode.LOCK_BUSY on lock
-    contention, ExitCode.TIMEOUT on wallclock cap, or 0 for a
-    gated/dry-run skip. Precondition failures (missing script) are
-    signalled by raising PreconditionError -- cli() maps that to
+    contention, ExitCode.TIMEOUT on wallclock cap, or 0 for a gated
+    skip. Precondition failures (missing script) are signalled by
+    raising PreconditionError -- cli() maps that to
     ExitCode.PRECONDITION.
     """
     full_name = str(snap.entity_name)
@@ -457,8 +452,6 @@ def _run_job(
 
     try:
         with crony.runtime.acquire_lock(lock_path):
-            if dry_run:
-                return 0
             # Publish our pid for waiters (parent groups, `crony
             # trigger --wait`) to watch for exit. The pid file lives
             # only for the duration of the lock-holding run; cleaned
@@ -481,7 +474,7 @@ def _run_job(
 
                 gate = crony.model.GateResult.NONE
                 gate_cmd = _gate_argv(snap)
-                if gate_cmd is not None and not skip_gate:
+                if gate_cmd is not None:
                     log_file.write(f"gate: {shlex.join(gate_cmd)}\n".encode())
                     gate_rc: int
                     try:
@@ -734,11 +727,7 @@ def _child_is_disabled(child_ref: crony.unit.EntityRef) -> bool:
 _DEFAULT_CHILD_TIMEOUT_FALLBACK: int = 1800
 
 
-def _run_group(
-    snap: crony.model.JobGroup,
-    *,
-    dry_run: bool = False,
-) -> int:
+def _run_group(snap: crony.model.JobGroup) -> int:
     """Run a job-group from its applied snapshot.
 
     Fires each child through the platform scheduler in order,
@@ -772,8 +761,6 @@ def _run_group(
 
     try:
         with crony.runtime.acquire_lock(lock_path):
-            if dry_run:
-                return 0
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_file = open(log_path, "ab", buffering=0)
@@ -1272,7 +1259,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     raise SystemExit(rc if rc >= 0 else 128 - rc)
 
 
-def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
+def do_run(ref: str) -> None:
     """Runner shim. Platform schedulers invoke this; not user-facing.
 
     `ref` is the entity's `<bundle>:<uuid>` address, the form
@@ -1307,9 +1294,9 @@ def do_run(ref: str, dry_run: bool, skip_gate: bool) -> None:
     try:
         snap = crony.runtime.load_snapshot(parsed)
         if isinstance(snap, crony.model.Job):
-            rc = _run_job(snap, dry_run=dry_run, skip_gate=skip_gate)
+            rc = _run_job(snap)
         else:
-            rc = _run_group(snap, dry_run=dry_run)
+            rc = _run_group(snap)
     except crony.errors.PreconditionError as exc:
         _record_precondition_cancel(parsed, exc)
         raise

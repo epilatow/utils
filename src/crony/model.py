@@ -1174,9 +1174,9 @@ class ConfigStatus(StrEnum):
 
 class GateResult(StrEnum):
     """A run's gate outcome, recorded as `gate` in last-run.json. NONE
-    when no gate ran (no gate configured, or --skip-gate); PASSED on a
-    gate exit 0; FAILED on any non-zero or timeout. A StrEnum so it
-    serializes as its plain value and reads back unchanged."""
+    when no gate ran (none configured); PASSED on a gate exit 0; FAILED
+    on any non-zero or timeout. A StrEnum so it serializes as its plain
+    value and reads back unchanged."""
 
     NONE = "none"
     PASSED = "passed"

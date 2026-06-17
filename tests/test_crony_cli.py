@@ -197,9 +197,7 @@ class TestRunLegacyAlias:
         ):
             result = crony_cli.cli()
         assert result == 0
-        mock_cb.assert_called_once_with(
-            ref="default:u-test", dry_run=False, skip_gate=False
-        )
+        mock_cb.assert_called_once_with(ref="default:u-test")
 
     def test_both_spellings_route_to_the_same_handler(self) -> None:
         cb = crony_cli._COMMAND_CALLBACKS
