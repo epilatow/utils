@@ -4,9 +4,7 @@
 # ///
 # This is AI generated code
 #
-# IMPORTANT: This script has tests in tests/test_linkfiles.py, plus
-# tests/test_dotfiles.py and tests/test_binfiles.py (the dotfiles /
-# binfiles argv0 presets).
+# IMPORTANT: This script has tests in tests/test_linkfiles.py.
 
 from __future__ import annotations
 
@@ -16,7 +14,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -35,28 +33,21 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 # DESIGN
 # =============================================================================
 #
-# This tool creates symlinks from a target root to the files in a
-# "source directory". The invocation mode is picked from the program
-# name in argv[0]:
+# This tool symlinks the files in a "source directory" into an explicit
+# "target directory":
 #
-#   linkfiles - the general engine: `install <src> <dst>` links src's
-#               entries into the explicit target dst. --dotfiles
-#               dot-prefixes each top-level entry; --no-recurse links
-#               only top-level entries. Entries are discovered
-#               recursively by default.
-#   dotfiles  - target root is $HOME, top-level entries get a "." prefix,
-#               entries are discovered recursively. (linkfiles --dotfiles
-#               into $HOME, with a fixed target.)
-#   binfiles  - target root is ~/.local/bin, names are linked verbatim,
-#               only top-level entries are considered (no-recurse).
+#   linkfiles install <src> <dst>
+#
+# links each of src's entries to the matching path under dst. --dotfiles
+# dot-prefixes each top-level entry; --no-recurse links only top-level
+# entries. Entries are discovered recursively by default.
 #
 # Tracking:
-#   The legacy modes record installed source directories one absolute
-#   path per line, in ~/.dotfiles.installed (dotfiles) or
-#   ~/.binfiles.installed (binfiles). linkfiles records each install in
-#   ~/.linkfiles.installed as `<dst>\t<src>[\t<flags>]`, sorted by
-#   (dst, src); dst / src are escaped so any path round-trips, and
-#   <flags> is a comma-separated subset of {dotfiles, no-recurse}.
+#   Each install is recorded in ~/.linkfiles.installed as
+#   `<dst>\t<src>[\t<flags>]`, sorted by (dst, src); dst / src are
+#   escaped so any path round-trips, and <flags> is a comma-separated
+#   subset of {dotfiles, no-recurse}. audit / cleanup / a no-arg install
+#   replay every record.
 #
 # Conflicts:
 #   A conflict occurs when a target path exists but doesn't point to the
@@ -148,13 +139,13 @@ def _colorize(text: str, code: str) -> str:
 
 @dataclass(frozen=True)
 class Profile:
-    """How an invocation maps a source dir onto symlinks: where they
-    go (target_root), how each top-level name is transformed, which
-    tracking file records installs, and whether discovery is flat.
+    """How a source dir maps onto symlinks: where they go (target_root),
+    how each top-level name is transformed, which tracking file records
+    installs, and whether discovery is flat. Each install builds its own
+    (see `LinkRecord.profile`).
 
-    Picked from argv[0] (dotfiles / binfiles / linkfiles). target_root,
-    transform_segment, and installed_file are callables so that test
-    monkeypatches of Path.home propagate through.
+    target_root, transform_segment, and installed_file are callables so
+    that test monkeypatches of Path.home propagate through.
     """
 
     name: str
@@ -173,69 +164,29 @@ def _identity(segment: str) -> str:
     return segment
 
 
-def _linkfiles_no_static_target() -> Path:
-    """The linkfiles profile has no fixed target root -- each tracked
-    install carries its own dst, so operations build a per-record
-    profile (see `LinkRecord.profile`) and never read the active
-    profile's `target_root`. Calling it is a bug."""
+def _no_static_target() -> Path:
+    """The linkfiles profile has no fixed target root -- each install
+    names its own dst, so operations build a per-record profile (see
+    `LinkRecord.profile`) and never read this profile's `target_root`.
+    Calling it is a bug."""
     raise AssertionError("linkfiles builds a per-record target root")
 
 
-DOTFILES_PROFILE = Profile(
-    name="dotfiles",
-    description="Manage dotfiles by creating symlinks from $HOME",
-    target_root=lambda: Path.home(),
-    transform_segment=_dot_prefix,
-    installed_file=lambda: Path.home() / ".dotfiles.installed",
-    flat=False,
-)
-
-
-BINFILES_PROFILE = Profile(
-    name="binfiles",
-    description="Manage ~/.local/bin by creating symlinks (top-level only)",
-    target_root=lambda: Path.home() / ".local" / "bin",
-    transform_segment=_identity,
-    installed_file=lambda: Path.home() / ".binfiles.installed",
-    flat=True,
-)
-
-
-# The general engine. Unlike the fixed-target legacy profiles, a
-# linkfiles install names its own dst and per-install flags; this
-# profile carries only the parser identity and the tracking-file
-# location. Each tracked record reconstitutes a concrete profile via
-# `LinkRecord.profile`.
+# Carries the parser identity and the tracking-file location. Each
+# install reconstitutes a concrete profile (its own dst + flags) via
+# `LinkRecord.profile`, so this profile's `target_root` is never read.
 LINKFILES_PROFILE = Profile(
     name="linkfiles",
     description="Symlink a source dir's contents into an explicit target",
-    target_root=_linkfiles_no_static_target,
+    target_root=_no_static_target,
     transform_segment=_identity,
     installed_file=lambda: Path.home() / ".linkfiles.installed",
     flat=False,
 )
 
-
-def select_profile(argv0: str) -> Profile:
-    """Pick a Profile from the program name in argv[0]. The two
-    fixed-target presets are named explicitly; every other name (the
-    canonical `linkfiles` included) gets the general engine."""
-    name = Path(argv0).name
-    if name == "dotfiles":
-        return DOTFILES_PROFILE
-    if name == "binfiles":
-        return BINFILES_PROFILE
-    return LINKFILES_PROFILE
-
-
-# Active profile, set by cli() based on argv[0]. Default is dotfiles so
-# that direct function calls (e.g. from tests) get the dotfiles
-# behavior unless they pass an explicit profile.
-ACTIVE_PROFILE: Profile = DOTFILES_PROFILE
-
-# Active tracking file, kept in sync with ACTIVE_PROFILE by cli(). Tests
-# monkeypatch this directly to point at a tmpdir.
-INSTALLED_FILE: Path = DOTFILES_PROFILE.installed_file()
+# The tracking file (~/.linkfiles.installed). Tests monkeypatch this to
+# point at a tmpdir.
+INSTALLED_FILE: Path = LINKFILES_PROFILE.installed_file()
 
 
 # =============================================================================
@@ -312,7 +263,7 @@ class DotfileEntry:
 
     relative_path: Path  # Path relative to source directory
     dotfile_dir: Path  # Absolute path to source directory
-    profile: Profile = field(default_factory=lambda: ACTIVE_PROFILE)
+    profile: Profile
 
     @property
     def source_path(self) -> Path:
@@ -338,51 +289,6 @@ class OperationResult:
 
     entry: DotfileEntry
     status: DotfileStatus
-
-
-# =============================================================================
-# INSTALLED DIRECTORIES MANAGEMENT
-# =============================================================================
-
-
-def load_installed_directories() -> list[Path]:
-    """Load list of installed dotfile directories."""
-    if not INSTALLED_FILE.exists():
-        return []
-
-    directories: list[Path] = []
-    content = INSTALLED_FILE.read_text(encoding="utf-8")
-    for line in content.strip().split("\n"):
-        line = line.strip()
-        if line:
-            directories.append(Path(line))
-    return directories
-
-
-def save_installed_directories(directories: list[Path]) -> None:
-    """Save list of installed dotfile directories."""
-    content = "\n".join(str(d) for d in directories)
-    if content:
-        content += "\n"
-    INSTALLED_FILE.write_text(content, encoding="utf-8")
-
-
-def add_installed_directory(directory: Path) -> None:
-    """Add a directory to the installed list if not already present."""
-    directories = load_installed_directories()
-    abs_dir = directory.resolve()
-    if abs_dir not in directories:
-        directories.append(abs_dir)
-        save_installed_directories(directories)
-
-
-def remove_installed_directory(directory: Path) -> None:
-    """Remove a directory from the installed list."""
-    directories = load_installed_directories()
-    abs_dir = directory.resolve()
-    if abs_dir in directories:
-        directories.remove(abs_dir)
-        save_installed_directories(directories)
 
 
 # =============================================================================
@@ -547,13 +453,9 @@ def remove_link_record(dst: Path, src: Path) -> None:
 
 
 def load_installed_entries() -> list[tuple[Path, Profile]]:
-    """The (source dir, profile) pairs the active mode operates on.
-    Legacy modes share ACTIVE_PROFILE across every tracked source dir;
-    linkfiles reconstitutes a per-record profile carrying that
-    record's dst and flags."""
-    if ACTIVE_PROFILE is LINKFILES_PROFILE:
-        return [(rec.src, rec.profile()) for rec in load_link_records()]
-    return [(d, ACTIVE_PROFILE) for d in load_installed_directories()]
+    """The (source dir, profile) pair for each tracked install, each
+    profile carrying that record's dst and flags."""
+    return [(rec.src, rec.profile()) for rec in load_link_records()]
 
 
 # =============================================================================
@@ -766,7 +668,7 @@ def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
 
 
 def discover_dotfiles(
-    dotfile_dir: Path, *, profile: Profile | None = None
+    dotfile_dir: Path, *, profile: Profile
 ) -> list[DotfileEntry]:
     """
     Discover entries in a source directory.
@@ -786,9 +688,6 @@ def discover_dotfiles(
     Raises:
         MissingDotfilesDirectory: If the directory doesn't exist or isn't valid.
     """
-    if profile is None:
-        profile = ACTIVE_PROFILE
-
     if not dotfile_dir.exists():
         raise MissingDotfilesDirectory(
             f"Source directory does not exist: {dotfile_dir}"
@@ -1116,7 +1015,7 @@ def process_directory(
     *,
     dry_run: bool = False,
     force: bool = False,
-    profile: Profile | None = None,
+    profile: Profile,
 ) -> list[OperationResult]:
     """
     Process all entries in a source directory.
@@ -1126,7 +1025,7 @@ def process_directory(
         operation: One of "install", "remove", "audit"
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks (install only)
-        profile: Profile to use for discovery; defaults to ACTIVE_PROFILE
+        profile: Profile to use for discovery
 
     Returns:
         List of OperationResult objects
@@ -1272,10 +1171,9 @@ def _find_stale_for_dir(
 # =============================================================================
 
 
-# The do_* handlers split by mode so each has a no-default signature
-# that matches its mode's parser exactly (the dispatch-table
-# invariant). They resolve an invocation to a list of (source dir,
-# profile) targets and hand off to these shared runners.
+# The do_* handlers resolve an invocation to a list of (source dir,
+# profile) targets -- one per tracked record -- and hand off to these
+# shared runners.
 
 
 def _run_install(
@@ -1379,32 +1277,6 @@ def _run_remove(
 
 def do_install(
     directory: Path | None,
-    *,
-    dry_run: bool,
-    force: bool,
-    verbose: bool,
-) -> None:
-    """Install one source directory under the active fixed-target mode,
-    or re-sync every tracked directory when none is given."""
-    if directory is not None:
-        resolved = directory.resolve()
-        if not resolved.is_dir():
-            raise MissingDotfilesDirectory(
-                f"Source directory does not exist: {resolved}"
-            )
-        if not dry_run:
-            add_installed_directory(directory)
-        targets = [(resolved, ACTIVE_PROFILE)]
-    else:
-        targets = load_installed_entries()
-        if not targets:
-            logger.info("No %s directories installed.", ACTIVE_PROFILE.name)
-            return
-    _run_install(targets, dry_run=dry_run, force=force, verbose=verbose)
-
-
-def do_install_linkfiles(
-    directory: Path | None,
     dst: Path | None,
     *,
     dotfiles: bool,
@@ -1418,9 +1290,7 @@ def do_install_linkfiles(
     install when neither source nor target is given."""
     if directory is not None or dst is not None:
         if directory is None or dst is None:
-            raise UsageError(
-                "linkfiles install needs both a source and a target dir"
-            )
+            raise UsageError("install needs both a source and a target dir")
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         if not src.is_dir():
@@ -1436,60 +1306,29 @@ def do_install_linkfiles(
     else:
         targets = load_installed_entries()
         if not targets:
-            logger.info("No linkfiles entries installed.")
+            logger.info("No installs tracked.")
             return
     _run_install(targets, dry_run=dry_run, force=force, verbose=verbose)
 
 
-def _untrack_installed_directory(src_dir: Path, _profile: Profile) -> None:
-    """Drop a legacy mode's tracked source directory."""
-    remove_installed_directory(src_dir)
-
-
-def _untrack_link_record(src_dir: Path, profile: Profile) -> None:
-    """Drop the linkfiles record for (target, source)."""
+def _untrack_record(src_dir: Path, profile: Profile) -> None:
+    """Drop the tracked record for (target, source)."""
     remove_link_record(profile.target_root(), src_dir)
 
 
 def do_remove(
-    directory: Path | None,
-    *,
-    dry_run: bool,
-    verbose: bool,
-) -> None:
-    """Remove one tracked source directory's links (and untrack it)
-    under the active fixed-target mode, or remove every tracked
-    directory when none is given."""
-    if directory is not None:
-        targets = [(directory.resolve(), ACTIVE_PROFILE)]
-    else:
-        targets = load_installed_entries()
-        if not targets:
-            logger.info("No %s directories installed.", ACTIVE_PROFILE.name)
-            return
-    _run_remove(
-        targets,
-        dry_run=dry_run,
-        verbose=verbose,
-        on_removed=_untrack_installed_directory,
-    )
-
-
-def do_remove_linkfiles(
     directory: Path | None,
     dst: Path | None,
     *,
     dry_run: bool,
     verbose: bool,
 ) -> None:
-    """Remove one tracked linkfiles install's links (identified by its
-    source and target dirs) and untrack it, or remove every tracked
-    install when neither is given."""
+    """Remove one tracked install's links (identified by its source and
+    target dirs) and untrack it, or remove every tracked install when
+    neither is given."""
     if directory is not None or dst is not None:
         if directory is None or dst is None:
-            raise UsageError(
-                "linkfiles remove needs both a source and a target dir"
-            )
+            raise UsageError("remove needs both a source and a target dir")
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         record = next(
@@ -1502,43 +1341,29 @@ def do_remove_linkfiles(
         )
         if record is None:
             raise MissingDotfilesDirectory(
-                f"No tracked linkfiles install: {src} -> {target}"
+                f"No tracked install: {src} -> {target}"
             )
         targets = [(src, record.profile())]
     else:
         targets = load_installed_entries()
         if not targets:
-            logger.info("No linkfiles entries installed.")
+            logger.info("No installs tracked.")
             return
     _run_remove(
         targets,
         dry_run=dry_run,
         verbose=verbose,
-        on_removed=_untrack_link_record,
+        on_removed=_untrack_record,
     )
 
 
-def do_audit(directory: Path | None, *, verbose: bool) -> None:
-    """Audit one tracked source directory under the active fixed-target
-    mode, or every tracked directory when none is given.
+def do_audit(*, verbose: bool) -> None:
+    """Audit every tracked install (each under its own target root).
 
     Reports the status of each discovered entry plus any STALE managed
-    symlinks -- symlinks under the target root that point into the
-    audited source but whose relative path is no longer in the
-    discovered set (file removed from the source, or matched by an
-    ignore file)."""
-    if directory is not None:
-        targets = [(directory.resolve(), ACTIVE_PROFILE)]
-    else:
-        targets = load_installed_entries()
-        if not targets:
-            return
-    _run_audit(targets, verbose=verbose)
-
-
-def do_audit_linkfiles(*, verbose: bool) -> None:
-    """Audit every tracked linkfiles install (each under its own target
-    root). See `do_audit` for what counts as a problem."""
+    symlinks -- symlinks under a target root that point into the audited
+    source but whose relative path is no longer in the discovered set
+    (file removed from the source, or matched by an ignore file)."""
     targets = load_installed_entries()
     if not targets:
         return
@@ -1558,23 +1383,15 @@ def do_cleanup(*, dry_run: bool) -> None:
     installed source directory and resolve to an existing file are
     foreign and left alone.
 
-    The scan set is every managed target root plus the parent
-    directory of every entry currently discovered across all tracked
-    sources. For binfiles (flat) this collapses to {~/.local/bin}; for
-    dotfiles it typically includes $HOME plus any subdirs where
-    dotfiles delivers nested files; for linkfiles it spans each
-    record's own target root.
+    The scan set spans every tracked record's target root plus the
+    parent directory of every entry currently discovered across all
+    tracked sources.
 
     Args:
         dry_run: If True, log what would be removed without removing it.
     """
-    # Legacy modes always scan their one fixed root (so a dangling link
-    # is reclaimed even with nothing tracked); linkfiles has no fixed
-    # root, so its scan set is built from the tracked records' targets.
     target_roots: set[Path] = set()
-    if ACTIVE_PROFILE is not LINKFILES_PROFILE:
-        target_roots.add(ACTIVE_PROFILE.target_root())
-    scan_dirs: set[Path] = set(target_roots)
+    scan_dirs: set[Path] = set()
     sources: dict[Path, set[Path]] = {}
 
     for src_dir, profile in load_installed_entries():
@@ -1624,28 +1441,24 @@ def do_cleanup(*, dry_run: bool) -> None:
 
 def build_parser() -> StrictArgumentParser:
     """
-    Build and return the argument parser for the active profile.
+    Build and return the argument parser.
 
     Returns:
         Configured ArgumentParser instance
     """
     parser = StrictArgumentParser(
-        prog=ACTIVE_PROFILE.name,
-        description=ACTIVE_PROFILE.description,
+        prog=LINKFILES_PROFILE.name,
+        description=LINKFILES_PROFILE.description,
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # linkfiles names its own target dir per install (and per-install
-    # flags); the legacy modes carry a fixed target root, so they take
-    # only a source.
-    is_linkfiles = ACTIVE_PROFILE is LINKFILES_PROFILE
     subparsers = parser.add_command_subparsers(help="Subcommands")
 
     # Install subcommand
     install_parser = subparsers.add_parser(
         "install",
         help=(
-            "Sync entries from a source directory: link new ones, "
+            "Sync a source directory into a target: link new entries, "
             "prune stale managed links"
         ),
     )
@@ -1666,34 +1479,32 @@ def build_parser() -> StrictArgumentParser:
         action="store_true",
         help="Print every entry; default suppresses ok lines",
     )
-    if is_linkfiles:
-        install_parser.add_argument(
-            "--dotfiles",
-            action="store_true",
-            help="Dot-prefix each top-level entry under the target",
-        )
-        install_parser.add_argument(
-            "--no-recurse",
-            action="store_true",
-            help="Link only top-level entries; do not descend",
-        )
+    install_parser.add_argument(
+        "--dotfiles",
+        action="store_true",
+        help="Dot-prefix each top-level entry under the target",
+    )
+    install_parser.add_argument(
+        "--no-recurse",
+        action="store_true",
+        help="Link only top-level entries; do not descend",
+    )
     install_parser.add_argument(
         "directory",
         type=Path,
         nargs="?",
         help="Source directory to install entries from",
     )
-    if is_linkfiles:
-        install_parser.add_argument(
-            "dst",
-            type=Path,
-            nargs="?",
-            help="Target directory to link the source's entries into",
-        )
+    install_parser.add_argument(
+        "dst",
+        type=Path,
+        nargs="?",
+        help="Target directory to link the source's entries into",
+    )
 
     # Remove subcommand
     remove_parser = subparsers.add_parser(
-        "remove", help="Remove installed entries"
+        "remove", help="Remove an installed source / target pair"
     )
     remove_parser.add_argument(
         "--dry-run",
@@ -1712,13 +1523,12 @@ def build_parser() -> StrictArgumentParser:
         nargs="?",
         help="Source directory whose entries should be removed",
     )
-    if is_linkfiles:
-        remove_parser.add_argument(
-            "dst",
-            type=Path,
-            nargs="?",
-            help="Target directory the install was linked into",
-        )
+    remove_parser.add_argument(
+        "dst",
+        type=Path,
+        nargs="?",
+        help="Target directory the install was linked into",
+    )
 
     # Audit subcommand
     audit_parser = subparsers.add_parser(
@@ -1734,13 +1544,6 @@ def build_parser() -> StrictArgumentParser:
         action="store_true",
         help="Print every entry; default suppresses ok lines",
     )
-    if not is_linkfiles:
-        audit_parser.add_argument(
-            "directory",
-            type=Path,
-            nargs="?",
-            help="Source directory to audit",
-        )
 
     # Cleanup subcommand
     cleanup_parser = subparsers.add_parser(
@@ -1760,8 +1563,6 @@ def build_parser() -> StrictArgumentParser:
 # COMMAND DISPATCH
 # =============================================================================
 
-# The fixed-target legacy modes (dotfiles / binfiles) share these
-# handlers; their signatures match the legacy parser.
 COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "install": do_install,
     "remove": do_remove,
@@ -1769,41 +1570,16 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "cleanup": do_cleanup,
 }
 
-# linkfiles uses handlers whose signatures match its parser (an explicit
-# target on install / remove, no source on audit).
-LINKFILES_COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
-    "install": do_install_linkfiles,
-    "remove": do_remove_linkfiles,
-    "audit": do_audit_linkfiles,
-    "cleanup": do_cleanup,
-}
-
-
-def command_callbacks() -> dict[str, Callable[..., None]]:
-    """The dispatch table matching the active mode's parser."""
-    if ACTIVE_PROFILE is LINKFILES_PROFILE:
-        return LINKFILES_COMMAND_CALLBACKS
-    return COMMAND_CALLBACKS
-
-
-def _activate_profile(profile: Profile) -> None:
-    """Set the module-level ACTIVE_PROFILE and INSTALLED_FILE."""
-    global ACTIVE_PROFILE, INSTALLED_FILE
-    ACTIVE_PROFILE = profile
-    INSTALLED_FILE = profile.installed_file()
-
 
 @cli_entrypoint
 def cli() -> int:
     """CLI entry point with exception handling."""
-    _activate_profile(select_profile(sys.argv[0]))
-
     parser = build_parser()
     args_dict = vars(parser.parse_command())
     command = args_dict.pop("command")
 
     try:
-        command_callbacks()[command](**args_dict)
+        COMMAND_CALLBACKS[command](**args_dict)
     except KeyError:
         raise UsageError(f"Unknown command '{command}'") from None
     except DotfilesError as e:

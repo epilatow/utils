@@ -143,7 +143,8 @@ def isolate_home(
 
     Tests that explicitly set their own home via patch.object /
     monkeypatch.setattr override this. Lives in conftest so the
-    dotfiles and binfiles autouse fixtures share one definition.
+    per-tool autouse fixtures (linkfiles, crony, ...) share one
+    definition.
     """
     sentinel = tmp_path / "_home_sentinel_unwritten"
     monkeypatch.setattr(Path, "home", lambda: sentinel)
@@ -152,9 +153,9 @@ def isolate_home(
 
 class SentinelHomeBase:
     """Common meta-tests pinning the `Path.home()` redirection that
-    every per-tool autouse home-isolation fixture provides. All
-    tool-specific bases (dotfiles, binfiles, crony) inherit these
-    two checks so the sentinel-naming contract stays uniform.
+    every per-tool autouse home-isolation fixture provides. Tool-specific
+    bases (e.g. crony) inherit these two checks so the sentinel-naming
+    contract stays uniform.
     """
 
     def test_home_diverted_to_sentinel(self, tmp_path: Path) -> None:
@@ -164,50 +165,6 @@ class SentinelHomeBase:
     def test_sentinel_does_not_exist(self) -> None:
         """The sentinel intentionally does not exist on disk."""
         assert not Path.home().exists()
-
-
-class IsolateHomeFixtureBase(SentinelHomeBase):
-    """Meta-tests pinning the autouse _isolate_home fixture in
-    test_dotfiles.py and test_binfiles.py.
-
-    Subclasses declare:
-      MODULE: the loaded dotfiles / binfiles module.
-      SOURCE_NAME: name of the source file under dotfile_dir.
-      PROFILE_ATTR: attribute on MODULE for the profile to use.
-
-    Subclasses also override _make_source(path) to create the file
-    in the form their profile accepts (text vs executable).
-    """
-
-    MODULE: ClassVar[Any]
-    SOURCE_NAME: ClassVar[str]
-    PROFILE_ATTR: ClassVar[str]
-
-    @staticmethod
-    def _make_source(path: Path) -> None:
-        raise NotImplementedError
-
-    def test_install_lands_under_sentinel_not_real_home(
-        self, tmp_path: Path
-    ) -> None:
-        """install_dotfile without an explicit home-patch writes
-        inside the sentinel tree under tmp_path, never to the real
-        $HOME / ~/.local/bin."""
-        mod = type(self).MODULE
-        src = tmp_path / "src"
-        src.mkdir()
-        type(self)._make_source(src / type(self).SOURCE_NAME)
-        profile = getattr(mod, type(self).PROFILE_ATTR)
-        entry = mod.DotfileEntry(
-            relative_path=Path(type(self).SOURCE_NAME),
-            dotfile_dir=src,
-            profile=profile,
-        )
-        assert str(entry.target_path).startswith(str(tmp_path))
-        result = mod.install_dotfile(entry)
-        assert result.status == mod.DotfileStatus.INSTALLED
-        assert entry.target_path.is_symlink()
-        assert str(entry.target_path).startswith(str(tmp_path))
 
 
 class CmdCallbacksBase:
@@ -223,11 +180,6 @@ class CmdCallbacksBase:
     EXIT_CODE_USAGE: ClassVar[int]
     POPPED_ARGS: ClassVar[set[str]] = set()
     TEST_SUBCOMMAND: ClassVar[str] = ""
-    # argv[0] the cli() tests run under. cli() re-selects the profile
-    # (and thus its callback table) from this name, so a tool whose
-    # dispatch table is profile-specific overrides it to the name that
-    # selects the table under test.
-    CLI_ARGV0: ClassVar[str] = "prog"
     EXCEPTION_EXIT_CODE_MAP: ClassVar[list[tuple[Exception, int]]] = []
 
     @staticmethod
@@ -342,7 +294,7 @@ class CmdCallbacksBase:
     def test_no_args_shows_help(self, capsys: Any) -> None:
         """No arguments prints help and exits USAGE."""
         with (
-            patch("sys.argv", [type(self).CLI_ARGV0]),
+            patch("sys.argv", ["prog"]),
             pytest.raises(SystemExit) as exc_info,
         ):
             type(self).CLI_FUNC()
@@ -353,7 +305,7 @@ class CmdCallbacksBase:
     def test_help_exits_success(self) -> None:
         """--help exits with code 0."""
         with (
-            patch("sys.argv", [type(self).CLI_ARGV0, "--help"]),
+            patch("sys.argv", ["prog", "--help"]),
             pytest.raises(SystemExit) as exc_info,
         ):
             type(self).CLI_FUNC()
@@ -376,7 +328,7 @@ class CmdCallbacksBase:
                 ),
                 patch(
                     "sys.argv",
-                    [type(self).CLI_ARGV0, subcommand],
+                    ["prog", subcommand],
                 ),
             ):
                 result = type(self).CLI_FUNC()
@@ -396,7 +348,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                [type(self).CLI_ARGV0, subcommand],
+                ["prog", subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()
@@ -419,7 +371,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                [type(self).CLI_ARGV0, subcommand],
+                ["prog", subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()
@@ -442,7 +394,7 @@ class CmdCallbacksBase:
             ),
             patch(
                 "sys.argv",
-                [type(self).CLI_ARGV0, subcommand],
+                ["prog", subcommand],
             ),
         ):
             result = type(self).CLI_FUNC()

@@ -34,10 +34,10 @@ This repo is a personal-utilities collection. Top-level structure:
   gate's `mypy --strict` resolve these imports statically.
 - `src/<module>.py` alias symlinks -- each extension-less `bin/` entry has a
   matching `src/<module>.py` symlink pointing at it (e.g.
-  `src/dotfiles.py -> ../bin/dotfiles`,
+  `src/linkfiles.py -> ../bin/linkfiles`,
   `src/firefox_cookies.py -> ../bin/firefox-cookies`). The alias gives the
   script an importable, `mypy`-resolvable module name, so the test suite
-  imports it as a typed module (`import dotfiles`) instead of loading it
+  imports it as a typed module (`import linkfiles`) instead of loading it
   through `SourceFileLoader`, and so ruff/mypy auto-discover it as a `.py`
   file instead of needing a manual `python-targets` entry. `crony` is the
   exception -- its logic already lives in the `src/crony` package, so it has
