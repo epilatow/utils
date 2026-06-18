@@ -211,25 +211,25 @@ class ExitCode(ExitCodeBase):
 # =============================================================================
 
 
-class DotfilesError(RuntimeError):
-    """Base exception for dotfiles errors."""
+class LinkfilesError(RuntimeError):
+    """Base exception for linkfiles errors."""
 
     exit_code: ExitCode = ExitCode.ERROR
 
 
-class ConflictsFound(DotfilesError):
-    """Raised when conflicts or missing dotfiles are found."""
+class ConflictsFound(LinkfilesError):
+    """Raised when conflicts or missing entries are found."""
 
     exit_code = ExitCode.CONFLICTS
 
 
-class UsageError(DotfilesError):
+class UsageError(LinkfilesError):
     """Raised for usage/argument errors."""
 
     exit_code = ExitCode.USAGE
 
 
-class MissingDotfilesDirectory(DotfilesError):
+class MissingSourceDir(LinkfilesError):
     """Raised when a source directory does not exist or is invalid."""
 
     exit_code = ExitCode.MISSING_DIR
@@ -240,8 +240,8 @@ class MissingDotfilesDirectory(DotfilesError):
 # =============================================================================
 
 
-class DotfileStatus(Enum):
-    """Status of a dotfile during operations."""
+class LinkStatus(Enum):
+    """Status of an entry during operations."""
 
     FILE_CONFLICT = "file-conflict"
     LINK_CONFLICT = "link-conflict"
@@ -258,17 +258,17 @@ class DotfileStatus(Enum):
 
 
 @dataclass
-class DotfileEntry:
+class LinkEntry:
     """Represents a single source-to-target link."""
 
     relative_path: Path  # Path relative to source directory
-    dotfile_dir: Path  # Absolute path to source directory
+    source_dir: Path  # Absolute path to source directory
     profile: Profile
 
     @property
     def source_path(self) -> Path:
         """Absolute path to the source file."""
-        return self.dotfile_dir / self.relative_path
+        return self.source_dir / self.relative_path
 
     @property
     def target_path(self) -> Path:
@@ -285,10 +285,10 @@ class DotfileEntry:
 
 @dataclass
 class OperationResult:
-    """Result of a dotfile operation."""
+    """Result of an entry operation."""
 
-    entry: DotfileEntry
-    status: DotfileStatus
+    entry: LinkEntry
+    status: LinkStatus
 
 
 # =============================================================================
@@ -459,7 +459,7 @@ def load_installed_entries() -> list[tuple[Path, Profile]]:
 
 
 # =============================================================================
-# DOTFILE DISCOVERY
+# ENTRY DISCOVERY
 # =============================================================================
 
 
@@ -500,23 +500,23 @@ def _is_repo_root(path: Path) -> bool:
     return (path / ".git").exists() or (path / ".hg").exists()
 
 
-def _ignore_search_dirs(dotfile_dir: Path) -> list[Path]:
-    """Return dotfile_dir plus ancestors up to the enclosing repo root.
+def _ignore_search_dirs(source_dir: Path) -> list[Path]:
+    """Return source_dir plus ancestors up to the enclosing repo root.
 
-    The walk consumes dotfile_dir and continues upward until it hits
+    The walk consumes source_dir and continues upward until it hits
     (and includes) the first ancestor that contains a '.git' or '.hg'
     entry -- the enclosing git/hg repo root. This covers the
     motivating case ('binfiles install ~/utils/bin' needs to see
     '~/utils/.gitignore', which lives one level above bin) without
     pulling in the user's $HOME-level ignore files, where flat-merged
     patterns -- especially leading-/ anchored ones -- would be
-    re-interpreted relative to dotfile_dir and silently mismatch.
+    re-interpreted relative to source_dir and silently mismatch.
 
-    If no enclosing repo root exists between dotfile_dir and $HOME,
-    the walk falls back to stopping at $HOME inclusive. A dotfile_dir
-    outside $HOME consults only dotfile_dir itself.
+    If no enclosing repo root exists between source_dir and $HOME,
+    the walk falls back to stopping at $HOME inclusive. A source_dir
+    outside $HOME consults only source_dir itself.
     """
-    abs_dir = dotfile_dir.resolve()
+    abs_dir = source_dir.resolve()
     dirs = [abs_dir]
     try:
         home = Path.home().resolve()
@@ -537,11 +537,11 @@ def _ignore_search_dirs(dotfile_dir: Path) -> list[Path]:
     return dirs
 
 
-def load_ignore_patterns(dotfile_dir: Path) -> set[str]:
+def load_ignore_patterns(source_dir: Path) -> set[str]:
     """
     Load ignore patterns from each file in IGNORE_FILES.
 
-    Patterns are collected from dotfile_dir and each ancestor directory
+    Patterns are collected from source_dir and each ancestor directory
     up to and including the enclosing repo root (see
     _ignore_search_dirs for the exact walk bound), plus a hardcoded
     set of editor / swap / autosave file patterns that always apply.
@@ -557,15 +557,15 @@ def load_ignore_patterns(dotfile_dir: Path) -> set[str]:
     Empty lines are skipped.
     Negation patterns (!) are not supported.
 
-    A leading '/' anchors the pattern to dotfile_dir's root, matching
+    A leading '/' anchors the pattern to source_dir's root, matching
     gitignore semantics: '/CLAUDE.md' excludes only the root-level
     CLAUDE.md, leaving nested files like 'claude/CLAUDE.md' eligible
     for linking. The leading slash is preserved in the returned set
     and interpreted by matches_ignore_pattern.
 
     Note: anchored patterns collected from an ancestor ignore file
-    (e.g. '/foo' in the repo root's '.gitignore' while dotfile_dir
-    is a subdir of the repo) anchor to dotfile_dir, not to the
+    (e.g. '/foo' in the repo root's '.gitignore' while source_dir
+    is a subdir of the repo) anchor to source_dir, not to the
     ancestor directory the pattern was written in. This diverges
     from gitignore proper, which anchors each pattern at its own
     .gitignore's directory. The flat-merge collection here is the
@@ -577,7 +577,7 @@ def load_ignore_patterns(dotfile_dir: Path) -> set[str]:
     """
     patterns: set[str] = set(HARDCODED_IGNORE_PATTERNS)
 
-    for directory in _ignore_search_dirs(dotfile_dir):
+    for directory in _ignore_search_dirs(source_dir):
         for ignore_file in IGNORE_FILES:
             ignore_path = directory / ignore_file
             if not (ignore_path.exists() and ignore_path.is_file()):
@@ -620,7 +620,7 @@ def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
     the full relative path, and each path component -- so a bare
     'CLAUDE.md' excludes that file at any depth.
 
-    Patterns with a leading '/' are anchored to the dotfile_dir root,
+    Patterns with a leading '/' are anchored to the source_dir root,
     matching gitignore semantics. An anchored bare name like
     '/CLAUDE.md' matches only the first path component (root-level
     file or root-level directory by that name), leaving nested
@@ -667,9 +667,7 @@ def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
     return False
 
 
-def discover_dotfiles(
-    dotfile_dir: Path, *, profile: Profile
-) -> list[DotfileEntry]:
+def discover_entries(source_dir: Path, *, profile: Profile) -> list[LinkEntry]:
     """
     Discover entries in a source directory.
 
@@ -678,7 +676,7 @@ def discover_dotfiles(
       depth (so .git / .hg / .github, the ignore files, and editor
       state never link).
     - Skip files matching patterns in .gitignore / .hgignore /
-      .dotfilesignore / .linkfiles.ignore from dotfile_dir and each
+      .dotfilesignore / .linkfiles.ignore from source_dir and each
       ancestor up to the enclosing repo root, plus a hardcoded set of
       editor / swap / autosave patterns.
 
@@ -686,32 +684,30 @@ def discover_dotfiles(
     subdirectories are not descended into.
 
     Raises:
-        MissingDotfilesDirectory: If the directory doesn't exist or isn't valid.
+        MissingSourceDir: If the directory doesn't exist or isn't valid.
     """
-    if not dotfile_dir.exists():
-        raise MissingDotfilesDirectory(
-            f"Source directory does not exist: {dotfile_dir}"
-        )
-    if not dotfile_dir.is_dir():
-        raise MissingDotfilesDirectory(f"Not a directory: {dotfile_dir}")
+    if not source_dir.exists():
+        raise MissingSourceDir(f"Source directory does not exist: {source_dir}")
+    if not source_dir.is_dir():
+        raise MissingSourceDir(f"Not a directory: {source_dir}")
 
-    abs_dotfile_dir = dotfile_dir.resolve()
-    entries: list[DotfileEntry] = []
+    abs_source_dir = source_dir.resolve()
+    entries: list[LinkEntry] = []
 
-    ignore_patterns = load_ignore_patterns(abs_dotfile_dir)
+    ignore_patterns = load_ignore_patterns(abs_source_dir)
 
     candidates: Iterator[Path]
     if profile.flat:
-        candidates = abs_dotfile_dir.iterdir()
+        candidates = abs_source_dir.iterdir()
     else:
-        candidates = abs_dotfile_dir.rglob("*")
+        candidates = abs_source_dir.rglob("*")
 
     for item in candidates:
         # Include files and symlinks, but not directories
         # (symlinks are included even if they point to directories).
         if not (item.is_file() or item.is_symlink()):
             continue
-        relative = item.relative_to(abs_dotfile_dir)
+        relative = item.relative_to(abs_source_dir)
         # Skip any dotfile -- a leading-'.' component at any depth. This
         # covers VCS / metadata dirs (.git, .hg, .github), the ignore
         # files themselves, and editor state, without linking them into
@@ -721,9 +717,9 @@ def discover_dotfiles(
         if matches_ignore_pattern(relative, ignore_patterns):
             continue
         entries.append(
-            DotfileEntry(
+            LinkEntry(
                 relative_path=relative,
-                dotfile_dir=abs_dotfile_dir,
+                source_dir=abs_source_dir,
                 profile=profile,
             )
         )
@@ -733,13 +729,13 @@ def discover_dotfiles(
 
 
 # =============================================================================
-# DOTFILE OPERATIONS
+# ENTRY OPERATIONS
 # =============================================================================
 
 
-def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
+def check_entry_status(entry: LinkEntry) -> LinkStatus:
     """
-    Check the current status of a dotfile entry.
+    Check the current status of an entry.
 
     Returns:
         OK - if correctly linked
@@ -750,27 +746,27 @@ def check_dotfile_status(entry: DotfileEntry) -> DotfileStatus:
     target = entry.target_path
 
     if not target.exists() and not target.is_symlink():
-        return DotfileStatus.MISSING
+        return LinkStatus.MISSING
 
     if target.is_symlink():
         # Check if it points to the correct location
         try:
             current = Path(os.readlink(target))
         except OSError:
-            return DotfileStatus.LINK_CONFLICT
+            return LinkStatus.LINK_CONFLICT
 
         # Resolve both to compare
         try:
             current_resolved = (target.parent / current).resolve()
             expected_resolved = entry.source_path.resolve()
             if current_resolved == expected_resolved:
-                return DotfileStatus.OK
+                return LinkStatus.OK
         except OSError:
             pass
-        return DotfileStatus.LINK_CONFLICT
+        return LinkStatus.LINK_CONFLICT
 
     # It's a regular file or directory
-    return DotfileStatus.FILE_CONFLICT
+    return LinkStatus.FILE_CONFLICT
 
 
 def _resolve_link_target(symlink: Path) -> Path | None:
@@ -861,7 +857,7 @@ def _stale_managed_links(
 
 
 def _scan_dirs_for_entries(
-    entries: list[DotfileEntry], profile: Profile
+    entries: list[LinkEntry], profile: Profile
 ) -> set[Path]:
     """Return the directory set to scan for symlinks managed by the
     given entries: target_root plus the parent directory of each
@@ -872,36 +868,34 @@ def _scan_dirs_for_entries(
     return scan_dirs
 
 
-def install_dotfile(
-    entry: DotfileEntry,
+def install_entry(
+    entry: LinkEntry,
     *,
     dry_run: bool = False,
     force: bool = False,
 ) -> OperationResult:
     """
-    Install a single dotfile.
+    Install a single entry.
 
     Args:
-        entry: The dotfile entry to install
+        entry: The entry to install
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks (not files)
 
     Returns:
         OperationResult with appropriate status
     """
-    status = check_dotfile_status(entry)
+    status = check_entry_status(entry)
 
-    if status == DotfileStatus.OK:
-        return OperationResult(entry=entry, status=DotfileStatus.OK)
+    if status == LinkStatus.OK:
+        return OperationResult(entry=entry, status=LinkStatus.OK)
 
-    if status == DotfileStatus.FILE_CONFLICT:
-        return OperationResult(entry=entry, status=DotfileStatus.FILE_CONFLICT)
+    if status == LinkStatus.FILE_CONFLICT:
+        return OperationResult(entry=entry, status=LinkStatus.FILE_CONFLICT)
 
-    if status == DotfileStatus.LINK_CONFLICT:
+    if status == LinkStatus.LINK_CONFLICT:
         if not force:
-            return OperationResult(
-                entry=entry, status=DotfileStatus.LINK_CONFLICT
-            )
+            return OperationResult(entry=entry, status=LinkStatus.LINK_CONFLICT)
         # Force mode: remove the conflicting symlink
         if not dry_run:
             entry.target_path.unlink()
@@ -915,39 +909,39 @@ def install_dotfile(
         relative_link = entry.compute_relative_symlink()
         entry.target_path.symlink_to(relative_link)
 
-    return OperationResult(entry=entry, status=DotfileStatus.INSTALLED)
+    return OperationResult(entry=entry, status=LinkStatus.INSTALLED)
 
 
-def remove_dotfile(
-    entry: DotfileEntry,
+def remove_entry(
+    entry: LinkEntry,
     *,
     dry_run: bool = False,
 ) -> OperationResult:
     """
-    Remove a single dotfile.
+    Remove a single entry.
 
     Only removes symlinks that point to the correct source.
-    Leaves invalid/conflicting dotfiles alone.
+    Leaves invalid/conflicting entries alone.
 
     Args:
-        entry: The dotfile entry to remove
+        entry: The entry to remove
         dry_run: If True, don't make any changes
 
     Returns:
         OperationResult with appropriate status
     """
-    status = check_dotfile_status(entry)
+    status = check_entry_status(entry)
 
-    if status == DotfileStatus.MISSING:
+    if status == LinkStatus.MISSING:
         # Already gone, nothing to do
-        return OperationResult(entry=entry, status=DotfileStatus.MISSING)
+        return OperationResult(entry=entry, status=LinkStatus.MISSING)
 
-    if status == DotfileStatus.OK:
+    if status == LinkStatus.OK:
         # Correctly linked, safe to remove
         if not dry_run:
             entry.target_path.unlink()
             _cleanup_empty_parents(entry.target_path.parent, entry.profile)
-        return OperationResult(entry=entry, status=DotfileStatus.REMOVED)
+        return OperationResult(entry=entry, status=LinkStatus.REMOVED)
 
     # FILE_CONFLICT or LINK_CONFLICT - leave alone
     return OperationResult(entry=entry, status=status)
@@ -972,13 +966,13 @@ def _cleanup_empty_parents(directory: Path, profile: Profile) -> None:
     _prune_empty_dirs(directory, {profile.target_root()})
 
 
-def audit_dotfile(entry: DotfileEntry) -> OperationResult:
+def audit_entry(entry: LinkEntry) -> OperationResult:
     """
-    Audit a single dotfile.
+    Audit a single entry.
 
     Returns the current status without making any changes.
     """
-    status = check_dotfile_status(entry)
+    status = check_entry_status(entry)
     return OperationResult(entry=entry, status=status)
 
 
@@ -988,7 +982,7 @@ def audit_dotfile(entry: DotfileEntry) -> OperationResult:
 
 
 def _process_entries(
-    entries: list[DotfileEntry],
+    entries: list[LinkEntry],
     operation: str,
     *,
     dry_run: bool = False,
@@ -998,11 +992,11 @@ def _process_entries(
     results: list[OperationResult] = []
     for entry in entries:
         if operation == "install":
-            result = install_dotfile(entry, dry_run=dry_run, force=force)
+            result = install_entry(entry, dry_run=dry_run, force=force)
         elif operation == "remove":
-            result = remove_dotfile(entry, dry_run=dry_run)
+            result = remove_entry(entry, dry_run=dry_run)
         elif operation == "audit":
-            result = audit_dotfile(entry)
+            result = audit_entry(entry)
         else:
             raise ValueError(f"Unknown operation: {operation}")
         results.append(result)
@@ -1010,7 +1004,7 @@ def _process_entries(
 
 
 def process_directory(
-    dotfile_dir: Path,
+    source_dir: Path,
     operation: str,
     *,
     dry_run: bool = False,
@@ -1021,7 +1015,7 @@ def process_directory(
     Process all entries in a source directory.
 
     Args:
-        dotfile_dir: Path to source directory
+        source_dir: Path to source directory
         operation: One of "install", "remove", "audit"
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks (install only)
@@ -1030,46 +1024,46 @@ def process_directory(
     Returns:
         List of OperationResult objects
     """
-    entries = discover_dotfiles(dotfile_dir, profile=profile)
+    entries = discover_entries(source_dir, profile=profile)
     return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
-# Per-operation classification of which DotfileStatus values count
+# Per-operation classification of which LinkStatus values count
 # as *problems* (anything else is either OK or a successful action).
 # install / remove that complete cleanly may yield INSTALLED, REMOVED,
 # or (for install) STALE-pruned entries -- those are state changes,
 # not errors. audit, by contrast, doesn't fix anything, so any
 # status that says the target tree diverges from the discovered set
 # is a problem the user needs to see.
-_INSTALL_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
-    {DotfileStatus.FILE_CONFLICT, DotfileStatus.LINK_CONFLICT}
+_INSTALL_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
+    {LinkStatus.FILE_CONFLICT, LinkStatus.LINK_CONFLICT}
 )
-_REMOVE_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
-    {DotfileStatus.FILE_CONFLICT, DotfileStatus.LINK_CONFLICT}
+_REMOVE_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
+    {LinkStatus.FILE_CONFLICT, LinkStatus.LINK_CONFLICT}
 )
-_AUDIT_PROBLEM_STATUSES: frozenset[DotfileStatus] = frozenset(
+_AUDIT_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
     {
-        DotfileStatus.MISSING,
-        DotfileStatus.FILE_CONFLICT,
-        DotfileStatus.LINK_CONFLICT,
-        DotfileStatus.STALE,
+        LinkStatus.MISSING,
+        LinkStatus.FILE_CONFLICT,
+        LinkStatus.LINK_CONFLICT,
+        LinkStatus.STALE,
     }
 )
 
 
 def _format_status(
-    status: DotfileStatus, problem_statuses: frozenset[DotfileStatus]
+    status: LinkStatus, problem_statuses: frozenset[LinkStatus]
 ) -> str:
     code = _ANSI_RED if status in problem_statuses else _ANSI_GREEN
     return _colorize(status.value, code)
 
 
 def log_results(
-    dotfile_dir: Path,
+    source_dir: Path,
     results: list[OperationResult],
     *,
     verbose: bool = False,
-    problem_statuses: frozenset[DotfileStatus] = frozenset(),
+    problem_statuses: frozenset[LinkStatus] = frozenset(),
 ) -> None:
     """Log the results of processing a directory.
 
@@ -1096,7 +1090,7 @@ def log_results(
         header_suffix = _colorize("ok", _ANSI_GREEN)
 
     if verbose:
-        logger.info("%s: %s", dotfile_dir, header_suffix)
+        logger.info("%s: %s", source_dir, header_suffix)
         for result in results:
             logger.info(
                 "    %s: %s",
@@ -1105,12 +1099,12 @@ def log_results(
             )
         return
 
-    non_ok = [r for r in results if r.status != DotfileStatus.OK]
+    non_ok = [r for r in results if r.status != LinkStatus.OK]
     if not non_ok:
-        logger.info("%s: %s", dotfile_dir, header_suffix)
+        logger.info("%s: %s", source_dir, header_suffix)
         return
 
-    logger.info("%s: %s", dotfile_dir, header_suffix)
+    logger.info("%s: %s", source_dir, header_suffix)
     for result in non_ok:
         logger.info(
             "    %s: %s",
@@ -1122,44 +1116,44 @@ def log_results(
 def has_conflicts(results: list[OperationResult]) -> bool:
     """Check if any results indicate a conflict."""
     conflict_statuses = {
-        DotfileStatus.FILE_CONFLICT,
-        DotfileStatus.LINK_CONFLICT,
+        LinkStatus.FILE_CONFLICT,
+        LinkStatus.LINK_CONFLICT,
     }
     return any(r.status in conflict_statuses for r in results)
 
 
 def has_missing(results: list[OperationResult]) -> bool:
     """Check if any results indicate missing entries."""
-    return any(r.status == DotfileStatus.MISSING for r in results)
+    return any(r.status == LinkStatus.MISSING for r in results)
 
 
 def has_stale(results: list[OperationResult]) -> bool:
     """Check if any results indicate a stale managed symlink."""
-    return any(r.status == DotfileStatus.STALE for r in results)
+    return any(r.status == LinkStatus.STALE for r in results)
 
 
 def _find_stale_for_dir(
-    dotfile_dir: Path,
-    entries: list[DotfileEntry],
+    source_dir: Path,
+    entries: list[LinkEntry],
     profile: Profile,
-) -> list[tuple[Path, DotfileEntry]]:
+) -> list[tuple[Path, LinkEntry]]:
     """Find managed-but-stale symlinks for one source dir.
 
-    Returns (symlink, synthesized DotfileEntry) tuples. The
+    Returns (symlink, synthesized LinkEntry) tuples. The
     synthesized entry has its relative_path set to the path inside
-    dotfile_dir that the stale link points to, so callers can
+    source_dir that the stale link points to, so callers can
     package it as an OperationResult or unlink the symlink.
     """
-    src_resolved = dotfile_dir.resolve()
+    src_resolved = source_dir.resolve()
     discovered_rels = {e.relative_path for e in entries}
     sources = {src_resolved: discovered_rels}
     scan_dirs = _scan_dirs_for_entries(entries, profile)
 
-    stale: list[tuple[Path, DotfileEntry]] = []
+    stale: list[tuple[Path, LinkEntry]] = []
     for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
-        synth_entry = DotfileEntry(
+        synth_entry = LinkEntry(
             relative_path=rel,
-            dotfile_dir=src_resolved,
+            source_dir=src_resolved,
             profile=profile,
         )
         stale.append((symlink, synth_entry))
@@ -1193,10 +1187,10 @@ def _run_install(
     had_conflicts = False
     for src_dir, profile in targets:
         if not src_dir.is_dir():
-            raise MissingDotfilesDirectory(
+            raise MissingSourceDir(
                 f"Source directory does not exist: {src_dir}"
             )
-        entries = discover_dotfiles(src_dir, profile=profile)
+        entries = discover_entries(src_dir, profile=profile)
         results = _process_entries(
             entries, "install", dry_run=dry_run, force=force
         )
@@ -1206,7 +1200,7 @@ def _run_install(
             if not dry_run:
                 symlink.unlink()
                 _cleanup_empty_parents(symlink.parent, profile)
-            results.append(OperationResult(synth_entry, DotfileStatus.STALE))
+            results.append(OperationResult(synth_entry, LinkStatus.STALE))
         log_results(
             src_dir,
             results,
@@ -1227,12 +1221,12 @@ def _run_audit(targets: list[tuple[Path, Profile]], *, verbose: bool) -> None:
     for src_dir, profile in targets:
         if not src_dir.exists():
             continue
-        entries = discover_dotfiles(src_dir, profile=profile)
+        entries = discover_entries(src_dir, profile=profile)
         results = _process_entries(entries, "audit")
         for _symlink, synth_entry in _find_stale_for_dir(
             src_dir, entries, profile
         ):
-            results.append(OperationResult(synth_entry, DotfileStatus.STALE))
+            results.append(OperationResult(synth_entry, LinkStatus.STALE))
         log_results(
             src_dir,
             results,
@@ -1259,7 +1253,7 @@ def _run_remove(
     that point to the correct source are removed."""
     for src_dir, profile in targets:
         if not src_dir.exists():
-            raise MissingDotfilesDirectory(
+            raise MissingSourceDir(
                 f"Source directory does not exist: {src_dir}"
             )
         results = process_directory(
@@ -1294,9 +1288,7 @@ def do_install(
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         if not src.is_dir():
-            raise MissingDotfilesDirectory(
-                f"Source directory does not exist: {src}"
-            )
+            raise MissingSourceDir(f"Source directory does not exist: {src}")
         record = LinkRecord(
             dst=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
         )
@@ -1340,9 +1332,7 @@ def do_remove(
             None,
         )
         if record is None:
-            raise MissingDotfilesDirectory(
-                f"No tracked install: {src} -> {target}"
-            )
+            raise MissingSourceDir(f"No tracked install: {src} -> {target}")
         targets = [(src, record.profile())]
     else:
         targets = load_installed_entries()
@@ -1401,7 +1391,7 @@ def do_cleanup(*, dry_run: bool) -> None:
         target_roots.add(root)
         scan_dirs.add(root)
         rels: set[Path] = set()
-        for entry in discover_dotfiles(src_dir, profile=profile):
+        for entry in discover_entries(src_dir, profile=profile):
             rels.add(entry.relative_path)
             scan_dirs.add(entry.target_path.parent)
         # Union, not assignment: one source can be installed under more
@@ -1582,7 +1572,7 @@ def cli() -> int:
         COMMAND_CALLBACKS[command](**args_dict)
     except KeyError:
         raise UsageError(f"Unknown command '{command}'") from None
-    except DotfilesError as e:
+    except LinkfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
     return ExitCode.SUCCESS

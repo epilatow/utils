@@ -466,7 +466,7 @@ class TestLinkfilesAuditRemoveCleanup:
 
     def test_remove_untracked_errors(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"x": "y"})
-        with pytest.raises(lf.MissingDotfilesDirectory):
+        with pytest.raises(lf.MissingSourceDir):
             lf.do_remove(src, tracked / "never", dry_run=False, verbose=False)
 
     def test_cleanup_spans_distinct_targets(self, tracked: Path) -> None:
@@ -524,7 +524,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
         (lf.ConflictsFound("t"), lf.ExitCode.CONFLICTS),
         (lf.UsageError("t"), lf.ExitCode.USAGE),
         (
-            lf.MissingDotfilesDirectory("t"),
+            lf.MissingSourceDir("t"),
             lf.ExitCode.MISSING_DIR,
         ),
         (RuntimeError("t"), lf.ExitCode.CRASHED),
@@ -532,7 +532,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):
-    BASE_ERROR = lf.DotfilesError
+    BASE_ERROR = lf.LinkfilesError
     EXIT_CODE = lf.ExitCode
     EXCLUDED_CODES = {
         lf.ExitCode.SUCCESS,
