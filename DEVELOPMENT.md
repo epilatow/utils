@@ -58,9 +58,9 @@ This repo is a personal-utilities collection. Top-level structure:
   roff man page and a GitHub-browsable GFM doc; see Testing); each utility is
   a `ManSpec`, and adding one is appending to the script's `_SPECS`.
   `scripts/pandoc` manages the pinned pandoc the man-page gate needs
-  (`pandoc install` fetches it into `.tools/`; see Testing). Like `bin/`
-  entries these are PEP 723 executables with a `src/<module>.py` alias for
-  import + lint coverage.
+  (`pandoc install` fetches it into `.tools/`; see Testing), with the pin in
+  `scripts/pandoc-pin.json`. Like `bin/` entries these are PEP 723 executables
+  with a `src/<module>.py` alias for import + lint coverage.
 - `share/man/man<N>/` -- roff man pages generated from the argparse parsers
   via pandoc (currently `share/man/man1/crony.1`). Generated build artifacts,
   never hand-edited.
@@ -103,16 +103,19 @@ gated by platform checks.
   mdformat), so its comparison needs no pandoc; the roff comparison shells out
   to pandoc, so **pandoc is a required dev/CI dependency** -- a missing pinned
   pandoc fails the gate rather than skipping it. pandoc's roff output varies
-  by version, so the version is pinned (`render_docs.PANDOC_VERSION`): run
+  by version, so a single pandoc is pinned in **`scripts/pandoc-pin.json`**
+  (the version plus the sha256 of each platform asset): run
   **`scripts/pandoc install`** to fetch exactly that release into `.tools/`
-  (gitignored). The tooling and the gate use **only** that binary -- never a
-  `PATH` pandoc -- so the rendered man page can't vary with whatever pandoc
-  happens to be installed; run the installer once before the gate will pass
-  locally. CI and `tests/linux-docker-test.sh` run the same installer on Linux
-  and macOS, so every environment renders with the identical binary (and CI
-  exercises the installer as a side effect). After any change to a utility's
-  CLI surface or `--help` text, run `scripts/render-docs` to regenerate the
-  man page and GFM doc, and commit them alongside the code.
+  (gitignored). Each download is checksum-verified against the pin before it
+  is trusted, so an artifact that changed upstream is rejected. The tooling
+  and the gate use **only** that binary -- never a `PATH` pandoc -- so the
+  rendered man page can't vary with whatever pandoc happens to be installed;
+  run the installer once before the gate will pass locally. CI and
+  `tests/linux-docker-test.sh` run the same installer on Linux and macOS, so
+  every environment renders with the identical binary (and CI exercises the
+  installer as a side effect). After any change to a utility's CLI surface or
+  `--help` text, run `scripts/render-docs` to regenerate the man page and GFM
+  doc, and commit them alongside the code.
 - Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
   subprocess the script under test (currently just the borgadm suite under
   `tests/test_borgadm.py`). They are slow (tens of minutes serially) and are
@@ -134,11 +137,36 @@ gated by platform checks.
   discovers only `test_*.py` and CI invokes `run_all.py` directly, so it never
   runs automatically. The container adds what the GitHub runner supplies
   implicitly -- Node 20+ (the markdownlint gate), systemd-analyze (the
-  systemd-unit verify test), borg (the e2e suite), pandoc 3.10 (the
-  `test_render_docs` man-page gate), and git (uv builds the repo-shared gate
-  from a git source) -- and runs as a non-root user (the secure_archiver
-  permission test); the script header maps each dep to the test that needs it.
-  It tests the committed HEAD, not the working tree.
+  systemd-unit verify test), borg (the e2e suite), the pinned pandoc (the
+  `test_render_docs` man-page gate, via `scripts/pandoc install`), and git (uv
+  builds the repo-shared gate from a git source) -- and runs as a non-root
+  user (the secure_archiver permission test); the script header maps each dep
+  to the test that needs it. It tests the committed HEAD, not the working
+  tree.
+
+### Updating the pinned pandoc
+
+The pinned pandoc (`scripts/pandoc-pin.json`) should be reviewed and bumped
+periodically so the generated man pages track current pandoc.
+`scripts/pandoc update [version]` does the bump in a throwaway worktree off
+`origin`'s default branch: it rewrites the pin (the new version plus each
+platform asset's sha256, read from the release's published digests), fetches
+and checksum-verifies the new pandoc (the given version, or the latest release
+if omitted), regenerates the docs, runs the gate suite, and commits the
+result.
+
+- Without `--push` it leaves the committed bump in the worktree for you to
+  review and land by hand.
+- With `--push` it lands the bump on the default branch automatically -- but
+  **only when the rendered man page is byte-identical** to before (a pure
+  version bump with nothing to review). pandoc renders only the roff man page
+  (the GFM doc is pure-Python and unaffected by a pandoc bump), so that is the
+  artifact checked. If the new pandoc changes it, `--push` refuses and keeps
+  the worktree for a human to inspect. A successful `--push` removes the
+  worktree; pass `--keep-worktree` to retain it for inspection.
+
+A no-op run (target already pinned) exits cleanly without touching the working
+tree, so it is safe to run on a dirty checkout.
 
 ## Conventions
 

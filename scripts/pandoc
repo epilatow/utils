@@ -10,30 +10,51 @@
 # ]
 # ///
 # This is AI generated code
+#
+# IMPORTANT: This script has tests in tests/test_pandoc.py
 """Manage the pinned pandoc the man-page gate renders with.
 
-The freshness gate (`tests/test_render_docs.py`) renders the roff with
-pandoc and byte-compares it to the checked-in page. pandoc's roff output
-varies between versions, so one version is pinned
-(`render_docs.PANDOC_VERSION`) and fetched into `.tools/` (gitignored),
-independent of any system / Homebrew pandoc.
+The freshness gate (`tests/test_render_docs.py`) renders the roff man
+page with pandoc and byte-compares it to the checked-in file (the GFM doc
+is pure-Python, gated without pandoc). pandoc's roff output varies between
+versions, so a single pandoc is pinned in `scripts/pandoc-pin.json` (the
+version plus the sha256 of each platform asset) and fetched into `.tools/`
+(gitignored), independent of any system / Homebrew pandoc.
 
-    pandoc install        Fetch the pinned version into .tools/.
+    pandoc install              Fetch the pinned version into .tools/.
+    pandoc update [version]     Bump the pin (to <version>, or the latest
+                                release if omitted) and regenerate docs.
 
-`install` is idempotent (a no-op when the pinned version is already
-present); CI and the Linux docker test run it so every environment
-renders with the identical binary.
+Every download is verified against the pinned sha256 before it is
+trusted, so an artifact that changed upstream is rejected. `install` is
+idempotent (a no-op when the pinned version is already present); CI and
+the Linux docker test run it so every environment renders with the
+identical, verified binary.
+
+`update` keeps the pin current. It works in a throwaway worktree off
+`origin/<default-branch>`: it rewrites the pin (version + the release's
+published sha256s), fetches and verifies the new pandoc, regenerates the
+docs, runs the gate suite, and commits. With `--push` it lands the bump
+on the default branch automatically -- but ONLY when the rendered man
+page is byte-identical to before (a pure version bump with nothing to
+review). If it changed, `--push` refuses and leaves the worktree for a
+human.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
+import json
 import platform
+import subprocess
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,10 +63,39 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 import render_docs  # noqa: E402  (import after the src/ path insert above)
 
 _RELEASE = "https://github.com/jgm/pandoc/releases/download"
+_RELEASES_API = "https://api.github.com/repos/jgm/pandoc/releases"
+_RENDER_DOCS_REL = Path("scripts") / "render-docs"
+# The pin: the version + the sha256 of each platform asset, frozen so a
+# download whose bytes ever differ from the pinned hash is rejected.
+_PIN_REL = Path("scripts") / "pandoc-pin.json"
 
 
-def _bin(version: str) -> Path:
-    return _REPO_ROOT / ".tools" / f"pandoc-{version}" / "bin" / "pandoc"
+def _pinned_asset_names(version: str) -> list[str]:
+    """The release assets we pin a sha256 for -- one per platform `_asset`
+    can resolve to (keep in sync with `_asset`'s supported platforms)."""
+    return [
+        f"pandoc-{version}-linux-amd64.tar.gz",
+        f"pandoc-{version}-linux-arm64.tar.gz",
+        f"pandoc-{version}-arm64-macOS.zip",
+    ]
+
+
+def _expected_sha(root: Path, asset: str) -> str:
+    """The pinned sha256 for `asset` from `<root>/scripts/pandoc-pin.json`."""
+    pin = json.loads((root / _PIN_REL).read_text())
+    sha = pin.get("sha256", {}).get(asset)
+    if not isinstance(sha, str) or not sha:
+        raise SystemExit(f"no pinned sha256 for {asset} in {root / _PIN_REL}")
+    return sha
+
+
+# ---------------------------------------------------------------------------
+# Fetching a pinned pandoc into <root>/.tools
+# ---------------------------------------------------------------------------
+
+
+def _bin(root: Path, version: str) -> Path:
+    return root / ".tools" / f"pandoc-{version}" / "bin" / "pandoc"
 
 
 def _asset(version: str) -> tuple[str, str]:
@@ -59,10 +109,11 @@ def _asset(version: str) -> tuple[str, str]:
             raise SystemExit(f"unsupported Linux architecture: {machine}")
         return f"pandoc-{version}-linux-{arch}.tar.gz", "tar"
     if system == "Darwin":
-        arch = {"arm64": "arm64", "x86_64": "x86_64"}.get(machine)
-        if arch is None:
+        # Only Apple Silicon: GitHub's macos-latest runner is arm64 and
+        # the Intel runners are retiring, so x86_64 macOS isn't a target.
+        if machine != "arm64":
             raise SystemExit(f"unsupported macOS architecture: {machine}")
-        return f"pandoc-{version}-{arch}-macOS.zip", "zip"
+        return f"pandoc-{version}-arm64-macOS.zip", "zip"
     raise SystemExit(f"unsupported OS: {system}")
 
 
@@ -87,17 +138,35 @@ def _extract(blob: bytes, kind: str, dest: Path) -> None:
     dest.chmod(0o755)
 
 
-def _fetch(version: str) -> None:
-    """Fetch `version` into `.tools/`, unless it is already present."""
-    dest = _bin(version)
+def _fetch(root: Path, version: str) -> None:
+    """Fetch `version` into `<root>/.tools`, unless already present."""
+    dest = _bin(root, version)
     if render_docs._pandoc_version(str(dest)) == version:
         print(f"pandoc {version} already installed at {dest}")
         return
     asset, kind = _asset(version)
     url = f"{_RELEASE}/{version}/{asset}"
     print(f"downloading {url}")
-    with urllib.request.urlopen(url) as resp:
-        blob = resp.read()
+    try:
+        with urllib.request.urlopen(url) as resp:
+            blob = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(
+            f"no pandoc release {version!r} upstream (HTTP {exc.code} "
+            f"for {url})."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            f"could not download pandoc {version}: {exc.reason}."
+        ) from exc
+    expected = _expected_sha(root, asset)
+    actual = hashlib.sha256(blob).hexdigest()
+    if actual != expected:
+        raise SystemExit(
+            f"sha256 mismatch for {asset}: pinned {expected}, "
+            f"downloaded {actual}. The release artifact changed "
+            "unexpectedly; do not trust it."
+        )
     _extract(blob, kind, dest)
     got = render_docs._pandoc_version(str(dest))
     if got != version:
@@ -107,8 +176,249 @@ def _fetch(version: str) -> None:
     print(f"installed pandoc {version} at {dest}")
 
 
-def _install() -> None:
-    _fetch(render_docs.PANDOC_VERSION)
+# ---------------------------------------------------------------------------
+# Update: bump the pin in a worktree, render, gate, optionally push
+# ---------------------------------------------------------------------------
+
+
+def _parse_latest_tag(payload: Mapping[str, object]) -> str:
+    """The release tag from a GitHub `releases/latest` payload."""
+    tag = payload.get("tag_name")
+    if not isinstance(tag, str) or not tag:
+        raise SystemExit("could not read the latest pandoc release tag")
+    return tag
+
+
+def _parse_asset_digests(payload: Mapping[str, object]) -> dict[str, str]:
+    """Map asset name -> sha256 hex from a release payload's `assets`,
+    keeping only assets that publish a `sha256:` digest."""
+    assets = payload.get("assets")
+    result: dict[str, str] = {}
+    if not isinstance(assets, list):
+        return result
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name, digest = asset.get("name"), asset.get("digest")
+        if (
+            isinstance(name, str)
+            and isinstance(digest, str)
+            and digest.startswith("sha256:")
+        ):
+            result[name] = digest[len("sha256:") :]
+    return result
+
+
+def _api(path: str, what: str) -> dict[str, object]:
+    """GET a GitHub releases API path, parsed as JSON."""
+    req = urllib.request.Request(
+        f"{_RELEASES_API}/{path}",
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            payload: dict[str, object] = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"{what} failed (HTTP {exc.code}).") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"{what} failed: {exc.reason}.") from exc
+    return payload
+
+
+def _latest_version() -> str:
+    """The newest pandoc release version from the GitHub API."""
+    return _parse_latest_tag(_api("latest", "querying the latest release"))
+
+
+def _release_digests(version: str) -> dict[str, str]:
+    """The published sha256 of each pinned asset for `version`, from the
+    release's GitHub API metadata."""
+    published = _parse_asset_digests(
+        _api(f"tags/{version}", f"querying release {version}")
+    )
+    digests: dict[str, str] = {}
+    for name in _pinned_asset_names(version):
+        sha = published.get(name)
+        if sha is None:
+            raise SystemExit(
+                f"release {version} publishes no sha256 for {name}."
+            )
+        digests[name] = sha
+    return digests
+
+
+def _write_pin(root: Path, version: str, sha256: dict[str, str]) -> None:
+    """Write `<root>/scripts/pandoc-pin.json` (version + per-asset sha)."""
+    pin = {"version": version, "sha256": sha256}
+    (root / _PIN_REL).write_text(json.dumps(pin, indent=2) + "\n")
+
+
+def _git_out(args: list[str], cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    ).stdout.strip()
+
+
+def _default_branch(repo: Path) -> str:
+    ref = _git_out(["symbolic-ref", "refs/remotes/origin/HEAD"], repo)
+    return ref.rsplit("/", 1)[-1]
+
+
+def _can_push(repo: Path, default: str) -> bool:
+    """Probe push auth without changing anything: push origin's own
+    current default-branch tip back to itself (an up-to-date no-op)."""
+    probe = subprocess.run(
+        ["git", "push", "--dry-run", "origin", f"origin/{default}:{default}"],
+        cwd=repo,
+        check=False,
+        timeout=120,
+    )
+    return probe.returncode == 0
+
+
+def _update(version: str | None, *, push: bool, keep_worktree: bool) -> int:
+    repo = _REPO_ROOT
+    # Work-available check FIRST -- before the clean-check or any git
+    # work -- so a no-op run stays quiet even on a dirty tree (a
+    # scheduled `update --push` that wakes to a quiet upstream must not
+    # error).
+    target = version if version is not None else _latest_version()
+    if target == render_docs.PANDOC_VERSION:
+        print(f"already pinned to pandoc {target}; nothing to do.")
+        return 0
+
+    if _git_out(["status", "--porcelain"], repo) != "":
+        raise SystemExit(
+            "working tree has uncommitted changes; update must start "
+            "clean (the worktree spawns from origin's default branch)."
+        )
+    default = _default_branch(repo)
+    subprocess.run(
+        ["git", "fetch", "origin"], cwd=repo, check=True, timeout=120
+    )
+    if push and not _can_push(repo, default):
+        raise SystemExit(
+            "git push --dry-run failed; aborting before any work "
+            "(investigate auth, branch protection, or divergence)."
+        )
+
+    branch = f"pandoc-update-{target}"
+    wt = repo / ".wt" / f"pandoc-update-{target}"
+    if wt.exists():
+        raise SystemExit(f"{wt} already exists; remove it and rerun.")
+    subprocess.run(
+        ["git", "worktree", "add", str(wt), "-b", branch, f"origin/{default}"],
+        cwd=repo,
+        check=True,
+        timeout=120,
+    )
+
+    # Write the new pin (version + the release's published sha256s) into
+    # the worktree first, so the fetch below verifies the download against
+    # the new hash and the render reads the new version from it.
+    _write_pin(wt, target, _release_digests(target))
+    _fetch(wt, target)
+    subprocess.run([str(wt / _RENDER_DOCS_REL)], cwd=wt, check=True)
+    # Only the roff man page is pandoc-rendered, so a version bump can only
+    # move `share/man`; the GFM doc is pure-Python and unaffected.
+    render_changed = (
+        _git_out(["status", "--porcelain", "--", "share/man"], wt) != ""
+    )
+
+    print("running the gate suite against the bumped pandoc ...")
+    gate = subprocess.run(
+        ["uv", "run", "tests/run_all.py"], cwd=wt, check=False, timeout=1800
+    )
+    if gate.returncode != 0:
+        raise SystemExit(
+            f"gate suite failed under pandoc {target}; worktree {wt} "
+            "kept for inspection."
+        )
+
+    subprocess.run(
+        ["git", "add", "scripts/pandoc-pin.json", "share", "docs"],
+        cwd=wt,
+        check=True,
+        timeout=120,
+    )
+    # Nothing staged means origin's default branch is already at `target`
+    # (the local pin -- which the work-available check read -- was behind
+    # origin). Treat it as the no-op it is, with a clean message rather
+    # than letting `git commit` fail.
+    if (
+        subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=wt,
+            check=False,
+            timeout=120,
+        ).returncode
+        == 0
+    ):
+        raise SystemExit(
+            f"origin/{default} is already pinned to pandoc {target}; "
+            f"nothing to commit (remove the worktree {wt})."
+        )
+    subprocess.run(
+        ["git", "commit", "-m", f"pandoc: Bump pinned pandoc to {target}."],
+        cwd=wt,
+        check=True,
+        timeout=120,
+    )
+
+    verb = "changed" if render_changed else "unchanged"
+    print(f"committed the pandoc {target} bump; rendered man page {verb}.")
+
+    if not push:
+        print(
+            f"worktree left at {wt}. Review"
+            + (" the rendered changes," if render_changed else ",")
+            + f" then ff-merge {branch} into {default} and push, or "
+            "remove the worktree to discard."
+        )
+        return 0
+
+    if render_changed:
+        raise SystemExit(
+            f"the rendered man page changed under pandoc {target}; "
+            "refusing to push. Review the bump in the worktree "
+            f"({wt}) and land it by hand."
+        )
+
+    # Doc-neutral bump: the branch is one commit off origin/<default>, so
+    # push its tip straight to <default> on origin as a fast-forward --
+    # no local checkout of <default> (which lives in another worktree).
+    pushed = subprocess.run(
+        ["git", "push", "origin", f"{branch}:{default}"],
+        cwd=wt,
+        check=False,
+        timeout=120,
+    )
+    if pushed.returncode != 0:
+        raise SystemExit(
+            f"push to origin/{default} failed (did upstream move?); "
+            f"worktree {wt} kept."
+        )
+    print(f"pushed the pandoc {target} bump to origin/{default}.")
+    if not keep_worktree:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt)],
+            cwd=repo,
+            check=False,
+            timeout=120,
+        )
+        subprocess.run(
+            ["git", "branch", "-D", branch], cwd=repo, check=False, timeout=120
+        )
+    print(
+        f"note: local {default} is now behind origin/{default} by the "
+        "bump; `git pull` in the default-branch checkout to sync."
+    )
+    return 0
 
 
 def main() -> int:
@@ -119,10 +429,33 @@ def main() -> int:
     sub.add_parser(
         "install", help="Fetch the pinned pandoc into .tools/ (idempotent)."
     )
+    up = sub.add_parser(
+        "update",
+        help="Bump the pin (to <version>, or latest), render, and commit.",
+    )
+    up.add_argument(
+        "version",
+        nargs="?",
+        help="Target pandoc version (default: the latest release).",
+    )
+    up.add_argument(
+        "--push",
+        action="store_true",
+        help="Land the bump on the default branch -- only if the "
+        "rendered man page is unchanged.",
+    )
+    up.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help="Keep the update worktree after a successful --push.",
+    )
     args = parser.parse_args()
     if args.cmd == "install":
-        _install()
-    return 0
+        _fetch(_REPO_ROOT, render_docs.PANDOC_VERSION)
+        return 0
+    return _update(
+        args.version, push=args.push, keep_worktree=args.keep_worktree
+    )
 
 
 if __name__ == "__main__":

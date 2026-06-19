@@ -16,9 +16,10 @@
 #     TestSystemdAnalyzeVerify, which validates rendered systemd units --
 #     it is skipped (not run) without systemd-analyze.
 #   - borgbackup: the borgadm `--e2e` suite forks the real borg binary.
-#   - pandoc 3.10: test_render_docs.py renders the roff man page and
-#     compares it to the checked-in copy; the version is pinned because
-#     pandoc's roff output varies between versions.
+#   - the pinned pandoc (via `scripts/pandoc install`): test_render_docs.py
+#     renders the roff man page and compares it to the checked-in copy; the
+#     version is pinned (scripts/pandoc-pin.json) because pandoc's roff
+#     output varies between versions.
 #   - Node >= 20 (from the base image): the repo-shared markdown gate runs
 #     `npx markdownlint-cli2`, and markdownlint-cli2 requires Node >= 20.
 #   - git: uv builds the repo-shared gate from its `git+https://` source

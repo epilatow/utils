@@ -1,0 +1,8 @@
+{
+  "version": "3.10",
+  "sha256": {
+    "pandoc-3.10-linux-amd64.tar.gz": "e0f8af62d0f267d22baa5bcefe6d5dda3a097ccc60de794b759fe03159923244",
+    "pandoc-3.10-linux-arm64.tar.gz": "55413dfb0c1aec861641fe858f1f73e84848f3db497b1c0c02e62887ea76f4a4",
+    "pandoc-3.10-arm64-macOS.zip": "d9cad01d96ae774a0dc8c8c45bb1ad3e4c5ff2cc2e24f45958f5f9b7974aee34"
+  }
+}

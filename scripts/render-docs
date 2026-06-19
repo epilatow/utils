@@ -49,6 +49,7 @@ freshness test instead.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -65,11 +66,14 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 # pandoc renders the Markdown to roff. Its roff output varies between
-# versions, so the version is pinned: `scripts/pandoc install` fetches
-# exactly this release into `.tools/`, and the freshness gate compares
-# against a render from it. Single-sourced here; the installer and the
-# gate both read it.
-PANDOC_VERSION = "3.10"
+# versions, so a single pandoc is pinned in `scripts/pandoc-pin.json`
+# (version + per-asset sha256); `scripts/pandoc install` fetches and
+# checksum-verifies it into `.tools/`, and the freshness gate renders
+# with it. The version is read from that pin file so it stays the single
+# source for both the gate and the installer.
+PANDOC_VERSION: str = json.loads(
+    (_REPO_ROOT / "scripts" / "pandoc-pin.json").read_text()
+)["version"]
 _PANDOC_DIR = _REPO_ROOT / ".tools" / f"pandoc-{PANDOC_VERSION}"
 
 _MD_SPECIAL = set("\\`*_[]<>#|")
