@@ -393,16 +393,15 @@ def remove_install_record(dst: Path, src: Path) -> None:
 # =============================================================================
 
 
-# Ignore file names to load patterns from. .dotfilesignore /
-# .linkfiles.ignore are the preferred way to keep something tracked in
-# git but unlinked by install (e.g. tests/, README.md, .github/,
-# pyproject.toml). The .gitignore / .hgignore reads cover the common
-# case where a file you don't want tracked also shouldn't be linked
-# (editor backups, build outputs). All modes read the whole set.
+# Ignore file names to load patterns from. .linkfiles.ignore is the
+# preferred way to keep something tracked in git but unlinked by install
+# (e.g. tests/, README.md, .github/, pyproject.toml). The .gitignore /
+# .hgignore reads cover the common case where a file you don't want
+# tracked also shouldn't be linked (editor backups, build outputs). All
+# modes read the whole set.
 IGNORE_FILES = {
     ".gitignore",
     ".hgignore",
-    ".dotfilesignore",
     ".linkfiles.ignore",
 }
 
@@ -476,11 +475,11 @@ def load_ignore_patterns(source_dir: Path) -> set[str]:
     _ignore_search_dirs for the exact walk bound), plus a hardcoded
     set of editor / swap / autosave file patterns that always apply.
 
-    .dotfilesignore / .linkfiles.ignore are the preferred way to exclude
-    something that is tracked in git but should not be linked into the
-    target tree (tests/, README.md, project config). .gitignore /
-    .hgignore covers the case where a file you don't want tracked also
-    shouldn't be linked (editor backups, build outputs).
+    .linkfiles.ignore is the preferred way to exclude something that is
+    tracked in git but should not be linked into the target tree
+    (tests/, README.md, project config). .gitignore / .hgignore covers
+    the case where a file you don't want tracked also shouldn't be linked
+    (editor backups, build outputs).
 
     Patterns are simple glob patterns (supports *, ?, []).
     Lines starting with # are comments.
@@ -606,9 +605,9 @@ def discover_entries(record: InstallRecord) -> list[LinkEntry]:
       depth (so .git / .hg / .github, the ignore files, and editor
       state never link).
     - Skip files matching patterns in .gitignore / .hgignore /
-      .dotfilesignore / .linkfiles.ignore from the source dir and each
-      ancestor up to the enclosing repo root, plus a hardcoded set of
-      editor / swap / autosave patterns.
+      .linkfiles.ignore from the source dir and each ancestor up to the
+      enclosing repo root, plus a hardcoded set of editor / swap /
+      autosave patterns.
 
     With the record's no_recurse flag, only top-level entries are
     considered; subdirectories are not descended into.
