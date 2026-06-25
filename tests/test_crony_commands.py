@@ -179,17 +179,14 @@ class TestInit:
         # config.toml is untouched.
         assert not cfg_file.exists()
 
-    def test_bundle_default_rejected(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        cfg_dir = tmp_path / "crony"
-        cfg_file = cfg_dir / "config.toml"
-        cfg_dropin = cfg_dir / "config"
-        monkeypatch.setattr(crony_paths, "CONFIG_DIR", cfg_dir)
-        monkeypatch.setattr(crony_paths, "CONFIG_FILE", cfg_file)
-        monkeypatch.setattr(crony_paths, "CONFIG_DROPIN_DIR", cfg_dropin)
-        with pytest.raises(UsageError, match="default"):
-            crony_commands.do_init(force=False, bundle="default")
+    def test_bundle_default_rejected(self) -> None:
+        # `--bundle default` would shadow config.toml; the parser
+        # rejects it (exit 2) before dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["config", "init", "--bundle", "default"]
+            )
+        assert exc.value.code == 2
 
     def test_bundle_invalid_name_rejected(
         self, tmp_path: Path, monkeypatch: Any
@@ -1747,17 +1744,14 @@ class TestDestroy:
         assert (default_old_d_dir / "snapshot.json").exists()
         assert not borgadm_old_b_dir.exists()
 
-    def test_orphans_flag_with_positional_names_rejected(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(UsageError, match="mutually exclusive"):
-            crony_commands.do_destroy(
-                jobs=["foo"],
-                bundle=None,
-                orphans=True,
+    def test_orphans_flag_with_positional_names_rejected(self) -> None:
+        # Arg-combination validation lives in the parser, so the bad
+        # combination exits 2 before any dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["destroy", "foo", "--orphans"]
             )
+        assert exc.value.code == 2
 
     def test_orphans_flag_leaves_active_entries_alone(
         self, tmp_path: Path, monkeypatch: Any
@@ -2226,18 +2220,14 @@ class TestEnableDisable:
             jobs=["j"], wait=True, trigger_timeout=None, bundle=None
         )
 
-    def test_trigger_timeout_requires_wait(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        with pytest.raises(UsageError, match="--trigger-timeout"):
-            crony_commands.do_trigger(
-                jobs=["j"], wait=False, trigger_timeout=10, bundle=None
+    def test_trigger_timeout_requires_wait(self) -> None:
+        # --trigger-timeout is only meaningful under --wait; the parser
+        # rejects the combination (exit 2) before dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["trigger", "j", "--trigger-timeout", "10"]
             )
+        assert exc.value.code == 2
 
     def test_trigger_rejects_ambiguous_uuid_swap(
         self, tmp_path: Path, monkeypatch: Any
@@ -2493,19 +2483,13 @@ class TestEnableDisable:
                 jobs=[], wait=False, trigger_timeout=None, bundle="ghost"
             )
 
-    def test_bundle_or_jobs_required(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(UsageError, match="specify job names"):
-            crony_commands.do_enable(jobs=[], bundle=None)
-        with pytest.raises(UsageError, match="specify job names"):
-            crony_commands.do_disable(jobs=[], bundle=None)
-        with pytest.raises(UsageError, match="specify job names"):
-            crony_commands.do_trigger(
-                jobs=[], wait=False, trigger_timeout=None, bundle=None
-            )
+    def test_bundle_or_jobs_required(self) -> None:
+        # An unscoped bulk verb (no names, no --bundle) is rejected by
+        # the parser (exit 2) so it can't silently act on everything.
+        for verb in ("enable", "disable", "trigger"):
+            with pytest.raises(SystemExit) as exc:
+                crony_cli._build_parser().parse_command([verb])
+            assert exc.value.code == 2
 
     def test_enable_disable_bulk_includes_grouped_in_bundle(
         self, tmp_path: Path, monkeypatch: Any
@@ -5009,21 +4993,14 @@ class TestStatusReport:
         assert "*-*-* 09:00^" in out
         assert "*-*-* 03:00" not in out
 
-    def test_config_current_and_pending_mutually_exclusive(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(UsageError, match="mutually exclusive"):
-            crony_commands.do_status(
-                jobs=[],
-                cols=None,
-                show_masked=False,
-                bundle=None,
-                config_current=True,
-                config_pending=True,
-                exclude_healthy=False,
+    def test_config_current_and_pending_mutually_exclusive(self) -> None:
+        # The two source-pin flags form a parser mutex group, so the
+        # combination exits 2 before dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["status", "--config-current", "--config-pending"]
             )
+        assert exc.value.code == 2
 
     def test_unused_mask_reason_surfaces_under_all(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -5655,26 +5632,14 @@ class TestLogs:
         out = capsys.readouterr().out
         assert "orphan content" in out
 
-    def test_latest_and_tail_mutually_exclusive(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config(
-            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
-            default_target_jobs=["j"],
-        )
-        log = h.state_dir("j") / "run.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text("=== 2026-05-01T03:00:00-08:00 j pid=1 ===\n")
-        with pytest.raises(UsageError, match="mutually exclusive"):
-            crony_commands.do_logs(
-                job="j",
-                n=0,
-                since=None,
-                tail=True,
-                path=False,
-                latest=True,
+    def test_latest_and_tail_mutually_exclusive(self) -> None:
+        # --tail and --latest form a parser mutex group, so the
+        # combination exits 2 before any log lookup.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["logs", "j", "--tail", "--latest"]
             )
+        assert exc.value.code == 2
 
 
 class TestDestroyByEntityRef:

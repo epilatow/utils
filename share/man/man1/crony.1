@@ -130,7 +130,7 @@ Override [defaults].trigger_timeout_sec (seconds to wait for a runner to come on
 Only meaningful with \-\-wait.\&
 .RE
 .TP
-\f[B]status\f[R] [\-a] [\-\-cols COLS] [\-b BUNDLE] [\-\-config\-current] [\-\-config\-pending] [\-\-exclude\-healthy] [job ...]\&
+\f[B]status\f[R] [\-a] [\-\-cols COLS] [\-b BUNDLE] [\-\-config\-current | \-\-config\-pending] [\-\-exclude\-healthy] [job ...]\&
 Print resolved state per job.\&
 With no job arguments every job is shown; pass job names to restrict the table.\&
 Many columns are source\-selected \-\- they show the pending (config) value by default, or the applied value under \-\-config\-current \-\- and a trailing \(ga\(ha\(ga on a value marks a divergence between the two.\&
@@ -156,7 +156,7 @@ Output is flat (no tree indent).\&
 Always exits 0 \-\- this is a filter on the display, not a gate.\&
 .RE
 .TP
-\f[B]logs\f[R] [\-n N] [\-s SINCE] [\-t] [\-p] [\-l] job
+\f[B]logs\f[R] [\-n N] [\-s SINCE] [\-t | \-l] [\-p] job
 Print a job\(aqs recent log output.\&
 .RS
 .TP
@@ -169,11 +169,11 @@ Print the last N lines (default: 200, or 10 with \-\-tail).\&
 \f[CR]\-t, \-\-tail\f[R]
 Follow appended output.\&
 .TP
-\f[CR]\-p, \-\-path\f[R]
-Print the log file path and exit (no content).\&
-.TP
 \f[CR]\-l, \-\-latest\f[R]
 Print only the latest run\(aqs entry.\&
+.TP
+\f[CR]\-p, \-\-path\f[R]
+Print the log file path and exit (no content).\&
 .RE
 .TP
 \f[B]notify\-test\f[R] [\-\-channel CHANNEL] [\-b BUNDLE]

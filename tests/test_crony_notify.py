@@ -993,16 +993,6 @@ class TestNotifyTestSubcommand:
         with pytest.raises(ConfigError, match="unknown notify channel"):
             crony_commands.do_notify_test(channel="borgadm.ntfy", bundle=None)
 
-    def test_bundle_and_channel_mismatch_errors(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _RunnerHarness(tmp_path, monkeypatch)
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(UsageError, match="contradicts"):
-            crony_commands.do_notify_test(
-                channel="borgadm.ntfy", bundle="other"
-            )
-
     def test_unknown_bundle_rejected(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

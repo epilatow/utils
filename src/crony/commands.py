@@ -364,12 +364,6 @@ def do_init(force: bool, bundle: str | None) -> None:
     """
     template = _default_config_template()
     if bundle is not None:
-        if bundle == crony.config.DEFAULT_BUNDLE_NAME:
-            raise crony.errors.UsageError(
-                f"--bundle {crony.config.DEFAULT_BUNDLE_NAME!r} would shadow "
-                f"config.toml; use plain `crony config init` (without "
-                f"--bundle) for the default bundle"
-            )
         try:
             crony.config.validate_bundle_name(bundle, "--bundle")
         except crony.errors.ConfigError as e:
@@ -947,10 +941,6 @@ def do_destroy(
     entity's own name keys the platform-unit cleanup; a too-corrupt
     orphan carries none, so only its state dir is wiped.
     """
-    if orphans and jobs:
-        raise crony.errors.UsageError(
-            "--orphans and positional names are mutually exclusive"
-        )
     config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
@@ -1103,8 +1093,8 @@ def _resolve_bulk_names(
     """
     if jobs:
         return [crony.config.resolve_cli_name(arg, bundle) for arg in jobs]
-    if bundle is None:
-        raise crony.errors.UsageError("specify job names or --bundle")
+    # The enable / disable / trigger parsers require names or --bundle.
+    assert bundle is not None
     return sorted(crony.config.bundle_prefix_filter(stamped, bundle))
 
 
@@ -1208,11 +1198,6 @@ def do_trigger(
     positional args, bare names resolve in `<name>` and qualified
     names must match it.
     """
-    if trigger_timeout is not None and not wait:
-        raise crony.errors.UsageError(
-            "--trigger-timeout requires --wait (only meaningful in "
-            "synchronous mode)"
-        )
     config = crony.runtime.load_config()
     bundles = config.toml_config
     config.require_addressable(bundle)
@@ -2251,10 +2236,6 @@ def do_status(
     render red and reconcilable drift renders yellow; see the
     `--help` epilog's Color section. Redirected output is plain.
     """
-    if config_current and config_pending:
-        raise crony.errors.UsageError(
-            "--config-current and --config-pending are mutually exclusive"
-        )
     config_source = (
         "current"
         if config_current
@@ -2860,10 +2841,6 @@ def do_logs(
         return
     if not log_path.exists():
         raise crony.errors.UsageError(f"no log for {full!r} (state dir: {sd})")
-    if tail and latest:
-        raise crony.errors.UsageError(
-            "--tail and --latest are mutually exclusive"
-        )
     if n is None:
         n = 10 if tail else 200
     if tail:
@@ -3393,13 +3370,9 @@ def do_notify_test(channel: str | None, bundle: str | None) -> None:
         else:
             channel_short = channel
 
-    # Compose --bundle and --channel's bundle prefix.
-    if channel_bundle is not None and bundle is not None:
-        if channel_bundle != bundle:
-            raise crony.errors.UsageError(
-                f"--bundle {bundle!r} contradicts --channel "
-                f"{channel!r} (bundle {channel_bundle!r}); pick one"
-            )
+    # Compose --bundle and --channel's bundle prefix. The parser
+    # rejects a fully-qualified --channel whose bundle contradicts an
+    # explicit --bundle, so at most one of the two is set here.
     bundle_name = channel_bundle or bundle or crony.config.DEFAULT_BUNDLE_NAME
     bundles.require_known(bundle_name)
     target_bundle = bundles.by_name(bundle_name)

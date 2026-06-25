@@ -183,3 +183,16 @@ tree, so it is safe to run on a dirty checkout.
   shared `DEVELOPMENT_SHARED.md`'s 79 -- this is the repo's pre-onboarding
   setting and per the layered-docs precedence rule this file's value wins. The
   delivered ruff gate reads `ruff.toml`, so 80 is what it enforces.
+
+- **Usage errors derivable from argv alone belong in the argument parser, not
+  the command handlers.** Argument-combination checks (mutually exclusive,
+  required-one-of, "X requires Y") and value-format checks (a value must parse
+  or be one of a static set) are decided from the parsed namespace, so express
+  them where argparse can: `add_mutually_exclusive_group` / `choices` /
+  `type=` when argparse models them natively, or `StrictArgumentParser`'s
+  `add_validate_callback` (a post-parse validator reporting via
+  `parser.error`) for combinations argparse can't express declaratively. The
+  payoff is a uniform exit-2 usage message with the subcommand's own usage
+  line before any dispatch. Usage errors that need runtime state -- a loaded
+  config, on-disk state, the filesystem -- can't be decided at parse time, so
+  they stay in the handler as a raised `UsageError`.

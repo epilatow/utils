@@ -149,7 +149,7 @@ with --bundle to fire every stamped entry in that bundle.
   Override [defaults].trigger_timeout_sec (seconds to wait for a runner to
   come online after kickstart). Only meaningful with --wait.
 
-### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current] [--config-pending] [--exclude-healthy] [job ...]`
+### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 
 Print resolved state per job. With no job arguments every job is shown; pass
 job names to restrict the table. Many columns are source-selected -- they show
@@ -175,7 +175,7 @@ the two.
   ok/never/gated. Output is flat (no tree indent). Always exits 0 -- this is a
   filter on the display, not a gate.
 
-### `logs [-n N] [-s SINCE] [-t] [-p] [-l] job`
+### `logs [-n N] [-s SINCE] [-t | -l] [-p] job`
 
 Print a job's recent log output.
 
@@ -185,10 +185,10 @@ Print a job's recent log output.
   "1h", "2d", or ISO timestamp.
 - **`-t, --tail`**\
   Follow appended output.
-- **`-p, --path`**\
-  Print the log file path and exit (no content).
 - **`-l, --latest`**\
   Print only the latest run's entry.
+- **`-p, --path`**\
+  Print the log file path and exit (no content).
 
 ### `notify-test [--channel CHANNEL] [-b BUNDLE]`
 

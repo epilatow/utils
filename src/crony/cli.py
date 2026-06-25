@@ -22,6 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 import crony.commands
+import crony.config
 import crony.errors
 import crony.model
 import crony.runner
@@ -179,6 +180,83 @@ def _add_jobs_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _validate_config_init(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject `config init --bundle default`: the default bundle is
+    config.toml, which a `config/default.toml` drop-in would shadow."""
+    if args.bundle == crony.config.DEFAULT_BUNDLE_NAME:
+        parser.error(
+            f"--bundle {crony.config.DEFAULT_BUNDLE_NAME!r} would shadow "
+            f"config.toml; use plain `crony config init` (without "
+            f"--bundle) for the default bundle"
+        )
+
+
+def _validate_destroy(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject `destroy --orphans` combined with positional names: the
+    orphan sweep and an explicit name list select different sets."""
+    if args.orphans and args.jobs:
+        parser.error("--orphans and positional names are mutually exclusive")
+
+
+def _require_names_or_bundle(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Shared precondition for the bulk verbs (enable / disable /
+    trigger): require positional names or --bundle, so an unscoped
+    invocation can't silently act on every stamped entry."""
+    if not args.jobs and args.bundle is None:
+        parser.error("specify job names or --bundle")
+
+
+def _validate_enable(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    _require_names_or_bundle(parser, args)
+
+
+def _validate_disable(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    _require_names_or_bundle(parser, args)
+
+
+def _validate_trigger(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.trigger_timeout is not None and not args.wait:
+        parser.error(
+            "--trigger-timeout requires --wait (only meaningful in "
+            "synchronous mode)"
+        )
+    _require_names_or_bundle(parser, args)
+
+
+def _validate_notify_test(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject a fully-qualified --channel whose bundle contradicts an
+    explicit --bundle."""
+    if args.channel is None or "." not in args.channel:
+        return
+    # Split the bundle prefix here rather than via parse_full_name: that
+    # raises UsageError on a malformed ref, and this validator runs
+    # outside cli()'s exception mapping, so the raise would escape as a
+    # crash. A malformed channel just isn't a contradiction -- the
+    # handler reports it as a usage error during dispatch.
+    channel_bundle, _, channel_short = args.channel.partition(".")
+    if not channel_bundle or not channel_short:
+        return
+    if args.bundle is not None and channel_bundle != args.bundle:
+        parser.error(
+            f"--bundle {args.bundle!r} contradicts --channel "
+            f"{args.channel!r} (bundle {channel_bundle!r}); pick one"
+        )
+
+
 def _build_parser() -> StrictArgumentParser:
     """Build and return the argument parser."""
     # The internal `_run` exit codes are hidden from the user-facing
@@ -231,6 +309,7 @@ def _build_parser() -> StrictArgumentParser:
         help="Overwrite an existing config file.",
     )
     _add_bundle_argument(p_config_init)
+    p_config_init.add_validate_callback(_validate_config_init)
 
     p_config_validate = config_subparsers.add_parser(
         "validate",
@@ -312,6 +391,7 @@ def _build_parser() -> StrictArgumentParser:
         ),
     )
     _add_bundle_argument(p_destroy)
+    p_destroy.add_validate_callback(_validate_destroy)
 
     # enable
     p_enable = subparsers.add_parser(
@@ -324,6 +404,7 @@ def _build_parser() -> StrictArgumentParser:
     )
     _add_jobs_argument(p_enable)
     _add_bundle_argument(p_enable)
+    p_enable.add_validate_callback(_validate_enable)
 
     # disable
     p_disable = subparsers.add_parser(
@@ -337,6 +418,7 @@ def _build_parser() -> StrictArgumentParser:
     )
     _add_jobs_argument(p_disable)
     _add_bundle_argument(p_disable)
+    p_disable.add_validate_callback(_validate_disable)
 
     # trigger
     p_trigger = subparsers.add_parser(
@@ -370,6 +452,7 @@ def _build_parser() -> StrictArgumentParser:
             "Only meaningful with --wait."
         ),
     )
+    p_trigger.add_validate_callback(_validate_trigger)
 
     # status
     p_status = subparsers.add_parser(
@@ -408,7 +491,8 @@ def _build_parser() -> StrictArgumentParser:
         ),
     )
     _add_bundle_argument(p_status)
-    p_status.add_argument(
+    config_source = p_status.add_mutually_exclusive_group()
+    config_source.add_argument(
         "--config-current",
         action="store_true",
         help=(
@@ -416,7 +500,7 @@ def _build_parser() -> StrictArgumentParser:
             "the currently-active (applied) value."
         ),
     )
-    p_status.add_argument(
+    config_source.add_argument(
         "--config-pending",
         action="store_true",
         help=(
@@ -456,23 +540,24 @@ def _build_parser() -> StrictArgumentParser:
         default=None,
         help='"1h", "2d", or ISO timestamp.',
     )
-    p_logs.add_argument(
+    tail_or_latest = p_logs.add_mutually_exclusive_group()
+    tail_or_latest.add_argument(
         "-t",
         "--tail",
         action="store_true",
         help="Follow appended output.",
+    )
+    tail_or_latest.add_argument(
+        "-l",
+        "--latest",
+        action="store_true",
+        help="Print only the latest run's entry.",
     )
     p_logs.add_argument(
         "-p",
         "--path",
         action="store_true",
         help="Print the log file path and exit (no content).",
-    )
-    p_logs.add_argument(
-        "-l",
-        "--latest",
-        action="store_true",
-        help="Print only the latest run's entry.",
     )
 
     # _run -- internal entry point for platform units; hidden from
@@ -529,6 +614,7 @@ def _build_parser() -> StrictArgumentParser:
         ),
     )
     _add_bundle_argument(p_nt)
+    p_nt.add_validate_callback(_validate_notify_test)
 
     return parser
 

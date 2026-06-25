@@ -280,6 +280,37 @@ class TestConfigSubcommandDispatch:
         assert "bogus" in err
 
 
+class TestNotifyTestArgValidation:
+    """`notify-test`'s parser rejects a fully-qualified --channel whose
+    bundle contradicts an explicit --bundle."""
+
+    def test_channel_bundle_contradicts_bundle_rejected(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["notify-test", "--bundle", "a", "--channel", "b.ntfy"]
+            )
+        assert exc.value.code == 2
+
+    def test_channel_bundle_matches_bundle_accepted(self) -> None:
+        # A qualified channel agreeing with --bundle parses cleanly.
+        args = crony_cli._build_parser().parse_command(
+            ["notify-test", "--bundle", "a", "--channel", "a.ntfy"]
+        )
+        assert args.command == "notify-test"
+        assert args.bundle == "a"
+        assert args.channel == "a.ntfy"
+
+    def test_malformed_channel_does_not_crash_validator(self) -> None:
+        # A channel with a dot but an empty component is not a
+        # contradiction; the validator must not raise (parse_full_name
+        # would), so parsing succeeds and the handler reports it later.
+        args = crony_cli._build_parser().parse_command(
+            ["notify-test", "--bundle", "a", "--channel", "a."]
+        )
+        assert args.command == "notify-test"
+        assert args.channel == "a."
+
+
 class TestBrokenPipeHandler:
     """Smoke check that _BrokenPipeAwareStreamHandler swallows
     BrokenPipeError without raising and swaps to /dev/null so the
