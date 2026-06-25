@@ -88,6 +88,12 @@ missing entries, or stale managed links.
 
 - **`~/.linkfiles.installed`**\
   Tracks installed directory pairs (source + target) and installation options.
+- **`~/.linkfiles.linked`**\
+  Tracks installed links (source + target pairs).
+- **`$REPO/.linkfiles.ignore`**\
+  A file containing gitignore style patterns used to specify repo files that
+  should be ignored by linkfiles. Used when source_dir is $REPO or a child of
+  $REPO.
 
 ## EXIT STATUS
 

@@ -738,7 +738,17 @@ def _linkfiles_spec() -> ManSpec:
                 "~/.linkfiles.installed",
                 "Tracks installed directory pairs (source + target) and "
                 "installation options.",
-            )
+            ),
+            (
+                "~/.linkfiles.linked",
+                "Tracks installed links (source + target pairs).",
+            ),
+            (
+                "$REPO/.linkfiles.ignore",
+                "A file containing gitignore style patterns used to "
+                "specify repo files that should be ignored by linkfiles. "
+                "Used when source_dir is $REPO or a child of $REPO.",
+            ),
         ],
         exit_status=[
             (str(value), description)

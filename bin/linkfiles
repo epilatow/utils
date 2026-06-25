@@ -14,10 +14,12 @@ import logging
 import os
 import sys
 import textwrap
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
+from enum import StrEnum, auto
 from pathlib import Path
+from typing import Self
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -39,21 +41,20 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 #   expected source. With --force, conflicting symlinks are replaced.
 #   Regular files/directories are never removed by --force.
 #
-# Stale managed links:
-#   A symlink is "managed" when its resolved target lies inside an
-#   installed source directory. It becomes "stale" when the relative
-#   path within that source is no longer in the source's discovered
-#   set -- because the file was removed from the repo or now matches an
-#   ignore pattern. Two subcommands handle stale managed links:
-#     - audit   reports them as STALE and fails (ConflictsFound).
-#     - install removes them, scoped to the source dir being installed.
-#               This makes install a sync: after it runs, the target
-#               tree matches the repo's current discovered set as if
-#               from a fresh clone.
-#
-#   The scan set for stale-link detection is target_root plus the
-#   parent directory of every currently-discovered entry. Stale links
-#   inside subdirectories that hold no current entries are not reached.
+# Stale and dangling links:
+#   A recorded link is "stale" when its source no longer wants it (the
+#   file was removed from the repo or now matches an ignore pattern) and
+#   "dangling" when its source file is gone outright. The link plan
+#   drives the handling of both:
+#     - install prunes every recorded link the source no longer
+#       delivers, unlinking it; afterward the target tree matches the
+#       source's current discovered set. A wholly missing source has all
+#       its links pruned but keeps its install record, so a restored
+#       source is re-linked by a later install.
+#     - remove tears down every recorded link for an install and then
+#       untracks it -- working even when the source is gone.
+#     - audit reports both (plus links install would create) and fails
+#       (ConflictsFound) if anything diverges.
 #
 # =============================================================================
 
@@ -127,6 +128,10 @@ LINKFILES_DESCRIPTION = (
 # point at a tmpdir.
 INSTALLED_FILE: Path = Path.home() / ".linkfiles.installed"
 
+# The per-link ledger (~/.linkfiles.linked); see the LINKED-FILE LEDGER
+# section. Tests monkeypatch this to point at a tmpdir.
+LINKED_FILE: Path = Path.home() / ".linkfiles.linked"
+
 
 # =============================================================================
 # EXIT CODES
@@ -172,16 +177,24 @@ class UsageError(LinkfilesError):
 # =============================================================================
 
 
-class LinkStatus(Enum):
-    """Status of an entry during operations."""
+class LinkStatus(StrEnum):
+    """Status of an entry during operations. The value is the lowercased,
+    hyphenated member name (NONLINK_CONFLICT -> "nonlink-conflict"), used
+    verbatim as the status text in result output."""
 
-    FILE_CONFLICT = "file-conflict"
-    LINK_CONFLICT = "link-conflict"
-    OK = "ok"
-    MISSING = "missing"
-    INSTALLED = "installed"
-    REMOVED = "removed"
-    STALE = "stale"
+    @staticmethod
+    def _generate_next_value_(
+        name: str, _start: int, _count: int, _last: list[str]
+    ) -> str:
+        return name.lower().replace("_", "-")
+
+    NONLINK_CONFLICT = auto()
+    LINK_CONFLICT = auto()
+    OK = auto()
+    MISSING = auto()
+    INSTALLED = auto()
+    REMOVED = auto()
+    STALE = auto()
 
 
 # =============================================================================
@@ -190,60 +203,110 @@ class LinkStatus(Enum):
 
 
 @dataclass
-class LinkEntry:
-    """Represents a single source-to-target link."""
-
-    relative_path: Path  # Path relative to source directory
-    source_dir: Path  # Absolute path to source directory
-    record: InstallRecord  # the install this link belongs to
-
-    @property
-    def source_path(self) -> Path:
-        """Absolute path to the source file."""
-        return self.source_dir / self.relative_path
-
-    @property
-    def target_path(self) -> Path:
-        """Absolute path to the target symlink under the install's tgt.
-        With the dotfiles flag, the top-level component is dot-prefixed
-        (`bashrc` -> `.bashrc`)."""
-        parts = self.relative_path.parts
-        first = ("." + parts[0]) if self.record.dotfiles else parts[0]
-        return self.record.tgt / Path(first, *parts[1:])
-
-    def compute_relative_symlink(self) -> Path:
-        """Compute relative path from target to source."""
-        target_dir = self.target_path.parent
-        return Path(os.path.relpath(self.source_path, target_dir))
-
-
-@dataclass
 class OperationResult:
-    """Result of an entry operation."""
+    """The outcome of an operation on one link, for reporting."""
 
-    entry: LinkEntry
+    record: LinkRecord
     status: LinkStatus
 
 
 # =============================================================================
-# LINKFILES RECORDS
+# TRACKING-FILE RECORDS
 # =============================================================================
 #
-# The linkfiles tracking file (~/.linkfiles.installed) records one
-# install per line as `<tgt>\t<src>[\t<flags>]`, kept sorted by
-# (tgt, src). tgt / src are tab-and-backslash escaped so an arbitrary
-# path (including one containing a tab or newline) round-trips on a
-# single line; <flags> is a comma-separated subset of the fixed
-# vocabulary below and needs no escaping.
+# Two tracking files share one on-disk format: one record per line, fields
+# tab-separated and backslash-escaped so an arbitrary path (even one with a
+# tab or newline) round-trips on a single line. ~/.linkfiles.installed holds
+# one InstallRecord per install (`<tgt>\t<src>[\t<flags>]`);
+# ~/.linkfiles.linked holds one LinkRecord per individual symlink
+# (`<tgt>\t<src>`). `LineRecord` carries the shared escaping and line
+# (de)serialization; each subclass only declares its field layout.
 
 _FLAG_DOTFILES = "dotfiles"
 _FLAG_NO_RECURSE = "no-recurse"
 
 
 @dataclass(frozen=True)
-class InstallRecord:
-    """One tracked linkfiles install: a source dir linked into a target
-    dir, plus the flags that shaped the link. Identity is (tgt, src)."""
+class LineRecord(ABC):
+    """Base for a record stored one per line in a tab-delimited,
+    backslash-escaped tracking file. Subclasses declare their on-disk
+    fields via `_fields` / `_from_fields`; field escaping and the
+    `to_line` / `from_line` round-trip are shared here."""
+
+    @staticmethod
+    def encode(value: str) -> str:
+        """Escape a single field: the escape char, the field separator
+        (tab), and the record separator (newline)."""
+        return (
+            value.replace("\\", "\\\\")
+            .replace("\t", "\\t")
+            .replace("\n", "\\n")
+        )
+
+    @staticmethod
+    def decode(value: str) -> str:
+        """Inverse of `encode`."""
+        out: list[str] = []
+        i = 0
+        while i < len(value):
+            ch = value[i]
+            if ch == "\\" and i + 1 < len(value):
+                mapped = {"\\": "\\", "t": "\t", "n": "\n"}.get(value[i + 1])
+                if mapped is not None:
+                    out.append(mapped)
+                    i += 2
+                    continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _split(line: str) -> list[str]:
+        """Split a record line on unescaped tabs into still-escaped
+        fields."""
+        fields: list[str] = []
+        cur: list[str] = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == "\\" and i + 1 < len(line):
+                cur.append(ch)
+                cur.append(line[i + 1])
+                i += 2
+                continue
+            if ch == "\t":
+                fields.append("".join(cur))
+                cur = []
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        fields.append("".join(cur))
+        return fields
+
+    @abstractmethod
+    def _fields(self) -> list[str]:
+        """This record's fields, unescaped, in on-disk order."""
+
+    @classmethod
+    @abstractmethod
+    def _from_fields(cls, fields: list[str]) -> Self | None:
+        """Build a record from its split + unescaped fields, or None when
+        the field list is malformed."""
+
+    def to_line(self) -> str:
+        return "\t".join(self.encode(f) for f in self._fields())
+
+    @classmethod
+    def from_line(cls, line: str) -> Self | None:
+        return cls._from_fields([cls.decode(f) for f in cls._split(line)])
+
+
+@dataclass(frozen=True)
+class InstallRecord(LineRecord):
+    """One tracked install: a source dir linked into a target dir, plus
+    the flags that shaped the links. Identity is (tgt, src). Stored in
+    ~/.linkfiles.installed."""
 
     tgt: Path
     src: Path
@@ -259,118 +322,352 @@ class InstallRecord:
             tokens.append(_FLAG_NO_RECURSE)
         return tokens
 
+    def _fields(self) -> list[str]:
+        fields = [str(self.tgt), str(self.src)]
+        tokens = self.flag_tokens()
+        if tokens:
+            fields.append(",".join(tokens))
+        return fields
 
-def _escape_field(value: str) -> str:
-    """Escape a path field for the tab-delimited tracking file: the
-    escape char, the field separator (tab), and the record separator
-    (newline)."""
-    return value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
-
-
-def _unescape_field(value: str) -> str:
-    """Inverse of `_escape_field`."""
-    out: list[str] = []
-    i = 0
-    while i < len(value):
-        ch = value[i]
-        if ch == "\\" and i + 1 < len(value):
-            nxt = value[i + 1]
-            mapped = {"\\": "\\", "t": "\t", "n": "\n"}.get(nxt)
-            if mapped is not None:
-                out.append(mapped)
-                i += 2
-                continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    @classmethod
+    def _from_fields(cls, fields: list[str]) -> InstallRecord | None:
+        if len(fields) < 2:
+            return None
+        flags = set(fields[2].split(",")) if len(fields) > 2 else set()
+        return cls(
+            tgt=Path(fields[0]),
+            src=Path(fields[1]),
+            dotfiles=_FLAG_DOTFILES in flags,
+            no_recurse=_FLAG_NO_RECURSE in flags,
+        )
 
 
-def _split_escaped(line: str) -> list[str]:
-    """Split a record line on unescaped tabs, returning still-escaped
-    fields (each caller unescapes what it keeps)."""
-    fields: list[str] = []
-    cur: list[str] = []
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if ch == "\\" and i + 1 < len(line):
-            cur.append(ch)
-            cur.append(line[i + 1])
-            i += 2
-            continue
-        if ch == "\t":
-            fields.append("".join(cur))
-            cur = []
-            i += 1
-            continue
-        cur.append(ch)
-        i += 1
-    fields.append("".join(cur))
-    return fields
+def _atomic_write(path: Path, content: str) -> None:
+    """Write `content` to `path` atomically -- a temp file in the same
+    directory, fsynced, then `os.replace`d over the target -- so an
+    interrupted write never leaves a half-written tracking file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _serialize(records: Iterable[LineRecord]) -> str:
+    """Render records to tracking-file content, one sorted line each."""
+    return "".join(f"{line}\n" for line in sorted(r.to_line() for r in records))
 
 
 def load_install_records() -> list[InstallRecord]:
-    """Parse the linkfiles tracking file into records. A line with
-    fewer than two fields is malformed and skipped."""
+    """Parse ~/.linkfiles.installed into InstallRecords. A malformed line
+    (fewer than two fields) is skipped."""
     if not INSTALLED_FILE.exists():
         return []
     records: list[InstallRecord] = []
     for line in INSTALLED_FILE.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        fields = _split_escaped(line)
-        if len(fields) < 2:
+        rec = InstallRecord.from_line(line)
+        if rec is None:
             logger.warning("skipping malformed linkfiles record: %s", line)
             continue
-        tgt = Path(_unescape_field(fields[0]))
-        src = Path(_unescape_field(fields[1]))
-        flags = set(fields[2].split(",")) if len(fields) > 2 else set()
-        records.append(
-            InstallRecord(
-                tgt=tgt,
-                src=src,
-                dotfiles=_FLAG_DOTFILES in flags,
-                no_recurse=_FLAG_NO_RECURSE in flags,
-            )
-        )
+        records.append(rec)
     return records
 
 
 def save_install_records(records: list[InstallRecord]) -> None:
-    """Write records to the linkfiles tracking file, sorted by
-    (tgt, src)."""
-    ordered = sorted(records, key=lambda r: (str(r.tgt), str(r.src)))
-    lines: list[str] = []
-    for rec in ordered:
-        parts = [_escape_field(str(rec.tgt)), _escape_field(str(rec.src))]
-        tokens = rec.flag_tokens()
-        if tokens:
-            parts.append(",".join(tokens))
-        lines.append("\t".join(parts))
-    content = "\n".join(lines)
-    if content:
-        content += "\n"
-    INSTALLED_FILE.write_text(content, encoding="utf-8")
+    """Write the install records to ~/.linkfiles.installed (atomic,
+    sorted by line)."""
+    _atomic_write(INSTALLED_FILE, _serialize(records))
 
 
-def add_install_record(record: InstallRecord) -> None:
-    """Record an install, replacing any prior record with the same
-    (tgt, src) so re-installing updates its flags."""
-    records = [
-        r
-        for r in load_install_records()
-        if not (r.tgt == record.tgt and r.src == record.src)
-    ]
-    records.append(record)
-    save_install_records(records)
+# =============================================================================
+# LINKED-FILE LEDGER (~/.linkfiles.linked)
+# =============================================================================
+#
+# An internal record of every individual symlink linkfiles maintains:
+# one `<tgt>\t<src>` line per link (tgt = the symlink, src = the source
+# file it points to), with the same escaping and (tgt, src) sort as the
+# install tracking file. It lets install/remove prune dangling links and
+# tear down an install's links without re-discovering the source -- so
+# cleanup works even when the source directory is gone. `WorldState.load`
+# builds a `LinkPlan` from it (plus the source scan and the targets'
+# on-disk state); the plan is executed and written back here.
+#
+# It is not part of the CLI surface (no --help flag reads or writes it);
+# the man page / GFM doc note it in their FILES section. When the file is
+# absent (a pre-ledger install), the links are seeded in memory from source
+# discovery and written out on the next install.
 
 
-def remove_install_record(tgt: Path, src: Path) -> None:
-    """Drop the (tgt, src) record if present."""
-    records = [
-        r for r in load_install_records() if not (r.tgt == tgt and r.src == src)
-    ]
-    save_install_records(records)
+@dataclass(frozen=True)
+class LinkRecord(LineRecord):
+    """One source-to-target link: `tgt` is the link path, `src` the source
+    file it points to. Identity is (tgt, src); only those two serialize to
+    ~/.linkfiles.linked. Carries the mechanics of the link (its on-disk
+    status, and creating / removing it) plus, once categorized, the
+    `install` it belongs to. `install` is None for a record freshly loaded
+    from the ledger file -- it is stamped when the link is matched to an
+    install while building world state -- and is excluded from identity."""
+
+    tgt: Path
+    src: Path
+
+    # The install this link belongs to, stamped when the record is
+    # categorized (a record loaded from the ledger has none until then).
+    install: InstallRecord | None = field(default=None, compare=False)
+
+    # The on-disk probe, cached per instance so status() (and the
+    # create / remove that consult it) reads the target once. A record is
+    # rebuilt each command and its status is read before the link it
+    # describes is created or removed, so the cache is never observed
+    # stale -- which a process-global cache could not promise.
+    # compare=False keeps two equal records equal regardless of probe.
+    _status: LinkStatus | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+    @property
+    def relative_path(self) -> Path:
+        """The source path relative to the owning install's source dir,
+        for display. Falls back to the basename when src isn't under it."""
+        assert self.install is not None
+        if self.src.is_relative_to(self.install.src):
+            return self.src.relative_to(self.install.src)
+        return Path(self.src.name)
+
+    def _fields(self) -> list[str]:
+        return [str(self.tgt), str(self.src)]
+
+    @classmethod
+    def _from_fields(cls, fields: list[str]) -> LinkRecord | None:
+        if len(fields) < 2:
+            return None
+        return cls(tgt=Path(fields[0]), src=Path(fields[1]))
+
+    def status(self) -> LinkStatus:
+        """Classify what is at `tgt` relative to this record: OK (our
+        symlink, possibly dangling), MISSING (nothing there),
+        LINK_CONFLICT (a symlink elsewhere), NONLINK_CONFLICT (a real
+        file/dir). `src` existence is judged separately, against the
+        scanned source snapshot. The probe is cached after the first
+        call."""
+        cached = self._status
+        if cached is None:
+            cached = self._probe()
+            object.__setattr__(self, "_status", cached)
+        return cached
+
+    def _probe(self) -> LinkStatus:
+        if self.tgt.is_symlink():
+            if _link_target(self.tgt) == self.src:
+                return LinkStatus.OK
+            return LinkStatus.LINK_CONFLICT
+        if self.tgt.exists():
+            return LinkStatus.NONLINK_CONFLICT
+        return LinkStatus.MISSING
+
+    def create(self, *, dry_run: bool) -> LinkStatus:
+        """Create the symlink, returning the resulting status. An
+        already-correct link stays OK; a missing target becomes INSTALLED.
+        A foreign symlink in the way is replaced (the plan schedules a link
+        for creation only once replacement is authorized); a real file/dir
+        is never touched (NONLINK_CONFLICT)."""
+        status = self.status()
+        if status == LinkStatus.OK:
+            return LinkStatus.OK
+        if status == LinkStatus.NONLINK_CONFLICT:
+            return LinkStatus.NONLINK_CONFLICT
+        if status == LinkStatus.LINK_CONFLICT and not dry_run:
+            self.tgt.unlink()
+        if not dry_run:
+            self.tgt.parent.mkdir(parents=True, exist_ok=True)
+            rel = Path(os.path.relpath(self.src, self.tgt.parent))
+            self.tgt.symlink_to(rel)
+        return LinkStatus.INSTALLED
+
+    def remove(self, *, dry_run: bool, target_root: Path) -> bool:
+        """Remove the symlink if linkfiles still owns it, pruning empty
+        parents up to `target_root`. Tolerant of drift -- a link already
+        gone, replaced by the user, or unremovable -- which warns and is
+        skipped without aborting. Returns True if the ledger entry should
+        be dropped (removed, gone, or no longer ours)."""
+        status = self.status()
+        if status != LinkStatus.OK:
+            if status == LinkStatus.MISSING:
+                logger.warning("linked path already gone: %s", self.tgt)
+            else:
+                logger.warning(
+                    "linked path is no longer linkfiles' link, leaving it: %s",
+                    self.tgt,
+                )
+            return True
+        if dry_run:
+            return False
+        try:
+            self.tgt.unlink()
+            _prune_empty_dirs(self.tgt.parent, {target_root})
+        except OSError as exc:
+            logger.warning("could not remove linked path %s: %s", self.tgt, exc)
+            return False
+        return True
+
+
+class LinkPlan:
+    """The categorized plan for one run, kept as a live model of the links.
+    `WorldState.load` builds it from the recorded links (~/.linkfiles.linked),
+    the current source scan, and each target's on-disk state. Executing a
+    phase updates the buckets so the plan always resembles what a reload would
+    produce: `install_links` creates each INSTALL link and moves it to KEEP;
+    `remove_links` drops the links it unlinks and leaves any it could not in
+    REMOVE. `write` persists every still-tracked link (keep + install +
+    remove); conflict links are not ours and orphans were dropped at build
+    time, so neither is written."""
+
+    def __init__(self) -> None:
+        # The buckets a link lands in, after the desired set (the source
+        # scan) is matched against the recorded ledger and the target's
+        # on-disk state:
+        #   keep     -- wanted and already correctly linked; also carries an
+        #               out-of-scope install's recorded links (added by
+        #               WorldState.load), written back untouched and scoped
+        #               out of reporting.
+        #   install  -- wanted but not yet linked (new entry, hand-removed
+        #               link, interrupted run, or a force-replaceable
+        #               conflict).
+        #   remove   -- recorded but no longer wanted (source file gone or
+        #               now ignored).
+        #   conflict -- wanted, but the target is occupied by something else
+        #               (a foreign symlink, or a real file/dir).
+        self.keep: list[LinkRecord] = []
+        self.install: list[LinkRecord] = []
+        self.remove: list[LinkRecord] = []
+        self.conflict: list[LinkRecord] = []
+
+    def preserve(self, link: LinkRecord) -> None:
+        """Carry an out-of-scope install's already-correct link through to
+        keep untouched. Used by `WorldState.load`; the link is written back
+        and scoped out of reporting."""
+        self.keep.append(link)
+
+    def categorize(
+        self,
+        install: InstallRecord,
+        recorded: list[LinkRecord],
+        desired: list[LinkRecord],
+        *,
+        force_install: bool,
+    ) -> None:
+        """Bucket one in-scope install's links, reading each target's on-disk
+        status exactly once. `desired` is what the source currently wants (one
+        scan, ignores applied); `recorded` is the install's links already in
+        the ledger. Each link is stamped with its owning install. A wanted
+        target is keep (already linked), install (missing, or a foreign
+        symlink when `force_install`), or conflict (blocked); a recorded
+        target the source no longer wants is remove. `force_install` is
+        consumed here -- the resulting plan already reflects which conflicts
+        will be replaced."""
+        recorded_by_tgt = {rec.tgt: rec for rec in recorded}
+        wanted = {rec.tgt: rec for rec in desired}
+        # Sorted so each bucket -- and the per-link report built from it --
+        # is deterministic regardless of dict / set iteration order.
+        for tgt in sorted(wanted.keys() | recorded_by_tgt.keys()):
+            want = wanted.get(tgt)
+            link = want if want is not None else recorded_by_tgt[tgt]
+            # Stamp the owning install (a record loaded from the ledger has
+            # none until matched here); for a discovered want it is a no-op.
+            object.__setattr__(link, "install", install)
+            status = link.status()
+            if want is None:
+                self.remove.append(link)
+            elif status == LinkStatus.OK:
+                self.keep.append(link)
+            elif status == LinkStatus.MISSING or (
+                status == LinkStatus.LINK_CONFLICT and force_install
+            ):
+                self.install.append(link)
+            else:
+                self.conflict.append(link)
+
+    def keep_links(self) -> list[OperationResult]:
+        """The keep links, each reported OK. Taken before `install_links`
+        runs, so it is the already-correct links, not the freshly installed
+        ones (which report via `install_links`)."""
+        return [OperationResult(link, LinkStatus.OK) for link in self.keep]
+
+    def conflict_links(self) -> list[OperationResult]:
+        """The conflict links, each reporting its own link / nonlink kind.
+        The bucket already excludes conflicts the plan will replace (those
+        are in install), so this is exactly the conflicts that remain."""
+        return [OperationResult(link, link.status()) for link in self.conflict]
+
+    def remove_links(self, *, dry_run: bool) -> list[OperationResult]:
+        """Unlink every remove link (pruning empty parents), reporting REMOVED
+        when it was ours and is now gone or MISSING when it was already absent
+        or no longer ours. A link that is unlinked leaves the bucket; one that
+        could not be unlinked stays in remove, so it is written back and a
+        later run of its still-tracked install retries it. A dry run reports
+        without unlinking and leaves the bucket untouched. Used to prune stale
+        links (install) and to tear an install down (remove)."""
+        results: list[OperationResult] = []
+        unremovable: list[LinkRecord] = []
+        for link in self.remove:
+            present = link.status() is LinkStatus.OK
+            dropped = link.remove(
+                dry_run=dry_run, target_root=_install_of(link).tgt
+            )
+            if not dropped:
+                unremovable.append(link)
+            results.append(
+                OperationResult(
+                    link,
+                    LinkStatus.REMOVED if present else LinkStatus.MISSING,
+                )
+            )
+        if not dry_run:
+            self.remove = unremovable
+        return results
+
+    def install_links(self, *, dry_run: bool) -> list[OperationResult]:
+        """Create every install link (replacing a foreign symlink, present in
+        this bucket only because the plan authorized replacement), moving each
+        into keep now that it is correctly linked, and report INSTALLED / OK
+        per link. A dry run reports without creating and leaves the buckets
+        untouched."""
+        results: list[OperationResult] = []
+        for link in self.install:
+            results.append(OperationResult(link, link.create(dry_run=dry_run)))
+            if not dry_run:
+                self.keep.append(link)
+        if not dry_run:
+            self.install = []
+        return results
+
+    def describe(self) -> list[OperationResult]:
+        """Per-link outcome for the whole plan without acting on it -- audit's
+        read-only view. Each link reports its own on-disk status (a keep link
+        probes OK, an install link MISSING, a conflict its link / nonlink
+        kind), except a remove link, which is a recorded link the source no
+        longer wants -- on disk a valid symlink (status OK), reported STALE so
+        audit surfaces it as a divergence to prune."""
+        return (
+            [OperationResult(link, link.status()) for link in self.keep]
+            + [OperationResult(link, link.status()) for link in self.install]
+            + [OperationResult(link, LinkStatus.STALE) for link in self.remove]
+            + [OperationResult(link, link.status()) for link in self.conflict]
+        )
+
+    def write(self) -> None:
+        """Persist every still-tracked link to ~/.linkfiles.linked (atomic):
+        the keep links (in-scope, out-of-scope, and -- after `install_links`
+        -- freshly installed), any install links not yet created (recorded
+        write-ahead so an interrupted run re-creates them), and any remove
+        link a removal could not unlink. Conflict links are not ours, and
+        orphans were dropped at build time, so neither is written."""
+        records = self.keep + self.install + self.remove
+        _atomic_write(LINKED_FILE, _serialize(records))
 
 
 # =============================================================================
@@ -461,10 +758,10 @@ def load_ignore_patterns(source_dir: Path) -> set[str]:
     set of editor / swap / autosave file patterns that always apply.
 
     .linkfiles.ignore is the preferred way to exclude something that is
-    tracked in git but should not be linked into the target tree
-    (tests/, README.md, project config). .gitignore / .hgignore covers
-    the case where a file you don't want tracked also shouldn't be linked
-    (editor backups, build outputs).
+    tracked in git but should not be linked into the target tree (tests/,
+    README.md, project config). .gitignore / .hgignore covers the case
+    where a file you don't want tracked also shouldn't be linked (editor
+    backups, build outputs).
 
     Patterns are simple glob patterns (supports *, ?, []).
     Lines starting with # are comments.
@@ -581,9 +878,19 @@ def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
     return False
 
 
-def discover_entries(record: InstallRecord) -> list[LinkEntry]:
+def _target_path(install: InstallRecord, relative: Path) -> Path:
+    """The link path for a source entry: its path relative to the source
+    placed under the install's tgt, with the top-level component
+    dot-prefixed under the dotfiles flag (`bashrc` -> `.bashrc`)."""
+    parts = relative.parts
+    first = ("." + parts[0]) if install.dotfiles else parts[0]
+    return install.tgt / Path(first, *parts[1:])
+
+
+def discover_entries(record: InstallRecord) -> list[LinkRecord]:
     """
-    Discover the entries an install links from its source directory.
+    Discover the links an install wants from its source directory, one
+    LinkRecord per discovered entry (with `install` set).
 
     Common rules:
     - Skip any dotfile -- an entry with a leading-'.' component at any
@@ -607,7 +914,7 @@ def discover_entries(record: InstallRecord) -> list[LinkEntry]:
         raise LinkfilesError(f"Not a directory: {source_dir}")
 
     abs_source_dir = source_dir.resolve()
-    entries: list[LinkEntry] = []
+    links: list[LinkRecord] = []
 
     ignore_patterns = load_ignore_patterns(abs_source_dir)
 
@@ -631,16 +938,16 @@ def discover_entries(record: InstallRecord) -> list[LinkEntry]:
             continue
         if matches_ignore_pattern(relative, ignore_patterns):
             continue
-        entries.append(
-            LinkEntry(
-                relative_path=relative,
-                source_dir=abs_source_dir,
-                record=record,
+        links.append(
+            LinkRecord(
+                tgt=_target_path(record, relative),
+                src=item,
+                install=record,
             )
         )
 
-    entries.sort(key=lambda e: str(e.relative_path))
-    return entries
+    links.sort(key=lambda link: str(link.src))
+    return links
 
 
 # =============================================================================
@@ -648,61 +955,23 @@ def discover_entries(record: InstallRecord) -> list[LinkEntry]:
 # =============================================================================
 
 
-def check_entry_status(entry: LinkEntry) -> LinkStatus:
-    """
-    Check the current status of an entry.
-
-    Returns:
-        OK - if correctly linked
-        MISSING - if target doesn't exist
-        FILE_CONFLICT - if target is a regular file or directory
-        LINK_CONFLICT - if target is a symlink to wrong location
-    """
-    target = entry.target_path
-
-    if not target.exists() and not target.is_symlink():
-        return LinkStatus.MISSING
-
-    if target.is_symlink():
-        # Check if it points to the correct location
-        try:
-            current = Path(os.readlink(target))
-        except OSError:
-            return LinkStatus.LINK_CONFLICT
-
-        # Resolve both to compare
-        try:
-            current_resolved = (target.parent / current).resolve()
-            expected_resolved = entry.source_path.resolve()
-            if current_resolved == expected_resolved:
-                return LinkStatus.OK
-        except OSError:
-            pass
-        return LinkStatus.LINK_CONFLICT
-
-    # It's a regular file or directory
-    return LinkStatus.FILE_CONFLICT
-
-
-def _resolve_link_target(symlink: Path) -> Path | None:
+def _link_target(symlink: Path) -> Path | None:
     """Compute the symlink's immediate target as an absolute path.
 
     The symlink's parent directory is resolved (so paths like
     /tmp/... canonicalize to /private/tmp/... on macOS, matching the
-    resolved source dirs the result is compared against). The
-    readlink value is appended literally and any '.'/'..' segments
-    in the joined path are normalized -- but symlinks within the
-    target are NOT followed.
+    resolved source paths recorded in the ledger). The readlink value
+    is appended literally and any '.'/'..' segments in the joined path
+    are normalized -- but symlinks within the target are NOT followed.
 
     The non-following matters when the source dir contains internal
     symlinks: e.g. claude/DEVELOPMENT_SHARED.md -> ../_repo_shared/
     files/DEVELOPMENT_SHARED.md. A managed link
     ~/.claude/DEVELOPMENT_SHARED.md -> .../dotfiles/claude/
-    DEVELOPMENT_SHARED.md should resolve to the immediate
-    claude/DEVELOPMENT_SHARED.md (which is in the discovered set,
-    so not stale), not to the chain end at _repo_shared/files/...
-    (which would otherwise be classified stale and unlinked,
-    destroying the install).
+    DEVELOPMENT_SHARED.md must match the immediate
+    claude/DEVELOPMENT_SHARED.md the ledger recorded, not the chain end
+    at _repo_shared/files/... (which would make linkfiles disown its
+    own link).
 
     Returns None if the symlink can't be read.
     """
@@ -715,151 +984,6 @@ def _resolve_link_target(symlink: Path) -> Path | None:
     except OSError:
         return None
     return Path(os.path.normpath(str(parent_resolved / link_value)))
-
-
-def _link_source_dir(
-    symlink: Path, source_dirs: list[Path]
-) -> tuple[Path, Path] | None:
-    """If symlink resolves into one of source_dirs, return
-    (matching_source_dir, relative_path_within_it).
-
-    source_dirs must already be resolved (no further .resolve() done
-    here). Returns None when the symlink points outside every
-    candidate or can't be read.
-    """
-    target = _resolve_link_target(symlink)
-    if target is None:
-        return None
-    for src in source_dirs:
-        try:
-            rel = target.relative_to(src)
-        except ValueError:
-            continue
-        return (src, rel)
-    return None
-
-
-def _stale_managed_links(
-    sources: dict[Path, set[Path]],
-    scan_dirs: Iterable[Path],
-) -> list[tuple[Path, Path, Path]]:
-    """Find managed-but-stale symlinks under scan_dirs.
-
-    A managed link is one whose resolved target lies inside a key of
-    `sources` (which maps a resolved source dir to the set of relative
-    paths currently delivered by that source). A managed link is stale
-    when its relative path is not in that set -- either because the
-    file was removed from the source repo or now matches an ignore
-    pattern.
-
-    Returns a list of (symlink, source_dir, relative_path) tuples.
-    """
-    src_list = list(sources.keys())
-    found: list[tuple[Path, Path, Path]] = []
-    for scan_dir in sorted(set(scan_dirs)):
-        if not scan_dir.is_dir():
-            continue
-        for item in sorted(scan_dir.iterdir()):
-            if not item.is_symlink():
-                continue
-            link = _link_source_dir(item, src_list)
-            if link is None:
-                continue
-            src, rel = link
-            if rel not in sources[src]:
-                found.append((item, src, rel))
-    return found
-
-
-def _scan_dirs_for_entries(
-    entries: list[LinkEntry], target_root: Path
-) -> set[Path]:
-    """Return the directory set to scan for symlinks managed by the
-    given entries: target_root plus the parent directory of each
-    entry's target_path."""
-    scan_dirs: set[Path] = {target_root}
-    for entry in entries:
-        scan_dirs.add(entry.target_path.parent)
-    return scan_dirs
-
-
-def install_entry(
-    entry: LinkEntry,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-) -> OperationResult:
-    """
-    Install a single entry.
-
-    Args:
-        entry: The entry to install
-        dry_run: If True, don't make any changes
-        force: If True, replace conflicting symlinks (not files)
-
-    Returns:
-        OperationResult with appropriate status
-    """
-    status = check_entry_status(entry)
-
-    if status == LinkStatus.OK:
-        return OperationResult(entry=entry, status=LinkStatus.OK)
-
-    if status == LinkStatus.FILE_CONFLICT:
-        return OperationResult(entry=entry, status=LinkStatus.FILE_CONFLICT)
-
-    if status == LinkStatus.LINK_CONFLICT:
-        if not force:
-            return OperationResult(entry=entry, status=LinkStatus.LINK_CONFLICT)
-        # Force mode: remove the conflicting symlink
-        if not dry_run:
-            entry.target_path.unlink()
-        # Continue to install
-
-    # MISSING or (LINK_CONFLICT with force) - proceed with installation
-    if not dry_run:
-        # Ensure parent directory exists
-        entry.target_path.parent.mkdir(parents=True, exist_ok=True)
-        # Create relative symlink
-        relative_link = entry.compute_relative_symlink()
-        entry.target_path.symlink_to(relative_link)
-
-    return OperationResult(entry=entry, status=LinkStatus.INSTALLED)
-
-
-def remove_entry(
-    entry: LinkEntry,
-    *,
-    dry_run: bool = False,
-) -> OperationResult:
-    """
-    Remove a single entry.
-
-    Only removes symlinks that point to the correct source.
-    Leaves invalid/conflicting entries alone.
-
-    Args:
-        entry: The entry to remove
-        dry_run: If True, don't make any changes
-
-    Returns:
-        OperationResult with appropriate status
-    """
-    status = check_entry_status(entry)
-
-    if status == LinkStatus.MISSING:
-        # Already gone, nothing to do
-        return OperationResult(entry=entry, status=LinkStatus.MISSING)
-
-    if status == LinkStatus.OK:
-        # Correctly linked, safe to remove
-        if not dry_run:
-            entry.target_path.unlink()
-            _cleanup_empty_parents(entry.target_path.parent, entry.record.tgt)
-        return OperationResult(entry=entry, status=LinkStatus.REMOVED)
-
-    # FILE_CONFLICT or LINK_CONFLICT - leave alone
-    return OperationResult(entry=entry, status=status)
 
 
 def _prune_empty_dirs(directory: Path, stop_at: set[Path]) -> None:
@@ -875,70 +999,9 @@ def _prune_empty_dirs(directory: Path, stop_at: set[Path]) -> None:
             break
 
 
-def _cleanup_empty_parents(directory: Path, target_root: Path) -> None:
-    """Remove empty parent directories up to but not including
-    target_root."""
-    _prune_empty_dirs(directory, {target_root})
-
-
-def audit_entry(entry: LinkEntry) -> OperationResult:
-    """
-    Audit a single entry.
-
-    Returns the current status without making any changes.
-    """
-    status = check_entry_status(entry)
-    return OperationResult(entry=entry, status=status)
-
-
 # =============================================================================
-# DIRECTORY OPERATIONS
+# RESULT REPORTING
 # =============================================================================
-
-
-def _process_entries(
-    entries: list[LinkEntry],
-    operation: str,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-) -> list[OperationResult]:
-    """Apply operation to each entry and return the results."""
-    results: list[OperationResult] = []
-    for entry in entries:
-        if operation == "install":
-            result = install_entry(entry, dry_run=dry_run, force=force)
-        elif operation == "remove":
-            result = remove_entry(entry, dry_run=dry_run)
-        elif operation == "audit":
-            result = audit_entry(entry)
-        else:
-            raise ValueError(f"Unknown operation: {operation}")
-        results.append(result)
-    return results
-
-
-def process_directory(
-    record: InstallRecord,
-    operation: str,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-) -> list[OperationResult]:
-    """
-    Process all entries an install links from its source directory.
-
-    Args:
-        record: The install whose entries to process
-        operation: One of "install", "remove", "audit"
-        dry_run: If True, don't make any changes
-        force: If True, replace conflicting symlinks (install only)
-
-    Returns:
-        List of OperationResult objects
-    """
-    entries = discover_entries(record)
-    return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
 # Per-operation classification of which LinkStatus values count
@@ -949,15 +1012,15 @@ def process_directory(
 # status that says the target tree diverges from the discovered set
 # is a problem the user needs to see.
 _INSTALL_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
-    {LinkStatus.FILE_CONFLICT, LinkStatus.LINK_CONFLICT}
+    {LinkStatus.NONLINK_CONFLICT, LinkStatus.LINK_CONFLICT}
 )
 _REMOVE_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
-    {LinkStatus.FILE_CONFLICT, LinkStatus.LINK_CONFLICT}
+    {LinkStatus.NONLINK_CONFLICT, LinkStatus.LINK_CONFLICT}
 )
 _AUDIT_PROBLEM_STATUSES: frozenset[LinkStatus] = frozenset(
     {
         LinkStatus.MISSING,
-        LinkStatus.FILE_CONFLICT,
+        LinkStatus.NONLINK_CONFLICT,
         LinkStatus.LINK_CONFLICT,
         LinkStatus.STALE,
     }
@@ -1007,7 +1070,7 @@ def log_results(
         for result in results:
             logger.info(
                 "    %s: %s",
-                result.entry.relative_path,
+                result.record.relative_path,
                 _format_status(result.status, problem_statuses),
             )
         return
@@ -1021,55 +1084,36 @@ def log_results(
     for result in non_ok:
         logger.info(
             "    %s: %s",
-            result.entry.relative_path,
+            result.record.relative_path,
             _format_status(result.status, problem_statuses),
         )
 
 
-def has_conflicts(results: list[OperationResult]) -> bool:
-    """Check if any results indicate a conflict."""
-    conflict_statuses = {
-        LinkStatus.FILE_CONFLICT,
-        LinkStatus.LINK_CONFLICT,
-    }
-    return any(r.status in conflict_statuses for r in results)
+def _install_of(link: LinkRecord) -> InstallRecord:
+    """The install a categorized link belongs to (stamped in categorize)."""
+    assert link.install is not None
+    return link.install
 
 
-def has_missing(results: list[OperationResult]) -> bool:
-    """Check if any results indicate missing entries."""
-    return any(r.status == LinkStatus.MISSING for r in results)
-
-
-def has_stale(results: list[OperationResult]) -> bool:
-    """Check if any results indicate a stale managed symlink."""
-    return any(r.status == LinkStatus.STALE for r in results)
-
-
-def _find_stale_for_dir(
-    record: InstallRecord,
-    entries: list[LinkEntry],
-) -> list[tuple[Path, LinkEntry]]:
-    """Find managed-but-stale symlinks for one install.
-
-    Returns (symlink, synthesized LinkEntry) tuples. The
-    synthesized entry has its relative_path set to the path inside
-    the source that the stale link points to, so callers can
-    package it as an OperationResult or unlink the symlink.
-    """
-    src_resolved = record.src.resolve()
-    discovered_rels = {e.relative_path for e in entries}
-    sources = {src_resolved: discovered_rels}
-    scan_dirs = _scan_dirs_for_entries(entries, record.tgt)
-
-    stale: list[tuple[Path, LinkEntry]] = []
-    for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
-        synth_entry = LinkEntry(
-            relative_path=rel,
-            source_dir=src_resolved,
-            record=record,
+def _report(
+    state: WorldState,
+    results: list[OperationResult],
+    problem_statuses: frozenset[LinkStatus],
+    *,
+    verbose: bool,
+) -> None:
+    """Log per-link outcomes under each in-scope install's source header,
+    grouped by the install each link belongs to."""
+    grouped: dict[InstallRecord, list[OperationResult]] = {}
+    for result in results:
+        grouped.setdefault(_install_of(result.record), []).append(result)
+    for install in state.scope:
+        log_results(
+            install.src,
+            grouped.get(install, []),
+            verbose=verbose,
+            problem_statuses=problem_statuses,
         )
-        stale.append((symlink, synth_entry))
-    return stale
 
 
 # =============================================================================
@@ -1077,101 +1121,254 @@ def _find_stale_for_dir(
 # =============================================================================
 
 
-# The do_* handlers resolve an invocation to a list of InstallRecord
-# targets -- one per tracked install -- and hand off to these shared
-# runners.
+# The do_* handlers build the WorldState for an invocation -- resolving the
+# tracked installs and the in-scope set, and categorizing the link plan --
+# then hand off to these shared runners.
 
 
-def _run_install(
-    targets: list[InstallRecord],
-    *,
-    dry_run: bool,
-    force: bool,
-    verbose: bool,
-) -> None:
-    """Sync each install: link new entries, prune the source's stale
-    managed links, and raise on conflict.
+@dataclass
+class WorldState:
+    """The categorized world a subcommand acts on. `installs` is the set
+    written back to ~/.linkfiles.installed when the command finishes (for
+    install, every tracked install including a new one; for remove, the ones
+    that survive); `scope` the installs whose links this command processes
+    and reports; `plan` the categorized LinkPlan; `missing_sources` the
+    in-scope installs whose source dir is gone (their desired set is empty,
+    so their recorded links fall to REMOVE)."""
 
-    install is a sync operation: after it runs, each target tree
-    reflects its source's current discovered set. Files removed from
-    the source or newly matched by an ignore file have their managed
-    symlinks pruned, scoped to the source being installed."""
-    had_conflicts = False
-    for record in targets:
-        if not record.src.is_dir():
-            raise LinkfilesError(
-                f"Source directory does not exist: {record.src}"
+    installs: list[InstallRecord]
+    scope: list[InstallRecord]
+    plan: LinkPlan
+    missing_sources: list[InstallRecord]
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        install: InstallRecord | None = None,
+        remove: InstallRecord | None = None,
+        remove_all: bool = False,
+        force_install: bool = False,
+    ) -> WorldState:
+        """Resolve the tracked install set against ~/.linkfiles.installed and
+        build the categorized plan. At most one of `install` / `remove` /
+        `remove_all` selects the operation; none re-syncs (or audits) every
+        tracked install:
+
+        - `install`: add or update this install and put it in scope.
+        - `remove`: drop this install from the tracked set, with its links in
+          scope (categorized REMOVE, since a removed install wants nothing).
+        - `remove_all`: every install leaves the tracked set; all in scope.
+        - none: every tracked install is in scope, the tracked set unchanged.
+
+        `force_install` is forwarded to categorization, so the returned plan
+        already encodes which conflicts will be replaced."""
+        installs = load_install_records()
+        if install is not None:
+            installs = [
+                r
+                for r in installs
+                if not (r.tgt == install.tgt and r.src == install.src)
+            ]
+            installs.append(install)
+            scope = [install]
+        elif remove is not None:
+            scope = [remove]
+            installs = [r for r in installs if r != remove]
+        elif remove_all:
+            scope = installs
+            installs = []
+        else:
+            scope = installs
+        return cls._build(installs, scope, force_install=force_install)
+
+    @classmethod
+    def _build(
+        cls,
+        installs: list[InstallRecord],
+        scope: list[InstallRecord],
+        *,
+        force_install: bool,
+    ) -> WorldState:
+        """Partition the recorded links against the tracked-and-scoped
+        installs and categorize each in-scope install's links from one source
+        scan (ignores applied) plus one stat per target. A link owned by an
+        in-scope install feeds its categorization; one owned by a
+        tracked-but-out-of-scope install goes straight to KEEP (carried
+        through untouched, scoped out of reporting); one owned by no tracked
+        install (an orphan) is dropped. The links seed from source discovery
+        when ~/.linkfiles.linked is absent -- from `installs` plus any `scope`
+        installs not in it, so a removed install (no longer in `installs`)
+        still gets its links seeded and cleaned."""
+        known = installs + [s for s in scope if s not in installs]
+        recorded = cls.load_link_records()
+        if not recorded and not LINKED_FILE.exists():
+            recorded = cls._seed_links_from_sources(known)
+        scope_set = set(scope)
+        per_install: dict[InstallRecord, list[LinkRecord]] = {
+            install: [] for install in scope
+        }
+        plan = LinkPlan()
+        for link in recorded:
+            owner = cls._owning_install(link, known)
+            if owner in scope_set:
+                per_install[owner].append(link)
+            elif owner is not None:
+                object.__setattr__(link, "install", owner)
+                plan.preserve(link)
+        installs_set = set(installs)
+        missing: list[InstallRecord] = []
+        for install in scope:
+            # An in-scope install absent from the tracked-after set is being
+            # removed: it wants nothing, so its recorded links all fall to
+            # REMOVE. One that stays tracked is synced against its source.
+            if install in installs_set:
+                desired = _desired_links(install)
+                if not install.src.is_dir():
+                    missing.append(install)
+            else:
+                desired = []
+            plan.categorize(
+                install,
+                per_install[install],
+                desired,
+                force_install=force_install,
             )
-        entries = discover_entries(record)
-        results = _process_entries(
-            entries, "install", dry_run=dry_run, force=force
+        return cls(
+            installs=installs,
+            scope=scope,
+            plan=plan,
+            missing_sources=missing,
         )
-        for symlink, synth_entry in _find_stale_for_dir(record, entries):
-            if not dry_run:
-                symlink.unlink()
-                _cleanup_empty_parents(symlink.parent, record.tgt)
-            results.append(OperationResult(synth_entry, LinkStatus.STALE))
-        log_results(
-            record.src,
-            results,
-            verbose=verbose,
-            problem_statuses=_INSTALL_PROBLEM_STATUSES,
+
+    def save(self) -> None:
+        """Persist the run's result: the surviving install records to
+        ~/.linkfiles.installed and the post-run link plan to
+        ~/.linkfiles.linked."""
+        save_install_records(self.installs)
+        self.plan.write()
+
+    @staticmethod
+    def load_link_records() -> list[LinkRecord]:
+        """Parse ~/.linkfiles.linked into LinkRecords (empty when the file
+        is absent). A malformed line (fewer than two fields) is skipped."""
+        if not LINKED_FILE.exists():
+            return []
+        records: list[LinkRecord] = []
+        for line in LINKED_FILE.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = LinkRecord.from_line(line)
+            if rec is None:
+                logger.warning("skipping malformed linkfiles link: %s", line)
+                continue
+            records.append(rec)
+        return records
+
+    @staticmethod
+    def _seed_links_from_sources(
+        installs: list[InstallRecord],
+    ) -> list[LinkRecord]:
+        """Seed the link set from each install's expected links by
+        discovering its source. Used once when ~/.linkfiles.linked is
+        absent, so a pre-ledger install has a baseline before the file is
+        first written. A source already gone at seed time leaves no record
+        of the links it once created, so its dangling links can't be seeded
+        (or cleaned) until the source returns and a later install re-seeds
+        from it."""
+        records: list[LinkRecord] = []
+        for install in installs:
+            if not install.src.is_dir():
+                continue
+            records.extend(discover_entries(install))
+        return records
+
+    @staticmethod
+    def _owning_install(
+        link: LinkRecord, installs: list[InstallRecord]
+    ) -> InstallRecord | None:
+        """The install a recorded link belongs to: its source under the
+        install's src and its target under the install's tgt. Install
+        sources are non-nested, so at most one install matches; a link
+        matching none is an orphan no longer owned by any tracked install."""
+        for install in installs:
+            if link.src.is_relative_to(install.src) and link.tgt.is_relative_to(
+                install.tgt
+            ):
+                return install
+        return None
+
+
+def _desired_links(record: InstallRecord) -> list[LinkRecord]:
+    """The links a source currently wants (ignores already applied), or
+    an empty list when the source dir is gone."""
+    if not record.src.is_dir():
+        return []
+    return discover_entries(record)
+
+
+def _run_install(state: WorldState, *, dry_run: bool, verbose: bool) -> None:
+    """Apply the plan in an interruption-safe order: unlink every REMOVE
+    link, persist the tracking files (.installed then .linked) recording the
+    wanted links *before* they exist, then create them. A crash at any step
+    leaves a state the next run reconciles. A CONFLICT is a hard error unless
+    the plan already resolved it (a foreign symlink under --force, which the
+    plan placed in INSTALL); a non-link is never touched. Raises
+    ConflictsFound if any wanted link stays blocked."""
+    plan = state.plan
+    for install in state.missing_sources:
+        logger.warning(
+            "tracked source is missing, pruning its links: %s", install.src
         )
-        if has_conflicts(results):
-            had_conflicts = True
-    if had_conflicts:
+    # Take the keep report before install_links moves the freshly created
+    # links into KEEP, so the two don't overlap.
+    keep_results = plan.keep_links()
+    remove_results = plan.remove_links(dry_run=dry_run)
+    # Record the links we will own before creating them: .installed then
+    # .linked, so an install interrupted partway is recovered (a
+    # recorded-but-missing link is re-created on the next run).
+    if not dry_run:
+        state.save()
+    install_results = plan.install_links(dry_run=dry_run)
+    results = (
+        keep_results + remove_results + install_results + plan.conflict_links()
+    )
+    _report(state, results, _INSTALL_PROBLEM_STATUSES, verbose=verbose)
+    if any(r.status in _INSTALL_PROBLEM_STATUSES for r in results):
         raise ConflictsFound("Conflicts found during install")
 
 
-def _run_audit(targets: list[InstallRecord], *, verbose: bool) -> None:
-    """Report each install's status plus any stale managed links; raise
-    if anything diverges from the discovered set."""
-    had_issues = False
-    for record in targets:
-        if not record.src.exists():
-            continue
-        entries = discover_entries(record)
-        results = _process_entries(entries, "audit")
-        for _symlink, synth_entry in _find_stale_for_dir(record, entries):
-            results.append(OperationResult(synth_entry, LinkStatus.STALE))
-        log_results(
-            record.src,
-            results,
-            verbose=verbose,
-            problem_statuses=_AUDIT_PROBLEM_STATUSES,
-        )
-        if has_conflicts(results) or has_missing(results) or has_stale(results):
-            had_issues = True
-    if had_issues:
+def _run_audit(state: WorldState, *, verbose: bool) -> None:
+    """Report, without changing anything, how each install diverges from
+    its source -- straight from the plan's buckets, no further IO: install
+    links would be created (missing), remove links pruned (stale), conflict
+    links are blocked, keep links are fine. Raises if anything diverges."""
+    for install in state.missing_sources:
+        logger.warning("tracked source is missing: %s", install.src)
+    results = state.plan.describe()
+    _report(state, results, _AUDIT_PROBLEM_STATUSES, verbose=verbose)
+    # A link in any non-keep bucket means the target tree diverges from what
+    # the sources want.
+    plan = state.plan
+    if plan.install or plan.remove or plan.conflict:
         raise ConflictsFound(
             "Conflicts, missing entries, or stale links found during audit"
         )
 
 
-def _run_remove(
-    targets: list[InstallRecord],
-    *,
-    dry_run: bool,
-    verbose: bool,
-    on_removed: Callable[[InstallRecord], None],
-) -> None:
-    """Remove each install's managed links, then untrack it via
-    `on_removed` (skipped on a dry run). Only symlinks that point to the
-    correct source are removed."""
-    for record in targets:
-        if not record.src.exists():
-            raise LinkfilesError(
-                f"Source directory does not exist: {record.src}"
-            )
-        results = process_directory(record, "remove", dry_run=dry_run)
-        log_results(
-            record.src,
-            results,
-            verbose=verbose,
-            problem_statuses=_REMOVE_PROBLEM_STATUSES,
-        )
-        if not dry_run:
-            on_removed(record)
+def _run_remove(state: WorldState, *, dry_run: bool, verbose: bool) -> None:
+    """Tear down every recorded link of each in-scope install -- live or
+    dangling, even when the source or target dir is gone. A removed install
+    wants nothing, so all its links are REMOVE; surviving installs' links are
+    preserved untouched. A link no longer ours (a foreign file or symlink now
+    at the path) is left in place with a warning; only its record is dropped.
+    The teardown is recorded (the surviving installs to .installed, the
+    dropped links to .linked) only after every link is gone, so an
+    interrupted remove is completed, not undone."""
+    results = state.plan.remove_links(dry_run=dry_run)
+    if not dry_run:
+        state.save()
+    _report(state, results, _REMOVE_PROBLEM_STATUSES, verbose=verbose)
 
 
 def do_install(
@@ -1183,33 +1380,43 @@ def do_install(
     dry_run: bool,
     force: bool,
     verbose: bool,
-) -> None:
+) -> ExitCode | None:
     """Install a source dir's entries into an explicit target dir
     (recording the install + its flags), or re-sync every tracked
-    install when neither source nor target is given."""
+    install when neither source nor target is given. An explicit but
+    missing source is an error; a tracked source that has since gone
+    missing has its dangling links pruned and returns WARNING (the
+    install record is kept so a restored source is re-linked)."""
     if source_dir is not None:
         assert target_dir is not None  # the parser validates them together
         src = source_dir.expanduser().resolve()
         target = target_dir.expanduser().resolve()
         if not src.is_dir():
             raise LinkfilesError(f"Source directory does not exist: {src}")
-        record = InstallRecord(
+        # Each install's source must be distinct and not nested within
+        # another's: that keeps a recorded link's source under exactly one
+        # install, so cleanup attributes it unambiguously. (Targets may
+        # nest freely -- the source is the discriminator.)
+        for other in load_install_records():
+            if other.tgt == target and other.src == src:
+                continue
+            if src.is_relative_to(other.src) or other.src.is_relative_to(src):
+                raise LinkfilesError(
+                    f"source {src} nests with tracked install's source "
+                    f"{other.src}; install sources must be distinct and "
+                    "not nested within one another"
+                )
+        new = InstallRecord(
             tgt=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
         )
-        if not dry_run:
-            add_install_record(record)
-        targets = [record]
+        state = WorldState.load(install=new, force_install=force)
     else:
-        targets = load_install_records()
-        if not targets:
+        if not load_install_records():
             logger.info("No installs tracked.")
-            return
-    _run_install(targets, dry_run=dry_run, force=force, verbose=verbose)
-
-
-def _untrack_record(record: InstallRecord) -> None:
-    """Drop the tracked record for this install."""
-    remove_install_record(record.tgt, record.src)
+            return None
+        state = WorldState.load(force_install=force)
+    _run_install(state, dry_run=dry_run, verbose=verbose)
+    return ExitCode.WARNING if state.missing_sources else None
 
 
 def do_remove(
@@ -1219,20 +1426,16 @@ def do_remove(
     all_installs: bool,
     dry_run: bool,
     verbose: bool,
-) -> None:
+) -> ExitCode | None:
     """Remove one tracked install's links (identified by its source and
     target dirs) and untrack it, or every tracked install with
     `all_installs`. Requiring one of the two -- rather than treating a
     bare `remove` as remove-everything -- guards against accidentally
-    wiping every install."""
-    if all_installs:
-        targets = load_install_records()
-        if not targets:
-            logger.info("No installs tracked.")
-            return
-    else:
-        # A non-all remove always names both dirs (parser-validated).
-        assert source_dir is not None and target_dir is not None
+    wiping every install. Removal is driven by the link ledger, so an
+    install whose source or target dir has gone missing still has its
+    links cleaned up and is untracked."""
+    if source_dir is not None:
+        assert target_dir is not None  # the parser validates them together
         src = source_dir.expanduser().resolve()
         target = target_dir.expanduser().resolve()
         record = next(
@@ -1245,26 +1448,33 @@ def do_remove(
         )
         if record is None:
             raise LinkfilesError(f"No tracked install: {src} -> {target}")
-        targets = [record]
-    _run_remove(
-        targets,
-        dry_run=dry_run,
-        verbose=verbose,
-        on_removed=_untrack_record,
-    )
+        state = WorldState.load(remove=record)
+    else:
+        assert all_installs  # parser: a bare remove (no pair, no --all) errors
+        if not load_install_records():
+            logger.info("No installs tracked.")
+            return None
+        state = WorldState.load(remove_all=True)
+    _run_remove(state, dry_run=dry_run, verbose=verbose)
+    return None
 
 
-def do_audit(*, verbose: bool) -> None:
-    """Audit every tracked install (each under its own target root).
+def do_audit(*, verbose: bool) -> ExitCode | None:
+    """Audit every tracked install (each under its own target root),
+    without changing anything.
 
-    Reports the status of each discovered entry plus any STALE managed
-    symlinks -- symlinks under a target root that point into the audited
-    source but whose relative path is no longer in the discovered set
-    (file removed from the source, or matched by an ignore file)."""
-    targets = load_install_records()
-    if not targets:
-        return
-    _run_audit(targets, verbose=verbose)
+    Reports each link `install` would create (a source entry not yet
+    linked), any conflicts, and any dangling/stale link `install` would
+    prune (a recorded link whose source file is gone or no longer
+    wanted). Any divergence -- including the dangling links of a tracked
+    source that has gone missing -- raises ConflictsFound. WARNING is
+    returned only when a tracked source is missing but nothing diverges
+    (its links were already pruned)."""
+    if not load_install_records():
+        return None
+    state = WorldState.load()
+    _run_audit(state, verbose=verbose)
+    return ExitCode.WARNING if state.missing_sources else None
 
 
 # =============================================================================
@@ -1470,7 +1680,7 @@ def build_parser() -> StrictArgumentParser:
 # COMMAND DISPATCH
 # =============================================================================
 
-COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
+COMMAND_CALLBACKS: dict[str, Callable[..., ExitCode | None]] = {
     "install": do_install,
     "remove": do_remove,
     "audit": do_audit,
@@ -1485,11 +1695,14 @@ def cli() -> int:
     command = args_dict.pop("command")
 
     try:
-        COMMAND_CALLBACKS[command](**args_dict)
+        result = COMMAND_CALLBACKS[command](**args_dict)
     except LinkfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
-    return ExitCode.SUCCESS
+    # A callback returns an ExitCode to override the default (e.g. install
+    # / audit return WARNING when a tracked source has gone missing);
+    # otherwise the command succeeded.
+    return result if isinstance(result, ExitCode) else ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

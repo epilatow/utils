@@ -78,6 +78,13 @@ Report the status of every tracked install; exits non\-zero on conflicts, missin
 .TP
 \f[CR]\(ti/.linkfiles.installed\f[R]
 Tracks installed directory pairs (source + target) and installation options.\&
+.TP
+\f[CR]\(ti/.linkfiles.linked\f[R]
+Tracks installed links (source + target pairs).\&
+.TP
+\f[CR]$REPO/.linkfiles.ignore\f[R]
+A file containing gitignore style patterns used to specify repo files that should be ignored by linkfiles.\&
+Used when source_dir is $REPO or a child of $REPO.\&
 .SH EXIT STATUS
 .PD 0
 .TP
