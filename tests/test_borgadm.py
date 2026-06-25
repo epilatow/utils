@@ -345,26 +345,35 @@ class TestArgumentParser:
         assert args.command == "repair delete-cache"
 
     def test_repair_repo_yes_parses(self) -> None:
-        """Test repair repo --yes parses."""
+        """repair repo --yes parses; the validator consumes --yes."""
         parser = ba.args_parser()
         args = parser.parse_command(["repair", "repo", "--yes"])
         assert args.command == "repair repo"
-        assert args.yes is True
+        assert not hasattr(args, "yes")
 
-    def test_repair_repo_no_yes_parses(self) -> None:
-        """Test repair repo without --yes defaults to False."""
+    def test_repair_repo_no_yes_errors(self) -> None:
+        """repair repo without --yes is rejected by the parser (exit 2)
+        before any dispatch -- the confirmation gate lives there now."""
         parser = ba.args_parser()
-        args = parser.parse_command(["repair", "repo"])
-        assert args.command == "repair repo"
-        assert args.yes is False
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(["repair", "repo"])
+        assert exc.value.code == 2
 
     @pytest.mark.parametrize("mode", ["repo", "archives", "full"])
     def test_repair_modes_parse(self, mode: str) -> None:
-        """Each repair mode parses and carries the --yes gate."""
+        """Each repair mode parses with --yes and consumes it."""
         parser = ba.args_parser()
         args = parser.parse_command(["repair", mode, "--yes"])
         assert args.command == f"repair {mode}"
-        assert args.yes is True
+        assert not hasattr(args, "yes")
+
+    @pytest.mark.parametrize("mode", ["repo", "archives", "full"])
+    def test_repair_modes_require_yes(self, mode: str) -> None:
+        """Each repair mode requires --yes (exit 2 without it)."""
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(["repair", mode])
+        assert exc.value.code == 2
 
     def test_common_args_rejected_before_action(self) -> None:
         """Common args between subcommand and action should fail."""
@@ -505,6 +514,8 @@ class TestCmdCallbacks(CmdCallbacksBase):
         "keep_weekly",
         "keep_monthly",
         "keep_yearly",
+        # Consumed by the repair-check parser validator:
+        "yes",
     }
 
     @pytest.fixture(autouse=True)
@@ -546,22 +557,6 @@ class TestRepair:
                 ]
             )
 
-    @pytest.mark.usefixtures("mock_cfg")
-    def test_repair_repo_without_yes_exits(self) -> None:
-        """Test that repair repo without --yes raises BorgadmError."""
-        with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
-            patch.object(
-                ba,
-                "borg_cmd",
-                autospec=True,
-                return_value=["borg"],
-            ),
-            pytest.raises(ba.BorgadmError),
-        ):
-            ba.do_repair_repo(progress=False, yes=False)
-        mock_run_cmd.assert_not_called()
-
     def _assert_repair_argv(
         self, mock_run_cmd: Any, repo: str, expected_args: list[str]
     ) -> None:
@@ -580,7 +575,7 @@ class TestRepair:
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_repair_repo(progress=False, yes=True)
+            ba.do_repair_repo(progress=False)
         self._assert_repair_argv(
             mock_run_cmd, mock_cfg.BORG_REPO, ["--repository-only"]
         )
@@ -591,7 +586,7 @@ class TestRepair:
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_repair_repo(progress=True, yes=True)
+            ba.do_repair_repo(progress=True)
         self._assert_repair_argv(
             mock_run_cmd,
             mock_cfg.BORG_REPO,
@@ -604,7 +599,7 @@ class TestRepair:
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_repair_archives(progress=False, yes=True)
+            ba.do_repair_archives(progress=False)
         self._assert_repair_argv(
             mock_run_cmd, mock_cfg.BORG_REPO, ["--archives-only"]
         )
@@ -615,23 +610,8 @@ class TestRepair:
             patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_repair_full(progress=False, yes=True)
+            ba.do_repair_full(progress=False)
         self._assert_repair_argv(mock_run_cmd, mock_cfg.BORG_REPO, [])
-
-    @pytest.mark.usefixtures("mock_cfg")
-    @pytest.mark.parametrize(
-        "func",
-        ["do_repair_archives", "do_repair_full"],
-    )
-    def test_repair_without_yes_exits(self, func: str) -> None:
-        """Every repair variant refuses to run without --yes."""
-        with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            pytest.raises(ba.BorgadmError),
-        ):
-            getattr(ba, func)(progress=False, yes=False)
-        mock_run_cmd.assert_not_called()
 
 
 class TestDelete:

@@ -1453,9 +1453,10 @@ def _borg_check_cmd(
 
     `repository_only` and `archives_only` select borg's two check phases
     (segment/index vs. archive metadata) and are mutually exclusive;
-    passing neither runs both. `repair` adds --repair -- callers gate it
-    behind --yes and set the BORG_CHECK_I_KNOW_WHAT_I_AM_DOING env borg
-    requires for non-interactive repair.
+    passing neither runs both. `repair` adds --repair -- the parser
+    requires --yes before any --repair caller runs, and the caller sets
+    the BORG_CHECK_I_KNOW_WHAT_I_AM_DOING env borg requires for
+    non-interactive repair.
     """
     assert not (repository_only and archives_only), (
         "repository_only and archives_only are mutually exclusive"
@@ -2124,7 +2125,6 @@ def do_repair_delete_cache() -> None:
 def _repair_check(
     *,
     progress: bool,
-    yes: bool,
     repository_only: bool = False,
     archives_only: bool = False,
 ) -> None:
@@ -2132,19 +2132,11 @@ def _repair_check(
 
     `repository_only` / `archives_only` scope the repair to one of
     borg's two check phases (see `_borg_check_cmd`); passing neither
-    repairs both. The --yes gate guards every variant -- repair is
-    potentially lossy for corruption borg cannot fully resolve.
+    repairs both. Repair is potentially lossy for corruption borg
+    cannot fully resolve, so the parser requires `--yes` before any of
+    these run.
     """
     cfg = get_cfg()
-    if not yes:
-        raise BorgadmError(
-            "This is a potentially dangerous function.\n"
-            "check --repair might lead to data loss (for kinds"
-            " of corruption it is not\n"
-            "capable of dealing with). BE VERY CAREFUL!\n"
-            "\n"
-            "Pass --yes to confirm you understand the risks."
-        )
     logger.info(f"Repairing repo: {cfg.BORG_REPO}")
     cmd = _borg_check_cmd(
         cfg.BORG_REPO,
@@ -2161,16 +2153,16 @@ def _repair_check(
     logger.info("Repo repair completed.")
 
 
-def do_repair_repo(progress: bool, yes: bool) -> None:
-    _repair_check(progress=progress, yes=yes, repository_only=True)
+def do_repair_repo(progress: bool) -> None:
+    _repair_check(progress=progress, repository_only=True)
 
 
-def do_repair_archives(progress: bool, yes: bool) -> None:
-    _repair_check(progress=progress, yes=yes, archives_only=True)
+def do_repair_archives(progress: bool) -> None:
+    _repair_check(progress=progress, archives_only=True)
 
 
-def do_repair_full(progress: bool, yes: bool) -> None:
-    _repair_check(progress=progress, yes=yes)
+def do_repair_full(progress: bool) -> None:
+    _repair_check(progress=progress)
 
 
 def do_environment() -> None:
@@ -2191,6 +2183,25 @@ class HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
 ):
     pass
+
+
+def _validate_repair(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Require `--yes` for a `repair` check, then drop it from the
+    namespace. Repair is potentially lossy, so the confirmation is
+    enforced at parse time (exit 2 with the usage line) and the repair
+    handlers take no `yes`."""
+    if not args.yes:
+        parser.error(
+            "This is a potentially dangerous function.\n"
+            "check --repair might lead to data loss (for kinds"
+            " of corruption it is not\n"
+            "capable of dealing with). BE VERY CAREFUL!\n"
+            "\n"
+            "Pass --yes to confirm you understand the risks."
+        )
+    del args.yes
 
 
 def args_parser() -> StrictArgumentParser:
@@ -2442,6 +2453,7 @@ def args_parser() -> StrictArgumentParser:
             action="store_true",
             help="confirm you understand the risks of --repair",
         )
+        sub.add_validate_callback(_validate_repair)
 
     add_repair_check(
         "repo",
