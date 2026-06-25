@@ -1202,9 +1202,8 @@ def do_install(
     """Install a source dir's entries into an explicit target dir
     (recording the install + its flags), or re-sync every tracked
     install when neither source nor target is given."""
-    if directory is not None or dst is not None:
-        if directory is None or dst is None:
-            raise UsageError("install needs both a source and a target dir")
+    if directory is not None:
+        assert dst is not None  # the parser validates them together
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         if not src.is_dir():
@@ -1232,15 +1231,23 @@ def do_remove(
     directory: Path | None,
     dst: Path | None,
     *,
+    all_installs: bool,
     dry_run: bool,
     verbose: bool,
 ) -> None:
     """Remove one tracked install's links (identified by its source and
-    target dirs) and untrack it, or remove every tracked install when
-    neither is given."""
-    if directory is not None or dst is not None:
-        if directory is None or dst is None:
-            raise UsageError("remove needs both a source and a target dir")
+    target dirs) and untrack it, or every tracked install with
+    `all_installs`. Requiring one of the two -- rather than treating a
+    bare `remove` as remove-everything -- guards against accidentally
+    wiping every install."""
+    if all_installs:
+        targets = load_install_records()
+        if not targets:
+            logger.info("No installs tracked.")
+            return
+    else:
+        # A non-all remove always names both dirs (parser-validated).
+        assert directory is not None and dst is not None
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         record = next(
@@ -1254,11 +1261,6 @@ def do_remove(
         if record is None:
             raise LinkfilesError(f"No tracked install: {src} -> {target}")
         targets = [record]
-    else:
-        targets = load_install_records()
-        if not targets:
-            logger.info("No installs tracked.")
-            return
     _run_remove(
         targets,
         dry_run=dry_run,
@@ -1283,6 +1285,32 @@ def do_audit(*, verbose: bool) -> None:
 # =============================================================================
 # ARGUMENT PARSER
 # =============================================================================
+
+
+def _validate_install(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject an install that names only one of source / target."""
+    if (args.directory is None) != (args.dst is None):
+        parser.error("install needs both a source and a target dir")
+
+
+def _validate_remove(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject an ambiguous remove: a bare invocation (which would wipe
+    every install), --all combined with a source/target pair, or a
+    half-named pair."""
+    has_pair = args.directory is not None or args.dst is not None
+    if has_pair and args.all_installs:
+        parser.error("--all cannot be combined with a source/target dir")
+    if has_pair and (args.directory is None or args.dst is None):
+        parser.error("remove needs both a source and a target dir")
+    if not has_pair and not args.all_installs:
+        parser.error(
+            "remove needs a source and target dir, or --all to remove "
+            "every tracked install"
+        )
 
 
 def build_parser() -> StrictArgumentParser:
@@ -1347,10 +1375,18 @@ def build_parser() -> StrictArgumentParser:
         nargs="?",
         help="Target directory to link the source's entries into",
     )
+    install_parser.add_validate_callback(_validate_install)
 
     # Remove subcommand
     remove_parser = subparsers.add_parser(
-        "remove", help="Remove an installed source / target pair"
+        "remove",
+        help="Remove one tracked install, or all of them with --all",
+    )
+    remove_parser.add_argument(
+        "--all",
+        dest="all_installs",
+        action="store_true",
+        help="Remove every tracked install (instead of a single pair)",
     )
     remove_parser.add_argument(
         "--dry-run",
@@ -1375,6 +1411,7 @@ def build_parser() -> StrictArgumentParser:
         nargs="?",
         help="Target directory the install was linked into",
     )
+    remove_parser.add_validate_callback(_validate_remove)
 
     # Audit subcommand
     audit_parser = subparsers.add_parser(

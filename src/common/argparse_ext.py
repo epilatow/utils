@@ -12,7 +12,11 @@ of argparse's terse "the following arguments are required" error.
 from __future__ import annotations
 
 import argparse
+import functools
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
+
+ValidateCallback = Callable[[argparse.ArgumentParser, argparse.Namespace], None]
 
 if TYPE_CHECKING:
     SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -115,6 +119,20 @@ class StrictArgumentParser(argparse.ArgumentParser):
         action._child_command_level = self._command_level + 1
         return action
 
+    def add_validate_callback(self, callback: ValidateCallback) -> None:
+        """Register a post-parse argument-combination validator.
+
+        ``parse_command`` invokes ``callback(self, namespace)`` right
+        after a successful parse -- before the caller dispatches -- to
+        check argument *combinations* argparse can't express
+        declaratively (e.g. "both or neither", "one of these is
+        required"). The callback receives this parser, so it reports a
+        bad combination via ``parser.error(...)`` (a usage message +
+        exit 2). At most one validator is kept per parser; a later call
+        replaces an earlier one.
+        """
+        self.set_defaults(_validate=functools.partial(callback, self))
+
     def parse_command(
         self, argv: list[str] | None = None
     ) -> argparse.Namespace:
@@ -128,8 +146,17 @@ class StrictArgumentParser(argparse.ArgumentParser):
         error, but with that subcommand's full help rather than a terse
         usage line. Invalid arguments / subcommands are still
         ``parse_args``'s usual usage error.
+
+        A subparser registered via ``add_validate_callback`` has its
+        validator invoked here, right after parsing and before the
+        caller dispatches, to reject argument combinations argparse
+        can't express declaratively.
         """
-        data = vars(self.parse_args(argv))
+        namespace = self.parse_args(argv)
+        data = vars(namespace)
+        validate = data.pop("_validate", None)
+        if validate is not None:
+            validate(namespace)
         action_help = data.pop("_action_help", None)
         path: list[str] = []
         level = 1

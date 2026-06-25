@@ -341,18 +341,12 @@ class TestLinkfilesInstall:
         )
         assert (dst / "readme").is_symlink()
 
-    def test_one_arg_without_target_errors(self, tracked: Path) -> None:
-        src = _make_tree(tracked / "s", {"x": "y"})
-        with pytest.raises(lf.UsageError):
-            lf.do_install(
-                src,
-                None,
-                dotfiles=False,
-                no_recurse=False,
-                dry_run=False,
-                force=False,
-                verbose=False,
-            )
+    def test_one_arg_without_target_errors(self) -> None:
+        # Arg-combination validation lives in the parser, so a half-named
+        # pair exits 2 before any command dispatch.
+        with pytest.raises(SystemExit) as exc:
+            lf.build_parser().parse_command(["install", "only-src"])
+        assert exc.value.code == 2
 
     def test_no_args_resyncs_all_tracked(self, tracked: Path) -> None:
         src1 = _make_tree(tracked / "s1", {"a": "1"})
@@ -465,14 +459,50 @@ class TestLinkfilesAuditRemove:
         src = _make_tree(tracked / "s", {"x": "y"})
         dst = tracked / "d"
         self._install(src, dst)
-        lf.do_remove(src, dst, dry_run=False, verbose=False)
+        lf.do_remove(src, dst, all_installs=False, dry_run=False, verbose=False)
         assert not (dst / "x").exists()
         assert lf.load_install_records() == []
 
     def test_remove_untracked_errors(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"x": "y"})
         with pytest.raises(lf.LinkfilesError):
-            lf.do_remove(src, tracked / "never", dry_run=False, verbose=False)
+            lf.do_remove(
+                src,
+                tracked / "never",
+                all_installs=False,
+                dry_run=False,
+                verbose=False,
+            )
+
+    def test_remove_all_removes_every_install(self, tracked: Path) -> None:
+        src1 = _make_tree(tracked / "s1", {"a": "1"})
+        src2 = _make_tree(tracked / "s2", {"b": "2"})
+        d1, d2 = tracked / "d1", tracked / "d2"
+        self._install(src1, d1)
+        self._install(src2, d2)
+        lf.do_remove(
+            None, None, all_installs=True, dry_run=False, verbose=False
+        )
+        assert not (d1 / "a").exists()
+        assert not (d2 / "b").exists()
+        assert lf.load_install_records() == []
+
+    def test_bare_remove_errors(self) -> None:
+        # A bare `remove` must not wipe every install; the parser
+        # rejects it (needs --all or a source/target pair) with exit 2.
+        with pytest.raises(SystemExit) as exc:
+            lf.build_parser().parse_command(["remove"])
+        assert exc.value.code == 2
+
+    def test_remove_all_with_pair_errors(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            lf.build_parser().parse_command(["remove", "--all", "s", "d"])
+        assert exc.value.code == 2
+
+    def test_remove_half_pair_errors(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            lf.build_parser().parse_command(["remove", "only-src"])
+        assert exc.value.code == 2
 
 
 class TestCmdCallbacks(CmdCallbacksBase):

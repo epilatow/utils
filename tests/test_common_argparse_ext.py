@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,43 @@ class TestCommandSubparsers:
         with pytest.raises(SystemExit):
             p.parse_command(["bogus"])
         assert "bogus" in capsys.readouterr().err
+
+
+class TestValidateHook:
+    @staticmethod
+    def _parser() -> StrictArgumentParser:
+        # `tool cmd [--bad]`; the cmd registers a _validate that rejects
+        # --bad as an illegal combination.
+        p = StrictArgumentParser(prog="tool")
+        top = p.add_command_subparsers()
+        cmd = top.add_parser("cmd")
+        cmd.add_argument("--bad", action="store_true")
+
+        def _validate(
+            parser: argparse.ArgumentParser, args: argparse.Namespace
+        ) -> None:
+            if args.bad:
+                parser.error("--bad is not allowed")
+
+        cmd.add_validate_callback(_validate)
+        return p
+
+    def test_bad_combo_routed_to_subcommand(self, capsys: Any) -> None:
+        p = self._parser()
+        with pytest.raises(SystemExit) as exc:
+            p.parse_command(["cmd", "--bad"])
+        assert exc.value.code == 2
+        assert "tool cmd:" in capsys.readouterr().err
+
+    def test_good_combo_passes(self) -> None:
+        p = self._parser()
+        args = p.parse_command(["cmd"])
+        assert args.command == "cmd"
+
+    def test_validate_stripped_from_namespace(self) -> None:
+        p = self._parser()
+        args = p.parse_command(["cmd"])
+        assert not hasattr(args, "_validate")
 
 
 if __name__ == "__main__":
