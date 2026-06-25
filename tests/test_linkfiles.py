@@ -12,7 +12,7 @@ linkfiles symlinks a source dir's entries into an explicit target. This
 file covers the engine end to end: the explicit-target CLI, the
 ~/.linkfiles.installed record format (escaping, flags, sorting), the
 discovery rules (ignore files, dotfile-skipping), and per-record install
-/ audit / remove / cleanup spanning distinct targets.
+/ audit / remove spanning distinct targets.
 """
 
 from __future__ import annotations
@@ -433,8 +433,8 @@ class TestLinkfilesDiscovery:
         assert not (dst / ".top").exists()
 
 
-class TestLinkfilesAuditRemoveCleanup:
-    """audit / remove / cleanup operate across every tracked record."""
+class TestLinkfilesAuditRemove:
+    """audit / remove operate across every tracked record."""
 
     def _install(self, src: Path, dst: Path, **flags: bool) -> None:
         lf.do_install(
@@ -473,47 +473,6 @@ class TestLinkfilesAuditRemoveCleanup:
         src = _make_tree(tracked / "s", {"x": "y"})
         with pytest.raises(lf.LinkfilesError):
             lf.do_remove(src, tracked / "never", dry_run=False, verbose=False)
-
-    def test_cleanup_spans_distinct_targets(self, tracked: Path) -> None:
-        src1 = _make_tree(tracked / "s1", {"a": "1"})
-        src2 = _make_tree(tracked / "s2", {"b": "2"})
-        d1, d2 = tracked / "d1", tracked / "d2"
-        self._install(src1, d1)
-        self._install(src2, d2)
-        # Drop a file from each source: both links are now stale.
-        (src1 / "a").unlink()
-        (src2 / "b").unlink()
-        lf.do_cleanup(dry_run=False)
-        assert not (d1 / "a").exists()
-        assert not (d2 / "b").exists()
-
-    def test_cleanup_removes_dangling(self, tracked: Path) -> None:
-        src = _make_tree(tracked / "s", {"x": "y"})
-        dst = tracked / "d"
-        self._install(src, dst)
-        # A dangling link under a managed target is reclaimed.
-        (dst / "stray").symlink_to(tracked / "missing")
-        lf.do_cleanup(dry_run=False)
-        assert not (dst / "stray").is_symlink()
-
-    def test_cleanup_keeps_valid_links_for_same_source(
-        self, tracked: Path
-    ) -> None:
-        # One source installed into two targets with different recurse
-        # flags: cleanup must not reclaim a link that is valid under its
-        # own record just because the other record's discovered set
-        # omits it. Records load sorted by dst, so the no-recurse target
-        # is named to sort last -- the order that, without the union,
-        # would let its narrower set decide the recursive target's
-        # nested link.
-        src = _make_tree(tracked / "s", {"top": "y", "sub/nested": "z"})
-        d_rec, d_flat = tracked / "d_a_recursive", tracked / "d_z_flat"
-        self._install(src, d_rec)
-        self._install(src, d_flat, no_recurse=True)
-        lf.do_cleanup(dry_run=False)
-        assert (d_rec / "top").is_symlink()
-        assert (d_rec / "sub" / "nested").is_symlink()
-        assert (d_flat / "top").is_symlink()
 
 
 class TestCmdCallbacks(CmdCallbacksBase):

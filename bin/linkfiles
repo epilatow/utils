@@ -46,8 +46,8 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 #   Each install is recorded in ~/.linkfiles.installed as
 #   `<dst>\t<src>[\t<flags>]`, sorted by (dst, src); dst / src are
 #   escaped so any path round-trips, and <flags> is a comma-separated
-#   subset of {dotfiles, no-recurse}. audit / cleanup / a no-arg install
-#   replay every record.
+#   subset of {dotfiles, no-recurse}. audit and a no-arg install replay
+#   every record.
 #
 # Conflicts:
 #   A conflict occurs when a target path exists but doesn't point to the
@@ -59,20 +59,16 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 #   installed source directory. It becomes "stale" when the relative
 #   path within that source is no longer in the source's discovered
 #   set -- because the file was removed from the repo or now matches an
-#   ignore pattern. The three subcommands handle stale managed links as
-#   follows:
+#   ignore pattern. Two subcommands handle stale managed links:
 #     - audit   reports them as STALE and fails (ConflictsFound).
-#     - cleanup removes them (alongside the existing dangling-symlink
-#               removal). Foreign symlinks are left alone.
 #     - install removes them, scoped to the source dir being installed.
 #               This makes install a sync: after it runs, the target
 #               tree matches the repo's current discovered set as if
 #               from a fresh clone.
 #
 #   The scan set for stale-link detection is target_root plus the
-#   parent directory of every currently-discovered entry, the same
-#   convention dangling-symlink cleanup uses. Stale links inside
-#   subdirectories that hold no current entries are not reached.
+#   parent directory of every currently-discovered entry. Stale links
+#   inside subdirectories that hold no current entries are not reached.
 #
 # =============================================================================
 
@@ -1285,69 +1281,6 @@ def do_audit(*, verbose: bool) -> None:
     _run_audit(targets, verbose=verbose)
 
 
-def do_cleanup(*, dry_run: bool) -> None:
-    """Remove dangling and stale managed symlinks from the directories
-    the tracked installs manage.
-
-    A *dangling* symlink points to a target that no longer exists on
-    disk and is removed regardless of where it points. A *stale
-    managed* symlink resolves into one of the installed source
-    directories but to a path that is no longer in that source's
-    discovered set -- because the file was removed from the repo or
-    now matches an ignore file. Symlinks that point outside every
-    installed source directory and resolve to an existing file are
-    foreign and left alone.
-
-    The scan set spans every tracked install's target root plus the
-    parent directory of every entry currently discovered across all
-    tracked sources.
-
-    Args:
-        dry_run: If True, log what would be removed without removing it.
-    """
-    target_roots: set[Path] = set()
-    scan_dirs: set[Path] = set()
-    sources: dict[Path, set[Path]] = {}
-
-    for record in load_install_records():
-        if not record.src.exists():
-            continue
-        target_roots.add(record.dst)
-        scan_dirs.add(record.dst)
-        rels: set[Path] = set()
-        for entry in discover_entries(record):
-            rels.add(entry.relative_path)
-            scan_dirs.add(entry.target_path.parent)
-        # Union, not assignment: one source can be installed under more
-        # than one record (e.g. into two targets, or with different
-        # recurse flags). A link is current if its relative path is
-        # delivered by any of them, so a valid link is never reclaimed
-        # because a different record for the same source omits it.
-        sources.setdefault(record.src.resolve(), set()).update(rels)
-
-    src_list = list(sources.keys())
-    for scan_dir in sorted(scan_dirs):
-        if not scan_dir.is_dir():
-            continue
-        for item in sorted(scan_dir.iterdir()):
-            if not item.is_symlink():
-                continue
-            link = _link_source_dir(item, src_list)
-            if link is not None:
-                src, rel = link
-                if rel in sources[src]:
-                    continue
-                logger.info("removing stale managed symlink: %s", item)
-                if not dry_run:
-                    item.unlink()
-                    _prune_empty_dirs(item.parent, target_roots)
-                continue
-            if not item.exists():
-                logger.info("removing dangling symlink: %s", item)
-                if not dry_run:
-                    item.unlink()
-
-
 # =============================================================================
 # ARGUMENT PARSER
 # =============================================================================
@@ -1459,17 +1392,6 @@ def build_parser() -> StrictArgumentParser:
         help="Print every entry; default suppresses ok lines",
     )
 
-    # Cleanup subcommand
-    cleanup_parser = subparsers.add_parser(
-        "cleanup",
-        help="Remove dangling and stale managed symlinks",
-    )
-    cleanup_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be removed without removing it",
-    )
-
     return parser
 
 
@@ -1481,7 +1403,6 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "install": do_install,
     "remove": do_remove,
     "audit": do_audit,
-    "cleanup": do_cleanup,
 }
 
 
