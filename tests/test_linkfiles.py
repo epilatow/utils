@@ -93,37 +93,42 @@ class TestFieldEscaping:
 
 
 class TestInstallRecord:
-    """A record reconstitutes a concrete profile from its dst / flags."""
-
-    def test_profile_target_is_dst(self) -> None:
-        rec = lf.InstallRecord(
-            dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=False
-        )
-        assert rec.profile().target_root() == Path("/t")
-
-    def test_dotfiles_flag_dot_prefixes(self) -> None:
-        rec = lf.InstallRecord(
-            dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=False
-        )
-        assert rec.profile().transform_segment("rc") == ".rc"
-
-    def test_plain_flag_is_identity(self) -> None:
-        rec = lf.InstallRecord(
-            dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=False
-        )
-        assert rec.profile().transform_segment("rc") == "rc"
-
-    def test_no_recurse_sets_flat(self) -> None:
-        rec = lf.InstallRecord(
-            dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=True
-        )
-        assert rec.profile().flat is True
+    """Flag tokens serialize in a stable order."""
 
     def test_flag_tokens_order(self) -> None:
         rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=True
         )
         assert rec.flag_tokens() == ["dotfiles", "no-recurse"]
+
+
+class TestLinkEntryTargetPath:
+    """A link's target is its relative path under the install's dst, with
+    the top-level component dot-prefixed under the dotfiles flag."""
+
+    def _entry(self, rel: str, **flags: bool) -> lf.LinkEntry:
+        rec = lf.InstallRecord(
+            dst=Path("/t"),
+            src=Path("/s"),
+            dotfiles=flags.get("dotfiles", False),
+            no_recurse=flags.get("no_recurse", False),
+        )
+        return lf.LinkEntry(
+            relative_path=Path(rel), source_dir=Path("/s"), record=rec
+        )
+
+    def test_target_is_under_dst(self) -> None:
+        assert self._entry("bin/x").target_path == Path("/t/bin/x")
+
+    def test_dotfiles_dot_prefixes_top_level(self) -> None:
+        assert self._entry("rc", dotfiles=True).target_path == Path("/t/.rc")
+
+    def test_dotfiles_prefixes_only_top_level(self) -> None:
+        entry = self._entry("rc/sub", dotfiles=True)
+        assert entry.target_path == Path("/t/.rc/sub")
+
+    def test_plain_is_identity(self) -> None:
+        assert self._entry("rc").target_path == Path("/t/rc")
 
 
 @pytest.mark.usefixtures("tracked")

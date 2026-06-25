@@ -133,60 +133,18 @@ def _colorize(text: str, code: str) -> str:
 
 
 # =============================================================================
-# PROFILE
+# IDENTITY
 # =============================================================================
 
-
-@dataclass(frozen=True)
-class Profile:
-    """How a source dir maps onto symlinks: where they go (target_root),
-    how each top-level name is transformed, which tracking file records
-    installs, and whether discovery is flat. Each install builds its own
-    (see `InstallRecord.profile`).
-
-    target_root, transform_segment, and installed_file are callables so
-    that test monkeypatches of Path.home propagate through.
-    """
-
-    name: str
-    description: str
-    target_root: Callable[[], Path]
-    transform_segment: Callable[[str], str]
-    installed_file: Callable[[], Path]
-    flat: bool
-
-
-def _dot_prefix(segment: str) -> str:
-    return "." + segment
-
-
-def _identity(segment: str) -> str:
-    return segment
-
-
-def _no_static_target() -> Path:
-    """The linkfiles profile has no fixed target root -- each install
-    names its own dst, so operations build a per-record profile (see
-    `InstallRecord.profile`) and never read this profile's `target_root`.
-    Calling it is a bug."""
-    raise AssertionError("linkfiles builds a per-record target root")
-
-
-# Carries the parser identity and the tracking-file location. Each
-# install reconstitutes a concrete profile (its own dst + flags) via
-# `InstallRecord.profile`, so this profile's `target_root` is never read.
-LINKFILES_PROFILE = Profile(
-    name="linkfiles",
-    description="Symlink a source dir's contents into an explicit target",
-    target_root=_no_static_target,
-    transform_segment=_identity,
-    installed_file=lambda: Path.home() / ".linkfiles.installed",
-    flat=False,
+# The argparse program identity.
+LINKFILES_NAME = "linkfiles"
+LINKFILES_DESCRIPTION = (
+    "Symlink a source dir's contents into an explicit target"
 )
 
 # The tracking file (~/.linkfiles.installed). Tests monkeypatch this to
 # point at a tmpdir.
-INSTALLED_FILE: Path = LINKFILES_PROFILE.installed_file()
+INSTALLED_FILE: Path = Path.home() / ".linkfiles.installed"
 
 
 # =============================================================================
@@ -256,7 +214,7 @@ class LinkEntry:
 
     relative_path: Path  # Path relative to source directory
     source_dir: Path  # Absolute path to source directory
-    profile: Profile
+    record: InstallRecord  # the install this link belongs to
 
     @property
     def source_path(self) -> Path:
@@ -265,10 +223,12 @@ class LinkEntry:
 
     @property
     def target_path(self) -> Path:
-        """Absolute path to the target symlink under target_root."""
+        """Absolute path to the target symlink under the install's dst.
+        With the dotfiles flag, the top-level component is dot-prefixed
+        (`bashrc` -> `.bashrc`)."""
         parts = self.relative_path.parts
-        transformed = (self.profile.transform_segment(parts[0]),) + parts[1:]
-        return self.profile.target_root() / Path(*transformed)
+        first = ("." + parts[0]) if self.record.dotfiles else parts[0]
+        return self.record.dst / Path(first, *parts[1:])
 
     def compute_relative_symlink(self) -> Path:
         """Compute relative path from target to source."""
@@ -317,19 +277,6 @@ class InstallRecord:
         if self.no_recurse:
             tokens.append(_FLAG_NO_RECURSE)
         return tokens
-
-    def profile(self) -> Profile:
-        """The concrete Profile this record installs under: its dst as
-        the target root, dot-prefixing iff the dotfiles flag is set,
-        flat iff no-recurse is set."""
-        return Profile(
-            name=LINKFILES_PROFILE.name,
-            description=LINKFILES_PROFILE.description,
-            target_root=lambda: self.dst,
-            transform_segment=(_dot_prefix if self.dotfiles else _identity),
-            installed_file=LINKFILES_PROFILE.installed_file,
-            flat=self.no_recurse,
-        )
 
 
 def _escape_field(value: str) -> str:
@@ -443,12 +390,6 @@ def remove_install_record(dst: Path, src: Path) -> None:
         r for r in load_install_records() if not (r.dst == dst and r.src == src)
     ]
     save_install_records(records)
-
-
-def load_installed_entries() -> list[tuple[Path, Profile]]:
-    """The (source dir, profile) pair for each tracked install, each
-    profile carrying that record's dst and flags."""
-    return [(rec.src, rec.profile()) for rec in load_install_records()]
 
 
 # =============================================================================
@@ -660,25 +601,26 @@ def matches_ignore_pattern(path: Path, patterns: set[str]) -> bool:
     return False
 
 
-def discover_entries(source_dir: Path, *, profile: Profile) -> list[LinkEntry]:
+def discover_entries(record: InstallRecord) -> list[LinkEntry]:
     """
-    Discover entries in a source directory.
+    Discover the entries an install links from its source directory.
 
     Common rules:
     - Skip any dotfile -- an entry with a leading-'.' component at any
       depth (so .git / .hg / .github, the ignore files, and editor
       state never link).
     - Skip files matching patterns in .gitignore / .hgignore /
-      .dotfilesignore / .linkfiles.ignore from source_dir and each
+      .dotfilesignore / .linkfiles.ignore from the source dir and each
       ancestor up to the enclosing repo root, plus a hardcoded set of
       editor / swap / autosave patterns.
 
-    With profile.flat=True, only top-level entries are considered;
-    subdirectories are not descended into.
+    With the record's no_recurse flag, only top-level entries are
+    considered; subdirectories are not descended into.
 
     Raises:
         LinkfilesError: If the directory doesn't exist or isn't valid.
     """
+    source_dir = record.src
     if not source_dir.exists():
         raise LinkfilesError(f"Source directory does not exist: {source_dir}")
     if not source_dir.is_dir():
@@ -690,7 +632,7 @@ def discover_entries(source_dir: Path, *, profile: Profile) -> list[LinkEntry]:
     ignore_patterns = load_ignore_patterns(abs_source_dir)
 
     candidates: Iterator[Path]
-    if profile.flat:
+    if record.no_recurse:
         candidates = abs_source_dir.iterdir()
     else:
         candidates = abs_source_dir.rglob("*")
@@ -713,7 +655,7 @@ def discover_entries(source_dir: Path, *, profile: Profile) -> list[LinkEntry]:
             LinkEntry(
                 relative_path=relative,
                 source_dir=abs_source_dir,
-                profile=profile,
+                record=record,
             )
         )
 
@@ -850,12 +792,12 @@ def _stale_managed_links(
 
 
 def _scan_dirs_for_entries(
-    entries: list[LinkEntry], profile: Profile
+    entries: list[LinkEntry], target_root: Path
 ) -> set[Path]:
     """Return the directory set to scan for symlinks managed by the
     given entries: target_root plus the parent directory of each
     entry's target_path."""
-    scan_dirs: set[Path] = {profile.target_root()}
+    scan_dirs: set[Path] = {target_root}
     for entry in entries:
         scan_dirs.add(entry.target_path.parent)
     return scan_dirs
@@ -933,7 +875,7 @@ def remove_entry(
         # Correctly linked, safe to remove
         if not dry_run:
             entry.target_path.unlink()
-            _cleanup_empty_parents(entry.target_path.parent, entry.profile)
+            _cleanup_empty_parents(entry.target_path.parent, entry.record.dst)
         return OperationResult(entry=entry, status=LinkStatus.REMOVED)
 
     # FILE_CONFLICT or LINK_CONFLICT - leave alone
@@ -953,10 +895,10 @@ def _prune_empty_dirs(directory: Path, stop_at: set[Path]) -> None:
             break
 
 
-def _cleanup_empty_parents(directory: Path, profile: Profile) -> None:
-    """Remove empty parent directories up to but not including the
-    profile's target_root."""
-    _prune_empty_dirs(directory, {profile.target_root()})
+def _cleanup_empty_parents(directory: Path, target_root: Path) -> None:
+    """Remove empty parent directories up to but not including
+    target_root."""
+    _prune_empty_dirs(directory, {target_root})
 
 
 def audit_entry(entry: LinkEntry) -> OperationResult:
@@ -997,27 +939,25 @@ def _process_entries(
 
 
 def process_directory(
-    source_dir: Path,
+    record: InstallRecord,
     operation: str,
     *,
     dry_run: bool = False,
     force: bool = False,
-    profile: Profile,
 ) -> list[OperationResult]:
     """
-    Process all entries in a source directory.
+    Process all entries an install links from its source directory.
 
     Args:
-        source_dir: Path to source directory
+        record: The install whose entries to process
         operation: One of "install", "remove", "audit"
         dry_run: If True, don't make any changes
         force: If True, replace conflicting symlinks (install only)
-        profile: Profile to use for discovery
 
     Returns:
         List of OperationResult objects
     """
-    entries = discover_entries(source_dir, profile=profile)
+    entries = discover_entries(record)
     return _process_entries(entries, operation, dry_run=dry_run, force=force)
 
 
@@ -1126,28 +1066,27 @@ def has_stale(results: list[OperationResult]) -> bool:
 
 
 def _find_stale_for_dir(
-    source_dir: Path,
+    record: InstallRecord,
     entries: list[LinkEntry],
-    profile: Profile,
 ) -> list[tuple[Path, LinkEntry]]:
-    """Find managed-but-stale symlinks for one source dir.
+    """Find managed-but-stale symlinks for one install.
 
     Returns (symlink, synthesized LinkEntry) tuples. The
     synthesized entry has its relative_path set to the path inside
-    source_dir that the stale link points to, so callers can
+    the source that the stale link points to, so callers can
     package it as an OperationResult or unlink the symlink.
     """
-    src_resolved = source_dir.resolve()
+    src_resolved = record.src.resolve()
     discovered_rels = {e.relative_path for e in entries}
     sources = {src_resolved: discovered_rels}
-    scan_dirs = _scan_dirs_for_entries(entries, profile)
+    scan_dirs = _scan_dirs_for_entries(entries, record.dst)
 
     stale: list[tuple[Path, LinkEntry]] = []
     for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
         synth_entry = LinkEntry(
             relative_path=rel,
             source_dir=src_resolved,
-            profile=profile,
+            record=record,
         )
         stale.append((symlink, synth_entry))
     return stale
@@ -1158,42 +1097,42 @@ def _find_stale_for_dir(
 # =============================================================================
 
 
-# The do_* handlers resolve an invocation to a list of (source dir,
-# profile) targets -- one per tracked record -- and hand off to these
-# shared runners.
+# The do_* handlers resolve an invocation to a list of InstallRecord
+# targets -- one per tracked install -- and hand off to these shared
+# runners.
 
 
 def _run_install(
-    targets: list[tuple[Path, Profile]],
+    targets: list[InstallRecord],
     *,
     dry_run: bool,
     force: bool,
     verbose: bool,
 ) -> None:
-    """Sync each (source, profile) target: link new entries, prune the
-    source's stale managed links, and raise on conflict.
+    """Sync each install: link new entries, prune the source's stale
+    managed links, and raise on conflict.
 
     install is a sync operation: after it runs, each target tree
     reflects its source's current discovered set. Files removed from
     the source or newly matched by an ignore file have their managed
     symlinks pruned, scoped to the source being installed."""
     had_conflicts = False
-    for src_dir, profile in targets:
-        if not src_dir.is_dir():
-            raise LinkfilesError(f"Source directory does not exist: {src_dir}")
-        entries = discover_entries(src_dir, profile=profile)
+    for record in targets:
+        if not record.src.is_dir():
+            raise LinkfilesError(
+                f"Source directory does not exist: {record.src}"
+            )
+        entries = discover_entries(record)
         results = _process_entries(
             entries, "install", dry_run=dry_run, force=force
         )
-        for symlink, synth_entry in _find_stale_for_dir(
-            src_dir, entries, profile
-        ):
+        for symlink, synth_entry in _find_stale_for_dir(record, entries):
             if not dry_run:
                 symlink.unlink()
-                _cleanup_empty_parents(symlink.parent, profile)
+                _cleanup_empty_parents(symlink.parent, record.dst)
             results.append(OperationResult(synth_entry, LinkStatus.STALE))
         log_results(
-            src_dir,
+            record.src,
             results,
             verbose=verbose,
             problem_statuses=_INSTALL_PROBLEM_STATUSES,
@@ -1204,22 +1143,19 @@ def _run_install(
         raise ConflictsFound("Conflicts found during install")
 
 
-def _run_audit(targets: list[tuple[Path, Profile]], *, verbose: bool) -> None:
-    """Report each (source, profile) target's status plus any stale
-    managed links; raise if anything diverges from the discovered
-    set."""
+def _run_audit(targets: list[InstallRecord], *, verbose: bool) -> None:
+    """Report each install's status plus any stale managed links; raise
+    if anything diverges from the discovered set."""
     had_issues = False
-    for src_dir, profile in targets:
-        if not src_dir.exists():
+    for record in targets:
+        if not record.src.exists():
             continue
-        entries = discover_entries(src_dir, profile=profile)
+        entries = discover_entries(record)
         results = _process_entries(entries, "audit")
-        for _symlink, synth_entry in _find_stale_for_dir(
-            src_dir, entries, profile
-        ):
+        for _symlink, synth_entry in _find_stale_for_dir(record, entries):
             results.append(OperationResult(synth_entry, LinkStatus.STALE))
         log_results(
-            src_dir,
+            record.src,
             results,
             verbose=verbose,
             problem_statuses=_AUDIT_PROBLEM_STATUSES,
@@ -1233,29 +1169,29 @@ def _run_audit(targets: list[tuple[Path, Profile]], *, verbose: bool) -> None:
 
 
 def _run_remove(
-    targets: list[tuple[Path, Profile]],
+    targets: list[InstallRecord],
     *,
     dry_run: bool,
     verbose: bool,
-    on_removed: Callable[[Path, Profile], None],
+    on_removed: Callable[[InstallRecord], None],
 ) -> None:
-    """Remove each (source, profile) target's managed links, then
-    untrack it via `on_removed` (skipped on a dry run). Only symlinks
-    that point to the correct source are removed."""
-    for src_dir, profile in targets:
-        if not src_dir.exists():
-            raise LinkfilesError(f"Source directory does not exist: {src_dir}")
-        results = process_directory(
-            src_dir, "remove", dry_run=dry_run, profile=profile
-        )
+    """Remove each install's managed links, then untrack it via
+    `on_removed` (skipped on a dry run). Only symlinks that point to the
+    correct source are removed."""
+    for record in targets:
+        if not record.src.exists():
+            raise LinkfilesError(
+                f"Source directory does not exist: {record.src}"
+            )
+        results = process_directory(record, "remove", dry_run=dry_run)
         log_results(
-            src_dir,
+            record.src,
             results,
             verbose=verbose,
             problem_statuses=_REMOVE_PROBLEM_STATUSES,
         )
         if not dry_run:
-            on_removed(src_dir, profile)
+            on_removed(record)
 
 
 def do_install(
@@ -1283,18 +1219,18 @@ def do_install(
         )
         if not dry_run:
             add_install_record(record)
-        targets = [(src, record.profile())]
+        targets = [record]
     else:
-        targets = load_installed_entries()
+        targets = load_install_records()
         if not targets:
             logger.info("No installs tracked.")
             return
     _run_install(targets, dry_run=dry_run, force=force, verbose=verbose)
 
 
-def _untrack_record(src_dir: Path, profile: Profile) -> None:
-    """Drop the tracked record for (target, source)."""
-    remove_install_record(profile.target_root(), src_dir)
+def _untrack_record(record: InstallRecord) -> None:
+    """Drop the tracked record for this install."""
+    remove_install_record(record.dst, record.src)
 
 
 def do_remove(
@@ -1322,9 +1258,9 @@ def do_remove(
         )
         if record is None:
             raise LinkfilesError(f"No tracked install: {src} -> {target}")
-        targets = [(src, record.profile())]
+        targets = [record]
     else:
-        targets = load_installed_entries()
+        targets = load_install_records()
         if not targets:
             logger.info("No installs tracked.")
             return
@@ -1343,15 +1279,15 @@ def do_audit(*, verbose: bool) -> None:
     symlinks -- symlinks under a target root that point into the audited
     source but whose relative path is no longer in the discovered set
     (file removed from the source, or matched by an ignore file)."""
-    targets = load_installed_entries()
+    targets = load_install_records()
     if not targets:
         return
     _run_audit(targets, verbose=verbose)
 
 
 def do_cleanup(*, dry_run: bool) -> None:
-    """Remove dangling and stale managed symlinks from the
-    directories the profile manages.
+    """Remove dangling and stale managed symlinks from the directories
+    the tracked installs manage.
 
     A *dangling* symlink points to a target that no longer exists on
     disk and is removed regardless of where it points. A *stale
@@ -1362,7 +1298,7 @@ def do_cleanup(*, dry_run: bool) -> None:
     installed source directory and resolve to an existing file are
     foreign and left alone.
 
-    The scan set spans every tracked record's target root plus the
+    The scan set spans every tracked install's target root plus the
     parent directory of every entry currently discovered across all
     tracked sources.
 
@@ -1373,14 +1309,13 @@ def do_cleanup(*, dry_run: bool) -> None:
     scan_dirs: set[Path] = set()
     sources: dict[Path, set[Path]] = {}
 
-    for src_dir, profile in load_installed_entries():
-        if not src_dir.exists():
+    for record in load_install_records():
+        if not record.src.exists():
             continue
-        root = profile.target_root()
-        target_roots.add(root)
-        scan_dirs.add(root)
+        target_roots.add(record.dst)
+        scan_dirs.add(record.dst)
         rels: set[Path] = set()
-        for entry in discover_entries(src_dir, profile=profile):
+        for entry in discover_entries(record):
             rels.add(entry.relative_path)
             scan_dirs.add(entry.target_path.parent)
         # Union, not assignment: one source can be installed under more
@@ -1388,7 +1323,7 @@ def do_cleanup(*, dry_run: bool) -> None:
         # recurse flags). A link is current if its relative path is
         # delivered by any of them, so a valid link is never reclaimed
         # because a different record for the same source omits it.
-        sources.setdefault(src_dir.resolve(), set()).update(rels)
+        sources.setdefault(record.src.resolve(), set()).update(rels)
 
     src_list = list(sources.keys())
     for scan_dir in sorted(scan_dirs):
@@ -1426,8 +1361,8 @@ def build_parser() -> StrictArgumentParser:
         Configured ArgumentParser instance
     """
     parser = StrictArgumentParser(
-        prog=LINKFILES_PROFILE.name,
-        description=LINKFILES_PROFILE.description,
+        prog=LINKFILES_NAME,
+        description=LINKFILES_DESCRIPTION,
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
