@@ -1,0 +1,106 @@
+.\"
+.TH "linkfiles" "1" "" "linkfiles" "linkfiles manual"
+.SH NAME
+linkfiles \- symlink a source directory\(aqs contents into a target
+.SH SYNOPSIS
+\f[B]linkfiles\f[R] <command> ...\&
+.SH DESCRIPTION
+linkfiles symlinks the contents of a source directory tree into a target directory, recreating the tree there.\&
+Installations are tracked, so later runs can add new links, audit existing ones, and clean up dangling links.\&
+While linkfiles can be used to link files from any source to any destination, its primary purpose is linking repository files into $HOME/ (as dotfiles) and $HOME/.local/.\&
+.PP
+By default linkfiles descends into the source and links the leaf files, recreating any subdirectories in the target; \-\-no\-recurse links each top\-level entry directly instead.\&
+\-\-dotfiles dot\-prefixes each top\-level entry in the target (\(gabashrc\(ga becomes \(ga.bashrc\(ga).\&
+Files matched by an ignore file (.gitignore, .hgignore, or .linkfiles.ignore, in or above the source) are skipped, as are editor backup and swap files.\&
+.SH GETTING STARTED
+To install files from repos in your $HOME you can do:
+.PP
+.EX
+    linkfiles install \-\-dotfiles .../files $HOME/
+    linkfiles install .../bin $HOME/.local/bin
+    linkfiles install .../share $HOME/.local/share
+.EE
+.PP
+To update already installed link trees after the source directories are updated run:
+.PP
+.EX
+    linkfiles install
+.EE
+.SH COMMON ARGUMENTS
+.TP
+\f[CR]\-\-dry\-run\f[R]
+Show what would be done without making changes.\&
+.TP
+\f[CR]\-v, \-\-verbose\f[R]
+Print every entry; default suppresses ok lines.\&
+.SH SUBCOMMANDS
+.TP
+\f[B]install\f[R] [\-\-dry\-run] [\-f] [\-v] [\-\-dotfiles] [\-\-no\-recurse] [source_dir] [target_dir]
+Link the contents of source_dir into target_dir, recording the install and its flags so it can be audited and removed later.\&
+To install links from a new directory, both source_dir and target_dir are required.\&
+If neither are specified, re\-sync all previously installed directories.\&
+.RS
+.TP
+\f[CR]\-f, \-\-force\f[R]
+Replace conflicting symlinks (not files).\&
+.TP
+\f[CR]\-\-dotfiles\f[R]
+Dot\-prefix each top\-level entry under the target.\&
+.TP
+\f[CR]\-\-no\-recurse\f[R]
+Link only top\-level entries; do not descend.\&
+.TP
+\f[CR]source_dir\f[R]
+Source directory to install entries from.\&
+.TP
+\f[CR]target_dir\f[R]
+Target directory to link the source\(aqs entries into.\&
+.RE
+.TP
+\f[B]remove\f[R] [\-\-all] [\-\-dry\-run] [\-v] [source_dir] [target_dir]
+Remove the links of one tracked install \-\- identified by its source_dir and target_dir, required together \-\- and untrack it.\&
+Pass \-\-all instead to remove every tracked install.\&
+.RS
+.TP
+\f[CR]\-\-all\f[R]
+Remove every tracked install (instead of one source/target).\&
+.TP
+\f[CR]source_dir\f[R]
+Source directory whose entries should be removed.\&
+.TP
+\f[CR]target_dir\f[R]
+Target directory the install was linked into.\&
+.RE
+.TP
+\f[B]audit\f[R] [\-v]
+Report the status of every tracked install; exits non\-zero on conflicts, missing entries, or stale managed links.\&
+.SH FILES
+.TP
+\f[CR]\(ti/.linkfiles.installed\f[R]
+Tracks installed directory pairs (source + target) and installation options.\&
+.SH EXIT STATUS
+.PD 0
+.TP
+\f[CR]0\f[R]
+Success
+.TP
+\f[CR]1\f[R]
+Warning
+.TP
+\f[CR]2\f[R]
+Usage/argument error
+.TP
+\f[CR]3\f[R]
+Configuration error
+.TP
+\f[CR]4\f[R]
+General error
+.TP
+\f[CR]5\f[R]
+Subprocess error
+.TP
+\f[CR]7\f[R]
+Crashed (unhandled exception)
+.TP
+\f[CR]10\f[R]
+Conflicts or missing entries

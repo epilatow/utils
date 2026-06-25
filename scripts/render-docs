@@ -33,15 +33,22 @@ flattens them), so a single shared source can't serve both.
 Each `ManSpec` supplies the per-utility bits the parser doesn't carry:
 the NAME one-liner, the DESCRIPTION overview, authored COMMON ARGUMENTS
 (cross-cutting args documented once), an optional reference section
-(structured `(label, description)` data, e.g. crony's status columns),
-and an EXIT STATUS table. Everything else -- SYNOPSIS, the SUBCOMMANDS
-list, and the data-driven detection of options shared across subcommands
--- is derived generically. Add a utility by appending a `ManSpec` to
-`_SPECS`.
+(structured `(label, description)` data, e.g. crony's status columns), a
+FILES list, and an EXIT STATUS table. Everything else -- SYNOPSIS, the
+SUBCOMMANDS list, and the data-driven detection of options shared across
+subcommands -- is derived generically. Add a utility by appending a
+`ManSpec` to `_SPECS`.
+
+It also generates the repo `README.md`: the authored preamble from
+`scripts/readme-intro.md`, the documented utilities (those in `_SPECS`,
+blurbed from their DESCRIPTION and linked to their `docs/` page), and the
+undocumented `bin/` utilities (blurbed from each one's `--help`). See
+`build_readme`.
 
 Run with no arguments to (re)write every utility's man page and GFM doc
-(pandoc required for the roff). `--check` re-renders the GFM doc -- which
-is pure Python plus mdformat -- and exits non-zero on drift without
+plus the README (pandoc required for the roff). `--check` re-renders the
+GFM docs and the README -- pure Python plus mdformat (and each
+undocumented tool's `--help`) -- and exits non-zero on drift without
 writing (no pandoc needed); the pandoc-built roff is gated by the pytest
 freshness test instead.
 """
@@ -143,6 +150,9 @@ class ManSpec:
     reference_sections: list[tuple[str, str, list[tuple[str, str]]]] = field(
         default_factory=list
     )
+    # Files the utility reads / writes, as `(path, description)`, rendered
+    # in a FILES section just before EXIT STATUS. [] to omit.
+    files: list[tuple[str, str]] = field(default_factory=list)
     # EXIT STATUS as `(code, description)` items, or [] to omit it.
     exit_status: list[tuple[str, str]] = field(default_factory=list)
 
@@ -319,7 +329,9 @@ def _overview_md(
         if any(line[:1].isspace() for line in lines):
             out += _code_block("\n".join(lines))
         else:
-            out += [" ".join(inline(line) for line in lines), ""]
+            # Join the wrapped source lines before escaping so a code span
+            # that wraps across lines is seen (and preserved) whole.
+            out += [inline(" ".join(lines)), ""]
     return out
 
 
@@ -424,6 +436,11 @@ def build_markdown(spec: ManSpec) -> str:
                 # Emphasis (italic -> underline in a terminal) sets the
                 # key apart from its description when both share a line.
                 out += _definition(f"*{_md(label)}*", _md(description))
+
+    if spec.files:
+        out += ["# FILES", ""]
+        for path, description in spec.files:
+            out += _definition(f"`{path}`", _md(description))
 
     if spec.exit_status:
         out += ["# EXIT STATUS", ""]
@@ -540,12 +557,19 @@ def _md_wrap() -> int:
     return int(pyproject["tool"]["repo-shared"]["markdown"]["wrap"])
 
 
+def _gfm_break_item(term_md: str, description: str) -> str:
+    """A bulleted list item whose `term_md` (already-formatted markdown --
+    a link, bold text, or inline code) sits on its own line, then a `\\`
+    hard break and the GFM-escaped description indented two spaces beneath.
+    Preferred over a table for wide terms (option / value / utility
+    names), which a GitHub table wraps across lines."""
+    return f"- {term_md}\\\n  {_gfm_inline(description)}"
+
+
 def _gfm_item(term: str, description: str) -> str:
     """A definition as a bulleted list item: the bold inline-code term on
-    its own line (a `\\` hard break), the description indented beneath it.
-    Preferred over a table for wide keys (option / value names), which a
-    GitHub table wraps across lines."""
-    return f"- **`{term.strip('`')}`**\\\n  {_gfm_inline(description)}"
+    its own line (a `\\` hard break), the description indented beneath it."""
+    return _gfm_break_item(f"**`{term.strip('`')}`**", description)
 
 
 def _gfm_table(
@@ -638,6 +662,11 @@ def build_gfm(spec: ManSpec) -> str:
             out += [_gfm_item(label, desc) for label, desc in items]
             out.append("")
 
+    if spec.files:
+        out += ["## FILES", ""]
+        out += [_gfm_item(path, desc) for path, desc in spec.files]
+        out.append("")
+
     if spec.exit_status:
         out += ["## EXIT STATUS", ""]
         out += _gfm_table(spec.exit_status, "Code", "Meaning")
@@ -694,19 +723,120 @@ def _crony_spec() -> ManSpec:
     )
 
 
-_SPECS: list[Callable[[], ManSpec]] = [_crony_spec]
+def _linkfiles_spec() -> ManSpec:
+    import linkfiles
+
+    return ManSpec(
+        prog="linkfiles",
+        section=1,
+        build_parser=linkfiles.build_parser,
+        name_description="symlink a source directory's contents into a target",
+        description=linkfiles._OVERVIEW,
+        extra_sections=[("GETTING STARTED", linkfiles._GETTING_STARTED)],
+        files=[
+            (
+                "~/.linkfiles.installed",
+                "Tracks installed directory pairs (source + target) and "
+                "installation options.",
+            )
+        ],
+        exit_status=[
+            (str(value), description)
+            for value, description in linkfiles.ExitCode.entries()
+        ],
+    )
+
+
+_SPECS: list[Callable[[], ManSpec]] = [_crony_spec, _linkfiles_spec]
+
+
+# ---------------------------------------------------------------------------
+# Repo README
+# ---------------------------------------------------------------------------
+
+_BIN_DIR = _REPO_ROOT / "bin"
+
+# The authored README preamble (title, intro, Installation). Everything
+# below it is derived -- documented utilities from their DESCRIPTION,
+# undocumented ones from their `--help` -- so this fragment is the only
+# hand-edited part of the generated README.
+_README_INTRO_PATH = _REPO_ROOT / "scripts" / "readme-intro.md"
+
+
+def _first_paragraph(text: str) -> str:
+    """The first blank-line-delimited paragraph of `text`, collapsed to a
+    single line (a utility's one-line blurb for the README)."""
+    for block in text.split("\n\n"):
+        collapsed = " ".join(block.split())
+        if collapsed:
+            return collapsed
+    return ""
+
+
+def _help_blurb(prog: str) -> str:
+    """The first paragraph of an undocumented utility's `--help`: the text
+    after the usage block, which argparse renders from its parser
+    `description`."""
+    output = subprocess.run(
+        [str(_BIN_DIR / prog), "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    lines = output.splitlines()
+    cursor = 0
+    if lines and lines[0].startswith("usage:"):
+        cursor = 1
+        while cursor < len(lines) and lines[cursor].strip():
+            cursor += 1
+    return _first_paragraph("\n".join(lines[cursor:]))
+
+
+def build_readme() -> str:
+    """Render the repo README: the authored preamble from
+    `scripts/readme-intro.md`, the documented utilities (linked to their
+    generated docs, blurbed from their DESCRIPTION), then the undocumented
+    utilities (blurbed from their `--help`). Run through mdformat so it
+    satisfies the repo's prose gates. Needs no pandoc, but runs each
+    undocumented utility's `--help`."""
+    specs = sorted((make() for make in _SPECS), key=lambda s: s.prog)
+    documented = {spec.prog for spec in specs}
+    intro = _README_INTRO_PATH.read_text().strip()
+    out = [intro, "", "## Documented utilities", ""]
+    for spec in specs:
+        blurb = _first_paragraph(spec.description)
+        term = f"**[{spec.prog}](docs/{spec.prog}.md)**"
+        out.append(_gfm_break_item(term, blurb))
+    out += ["", "## Undocumented utilities", ""]
+    undocumented = sorted(
+        entry.name
+        for entry in _BIN_DIR.iterdir()
+        if entry.is_file() and not entry.name.startswith(".")
+        if entry.name not in documented
+    )
+    for prog in undocumented:
+        out.append(_gfm_break_item(f"**{prog}**", _help_blurb(prog)))
+    return mdformat.text(
+        "\n".join(out),
+        options={"wrap": _md_wrap(), "number": True},
+        extensions={"gfm", "tables"},
+    )
+
+
+def _is_stale(path: Path, content: str) -> bool:
+    return (path.read_text() if path.exists() else "") != content
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Generate reference docs (man page + GFM) from the "
-        "utilities' argparse parsers."
+        description="Generate reference docs (man pages, GFM docs, README) "
+        "from the utilities' argparse parsers."
     )
     ap.add_argument(
         "--check",
         action="store_true",
-        help="Exit non-zero if any checked-in GFM doc is stale; do not "
-        "write (no pandoc needed).",
+        help="Exit non-zero if any checked-in GFM doc or the README is "
+        "stale; do not write (no pandoc needed).",
     )
     args = ap.parse_args()
 
@@ -718,18 +848,26 @@ def main() -> int:
         # the pytest freshness test instead.
         gfm = build_gfm(spec)
         if args.check:
-            current = (
-                spec.docs_path.read_text() if spec.docs_path.exists() else ""
-            )
-            if current != gfm:
+            if _is_stale(spec.docs_path, gfm):
                 stale.append(spec.docs_path)
-            continue
-        roff = _render_roff(build_markdown(spec))
-        for path in (spec.man_path, spec.docs_path):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        spec.man_path.write_text(roff)
-        spec.docs_path.write_text(gfm)
-        print(f"wrote {spec.man_path}\nwrote {spec.docs_path}")
+        else:
+            roff = _render_roff(build_markdown(spec))
+            for path in (spec.man_path, spec.docs_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            spec.man_path.write_text(roff)
+            spec.docs_path.write_text(gfm)
+            print(f"wrote {spec.man_path}\nwrote {spec.docs_path}")
+
+    # The README is pure Python plus each undocumented utility's `--help`
+    # (no pandoc), so --check gates it alongside the GFM docs.
+    readme = build_readme()
+    readme_path = _REPO_ROOT / "README.md"
+    if args.check:
+        if _is_stale(readme_path, readme):
+            stale.append(readme_path)
+    else:
+        readme_path.write_text(readme)
+        print(f"wrote {readme_path}")
 
     if stale:
         for path in stale:

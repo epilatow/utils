@@ -17,10 +17,10 @@
 
 `scripts/render-docs` renders each utility's roff man page (e.g.
 `share/man/man1/crony.1`) and GitHub-browsable GFM doc (e.g.
-`docs/crony.md`) from its argparse parser. Both checked-in artifacts are
-gated against a fresh render, so a CLI / help-text change that isn't
-accompanied by regenerated docs -- or a hand-edit of a generated file --
-fails here.
+`docs/crony.md`) from its argparse parser, plus the repo `README.md`. The
+checked-in artifacts are gated against a fresh render, so a CLI /
+help-text change that isn't accompanied by regenerated docs -- or a
+hand-edit of a generated file -- fails here.
 
 The GFM doc is built in pure Python (plus mdformat), so its comparison
 needs no pandoc. The roff comparison shells out to pandoc, a required,
@@ -75,6 +75,15 @@ def test_docs_gfm_is_current(
     assert spec.docs_path.read_text() == render_docs.build_gfm(spec)
 
 
+def test_readme_is_current() -> None:
+    # The repo README is regenerated (the documented list from `_SPECS`,
+    # the undocumented list from each `bin/` tool's `--help`) and gated
+    # for drift. No pandoc, but it does run each undocumented tool's
+    # `--help`.
+    readme = REPO_ROOT / "README.md"
+    assert readme.read_text() == render_docs.build_readme()
+
+
 def test_gfm_has_single_title_and_demoted_sections() -> None:
     # The GFM doc carries exactly one top-level heading -- the `# <prog> -
     # <summary>` title (the man NAME line, with no separate NAME section)
@@ -118,6 +127,26 @@ def test_extra_sections_render_between_description_and_common_args() -> None:
         < md.index("# NOTES")
         < md.index("# COMMON ARGUMENTS")
     )
+
+
+def test_files_section_renders_before_exit_status() -> None:
+    # A `files` list renders as a FILES section positioned just above
+    # EXIT STATUS, in both the roff-Markdown and the GFM rendering.
+    spec = render_docs.ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=argparse.ArgumentParser,
+        name_description="demo tool",
+        description="Demo overview.",
+        files=[("~/.demorc", "The demo config.")],
+        exit_status=[("0", "Success")],
+    )
+    md = render_docs.build_markdown(spec)
+    assert "`~/.demorc`" in md and "The demo config." in md
+    assert md.index("# FILES") < md.index("# EXIT STATUS")
+    gfm = render_docs.build_gfm(spec)
+    assert "`~/.demorc`" in gfm
+    assert gfm.index("## FILES") < gfm.index("## EXIT STATUS")
 
 
 class TestInvocation:

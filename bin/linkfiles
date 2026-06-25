@@ -13,6 +13,7 @@ import fnmatch
 import logging
 import os
 import sys
+import textwrap
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -32,22 +33,6 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 # =============================================================================
 # DESIGN
 # =============================================================================
-#
-# This tool symlinks the files in a "source directory" into an explicit
-# "target directory":
-#
-#   linkfiles install <src> <tgt>
-#
-# links each of src's entries to the matching path under tgt. --dotfiles
-# dot-prefixes each top-level entry; --no-recurse links only top-level
-# entries. Entries are discovered recursively by default.
-#
-# Tracking:
-#   Each install is recorded in ~/.linkfiles.installed as
-#   `<tgt>\t<src>[\t<flags>]`, sorted by (tgt, src); tgt / src are
-#   escaped so any path round-trips, and <flags> is a comma-separated
-#   subset of {dotfiles, no-recurse}. audit and a no-arg install replay
-#   every record.
 #
 # Conflicts:
 #   A conflict occurs when a target path exists but doesn't point to the
@@ -1313,6 +1298,37 @@ def _validate_remove(
         )
 
 
+# The Description and Getting Started text appended to the `--help`
+# epilog. _OVERVIEW's first paragraph is written to stand alone so it can
+# serve as a one-line summary of the tool on its own.
+_OVERVIEW = """\
+linkfiles symlinks the contents of a source directory tree into a target
+directory, recreating the tree there. Installations are tracked, so later
+runs can add new links, audit existing ones, and clean up dangling links.
+While linkfiles can be used to link
+files from any source to any destination, its primary purpose is linking
+repository files into $HOME/ (as dotfiles) and $HOME/.local/.
+
+By default linkfiles descends into the source and links the leaf files,
+recreating any subdirectories in the target; --no-recurse links each
+top-level entry directly instead. --dotfiles dot-prefixes each top-level
+entry in the target (`bashrc` becomes `.bashrc`). Files matched by an
+ignore file (.gitignore, .hgignore, or .linkfiles.ignore, in or above the
+source) are skipped, as are editor backup and swap files."""
+
+_GETTING_STARTED = """\
+To install files from repos in your $HOME you can do:
+
+    linkfiles install --dotfiles .../files $HOME/
+    linkfiles install .../bin $HOME/.local/bin
+    linkfiles install .../share $HOME/.local/share
+
+To update already installed link trees after the source directories are
+updated run:
+
+    linkfiles install"""
+
+
 def build_parser() -> StrictArgumentParser:
     """
     Build and return the argument parser.
@@ -1323,93 +1339,112 @@ def build_parser() -> StrictArgumentParser:
     parser = StrictArgumentParser(
         prog=LINKFILES_NAME,
         description=LINKFILES_DESCRIPTION,
-        epilog=ExitCode.epilog(),
+        epilog=(
+            f"{ExitCode.epilog()}\n\n"
+            f"Description:\n{textwrap.indent(_OVERVIEW, '  ')}\n\n"
+            f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_command_subparsers(help="Subcommands")
+    subparsers = parser.add_command_subparsers(
+        metavar="<command>",
+        help="Subcommands.",
+    )
 
     # Install subcommand
     install_parser = subparsers.add_parser(
         "install",
         help=(
-            "Sync a source directory into a target: link new entries, "
-            "prune stale managed links"
+            "Link a source directory's contents into a target, or re-sync "
+            "every tracked install."
+        ),
+        description=(
+            "Link the contents of source_dir into target_dir, recording "
+            "the install and its flags so it can be audited and removed "
+            "later. To install links from a new directory, both source_dir "
+            "and target_dir are required. If neither are specified, re-sync "
+            "all previously installed directories."
         ),
     )
     install_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be done without making changes",
+        help="Show what would be done without making changes.",
     )
     install_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
-        help="Replace conflicting symlinks (not files)",
+        help="Replace conflicting symlinks (not files).",
     )
     install_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Print every entry; default suppresses ok lines",
+        help="Print every entry; default suppresses ok lines.",
     )
     install_parser.add_argument(
         "--dotfiles",
         action="store_true",
-        help="Dot-prefix each top-level entry under the target",
+        help="Dot-prefix each top-level entry under the target.",
     )
     install_parser.add_argument(
         "--no-recurse",
         action="store_true",
-        help="Link only top-level entries; do not descend",
+        help="Link only top-level entries; do not descend.",
     )
     install_parser.add_argument(
         "source_dir",
         type=Path,
         nargs="?",
-        help="Source directory to install entries from",
+        help="Source directory to install entries from.",
     )
     install_parser.add_argument(
         "target_dir",
         type=Path,
         nargs="?",
-        help="Target directory to link the source's entries into",
+        help="Target directory to link the source's entries into.",
     )
     install_parser.add_validate_callback(_validate_install)
 
     # Remove subcommand
     remove_parser = subparsers.add_parser(
         "remove",
-        help="Remove one tracked install, or all of them with --all",
+        help="Remove one tracked install's links, or all of them with --all.",
+        description=(
+            "Remove the links of one tracked install -- identified by its "
+            "source_dir and target_dir, required together -- and untrack "
+            "it. Pass --all instead to remove every tracked install."
+        ),
     )
     remove_parser.add_argument(
         "--all",
         dest="all_installs",
         action="store_true",
-        help="Remove every tracked install (instead of a single pair)",
+        help="Remove every tracked install (instead of one source/target).",
     )
     remove_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be done without making changes",
+        help="Show what would be done without making changes.",
     )
     remove_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Print every entry; default suppresses ok lines",
+        help="Print every entry; default suppresses ok lines.",
     )
     remove_parser.add_argument(
         "source_dir",
         type=Path,
         nargs="?",
-        help="Source directory whose entries should be removed",
+        help="Source directory whose entries should be removed.",
     )
     remove_parser.add_argument(
         "target_dir",
         type=Path,
         nargs="?",
-        help="Target directory the install was linked into",
+        help="Target directory the install was linked into.",
     )
     remove_parser.add_validate_callback(_validate_remove)
 
@@ -1417,15 +1452,15 @@ def build_parser() -> StrictArgumentParser:
     audit_parser = subparsers.add_parser(
         "audit",
         help=(
-            "Report status of installed entries; fails on conflicts, "
-            "missing entries, or stale managed links"
+            "Report the status of every tracked install; exits non-zero on "
+            "conflicts, missing entries, or stale managed links."
         ),
     )
     audit_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Print every entry; default suppresses ok lines",
+        help="Print every entry; default suppresses ok lines.",
     )
 
     return parser
