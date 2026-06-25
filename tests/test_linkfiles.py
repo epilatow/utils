@@ -97,18 +97,18 @@ class TestInstallRecord:
 
     def test_flag_tokens_order(self) -> None:
         rec = lf.InstallRecord(
-            dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=True
+            tgt=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=True
         )
         assert rec.flag_tokens() == ["dotfiles", "no-recurse"]
 
 
 class TestLinkEntryTargetPath:
-    """A link's target is its relative path under the install's dst, with
+    """A link's target is its relative path under the install's tgt, with
     the top-level component dot-prefixed under the dotfiles flag."""
 
     def _entry(self, rel: str, **flags: bool) -> lf.LinkEntry:
         rec = lf.InstallRecord(
-            dst=Path("/t"),
+            tgt=Path("/t"),
             src=Path("/s"),
             dotfiles=flags.get("dotfiles", False),
             no_recurse=flags.get("no_recurse", False),
@@ -117,7 +117,7 @@ class TestLinkEntryTargetPath:
             relative_path=Path(rel), source_dir=Path("/s"), record=rec
         )
 
-    def test_target_is_under_dst(self) -> None:
+    def test_target_is_under_tgt(self) -> None:
         assert self._entry("bin/x").target_path == Path("/t/bin/x")
 
     def test_dotfiles_dot_prefixes_top_level(self) -> None:
@@ -133,19 +133,19 @@ class TestLinkEntryTargetPath:
 
 @pytest.mark.usefixtures("tracked")
 class TestTrackingIO:
-    """~/.linkfiles.installed round-trips records, sorted by (dst, src),
-    as <dst>\\t<src>[\\t<flags>]."""
+    """~/.linkfiles.installed round-trips records, sorted by (tgt, src),
+    as <tgt>\\t<src>[\\t<flags>]."""
 
     def test_save_load_round_trip(self) -> None:
         recs = [
             lf.InstallRecord(
-                dst=Path("/share"),
+                tgt=Path("/share"),
                 src=Path("/s1"),
                 dotfiles=False,
                 no_recurse=False,
             ),
             lf.InstallRecord(
-                dst=Path("/home"),
+                tgt=Path("/home"),
                 src=Path("/s2"),
                 dotfiles=True,
                 no_recurse=True,
@@ -153,27 +153,27 @@ class TestTrackingIO:
         ]
         lf.save_install_records(recs)
         loaded = lf.load_install_records()
-        assert {(r.dst, r.src, tuple(r.flag_tokens())) for r in loaded} == {
-            (r.dst, r.src, tuple(r.flag_tokens())) for r in recs
+        assert {(r.tgt, r.src, tuple(r.flag_tokens())) for r in loaded} == {
+            (r.tgt, r.src, tuple(r.flag_tokens())) for r in recs
         }
 
-    def test_sorted_by_dst_then_src(self) -> None:
+    def test_sorted_by_tgt_then_src(self) -> None:
         lf.save_install_records(
             [
                 lf.InstallRecord(
-                    dst=Path("/z"),
+                    tgt=Path("/z"),
                     src=Path("/a"),
                     dotfiles=False,
                     no_recurse=False,
                 ),
                 lf.InstallRecord(
-                    dst=Path("/a"),
+                    tgt=Path("/a"),
                     src=Path("/b"),
                     dotfiles=False,
                     no_recurse=False,
                 ),
                 lf.InstallRecord(
-                    dst=Path("/a"),
+                    tgt=Path("/a"),
                     src=Path("/a"),
                     dotfiles=False,
                     no_recurse=False,
@@ -187,7 +187,7 @@ class TestTrackingIO:
         lf.save_install_records(
             [
                 lf.InstallRecord(
-                    dst=Path("/t"),
+                    tgt=Path("/t"),
                     src=Path("/s"),
                     dotfiles=False,
                     no_recurse=False,
@@ -200,7 +200,7 @@ class TestTrackingIO:
         lf.save_install_records(
             [
                 lf.InstallRecord(
-                    dst=Path("/t"),
+                    tgt=Path("/t"),
                     src=Path("/s"),
                     dotfiles=True,
                     no_recurse=True,
@@ -214,18 +214,18 @@ class TestTrackingIO:
 
     def test_path_with_tab_round_trips(self) -> None:
         rec = lf.InstallRecord(
-            dst=Path("/t\tx"),
+            tgt=Path("/t\tx"),
             src=Path("/s"),
             dotfiles=False,
             no_recurse=False,
         )
         lf.save_install_records([rec])
-        assert lf.load_install_records()[0].dst == Path("/t\tx")
+        assert lf.load_install_records()[0].tgt == Path("/t\tx")
 
-    def test_add_replaces_same_dst_src(self) -> None:
+    def test_add_replaces_same_tgt_src(self) -> None:
         lf.add_install_record(
             lf.InstallRecord(
-                dst=Path("/t"),
+                tgt=Path("/t"),
                 src=Path("/s"),
                 dotfiles=False,
                 no_recurse=False,
@@ -233,7 +233,7 @@ class TestTrackingIO:
         )
         lf.add_install_record(
             lf.InstallRecord(
-                dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=False
+                tgt=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=False
             )
         )
         recs = lf.load_install_records()
@@ -243,7 +243,7 @@ class TestTrackingIO:
     def test_remove_drops_record(self) -> None:
         lf.add_install_record(
             lf.InstallRecord(
-                dst=Path("/t"),
+                tgt=Path("/t"),
                 src=Path("/s"),
                 dotfiles=False,
                 no_recurse=False,
@@ -260,31 +260,31 @@ class TestTrackingIO:
 
 
 class TestLinkfilesInstall:
-    """install <src> <dst> links recursively into the explicit target,
+    """install <src> <tgt> links recursively into the explicit target,
     records the install, and honors --dotfiles / --no-recurse."""
 
     def test_recursive_into_explicit_target(self, tracked: Path) -> None:
         src = _make_tree(tracked / "share", {"man/man1/foo.1": "page"})
-        dst = tracked / "dest"
+        tgt = tracked / "dest"
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=False,
             no_recurse=False,
             dry_run=False,
             force=False,
             verbose=False,
         )
-        link = dst / "man" / "man1" / "foo.1"
+        link = tgt / "man" / "man1" / "foo.1"
         assert link.is_symlink()
         assert link.resolve() == (src / "man" / "man1" / "foo.1").resolve()
 
     def test_records_the_install(self, tracked: Path) -> None:
         src = _make_tree(tracked / "share", {"x": "y"})
-        dst = tracked / "dest"
+        tgt = tracked / "dest"
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=False,
             no_recurse=False,
             dry_run=False,
@@ -294,52 +294,52 @@ class TestLinkfilesInstall:
         recs = lf.load_install_records()
         assert len(recs) == 1
         assert recs[0].src == src.resolve()
-        assert recs[0].dst == dst.resolve()
+        assert recs[0].tgt == tgt.resolve()
 
     def test_dotfiles_flag_dot_prefixes_top_level(self, tracked: Path) -> None:
         src = _make_tree(tracked / "cfg", {"rc": "x", "sub/deep": "y"})
-        dst = tracked / "home"
+        tgt = tracked / "home"
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=True,
             no_recurse=False,
             dry_run=False,
             force=False,
             verbose=False,
         )
-        assert (dst / ".rc").is_symlink()
+        assert (tgt / ".rc").is_symlink()
         # Only the top-level segment is dot-prefixed.
-        assert (dst / ".sub" / "deep").is_symlink()
+        assert (tgt / ".sub" / "deep").is_symlink()
 
     def test_no_recurse_links_top_level_only(self, tracked: Path) -> None:
         src = _make_tree(tracked / "bin", {"tool": "x", "sub/nested": "y"})
-        dst = tracked / "dest"
+        tgt = tracked / "dest"
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=False,
             no_recurse=True,
             dry_run=False,
             force=False,
             verbose=False,
         )
-        assert (dst / "tool").is_symlink()
-        assert not (dst / "sub").exists()
+        assert (tgt / "tool").is_symlink()
+        assert not (tgt / "sub").exists()
 
     def test_links_non_executable_files(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"readme": "docs"})
-        dst = tracked / "dest"
+        tgt = tracked / "dest"
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=False,
             no_recurse=False,
             dry_run=False,
             force=False,
             verbose=False,
         )
-        assert (dst / "readme").is_symlink()
+        assert (tgt / "readme").is_symlink()
 
     def test_one_arg_without_target_errors(self) -> None:
         # Arg-combination validation lives in the parser, so a half-named
@@ -382,10 +382,10 @@ class TestLinkfilesDiscovery:
     """linkfiles shares the discovery rules: it honors .linkfiles.ignore
     (and the other ignore files) and skips every dotfile."""
 
-    def _install(self, src: Path, dst: Path) -> None:
+    def _install(self, src: Path, tgt: Path) -> None:
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=False,
             no_recurse=False,
             dry_run=False,
@@ -402,12 +402,12 @@ class TestLinkfilesDiscovery:
                 ".linkfiles.ignore": "skip.me\n",
             },
         )
-        dst = tracked / "d"
-        self._install(src, dst)
-        assert (dst / "keep").is_symlink()
-        assert not (dst / "skip.me").exists()
+        tgt = tracked / "d"
+        self._install(src, tgt)
+        assert (tgt / "keep").is_symlink()
+        assert not (tgt / "skip.me").exists()
         # The ignore file is itself a dotfile, so it is never linked.
-        assert not (dst / ".linkfiles.ignore").exists()
+        assert not (tgt / ".linkfiles.ignore").exists()
 
     def test_skips_dotfiles_at_any_depth(self, tracked: Path) -> None:
         src = _make_tree(
@@ -419,21 +419,21 @@ class TestLinkfilesDiscovery:
                 ".top": "w",
             },
         )
-        dst = tracked / "d"
-        self._install(src, dst)
-        assert (dst / "visible").is_symlink()
-        assert (dst / "sub" / "visible").is_symlink()
-        assert not (dst / "sub" / ".hidden").exists()
-        assert not (dst / ".top").exists()
+        tgt = tracked / "d"
+        self._install(src, tgt)
+        assert (tgt / "visible").is_symlink()
+        assert (tgt / "sub" / "visible").is_symlink()
+        assert not (tgt / "sub" / ".hidden").exists()
+        assert not (tgt / ".top").exists()
 
 
 class TestLinkfilesAuditRemove:
     """audit / remove operate across every tracked record."""
 
-    def _install(self, src: Path, dst: Path, **flags: bool) -> None:
+    def _install(self, src: Path, tgt: Path, **flags: bool) -> None:
         lf.do_install(
             src,
-            dst,
+            tgt,
             dotfiles=flags.get("dotfiles", False),
             no_recurse=flags.get("no_recurse", False),
             dry_run=False,
@@ -448,8 +448,8 @@ class TestLinkfilesAuditRemove:
 
     def test_audit_flags_stale(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"x": "y", "gone": "z"})
-        dst = tracked / "d"
-        self._install(src, dst)
+        tgt = tracked / "d"
+        self._install(src, tgt)
         # Remove a source file; its managed link is now stale.
         (src / "gone").unlink()
         with pytest.raises(lf.ConflictsFound):
@@ -457,10 +457,10 @@ class TestLinkfilesAuditRemove:
 
     def test_remove_one_install(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"x": "y"})
-        dst = tracked / "d"
-        self._install(src, dst)
-        lf.do_remove(src, dst, all_installs=False, dry_run=False, verbose=False)
-        assert not (dst / "x").exists()
+        tgt = tracked / "d"
+        self._install(src, tgt)
+        lf.do_remove(src, tgt, all_installs=False, dry_run=False, verbose=False)
+        assert not (tgt / "x").exists()
         assert lf.load_install_records() == []
 
     def test_remove_untracked_errors(self, tracked: Path) -> None:

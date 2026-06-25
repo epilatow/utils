@@ -36,15 +36,15 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 # This tool symlinks the files in a "source directory" into an explicit
 # "target directory":
 #
-#   linkfiles install <src> <dst>
+#   linkfiles install <src> <tgt>
 #
-# links each of src's entries to the matching path under dst. --dotfiles
+# links each of src's entries to the matching path under tgt. --dotfiles
 # dot-prefixes each top-level entry; --no-recurse links only top-level
 # entries. Entries are discovered recursively by default.
 #
 # Tracking:
 #   Each install is recorded in ~/.linkfiles.installed as
-#   `<dst>\t<src>[\t<flags>]`, sorted by (dst, src); dst / src are
+#   `<tgt>\t<src>[\t<flags>]`, sorted by (tgt, src); tgt / src are
 #   escaped so any path round-trips, and <flags> is a comma-separated
 #   subset of {dotfiles, no-recurse}. audit and a no-arg install replay
 #   every record.
@@ -219,12 +219,12 @@ class LinkEntry:
 
     @property
     def target_path(self) -> Path:
-        """Absolute path to the target symlink under the install's dst.
+        """Absolute path to the target symlink under the install's tgt.
         With the dotfiles flag, the top-level component is dot-prefixed
         (`bashrc` -> `.bashrc`)."""
         parts = self.relative_path.parts
         first = ("." + parts[0]) if self.record.dotfiles else parts[0]
-        return self.record.dst / Path(first, *parts[1:])
+        return self.record.tgt / Path(first, *parts[1:])
 
     def compute_relative_symlink(self) -> Path:
         """Compute relative path from target to source."""
@@ -245,8 +245,8 @@ class OperationResult:
 # =============================================================================
 #
 # The linkfiles tracking file (~/.linkfiles.installed) records one
-# install per line as `<dst>\t<src>[\t<flags>]`, kept sorted by
-# (dst, src). dst / src are tab-and-backslash escaped so an arbitrary
+# install per line as `<tgt>\t<src>[\t<flags>]`, kept sorted by
+# (tgt, src). tgt / src are tab-and-backslash escaped so an arbitrary
 # path (including one containing a tab or newline) round-trips on a
 # single line; <flags> is a comma-separated subset of the fixed
 # vocabulary below and needs no escaping.
@@ -258,9 +258,9 @@ _FLAG_NO_RECURSE = "no-recurse"
 @dataclass(frozen=True)
 class InstallRecord:
     """One tracked linkfiles install: a source dir linked into a target
-    dir, plus the flags that shaped the link. Identity is (dst, src)."""
+    dir, plus the flags that shaped the link. Identity is (tgt, src)."""
 
-    dst: Path
+    tgt: Path
     src: Path
     dotfiles: bool
     no_recurse: bool
@@ -337,12 +337,12 @@ def load_install_records() -> list[InstallRecord]:
         if len(fields) < 2:
             logger.warning("skipping malformed linkfiles record: %s", line)
             continue
-        dst = Path(_unescape_field(fields[0]))
+        tgt = Path(_unescape_field(fields[0]))
         src = Path(_unescape_field(fields[1]))
         flags = set(fields[2].split(",")) if len(fields) > 2 else set()
         records.append(
             InstallRecord(
-                dst=dst,
+                tgt=tgt,
                 src=src,
                 dotfiles=_FLAG_DOTFILES in flags,
                 no_recurse=_FLAG_NO_RECURSE in flags,
@@ -353,11 +353,11 @@ def load_install_records() -> list[InstallRecord]:
 
 def save_install_records(records: list[InstallRecord]) -> None:
     """Write records to the linkfiles tracking file, sorted by
-    (dst, src)."""
-    ordered = sorted(records, key=lambda r: (str(r.dst), str(r.src)))
+    (tgt, src)."""
+    ordered = sorted(records, key=lambda r: (str(r.tgt), str(r.src)))
     lines: list[str] = []
     for rec in ordered:
-        parts = [_escape_field(str(rec.dst)), _escape_field(str(rec.src))]
+        parts = [_escape_field(str(rec.tgt)), _escape_field(str(rec.src))]
         tokens = rec.flag_tokens()
         if tokens:
             parts.append(",".join(tokens))
@@ -370,20 +370,20 @@ def save_install_records(records: list[InstallRecord]) -> None:
 
 def add_install_record(record: InstallRecord) -> None:
     """Record an install, replacing any prior record with the same
-    (dst, src) so re-installing updates its flags."""
+    (tgt, src) so re-installing updates its flags."""
     records = [
         r
         for r in load_install_records()
-        if not (r.dst == record.dst and r.src == record.src)
+        if not (r.tgt == record.tgt and r.src == record.src)
     ]
     records.append(record)
     save_install_records(records)
 
 
-def remove_install_record(dst: Path, src: Path) -> None:
-    """Drop the (dst, src) record if present."""
+def remove_install_record(tgt: Path, src: Path) -> None:
+    """Drop the (tgt, src) record if present."""
     records = [
-        r for r in load_install_records() if not (r.dst == dst and r.src == src)
+        r for r in load_install_records() if not (r.tgt == tgt and r.src == src)
     ]
     save_install_records(records)
 
@@ -870,7 +870,7 @@ def remove_entry(
         # Correctly linked, safe to remove
         if not dry_run:
             entry.target_path.unlink()
-            _cleanup_empty_parents(entry.target_path.parent, entry.record.dst)
+            _cleanup_empty_parents(entry.target_path.parent, entry.record.tgt)
         return OperationResult(entry=entry, status=LinkStatus.REMOVED)
 
     # FILE_CONFLICT or LINK_CONFLICT - leave alone
@@ -1074,7 +1074,7 @@ def _find_stale_for_dir(
     src_resolved = record.src.resolve()
     discovered_rels = {e.relative_path for e in entries}
     sources = {src_resolved: discovered_rels}
-    scan_dirs = _scan_dirs_for_entries(entries, record.dst)
+    scan_dirs = _scan_dirs_for_entries(entries, record.tgt)
 
     stale: list[tuple[Path, LinkEntry]] = []
     for symlink, _src, rel in _stale_managed_links(sources, scan_dirs):
@@ -1124,7 +1124,7 @@ def _run_install(
         for symlink, synth_entry in _find_stale_for_dir(record, entries):
             if not dry_run:
                 symlink.unlink()
-                _cleanup_empty_parents(symlink.parent, record.dst)
+                _cleanup_empty_parents(symlink.parent, record.tgt)
             results.append(OperationResult(synth_entry, LinkStatus.STALE))
         log_results(
             record.src,
@@ -1190,8 +1190,8 @@ def _run_remove(
 
 
 def do_install(
-    directory: Path | None,
-    dst: Path | None,
+    source_dir: Path | None,
+    target_dir: Path | None,
     *,
     dotfiles: bool,
     no_recurse: bool,
@@ -1202,14 +1202,14 @@ def do_install(
     """Install a source dir's entries into an explicit target dir
     (recording the install + its flags), or re-sync every tracked
     install when neither source nor target is given."""
-    if directory is not None:
-        assert dst is not None  # the parser validates them together
-        src = directory.expanduser().resolve()
-        target = dst.expanduser().resolve()
+    if source_dir is not None:
+        assert target_dir is not None  # the parser validates them together
+        src = source_dir.expanduser().resolve()
+        target = target_dir.expanduser().resolve()
         if not src.is_dir():
             raise LinkfilesError(f"Source directory does not exist: {src}")
         record = InstallRecord(
-            dst=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
+            tgt=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
         )
         if not dry_run:
             add_install_record(record)
@@ -1224,12 +1224,12 @@ def do_install(
 
 def _untrack_record(record: InstallRecord) -> None:
     """Drop the tracked record for this install."""
-    remove_install_record(record.dst, record.src)
+    remove_install_record(record.tgt, record.src)
 
 
 def do_remove(
-    directory: Path | None,
-    dst: Path | None,
+    source_dir: Path | None,
+    target_dir: Path | None,
     *,
     all_installs: bool,
     dry_run: bool,
@@ -1247,14 +1247,14 @@ def do_remove(
             return
     else:
         # A non-all remove always names both dirs (parser-validated).
-        assert directory is not None and dst is not None
-        src = directory.expanduser().resolve()
-        target = dst.expanduser().resolve()
+        assert source_dir is not None and target_dir is not None
+        src = source_dir.expanduser().resolve()
+        target = target_dir.expanduser().resolve()
         record = next(
             (
                 r
                 for r in load_install_records()
-                if r.src == src and r.dst == target
+                if r.src == src and r.tgt == target
             ),
             None,
         )
@@ -1291,7 +1291,7 @@ def _validate_install(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     """Reject an install that names only one of source / target."""
-    if (args.directory is None) != (args.dst is None):
+    if (args.source_dir is None) != (args.target_dir is None):
         parser.error("install needs both a source and a target dir")
 
 
@@ -1301,10 +1301,10 @@ def _validate_remove(
     """Reject an ambiguous remove: a bare invocation (which would wipe
     every install), --all combined with a source/target pair, or a
     half-named pair."""
-    has_pair = args.directory is not None or args.dst is not None
+    has_pair = args.source_dir is not None or args.target_dir is not None
     if has_pair and args.all_installs:
         parser.error("--all cannot be combined with a source/target dir")
-    if has_pair and (args.directory is None or args.dst is None):
+    if has_pair and (args.source_dir is None or args.target_dir is None):
         parser.error("remove needs both a source and a target dir")
     if not has_pair and not args.all_installs:
         parser.error(
@@ -1364,13 +1364,13 @@ def build_parser() -> StrictArgumentParser:
         help="Link only top-level entries; do not descend",
     )
     install_parser.add_argument(
-        "directory",
+        "source_dir",
         type=Path,
         nargs="?",
         help="Source directory to install entries from",
     )
     install_parser.add_argument(
-        "dst",
+        "target_dir",
         type=Path,
         nargs="?",
         help="Target directory to link the source's entries into",
@@ -1400,13 +1400,13 @@ def build_parser() -> StrictArgumentParser:
         help="Print every entry; default suppresses ok lines",
     )
     remove_parser.add_argument(
-        "directory",
+        "source_dir",
         type=Path,
         nargs="?",
         help="Source directory whose entries should be removed",
     )
     remove_parser.add_argument(
-        "dst",
+        "target_dir",
         type=Path,
         nargs="?",
         help="Target directory the install was linked into",
