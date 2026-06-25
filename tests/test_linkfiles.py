@@ -92,35 +92,35 @@ class TestFieldEscaping:
         assert lf._unescape_field(fields[1]) == "/c"
 
 
-class TestLinkRecord:
+class TestInstallRecord:
     """A record reconstitutes a concrete profile from its dst / flags."""
 
     def test_profile_target_is_dst(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=False
         )
         assert rec.profile().target_root() == Path("/t")
 
     def test_dotfiles_flag_dot_prefixes(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=False
         )
         assert rec.profile().transform_segment("rc") == ".rc"
 
     def test_plain_flag_is_identity(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=False
         )
         assert rec.profile().transform_segment("rc") == "rc"
 
     def test_no_recurse_sets_flat(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=False, no_recurse=True
         )
         assert rec.profile().flat is True
 
     def test_flag_tokens_order(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=True
         )
         assert rec.flag_tokens() == ["dotfiles", "no-recurse"]
@@ -133,41 +133,41 @@ class TestTrackingIO:
 
     def test_save_load_round_trip(self) -> None:
         recs = [
-            lf.LinkRecord(
+            lf.InstallRecord(
                 dst=Path("/share"),
                 src=Path("/s1"),
                 dotfiles=False,
                 no_recurse=False,
             ),
-            lf.LinkRecord(
+            lf.InstallRecord(
                 dst=Path("/home"),
                 src=Path("/s2"),
                 dotfiles=True,
                 no_recurse=True,
             ),
         ]
-        lf.save_link_records(recs)
-        loaded = lf.load_link_records()
+        lf.save_install_records(recs)
+        loaded = lf.load_install_records()
         assert {(r.dst, r.src, tuple(r.flag_tokens())) for r in loaded} == {
             (r.dst, r.src, tuple(r.flag_tokens())) for r in recs
         }
 
     def test_sorted_by_dst_then_src(self) -> None:
-        lf.save_link_records(
+        lf.save_install_records(
             [
-                lf.LinkRecord(
+                lf.InstallRecord(
                     dst=Path("/z"),
                     src=Path("/a"),
                     dotfiles=False,
                     no_recurse=False,
                 ),
-                lf.LinkRecord(
+                lf.InstallRecord(
                     dst=Path("/a"),
                     src=Path("/b"),
                     dotfiles=False,
                     no_recurse=False,
                 ),
-                lf.LinkRecord(
+                lf.InstallRecord(
                     dst=Path("/a"),
                     src=Path("/a"),
                     dotfiles=False,
@@ -179,9 +179,9 @@ class TestTrackingIO:
         assert lines == ["/a\t/a", "/a\t/b", "/z\t/a"]
 
     def test_flags_field_omitted_when_empty(self) -> None:
-        lf.save_link_records(
+        lf.save_install_records(
             [
-                lf.LinkRecord(
+                lf.InstallRecord(
                     dst=Path("/t"),
                     src=Path("/s"),
                     dotfiles=False,
@@ -192,9 +192,9 @@ class TestTrackingIO:
         assert lf.INSTALLED_FILE.read_text().strip() == "/t\t/s"
 
     def test_flags_field_written_when_set(self) -> None:
-        lf.save_link_records(
+        lf.save_install_records(
             [
-                lf.LinkRecord(
+                lf.InstallRecord(
                     dst=Path("/t"),
                     src=Path("/s"),
                     dotfiles=True,
@@ -208,48 +208,48 @@ class TestTrackingIO:
         )
 
     def test_path_with_tab_round_trips(self) -> None:
-        rec = lf.LinkRecord(
+        rec = lf.InstallRecord(
             dst=Path("/t\tx"),
             src=Path("/s"),
             dotfiles=False,
             no_recurse=False,
         )
-        lf.save_link_records([rec])
-        assert lf.load_link_records()[0].dst == Path("/t\tx")
+        lf.save_install_records([rec])
+        assert lf.load_install_records()[0].dst == Path("/t\tx")
 
     def test_add_replaces_same_dst_src(self) -> None:
-        lf.add_link_record(
-            lf.LinkRecord(
+        lf.add_install_record(
+            lf.InstallRecord(
                 dst=Path("/t"),
                 src=Path("/s"),
                 dotfiles=False,
                 no_recurse=False,
             )
         )
-        lf.add_link_record(
-            lf.LinkRecord(
+        lf.add_install_record(
+            lf.InstallRecord(
                 dst=Path("/t"), src=Path("/s"), dotfiles=True, no_recurse=False
             )
         )
-        recs = lf.load_link_records()
+        recs = lf.load_install_records()
         assert len(recs) == 1
         assert recs[0].dotfiles is True
 
     def test_remove_drops_record(self) -> None:
-        lf.add_link_record(
-            lf.LinkRecord(
+        lf.add_install_record(
+            lf.InstallRecord(
                 dst=Path("/t"),
                 src=Path("/s"),
                 dotfiles=False,
                 no_recurse=False,
             )
         )
-        lf.remove_link_record(Path("/t"), Path("/s"))
-        assert lf.load_link_records() == []
+        lf.remove_install_record(Path("/t"), Path("/s"))
+        assert lf.load_install_records() == []
 
     def test_malformed_line_skipped(self) -> None:
         lf.INSTALLED_FILE.write_text("no-tab-here\n/t\t/s\n")
-        recs = lf.load_link_records()
+        recs = lf.load_install_records()
         assert len(recs) == 1
         assert recs[0].src == Path("/s")
 
@@ -286,7 +286,7 @@ class TestLinkfilesInstall:
             force=False,
             verbose=False,
         )
-        recs = lf.load_link_records()
+        recs = lf.load_install_records()
         assert len(recs) == 1
         assert recs[0].src == src.resolve()
         assert recs[0].dst == dst.resolve()
@@ -462,7 +462,7 @@ class TestLinkfilesAuditRemoveCleanup:
         self._install(src, dst)
         lf.do_remove(src, dst, dry_run=False, verbose=False)
         assert not (dst / "x").exists()
-        assert lf.load_link_records() == []
+        assert lf.load_install_records() == []
 
     def test_remove_untracked_errors(self, tracked: Path) -> None:
         src = _make_tree(tracked / "s", {"x": "y"})

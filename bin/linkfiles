@@ -142,7 +142,7 @@ class Profile:
     """How a source dir maps onto symlinks: where they go (target_root),
     how each top-level name is transformed, which tracking file records
     installs, and whether discovery is flat. Each install builds its own
-    (see `LinkRecord.profile`).
+    (see `InstallRecord.profile`).
 
     target_root, transform_segment, and installed_file are callables so
     that test monkeypatches of Path.home propagate through.
@@ -167,14 +167,14 @@ def _identity(segment: str) -> str:
 def _no_static_target() -> Path:
     """The linkfiles profile has no fixed target root -- each install
     names its own dst, so operations build a per-record profile (see
-    `LinkRecord.profile`) and never read this profile's `target_root`.
+    `InstallRecord.profile`) and never read this profile's `target_root`.
     Calling it is a bug."""
     raise AssertionError("linkfiles builds a per-record target root")
 
 
 # Carries the parser identity and the tracking-file location. Each
 # install reconstitutes a concrete profile (its own dst + flags) via
-# `LinkRecord.profile`, so this profile's `target_root` is never read.
+# `InstallRecord.profile`, so this profile's `target_root` is never read.
 LINKFILES_PROFILE = Profile(
     name="linkfiles",
     description="Symlink a source dir's contents into an explicit target",
@@ -307,7 +307,7 @@ _FLAG_NO_RECURSE = "no-recurse"
 
 
 @dataclass(frozen=True)
-class LinkRecord:
+class InstallRecord:
     """One tracked linkfiles install: a source dir linked into a target
     dir, plus the flags that shaped the link. Identity is (dst, src)."""
 
@@ -388,12 +388,12 @@ def _split_escaped(line: str) -> list[str]:
     return fields
 
 
-def load_link_records() -> list[LinkRecord]:
+def load_install_records() -> list[InstallRecord]:
     """Parse the linkfiles tracking file into records. A line with
     fewer than two fields is malformed and skipped."""
     if not INSTALLED_FILE.exists():
         return []
-    records: list[LinkRecord] = []
+    records: list[InstallRecord] = []
     for line in INSTALLED_FILE.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -405,7 +405,7 @@ def load_link_records() -> list[LinkRecord]:
         src = Path(_unescape_field(fields[1]))
         flags = set(fields[2].split(",")) if len(fields) > 2 else set()
         records.append(
-            LinkRecord(
+            InstallRecord(
                 dst=dst,
                 src=src,
                 dotfiles=_FLAG_DOTFILES in flags,
@@ -415,7 +415,7 @@ def load_link_records() -> list[LinkRecord]:
     return records
 
 
-def save_link_records(records: list[LinkRecord]) -> None:
+def save_install_records(records: list[InstallRecord]) -> None:
     """Write records to the linkfiles tracking file, sorted by
     (dst, src)."""
     ordered = sorted(records, key=lambda r: (str(r.dst), str(r.src)))
@@ -432,30 +432,30 @@ def save_link_records(records: list[LinkRecord]) -> None:
     INSTALLED_FILE.write_text(content, encoding="utf-8")
 
 
-def add_link_record(record: LinkRecord) -> None:
+def add_install_record(record: InstallRecord) -> None:
     """Record an install, replacing any prior record with the same
     (dst, src) so re-installing updates its flags."""
     records = [
         r
-        for r in load_link_records()
+        for r in load_install_records()
         if not (r.dst == record.dst and r.src == record.src)
     ]
     records.append(record)
-    save_link_records(records)
+    save_install_records(records)
 
 
-def remove_link_record(dst: Path, src: Path) -> None:
+def remove_install_record(dst: Path, src: Path) -> None:
     """Drop the (dst, src) record if present."""
     records = [
-        r for r in load_link_records() if not (r.dst == dst and r.src == src)
+        r for r in load_install_records() if not (r.dst == dst and r.src == src)
     ]
-    save_link_records(records)
+    save_install_records(records)
 
 
 def load_installed_entries() -> list[tuple[Path, Profile]]:
     """The (source dir, profile) pair for each tracked install, each
     profile carrying that record's dst and flags."""
-    return [(rec.src, rec.profile()) for rec in load_link_records()]
+    return [(rec.src, rec.profile()) for rec in load_install_records()]
 
 
 # =============================================================================
@@ -1289,11 +1289,11 @@ def do_install(
         target = dst.expanduser().resolve()
         if not src.is_dir():
             raise MissingSourceDir(f"Source directory does not exist: {src}")
-        record = LinkRecord(
+        record = InstallRecord(
             dst=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
         )
         if not dry_run:
-            add_link_record(record)
+            add_install_record(record)
         targets = [(src, record.profile())]
     else:
         targets = load_installed_entries()
@@ -1305,7 +1305,7 @@ def do_install(
 
 def _untrack_record(src_dir: Path, profile: Profile) -> None:
     """Drop the tracked record for (target, source)."""
-    remove_link_record(profile.target_root(), src_dir)
+    remove_install_record(profile.target_root(), src_dir)
 
 
 def do_remove(
@@ -1326,7 +1326,7 @@ def do_remove(
         record = next(
             (
                 r
-                for r in load_link_records()
+                for r in load_install_records()
                 if r.src == src and r.dst == target
             ),
             None,
