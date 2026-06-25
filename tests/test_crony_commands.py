@@ -53,6 +53,7 @@ from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
+    JobFlagNames,
     JobFlags,
     MaskReason,
     TomlConfig,
@@ -1931,7 +1932,7 @@ class TestEnableDisable:
         assert node is not None and node.unit_disabled is True
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -1970,7 +1971,7 @@ class TestEnableDisable:
         so the value is the bare token (no ANSI)."""
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid,schedule",
+            cols=crony_commands.parse_cols_arg("job-or-uuid,schedule"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -2610,7 +2611,7 @@ class TestStatusUuidColumn:
     """`uuid` is an opt-in column rendering the `<bundle>:<UUID>`
     ref form. Default `cols=None` hides it (the default identity
     column is `job-or-uuid`, which shows the plain name for an
-    unambiguous entry); `cols="job,uuid"` surfaces the stable
+    unambiguous entry); `--cols job,uuid` surfaces the stable
     identity for scripts correlating status with disk state or the
     config file's `uuid =` keys.
     """
@@ -2626,7 +2627,7 @@ class TestStatusUuidColumn:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid",
+            cols=crony_commands.parse_cols_arg("job,uuid"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -2673,7 +2674,7 @@ class TestStatusUuidColumn:
         h.config({}, default_target_jobs=[])
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid,config",
+            cols=crony_commands.parse_cols_arg("job,uuid,config"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -2692,7 +2693,7 @@ class TestStatusFieldColumns:
     def _status(self, cols: str, capsys: Any) -> str:
         crony_commands.do_status(
             jobs=[],
-            cols=cols,
+            cols=crony_commands.parse_cols_arg(cols),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -2946,7 +2947,7 @@ class TestStatusDivergenceFooter:
         self._stale_schedule(tmp_path, monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="schedule",
+            cols=crony_commands.parse_cols_arg("schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -2965,7 +2966,7 @@ class TestStatusDivergenceFooter:
         self._stale_schedule(tmp_path, monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="config",
+            cols=crony_commands.parse_cols_arg("config"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3065,7 +3066,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,status,last-ran",
+            cols=crony_commands.parse_cols_arg("job,status,last-ran"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -3082,21 +3083,35 @@ class TestStatusReport:
         assert "SCHEDULE" not in header
         assert "UNIT" not in header
 
-    def test_cols_unknown_name_rejected(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch)
-        h.config({}, default_target_jobs=[])
-        with pytest.raises(UsageError, match="unknown status column"):
-            crony_commands.do_status(
-                jobs=[],
-                cols="job,bogus",
-                show_masked=False,
-                bundle=None,
-                config_current=False,
-                config_pending=False,
-                exclude_healthy=False,
+    def test_cols_unknown_name_rejected(self) -> None:
+        # --cols names are validated by the parser (type=), so an
+        # unknown column exits 2 before dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["status", "--cols", "job,bogus"]
             )
+        assert exc.value.code == 2
+
+    def test_parse_cols_arg_rejects_unknown(self) -> None:
+        # The type= converter names the offending column(s).
+        with pytest.raises(
+            argparse.ArgumentTypeError, match="unknown status column"
+        ):
+            crony_commands.parse_cols_arg("job,bogus")
+
+    def test_parse_cols_arg_classifies_token_kinds(self) -> None:
+        # Each token resolves to its enum: column, alias, per-flag.
+        tokens = crony_commands.parse_cols_arg("job,default,interactive")
+        assert tokens == [
+            crony_commands.StatusCols.JOB,
+            crony_commands.StatusAliases.DEFAULT,
+            JobFlagNames.INTERACTIVE,
+        ]
+        assert [type(t).__name__ for t in tokens] == [
+            "StatusCols",
+            "StatusAliases",
+            "JobFlagNames",
+        ]
 
     def test_last_ran_column_shows_relative_time(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3124,7 +3139,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,last-ran",
+            cols=crony_commands.parse_cols_arg("job,last-ran"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -3149,7 +3164,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,last-ran",
+            cols=crony_commands.parse_cols_arg("job,last-ran"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -3267,7 +3282,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid",
+            cols=crony_commands.parse_cols_arg("job,uuid"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3305,7 +3320,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid,config,groups",
+            cols=crony_commands.parse_cols_arg("job-or-uuid,config,groups"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3349,7 +3364,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid,config,groups",
+            cols=crony_commands.parse_cols_arg("job-or-uuid,config,groups"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3395,7 +3410,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid,config,schedule",
+            cols=crony_commands.parse_cols_arg("job-or-uuid,config,schedule"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3452,7 +3467,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3533,7 +3548,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3569,7 +3584,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3580,7 +3595,7 @@ class TestStatusReport:
         assert h.full("j") not in out
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3626,7 +3641,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3660,7 +3675,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3691,7 +3706,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="all",
+            cols=crony_commands.parse_cols_arg("all"),
             show_masked=show_masked,
             config_current=False,
             config_pending=False,
@@ -3750,7 +3765,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="all",
+            cols=crony_commands.parse_cols_arg("all"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -3779,7 +3794,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=["j"],
-            cols="all",
+            cols=crony_commands.parse_cols_arg("all"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3827,7 +3842,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="all",
+            cols=crony_commands.parse_cols_arg("all"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3862,7 +3877,7 @@ class TestStatusReport:
         baseline = capsys.readouterr().out
         crony_commands.do_status(
             jobs=[],
-            cols="default",
+            cols=crony_commands.parse_cols_arg("default"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3885,7 +3900,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-files",
+            cols=crony_commands.parse_cols_arg("job,unit-files"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3911,7 +3926,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-files",
+            cols=crony_commands.parse_cols_arg("job,unit-files"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3935,7 +3950,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="all,unit-timer",
+            cols=crony_commands.parse_cols_arg("all,unit-timer"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -3957,7 +3972,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="default,masked-by",
+            cols=crony_commands.parse_cols_arg("default,masked-by"),
             show_masked=False,
             config_current=False,
             config_pending=False,
@@ -4058,7 +4073,7 @@ class TestStatusReport:
             h.apply(short)
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid",
+            cols=crony_commands.parse_cols_arg("job-or-uuid"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4120,7 +4135,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid",
+            cols=crony_commands.parse_cols_arg("job-or-uuid"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4162,7 +4177,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid",
+            cols=crony_commands.parse_cols_arg("job-or-uuid"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -4212,7 +4227,7 @@ class TestStatusReport:
         h.apply("k", bundle="borgadm")
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid",
+            cols=crony_commands.parse_cols_arg("job-or-uuid"),
             show_masked=False,
             bundle="default",
             config_current=False,
@@ -4241,7 +4256,7 @@ class TestStatusReport:
         h.apply("g")
         crony_commands.do_status(
             jobs=[],
-            cols="job,kind",
+            cols=crony_commands.parse_cols_arg("job,kind"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4270,7 +4285,7 @@ class TestStatusReport:
         h.config({}, default_target_jobs=[])
         crony_commands.do_status(
             jobs=[],
-            cols="job,kind,config",
+            cols=crony_commands.parse_cols_arg("job,kind,config"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4294,7 +4309,7 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-name",
+            cols=crony_commands.parse_cols_arg("job,unit-name"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4330,7 +4345,7 @@ class TestStatusReport:
         h.apply("g")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-name",
+            cols=crony_commands.parse_cols_arg("job,unit-name"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4360,7 +4375,7 @@ class TestStatusReport:
         h.apply("g")
         crony_commands.do_status(
             jobs=[],
-            cols="job,groups",
+            cols=crony_commands.parse_cols_arg("job,groups"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4395,7 +4410,7 @@ class TestStatusReport:
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         crony_commands.do_status(
             jobs=[],
-            cols="job,groups",
+            cols=crony_commands.parse_cols_arg("job,groups"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4451,7 +4466,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,groups",
+            cols=crony_commands.parse_cols_arg("job,groups"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4506,7 +4521,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,groups",
+            cols=crony_commands.parse_cols_arg("job,groups"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4737,7 +4752,7 @@ class TestStatusReport:
         cols = ",".join(["all", *flag_tokens])
         crony_commands.do_status(
             jobs=[],
-            cols=cols,
+            cols=crony_commands.parse_cols_arg(cols),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4823,7 +4838,7 @@ class TestStatusReport:
         h.apply("g")
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4857,7 +4872,7 @@ class TestStatusReport:
         for pending in (False, True):
             crony_commands.do_status(
                 jobs=[],
-                cols="job,schedule",
+                cols=crony_commands.parse_cols_arg("job,schedule"),
                 show_masked=False,
                 bundle=None,
                 config_current=False,
@@ -4891,7 +4906,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4923,7 +4938,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -4956,7 +4971,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=True,
@@ -4982,7 +4997,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -5023,7 +5038,7 @@ class TestStatusReport:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job,config,masked-by",
+            cols=crony_commands.parse_cols_arg("job,config,masked-by"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -5035,7 +5050,7 @@ class TestStatusReport:
         capsys.readouterr()
         crony_commands.do_status(
             jobs=[],
-            cols="job,config,masked-by",
+            cols=crony_commands.parse_cols_arg("job,config,masked-by"),
             show_masked=True,
             bundle=None,
             config_current=False,
@@ -5504,21 +5519,35 @@ class TestLogs:
             encoding="utf-8",
         )
         crony_commands.do_logs(
-            job="j", n=0, since="1h", tail=False, path=False, latest=False
+            job="j",
+            n=0,
+            since=crony_commands.parse_since_arg("1h"),
+            tail=False,
+            path=False,
+            latest=False,
         )
         out = capsys.readouterr().out
         assert "new-line" in out
         assert "old-line" not in out
 
     def test_parse_since_unparseable(self) -> None:
-        with pytest.raises(UsageError, match="unparseable"):
-            crony_commands._parse_since("eventually")
+        with pytest.raises(argparse.ArgumentTypeError, match="unparseable"):
+            crony_commands.parse_since_arg("eventually")
 
     def test_parse_since_naive_iso_rejected(self) -> None:
         # Naive ISO would crash later when compared with tz-aware
         # run-header timestamps; surface at parse time instead.
-        with pytest.raises(UsageError, match="timezone offset"):
-            crony_commands._parse_since("2026-04-01T12:00:00")
+        with pytest.raises(argparse.ArgumentTypeError, match="timezone offset"):
+            crony_commands.parse_since_arg("2026-04-01T12:00:00")
+
+    def test_since_unparseable_rejected_by_parser(self) -> None:
+        # The --since type= converter routes a bad value through the
+        # parser, so it exits 2 before any log lookup.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["logs", "j", "--since", "eventually"]
+            )
+        assert exc.value.code == 2
 
     def test_follow_log_returns_cleanly_on_keyboard_interrupt(
         self, tmp_path: Path, monkeypatch: Any
@@ -6073,7 +6102,7 @@ class TestNameCollision:
         self._plant_residue(h, h.full("j"), stray_uuid)
         crony_commands.do_status(
             jobs=[],
-            cols="job",
+            cols=crony_commands.parse_cols_arg("job"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6323,7 +6352,7 @@ class TestStatusUnitConfigColumn:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-config,unit-timer",
+            cols=crony_commands.parse_cols_arg("job,unit-config,unit-timer"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6348,7 +6377,7 @@ class TestStatusUnitConfigColumn:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols="job,unit-config,unit-timer",
+            cols=crony_commands.parse_cols_arg("job,unit-config,unit-timer"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6371,7 +6400,7 @@ class TestStatusLogFileColumn:
     def _status(self, cols: str, **kw: Any) -> None:
         crony_commands.do_status(
             jobs=[],
-            cols=cols,
+            cols=crony_commands.parse_cols_arg(cols),
             show_masked=False,
             bundle=None,
             config_current=kw.get("config_current", False),
@@ -6459,7 +6488,7 @@ class TestStatusFlagsColumns:
     def _status(self, cols: str, **kw: Any) -> None:
         crony_commands.do_status(
             jobs=[],
-            cols=cols,
+            cols=crony_commands.parse_cols_arg(cols),
             show_masked=False,
             bundle=None,
             config_current=kw.get("config_current", False),
@@ -6702,7 +6731,7 @@ class TestStatusFullDiskAccess:
     def _status(self, cols: str) -> None:
         crony_commands.do_status(
             jobs=[],
-            cols=cols,
+            cols=crony_commands.parse_cols_arg(cols),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -7914,7 +7943,9 @@ class TestStatusRenameUuidModel:
         h, group_uuid, member_uuid = self._renamed_config(tmp_path, monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid,schedule,status,last-ran",
+            cols=crony_commands.parse_cols_arg(
+                "job,uuid,schedule,status,last-ran"
+            ),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -7943,7 +7974,7 @@ class TestStatusRenameUuidModel:
         h, group_uuid, member_uuid = self._renamed_config(tmp_path, monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,uuid,schedule",
+            cols=crony_commands.parse_cols_arg("job,uuid,schedule"),
             show_masked=False,
             bundle=None,
             config_current=True,
@@ -7974,7 +8005,7 @@ class TestStatusRenameUuidModel:
         )
         crony_commands.do_status(
             jobs=[],
-            cols="job-or-uuid,uuid,unit-name",
+            cols=crony_commands.parse_cols_arg("job-or-uuid,uuid,unit-name"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -8072,7 +8103,7 @@ class TestStatusColor:
         self._force_color(monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,status",
+            cols=crony_commands.parse_cols_arg("job,status"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -8097,7 +8128,7 @@ class TestStatusColor:
         self._force_color(monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,schedule",
+            cols=crony_commands.parse_cols_arg("job,schedule"),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -8116,7 +8147,7 @@ class TestStatusColor:
         self._force_color(monkeypatch)
         crony_commands.do_status(
             jobs=[],
-            cols="job,config",
+            cols=crony_commands.parse_cols_arg("job,config"),
             show_masked=False,
             bundle=None,
             config_current=False,

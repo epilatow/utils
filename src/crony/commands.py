@@ -14,6 +14,7 @@ lifecycle itself (apply_one / destroy_one) lives in crony.runtime.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import datetime
 import importlib.resources
@@ -1625,6 +1626,14 @@ class StatusAliases(StrEnum):
     UNIT_FILES = "unit-files"
 
 
+# A parsed `--cols` token: a concrete column, an alias (expanded later
+# with runtime context), or a per-flag column (`JobFlagNames`). All
+# three are StrEnums with disjoint string values, so the union
+# round-trips to the on-disk / row-key spelling while staying closed
+# and type-checked.
+ColToken = StatusCols | StatusAliases | crony.config.JobFlagNames
+
+
 class StatusAlias(NamedTuple):
     """A `--cols` alias: its name, the `StatusCols` it expands to (before
     the context trim `_expand_status_alias` applies), and the prose the
@@ -1669,6 +1678,7 @@ _STATUS_ALIAS_BY_NAME: dict[str, StatusAlias] = {
     a.name: a for a in _STATUS_ALIASES
 }
 _STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(StatusAliases)
+_JOB_FLAG_COL_NAMES: frozenset[str] = frozenset(crony.config.JobFlagNames)
 
 
 def _column_in_context(
@@ -1821,12 +1831,42 @@ STATUS_HELP_EPILOG: str = (
 )
 
 
-def _parse_status_cols(
-    spec: str | None, *, masked_present: bool, platform: str
-) -> list[str]:
-    """Parse the `--cols` argument into an ordered column list.
+def _classify_col_token(name: str) -> ColToken:
+    """Map a validated `--cols` name to its column / alias / flag enum."""
+    if name in _STATUS_COL_ALIAS_NAMES:
+        return StatusAliases(name)
+    if name in _JOB_FLAG_COL_NAMES:
+        return crony.config.JobFlagNames(name)
+    return StatusCols(name)
 
-    Comma-separated; whitespace around names is ignored.
+
+def parse_cols_arg(value: str) -> list[ColToken]:
+    """argparse `type=` for `status --cols`: parse into an ordered list.
+
+    Splits the comma-separated spec (whitespace around names ignored)
+    and rejects any name that is neither a column, a per-flag column,
+    nor an alias, so a typo is loud at parse time rather than a silent
+    missing column. Returns each name as its `StatusCols` / `StatusAliases`
+    / `JobFlagNames` enum member; `_parse_status_cols` expands the aliases
+    among them once the displayed rows and platform are known.
+    """
+    raw = [c.strip() for c in value.split(",") if c.strip()]
+    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIAS_NAMES)
+    unknown = [c for c in raw if c not in valid]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown status column(s): {sorted(unknown)} "
+            f"(valid: {sorted(_STATUS_COL_HEADERS)}; "
+            f"aliases: {sorted(_STATUS_COL_ALIAS_NAMES)})"
+        )
+    return [_classify_col_token(c) for c in raw]
+
+
+def _parse_status_cols(
+    raw: list[ColToken] | None, *, masked_present: bool, platform: str
+) -> list[str]:
+    """Expand the parsed `--cols` tokens into an ordered column list.
+
     `job-or-uuid` is always included (and forced to the first
     column) because everything else is meaningless without an
     entity identity, and it's the one column guaranteed to be
@@ -1836,37 +1876,27 @@ def _parse_status_cols(
     that would be blank in this context); mixing aliases with
     explicit names is allowed (`default,masked-by`), and an
     explicitly named column is never trimmed. Order is preserved
-    across the resolved list with duplicates dropped. Unknown names
-    raise UsageError so a typo is loud, not a silent missing column.
+    across the resolved list with duplicates dropped.
     """
-    if not spec:
+    if not raw:
         return list(_DEFAULT_STATUS_COLS)
-    raw = [c.strip() for c in spec.split(",") if c.strip()]
-    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIAS_NAMES)
-    unknown = [c for c in raw if c not in valid]
-    if unknown:
-        raise crony.errors.UsageError(
-            f"unknown status column(s): {sorted(unknown)} "
-            f"(valid: {sorted(_STATUS_COL_HEADERS)}; "
-            f"aliases: {sorted(_STATUS_COL_ALIAS_NAMES)})"
-        )
     expanded: list[str] = []
-    for c in raw:
-        if c in _STATUS_COL_ALIAS_NAMES:
+    for token in raw:
+        if isinstance(token, StatusAliases):
             expanded.extend(
                 _expand_status_alias(
-                    c, masked_present=masked_present, platform=platform
+                    token, masked_present=masked_present, platform=platform
                 )
             )
         else:
-            expanded.append(c)
+            expanded.append(token)
     seen: set[str] = set()
     cols: list[str] = []
-    for c in expanded:
-        if c in seen:
+    for col in expanded:
+        if col in seen:
             continue
-        seen.add(c)
-        cols.append(c)
+        seen.add(col)
+        cols.append(col)
     if StatusCols.JOB_OR_UUID in cols:
         cols.remove(StatusCols.JOB_OR_UUID)
     return [StatusCols.JOB_OR_UUID] + cols
@@ -2196,7 +2226,7 @@ def _select_name(
 
 def do_status(
     jobs: list[str],
-    cols: str | None,
+    cols: list[ColToken] | None,
     show_masked: bool,
     bundle: str | None,
     config_current: bool,
@@ -2761,7 +2791,7 @@ def do_status(
 def do_logs(
     job: str,
     n: int | None,
-    since: str | None,
+    since: datetime.datetime | None,
     tail: bool,
     path: bool,
     latest: bool,
@@ -2911,15 +2941,15 @@ def _follow_log(log_path: Path, *, n: int = 0) -> None:
 _DURATION_RE = re.compile(r"^(\d+)([smhd])$")
 
 
-def _parse_since(spec: str) -> datetime.datetime:
-    """Parse a --since argument as duration shorthand or ISO timestamp.
+def parse_since_arg(value: str) -> datetime.datetime:
+    """argparse `type=` for `logs --since`: duration shorthand or ISO.
 
     Returns a tz-aware datetime. ISO inputs without an offset are
-    rejected here -- comparing them against the runner's tz-aware
-    run-header timestamps would raise TypeError mid-filter, so we
-    surface the issue at parse time as a UsageError instead.
+    rejected -- comparing them against the runner's tz-aware run-header
+    timestamps would raise TypeError mid-filter, so the offset is
+    required at parse time.
     """
-    text = spec.strip()
+    text = value.strip()
     m = _DURATION_RE.fullmatch(text)
     if m:
         n = int(m.group(1))
@@ -2931,21 +2961,19 @@ def _parse_since(spec: str) -> datetime.datetime:
     try:
         ts = datetime.datetime.fromisoformat(text)
     except ValueError as e:
-        raise crony.errors.UsageError(
-            f"unparseable --since value: {spec!r} "
-            f"(use NUMs/m/h/d or ISO timestamp)"
+        raise argparse.ArgumentTypeError(
+            f"unparseable value {value!r} (use NUMs/m/h/d or ISO timestamp)"
         ) from e
     if ts.tzinfo is None:
-        raise crony.errors.UsageError(
-            f"--since {spec!r} is missing a timezone offset; "
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is missing a timezone offset; "
             f"use a form like 2026-04-01T12:00:00-07:00"
         )
     return ts
 
 
-def _filter_since(text: str, since: str) -> str:
+def _filter_since(text: str, cutoff: datetime.datetime) -> str:
     """Drop log content older than --since by run-header timestamp."""
-    cutoff = _parse_since(since)
     header_re = re.compile(r"^=== (\S+) ")
     keep_from: int | None = None
     lines = text.splitlines(keepends=True)

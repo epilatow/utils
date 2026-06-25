@@ -485,6 +485,7 @@ def _build_parser() -> StrictArgumentParser:
     p_status.add_argument(
         "--cols",
         default=None,
+        type=crony.commands.parse_cols_arg,
         help=(
             "Comma-separated columns to display. See the Status Columns "
             "reference for valid names, aliases, and descriptions."
@@ -538,6 +539,7 @@ def _build_parser() -> StrictArgumentParser:
         "-s",
         "--since",
         default=None,
+        type=crony.commands.parse_since_arg,
         help='"1h", "2d", or ISO timestamp.',
     )
     tail_or_latest = p_logs.add_mutually_exclusive_group()

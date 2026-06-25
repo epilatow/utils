@@ -103,6 +103,27 @@ class JobFlags(enum.Flag):
         return list(cls)
 
 
+class JobFlagNames(enum.StrEnum):
+    """The text token (dash spelling) of each `JobFlags` member.
+
+    `JobFlags` is a bitmask; this is its name side -- the spelling a
+    flag carries when addressed as text (a scalar `keep-awake = true`
+    config key, a `status --cols interactive` column). A closed StrEnum
+    so callers that select or display a single flag by token can do so
+    with a typed value. The members mirror `JobFlags` one-for-one; the
+    assert below fails the import if a flag's token is added, renamed,
+    or re-spelled without a matching entry here."""
+
+    INTERACTIVE = "interactive"
+    KEEP_AWAKE = "keep-awake"
+    FULL_DISK_ACCESS = "full-disk-access"
+
+
+assert {n.value for n in JobFlagNames} == {
+    f.token for f in JobFlags.members()
+}, "JobFlagNames values must match JobFlags tokens"
+
+
 # The meaning of each flag, shown in `crony status --help`'s FLAG values
 # reference. Keyed by member so a new flag without an entry trips the
 # coverage test rather than rendering blank.
