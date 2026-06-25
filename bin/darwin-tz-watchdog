@@ -29,9 +29,10 @@ agents (exit 150, "Operation not permitted while System
 Integrity Protection is engaged"). Killing the pid we own
 sidesteps the launchctl restriction.
 
-The script exits immediately on non-darwin platforms (systemd
-timers on linux re-read the zone on each evaluation and don't
-have this bug, so there's nothing to watch).
+On non-darwin platforms the script does nothing (systemd timers
+on linux re-read the zone on each evaluation and don't have this
+bug, so there's nothing to watch); it still parses its arguments
+first, so --help behaves the same everywhere.
 """
 
 from __future__ import annotations
@@ -277,12 +278,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 @cli_entrypoint
 def main(argv: list[str] | None = None) -> int:
-    # Bail before argparse on non-darwin: the script has nothing
-    # to do, and skipping --help / unknown-arg errors means
-    # cross-platform scheduling can invoke it unconditionally.
+    # Parse first so --help/-h and argument validation behave
+    # identically on every platform (the tool's one-line blurb in the
+    # repo README is generated from its --help, which must render the
+    # same off darwin). On non-darwin the watchdog then no-ops -- there
+    # is nothing to restart -- so a cross-platform scheduler can still
+    # invoke it unconditionally.
+    args = _build_parser().parse_args(argv)
     if platform.system() != "Darwin":
         return ExitCode.SUCCESS
-    args = _build_parser().parse_args(argv)
     try:
         return check_and_restart(
             dry_run=args.dry_run,
