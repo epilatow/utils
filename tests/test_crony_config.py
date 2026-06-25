@@ -2433,6 +2433,15 @@ class TestJobFlagsField:
             "more than once",
         )
 
+    def test_flag_error_renders_bare_token(self) -> None:
+        # The message quotes the plain token, not the JobFlagNames repr
+        # (`<JobFlagNames.KEEP_AWAKE: ...>`).
+        _assert_errored_job(
+            self._cfg(_job(flags=["keep-awake=maybe"])),
+            "j",
+            r"flag 'keep-awake' value",
+        )
+
     def test_flags_must_be_list_of_strings(self) -> None:
         _assert_errored_job(
             self._cfg(_job(flags="interactive")), "j", "list of strings"
@@ -2687,6 +2696,13 @@ class TestJobFlags:
     def test_from_token_rejects_unknown(self) -> None:
         with pytest.raises(ValueError, match="unknown flag"):
             JobFlags.from_token("turbo")
+
+    def test_from_token_accepts_non_canonical_spellings(self) -> None:
+        # Input is normalized, so case and `_`/`-` differences from the
+        # canonical dash token still resolve.
+        assert JobFlags.from_token("keep_awake") is JobFlags.KEEP_AWAKE
+        assert JobFlags.from_token("KEEP-AWAKE") is JobFlags.KEEP_AWAKE
+        assert JobFlags.from_token("Interactive") is JobFlags.INTERACTIVE
 
     def test_combines_as_bitmask(self) -> None:
         only_iv = JobFlags.INTERACTIVE

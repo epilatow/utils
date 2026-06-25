@@ -2636,7 +2636,7 @@ def do_status(
                 and (member in pending_flags) != (member in current_flags)
             )
             if active_flags is not None and member in active_flags:
-                token = member.token
+                token: str = member.token
                 if member_diverged:
                     token = f"{token}{_DIVERGENCE_MARKER}"
                 flags_summary_parts.append(token)

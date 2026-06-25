@@ -66,15 +66,14 @@ class JobFlags(enum.Flag):
     FULL_DISK_ACCESS = enum.auto()
 
     @property
-    def token(self) -> str:
+    def token(self) -> JobFlagNames:
         """The token (text spelling) of a single flag member. Not
         defined for a combined value -- callers render those by testing
         each member from `members()`."""
         if self.value.bit_count() != 1:
             raise ValueError("token is defined only for a single flag")
-        name = self.name
-        assert name is not None  # a single-bit member always has a name
-        return name.lower().replace("_", "-")
+        assert self.name is not None  # a single-bit member always has a name
+        return JobFlagNames[self.name]
 
     @property
     def description(self) -> str:
@@ -87,11 +86,16 @@ class JobFlags(enum.Flag):
 
     @classmethod
     def from_token(cls, token: str) -> JobFlags:
-        """The flag member named by `token` (its dash spelling)."""
+        """The flag member named by `token`.
+
+        The canonical spelling is the dash token, but input is
+        normalized (case-insensitive, `_` accepted for `-`) so
+        `keep_awake` / `KEEP-AWAKE` resolve like `keep-awake`.
+        """
         try:
-            return cls[token.upper().replace("-", "_")]
-        except KeyError:
-            allowed = ", ".join(f.token for f in cls)
+            return cls[JobFlagNames(token.lower().replace("_", "-")).name]
+        except ValueError:
+            allowed = ", ".join(JobFlagNames)
             raise ValueError(
                 f"unknown flag {token!r}; expected one of {allowed}"
             ) from None
@@ -108,20 +112,24 @@ class JobFlagNames(enum.StrEnum):
 
     `JobFlags` is a bitmask; this is its name side -- the spelling a
     flag carries when addressed as text (a scalar `keep-awake = true`
-    config key, a `status --cols interactive` column). A closed StrEnum
-    so callers that select or display a single flag by token can do so
-    with a typed value. The members mirror `JobFlags` one-for-one; the
-    assert below fails the import if a flag's token is added, renamed,
-    or re-spelled without a matching entry here."""
+    config key, a `status --cols interactive` column). It is the single
+    source of those spellings: `JobFlags.token` / `from_token` pivot
+    through it by member name, so callers selecting or displaying a flag
+    by token get a typed value. One member per `JobFlags` member, named
+    identically; the assert below fails the import if that drifts or a
+    value stops being the dash spelling of its name."""
 
     INTERACTIVE = "interactive"
     KEEP_AWAKE = "keep-awake"
     FULL_DISK_ACCESS = "full-disk-access"
 
 
-assert {n.value for n in JobFlagNames} == {
-    f.token for f in JobFlags.members()
-}, "JobFlagNames values must match JobFlags tokens"
+assert {n.name for n in JobFlagNames} == {f.name for f in JobFlags.members()}, (
+    "JobFlagNames must have one member per JobFlags member, by name"
+)
+assert all(n.value == n.name.lower().replace("_", "-") for n in JobFlagNames), (
+    "JobFlagNames values must be the dash spelling of their member name"
+)
 
 
 # The meaning of each flag, shown in `crony status --help`'s FLAG values
@@ -1678,12 +1686,12 @@ def _parse_flags_field(raw: dict[str, Any], where: str) -> dict[JobFlags, bool]:
             enabled = False
         else:
             raise crony.errors.ConfigError(
-                f"{where}: flag {flag.token!r} value must be 'true' or "
+                f"{where}: flag '{flag.token}' value must be 'true' or "
                 f"'false', got {value_str.strip()!r}"
             )
         if flag in settings:
             raise crony.errors.ConfigError(
-                f"{where}: flag {flag.token!r} set more than once in 'flags'"
+                f"{where}: flag '{flag.token}' set more than once in 'flags'"
             )
         settings[flag] = enabled
     return settings
@@ -1709,7 +1717,7 @@ def _parse_flags_partial(
             continue
         if flag in partial:
             raise crony.errors.ConfigError(
-                f"{where}: {flag.token!r} is set both in 'flags' and as "
+                f"{where}: '{flag.token}' is set both in 'flags' and as "
                 f"'{scalar_key}'; use one"
             )
         partial[flag] = bool(_typed_field(raw, scalar_key, bool, where))
