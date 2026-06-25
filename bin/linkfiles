@@ -203,7 +203,6 @@ class ExitCode(ExitCodeBase):
     SUBPROCESS = CommonExitCode.SUBPROCESS
     CRASHED = CommonExitCode.CRASHED
     CONFLICTS = 10, "Conflicts or missing entries"
-    MISSING_DIR = 11, "Missing source directory"
 
 
 # =============================================================================
@@ -227,12 +226,6 @@ class UsageError(LinkfilesError):
     """Raised for usage/argument errors."""
 
     exit_code = ExitCode.USAGE
-
-
-class MissingSourceDir(LinkfilesError):
-    """Raised when a source directory does not exist or is invalid."""
-
-    exit_code = ExitCode.MISSING_DIR
 
 
 # =============================================================================
@@ -684,12 +677,12 @@ def discover_entries(source_dir: Path, *, profile: Profile) -> list[LinkEntry]:
     subdirectories are not descended into.
 
     Raises:
-        MissingSourceDir: If the directory doesn't exist or isn't valid.
+        LinkfilesError: If the directory doesn't exist or isn't valid.
     """
     if not source_dir.exists():
-        raise MissingSourceDir(f"Source directory does not exist: {source_dir}")
+        raise LinkfilesError(f"Source directory does not exist: {source_dir}")
     if not source_dir.is_dir():
-        raise MissingSourceDir(f"Not a directory: {source_dir}")
+        raise LinkfilesError(f"Not a directory: {source_dir}")
 
     abs_source_dir = source_dir.resolve()
     entries: list[LinkEntry] = []
@@ -1187,9 +1180,7 @@ def _run_install(
     had_conflicts = False
     for src_dir, profile in targets:
         if not src_dir.is_dir():
-            raise MissingSourceDir(
-                f"Source directory does not exist: {src_dir}"
-            )
+            raise LinkfilesError(f"Source directory does not exist: {src_dir}")
         entries = discover_entries(src_dir, profile=profile)
         results = _process_entries(
             entries, "install", dry_run=dry_run, force=force
@@ -1253,9 +1244,7 @@ def _run_remove(
     that point to the correct source are removed."""
     for src_dir, profile in targets:
         if not src_dir.exists():
-            raise MissingSourceDir(
-                f"Source directory does not exist: {src_dir}"
-            )
+            raise LinkfilesError(f"Source directory does not exist: {src_dir}")
         results = process_directory(
             src_dir, "remove", dry_run=dry_run, profile=profile
         )
@@ -1288,7 +1277,7 @@ def do_install(
         src = directory.expanduser().resolve()
         target = dst.expanduser().resolve()
         if not src.is_dir():
-            raise MissingSourceDir(f"Source directory does not exist: {src}")
+            raise LinkfilesError(f"Source directory does not exist: {src}")
         record = InstallRecord(
             dst=target, src=src, dotfiles=dotfiles, no_recurse=no_recurse
         )
@@ -1332,7 +1321,7 @@ def do_remove(
             None,
         )
         if record is None:
-            raise MissingSourceDir(f"No tracked install: {src} -> {target}")
+            raise LinkfilesError(f"No tracked install: {src} -> {target}")
         targets = [(src, record.profile())]
     else:
         targets = load_installed_entries()
