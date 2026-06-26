@@ -38,6 +38,13 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   via the `trigger` subcommand). Crony supports the following notification
   mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
   macOS/darwin).
+- **[firefox-cookies](docs/firefox-cookies.md)**\
+  firefox-cookies extracts cookies from a Firefox profile and writes them to
+  stdout in Netscape or JSON format. It reads both the on-disk cookie database
+  (cookies.sqlite) and the session-store backup (recovery.jsonlz4), so the
+  session cookies Firefox keeps only in memory are included alongside the
+  persisted ones. Cookies can be filtered by domain and by container, and the
+  profile is auto-detected or selected by name or path.
 - **[linkfiles](docs/linkfiles.md)**\
   linkfiles symlinks the contents of a source directory tree into a target
   directory, recreating the tree there. Installations are tracked, so later
@@ -53,8 +60,6 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
 - **darwin-tz-watchdog**\
   Restart macOS UserEventAgent-Aqua when its cached timezone is stale relative
   to /etc/localtime.
-- **firefox-cookies**\
-  Firefox cookie extraction utility
 - **secure-archiver**\
   Generate 7z encrypted archives containing files and 1Password data that are
   encrypted using passwords stored in 1Password

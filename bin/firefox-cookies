@@ -21,6 +21,7 @@ import sqlite3
 import struct
 import sys
 import tempfile
+import textwrap
 
 # Handle broken pipes gracefully (e.g., when piping to `head`).
 # Restore default SIGPIPE behavior so the process exits cleanly.
@@ -39,8 +40,16 @@ from typing import Any
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    StrictArgumentParser,
+    add_argument_ext,
+)
 from common.cli import cli_entrypoint  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemsSection,
+    ManSpec,
+    TextSection,
+)
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # Configure logging to stderr
@@ -949,11 +958,70 @@ class _SingleUseAction(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+# The Description and Getting Started text appended to the `--help`
+# epilog. _DESCRIPTION's first paragraph is written to stand alone so it
+# can serve as the tool's summary blurb (the README entry) on its own.
+_DESCRIPTION = """\
+firefox-cookies extracts cookies from a Firefox profile and writes them to
+stdout in Netscape or JSON format. It reads both the on-disk cookie database
+(cookies.sqlite) and the session-store backup (recovery.jsonlz4), so the
+session cookies Firefox keeps only in memory are included alongside the
+persisted ones. Cookies can be filtered by domain and by container, and the
+profile is auto-detected or selected by name or path.
+
+Firefox organizes cookies in a three-level hierarchy. A profile is a
+self-contained browser instance with its own cookies, history, and settings;
+most installs have a single profile, but Firefox supports many (they are
+indexed in profiles.ini and listed by list-profiles). Within a profile,
+containers are optional isolated cookie jars: the same site can keep
+separate cookies in, say, a Work and a Personal container. Containers are
+off until enabled -- typically through the Multi-Account Containers
+extension -- and without them every cookie lives in the default context,
+container ID 0. Domains are the individual hosts that have set cookies
+inside a given profile and container. list-containers and list-domains
+summarize what a profile holds at each level.
+
+With no --profile, the default profile is chosen the same way Firefox itself
+chooses one: the profile that profiles.ini's install section marks as the
+default, falling back to a profile's own default flag, and finally to the
+first profile listed when none is marked. Selection is keyed off that
+marker, not the profile's name -- the default is usually a random-suffixed
+name such as 8f3k2a1b.default-release, not literally "default". Pass
+--profile to override with a profile name (matched case-insensitively) or a
+filesystem path to a profile directory.
+
+Because Firefox locks cookies.sqlite while it is running, the database is
+copied to a temporary location before it is read, so cookies can be
+extracted without closing the browser. In a whole-profile dump (no
+--container), a cookie present in several containers is emitted once -- the
+default-context copy, or the one from the lowest container ID when no
+default-context copy exists -- and the dropped containers are reported."""
+
+_GETTING_STARTED = """\
+Dump every cookie from the default profile in Netscape format:
+
+    firefox-cookies list
+
+Dump the cookies for a single domain as JSON:
+
+    firefox-cookies list --format json -d example.com
+
+See which profiles, domains, and containers a profile holds:
+
+    firefox-cookies list-profiles
+    firefox-cookies list-domains
+    firefox-cookies list-containers"""
+
+
 def build_parser() -> StrictArgumentParser:
     """Build and return the argument parser."""
     parser = StrictArgumentParser(
-        description="Firefox cookie extraction utility",
-        epilog=ExitCode.epilog(),
+        description="Extract cookies from a Firefox profile.",
+        epilog=(
+            f"{ExitCode.epilog()}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
+            f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_command_subparsers()
@@ -961,61 +1029,90 @@ def build_parser() -> StrictArgumentParser:
     def add_profile_arg(
         p: argparse.ArgumentParser,
     ) -> None:
-        p.add_argument(
+        add_argument_ext(
+            p,
             "-p",
             "--profile",
             action=_SingleUseAction,
-            help=("Profile name or path (default: auto-detect)"),
+            common=True,
+            help=(
+                "Profile name (case-insensitive) or path to a profile"
+                " directory (default: auto-detect)."
+            ),
         )
 
     def add_container_arg(
         p: argparse.ArgumentParser,
     ) -> None:
-        p.add_argument(
+        add_argument_ext(
+            p,
             "-c",
             "--container",
             action=_SingleUseAction,
-            help="Container ID or name",
+            common=True,
+            help=(
+                "Container ID, or name (case-insensitive; an exact name"
+                " wins, otherwise a unique substring match)."
+            ),
+        )
+
+    def add_domain_arg(
+        p: argparse.ArgumentParser,
+    ) -> None:
+        add_argument_ext(
+            p,
+            "-d",
+            "--domain",
+            dest="domains",
+            action="append",
+            common=True,
+            help=(
+                "Filter by domain; matches the domain and its subdomains"
+                " (repeatable)."
+            ),
         )
 
     def add_src_arg(
         p: argparse.ArgumentParser,
     ) -> None:
-        p.add_argument(
+        add_argument_ext(
+            p,
             "-s",
             "--source",
             dest="sources",
             action="append",
             choices=["db", "recovery"],
+            common=True,
             help=(
                 "Cookie source (repeatable)."
                 " db=cookies.sqlite,"
                 " recovery=recovery.jsonlz4."
-                " Default: both"
+                " Default: both."
+            ),
+            extended_help=(
+                "Which cookie stores to read; repeatable (default: both)."
+                " `db` reads the persistent on-disk database -- the cookies"
+                " Firefox has already written to disk. `recovery` reads the"
+                " session-store backup, which holds the session cookies"
+                " Firefox keeps only in memory for the current session."
             ),
         )
 
     # list
     list_cmd = subparsers.add_parser(
         "list",
-        help="Extract/list cookies to stdout",
+        help="Extract cookies to stdout.",
         description=(
-            "Output cookies in Netscape or JSON format."
-            " Netscape columns: host, subdomain flag,"
-            " path, secure, expiry, name, value"
-            " (tab-separated)."
+            "Extract cookies from the resolved profile and write them to"
+            " stdout in Netscape or JSON format. The Netscape format emits"
+            " one tab-separated row per cookie, with the columns host,"
+            " subdomain flag, path, secure flag, expiry, name, and value."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_profile_arg(list_cmd)
-    list_cmd.add_argument(
-        "-d",
-        "--domain",
-        dest="domains",
-        action="append",
-        help="Filter by domain (repeatable)",
-    )
     add_container_arg(list_cmd)
+    add_domain_arg(list_cmd)
     add_src_arg(list_cmd)
     list_cmd.add_argument(
         "--format",
@@ -1023,18 +1120,18 @@ def build_parser() -> StrictArgumentParser:
         choices=["netscape", "json"],
         default="netscape",
         action=_SingleUseAction,
-        help="Output format",
+        help="Output format.",
     )
 
     # list-domains
     list_domains = subparsers.add_parser(
         "list-domains",
-        help="List domains with cookie counts",
+        help="List domains with cookie counts.",
         description=(
-            "Output columns: cookie count,"
-            " container ID, domain."
-            " Sorted by domain."
-            " Container ID 0 is the default context."
+            "List the domains that have cookies in the resolved profile, one"
+            " per line, as the columns cookie count, container ID, and"
+            " domain, sorted by domain. Container ID 0 is the default"
+            " (no-container) context."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
@@ -1045,10 +1142,11 @@ def build_parser() -> StrictArgumentParser:
     # list-profiles
     subparsers.add_parser(
         "list-profiles",
-        help="List available Firefox profiles",
+        help="List available Firefox profiles.",
         description=(
-            "Output: profile name (with default marker),"
-            " followed by its path on the next line."
+            "List the Firefox profiles found in profiles.ini, printing each"
+            " profile's name (with a marker on the default profile) followed"
+            " by its on-disk path on the next line."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
@@ -1056,11 +1154,11 @@ def build_parser() -> StrictArgumentParser:
     # list-containers
     list_containers = subparsers.add_parser(
         "list-containers",
-        help="List containers with cookie counts",
+        help="List containers with cookie counts.",
         description=(
-            "Output columns: cookie count,"
-            " container ID, container name."
-            " Sorted by name."
+            "List the containers defined in the resolved profile, one per"
+            " line, as the columns cookie count, container ID, and container"
+            " name, sorted by name."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
@@ -1096,6 +1194,50 @@ def cli() -> int:
         logger.error("ERROR: %s", e)
         return e.exit_code
     return ExitCode.SUCCESS
+
+
+# Reference-doc spec discovered by scripts/render-docs.
+MAN_SPEC = ManSpec(
+    prog="firefox-cookies",
+    section=1,
+    build_parser=build_parser,
+    name_description="extract cookies from a Firefox profile",
+    description=_DESCRIPTION,
+    pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
+    post_sections=[
+        ItemsSection(
+            "FILES",
+            [
+                (
+                    "<profile>/cookies.sqlite",
+                    "The profile's persistent cookie database (the `db` "
+                    "source). Copied to a temporary location before reading, "
+                    "so it can be queried while Firefox is running.",
+                ),
+                (
+                    "<profile>/sessionstore-backups/recovery.jsonlz4",
+                    "The Session Restore backup (mozlz4-compressed). Holds "
+                    "the session cookies Firefox keeps only in memory (the "
+                    "`recovery` source).",
+                ),
+                (
+                    "<profile>/containers.json",
+                    "The profile's container definitions, used to resolve "
+                    "container names and IDs.",
+                ),
+                (
+                    "<firefox-dir>/profiles.ini",
+                    "The profile index, read to locate and resolve profiles. "
+                    "<firefox-dir> is ~/Library/Application Support/Firefox on "
+                    "macOS and ~/.mozilla/firefox on Linux.",
+                ),
+            ],
+        ),
+    ],
+    exit_status=[
+        (str(value), description) for value, description in ExitCode.entries()
+    ],
+)
 
 
 if __name__ == "__main__":
