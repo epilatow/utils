@@ -842,12 +842,31 @@ def collect_cookies(
     return sqlite_cookies + session_cookies
 
 
+def filter_cookies_by_name(
+    cookies: list[Cookie],
+    name: str,
+) -> list[Cookie]:
+    """Filter `cookies` to those whose name matches `name`.
+
+    A case-insensitive exact match wins: when any cookie's name equals
+    `name` ignoring case, only those cookies are kept. Otherwise every
+    cookie whose name contains `name` (case-insensitive) is kept. A `name`
+    that matches nothing yields an empty list.
+    """
+    lower = name.lower()
+    exact = [c for c in cookies if c.name.lower() == lower]
+    if exact:
+        return exact
+    return [c for c in cookies if lower in c.name.lower()]
+
+
 def do_list(
     profile: str | None,
     domains: list[str] | None,
     container: str | None,
     fmt: str,
     sources: list[str] | None,
+    name: str | None,
 ) -> None:
     """Extract/list cookies to stdout."""
     firefox_dir = find_firefox_dir()
@@ -861,6 +880,8 @@ def do_list(
         container_id = resolved.id
 
     cookies = collect_cookies(prof.path, src, domains, container_id)
+    if name is not None:
+        cookies = filter_cookies_by_name(cookies, name)
 
     conflicts: list[ContainerConflict] = []
     if container is None:
@@ -1063,19 +1084,25 @@ default-context copy, or the one from the lowest container ID when no
 default-context copy exists -- and the dropped containers are reported."""
 
 _GETTING_STARTED = """\
-Dump every cookie from the default profile in Netscape format:
+Dump all cookies from the default profile (in Netscape format):
 
     firefox-cookies list
 
-Dump the cookies for a single domain as JSON:
-
-    firefox-cookies list --format json -d example.com
-
-See which profiles, domains, and containers a profile holds:
+List the available profiles:
 
     firefox-cookies list-profiles
-    firefox-cookies list-domains
-    firefox-cookies list-containers"""
+
+List the containers in use by the default profile:
+
+    firefox-cookies list-containers
+
+Extract the trainingpeaks.com login authentication cookie
+(Production_tpAuth), from the TrainingPeaks container, in the default
+profile:
+
+    firefox-cookies list -c TrainingPeaks -d trainingpeaks.com \\
+        Production_tpAuth
+"""
 
 
 def build_parser() -> StrictArgumentParser:
@@ -1187,7 +1214,9 @@ def build_parser() -> StrictArgumentParser:
             " host, subdomain flag, path, secure flag, expiry, name, and"
             " value. The JSON format (--format json) emits an array of cookie"
             " objects with host, name, value, path, expiry, and secure, plus"
-            " httpOnly and sameSite."
+            " httpOnly and sameSite. An optional NAME positional keeps only"
+            " cookies whose name matches it: a case-insensitive exact match"
+            " if any name equals NAME, otherwise every name containing NAME."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
@@ -1202,6 +1231,15 @@ def build_parser() -> StrictArgumentParser:
         default="netscape",
         action=_SingleUseAction,
         help="Output format.",
+    )
+    list_cmd.add_argument(
+        "name",
+        nargs="?",
+        metavar="NAME",
+        help=(
+            "Optional cookie name to filter by (case-insensitive: an exact"
+            " name wins, otherwise every name containing NAME)."
+        ),
     )
 
     # list-domains

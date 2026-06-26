@@ -45,24 +45,30 @@ exists -- and the dropped containers are reported.
 
 ## GETTING STARTED
 
-Dump every cookie from the default profile in Netscape format:
+Dump all cookies from the default profile (in Netscape format):
 
 ```text
     firefox-cookies list
 ```
 
-Dump the cookies for a single domain as JSON:
-
-```text
-    firefox-cookies list --format json -d example.com
-```
-
-See which profiles, domains, and containers a profile holds:
+List the available profiles:
 
 ```text
     firefox-cookies list-profiles
-    firefox-cookies list-domains
+```
+
+List the containers in use by the default profile:
+
+```text
     firefox-cookies list-containers
+```
+
+Extract the trainingpeaks.com login authentication cookie (Production_tpAuth),
+from the TrainingPeaks container, in the default profile:
+
+```text
+    firefox-cookies list -c TrainingPeaks -d trainingpeaks.com \
+        Production_tpAuth
 ```
 
 ## COMMON ARGUMENTS
@@ -85,17 +91,22 @@ See which profiles, domains, and containers a profile holds:
 
 ## SUBCOMMANDS
 
-### `list [-p PROFILE] [-c CONTAINER] [-d DOMAINS] [-s {db,recovery}] [--format {netscape,json}]`
+### `list [-p PROFILE] [-c CONTAINER] [-d DOMAINS] [-s {db,recovery}] [--format {netscape,json}] [NAME]`
 
 Extract cookies from the resolved profile and write them to stdout. The
 default Netscape format emits a commented header followed by one tab-separated
 row per cookie, with the columns host, subdomain flag, path, secure flag,
 expiry, name, and value. The JSON format (--format json) emits an array of
 cookie objects with host, name, value, path, expiry, and secure, plus httpOnly
-and sameSite.
+and sameSite. An optional NAME positional keeps only cookies whose name
+matches it: a case-insensitive exact match if any name equals NAME, otherwise
+every name containing NAME.
 
 - **`--format {netscape,json}`**\
   Output format.
+- **`NAME`**\
+  Optional cookie name to filter by (case-insensitive: an exact name wins,
+  otherwise every name containing NAME).
 
 ### `list-domains [-p PROFILE] [-c CONTAINER] [-s {db,recovery}] [--no-header]`
 

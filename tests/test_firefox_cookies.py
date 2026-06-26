@@ -395,6 +395,12 @@ class TestArgumentParser:
             assert args.no_header is True
             assert parser.parse_command([cmd]).no_header is False
 
+    def test_list_name_positional(self) -> None:
+        """Test list accepts an optional cookie-name positional."""
+        parser = fc.build_parser()
+        assert parser.parse_command(["list", "sessionid"]).name == "sessionid"
+        assert parser.parse_command(["list"]).name is None
+
     def test_multiple_domains(self) -> None:
         """Test -d can be repeated for multiple domains."""
         parser = fc.build_parser()
@@ -1305,6 +1311,7 @@ class TestDoList:
                 container=None,
                 fmt="netscape",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         assert "# Netscape HTTP Cookie File" in captured.out
@@ -1329,6 +1336,7 @@ class TestDoList:
                 container=None,
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -1353,6 +1361,7 @@ class TestDoList:
                 container=None,
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -1378,11 +1387,65 @@ class TestDoList:
                 container="Personal",
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
         assert len(data) == 1
         assert data[0]["name"] == "container_cookie"
+
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
+    def test_list_filter_name_exact(
+        self,
+        firefox_dir: Path,
+        capsys: Any,
+    ) -> None:
+        """The NAME positional filters to an exact cookie-name match."""
+        with patch.object(
+            fc,
+            "find_firefox_dir",
+            autospec=True,
+            return_value=firefox_dir,
+        ):
+            fc.do_list(
+                profile=None,
+                domains=None,
+                container=None,
+                fmt="json",
+                sources=None,
+                name="session",
+            )
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert {c["name"] for c in data} == {"session"}
+
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
+    def test_list_filter_name_substring(
+        self,
+        firefox_dir: Path,
+        capsys: Any,
+    ) -> None:
+        """With no exact match, NAME keeps every substring match."""
+        with patch.object(
+            fc,
+            "find_firefox_dir",
+            autospec=True,
+            return_value=firefox_dir,
+        ):
+            fc.do_list(
+                profile=None,
+                domains=None,
+                container=None,
+                fmt="json",
+                sources=None,
+                name="cookie",
+            )
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert {c["name"] for c in data} == {
+            "container_cookie",
+            "work_cookie",
+        }
 
 
 # =============================================================================
@@ -1946,6 +2009,7 @@ class TestDoListWithSessionCookies:
                 container=None,
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -1972,6 +2036,7 @@ class TestDoListWithSessionCookies:
                 container=None,
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -1998,6 +2063,7 @@ class TestDoListWithSessionCookies:
                 container=None,
                 fmt="json",
                 sources=["db"],
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -2023,6 +2089,7 @@ class TestDoListWithSessionCookies:
                 container=None,
                 fmt="json",
                 sources=["recovery"],
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -2050,6 +2117,7 @@ class TestDoListWithSessionCookies:
                 container=None,
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -2076,6 +2144,7 @@ class TestDoListWithSessionCookies:
                 container="Personal",
                 fmt="json",
                 sources=None,
+                name=None,
             )
         captured = capsys.readouterr()
         data = json.loads(captured.out)
@@ -2137,6 +2206,37 @@ class TestRenderTable:
         """An empty row set emits no output, not a lone header."""
         fc.render_table(("a", "b"), [])
         assert capsys.readouterr().out == ""
+
+
+class TestFilterCookiesByName:
+    """Test the cookie-name filter used by `list NAME`."""
+
+    @pytest.fixture
+    def cookies(self) -> list[Any]:
+        return [
+            _make_cookie(name="sessionid"),
+            _make_cookie(name="SessionID", host=".other.org"),
+            _make_cookie(name="csrf_token"),
+            _make_cookie(name="session_backup"),
+        ]
+
+    def test_exact_case_insensitive(self, cookies: list[Any]) -> None:
+        """An exact name (any case) selects only the exact matches."""
+        result = fc.filter_cookies_by_name(cookies, "SESSIONID")
+        assert {c.name for c in result} == {"sessionid", "SessionID"}
+
+    def test_substring_when_no_exact(self, cookies: list[Any]) -> None:
+        """With no exact match, every substring match is kept."""
+        result = fc.filter_cookies_by_name(cookies, "session")
+        assert {c.name for c in result} == {
+            "sessionid",
+            "SessionID",
+            "session_backup",
+        }
+
+    def test_no_match_is_empty(self, cookies: list[Any]) -> None:
+        """A name matching nothing yields no cookies."""
+        assert fc.filter_cookies_by_name(cookies, "nope") == []
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):

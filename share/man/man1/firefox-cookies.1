@@ -23,24 +23,29 @@ Pass \-\-profile to override with a profile name (matched case\-insensitively) o
 Because Firefox locks cookies.sqlite while it is running, the database is copied to a temporary location before it is read, so cookies can be extracted without closing the browser.\&
 In a whole\-profile dump (no \-\-container), a cookie present in several containers is emitted once \-\- the default\-context copy, or the one from the lowest container ID when no default\-context copy exists \-\- and the dropped containers are reported.\&
 .SH GETTING STARTED
-Dump every cookie from the default profile in Netscape format:
+Dump all cookies from the default profile (in Netscape format):
 .PP
 .EX
     firefox\-cookies list
 .EE
 .PP
-Dump the cookies for a single domain as JSON:
-.PP
-.EX
-    firefox\-cookies list \-\-format json \-d example.com
-.EE
-.PP
-See which profiles, domains, and containers a profile holds:
+List the available profiles:
 .PP
 .EX
     firefox\-cookies list\-profiles
-    firefox\-cookies list\-domains
+.EE
+.PP
+List the containers in use by the default profile:
+.PP
+.EX
     firefox\-cookies list\-containers
+.EE
+.PP
+Extract the trainingpeaks.com login authentication cookie (Production_tpAuth), from the TrainingPeaks container, in the default profile:
+.PP
+.EX
+    firefox\-cookies list \-c TrainingPeaks \-d trainingpeaks.com \(rs
+        Production_tpAuth
 .EE
 .SH COMMON ARGUMENTS
 .TP
@@ -62,14 +67,18 @@ Which cookie stores to read; repeatable (default: both).\&
 \f[CR]recovery\f[R] reads the session\-store backup, which holds the session cookies Firefox keeps only in memory for the current session.\&
 .SH SUBCOMMANDS
 .TP
-\f[B]list\f[R] [\-p PROFILE] [\-c CONTAINER] [\-d DOMAINS] [\-s {db,recovery}] [\-\-format {netscape,json}]
+\f[B]list\f[R] [\-p PROFILE] [\-c CONTAINER] [\-d DOMAINS] [\-s {db,recovery}] [\-\-format {netscape,json}] [NAME]
 Extract cookies from the resolved profile and write them to stdout.\&
 The default Netscape format emits a commented header followed by one tab\-separated row per cookie, with the columns host, subdomain flag, path, secure flag, expiry, name, and value.\&
 The JSON format (\-\-format json) emits an array of cookie objects with host, name, value, path, expiry, and secure, plus httpOnly and sameSite.\&
+An optional NAME positional keeps only cookies whose name matches it: a case\-insensitive exact match if any name equals NAME, otherwise every name containing NAME.\&
 .RS
 .TP
 \f[CR]\-\-format {netscape,json}\f[R]
 Output format.\&
+.TP
+\f[CR]NAME\f[R]
+Optional cookie name to filter by (case\-insensitive: an exact name wins, otherwise every name containing NAME).\&
 .RE
 .TP
 \f[B]list\-domains\f[R] [\-p PROFILE] [\-c CONTAINER] [\-s {db,recovery}] [\-\-no\-header]
