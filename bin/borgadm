@@ -68,8 +68,14 @@ from common.argparse_ext import (  # noqa: E402
     DefaultsHelpFormatter,
     RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
+    add_argument_ext,
 )
 from common.cli import cli_entrypoint  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemsSection,
+    ManSpec,
+    TextSection,
+)
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # -----------------------------------------------------------------------------
@@ -1747,14 +1753,12 @@ def _resolve_archives(
 
 
 def do_check_archives(
-    progress: bool, latest: bool, archives: list[str], bypass_lock: bool
+    progress: bool, latest: bool, archive: list[str], bypass_lock: bool
 ) -> None:
     cfg = get_cfg()
-    assert not (latest and archives), (
-        "latest and archives are mutually exclusive"
-    )
-    if archives:
-        names = _resolve_archives(archives, bypass_lock=bypass_lock)
+    assert not (latest and archive), "latest and archive are mutually exclusive"
+    if archive:
+        names = _resolve_archives(archive, bypass_lock=bypass_lock)
         targets = [f"{cfg.BORG_REPO}::{name}" for name in names]
         _check_archive_targets(targets, progress, bypass_lock)
     elif latest:
@@ -2550,17 +2554,82 @@ def _validate_repair(
     del args.yes
 
 
+# The Description and Getting Started text appended to the `--help`
+# epilog and rendered into the man page / GFM doc via MAN_SPEC.
+# _DESCRIPTION's first paragraph is written to stand alone so it can serve
+# as a one-line summary of the tool on its own (the README blurb).
+_DESCRIPTION = """\
+borgadm is a wrapper around borgbackup designed to manage backup sets,
+where a set is a group of separate borg backups (archives) created with
+different create options. It creates backups from the named sets,
+verifies repository and archive integrity, prunes old and partial
+archives by retention policy, and restores archives via extract or rsync.
+A passphrase- and SSH-key-based workflow handles authentication to local
+and remote repositories, and it can schedule unattended backups and
+checks through crony(1) on macOS (launchd) and Linux (systemd).
+
+The sets are defined in the config file; each `create` run writes one
+archive per set, named {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM. The
+NofM suffix records a set's position so a timestamp is "full" only when
+every configured set is present and "partial" otherwise. The list, check,
+prune, and restore subcommands operate on these timestamps, and prune can
+also clean up partial or unrecognized ("unknown") archives.
+
+Configuration lives in ~/.borgadm, an INI-style file naming the
+repository, the backup sets, retention counts, credential file paths, and
+check thresholds. The `automate` subcommand deploys borgadm's scheduled
+create and check jobs through crony(1) (launchd on macOS, systemd on Linux);
+`environment` prints the shell exports needed to run the borg CLI
+directly against the configured repository."""
+
+_GETTING_STARTED = """\
+Generate a starter config at ~/.borgadm, then edit it to set at least
+BORG_REPO and your BACKUP_SETS (see CONFIGURATION):
+
+    borgadm config init
+
+Check the config parses and is complete before the first backup:
+
+    borgadm config validate
+
+To create a backup of every configured set and prune old archives run:
+
+    borgadm create
+
+To inspect what is in the repository and verify its integrity:
+
+    borgadm list
+    borgadm check full
+
+To restore the latest full backup into a directory:
+
+    borgadm extract /path/to/restore
+
+To schedule unattended backups and checks via crony(1) run:
+
+    borgadm automate enable"""
+
+
 def args_parser() -> StrictArgumentParser:
     parser = StrictArgumentParser(
         description="Borg backup manager",
         formatter_class=RawDescriptionDefaultsHelpFormatter,
-        epilog=ExitCode.epilog(),
+        epilog=(
+            f"{ExitCode.epilog()}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
+            f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
+        ),
     )
     subparsers = parser.add_command_subparsers(metavar="<command>")
 
-    # Always set formatter_class so that we display default values.
+    # Always set formatter_class so that we display default values. Leaf
+    # subcommands carry plain-prose descriptions, so the wrapping
+    # DefaultsHelpFormatter is used (it reflows description text to the
+    # terminal width while still appending each option's default); only
+    # the top-level parser needs the raw variant for its preformatted
+    # epilog.
     def add_parser(name: str, **kwargs: Any) -> StrictArgumentParser:
-        kwargs["formatter_class"] = RawDescriptionDefaultsHelpFormatter
+        kwargs["formatter_class"] = DefaultsHelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
     def add_delete(parser: argparse.ArgumentParser) -> None:
@@ -2571,13 +2640,27 @@ def args_parser() -> StrictArgumentParser:
         )
 
     def add_dry_run(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--dry-run", action="store_true", help="don't make any changes"
+        add_argument_ext(
+            parser,
+            "--dry-run",
+            action="store_true",
+            help="don't make any changes",
+            common=True,
+            extended_help=(
+                "Report what the operation would do without changing anything."
+            ),
         )
 
     def add_progress(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--progress", action="store_true", help="show progress information"
+        add_argument_ext(
+            parser,
+            "--progress",
+            action="store_true",
+            help="show progress information",
+            common=True,
+            extended_help=(
+                "Show borg's progress output while the operation runs."
+            ),
         )
 
     def add_bypass_lock(
@@ -2597,23 +2680,20 @@ def args_parser() -> StrictArgumentParser:
         )
 
     def add_prune_args(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--keep-hourly", type=int, help="Number of hourly backups to keep"
-        )
-        parser.add_argument(
-            "--keep-daily", type=int, help="Number of daily backups to keep"
-        )
-        parser.add_argument(
-            "--keep-weekly", type=int, help="Number of weekly backups to keep"
-        )
-        parser.add_argument(
-            "--keep-monthly",
-            type=int,
-            help="Number of monthly backups to keep",
-        )
-        parser.add_argument(
-            "--keep-yearly", type=int, help="Number of yearly backups to keep"
-        )
+        # Override the configured PRUNE_KEEP_* retention counts for this
+        # run; the same flags document once in COMMON ARGUMENTS.
+        for unit in ("hourly", "daily", "weekly", "monthly", "yearly"):
+            add_argument_ext(
+                parser,
+                f"--keep-{unit}",
+                type=int,
+                help=f"Number of {unit} backups to keep",
+                common=True,
+                extended_help=(
+                    f"Number of {unit} backups to keep, overriding the "
+                    f"PRUNE_KEEP_{unit.upper()} config value for this run."
+                ),
+            )
 
     def add_seconds(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -2627,7 +2707,48 @@ def args_parser() -> StrictArgumentParser:
         parser.add_argument(
             "target_dir",
             type=Path,
-            help="Target directly for extracted backup",
+            help="Target directory for extracted backup",
+        )
+
+    def add_archive(
+        container: argparse._ActionsContainer,
+        *,
+        nargs: str,
+        default: list[str] | None,
+    ) -> None:
+        # The `archive` positional is shared by `check archives` and
+        # `delete`, which read it the same way (a name or an expanded
+        # timestamp, via _resolve_archives), so its format is documented
+        # once here. Arity differs per subcommand and shows in each
+        # synopsis, so it stays out of the shared help.
+        add_argument_ext(
+            container,
+            "archive",
+            nargs=nargs,
+            default=default,
+            help="Full archive name or timestamp.",
+            common=True,
+            extended_help=(
+                "A full archive name as shown by `borgadm list`, or a "
+                "YYYYMMDD_HHMMSS timestamp standing for every archive at "
+                "that time."
+            ),
+        )
+
+    def add_latest(container: argparse._ActionsContainer) -> None:
+        # Shared by check archives, delete, and list, so COMMON ARGUMENTS
+        # documents it once; the per-verb meaning comes from each
+        # subcommand.
+        add_argument_ext(
+            container,
+            "--latest",
+            action="store_true",
+            help="operate only on the latest full backup set",
+            common=True,
+            extended_help=(
+                "Restrict the operation to the latest full backup set "
+                "(the newest timestamp with every configured set present)."
+            ),
         )
 
     automate = add_parser(
@@ -2638,20 +2759,41 @@ def args_parser() -> StrictArgumentParser:
     automate_subparsers.add_parser(
         "enable",
         help="Enable automated backup creation and checks",
+        description=(
+            "Write borgadm's crony(1) bundle and deploy the scheduled "
+            "backup-creation and check jobs (via launchd on macOS, "
+            "systemd on Linux). On macOS the create job runs with Full "
+            "Disk Access permissions."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
     automate_subparsers.add_parser(
         "disable",
         help="Disable automated backup creation and checks",
+        description=(
+            "Tear down borgadm's scheduled backup and check jobs and remove "
+            "its crony(1) bundle."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
     automate_subparsers.add_parser(
         "status",
-        help="Show automation status (via crony)",
+        help="Show automation status (via crony(1))",
+        description=(
+            "Report whether automated backups and checks are deployed, "
+            "querying crony(1) for their status."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
 
-    add_parser("break-lock", help="Break repo lock")
+    add_parser(
+        "break-lock",
+        help="Break repo lock",
+        description=(
+            "Forcibly release a stale lock left on the repository by an "
+            "interrupted borg run."
+        ),
+    )
 
     check = add_parser("check", help="Run backup checks")
     check_subparsers = check.add_command_subparsers(metavar="<command>")
@@ -2659,6 +2801,10 @@ def args_parser() -> StrictArgumentParser:
     check_age = check_subparsers.add_parser(
         "age",
         help="Check full backup age",
+        description=(
+            "Verify that the latest full backup is no older than the "
+            "configured (or given) maximum age."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
     add_seconds(check_age)
@@ -2667,37 +2813,36 @@ def args_parser() -> StrictArgumentParser:
     check_archives = check_subparsers.add_parser(
         "archives",
         help="Check archive metadata (borg check --archives-only)",
+        description=(
+            "Verify archive metadata with borg check --archives-only, over "
+            "the given archives, the latest full set (--latest), or every "
+            "archive in the repository."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
     check_archives_target = check_archives.add_mutually_exclusive_group()
-    check_archives_target.add_argument(
-        "archives",
-        nargs="*",
-        default=[],
-        help=(
-            "Full archive name(s) to check. Default (none given): "
-            "check every archive in the repo."
-        ),
-    )
-    check_archives_target.add_argument(
-        "--latest",
-        action="store_true",
-        help="Check only the latest full backup set",
-    )
+    add_archive(check_archives_target, nargs="*", default=[])
+    add_latest(check_archives_target)
     add_progress(check_archives)
     add_bypass_lock(check_archives, default=False)
 
     check_prune = check_subparsers.add_parser(
         "prune",
         help="Check for unpruned archives",
-        formatter_class=RawDescriptionDefaultsHelpFormatter,
+        description=(
+            "Report any partial or unpruned archives left in the repository."
+        ),
+        formatter_class=DefaultsHelpFormatter,
     )
     add_bypass_lock(check_prune, default=False)
 
     check_repo = check_subparsers.add_parser(
         "repo",
         help="Check repo metadata (borg check --repository-only)",
-        formatter_class=RawDescriptionDefaultsHelpFormatter,
+        description=(
+            "Verify repository metadata with borg check --repository-only."
+        ),
+        formatter_class=DefaultsHelpFormatter,
     )
     add_progress(check_repo)
     add_bypass_lock(check_repo, default=False)
@@ -2705,12 +2850,23 @@ def args_parser() -> StrictArgumentParser:
     check_full = check_subparsers.add_parser(
         "full",
         help="Check repo + archive metadata (borg check)",
-        formatter_class=RawDescriptionDefaultsHelpFormatter,
+        description=(
+            "Verify both repository and archive metadata with a full "
+            "borg check."
+        ),
+        formatter_class=DefaultsHelpFormatter,
     )
     add_progress(check_full)
     add_bypass_lock(check_full, default=False)
 
-    compact = add_parser("compact", help="Check full backup metadata")
+    compact = add_parser(
+        "compact",
+        help="Compact the repository to reclaim freed space",
+        description=(
+            "Compact the repository to reclaim space left behind by deleted "
+            "archives."
+        ),
+    )
     add_progress(compact)
 
     config = add_parser(
@@ -2744,29 +2900,29 @@ def args_parser() -> StrictArgumentParser:
     )
 
     delete_cmd = add_parser(
-        "delete", help="Delete archives by timestamp or name"
+        "delete",
+        help="Delete archives by timestamp or name",
+        description=(
+            "Delete the given archive, or the latest full backup set "
+            "(--latest)."
+        ),
     )
     # Exactly one of an explicit archive or --latest is required, so a
     # bare `delete` cannot silently target the whole repo.
     delete_target = delete_cmd.add_mutually_exclusive_group(required=True)
-    delete_target.add_argument(
-        "archive",
-        nargs="?",
-        help=(
-            "Timestamp (YYYYMMDD_HHMMSS) to delete all archives "
-            "at that time, or a full archive name to delete a "
-            "single archive"
-        ),
-    )
-    delete_target.add_argument(
-        "--latest",
-        action="store_true",
-        help="Delete the latest full backup",
-    )
+    add_archive(delete_target, nargs="?", default=None)
+    add_latest(delete_target)
     add_dry_run(delete_cmd)
     add_progress(delete_cmd)
 
-    create = add_parser("create", help="Create full backup")
+    create = add_parser(
+        "create",
+        help="Create full backup",
+        description=(
+            "Create a full backup, writing one archive per configured backup "
+            "set, then prune old archives unless --no-prune is given."
+        ),
+    )
     create.add_argument(
         "--no-prune", action="store_true", help="Skip backup pruning"
     )
@@ -2774,7 +2930,14 @@ def args_parser() -> StrictArgumentParser:
     add_progress(create)
     add_prune_args(create)
 
-    extract = add_parser("extract", help="Extract latest full backup")
+    extract = add_parser(
+        "extract",
+        help="Extract latest full backup",
+        description=(
+            "Extract the latest full backup into a target directory, "
+            "optionally filtered by include/exclude patterns."
+        ),
+    )
     add_target_dir(extract)
     extract.add_argument(
         "patterns",
@@ -2789,12 +2952,15 @@ def args_parser() -> StrictArgumentParser:
     add_progress(extract)
     add_bypass_lock(extract, default=True)
 
-    list_cmd = add_parser("list", help="List backups")
-    list_cmd.add_argument(
-        "--latest",
-        action="store_true",
-        help="Only list latest complete backup set",
+    list_cmd = add_parser(
+        "list",
+        help="List backups",
+        description=(
+            "List backups grouped by timestamp, distinguishing full from "
+            "partial sets and showing prune keep tags."
+        ),
     )
+    add_latest(list_cmd)
     list_cmd.add_argument(
         "--full-names",
         action="store_true",
@@ -2827,6 +2993,10 @@ def args_parser() -> StrictArgumentParser:
     add_parser(
         "log-files",
         help="Show borgadm log file paths (default and enabled automations)",
+        description=(
+            "Print the borgadm log file paths, including those of any enabled "
+            "automations."
+        ),
     )
 
     repair = add_parser(
@@ -2837,13 +3007,18 @@ def args_parser() -> StrictArgumentParser:
     repair_subparsers.add_parser(
         "delete-cache",
         help="Delete the local borg cache for the repository",
+        description=(
+            "Delete the local borg cache for the repository, forcing it to be "
+            "rebuilt on the next access."
+        ),
         formatter_class=DefaultsHelpFormatter,
     )
 
-    def add_repair_check(name: str, help_text: str) -> None:
+    def add_repair_check(name: str, help_text: str, description: str) -> None:
         sub = repair_subparsers.add_parser(
             name,
             help=help_text,
+            description=description,
             formatter_class=DefaultsHelpFormatter,
         )
         add_progress(sub)
@@ -2857,17 +3032,30 @@ def args_parser() -> StrictArgumentParser:
     add_repair_check(
         "repo",
         "Repair repo metadata (borg check --repair --repository-only)",
+        "Repair repository metadata with borg check --repair "
+        "--repository-only; requires --yes.",
     )
     add_repair_check(
         "archives",
         "Repair archive metadata (borg check --repair --archives-only)",
+        "Repair archive metadata with borg check --repair --archives-only; "
+        "requires --yes.",
     )
     add_repair_check(
         "full",
         "Repair repo + archive metadata (borg check --repair)",
+        "Repair both repository and archive metadata with borg check "
+        "--repair; requires --yes.",
     )
 
-    prune = add_parser("prune", help="Prune partial and old backups")
+    prune = add_parser(
+        "prune",
+        help="Prune partial and old backups",
+        description=(
+            "Prune partial and aged-out archives according to the configured "
+            "retention policy, optionally removing unknown archives."
+        ),
+    )
     add_dry_run(prune)
     add_progress(prune)
     add_prune_args(prune)
@@ -2884,7 +3072,14 @@ def args_parser() -> StrictArgumentParser:
         ),
     )
 
-    rsync = add_parser("rsync", help="Rsync latest archive")
+    rsync = add_parser(
+        "rsync",
+        help="Rsync latest archive",
+        description=(
+            "Mirror the contents of the latest archive to a target directory "
+            "with rsync (Linux only)."
+        ),
+    )
     add_target_dir(rsync)
     add_delete(rsync)
     add_dry_run(rsync)
@@ -2892,25 +3087,41 @@ def args_parser() -> StrictArgumentParser:
     add_bypass_lock(rsync, default=True)
 
     add_parser(
-        "environment", help="Display environment settings to run borg cli"
+        "environment",
+        help="Display environment settings to run borg cli",
+        description=(
+            "Print the shell commands needed to run the borg CLI directly "
+            "against the configured repository."
+        ),
     )
 
     def add_common_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument(
+        add_argument_ext(
+            p,
             "--config",
             type=str,
             default=CONFIG,
             help="borgadm config file",
+            common=True,
+            extended_help="Path to the borgadm config file to read.",
         )
-        p.add_argument(
+        add_argument_ext(
+            p,
             "--verbose",
             action="store_true",
             help="Enable verbose output",
+            common=True,
+            extended_help="Log informational messages, not just warnings.",
         )
-        p.add_argument(
+        add_argument_ext(
+            p,
             "--timestamp-messages",
             action="store_true",
             help="Add timestamps to stdout/stderr messages",
+            common=True,
+            extended_help=(
+                "Prefix each stdout/stderr message with a timestamp."
+            ),
         )
 
     for subparser in subparsers.choices.values():
@@ -3059,6 +3270,62 @@ def cli() -> int:
         return ExitCode.WARNING
 
     return ExitCode.SUCCESS
+
+
+def _config_doc_items() -> list[tuple[str, str]]:
+    """The CONFIGURATION reference, rendered from CONFIG_FIELDS: each
+    field's name and description with `(required)` or `(default: X)`
+    appended (the latter omitted for empty defaults)."""
+    items: list[tuple[str, str]] = []
+    for field in CONFIG_FIELDS:
+        if field.required:
+            suffix = " (required)"
+        elif field.default in ("", [], {}):
+            suffix = ""
+        else:
+            suffix = f" (default: {field.default})"
+        items.append((field.name, f"{field.description}{suffix}."))
+    return items
+
+
+def _files_doc_items() -> list[tuple[str, str]]:
+    """The FILES reference, sourced from BASENAME and the CONFIG_FIELDS
+    defaults so the paths can't drift from the code that defines them."""
+    return [
+        (
+            f"~/.{BASENAME}",
+            "INI-style configuration file (see CONFIGURATION).",
+        ),
+        (
+            str(_FIELDS["BORG_PASSPHRASE_FILE"].default),
+            "Default repository passphrase file (BORG_PASSPHRASE_FILE).",
+        ),
+        (
+            str(_FIELDS["BORG_SSHKEY_FILE"].default),
+            "Default SSH key for a remote repository (BORG_SSHKEY_FILE).",
+        ),
+        (
+            f"$TMPDIR/{BASENAME}.log",
+            "Run log written on every invocation.",
+        ),
+    ]
+
+
+MAN_SPEC = ManSpec(
+    prog="borgadm",
+    section=1,
+    build_parser=args_parser,
+    name_description="manage borg backup repositories and scheduled backups",
+    description=_DESCRIPTION,
+    pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
+    post_sections=[
+        ItemsSection("CONFIGURATION", _config_doc_items()),
+        ItemsSection("FILES", _files_doc_items()),
+    ],
+    exit_status=[
+        (str(value), description) for value, description in ExitCode.entries()
+    ],
+)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,378 @@
+.\"
+.TH "borgadm" "1" "" "borgadm" "borgadm manual"
+.SH NAME
+borgadm \- manage borg backup repositories and scheduled backups
+.SH SYNOPSIS
+\f[B]borgadm\f[R] <command> ...\&
+.SH DESCRIPTION
+borgadm is a wrapper around borgbackup designed to manage backup sets, where a set is a group of separate borg backups (archives) created with different create options.\&
+It creates backups from the named sets, verifies repository and archive integrity, prunes old and partial archives by retention policy, and restores archives via extract or rsync.\&
+A passphrase\- and SSH\-key\-based workflow handles authentication to local and remote repositories, and it can schedule unattended backups and checks through crony(1) on macOS (launchd) and Linux (systemd).\&
+.PP
+The sets are defined in the config file; each \(gacreate\(ga run writes one archive per set, named {BACKUP_NAME}\-{set_name}\-YYYYMMDD_HHMMSS_NofM.\&
+The NofM suffix records a set\(aqs position so a timestamp is \(dqfull\(dq only when every configured set is present and \(dqpartial\(dq otherwise.\&
+The list, check, prune, and restore subcommands operate on these timestamps, and prune can also clean up partial or unrecognized (\(dqunknown\(dq) archives.\&
+.PP
+Configuration lives in \(ti/.borgadm, an INI\-style file naming the repository, the backup sets, retention counts, credential file paths, and check thresholds.\&
+The \(gaautomate\(ga subcommand deploys borgadm\(aqs scheduled create and check jobs through crony(1) (launchd on macOS, systemd on Linux); \(gaenvironment\(ga prints the shell exports needed to run the borg CLI directly against the configured repository.\&
+.SH GETTING STARTED
+Generate a starter config at \(ti/.borgadm, then edit it to set at least BORG_REPO and your BACKUP_SETS (see CONFIGURATION):
+.PP
+.EX
+    borgadm config init
+.EE
+.PP
+Check the config parses and is complete before the first backup:
+.PP
+.EX
+    borgadm config validate
+.EE
+.PP
+To create a backup of every configured set and prune old archives run:
+.PP
+.EX
+    borgadm create
+.EE
+.PP
+To inspect what is in the repository and verify its integrity:
+.PP
+.EX
+    borgadm list
+    borgadm check full
+.EE
+.PP
+To restore the latest full backup into a directory:
+.PP
+.EX
+    borgadm extract /path/to/restore
+.EE
+.PP
+To schedule unattended backups and checks via crony(1) run:
+.PP
+.EX
+    borgadm automate enable
+.EE
+.SH COMMON ARGUMENTS
+.TP
+\f[CR]archive\f[R]
+A full archive name as shown by \f[CR]borgadm list\f[R], or a YYYYMMDD_HHMMSS timestamp standing for every archive at that time.\&
+.TP
+\f[CR]\-\-config CONFIG\f[R]
+Path to the borgadm config file to read.\&
+(default: \(ti/.borgadm)
+.TP
+\f[CR]\-\-dry\-run\f[R]
+Report what the operation would do without changing anything.\&
+.TP
+\f[CR]\-\-keep\-daily KEEP_DAILY\f[R]
+Number of daily backups to keep, overriding the PRUNE_KEEP_DAILY config value for this run.\&
+.TP
+\f[CR]\-\-keep\-hourly KEEP_HOURLY\f[R]
+Number of hourly backups to keep, overriding the PRUNE_KEEP_HOURLY config value for this run.\&
+.TP
+\f[CR]\-\-keep\-monthly KEEP_MONTHLY\f[R]
+Number of monthly backups to keep, overriding the PRUNE_KEEP_MONTHLY config value for this run.\&
+.TP
+\f[CR]\-\-keep\-weekly KEEP_WEEKLY\f[R]
+Number of weekly backups to keep, overriding the PRUNE_KEEP_WEEKLY config value for this run.\&
+.TP
+\f[CR]\-\-keep\-yearly KEEP_YEARLY\f[R]
+Number of yearly backups to keep, overriding the PRUNE_KEEP_YEARLY config value for this run.\&
+.TP
+\f[CR]\-\-latest\f[R]
+Restrict the operation to the latest full backup set (the newest timestamp with every configured set present).\&
+.TP
+\f[CR]\-\-progress\f[R]
+Show borg\(aqs progress output while the operation runs.\&
+.TP
+\f[CR]\-\-timestamp\-messages\f[R]
+Prefix each stdout/stderr message with a timestamp.\&
+.TP
+\f[CR]\-\-verbose\f[R]
+Log informational messages, not just warnings.\&
+.SH SUBCOMMANDS
+.TP
+\f[B]automate enable\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Write borgadm\(aqs crony(1) bundle and deploy the scheduled backup\-creation and check jobs (via launchd on macOS, systemd on Linux).\&
+On macOS the create job runs with Full Disk Access permissions.\&
+.TP
+\f[B]automate disable\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Tear down borgadm\(aqs scheduled backup and check jobs and remove its crony(1) bundle.\&
+.TP
+\f[B]automate status\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Report whether automated backups and checks are deployed, querying crony(1) for their status.\&
+.TP
+\f[B]break\-lock\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Forcibly release a stale lock left on the repository by an interrupted borg run.\&
+.TP
+\f[B]check age\f[R] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [seconds]
+Verify that the latest full backup is no older than the configured (or given) maximum age.\&
+.RS
+.TP
+\f[CR]seconds\f[R]
+Maximum backup age, in seconds
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]check archives\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [\-\-latest | archive ...]\&
+Verify archive metadata with borg check \-\-archives\-only, over the given archives, the latest full set (\-\-latest), or every archive in the repository.\&
+.RS
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]check prune\f[R] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Report any partial or unpruned archives left in the repository.\&
+.RS
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]check repo\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Verify repository metadata with borg check \-\-repository\-only.\&
+.RS
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]check full\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Verify both repository and archive metadata with a full borg check.\&
+.RS
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]compact\f[R] [\-\-progress] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Compact the repository to reclaim space left behind by deleted archives.\&
+.TP
+\f[B]config init\f[R] [\-\-force] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Write the shipped example config to \(ti/.borgadm, refusing to overwrite an existing file unless \-\-force is given.\&
+.RS
+.TP
+\f[CR]\-\-force\f[R]
+Overwrite an existing config file
+.RE
+.TP
+\f[B]config validate\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Load the config file (see \-\-config) and report whether it is structurally valid, listing any errors.\&
+Does not connect to the repository.\&
+.TP
+\f[B]delete\f[R] [\-\-dry\-run] [\-\-progress] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] (\-\-latest | archive)
+Delete the given archive, or the latest full backup set (\-\-latest).\&
+.TP
+\f[B]create\f[R] [\-\-no\-prune] [\-\-dry\-run] [\-\-progress] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Create a full backup, writing one archive per configured backup set, then prune old archives unless \-\-no\-prune is given.\&
+.RS
+.TP
+\f[CR]\-\-no\-prune\f[R]
+Skip backup pruning
+.RE
+.TP
+\f[B]extract\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir [patterns ...]\&
+Extract the latest full backup into a target directory, optionally filtered by include/exclude patterns.\&
+.RS
+.TP
+\f[CR]target_dir\f[R]
+Target directory for extracted backup
+.TP
+\f[CR]patterns\f[R]
+include/exclude paths matching PATTERN, see \(aqborg help patterns\(aq for details
+.TP
+\f[CR]\-\-delete\f[R]
+Delete files in destination not in backup
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup) (default: True)
+.RE
+.TP
+\f[B]list\f[R] [\-\-latest] [\-\-full\-names] [\-\-keep\-tags | \-\-no\-keep\-tags] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-include\-partial | \-\-no\-include\-partial | \-\-only\-partial] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+List backups grouped by timestamp, distinguishing full from partial sets and showing prune keep tags.\&
+.RS
+.TP
+\f[CR]\-\-full\-names\f[R]
+List full names of backups (instead of just timestamps)
+.TP
+\f[CR]\-\-keep\-tags, \-\-no\-keep\-tags\f[R]
+Include keep tags (indicating what would be kept and deleted during a prune) (default: True)
+.TP
+\f[CR]\-\-include\-partial, \-\-no\-include\-partial\f[R]
+Include partial backups (default: True)
+.TP
+\f[CR]\-\-only\-partial\f[R]
+Only list partial
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]log\-files\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Print the borgadm log file paths, including those of any enabled automations.\&
+.TP
+\f[B]repair delete\-cache\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Delete the local borg cache for the repository, forcing it to be rebuilt on the next access.\&
+.TP
+\f[B]repair repo\f[R] [\-\-progress] [\-\-yes] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Repair repository metadata with borg check \-\-repair \-\-repository\-only; requires \-\-yes.\&
+.RS
+.TP
+\f[CR]\-\-yes\f[R]
+confirm you understand the risks of \-\-repair
+.RE
+.TP
+\f[B]repair archives\f[R] [\-\-progress] [\-\-yes] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Repair archive metadata with borg check \-\-repair \-\-archives\-only; requires \-\-yes.\&
+.RS
+.TP
+\f[CR]\-\-yes\f[R]
+confirm you understand the risks of \-\-repair
+.RE
+.TP
+\f[B]repair full\f[R] [\-\-progress] [\-\-yes] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Repair both repository and archive metadata with borg check \-\-repair; requires \-\-yes.\&
+.RS
+.TP
+\f[CR]\-\-yes\f[R]
+confirm you understand the risks of \-\-repair
+.RE
+.TP
+\f[B]prune\f[R] [\-\-dry\-run] [\-\-progress] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-cleanup\-unknown] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Prune partial and aged\-out archives according to the configured retention policy, optionally removing unknown archives.\&
+.RS
+.TP
+\f[CR]\-\-cleanup\-unknown\f[R]
+Delete archives whose names start with the configured BACKUP_NAME prefix but don\(aqt match the expected {BACKUP_NAME}\-{set_name}\-YYYYMMDD_HHMMSS_NofM shape.\&
+Default: warn but leave in place.\&
+Either way, an unknown archive in the repo causes list and prune to exit with the WARNING status.\&
+.RE
+.TP
+\f[B]rsync\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir
+Mirror the contents of the latest archive to a target directory with rsync (Linux only).\&
+.RS
+.TP
+\f[CR]target_dir\f[R]
+Target directory for extracted backup
+.TP
+\f[CR]\-\-delete\f[R]
+Delete files in destination not in backup
+.TP
+\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+skip the repo lock instead of waiting for it (faster, but may race a concurrent backup) (default: True)
+.RE
+.TP
+\f[B]environment\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Print the shell commands needed to run the borg CLI directly against the configured repository.\&
+.SH CONFIGURATION
+.TP
+\f[CR]BORG_REPO\f[R]
+Path or ssh URL of the borg repository to manage (required).\&
+.TP
+\f[CR]BORG_REPO_HOSTKEY\f[R]
+known_hosts entry for the remote repository host.\&
+.TP
+\f[CR]BORG_PASSPHRASE_FILE\f[R]
+File holding the repository passphrase (default: \(ti/.borg_passphrase).\&
+.TP
+\f[CR]BORG_SSHKEY_FILE\f[R]
+SSH private key used to reach a remote repository (default: \(ti/.ssh/id_borg.net).\&
+.TP
+\f[CR]BORG_REMOTE_PATH\f[R]
+Path to the borg executable on the remote host.\&
+.TP
+\f[CR]BORG_CMD_TIMEOUT\f[R]
+Timeout for borg commands, in seconds (default: 14400).\&
+.TP
+\f[CR]CMD_TIMEOUT\f[R]
+Timeout for non\-borg commands, in seconds (default: 60).\&
+.TP
+\f[CR]LOCK_CHECK_TIMEOUT\f[R]
+Seconds to wait probing whether the repository lock is held (default: 5).\&
+.TP
+\f[CR]BACKUP_NAME\f[R]
+Prefix for archive names (default: home).\&
+.TP
+\f[CR]BACKUP_ROOT\f[R]
+Directory \(gacreate\(ga runs from and that backup\-set paths are resolved against (default: \(ti).\&
+.TP
+\f[CR]CHECK_AGE_SECONDS\f[R]
+Maximum age \(gacheck age\(ga tolerates for the latest full backup, in seconds (default: 86400).\&
+.TP
+\f[CR]PRUNE_KEEP_HOURLY\f[R]
+Hourly archives \(gaprune\(ga retains (default: 24).\&
+.TP
+\f[CR]PRUNE_KEEP_DAILY\f[R]
+Daily archives \(gaprune\(ga retains (default: 7).\&
+.TP
+\f[CR]PRUNE_KEEP_WEEKLY\f[R]
+Weekly archives \(gaprune\(ga retains (default: 4).\&
+.TP
+\f[CR]PRUNE_KEEP_MONTHLY\f[R]
+Monthly archives \(gaprune\(ga retains (default: 12).\&
+.TP
+\f[CR]PRUNE_KEEP_YEARLY\f[R]
+Yearly archives \(gaprune\(ga retains (default: 2).\&
+.TP
+\f[CR]BACKUP_MOUNTS\f[R]
+JSON list of paths (relative to BACKUP_ROOT) that must be mountpoints before \(gacreate\(ga proceeds.\&
+.TP
+\f[CR]BACKUP_SETS\f[R]
+JSON object mapping each backup\-set name to its \(gapaths\(ga, optional \(gaexcludes\(ga, and optional \(gacreate_options\(ga; \(gacreate\(ga writes one archive per set (required).\&
+.SH FILES
+.TP
+\f[CR]\(ti/.borgadm\f[R]
+INI\-style configuration file (see CONFIGURATION).\&
+.TP
+\f[CR]\(ti/.borg_passphrase\f[R]
+Default repository passphrase file (BORG_PASSPHRASE_FILE).\&
+.TP
+\f[CR]\(ti/.ssh/id_borg.net\f[R]
+Default SSH key for a remote repository (BORG_SSHKEY_FILE).\&
+.TP
+\f[CR]$TMPDIR/borgadm.log\f[R]
+Run log written on every invocation.\&
+.SH EXIT STATUS
+.PD 0
+.TP
+\f[CR]0\f[R]
+Success
+.TP
+\f[CR]1\f[R]
+Warning
+.TP
+\f[CR]2\f[R]
+Usage/argument error
+.TP
+\f[CR]3\f[R]
+Configuration error
+.TP
+\f[CR]4\f[R]
+General error
+.TP
+\f[CR]5\f[R]
+Subprocess error
+.TP
+\f[CR]7\f[R]
+Crashed (unhandled exception)
+.TP
+\f[CR]10\f[R]
+Check failed: no full backups
+.TP
+\f[CR]11\f[R]
+Check failed: backup too old
+.TP
+\f[CR]12\f[R]
+Check failed: repo metadata
+.TP
+\f[CR]13\f[R]
+Check failed: archive metadata
+.TP
+\f[CR]14\f[R]
+Check failed: unpruned archives
+.TP
+\f[CR]15\f[R]
+Check failed: full repo + archives

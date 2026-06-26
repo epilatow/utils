@@ -1683,7 +1683,7 @@ class TestCheck:
             pytest.raises(ba.CheckNoBackupsError),
         ):
             ba.do_check_archives(
-                progress=False, latest=True, archives=[], bypass_lock=False
+                progress=False, latest=True, archive=[], bypass_lock=False
             )
 
     def test_check_repo_argv(self, mock_cfg: Any) -> None:
@@ -1731,7 +1731,7 @@ class TestCheck:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_check_archives(
-                progress=False, latest=False, archives=[], bypass_lock=False
+                progress=False, latest=False, archive=[], bypass_lock=False
             )
         mock_run_borg.assert_called_once_with(
             ["borg", "check", "--archives-only", mock_cfg.BORG_REPO],
@@ -1763,7 +1763,7 @@ class TestCheck:
             patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
         ):
             ba.do_check_archives(
-                progress=False, latest=True, archives=[], bypass_lock=False
+                progress=False, latest=True, archive=[], bypass_lock=False
             )
         mock_list.assert_called_once_with(latest=True, bypass_lock=False)
         assert [c.args[0] for c in mock_run_borg.call_args_list] == [
@@ -1786,7 +1786,7 @@ class TestCheck:
             ba.do_check_archives(
                 progress=False,
                 latest=False,
-                archives=["home-fuse-20250101_120000"],
+                archive=["home-fuse-20250101_120000"],
                 bypass_lock=False,
             )
         mock_run_borg.assert_called_once_with(
@@ -1826,7 +1826,7 @@ class TestCheck:
             ba.do_check_archives(
                 progress=False,
                 latest=False,
-                archives=["20250101_120000"],
+                archive=["20250101_120000"],
                 bypass_lock=False,
             )
         checked = {c.args[0][-1] for c in mock_run_borg.call_args_list}
@@ -1847,7 +1847,7 @@ class TestCheck:
             ba.do_check_archives(
                 progress=False,
                 latest=False,
-                archives=["20250101_120000"],
+                archive=["20250101_120000"],
                 bypass_lock=False,
             )
         mock_run_borg.assert_not_called()
@@ -1868,7 +1868,7 @@ class TestCheck:
             ba.do_check_archives(
                 progress=False,
                 latest=False,
-                archives=["nope"],
+                archive=["nope"],
                 bypass_lock=False,
             )
         mock_run_borg.assert_not_called()
@@ -1887,7 +1887,7 @@ class TestCheck:
         parser = ba.args_parser()
         args = parser.parse_command(["check", "archives"])
         assert args.latest is False
-        assert args.archives == []
+        assert args.archive == []
 
     @pytest.mark.parametrize("mode", ["repo", "archives", "full"])
     def test_check_modes_parse(self, mode: str) -> None:
