@@ -30,20 +30,22 @@ mdformat. The two are rendered separately because the definition lists
 that read well in roff have no native GFM equivalent (pandoc's GFM writer
 flattens them), so a single shared source can't serve both.
 
-Each `ManSpec` supplies the per-utility bits the parser doesn't carry:
-the NAME one-liner, the DESCRIPTION overview, authored COMMON ARGUMENTS
-(cross-cutting args documented once), an optional reference section
+Each utility's `ManSpec` (see `common.docspec`) supplies the per-utility
+bits the parser doesn't carry: the NAME one-liner, the DESCRIPTION
+overview, extra prose sections, an optional reference section
 (structured `(label, description)` data, e.g. crony's status columns), a
 FILES list, and an EXIT STATUS table. Everything else -- SYNOPSIS, the
-SUBCOMMANDS list, and the data-driven detection of options shared across
-subcommands -- is derived generically. Add a utility by appending a
-`ManSpec` to `_SPECS`.
+SUBCOMMANDS list, and COMMON ARGUMENTS (the args shared across
+subcommands, detected from the parser and shown with each argument's
+extended help) -- is derived generically. A utility opts in by exposing
+a module-level `MAN_SPEC`; `_discover_specs` finds them, so adding one
+touches only that utility.
 
 It also generates the repo `README.md`: the authored preamble from
-`scripts/readme-intro.md`, the documented utilities (those in `_SPECS`,
-blurbed from their DESCRIPTION and linked to their `docs/` page), and the
-undocumented `bin/` utilities (blurbed from each one's `--help`). See
-`build_readme`.
+`scripts/readme-intro.md`, the documented utilities (those with a
+`MAN_SPEC`, blurbed from their DESCRIPTION and linked to their `docs/`
+page), and the undocumented `bin/` utilities (blurbed from each one's
+`--help`). See `build_readme`.
 
 Run with no arguments to (re)write every utility's man page and GFM doc
 plus the README (pandoc required for the roff). `--check` re-renders the
@@ -56,14 +58,15 @@ freshness test instead.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import mdformat
 
@@ -71,6 +74,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # First-party packages live under <repo>/src; put it on the path before
 # importing any utility's parser, the same way each bin/ entry does.
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from common.argparse_ext import get_extended_help, is_common  # noqa: E402
+from common.docspec import ManSpec  # noqa: E402
 
 # pandoc renders the Markdown to roff. Its roff output varies between
 # versions, so a single pandoc is pinned in `scripts/pandoc-pin.json`
@@ -119,56 +125,38 @@ def _gfm_inline(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-utility specification
+# Spec discovery
 # ---------------------------------------------------------------------------
+#
+# A utility opts into generated docs by exposing a module-level `MAN_SPEC`
+# (see `common.docspec.ManSpec`). Discovery imports each `src/*.py` alias
+# that points at a `bin/` entry and collects any `MAN_SPEC`, so adding a
+# utility's docs touches only that utility -- never this file. The alias
+# is imported only when its source actually defines `MAN_SPEC`, so an
+# undocumented tool's dependencies aren't pulled in here. crony is the one
+# exception: it has no alias (its logic is the `src/crony` package), so it
+# is imported by name.
 
 
-@dataclass(frozen=True)
-class ManSpec:
-    """One utility's man page. `build_parser` returns its argparse parser;
-    the rest supplies what the parser doesn't carry."""
-
-    prog: str
-    section: int
-    build_parser: Callable[[], argparse.ArgumentParser]
-    name_description: str
-    # DESCRIPTION body; falls back to the parser's own `description`.
-    description: str = ""
-    # Extra top-level prose sections rendered after DESCRIPTION and
-    # before COMMON ARGUMENTS, as `(SECTION TITLE, body)`. The body is
-    # prose (reflowed like DESCRIPTION).
-    extra_sections: list[tuple[str, str]] = field(default_factory=list)
-    # Cross-cutting args documented once under COMMON ARGUMENTS and
-    # dropped from each subcommand. `(label, description)`, authored
-    # Markdown; a bare label (e.g. ``job``) also prunes the matching
-    # per-subcommand argument.
-    common_args: list[tuple[str, str]] = field(default_factory=list)
-    # An optional trailing reference section (e.g. crony's status
-    # columns): a heading, an intro paragraph, and structured subsections.
-    reference_title: str = ""
-    reference_intro: str = ""
-    reference_sections: list[tuple[str, str, list[tuple[str, str]]]] = field(
-        default_factory=list
-    )
-    # Files the utility reads / writes, as `(path, description)`, rendered
-    # in a FILES section just before EXIT STATUS. [] to omit.
-    files: list[tuple[str, str]] = field(default_factory=list)
-    # EXIT STATUS as `(code, description)` items, or [] to omit it.
-    exit_status: list[tuple[str, str]] = field(default_factory=list)
-
-    @property
-    def man_path(self) -> Path:
-        return (
-            _REPO_ROOT
-            / "share"
-            / "man"
-            / f"man{self.section}"
-            / f"{self.prog}.{self.section}"
-        )
-
-    @property
-    def docs_path(self) -> Path:
-        return _REPO_ROOT / "docs" / f"{self.prog}.md"
+def _discover_specs() -> list[ManSpec]:
+    """Every utility's `MAN_SPEC`, crony first then the alias'd `bin/`
+    entries in name order. Order is immaterial -- each man / GFM doc is a
+    separate file and the README sorts by `prog` -- but kept stable."""
+    specs: list[ManSpec] = [importlib.import_module("crony.cli").MAN_SPEC]
+    for alias in sorted((_REPO_ROOT / "src").glob("*.py")):
+        if not alias.is_symlink():
+            continue
+        target = alias.resolve()
+        # Only bin/ utilities, and only import one whose source names
+        # MAN_SPEC -- so an undocumented tool's deps aren't pulled in
+        # here. The substring check can false-positive (a mention in a
+        # comment), so confirm the attribute actually exists.
+        if target.parent.name != "bin" or "MAN_SPEC" not in target.read_text():
+            continue
+        spec = getattr(importlib.import_module(alias.stem), "MAN_SPEC", None)
+        if spec is not None:
+            specs.append(spec)
+    return specs
 
 
 # ---------------------------------------------------------------------------
@@ -262,19 +250,27 @@ def _invocation(action: argparse.Action) -> str:
     return ", ".join(action.option_strings) + " " + args
 
 
+def _documented_actions(
+    parser: argparse.ArgumentParser,
+) -> list[argparse.Action]:
+    """Every documented option / positional action, skipping the universal
+    `-h/--help` and the subparsers pseudo-action."""
+    return [
+        action
+        for action in parser._actions
+        if not isinstance(action, argparse._SubParsersAction)
+        and "-h" not in action.option_strings
+    ]
+
+
 def _options(
     parser: argparse.ArgumentParser,
 ) -> list[tuple[str, str]]:
-    """(invocation, help) for each documented option / positional,
-    skipping the universal `-h/--help` and the subparsers pseudo-action."""
-    out: list[tuple[str, str]] = []
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            continue
-        if "-h" in action.option_strings:
-            continue
-        out.append((_invocation(action), action.help or ""))
-    return out
+    """(invocation, help) for each documented option / positional."""
+    return [
+        (_invocation(action), action.help or "")
+        for action in _documented_actions(parser)
+    ]
 
 
 def _walk_subcommands(
@@ -346,30 +342,52 @@ def _definition(term: str, description: str, *, indent: str = "") -> list[str]:
     ]
 
 
-def _shared_options(
-    spec: ManSpec,
-    subs: list[tuple[argparse.ArgumentParser, str]],
-) -> tuple[set[str], set[tuple[str, str]]]:
-    """The two sets that drive COMMON ARGUMENTS, shared by both renderers
-    so they agree on what is hoisted out of the per-subcommand listing.
+class _CommonArg(NamedTuple):
+    """An argument shared across subcommands, hoisted into COMMON
+    ARGUMENTS. `extended_help` (when set on the argument) is the longer
+    description shown there; `help` is argparse's terse one-liner."""
 
-    `authored` is the bare labels in `common_args` (e.g. ``job``); an
-    authored label also prunes the matching per-subcommand argument and is
-    excluded from detection so its own entry isn't joined by a re-detected
-    one. `common` is every (invocation, help) pair identical across two or
-    more subcommands -- documented once and dropped from each subcommand,
-    detected from the parser so it can't drift."""
-    authored = {label.strip("`") for label, _ in spec.common_args}
-    counts: dict[tuple[str, str], int] = {}
+    invocation: str
+    help: str
+    extended_help: str | None
+    is_positional: bool
+
+
+def _shared_options(
+    subs: list[tuple[argparse.ArgumentParser, str]],
+) -> tuple[list[_CommonArg], set[str]]:
+    """Drive COMMON ARGUMENTS, shared by both renderers so they agree on
+    what is hoisted out of the per-subcommand listing.
+
+    Collect every argument tagged common (`add_argument_ext(common=True)`)
+    from the subcommands -- the tag is the single source -- deduplicated by
+    invocation. Return them ordered shared-positionals-first (so a `job`
+    positional leads) then by invocation, plus the invocations used to
+    prune them from each subcommand."""
+    by_invocation: dict[str, _CommonArg] = {}
     for sub, _ in subs:
-        for invocation, opt_help in _options(sub):
-            if invocation in authored:
+        for action in _documented_actions(sub):
+            if not is_common(action):
                 continue
-            counts[(invocation, opt_help)] = (
-                counts.get((invocation, opt_help), 0) + 1
+            arg = _CommonArg(
+                _invocation(action),
+                action.help or "",
+                get_extended_help(action),
+                not action.option_strings,
             )
-    common = {opt for opt, count in counts.items() if count >= 2}
-    return authored, common
+            existing = by_invocation.setdefault(arg.invocation, arg)
+            # A common argument is documented once, so every subcommand
+            # that tags it must describe it identically; otherwise the
+            # single COMMON ARGUMENTS entry would silently pick one.
+            assert existing == arg, (
+                f"common argument {arg.invocation!r} is tagged "
+                f"inconsistently across subcommands"
+            )
+    shared = sorted(
+        by_invocation.values(),
+        key=lambda a: (not a.is_positional, a.invocation),
+    )
+    return shared, set(by_invocation)
 
 
 def build_markdown(spec: ManSpec) -> str:
@@ -397,20 +415,21 @@ def build_markdown(spec: ManSpec) -> str:
     ]
     out += _overview_md(spec.description or parser.description or "")
 
-    for title, body in spec.extra_sections:
+    for title, body in spec.prose_sections:
         out += [f"# {title}", ""]
         out += _overview_md(body)
 
     subs: list[tuple[argparse.ArgumentParser, str]] = []
     _walk_subcommands(parser, subs)
-    authored, common = _shared_options(spec, subs)
+    shared, pruned = _shared_options(subs)
 
-    if spec.common_args or common:
+    if shared:
         out += ["# COMMON ARGUMENTS", ""]
-        for label, description in spec.common_args:
-            out += _definition(label, description)
-        for invocation, opt_help in sorted(common):
-            out += _definition(f"`{invocation}`", _md(opt_help))
+        for arg in shared:
+            # The authored extended help is doc Markdown rendered verbatim;
+            # argparse's terse help is escaped like any parser-derived text.
+            description = arg.extended_help or _md(arg.help)
+            out += _definition(f"`{arg.invocation}`", description)
 
     out += ["# SUBCOMMANDS", ""]
     for sub, summary in subs:
@@ -420,7 +439,7 @@ def build_markdown(spec: ManSpec) -> str:
         out += [f"**{path}** {_md(_signature(sub))}".rstrip(), ""]
         out += [f":   {_md(summary)}", ""]
         for invocation, opt_help in _options(sub):
-            if (invocation, opt_help) in common or invocation in authored:
+            if invocation in pruned:
                 continue
             out += _definition(f"`{invocation}`", _md(opt_help), indent="    ")
 
@@ -615,20 +634,20 @@ def build_gfm(spec: ManSpec) -> str:
         spec.description or parser.description or "", _gfm_inline
     )
 
-    for title, body in spec.extra_sections:
+    for title, body in spec.prose_sections:
         out += [f"## {title}", ""]
         out += _overview_md(body, _gfm_inline)
 
     subs: list[tuple[argparse.ArgumentParser, str]] = []
     _walk_subcommands(parser, subs)
-    authored, common = _shared_options(spec, subs)
+    shared, pruned = _shared_options(subs)
 
-    if spec.common_args or common:
+    if shared:
         out += ["## COMMON ARGUMENTS", ""]
-        # `_gfm_item` strips the authored backticks and escapes the help.
-        items = [(label.strip("`"), desc) for label, desc in spec.common_args]
-        items += sorted(common)
-        out += [_gfm_item(term, desc) for term, desc in items]
+        out += [
+            _gfm_item(arg.invocation, arg.extended_help or arg.help)
+            for arg in shared
+        ]
         out.append("")
 
     out += ["## SUBCOMMANDS", ""]
@@ -644,8 +663,7 @@ def build_gfm(spec: ManSpec) -> str:
         own = [
             (invocation, opt_help)
             for invocation, opt_help in _options(sub)
-            if (invocation, opt_help) not in common
-            and invocation not in authored
+            if invocation not in pruned
         ]
         if own:
             out += [_gfm_item(inv, opt_help) for inv, opt_help in own]
@@ -676,88 +694,6 @@ def build_gfm(spec: ManSpec) -> str:
         options={"wrap": _md_wrap(), "number": True},
         extensions={"gfm", "tables"},
     )
-
-
-# ---------------------------------------------------------------------------
-# Utility specs
-# ---------------------------------------------------------------------------
-
-
-def _crony_spec() -> ManSpec:
-    import crony.cli
-    import crony.commands
-    import crony.errors
-
-    job = (
-        "`job`",
-        "A job (or group) identity: the full namespaced name "
-        "`<bundle>.<name>`, or the `<bundle>:<uuid>` form for an entry "
-        "with no recoverable name. A bare `name` is shorthand for "
-        "`default.<name>`. Subcommands that accept more than one take a "
-        "space-separated list (shown as `[job ...]`).",
-    )
-    internal = {code.value for code in crony.errors.INTERNAL_EXIT_CODES}
-    exit_status = [
-        (str(value), description)
-        for value, description in crony.errors.ExitCode.entries()
-        if value not in internal
-    ]
-    sections = [
-        (s.title, s.lead, s.items)
-        for s in crony.commands.status_reference_sections()
-    ]
-    return ManSpec(
-        prog="crony",
-        section=1,
-        build_parser=crony.cli._build_parser,
-        name_description="user-level scheduled-job manager",
-        description=crony.cli._OVERVIEW,
-        extra_sections=[
-            ("GETTING STARTED", crony.cli._GETTING_STARTED),
-            ("PLATFORM SPECIFICS", crony.cli._PLATFORM_SPECIFICS),
-        ],
-        common_args=[job],
-        reference_title="STATUS COLUMNS",
-        reference_sections=sections,
-        exit_status=exit_status,
-    )
-
-
-def _linkfiles_spec() -> ManSpec:
-    import linkfiles
-
-    return ManSpec(
-        prog="linkfiles",
-        section=1,
-        build_parser=linkfiles.build_parser,
-        name_description="symlink a source directory's contents into a target",
-        description=linkfiles._OVERVIEW,
-        extra_sections=[("GETTING STARTED", linkfiles._GETTING_STARTED)],
-        files=[
-            (
-                "~/.linkfiles.installed",
-                "Tracks installed directory pairs (source + target) and "
-                "installation options.",
-            ),
-            (
-                "~/.linkfiles.linked",
-                "Tracks installed links (source + target pairs).",
-            ),
-            (
-                "$REPO/.linkfiles.ignore",
-                "A file containing gitignore style patterns used to "
-                "specify repo files that should be ignored by linkfiles. "
-                "Used when source_dir is $REPO or a child of $REPO.",
-            ),
-        ],
-        exit_status=[
-            (str(value), description)
-            for value, description in linkfiles.ExitCode.entries()
-        ],
-    )
-
-
-_SPECS: list[Callable[[], ManSpec]] = [_crony_spec, _linkfiles_spec]
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +745,7 @@ def build_readme() -> str:
     utilities (blurbed from their `--help`). Run through mdformat so it
     satisfies the repo's prose gates. Needs no pandoc, but runs each
     undocumented utility's `--help`."""
-    specs = sorted((make() for make in _SPECS), key=lambda s: s.prog)
+    specs = sorted(_discover_specs(), key=lambda s: s.prog)
     documented = {spec.prog for spec in specs}
     intro = _README_INTRO_PATH.read_text().strip()
     out = [intro, "", "## Documented utilities", ""]
@@ -851,8 +787,7 @@ def main() -> int:
     args = ap.parse_args()
 
     stale: list[Path] = []
-    for make_spec in _SPECS:
-        spec = make_spec()
+    for spec in _discover_specs():
         # The GFM doc is pure Python (plus mdformat), so --check verifies
         # it without pandoc; the roff man page needs pandoc and is gated by
         # the pytest freshness test instead.

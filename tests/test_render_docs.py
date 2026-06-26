@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -43,43 +42,39 @@ REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import render_docs  # noqa: E402  (import after the src/ path insert above)
+from common.argparse_ext import add_argument_ext  # noqa: E402
+from common.docspec import ManSpec  # noqa: E402
 
 _script_path = REPO_ROOT / "src" / "render_docs.py"
 
 
 @pytest.mark.parametrize(
-    "make_spec", render_docs._SPECS, ids=lambda m: m().prog
+    "spec", render_docs._discover_specs(), ids=lambda s: s.prog
 )
-def test_man_roff_is_current(
-    make_spec: Callable[[], render_docs.ManSpec],
-) -> None:
+def test_man_roff_is_current(spec: ManSpec) -> None:
     if render_docs._pinned_pandoc() is None:
         pytest.fail(
             f"pandoc {render_docs.PANDOC_VERSION} not found; run "
             "scripts/pandoc install to fetch the pinned version into "
             ".tools/ (see DEVELOPMENT.md)."
         )
-    spec = make_spec()
     rendered = render_docs._render_roff(render_docs.build_markdown(spec))
     assert spec.man_path.read_text() == rendered
 
 
 @pytest.mark.parametrize(
-    "make_spec", render_docs._SPECS, ids=lambda m: m().prog
+    "spec", render_docs._discover_specs(), ids=lambda s: s.prog
 )
-def test_docs_gfm_is_current(
-    make_spec: Callable[[], render_docs.ManSpec],
-) -> None:
+def test_docs_gfm_is_current(spec: ManSpec) -> None:
     # The GFM doc is pure Python plus mdformat, so no pandoc is needed.
-    spec = make_spec()
     assert spec.docs_path.read_text() == render_docs.build_gfm(spec)
 
 
 def test_readme_is_current() -> None:
-    # The repo README is regenerated (the documented list from `_SPECS`,
-    # the undocumented list from each `bin/` tool's `--help`) and gated
-    # for drift. No pandoc, but it does run each undocumented tool's
-    # `--help`.
+    # The repo README is regenerated (the documented list from the
+    # discovered specs, the undocumented list from each `bin/` tool's
+    # `--help`) and gated for drift. No pandoc, but it does run each
+    # undocumented tool's `--help`.
     readme = REPO_ROOT / "README.md"
     assert readme.read_text() == render_docs.build_readme()
 
@@ -89,7 +84,7 @@ def test_gfm_has_single_title_and_demoted_sections() -> None:
     # <summary>` title (the man NAME line, with no separate NAME section)
     # -- with every man section demoted under it, so it reads as one
     # GitHub document rather than a run of sibling H1s.
-    spec = render_docs.ManSpec(
+    spec = ManSpec(
         prog="demo",
         section=1,
         build_parser=argparse.ArgumentParser,
@@ -104,20 +99,19 @@ def test_gfm_has_single_title_and_demoted_sections() -> None:
     assert "## DESCRIPTION" in gfm
 
 
-def test_extra_sections_render_between_description_and_common_args() -> None:
-    # `extra_sections` are top-level prose sections placed after
-    # DESCRIPTION and before COMMON ARGUMENTS, in order.
-    spec = render_docs.ManSpec(
+def test_prose_sections_render_between_description_and_subcommands() -> None:
+    # `prose_sections` are top-level prose sections placed after
+    # DESCRIPTION and before SUBCOMMANDS, in order.
+    spec = ManSpec(
         prog="demo",
         section=1,
         build_parser=argparse.ArgumentParser,
         name_description="demo tool",
         description="Demo overview.",
-        extra_sections=[
+        prose_sections=[
             ("GETTING STARTED", "Start here."),
             ("NOTES", "A note."),
         ],
-        common_args=[("`-x`", "an option")],
     )
     md = render_docs.build_markdown(spec)
     assert "Start here." in md and "A note." in md
@@ -125,14 +119,47 @@ def test_extra_sections_render_between_description_and_common_args() -> None:
         md.index("# DESCRIPTION")
         < md.index("# GETTING STARTED")
         < md.index("# NOTES")
-        < md.index("# COMMON ARGUMENTS")
+        < md.index("# SUBCOMMANDS")
     )
+
+
+def test_common_arguments_uses_each_arg_extended_help() -> None:
+    # COMMON ARGUMENTS is driven by the `common=True` tag: a tagged
+    # argument is hoisted there once, shown with its extended help (not
+    # the terse `help=`) and dropped from each subcommand.
+    def build_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        subs = parser.add_subparsers()
+        for name in ("first", "second"):
+            sub = subs.add_parser(name, help=f"The {name} subcommand.")
+            add_argument_ext(
+                sub,
+                "--scope",
+                action="store_true",
+                common=True,
+                help="terse scope help",
+                extended_help="The extended scope description.",
+            )
+        return parser
+
+    spec = ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=build_parser,
+        name_description="demo tool",
+    )
+    md = render_docs.build_markdown(spec)
+    assert "The extended scope description." in md
+    assert "terse scope help" not in md
+    # Hoisted once into COMMON ARGUMENTS, not repeated under a subcommand.
+    assert md.count("`--scope`") == 1
+    assert md.index("# COMMON ARGUMENTS") < md.index("# SUBCOMMANDS")
 
 
 def test_files_section_renders_before_exit_status() -> None:
     # A `files` list renders as a FILES section positioned just above
     # EXIT STATUS, in both the roff-Markdown and the GFM rendering.
-    spec = render_docs.ManSpec(
+    spec = ManSpec(
         prog="demo",
         section=1,
         build_parser=argparse.ArgumentParser,

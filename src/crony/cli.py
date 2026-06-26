@@ -27,8 +27,9 @@ import crony.errors
 import crony.model
 import crony.runner
 import crony.runtime
-from common.argparse_ext import StrictArgumentParser
+from common.argparse_ext import StrictArgumentParser, add_argument_ext
 from common.cli import cli_entrypoint
+from common.docspec import ManSpec
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -48,7 +49,7 @@ if hasattr(signal, "SIGPIPE"):
 # concise summary only -- per-subcommand and per-column detail lives in
 # each subcommand's own `--help`.
 
-_OVERVIEW: str = """\
+_DESCRIPTION: str = """\
 Crony is a multi-platform user-level scheduled-job manager. It supports
 jobs on macOS/darwin (via launchd) and linux (via systemd). It reads one
 or more TOML config bundles and can deploy the corresponding platform
@@ -155,10 +156,12 @@ def _add_bundle_argument(container: argparse._ActionsContainer) -> None:
     -- identically wherever it appears. The lead fits both the name-scoping
     verbs and the bundle-selecting ones (e.g. `config init`); the
     name-resolution clause is conditional on the subcommand taking names."""
-    container.add_argument(
+    add_argument_ext(
+        container,
         "-b",
         "--bundle",
         default=None,
+        common=True,
         help=(
             "Operate on config bundle BUNDLE. Where the subcommand takes "
             "names, bare names resolve within BUNDLE and a qualified name "
@@ -172,11 +175,20 @@ def _add_jobs_argument(parser: argparse.ArgumentParser) -> None:
     `job` in usage) to `parser`. Every name-taking verb operates on both
     jobs and groups, so the unified help lives here and can't drift between
     subcommands."""
-    parser.add_argument(
+    add_argument_ext(
+        parser,
         "jobs",
         nargs="*",
         metavar="job",
         help="Job/group names.",
+        common=True,
+        extended_help=(
+            "A job (or group) identity: the full namespaced name "
+            "`<bundle>.<name>`, or the `<bundle>:<uuid>` form for an entry "
+            "with no recoverable name. A bare `name` is shorthand for "
+            "`default.<name>`. Subcommands that accept more than one take a "
+            "space-separated list (shown as `[job ...]`)."
+        ),
     )
 
 
@@ -185,10 +197,12 @@ def _add_all_argument(parser: argparse.ArgumentParser) -> None:
     the `all` builtin) so the flag is wired -- and its help reads --
     identically wherever it appears. A name-taking verb requires it
     before acting on every entry instead of an explicit name list."""
-    parser.add_argument(
+    add_argument_ext(
+        parser,
         "--all",
         dest="all_jobs",
         action="store_true",
+        common=True,
         help=(
             "Act on every entry instead of an explicit name list. "
             "Scope to one bundle with -b/--bundle."
@@ -298,7 +312,7 @@ def _build_parser() -> StrictArgumentParser:
         ),
         epilog=(
             f"{exit_status}\n\n"
-            f"Description:\n{textwrap.indent(_OVERVIEW, '  ')}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
             f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}\n\n"
             f"Platform Specifics:\n{textwrap.indent(_PLATFORM_SPECIFICS, '  ')}"
         ),
@@ -699,3 +713,30 @@ def cli() -> int:
         logger.error("ERROR: %s", e)
         return e.exit_code
     return crony.errors.ExitCode.SUCCESS
+
+
+# Reference-doc spec discovered by scripts/render-docs. The prose lives
+# in the overview constants and the status-column reference above / in
+# crony.commands; this just assembles them.
+_INTERNAL_EXIT_CODES = {c.value for c in crony.errors.INTERNAL_EXIT_CODES}
+MAN_SPEC = ManSpec(
+    prog="crony",
+    section=1,
+    build_parser=_build_parser,
+    name_description="user-level scheduled-job manager",
+    description=_DESCRIPTION,
+    prose_sections=[
+        ("GETTING STARTED", _GETTING_STARTED),
+        ("PLATFORM SPECIFICS", _PLATFORM_SPECIFICS),
+    ],
+    reference_title="STATUS COLUMNS",
+    reference_sections=[
+        (s.title, s.lead, s.items)
+        for s in crony.commands.status_reference_sections()
+    ],
+    exit_status=[
+        (str(value), description)
+        for value, description in crony.errors.ExitCode.entries()
+        if value not in _INTERNAL_EXIT_CODES
+    ],
+)

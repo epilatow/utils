@@ -18,6 +18,48 @@ from typing import TYPE_CHECKING, Any, cast
 
 ValidateCallback = Callable[[argparse.ArgumentParser, argparse.Namespace], None]
 
+# Attributes stashed on an Action for the doc renderer to read.
+_EXTENDED_HELP_ATTR = "_extended_help"
+_COMMON_ATTR = "_doc_common"
+
+
+def add_argument_ext(
+    container: argparse._ActionsContainer,
+    *args: Any,
+    extended_help: str | None = None,
+    common: bool = False,
+    **kwargs: Any,
+) -> argparse.Action:
+    """``container.add_argument`` plus doc-renderer metadata.
+
+    argparse's own ``--help`` shows the terse ``help=``; the doc renderer
+    reads ``extended_help`` (via ``get_extended_help``) for a richer
+    description, and ``common=True`` (via ``is_common``) to hoist an
+    argument shared across subcommands into a single COMMON ARGUMENTS
+    section. Both let the documentation live next to the argument instead
+    of in the renderer.
+    """
+    action = container.add_argument(*args, **kwargs)
+    if extended_help is not None:
+        setattr(action, _EXTENDED_HELP_ATTR, extended_help)
+    if common:
+        setattr(action, _COMMON_ATTR, True)
+    return action
+
+
+def get_extended_help(action: argparse.Action) -> str | None:
+    """The extended help stashed by ``add_argument_ext``, or None."""
+    value = getattr(action, _EXTENDED_HELP_ATTR, None)
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def is_common(action: argparse.Action) -> bool:
+    """Whether the argument was tagged ``common=True`` (documented once
+    under COMMON ARGUMENTS rather than per subcommand)."""
+    return getattr(action, _COMMON_ATTR, False) is True
+
+
 if TYPE_CHECKING:
     SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
 else:

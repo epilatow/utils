@@ -21,6 +21,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from common.argparse_ext import (  # noqa: E402
     StrictArgumentParser,
     StrictSubParsersAction,
+    add_argument_ext,
+    get_extended_help,
+    is_common,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -163,6 +166,35 @@ class TestValidateHook:
         p = self._parser()
         args = p.parse_command(["cmd"])
         assert not hasattr(args, "_validate")
+
+
+class TestAddArgumentExt:
+    """`add_argument_ext` stashes doc-renderer metadata on the action;
+    plain `add_argument` leaves the defaults."""
+
+    def test_extended_help_and_common_round_trip(self) -> None:
+        action = add_argument_ext(
+            argparse.ArgumentParser(),
+            "--foo",
+            action="store_true",
+            common=True,
+            help="terse",
+            extended_help="The longer description.",
+        )
+        assert get_extended_help(action) == "The longer description."
+        assert is_common(action) is True
+        # argparse still sees only the terse help.
+        assert action.help == "terse"
+
+    def test_defaults_when_unset(self) -> None:
+        action = add_argument_ext(argparse.ArgumentParser(), "--foo")
+        assert get_extended_help(action) is None
+        assert is_common(action) is False
+
+    def test_plain_add_argument_has_no_metadata(self) -> None:
+        action = argparse.ArgumentParser().add_argument("--foo")
+        assert get_extended_help(action) is None
+        assert is_common(action) is False
 
 
 if __name__ == "__main__":

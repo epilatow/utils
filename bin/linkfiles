@@ -28,8 +28,12 @@ from typing import Self
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    StrictArgumentParser,
+    add_argument_ext,
+)
 from common.cli import cli_entrypoint  # noqa: E402
+from common.docspec import ManSpec  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # =============================================================================
@@ -1509,9 +1513,9 @@ def _validate_remove(
 
 
 # The Description and Getting Started text appended to the `--help`
-# epilog. _OVERVIEW's first paragraph is written to stand alone so it can
+# epilog. _DESCRIPTION's first paragraph is written to stand alone so it can
 # serve as a one-line summary of the tool on its own.
-_OVERVIEW = """\
+_DESCRIPTION = """\
 linkfiles symlinks the contents of a source directory tree into a target
 directory, recreating the tree there. Installations are tracked, so later
 runs can add new links, audit existing ones, and clean up dangling links.
@@ -1539,6 +1543,33 @@ updated run:
     linkfiles install"""
 
 
+def _add_dry_run_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared `--dry-run` flag, so it is wired -- and its help
+    reads -- identically wherever it appears, and documented once under
+    COMMON ARGUMENTS."""
+    add_argument_ext(
+        parser,
+        "--dry-run",
+        action="store_true",
+        common=True,
+        help="Show what would be done without making changes.",
+    )
+
+
+def _add_verbose_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared `-v/--verbose` flag, so it is wired -- and its help
+    reads -- identically wherever it appears, and documented once under
+    COMMON ARGUMENTS."""
+    add_argument_ext(
+        parser,
+        "-v",
+        "--verbose",
+        action="store_true",
+        common=True,
+        help="Print every entry; default suppresses ok lines.",
+    )
+
+
 def build_parser() -> StrictArgumentParser:
     """
     Build and return the argument parser.
@@ -1551,7 +1582,7 @@ def build_parser() -> StrictArgumentParser:
         description=LINKFILES_DESCRIPTION,
         epilog=(
             f"{ExitCode.epilog()}\n\n"
-            f"Description:\n{textwrap.indent(_OVERVIEW, '  ')}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
             f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1576,23 +1607,14 @@ def build_parser() -> StrictArgumentParser:
             "all previously installed directories."
         ),
     )
-    install_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes.",
-    )
+    _add_dry_run_argument(install_parser)
     install_parser.add_argument(
         "-f",
         "--force",
         action="store_true",
         help="Replace conflicting symlinks (not files).",
     )
-    install_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print every entry; default suppresses ok lines.",
-    )
+    _add_verbose_argument(install_parser)
     install_parser.add_argument(
         "--dotfiles",
         action="store_true",
@@ -1633,17 +1655,8 @@ def build_parser() -> StrictArgumentParser:
         action="store_true",
         help="Remove every tracked install (instead of one source/target).",
     )
-    remove_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes.",
-    )
-    remove_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print every entry; default suppresses ok lines.",
-    )
+    _add_dry_run_argument(remove_parser)
+    _add_verbose_argument(remove_parser)
     remove_parser.add_argument(
         "source_dir",
         type=Path,
@@ -1666,12 +1679,7 @@ def build_parser() -> StrictArgumentParser:
             "conflicts, missing entries, or stale managed links."
         ),
     )
-    audit_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print every entry; default suppresses ok lines.",
-    )
+    _add_verbose_argument(audit_parser)
 
     return parser
 
@@ -1703,6 +1711,37 @@ def cli() -> int:
     # / audit return WARNING when a tracked source has gone missing);
     # otherwise the command succeeded.
     return result if isinstance(result, ExitCode) else ExitCode.SUCCESS
+
+
+# Reference-doc spec discovered by scripts/render-docs.
+MAN_SPEC = ManSpec(
+    prog="linkfiles",
+    section=1,
+    build_parser=build_parser,
+    name_description="symlink a source directory's contents into a target",
+    description=_DESCRIPTION,
+    prose_sections=[("GETTING STARTED", _GETTING_STARTED)],
+    files=[
+        (
+            "~/.linkfiles.installed",
+            "Tracks installed directory pairs (source + target) and "
+            "installation options.",
+        ),
+        (
+            "~/.linkfiles.linked",
+            "Tracks installed links (source + target pairs).",
+        ),
+        (
+            "$REPO/.linkfiles.ignore",
+            "A file containing gitignore style patterns used to "
+            "specify repo files that should be ignored by linkfiles. "
+            "Used when source_dir is $REPO or a child of $REPO.",
+        ),
+    ],
+    exit_status=[
+        (str(value), description) for value, description in ExitCode.entries()
+    ],
+)
 
 
 if __name__ == "__main__":
