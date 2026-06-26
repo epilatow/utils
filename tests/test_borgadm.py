@@ -1314,23 +1314,40 @@ class TestAutomate:
         "check-full",
     ]
 
-    @pytest.fixture
-    def automate_env(
-        self, tmp_path: Path, monkeypatch: Any
+    @staticmethod
+    @contextlib.contextmanager
+    def _automate_ctx(
+        system: str, tmp_path: Path, monkeypatch: Any
     ) -> Iterator[tuple[Path, Any]]:
-        """Darwin + a temp crony drop-in dir + mocked run_cmd (so crony
-        is never really invoked).
+        """A given platform + a temp crony drop-in dir + mocked run_cmd
+        (so crony is never really invoked).
         """
         dropin = tmp_path / "crony-config"
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
         with (
-            patch.object(ba.platform, "system", return_value="Darwin"),
+            patch.object(ba.platform, "system", return_value=system),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
         ):
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="", stderr=""
             )
             yield dropin, mock_run
+
+    @pytest.fixture
+    def automate_env(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> Iterator[tuple[Path, Any]]:
+        """Darwin automate environment (see _automate_ctx)."""
+        with self._automate_ctx("Darwin", tmp_path, monkeypatch) as env:
+            yield env
+
+    @pytest.fixture
+    def automate_env_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> Iterator[tuple[Path, Any]]:
+        """Linux automate environment (see _automate_ctx)."""
+        with self._automate_ctx("Linux", tmp_path, monkeypatch) as env:
+            yield env
 
     @staticmethod
     def _crony_calls(mock_run: Any) -> list[list[str]]:
@@ -1404,10 +1421,55 @@ class TestAutomate:
         assert ["status", "-b", "borgadm"] not in self._crony_calls(mock_run)
         assert any("not enabled" in r.message for r in caplog.records)
 
-    def test_enable_requires_darwin(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
-        with pytest.raises(ba.BorgadmError, match="only supported on osx"):
-            ba.do_automate_enable()
+    def test_enable_on_linux_omits_full_disk_access(
+        self, automate_env_linux: Any
+    ) -> None:
+        # automate is cross-platform: on Linux enable still writes the
+        # bundle and applies it, but the create job carries no
+        # full-disk-access flag (a user systemd job already has the
+        # access, so no Crony.app grant is needed).
+        dropin, mock_run = automate_env_linux
+        ba.do_automate_enable()
+        bundle = dropin / "borgadm.toml"
+        assert bundle.exists()
+        assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
+        doc = tomllib.loads(bundle.read_text())
+        assert "flags" not in doc["job"]["create"]
+
+    @pytest.mark.parametrize(
+        ("system", "expect_flag"),
+        [("Darwin", True), ("Linux", False)],
+    )
+    def test_create_full_disk_access_gated_on_macos(
+        self, system: str, expect_flag: bool, monkeypatch: Any
+    ) -> None:
+        # The create job reads protected user files, but only macOS gates
+        # that behind Full Disk Access, so the full-disk-access flag is
+        # rendered on Darwin and omitted everywhere else.
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
+        doc = tomllib.loads(ba._render_crony_bundle())
+        if expect_flag:
+            assert doc["job"]["create"]["flags"] == ["full-disk-access"]
+        else:
+            assert "flags" not in doc["job"]["create"]
+
+    @pytest.mark.parametrize(
+        ("system", "expect_dialog"),
+        [("Darwin", True), ("Linux", False)],
+    )
+    def test_dialog_popup_default_gated_on_macos(
+        self, system: str, expect_dialog: bool, monkeypatch: Any
+    ) -> None:
+        # dialog-popup is a macOS desktop-dialog channel, undeliverable
+        # on Linux, so the bundle default notify-channels carry it only
+        # on Darwin; everywhere else the default is just ["default"].
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
+        doc = tomllib.loads(ba._render_crony_bundle())
+        channels = doc["defaults"]["notify-channels"]
+        if expect_dialog:
+            assert channels == ["default", "dialog-popup"]
+        else:
+            assert channels == ["default"]
 
     def test_deterministic_uuids(self) -> None:
         assert ba._crony_job_uuid("create") == ba._crony_job_uuid("create")
@@ -1416,7 +1478,10 @@ class TestAutomate:
         parsed = uuid.UUID(ba._crony_job_uuid("create"))
         assert str(parsed) == ba._crony_job_uuid("create")
 
-    def test_create_silenced_checks_inherit(self) -> None:
+    def test_create_silenced_checks_inherit(self, monkeypatch: Any) -> None:
+        # Pin to Darwin so the create job's macOS-only full-disk-access
+        # flag is present for the assertion below.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
         doc = tomllib.loads(ba._render_crony_bundle())
         # Bundle default: inherit the user's default channels AND pop a
         # desktop dialog on failure.
@@ -1476,10 +1541,11 @@ class TestAutomate:
 class TestLogFiles:
     """Test the log-files subcommand (crony-backed)."""
 
+    @pytest.mark.parametrize("system", ["Darwin", "Linux"])
     def test_shows_default_logfile_only_without_bundle(
-        self, monkeypatch: Any, caplog: Any
+        self, system: str, monkeypatch: Any, caplog: Any
     ) -> None:
-        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
         with patch.object(
             ba,
             "_crony_bundle_path",
@@ -1491,19 +1557,13 @@ class TestLogFiles:
         messages = [r.message for r in caplog.records]
         assert messages == [str(ba.LOGFILE)]
 
-    def test_no_crony_paths_off_darwin(
-        self, monkeypatch: Any, caplog: Any
-    ) -> None:
-        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
-        with caplog.at_level(logging.INFO):
-            ba.do_log_files()
-        messages = [r.message for r in caplog.records]
-        assert messages == [str(ba.LOGFILE)]
-
+    @pytest.mark.parametrize("system", ["Darwin", "Linux"])
     def test_shows_crony_log_paths_when_bundle_present(
-        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+        self, system: str, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
-        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
+        # Log paths resolve on any platform crony supports (the bundle is
+        # installed and crony is queried regardless of OS).
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
         bundle = tmp_path / "borgadm.toml"
         bundle.write_text("# stub\n")
         log_paths = {

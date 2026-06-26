@@ -155,8 +155,8 @@ gated by platform checks.
   the identical suite reliably in under a minute (borg is cross-platform, so
   coverage is the same). The macOS CI leg runs only the non-e2e suite -- which
   is where the macOS-specific code lives (the Crony.app C wrapper, the
-  crony-backed `automate` subcommand) -- so a local `--e2e` run is the way to
-  exercise the e2e suite on macOS.
+  `automate` subcommand's macOS-only Full Disk Access path) -- so a local
+  `--e2e` run is the way to exercise the e2e suite on macOS.
 - `tests/linux-docker-test.sh` reproduces the CI Linux leg from a non-Linux
   host: it runs the full suite (extra args pass through to `run_all.py`, e.g.
   `--e2e`) in a throwaway Linux container. It is a manual tool -- `run_all.py`
