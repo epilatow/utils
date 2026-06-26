@@ -38,6 +38,16 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   via the `trigger` subcommand). Crony supports the following notification
   mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
   macOS/darwin).
+- **[darwin-tz-watchdog](docs/darwin-tz-watchdog.md)**\
+  darwin-tz-watchdog restarts macOS UserEventAgent-Aqua when its cached
+  timezone has gone stale. UserEventAgent-Aqua dispatches user-level launchd
+  StartCalendarInterval triggers, but it reads the timezone once at startup
+  and never re-reads it when /etc/localtime changes. After a timezone switch
+  (e.g. travel) calendar-interval jobs keep firing against the stale cached
+  zone -- a job set for 02:30 local fires at 02:30 in the previously cached
+  zone, potentially hours off -- until the agent is restarted. This watchdog
+  detects that condition and restarts the agent so it picks up the current
+  zone.
 - **[firefox-cookies](docs/firefox-cookies.md)**\
   firefox-cookies extracts cookies from a Firefox profile and writes them to
   stdout in Netscape or JSON format. It reads both the on-disk cookie database
@@ -57,9 +67,6 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
 
 - **borgadm**\
   Borg backup manager
-- **darwin-tz-watchdog**\
-  Restart macOS UserEventAgent-Aqua when its cached timezone is stale relative
-  to /etc/localtime.
 - **secure-archiver**\
   Generate 7z encrypted archives containing files and 1Password data that are
   encrypted using passwords stored in 1Password

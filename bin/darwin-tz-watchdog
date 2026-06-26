@@ -43,12 +43,16 @@ import platform as platform  # noqa: PLC0414  re-exported for tests
 import signal as signal  # noqa: PLC0414  re-exported for tests
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import DefaultsHelpFormatter  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    RawDescriptionDefaultsHelpFormatter,
+)
 from common.cli import cli_entrypoint  # noqa: E402
+from common.docspec import ManSpec, TextSection  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # Configure logging to stderr so notification output (decision /
@@ -253,14 +257,71 @@ def check_and_restart(*, dry_run: bool, verbose: bool) -> int:
 # CLI
 # =============================================================================
 
+# The overview shown in `--help` (appended to the epilog) and rendered as
+# the DESCRIPTION of the generated man page / GFM doc via MAN_SPEC.
+# _DESCRIPTION's first paragraph stands alone so it can also serve as the
+# tool's one-line blurb in the repo README.
+_DESCRIPTION = """\
+darwin-tz-watchdog restarts macOS UserEventAgent-Aqua when its cached
+timezone has gone stale. UserEventAgent-Aqua dispatches user-level launchd
+StartCalendarInterval triggers, but it reads the timezone once at startup
+and never re-reads it when /etc/localtime changes. After a timezone switch
+(e.g. travel) calendar-interval jobs keep firing against the stale cached
+zone -- a job set for 02:30 local fires at 02:30 in the previously cached
+zone, potentially hours off -- until the agent is restarted. This watchdog
+detects that condition and restarts the agent so it picks up the current
+zone.
+
+It compares the mtime of the /etc/localtime symlink (bumped whenever the
+system timezone changes) against UserEventAgent-Aqua's start time; if the
+timezone link is newer the agent is stale and is restarted by signaling
+the process this user owns, which launchd then respawns against the
+current zone. With nothing stale to act on it exits silently, so it is
+cheap to run periodically from a scheduler. Use --dry-run to report what
+would happen without touching the agent, and -v to print the decision
+inputs (pid, times, staleness)."""
+
+_GETTING_STARTED = """\
+Schedule darwin-tz-watchdog with crony(1) so it runs automatically --
+e.g. a daily, darwin-only job:
+
+    mkdir -p ~/.config/crony/config/
+    cat > ~/.config/crony/config/darwin-tz-watchdog.toml <<-EOF
+    [defaults]
+    notify-channels = ["default"]
+
+    [job.doit]
+    command   = "darwin-tz-watchdog"
+    env.PATH  = "\\$PATH:\\$HOME/.local/bin"
+    interval = "1d"
+    platforms = ["darwin"]
+    uuid = "$(crony config generate-uuid)"
+    EOF
+    crony apply -b darwin-tz-watchdog
+"""
+
+
+_PLATFORM_SPECIFICS = """\
+darwin-tz-watchdog targets a macOS-only bug, so it does real work only on
+macOS/darwin. On every other platform it still parses its arguments (so
+--help behaves identically everywhere) and then exits successfully without
+doing anything, which lets a cross-platform scheduler invoke it
+unconditionally."""
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="darwin-tz-watchdog",
         description=(
-            "Restart macOS UserEventAgent-Aqua when its cached "
+            "Restart macOS UserEventAgent-Aqua when its cached\n"
             "timezone is stale relative to /etc/localtime."
         ),
-        formatter_class=DefaultsHelpFormatter,
+        epilog=(
+            f"{ExitCode.epilog()}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
+            f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
+        ),
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     parser.add_argument(
         "-v",
@@ -271,7 +332,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help=("Report what would happen without signaling the agent."),
+        help="Report what would happen without signaling the agent.",
     )
     return parser
 
@@ -279,9 +340,8 @@ def _build_parser() -> argparse.ArgumentParser:
 @cli_entrypoint
 def main(argv: list[str] | None = None) -> int:
     # Parse first so --help/-h and argument validation behave
-    # identically on every platform (the tool's one-line blurb in the
-    # repo README is generated from its --help, which must render the
-    # same off darwin). On non-darwin the watchdog then no-ops -- there
+    # identically on every platform, before the non-darwin no-op
+    # short-circuit. On non-darwin the watchdog then no-ops -- there
     # is nothing to restart -- so a cross-platform scheduler can still
     # invoke it unconditionally.
     args = _build_parser().parse_args(argv)
@@ -295,6 +355,22 @@ def main(argv: list[str] | None = None) -> int:
     except WatchdogError as exc:
         logger.error("tz-agent-watchdog: %s", exc)
         return ExitCode.ERROR
+
+
+MAN_SPEC = ManSpec(
+    prog="darwin-tz-watchdog",
+    section=1,
+    build_parser=_build_parser,
+    name_description=("restart macOS UserEventAgent-Aqua on a stale timezone"),
+    description=_DESCRIPTION,
+    pre_sections=[
+        TextSection("GETTING STARTED", _GETTING_STARTED),
+        TextSection("PLATFORM SPECIFICS", _PLATFORM_SPECIFICS),
+    ],
+    exit_status=[
+        (str(value), description) for value, description in ExitCode.entries()
+    ],
+)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,12 @@ each into a roff man page and a GFM doc. The spec carries only the
 per-utility bits the argparse parser doesn't: the NAME one-liner, the
 DESCRIPTION overview, the EXIT STATUS table, and a list of free-form
 sections to place before and after the auto-derived COMMON ARGUMENTS /
-SUBCOMMANDS listing. Each free-form section picks its rendered shape
-(prose, a definition list, or titled sub-lists). Everything derivable
-from the parser (the synopsis, the subcommand list, the arguments shared
-across subcommands) is left to the renderer so it can't drift from the
-CLI. Keeping the spec here -- importable, separate from the renderer --
+OPTIONS / SUBCOMMANDS listing. Each free-form section picks its
+rendered shape (prose, a definition list, or titled sub-lists).
+Everything derivable from the parser (the synopsis, a single-command
+tool's own options, the subcommand list, the arguments shared across
+subcommands) is left to the renderer so it can't drift from the CLI.
+Keeping the spec here -- importable, separate from the renderer --
 lets each utility own its documentation content while render-docs stays
 pure formatting.
 """
@@ -74,10 +75,12 @@ class ManSpec:
     # DESCRIPTION body; falls back to the parser's own `description`.
     description: str = ""
     # Free-form sections placed after DESCRIPTION and before the derived
-    # COMMON ARGUMENTS / SUBCOMMANDS listing (e.g. GETTING STARTED).
+    # COMMON ARGUMENTS / OPTIONS / SUBCOMMANDS listing (e.g. GETTING
+    # STARTED).
     pre_sections: list[Section] = field(default_factory=list)
-    # Free-form sections placed after SUBCOMMANDS and before EXIT STATUS
-    # (e.g. crony's STATUS COLUMNS, a FILES list).
+    # Free-form sections placed after the derived OPTIONS / SUBCOMMANDS
+    # listing and before EXIT STATUS (e.g. crony's STATUS COLUMNS, a FILES
+    # list).
     post_sections: list[Section] = field(default_factory=list)
     # EXIT STATUS as `(code, description)` items, or [] to omit it.
     exit_status: list[tuple[str, str]] = field(default_factory=list)

@@ -51,6 +51,14 @@ from common.docspec import (  # noqa: E402
 _script_path = REPO_ROOT / "src" / "render_docs.py"
 
 
+def _parser_with_subcommand() -> argparse.ArgumentParser:
+    # A minimal subcommand parser so the SUBCOMMANDS section renders (it is
+    # emitted only when the parser actually has subcommands).
+    parser = argparse.ArgumentParser()
+    parser.add_subparsers().add_parser("go", help="Do the thing.")
+    return parser
+
+
 @pytest.mark.parametrize(
     "spec", render_docs._discover_specs(), ids=lambda s: s.prog
 )
@@ -128,7 +136,7 @@ def test_pre_sections_render_between_description_and_subcommands() -> None:
     spec = ManSpec(
         prog="demo",
         section=1,
-        build_parser=argparse.ArgumentParser,
+        build_parser=_parser_with_subcommand,
         name_description="demo tool",
         description="Demo overview.",
         pre_sections=[
@@ -207,6 +215,33 @@ def test_common_argument_default_appended_to_extended_help() -> None:
     assert "The output format. (default: netscape)" in md
 
 
+def test_single_command_tool_renders_options_and_omits_subcommands() -> None:
+    # A parser with its own options but no subcommands documents them under
+    # OPTIONS and emits no (empty) SUBCOMMANDS section.
+    def build_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "-v", "--verbose", action="store_true", help="Be loud."
+        )
+        return parser
+
+    spec = ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=build_parser,
+        name_description="demo tool",
+        description="Demo overview.",
+    )
+    md = render_docs.build_markdown(spec)
+    assert "# OPTIONS" in md
+    assert "`-v, --verbose`" in md and "Be loud." in md
+    assert "# SUBCOMMANDS" not in md
+    gfm = render_docs.build_gfm(spec)
+    assert "## OPTIONS" in gfm
+    assert "`-v, --verbose`" in gfm and "Be loud." in gfm
+    assert "## SUBCOMMANDS" not in gfm
+
+
 def test_items_post_section_renders_before_exit_status() -> None:
     # An ItemsSection in `post_sections` renders as a definition list
     # positioned after SUBCOMMANDS and before EXIT STATUS, in both the
@@ -214,7 +249,7 @@ def test_items_post_section_renders_before_exit_status() -> None:
     spec = ManSpec(
         prog="demo",
         section=1,
-        build_parser=argparse.ArgumentParser,
+        build_parser=_parser_with_subcommand,
         name_description="demo tool",
         description="Demo overview.",
         post_sections=[ItemsSection("FILES", [("~/.demorc", "The config.")])],

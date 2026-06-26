@@ -34,11 +34,14 @@ Each utility's `ManSpec` (see `common.docspec`) supplies the per-utility
 bits the parser doesn't carry: the NAME one-liner, the DESCRIPTION
 overview, extra prose sections, an optional reference section
 (structured `(label, description)` data, e.g. crony's status columns), a
-FILES list, and an EXIT STATUS table. Everything else -- SYNOPSIS, the
-SUBCOMMANDS list, and COMMON ARGUMENTS (the args shared across
-subcommands, detected from the parser and shown with each argument's
-extended help) -- is derived generically. A utility opts in by exposing
-a module-level `MAN_SPEC`; `_discover_specs` finds them, so adding one
+FILES list, and an EXIT STATUS table. Everything else is derived
+generically from the parser: SYNOPSIS; OPTIONS (a single-command tool's
+own options); for a subcommand tool, the SUBCOMMANDS list and COMMON
+ARGUMENTS (the args shared across subcommands, shown with each argument's
+extended help). A SUBCOMMANDS section is emitted only when the parser has
+subcommands, so a single-command tool documents its options under OPTIONS
+and omits SUBCOMMANDS entirely. A utility opts in by exposing a
+module-level `MAN_SPEC`; `_discover_specs` finds them, so adding one
 touches only that utility.
 
 It also generates the repo `README.md`: the authored preamble from
@@ -523,17 +526,26 @@ def build_markdown(spec: ManSpec) -> str:
             description = arg.extended_help or _md(arg.help)
             out += _definition(f"`{arg.invocation}`", description)
 
-    out += ["# SUBCOMMANDS", ""]
-    for sub, summary in subs:
-        path = sub.prog.removeprefix(f"{spec.prog} ")
-        # rstrip so a no-argument subcommand (empty signature) doesn't
-        # leave a trailing space after the bold name.
-        out += [f"**{path}** {_md(_signature(sub))}".rstrip(), ""]
-        out += [f":   {_md(summary)}", ""]
-        for invocation, opt_help in _options(sub):
-            if invocation in pruned:
-                continue
-            out += _definition(f"`{invocation}`", _md(opt_help), indent="    ")
+    own_options = _options(parser)
+    if own_options:
+        out += ["# OPTIONS", ""]
+        for invocation, opt_help in own_options:
+            out += _definition(f"`{invocation}`", _md(opt_help))
+
+    if subs:
+        out += ["# SUBCOMMANDS", ""]
+        for sub, summary in subs:
+            path = sub.prog.removeprefix(f"{spec.prog} ")
+            # rstrip so a no-argument subcommand (empty signature) doesn't
+            # leave a trailing space after the bold name.
+            out += [f"**{path}** {_md(_signature(sub))}".rstrip(), ""]
+            out += [f":   {_md(summary)}", ""]
+            for invocation, opt_help in _options(sub):
+                if invocation in pruned:
+                    continue
+                out += _definition(
+                    f"`{invocation}`", _md(opt_help), indent="    "
+                )
 
     for sec in spec.post_sections:
         out += _section_md(sec)
@@ -769,24 +781,34 @@ def build_gfm(spec: ManSpec) -> str:
         ]
         out.append("")
 
-    out += ["## SUBCOMMANDS", ""]
-    for sub, summary in subs:
-        path = sub.prog.removeprefix(f"{spec.prog} ")
-        # The command and its signature go in the one heading (so it reads
-        # once and still anchors in GitHub's outline), not a heading plus a
-        # repeated usage block. The heading is a code span so the command
-        # and its arguments render in the monospace font.
-        signature = f"{path} {_signature(sub)}".rstrip()
-        out += [f"### `{signature}`", ""]
-        out += [_gfm_inline(summary), ""]
-        own = [
-            (invocation, opt_help)
-            for invocation, opt_help in _options(sub)
-            if invocation not in pruned
+    own_options = _options(parser)
+    if own_options:
+        out += ["## OPTIONS", ""]
+        out += [
+            _gfm_item(invocation, opt_help)
+            for invocation, opt_help in own_options
         ]
-        if own:
-            out += [_gfm_item(inv, opt_help) for inv, opt_help in own]
-            out.append("")
+        out.append("")
+
+    if subs:
+        out += ["## SUBCOMMANDS", ""]
+        for sub, summary in subs:
+            path = sub.prog.removeprefix(f"{spec.prog} ")
+            # The command and its signature go in the one heading (so it
+            # reads once and still anchors in GitHub's outline), not a
+            # heading plus a repeated usage block. The heading is a code
+            # span so the command and its arguments render in monospace.
+            signature = f"{path} {_signature(sub)}".rstrip()
+            out += [f"### `{signature}`", ""]
+            out += [_gfm_inline(summary), ""]
+            own = [
+                (invocation, opt_help)
+                for invocation, opt_help in _options(sub)
+                if invocation not in pruned
+            ]
+            if own:
+                out += [_gfm_item(inv, opt_help) for inv, opt_help in own]
+                out.append("")
 
     for sec in spec.post_sections:
         out += _section_gfm(sec)
