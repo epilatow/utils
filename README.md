@@ -62,11 +62,15 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   While linkfiles can be used to link files from any source to any
   destination, its primary purpose is linking repository files into $HOME/ (as
   dotfiles) and $HOME/.local/.
+- **[secure-archiver](docs/secure-archiver.md)**\
+  secure-archiver builds 7z encrypted archives from a TOML config, bundling
+  local files and secrets fetched from 1Password into each archive and
+  encrypting it with a password read from 1Password. Each archive is
+  timestamped and paired with a plaintext readme describing how to open it,
+  and old revisions are pruned to a configurable count. The 1Password CLI
+  (`op`) and the 7-Zip CLI (`7zz`) must be on PATH.
 
 ## Undocumented utilities
 
 - **borgadm**\
   Borg backup manager
-- **secure-archiver**\
-  Generate 7z encrypted archives containing files and 1Password data that are
-  encrypted using passwords stored in 1Password

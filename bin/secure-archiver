@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ from common.argparse_ext import (  # noqa: E402
     StrictArgumentParser,
 )
 from common.cli import cli_entrypoint  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemsSection,
+    ManSpec,
+    TextSection,
+)
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # =============================================================================
@@ -1138,6 +1144,38 @@ def publish(
     return True
 
 
+# The DESCRIPTION and GETTING STARTED text, shown in `--help` (appended to
+# the exit-code epilog) and rendered into the man page / GFM doc via
+# MAN_SPEC. _DESCRIPTION's first paragraph is written to stand alone so it
+# can serve as the README blurb on its own.
+_DESCRIPTION = """\
+secure-archiver builds 7z encrypted archives from a TOML config, bundling
+local files and secrets fetched from 1Password into each archive and
+encrypting it with a password read from 1Password. Each archive is
+timestamped and paired with a plaintext readme describing how to open it,
+and old revisions are pruned to a configurable count. The 1Password CLI
+(`op`) and the 7-Zip CLI (`7zz`) must be on PATH.
+
+Each archive is defined by an [archive.NAME] section in the config (see the
+example config written by `write-example-config`). On every run it stages
+an archive's files into a temporary directory, computes a SHA256 manifest
+of the contents, and publishes a new revision only when the
+contents changed since the latest existing archive -- unless --force-update
+forces a write. All archives produced by a single run share one
+timestamp."""
+
+_GETTING_STARTED = """\
+To get started, write a sample config, edit it to point at your files and
+1Password references, then create archives from it:
+
+    secure-archiver write-example-config ./secure-archiver.toml
+    secure-archiver check-config --config ./secure-archiver.toml
+    secure-archiver create --config ./secure-archiver.toml
+
+When --config is omitted, secure-archiver looks for `secure-archiver.toml`
+in the current directory, then `~/.secure-archiver.toml`."""
+
+
 def build_parser() -> StrictArgumentParser:
     """
     Build and return the argument parser.
@@ -1158,7 +1196,11 @@ def build_parser() -> StrictArgumentParser:
             "Generate 7z encrypted archives containing files and 1Password\n"
             "data that are encrypted using passwords stored in 1Password"
         ),
-        epilog=ExitCode.epilog(),
+        epilog=(
+            f"{ExitCode.epilog()}\n\n"
+            f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
+            f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
+        ),
         formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     subparsers = parser.add_command_subparsers(
@@ -1167,7 +1209,14 @@ def build_parser() -> StrictArgumentParser:
 
     # Create subcommand
     create_parser = subparsers.add_parser(
-        "create", help="Create archives based on configuration"
+        "create",
+        help="Create archives based on configuration",
+        description=(
+            "Build the archives defined in the config, publishing a new "
+            "timestamped revision of each archive whose contents changed "
+            "(or all of them with --force-update) and pruning old "
+            "revisions."
+        ),
     )
     add_config(create_parser)
     create_parser.add_argument(
@@ -1185,6 +1234,10 @@ def build_parser() -> StrictArgumentParser:
     example_parser = subparsers.add_parser(
         "write-example-config",
         help="Write an example config file",
+        description=(
+            "Write a commented example config to output_file, which must "
+            "not already exist."
+        ),
     )
     example_parser.add_argument(
         "output_file",
@@ -1196,6 +1249,10 @@ def build_parser() -> StrictArgumentParser:
     check_parser = subparsers.add_parser(
         "check-config",
         help="Validate a config file",
+        description=(
+            "Load and validate the config file, reporting the resolved "
+            "path on success and the validation errors on failure."
+        ),
     )
     add_config(check_parser)
 
@@ -1309,6 +1366,37 @@ def cli() -> int:
         eprint(f"ERROR: {e}")
         return e.exit_code
     return ExitCode.SUCCESS
+
+
+# Reference-doc spec discovered by scripts/render-docs.
+MAN_SPEC = ManSpec(
+    prog="secure-archiver",
+    section=1,
+    build_parser=build_parser,
+    name_description="build encrypted 7z archives keyed by 1Password passwords",
+    description=_DESCRIPTION,
+    pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
+    post_sections=[
+        ItemsSection(
+            "FILES",
+            [
+                (
+                    "./secure-archiver.toml",
+                    "Config file used when --config is omitted and present "
+                    "in the current directory.",
+                ),
+                (
+                    "~/.secure-archiver.toml",
+                    "Config file used when --config is omitted and no "
+                    "secure-archiver.toml exists in the current directory.",
+                ),
+            ],
+        ),
+    ],
+    exit_status=[
+        (str(value), description) for value, description in ExitCode.entries()
+    ],
+)
 
 
 if __name__ == "__main__":
