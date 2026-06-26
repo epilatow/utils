@@ -1310,8 +1310,6 @@ def cli() -> int:
 
     try:
         COMMAND_CALLBACKS[command](**args_dict)
-    except KeyError:
-        raise UsageError(f"Unknown command '{command}'") from None
     except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
         return e.exit_code

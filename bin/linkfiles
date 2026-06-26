@@ -1486,8 +1486,6 @@ def cli() -> int:
 
     try:
         COMMAND_CALLBACKS[command](**args_dict)
-    except KeyError:
-        raise UsageError(f"Unknown command '{command}'") from None
     except LinkfilesError as e:
         logger.error("ERROR: %s", e)
         return e.exit_code
