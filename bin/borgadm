@@ -2210,7 +2210,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=HelpFormatter,
         epilog=ExitCode.epilog(),
     )
-    subparsers = parser.add_command_subparsers()
+    subparsers = parser.add_command_subparsers(metavar="<command>")
 
     # Always set formatter_class so that we display default values.
     def add_parser(name: str, **kwargs: Any) -> StrictArgumentParser:
@@ -2272,7 +2272,7 @@ def args_parser() -> StrictArgumentParser:
         "automate",
         help="Enable/Disable automated backups and checks",
     )
-    automate_subparsers = automate.add_command_subparsers()
+    automate_subparsers = automate.add_command_subparsers(metavar="<command>")
     automate_subparsers.add_parser(
         "enable",
         help="Enable automated backup creation and checks",
@@ -2292,7 +2292,7 @@ def args_parser() -> StrictArgumentParser:
     add_parser("break-lock", help="Break repo lock")
 
     check = add_parser("check", help="Run backup checks")
-    check_subparsers = check.add_command_subparsers()
+    check_subparsers = check.add_command_subparsers(metavar="<command>")
 
     check_age = check_subparsers.add_parser(
         "age",
@@ -2434,7 +2434,7 @@ def args_parser() -> StrictArgumentParser:
         "repair",
         help="Repair operations for the borg repository",
     )
-    repair_subparsers = repair.add_command_subparsers()
+    repair_subparsers = repair.add_command_subparsers(metavar="<command>")
     repair_subparsers.add_parser(
         "delete-cache",
         help="Delete the local borg cache for the repository",

@@ -26,6 +26,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    HelpWidthBase,
     isolate_home,
 )
 
@@ -1048,6 +1049,11 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         lf.ExitCode.SUBPROCESS,
         lf.ExitCode.CRASHED,
     }
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "linkfiles"
+    PARSER_FUNC = staticmethod(lf.build_parser)
 
 
 if __name__ == "__main__":

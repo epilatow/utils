@@ -21,6 +21,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    HelpWidthBase,
     UnknownArgRoutedToSubparserBase,
 )
 
@@ -2146,6 +2147,11 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         sa.ExitCode.WARNING,
         sa.ExitCode.CRASHED,
     }
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "secure-archiver"
+    PARSER_FUNC = staticmethod(sa.build_parser)
 
 
 if __name__ == "__main__":

@@ -129,6 +129,15 @@ gated by platform checks.
   `README.md` blurb for any `bin/` utility (a documented one's comes from its
   DESCRIPTION, an undocumented one's from its `--help`) -- and commit them
   alongside the code.
+- `--help` width gate: every utility's `--help` (and every subcommand's) must
+  fit 78 columns when rendered at an 80-column terminal. A utility opts in by
+  subclassing `conftest.HelpWidthBase`, setting `PROG` (the command name) and
+  `PARSER_FUNC` (its parser factory); the base walks the parser tree and
+  asserts the width. Text argparse copies verbatim -- a long `description=`,
+  `RawDescriptionHelpFormatter` epilog prose, or a wide subparser choices
+  metavar -- is what typically overflows; wrap such prose narrower (so a
+  2-space epilog indent still fits) or give a many-subcommand parser a
+  `metavar`.
 - Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
   subprocess the script under test (currently just the borgadm suite under
   `tests/test_borgadm.py`). They are slow (tens of minutes serially) and are

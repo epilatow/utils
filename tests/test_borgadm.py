@@ -37,6 +37,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    HelpWidthBase,
     UnknownArgRoutedToSubparserBase,
 )
 
@@ -4034,6 +4035,11 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         ba.ExitCode.USAGE,
         ba.ExitCode.CRASHED,
     }
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "borgadm"
+    PARSER_FUNC = staticmethod(ba.args_parser)
 
 
 if __name__ == "__main__":

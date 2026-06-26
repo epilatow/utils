@@ -3,7 +3,7 @@
 ## SYNOPSIS
 
 ```text
-firefox-cookies {list,list-domains,list-profiles,list-containers} ...
+firefox-cookies <command> ...
 ```
 
 ## DESCRIPTION

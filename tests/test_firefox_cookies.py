@@ -25,6 +25,7 @@ import pytest
 from conftest import (
     CmdCallbacksBase,
     ExceptionHierarchyBase,
+    HelpWidthBase,
     UnknownArgRoutedToSubparserBase,
 )
 
@@ -2250,6 +2251,11 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         fc.ExitCode.SUBPROCESS,
         fc.ExitCode.CRASHED,
     }
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "firefox-cookies"
+    PARSER_FUNC = staticmethod(fc.build_parser)
 
 
 if __name__ == "__main__":

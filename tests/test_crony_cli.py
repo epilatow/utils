@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import (
     CmdCallbacksBase,
+    HelpWidthBase,
     SentinelHomeBase,
     UnknownArgRoutedToSubparserBase,
 )
@@ -344,6 +345,11 @@ class TestBrokenPipeHandler:
         assert handler.stream is not stream
         # And future emits should not raise.
         handler.emit(record)
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "crony"
+    PARSER_FUNC = staticmethod(crony_cli._build_parser)
 
 
 if __name__ == "__main__":

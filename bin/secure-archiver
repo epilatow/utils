@@ -1161,14 +1161,15 @@ def build_parser() -> StrictArgumentParser:
 
     parser = StrictArgumentParser(
         description=(
-            "Generate 7z encrypted archives containing files and "
-            "1Password data that are encrypted using passwords "
-            "stored in 1Password"
+            "Generate 7z encrypted archives containing files and 1Password\n"
+            "data that are encrypted using passwords stored in 1Password"
         ),
         epilog=ExitCode.epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_command_subparsers(help="Subcommands")
+    subparsers = parser.add_command_subparsers(
+        metavar="<command>", help="Subcommands"
+    )
 
     # Create subcommand
     create_parser = subparsers.add_parser(

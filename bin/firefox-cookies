@@ -1116,7 +1116,7 @@ def build_parser() -> StrictArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_command_subparsers()
+    subparsers = parser.add_command_subparsers(metavar="<command>")
 
     def add_profile_arg(
         p: argparse.ArgumentParser,

@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import create_autospec, patch
 
 import pytest
+from conftest import HelpWidthBase
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -386,6 +387,11 @@ def test_main_dispatches_args(
     monkeypatch.setattr(dtw, "check_and_restart", _capture)
     assert dtw.main(["--dry-run", "--verbose"]) == dtw.ExitCode.SUCCESS
     assert seen == {"dry_run": True, "verbose": True}
+
+
+class TestHelpWidth(HelpWidthBase):
+    PROG = "darwin-tz-watchdog"
+    PARSER_FUNC = staticmethod(dtw._build_parser)
 
 
 if __name__ == "__main__":

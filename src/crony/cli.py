@@ -95,21 +95,32 @@ their execution status) with `crony status`. To deploy configured jobs run
 status` will report that the job is `stale` and you can update the deployed
 configuration by running `crony apply` again. To see execution logs (file
 path, content, etc.) for a job use `crony logs`. To manually trigger a job
-run use `crony trigger`. To disable a job (without destroying it), use `crony
-disable` (you can subsequently re-enable it with `crony enable`). To remove
-deployed jobs run `crony destroy`. (Destroying jobs removes all previous job
-state: log files, last run information, etc.)\
+run use `crony trigger`. To disable a job (without destroying it), use
+`crony disable` (you can subsequently re-enable it with `crony enable`). To
+remove deployed jobs run `crony destroy`. (Destroying jobs removes all
+previous job state: log files, last run information, etc.)\
 """
 
 _PLATFORM_SPECIFICS: str = """\
 On systemd-based platforms, for scheduled jobs to execute when a user is not
-logged in, "linger" must be enabled. Enabling linger requires sudo access and
-can be done via the following command: `sudo loginctl enable-linger $USER`.
-The `crony status` and `crony config validate` commands will check if systemd
-linger is enabled, and if not will emit a warning asking the user to enable
-it. While linger is disabled, a scheduled job whose time arrives while the
-user is logged out will not run then; instead it runs immediately the next
-time the user logs in.\
+logged in, "linger" must be enabled. Enabling linger requires sudo access
+and can be done via the following command: `sudo loginctl enable-linger
+$USER`. The `crony status` and `crony config validate` commands will check
+if systemd linger is enabled, and if not will emit a warning asking the user
+to enable it. While linger is disabled, a scheduled job whose time arrives
+while the user is logged out will not run then; instead it runs immediately
+the next time the user logs in.\
+"""
+
+# The `crony status` overview. A module-level constant (rather than an inline
+# add_parser argument) so its lines clear the source margin while still
+# wrapping narrow enough to render verbatim in `crony status --help`.
+_STATUS_DESCRIPTION: str = """\
+Print resolved state per job. With no job arguments every job is shown;
+pass job names to restrict the table. Many columns are source-selected --
+they show the pending (config) value by default, or the applied value
+under --config-current -- and a trailing `^` on a value marks a divergence
+between the two.\
 """
 
 
@@ -307,8 +318,8 @@ def _build_parser() -> StrictArgumentParser:
     )
     parser = StrictArgumentParser(
         description=(
-            "User-level scheduled-job manager for macOS "
-            "(launchd LaunchAgents) and Linux (systemd user timers)."
+            "User-level scheduled-job manager for macOS (launchd\n"
+            "LaunchAgents) and Linux (systemd user timers)."
         ),
         epilog=(
             f"{exit_status}\n\n"
@@ -503,14 +514,7 @@ def _build_parser() -> StrictArgumentParser:
     p_status = subparsers.add_parser(
         "status",
         help="Print resolved state per job.",
-        description=(
-            "Print resolved state per job. With no job arguments every "
-            "job is shown; pass job names to restrict the table. Many "
-            "columns are source-selected -- they show the pending "
-            "(config) value by default, or the applied value under "
-            "--config-current -- and a trailing `^` on a value marks a "
-            "divergence between the two."
-        ),
+        description=_STATUS_DESCRIPTION,
         epilog=crony.commands.STATUS_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
