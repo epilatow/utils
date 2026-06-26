@@ -180,6 +180,22 @@ def _add_jobs_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_all_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared `--all` opt-in (dest `all_jobs`, to avoid shadowing
+    the `all` builtin) so the flag is wired -- and its help reads --
+    identically wherever it appears. A name-taking verb requires it
+    before acting on every entry instead of an explicit name list."""
+    parser.add_argument(
+        "--all",
+        dest="all_jobs",
+        action="store_true",
+        help=(
+            "Act on every entry instead of an explicit name list. "
+            "Scope to one bundle with -b/--bundle."
+        ),
+    )
+
+
 def _validate_config_init(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -196,32 +212,43 @@ def _validate_config_init(
 def _validate_destroy(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject `destroy --orphans` combined with positional names: the
-    orphan sweep and an explicit name list select different sets."""
-    if args.orphans and args.jobs:
-        parser.error("--orphans and positional names are mutually exclusive")
+    """Require exactly one target selector -- job names, `--all`, or
+    `--orphans` -- so a bare invocation can't silently wipe everything.
+    `--all` is consumed once validated (the handler infers the whole-set
+    sweep from an empty name list)."""
+    modes = sum([bool(args.jobs), args.all_jobs, args.orphans])
+    if modes == 0:
+        parser.error("specify job names, --all, or --orphans")
+    if modes > 1:
+        parser.error("job names, --all, and --orphans are mutually exclusive")
+    del args.all_jobs
 
 
-def _require_names_or_bundle(
+def _require_names_or_all(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     """Shared precondition for the bulk verbs (enable / disable /
-    trigger): require positional names or --bundle, so an unscoped
-    invocation can't silently act on every stamped entry."""
-    if not args.jobs and args.bundle is None:
-        parser.error("specify job names or --bundle")
+    trigger): require either positional names or `--all`, so an unscoped
+    invocation can't silently act on every stamped entry. `--all` may be
+    narrowed by `--bundle`; it is consumed once validated (the handler
+    infers the whole-set action from an empty name list)."""
+    if args.jobs and args.all_jobs:
+        parser.error("--all cannot be combined with job names")
+    if not args.jobs and not args.all_jobs:
+        parser.error("specify job names or --all")
+    del args.all_jobs
 
 
 def _validate_enable(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    _require_names_or_bundle(parser, args)
+    _require_names_or_all(parser, args)
 
 
 def _validate_disable(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    _require_names_or_bundle(parser, args)
+    _require_names_or_all(parser, args)
 
 
 def _validate_trigger(
@@ -232,7 +259,7 @@ def _validate_trigger(
             "--trigger-timeout requires --wait (only meaningful in "
             "synchronous mode)"
         )
-    _require_names_or_bundle(parser, args)
+    _require_names_or_all(parser, args)
 
 
 def _validate_notify_test(
@@ -374,12 +401,13 @@ def _build_parser() -> StrictArgumentParser:
         "destroy",
         help="Remove platform units.",
         description=(
-            "Remove platform units. With no job arguments this is a "
-            "factory reset; with names it surgically removes just those "
-            "entries."
+            "Remove platform units -- the platform unit files and the "
+            "entry's state dir both go away. Requires a target: job(s), "
+            "--all, or --orphans."
         ),
     )
     _add_jobs_argument(p_destroy)
+    _add_all_argument(p_destroy)
     p_destroy.add_argument(
         "--orphans",
         action="store_true",
@@ -387,7 +415,7 @@ def _build_parser() -> StrictArgumentParser:
             "Limit removal to entries with on-disk remnants "
             "that no config selects on this host. "
             "Combinable with -b/--bundle; mutually exclusive "
-            "with positional names."
+            "with positional names and --all."
         ),
     )
     _add_bundle_argument(p_destroy)
@@ -398,11 +426,12 @@ def _build_parser() -> StrictArgumentParser:
         "enable",
         help="Re-arm the named jobs' schedules.",
         description=(
-            "Re-arm the named jobs' schedules. Omit the job arguments "
-            "with --bundle to enable every stamped entry in that bundle."
+            "Re-arm the named jobs' schedules (clear the "
+            "operator-disable). Requires a target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_enable)
+    _add_all_argument(p_enable)
     _add_bundle_argument(p_enable)
     p_enable.add_validate_callback(_validate_enable)
 
@@ -411,12 +440,13 @@ def _build_parser() -> StrictArgumentParser:
         "disable",
         help="Disarm the named jobs' schedules (still triggerable).",
         description=(
-            "Disarm the named jobs' schedules (still triggerable). Omit "
-            "the job arguments with --bundle to disable every stamped "
-            "entry in that bundle."
+            "Disarm the named jobs' schedules: loaded and triggerable, "
+            "but not firing on their own. Requires a target: job(s) or "
+            "--all."
         ),
     )
     _add_jobs_argument(p_disable)
+    _add_all_argument(p_disable)
     _add_bundle_argument(p_disable)
     p_disable.add_validate_callback(_validate_disable)
 
@@ -425,12 +455,13 @@ def _build_parser() -> StrictArgumentParser:
         "trigger",
         help="Ask the platform scheduler to fire the named jobs now.",
         description=(
-            "Ask the platform scheduler to fire the named jobs now. "
-            "Omit the job arguments with --bundle to fire every stamped "
-            "entry in that bundle."
+            "Ask the platform scheduler to fire the named jobs now, via "
+            "the same path a scheduled fire uses. Requires a target: "
+            "job(s) or --all."
         ),
     )
     _add_jobs_argument(p_trigger)
+    _add_all_argument(p_trigger)
     _add_bundle_argument(p_trigger)
     p_trigger.add_argument(
         "-w",

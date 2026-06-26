@@ -1754,6 +1754,44 @@ class TestDestroy:
             )
         assert exc.value.code == 2
 
+    def test_bare_destroy_rejected(self) -> None:
+        # A bare destroy would factory-reset everything; the parser
+        # requires an explicit selector (exit 2) before dispatch.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(["destroy"])
+        assert exc.value.code == 2
+
+    def test_bundle_only_destroy_rejected(self) -> None:
+        # --bundle narrows the scope but isn't itself a selector; --all
+        # is still required to wipe the whole bundle.
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(["destroy", "-b", "x"])
+        assert exc.value.code == 2
+
+    def test_all_with_names_rejected(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(["destroy", "--all", "foo"])
+        assert exc.value.code == 2
+
+    def test_all_with_orphans_rejected(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(
+                ["destroy", "--all", "--orphans"]
+            )
+        assert exc.value.code == 2
+
+    def test_all_and_orphans_parse_and_consume_all(self) -> None:
+        # --all (optionally -b) and --orphans each parse on their own;
+        # the validator consumes --all so it never reaches the handler.
+        for argv in (
+            ["destroy", "--all"],
+            ["destroy", "--all", "-b", "x"],
+            ["destroy", "--orphans"],
+        ):
+            args = crony_cli._build_parser().parse_command(argv)
+            assert args.command == "destroy"
+            assert not hasattr(args, "all_jobs")
+
     def test_orphans_flag_leaves_active_entries_alone(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -2484,13 +2522,30 @@ class TestEnableDisable:
                 jobs=[], wait=False, trigger_timeout=None, bundle="ghost"
             )
 
-    def test_bundle_or_jobs_required(self) -> None:
-        # An unscoped bulk verb (no names, no --bundle) is rejected by
-        # the parser (exit 2) so it can't silently act on everything.
+    def test_names_or_all_required(self) -> None:
+        # An unscoped bulk verb (no names, no --all) is rejected by the
+        # parser (exit 2) so it can't silently act on everything --
+        # including with only --bundle, which narrows but doesn't select.
+        for verb in ("enable", "disable", "trigger"):
+            for argv in ([verb], [verb, "-b", "x"]):
+                with pytest.raises(SystemExit) as exc:
+                    crony_cli._build_parser().parse_command(argv)
+                assert exc.value.code == 2
+
+    def test_all_with_names_rejected(self) -> None:
         for verb in ("enable", "disable", "trigger"):
             with pytest.raises(SystemExit) as exc:
-                crony_cli._build_parser().parse_command([verb])
+                crony_cli._build_parser().parse_command([verb, "--all", "foo"])
             assert exc.value.code == 2
+
+    def test_all_parses_and_is_consumed(self) -> None:
+        # --all (optionally -b) parses; the validator consumes it so it
+        # never reaches the handler signature.
+        for verb in ("enable", "disable", "trigger"):
+            for argv in ([verb, "--all"], [verb, "--all", "-b", "x"]):
+                args = crony_cli._build_parser().parse_command(argv)
+                assert args.command == verb
+                assert not hasattr(args, "all_jobs")
 
     def test_enable_disable_bulk_includes_grouped_in_bundle(
         self, tmp_path: Path, monkeypatch: Any
@@ -2536,6 +2591,38 @@ class TestEnableDisable:
         assert disabled_flags() == {"a": False, "b": False, "g": False}
         assert (h.sysd / f"crony-{h.full('b')}.timer").exists()
         assert (h.sysd / f"crony-{h.full('g')}.timer").exists()
+
+    def test_bulk_without_bundle_acts_on_every_stamped_entry(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `--all` with no `--bundle` reaches the handler as empty names
+        # and a None bundle, which expands to every stamped entry rather
+        # than failing -- the unscoped whole-host action.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "schedule": "*-*-* 03:00"},
+                    "b": {"command": "true", "schedule": "*-*-* 04:00"},
+                },
+            },
+            default_target_jobs=["a", "b"],
+        )
+        h.apply("a")
+        h.apply("b")
+
+        def disabled_flags() -> dict[str, bool]:
+            config = crony_runtime.load_config()
+            out: dict[str, bool] = {}
+            for short in ("a", "b"):
+                ref = config.current.by_full_name[h.full(short)]
+                node = config.current.job_from_ref(ref)
+                assert node is not None
+                out[short] = node.unit_disabled
+            return out
+
+        crony_commands.do_disable(jobs=[], bundle=None)
+        assert disabled_flags() == {"a": True, "b": True}
 
     def test_trigger_bulk_includes_unscheduled_in_bundle(
         self, tmp_path: Path, monkeypatch: Any

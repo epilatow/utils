@@ -142,6 +142,9 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(crony_cli.cli)
     EXIT_CODE_USAGE = ExitCode.USAGE
     TEST_SUBCOMMAND = "status"
+    # destroy / enable / disable / trigger validators consume --all once
+    # checked, so it never reaches the handler signatures.
+    POPPED_ARGS = {"all_jobs"}
     EXCEPTION_EXIT_CODE_MAP = [
         (UsageError("t"), ExitCode.USAGE),
         (ConfigError("t"), ExitCode.CONFIG),

@@ -912,17 +912,17 @@ def do_destroy(
     """Remove platform units. Always a full wipe -- the platform
     unit files and the entry's state dir both go away.
 
-    No args: factory reset -- every crony-managed remnant on this
-    host. Discovery covers state dirs plus platform unit files.
+    With `--all`: factory reset -- every crony-managed remnant on
+    this host. Discovery covers state dirs plus platform unit files.
 
-    With `--bundle <name>` and no positional args: scope the reset
-    to that bundle's discovered names. Other bundles' remnants
-    stay intact.
+    With `--all` plus `--bundle <name>`: scope the reset to that
+    bundle's discovered names. Other bundles' remnants stay intact.
 
     With `--orphans`: limit removal to entries with on-disk
     remnants that no bundle's live config selects to install on
     this host. Combinable with `--bundle` (orphans within that
-    bundle namespace). Mutually exclusive with positional names.
+    bundle namespace). Mutually exclusive with positional names and
+    `--all`.
 
     With names: surgical removal by full namespaced name. Refuses
     if a name is in neither any bundle's config nor the
@@ -991,9 +991,9 @@ def do_destroy(
                 _reclaim_entity(config, entity, raise_on_lock=True)
             logger.info("%s: destroyed", full)
     else:
-        # A bare `destroy` factory-resets every crony-managed remnant;
-        # `--orphans` limits it to entities the live config no longer
-        # selects. Both go through the one reclamation `apply` shares.
+        # `--all` factory-resets every crony-managed remnant; `--orphans`
+        # limits it to entities the live config no longer selects. Both
+        # go through the one reclamation `apply` shares.
         _reclaim(config, bundle, only_unselected=orphans)
 
 
@@ -1087,16 +1087,17 @@ def _resolve_bulk_names(
     """Derive the operate-on name set for enable / disable / trigger.
 
     With positional `jobs`, normalize each via `resolve_cli_name`
-    (which honors `-b`'s bundle-scoping rules). With no positionals,
-    `bundle` is required and the set expands to that bundle's stamped
-    names -- every kind (scheduled, grouped, group container), since a
-    disable / enable / trigger applies to all of them.
+    (which honors `-b`'s bundle-scoping rules). With no positionals
+    (the `--all` path the parser requires), the set is every stamped
+    name -- every kind (scheduled, grouped, group container), since a
+    disable / enable / trigger applies to all of them -- narrowed to
+    `bundle` when one is given.
     """
     if jobs:
         return [crony.config.resolve_cli_name(arg, bundle) for arg in jobs]
-    # The enable / disable / trigger parsers require names or --bundle.
-    assert bundle is not None
-    return sorted(crony.config.bundle_prefix_filter(stamped, bundle))
+    if bundle is not None:
+        return sorted(crony.config.bundle_prefix_filter(stamped, bundle))
+    return sorted(stamped)
 
 
 def do_enable(jobs: list[str], bundle: str | None) -> None:
@@ -1115,9 +1116,10 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     dispatch skips it, so the operator-disable is meaningful even with
     no timer to disarm.
 
-    With `--bundle <name>` and no positional args, enables every
-    stamped entry in `<name>`. With `--bundle` plus positional args,
-    bare names resolve in `<name>` and qualified names must match it.
+    With `--all`, enables every stamped entry, narrowed to one bundle
+    when `--bundle <name>` is also given. With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified
+    names must match it.
     """
     config = crony.runtime.load_config()
     config.require_addressable(bundle)
@@ -1146,9 +1148,10 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     parent group's dispatch skip it, so the child stays installed but
     no longer runs as part of the group.
 
-    With `--bundle <name>` and no positional args, disables every
-    stamped entry in `<name>`. With `--bundle` plus positional args,
-    bare names resolve in `<name>` and qualified names must match it.
+    With `--all`, disables every stamped entry, narrowed to one bundle
+    when `--bundle <name>` is also given. With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified
+    names must match it.
     """
     config = crony.runtime.load_config()
     config.require_addressable(bundle)
@@ -1193,11 +1196,11 @@ def do_trigger(
     uuids in config vs on disk is rejected until `crony apply`.
     Refuses names not stamped on this host (run apply first).
 
-    With `--bundle <name>` and no positional args, triggers every
-    stamped entry in `<name>` (including schedule-less ones, since
-    trigger is meaningful for them too). With `--bundle` plus
-    positional args, bare names resolve in `<name>` and qualified
-    names must match it.
+    With `--all`, triggers every stamped entry (including schedule-less
+    ones, since trigger is meaningful for them too), narrowed to one
+    bundle when `--bundle <name>` is also given. With `--bundle` plus
+    positional args, bare names resolve in `<name>` and qualified names
+    must match it.
     """
     config = crony.runtime.load_config()
     bundles = config.toml_config

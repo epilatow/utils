@@ -75,6 +75,9 @@ time the user logs in.
   the `<bundle>:<uuid>` form for an entry with no recoverable name. A bare
   `name` is shorthand for `default.<name>`. Subcommands that accept more than
   one take a space-separated list (shown as `[job ...]`).
+- **`--all`**\
+  Act on every entry instead of an explicit name list. Scope to one bundle
+  with -b/--bundle.
 - **`-b, --bundle BUNDLE`**\
   Operate on config bundle BUNDLE. Where the subcommand takes names, bare
   names resolve within BUNDLE and a qualified name must match it.
@@ -117,30 +120,30 @@ surgically updates just those entries.
 - **`-v, --verbose`**\
   Also print 'unchanged' lines (default: suppressed).
 
-### `destroy [--orphans] [-b BUNDLE] [job ...]`
+### `destroy [--all] [--orphans] [-b BUNDLE] [job ...]`
 
-Remove platform units. With no job arguments this is a factory reset; with
-names it surgically removes just those entries.
+Remove platform units -- the platform unit files and the entry's state dir
+both go away. Requires a target: job(s), --all, or --orphans.
 
 - **`--orphans`**\
   Limit removal to entries with on-disk remnants that no config selects on
   this host. Combinable with -b/--bundle; mutually exclusive with positional
-  names.
+  names and --all.
 
-### `enable [-b BUNDLE] [job ...]`
+### `enable [--all] [-b BUNDLE] [job ...]`
 
-Re-arm the named jobs' schedules. Omit the job arguments with --bundle to
-enable every stamped entry in that bundle.
+Re-arm the named jobs' schedules (clear the operator-disable). Requires a
+target: job(s) or --all.
 
-### `disable [-b BUNDLE] [job ...]`
+### `disable [--all] [-b BUNDLE] [job ...]`
 
-Disarm the named jobs' schedules (still triggerable). Omit the job arguments
-with --bundle to disable every stamped entry in that bundle.
+Disarm the named jobs' schedules: loaded and triggerable, but not firing on
+their own. Requires a target: job(s) or --all.
 
-### `trigger [-b BUNDLE] [-w] [--trigger-timeout TRIGGER_TIMEOUT] [job ...]`
+### `trigger [--all] [-b BUNDLE] [-w] [--trigger-timeout TRIGGER_TIMEOUT] [job ...]`
 
-Ask the platform scheduler to fire the named jobs now. Omit the job arguments
-with --bundle to fire every stamped entry in that bundle.
+Ask the platform scheduler to fire the named jobs now, via the same path a
+scheduled fire uses. Requires a target: job(s) or --all.
 
 - **`-w, --wait`**\
   Block until each named entry's next completion and exit with that exit code

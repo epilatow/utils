@@ -58,6 +58,10 @@ A job (or group) identity: the full namespaced name \f[CR]<bundle>.<name>\f[R], 
 A bare \f[CR]name\f[R] is shorthand for \f[CR]default.<name>\f[R].\&
 Subcommands that accept more than one take a space\-separated list (shown as \f[CR][job ...]\f[R]).\&
 .TP
+\f[CR]\-\-all\f[R]
+Act on every entry instead of an explicit name list.\&
+Scope to one bundle with \-b/\-\-bundle.\&
+.TP
 \f[CR]\-b, \-\-bundle BUNDLE\f[R]
 Operate on config bundle BUNDLE.\&
 Where the subcommand takes names, bare names resolve within BUNDLE and a qualified name must match it.\&
@@ -99,27 +103,27 @@ With no job arguments this is a full sync (install missing, fix drift, remove or
 Also print \(aqunchanged\(aq lines (default: suppressed).\&
 .RE
 .TP
-\f[B]destroy\f[R] [\-\-orphans] [\-b BUNDLE] [job ...]\&
-Remove platform units.\&
-With no job arguments this is a factory reset; with names it surgically removes just those entries.\&
+\f[B]destroy\f[R] [\-\-all] [\-\-orphans] [\-b BUNDLE] [job ...]\&
+Remove platform units \-\- the platform unit files and the entry\(aqs state dir both go away.\&
+Requires a target: job(s), \-\-all, or \-\-orphans.\&
 .RS
 .TP
 \f[CR]\-\-orphans\f[R]
 Limit removal to entries with on\-disk remnants that no config selects on this host.\&
-Combinable with \-b/\-\-bundle; mutually exclusive with positional names.\&
+Combinable with \-b/\-\-bundle; mutually exclusive with positional names and \-\-all.\&
 .RE
 .TP
-\f[B]enable\f[R] [\-b BUNDLE] [job ...]\&
-Re\-arm the named jobs\(aq schedules.\&
-Omit the job arguments with \-\-bundle to enable every stamped entry in that bundle.\&
+\f[B]enable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
+Re\-arm the named jobs\(aq schedules (clear the operator\-disable).\&
+Requires a target: job(s) or \-\-all.\&
 .TP
-\f[B]disable\f[R] [\-b BUNDLE] [job ...]\&
-Disarm the named jobs\(aq schedules (still triggerable).\&
-Omit the job arguments with \-\-bundle to disable every stamped entry in that bundle.\&
+\f[B]disable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
+Disarm the named jobs\(aq schedules: loaded and triggerable, but not firing on their own.\&
+Requires a target: job(s) or \-\-all.\&
 .TP
-\f[B]trigger\f[R] [\-b BUNDLE] [\-w] [\-\-trigger\-timeout TRIGGER_TIMEOUT] [job ...]\&
-Ask the platform scheduler to fire the named jobs now.\&
-Omit the job arguments with \-\-bundle to fire every stamped entry in that bundle.\&
+\f[B]trigger\f[R] [\-\-all] [\-b BUNDLE] [\-w] [\-\-trigger\-timeout TRIGGER_TIMEOUT] [job ...]\&
+Ask the platform scheduler to fire the named jobs now, via the same path a scheduled fire uses.\&
+Requires a target: job(s) or \-\-all.\&
 .RS
 .TP
 \f[CR]\-w, \-\-wait\f[R]
