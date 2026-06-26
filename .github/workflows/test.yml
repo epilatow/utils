@@ -26,7 +26,17 @@ jobs:
       # which mocks every borg call, so it needs no borg binary.
       - name: Install borg
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y borgbackup
+        # The packages.microsoft.com repos (azure-cli, MS prod) ship
+        # pre-configured on the hosted runner image and intermittently 403
+        # their InRelease signature, which makes apt-get update exit 100
+        # before borg is reached. We need none of them, so drop them; and
+        # don't let a transient signing failure on any other repo abort the
+        # install -- the only package this step actually requires is borg.
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.* \
+                     /etc/apt/sources.list.d/azure-cli.*
+          sudo apt-get update || true
+          sudo apt-get install -y borgbackup
 
       # The pinned pandoc that test_render_docs.py renders the roff man
       # page with. Fetched into .tools/ by the same installer local devs
