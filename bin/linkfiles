@@ -33,7 +33,11 @@ from common.argparse_ext import (  # noqa: E402
     add_argument_ext,
 )
 from common.cli import cli_entrypoint  # noqa: E402
-from common.docspec import ManSpec  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemsSection,
+    ManSpec,
+    TextSection,
+)
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
 # =============================================================================
@@ -1720,22 +1724,27 @@ MAN_SPEC = ManSpec(
     build_parser=build_parser,
     name_description="symlink a source directory's contents into a target",
     description=_DESCRIPTION,
-    prose_sections=[("GETTING STARTED", _GETTING_STARTED)],
-    files=[
-        (
-            "~/.linkfiles.installed",
-            "Tracks installed directory pairs (source + target) and "
-            "installation options.",
-        ),
-        (
-            "~/.linkfiles.linked",
-            "Tracks installed links (source + target pairs).",
-        ),
-        (
-            "$REPO/.linkfiles.ignore",
-            "A file containing gitignore style patterns used to "
-            "specify repo files that should be ignored by linkfiles. "
-            "Used when source_dir is $REPO or a child of $REPO.",
+    pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
+    post_sections=[
+        ItemsSection(
+            "FILES",
+            [
+                (
+                    "~/.linkfiles.installed",
+                    "Tracks installed directory pairs (source + target) and "
+                    "installation options.",
+                ),
+                (
+                    "~/.linkfiles.linked",
+                    "Tracks installed links (source + target pairs).",
+                ),
+                (
+                    "$REPO/.linkfiles.ignore",
+                    "A file containing gitignore style patterns used to "
+                    "specify repo files that should be ignored by linkfiles. "
+                    "Used when source_dir is $REPO or a child of $REPO.",
+                ),
+            ],
         ),
     ],
     exit_status=[

@@ -43,7 +43,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import render_docs  # noqa: E402  (import after the src/ path insert above)
 from common.argparse_ext import add_argument_ext  # noqa: E402
-from common.docspec import ManSpec  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemListsSection,
+    ItemsSection,
+    ManSpec,
+    TextSection,
+)
 
 _script_path = REPO_ROOT / "src" / "render_docs.py"
 
@@ -99,18 +104,18 @@ def test_gfm_has_single_title_and_demoted_sections() -> None:
     assert "## DESCRIPTION" in gfm
 
 
-def test_prose_sections_render_between_description_and_subcommands() -> None:
-    # `prose_sections` are top-level prose sections placed after
-    # DESCRIPTION and before SUBCOMMANDS, in order.
+def test_pre_sections_render_between_description_and_subcommands() -> None:
+    # `pre_sections` are placed after DESCRIPTION and before SUBCOMMANDS,
+    # in order.
     spec = ManSpec(
         prog="demo",
         section=1,
         build_parser=argparse.ArgumentParser,
         name_description="demo tool",
         description="Demo overview.",
-        prose_sections=[
-            ("GETTING STARTED", "Start here."),
-            ("NOTES", "A note."),
+        pre_sections=[
+            TextSection("GETTING STARTED", "Start here."),
+            TextSection("NOTES", "A note."),
         ],
     )
     md = render_docs.build_markdown(spec)
@@ -156,24 +161,55 @@ def test_common_arguments_uses_each_arg_extended_help() -> None:
     assert md.index("# COMMON ARGUMENTS") < md.index("# SUBCOMMANDS")
 
 
-def test_files_section_renders_before_exit_status() -> None:
-    # A `files` list renders as a FILES section positioned just above
-    # EXIT STATUS, in both the roff-Markdown and the GFM rendering.
+def test_items_post_section_renders_before_exit_status() -> None:
+    # An ItemsSection in `post_sections` renders as a definition list
+    # positioned after SUBCOMMANDS and before EXIT STATUS, in both the
+    # roff-Markdown and the GFM rendering.
     spec = ManSpec(
         prog="demo",
         section=1,
         build_parser=argparse.ArgumentParser,
         name_description="demo tool",
         description="Demo overview.",
-        files=[("~/.demorc", "The demo config.")],
+        post_sections=[ItemsSection("FILES", [("~/.demorc", "The config.")])],
         exit_status=[("0", "Success")],
     )
     md = render_docs.build_markdown(spec)
-    assert "`~/.demorc`" in md and "The demo config." in md
-    assert md.index("# FILES") < md.index("# EXIT STATUS")
+    assert "`~/.demorc`" in md and "The config." in md
+    assert (
+        md.index("# SUBCOMMANDS")
+        < md.index("# FILES")
+        < md.index("# EXIT STATUS")
+    )
     gfm = render_docs.build_gfm(spec)
     assert "`~/.demorc`" in gfm
     assert gfm.index("## FILES") < gfm.index("## EXIT STATUS")
+
+
+def test_item_lists_post_section_renders_titled_sublists() -> None:
+    # An ItemListsSection renders its intro then each titled sub-list of
+    # (term, description) items.
+    spec = ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=argparse.ArgumentParser,
+        name_description="demo tool",
+        description="Demo overview.",
+        post_sections=[
+            ItemListsSection(
+                "COLUMNS",
+                "The intro line.",
+                [("Group A", "Lead A.", [("col1", "First column.")])],
+            )
+        ],
+    )
+    md = render_docs.build_markdown(spec)
+    assert "# COLUMNS" in md
+    assert "The intro line." in md
+    assert "## Group A" in md and "Lead A." in md
+    assert "col1" in md and "First column." in md
+    gfm = render_docs.build_gfm(spec)
+    assert "## COLUMNS" in gfm and "### Group A" in gfm
 
 
 class TestInvocation:

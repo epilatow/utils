@@ -29,7 +29,7 @@ import crony.runner
 import crony.runtime
 from common.argparse_ext import StrictArgumentParser, add_argument_ext
 from common.cli import cli_entrypoint
-from common.docspec import ManSpec
+from common.docspec import ItemListsSection, ManSpec, TextSection
 
 # Handle broken pipes gracefully (e.g., when piping to `head`). Ignore
 # SIGPIPE so writes to a closed pipe raise BrokenPipeError instead of
@@ -725,14 +725,19 @@ MAN_SPEC = ManSpec(
     build_parser=_build_parser,
     name_description="user-level scheduled-job manager",
     description=_DESCRIPTION,
-    prose_sections=[
-        ("GETTING STARTED", _GETTING_STARTED),
-        ("PLATFORM SPECIFICS", _PLATFORM_SPECIFICS),
+    pre_sections=[
+        TextSection("GETTING STARTED", _GETTING_STARTED),
+        TextSection("PLATFORM SPECIFICS", _PLATFORM_SPECIFICS),
     ],
-    reference_title="STATUS COLUMNS",
-    reference_sections=[
-        (s.title, s.lead, s.items)
-        for s in crony.commands.status_reference_sections()
+    post_sections=[
+        ItemListsSection(
+            "STATUS COLUMNS",
+            "",
+            [
+                (s.title, s.lead, s.items)
+                for s in crony.commands.status_reference_sections()
+            ],
+        ),
     ],
     exit_status=[
         (str(value), description)

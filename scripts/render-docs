@@ -66,7 +66,7 @@ import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, assert_never
 
 import mdformat
 
@@ -76,7 +76,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from common.argparse_ext import get_extended_help, is_common  # noqa: E402
-from common.docspec import ManSpec  # noqa: E402
+from common.docspec import (  # noqa: E402
+    ItemListsSection,
+    ItemsSection,
+    ManSpec,
+    Section,
+    TextSection,
+)
 
 # pandoc renders the Markdown to roff. Its roff output varies between
 # versions, so a single pandoc is pinned in `scripts/pandoc-pin.json`
@@ -390,6 +396,32 @@ def _shared_options(
     return shared, set(by_invocation)
 
 
+def _section_md(section: Section) -> list[str]:
+    """Render a free-form spec section as pandoc Markdown, dispatching on
+    its shape: prose, a definition list, or an intro plus titled
+    sub-lists."""
+    out = [f"# {section.title}", ""]
+    if isinstance(section, TextSection):
+        out += _overview_md(section.body)
+    elif isinstance(section, ItemsSection):
+        for term, description in section.items:
+            out += _definition(f"`{term}`", _md(description))
+    elif isinstance(section, ItemListsSection):
+        if section.intro:
+            out += [_md(section.intro), ""]
+        for title, lead, items in section.subsections:
+            out += [f"## {title}", ""]
+            if lead:
+                out += [_md(lead), ""]
+            for label, description in items:
+                # Emphasis (italic -> underline in a terminal) sets the
+                # key apart from its description when both share a line.
+                out += _definition(f"*{_md(label)}*", _md(description))
+    else:
+        assert_never(section)
+    return out
+
+
 def build_markdown(spec: ManSpec) -> str:
     """Render a utility's man page as pandoc Markdown. Pure and
     deterministic. Transient: piped to pandoc for the roff man page, not
@@ -415,9 +447,8 @@ def build_markdown(spec: ManSpec) -> str:
     ]
     out += _overview_md(spec.description or parser.description or "")
 
-    for title, body in spec.prose_sections:
-        out += [f"# {title}", ""]
-        out += _overview_md(body)
+    for sec in spec.pre_sections:
+        out += _section_md(sec)
 
     subs: list[tuple[argparse.ArgumentParser, str]] = []
     _walk_subcommands(parser, subs)
@@ -443,23 +474,8 @@ def build_markdown(spec: ManSpec) -> str:
                 continue
             out += _definition(f"`{invocation}`", _md(opt_help), indent="    ")
 
-    if spec.reference_sections:
-        out += [f"# {spec.reference_title}", ""]
-        if spec.reference_intro:
-            out += [_md(spec.reference_intro), ""]
-        for title, lead, items in spec.reference_sections:
-            out += [f"## {title}", ""]
-            if lead:
-                out += [_md(lead), ""]
-            for label, description in items:
-                # Emphasis (italic -> underline in a terminal) sets the
-                # key apart from its description when both share a line.
-                out += _definition(f"*{_md(label)}*", _md(description))
-
-    if spec.files:
-        out += ["# FILES", ""]
-        for path, description in spec.files:
-            out += _definition(f"`{path}`", _md(description))
+    for sec in spec.post_sections:
+        out += _section_md(sec)
 
     if spec.exit_status:
         out += ["# EXIT STATUS", ""]
@@ -610,6 +626,30 @@ def _gfm_table(
     return rows
 
 
+def _section_gfm(section: Section) -> list[str]:
+    """Render a free-form spec section as GFM, dispatching on its shape:
+    prose, a bulleted definition list, or an intro plus titled
+    sub-lists."""
+    out = [f"## {section.title}", ""]
+    if isinstance(section, TextSection):
+        out += _overview_md(section.body, _gfm_inline)
+    elif isinstance(section, ItemsSection):
+        out += [_gfm_item(term, desc) for term, desc in section.items]
+        out.append("")
+    elif isinstance(section, ItemListsSection):
+        if section.intro:
+            out += [_gfm_inline(section.intro), ""]
+        for title, lead, items in section.subsections:
+            out += [f"### {title}", ""]
+            if lead:
+                out += [_gfm_inline(lead), ""]
+            out += [_gfm_item(label, desc) for label, desc in items]
+            out.append("")
+    else:
+        assert_never(section)
+    return out
+
+
 def build_gfm(spec: ManSpec) -> str:
     """Render a utility's doc as GitHub-Flavored Markdown: a single
     `# <prog> - <summary>` title (the man page's NAME line, which a
@@ -634,9 +674,8 @@ def build_gfm(spec: ManSpec) -> str:
         spec.description or parser.description or "", _gfm_inline
     )
 
-    for title, body in spec.prose_sections:
-        out += [f"## {title}", ""]
-        out += _overview_md(body, _gfm_inline)
+    for sec in spec.pre_sections:
+        out += _section_gfm(sec)
 
     subs: list[tuple[argparse.ArgumentParser, str]] = []
     _walk_subcommands(parser, subs)
@@ -669,21 +708,8 @@ def build_gfm(spec: ManSpec) -> str:
             out += [_gfm_item(inv, opt_help) for inv, opt_help in own]
             out.append("")
 
-    if spec.reference_sections:
-        out += [f"## {spec.reference_title}", ""]
-        if spec.reference_intro:
-            out += [_gfm_inline(spec.reference_intro), ""]
-        for title, lead, items in spec.reference_sections:
-            out += [f"### {title}", ""]
-            if lead:
-                out += [_gfm_inline(lead), ""]
-            out += [_gfm_item(label, desc) for label, desc in items]
-            out.append("")
-
-    if spec.files:
-        out += ["## FILES", ""]
-        out += [_gfm_item(path, desc) for path, desc in spec.files]
-        out.append("")
+    for sec in spec.post_sections:
+        out += _section_gfm(sec)
 
     if spec.exit_status:
         out += ["## EXIT STATUS", ""]

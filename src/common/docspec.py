@@ -5,9 +5,11 @@
 A utility opts into generated docs by exposing a module-level `MAN_SPEC`
 of this type; `scripts/render-docs` discovers those specs and renders
 each into a roff man page and a GFM doc. The spec carries only the
-per-utility bits the argparse parser doesn't -- the NAME one-liner, the
-DESCRIPTION overview, extra prose sections, an optional reference
-section, a FILES list, and an EXIT STATUS table. Everything derivable
+per-utility bits the argparse parser doesn't: the NAME one-liner, the
+DESCRIPTION overview, the EXIT STATUS table, and a list of free-form
+sections to place before and after the auto-derived COMMON ARGUMENTS /
+SUBCOMMANDS listing. Each free-form section picks its rendered shape
+(prose, a definition list, or titled sub-lists). Everything derivable
 from the parser (the synopsis, the subcommand list, the arguments shared
 across subcommands) is left to the renderer so it can't drift from the
 CLI. Keeping the spec here -- importable, separate from the renderer --
@@ -26,6 +28,41 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
+class TextSection:
+    """A prose section, reflowed like DESCRIPTION (e.g. GETTING STARTED)."""
+
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ItemsSection:
+    """A flat definition list of `(term, description)` items, the term
+    shown as code (e.g. FILES)."""
+
+    title: str
+    items: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class ItemListsSection:
+    """A section with an optional intro and titled sub-lists, each a
+    definition list of `(term, description)` items (e.g. crony's status
+    columns)."""
+
+    title: str
+    intro: str
+    subsections: list[tuple[str, str, list[tuple[str, str]]]]
+
+
+# A free-form section placed in `ManSpec.pre_sections` / `post_sections`.
+# render-docs dispatches on the concrete type to pick the rendered shape.
+# Every section in those lists renders, heading included; omit a section
+# by leaving it out of the list rather than handing in an empty one.
+Section = TextSection | ItemsSection | ItemListsSection
+
+
+@dataclass(frozen=True)
 class ManSpec:
     """One utility's reference doc. `build_parser` returns its argparse
     parser; the rest supplies what the parser doesn't carry."""
@@ -36,20 +73,12 @@ class ManSpec:
     name_description: str
     # DESCRIPTION body; falls back to the parser's own `description`.
     description: str = ""
-    # Extra top-level prose sections rendered after DESCRIPTION and
-    # before COMMON ARGUMENTS, as `(SECTION TITLE, body)`. The body is
-    # prose (reflowed like DESCRIPTION).
-    prose_sections: list[tuple[str, str]] = field(default_factory=list)
-    # An optional trailing reference section (e.g. crony's status
-    # columns): a heading, an intro paragraph, and structured subsections.
-    reference_title: str = ""
-    reference_intro: str = ""
-    reference_sections: list[tuple[str, str, list[tuple[str, str]]]] = field(
-        default_factory=list
-    )
-    # Files the utility reads / writes, as `(path, description)`, rendered
-    # in a FILES section just before EXIT STATUS. [] to omit.
-    files: list[tuple[str, str]] = field(default_factory=list)
+    # Free-form sections placed after DESCRIPTION and before the derived
+    # COMMON ARGUMENTS / SUBCOMMANDS listing (e.g. GETTING STARTED).
+    pre_sections: list[Section] = field(default_factory=list)
+    # Free-form sections placed after SUBCOMMANDS and before EXIT STATUS
+    # (e.g. crony's STATUS COLUMNS, a FILES list).
+    post_sections: list[Section] = field(default_factory=list)
     # EXIT STATUS as `(code, description)` items, or [] to omit it.
     exit_status: list[tuple[str, str]] = field(default_factory=list)
 
