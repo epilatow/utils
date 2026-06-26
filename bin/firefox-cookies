@@ -28,7 +28,7 @@ import textwrap
 if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path as Path  # noqa: PLC0414  re-exported for tests
 from typing import Any
@@ -762,6 +762,40 @@ def format_json(
     return json.dumps(data, indent=2) + "\n"
 
 
+def render_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    *,
+    right_align: frozenset[int] = frozenset(),
+    show_header: bool = True,
+) -> None:
+    """Print `rows` as space-aligned columns under `headers`.
+
+    Columns are separated by two spaces; those whose index is in
+    `right_align` are right-justified (for numbers), the rest are
+    left-justified. The final column is never padded, so no trailing
+    whitespace is emitted. Nothing is printed when there are no rows, so a
+    lone header never appears; `show_header=False` drops the header row for
+    scripting.
+    """
+    if not rows:
+        return
+    str_rows = [[str(cell) for cell in row] for row in rows]
+    body = ([list(headers), *str_rows]) if show_header else str_rows
+    widths = [max(len(r[i]) for r in body) for i in range(len(headers))]
+    last = len(headers) - 1
+    for row in body:
+        cells = [
+            cell
+            if i == last
+            else cell.rjust(widths[i])
+            if i in right_align
+            else cell.ljust(widths[i])
+            for i, cell in enumerate(row)
+        ]
+        print("  ".join(cells))
+
+
 # =============================================================================
 # Subcommand Handlers
 # =============================================================================
@@ -842,6 +876,7 @@ def do_list_domains(
     profile: str | None,
     container: str | None,
     sources: list[str] | None,
+    no_header: bool,
 ) -> None:
     """List domains with cookie counts."""
     firefox_dir = find_firefox_dir()
@@ -875,27 +910,33 @@ def do_list_domains(
     ]
     rows.sort(key=lambda x: (x[2], x[1]))
 
-    if rows:
-        count_w = max(len(str(r[0])) for r in rows)
-        ctx_w = max(len(str(r[1])) for r in rows)
-        for count, ctx_id, domain in rows:
-            print(f"{count:{count_w}d}  {ctx_id:{ctx_w}d}  {domain}")
+    render_table(
+        ("cookie-count", "container-id", "domain"),
+        rows,
+        right_align=frozenset({0, 1}),
+        show_header=not no_header,
+    )
 
 
-def do_list_profiles() -> None:
+def do_list_profiles(no_header: bool) -> None:
     """List available Firefox profiles."""
     firefox_dir = find_firefox_dir()
     profiles = parse_profiles(firefox_dir)
 
-    for p in profiles:
-        default = " (default)" if p.is_default else ""
-        print(f"{p.name}{default}")
-        print(f"  {p.path}")
+    rows = [
+        ("*" if p.is_default else "", p.name, str(p.path)) for p in profiles
+    ]
+    render_table(
+        ("default", "name", "path"),
+        rows,
+        show_header=not no_header,
+    )
 
 
 def do_list_containers(
     profile: str | None,
     sources: list[str] | None,
+    no_header: bool,
 ) -> None:
     """List containers with cookie counts."""
     firefox_dir = find_firefox_dir()
@@ -928,11 +969,12 @@ def do_list_containers(
         )
     )
 
-    if rows:
-        count_w = max(len(str(r[0])) for r in rows)
-        id_w = max(len(str(r[1])) for r in rows)
-        for count, ctx_id, name in rows:
-            print(f"{count:{count_w}d}  {ctx_id:{id_w}d}  {name}")
+    render_table(
+        ("cookie-count", "container-id", "container-name"),
+        rows,
+        right_align=frozenset({0, 1}),
+        show_header=not no_header,
+    )
 
 
 # =============================================================================
@@ -941,7 +983,25 @@ def do_list_containers(
 
 
 class _SingleUseAction(argparse.Action):
-    """Argparse action that errors if a flag is repeated."""
+    """Argparse action that errors if its flag is repeated.
+
+    Works for value options and for store-true flags: pass `nargs=0` to
+    make it a boolean flag, which then stores `const` (defaulting to True,
+    with a False default) like argparse's own store_true -- so a caller
+    need only add `nargs=0` to get a single-use boolean.
+    """
+
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        nargs: int | str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if nargs == 0:
+            kwargs.setdefault("const", True)
+            kwargs.setdefault("default", False)
+        super().__init__(option_strings, dest, nargs=nargs, **kwargs)
 
     def __call__(
         self,
@@ -955,7 +1015,12 @@ class _SingleUseAction(argparse.Action):
             parser.error(f"{option_string} can only be specified once")
         seen.add(self.dest)
         namespace._seen_flags = seen
-        setattr(namespace, self.dest, values)
+        # A boolean flag (nargs=0) carries no value, so store its const.
+        setattr(
+            namespace,
+            self.dest,
+            self.const if self.nargs == 0 else values,
+        )
 
 
 # The Description and Getting Started text appended to the `--help`
@@ -1072,6 +1137,19 @@ def build_parser() -> StrictArgumentParser:
             ),
         )
 
+    def add_no_header_arg(
+        p: argparse.ArgumentParser,
+    ) -> None:
+        add_argument_ext(
+            p,
+            "--no-header",
+            dest="no_header",
+            action=_SingleUseAction,
+            nargs=0,
+            common=True,
+            help="Omit the column header row.",
+        )
+
     def add_src_arg(
         p: argparse.ArgumentParser,
     ) -> None:
@@ -1104,9 +1182,12 @@ def build_parser() -> StrictArgumentParser:
         help="Extract cookies to stdout.",
         description=(
             "Extract cookies from the resolved profile and write them to"
-            " stdout in Netscape or JSON format. The Netscape format emits"
-            " one tab-separated row per cookie, with the columns host,"
-            " subdomain flag, path, secure flag, expiry, name, and value."
+            " stdout. The default Netscape format emits a commented header"
+            " followed by one tab-separated row per cookie, with the columns"
+            " host, subdomain flag, path, secure flag, expiry, name, and"
+            " value. The JSON format (--format json) emits an array of cookie"
+            " objects with host, name, value, path, expiry, and secure, plus"
+            " httpOnly and sameSite."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
@@ -1129,8 +1210,8 @@ def build_parser() -> StrictArgumentParser:
         help="List domains with cookie counts.",
         description=(
             "List the domains that have cookies in the resolved profile, one"
-            " per line, as the columns cookie count, container ID, and"
-            " domain, sorted by domain. Container ID 0 is the default"
+            " per line. The columns are: cookie-count, container-id, and"
+            " domain, sorted by domain. container-id 0 is the default"
             " (no-container) context."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
@@ -1138,18 +1219,20 @@ def build_parser() -> StrictArgumentParser:
     add_profile_arg(list_domains)
     add_container_arg(list_domains)
     add_src_arg(list_domains)
+    add_no_header_arg(list_domains)
 
     # list-profiles
-    subparsers.add_parser(
+    list_profiles = subparsers.add_parser(
         "list-profiles",
         help="List available Firefox profiles.",
         description=(
-            "List the Firefox profiles found in profiles.ini, printing each"
-            " profile's name (with a marker on the default profile) followed"
-            " by its on-disk path on the next line."
+            "List the Firefox profiles found in profiles.ini, one per line."
+            " The columns are: default, name, and path. The default column"
+            " holds a * on the profile profiles.ini marks as the default."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
+    add_no_header_arg(list_profiles)
 
     # list-containers
     list_containers = subparsers.add_parser(
@@ -1157,13 +1240,14 @@ def build_parser() -> StrictArgumentParser:
         help="List containers with cookie counts.",
         description=(
             "List the containers defined in the resolved profile, one per"
-            " line, as the columns cookie count, container ID, and container"
-            " name, sorted by name."
+            " line. The columns are: cookie-count, container-id, and"
+            " container-name, sorted by container-name."
         ),
         formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_profile_arg(list_containers)
     add_src_arg(list_containers)
+    add_no_header_arg(list_containers)
 
     return parser
 

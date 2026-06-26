@@ -387,6 +387,14 @@ class TestArgumentParser:
         assert args.command == "list-containers"
         assert args.profile == "myprof"
 
+    def test_no_header_flag(self) -> None:
+        """Test --no-header is accepted by the list-* summaries."""
+        parser = fc.build_parser()
+        for cmd in ("list-domains", "list-containers", "list-profiles"):
+            args = parser.parse_command([cmd, "--no-header"])
+            assert args.no_header is True
+            assert parser.parse_command([cmd]).no_header is False
+
     def test_multiple_domains(self) -> None:
         """Test -d can be repeated for multiple domains."""
         parser = fc.build_parser()
@@ -426,6 +434,12 @@ class TestArgumentParser:
                     "netscape",
                 ]
             )
+
+    def test_duplicate_no_header_errors(self) -> None:
+        """Test --no-header cannot be specified twice."""
+        parser = fc.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_command(["list-domains", "--no-header", "--no-header"])
 
 
 class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
@@ -1068,10 +1082,32 @@ class TestDoListProfiles:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_profiles()
+            fc.do_list_profiles(no_header=False)
         captured = capsys.readouterr()
-        assert "default" in captured.out
-        assert "(default)" in captured.out
+        lines = captured.out.strip().split("\n")
+        assert lines[0].split() == ["default", "name", "path"]
+        # The sole profile is the default, so it carries the * marker.
+        assert "*" in lines[1]
+        assert "abc123.default" in lines[1]
+
+    def test_no_header(
+        self,
+        firefox_dir: Path,
+        capsys: Any,
+    ) -> None:
+        """--no-header drops the header row."""
+        with patch.object(
+            fc,
+            "find_firefox_dir",
+            autospec=True,
+            return_value=firefox_dir,
+        ):
+            fc.do_list_profiles(no_header=True)
+        captured = capsys.readouterr()
+        lines = captured.out.strip().split("\n")
+        # First line is data (the * marker + name), not the column header.
+        assert lines[0].split()[:2] == ["*", "default"]
+        assert "path" not in captured.out
 
 
 class TestDoListContainers:
@@ -1090,7 +1126,7 @@ class TestDoListContainers:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_containers(profile=None, sources=None)
+            fc.do_list_containers(profile=None, sources=None, no_header=False)
         captured = capsys.readouterr()
         assert "Personal" in captured.out
         assert "Work" in captured.out
@@ -1108,7 +1144,7 @@ class TestDoListContainers:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_containers(profile=None, sources=None)
+            fc.do_list_containers(profile=None, sources=None, no_header=False)
 
 
 class TestDoListDomains:
@@ -1127,7 +1163,9 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(profile=None, container=None, sources=None)
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=False
+            )
         captured = capsys.readouterr()
         assert "example.com" in captured.out
         assert "other.org" in captured.out
@@ -1145,10 +1183,12 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(profile=None, container=None, sources=None)
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=True
+            )
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        # Each line should have 3 columns
+        # Each data line should have 3 columns (header suppressed).
         for line in lines:
             parts = line.split()
             assert len(parts) == 3, f"Expected 3 columns: {line!r}"
@@ -1169,7 +1209,9 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(profile=None, container=None, sources=None)
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=False
+            )
         captured = capsys.readouterr()
         # example.com appears in default (0), container
         # 1, and container 2
@@ -1193,10 +1235,52 @@ class TestDoListDomains:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(profile=None, container="1", sources=None)
+            fc.do_list_domains(
+                profile=None, container="1", sources=None, no_header=False
+            )
         captured = capsys.readouterr()
         assert "example.com" in captured.out
         assert "other.org" not in captured.out
+
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
+    def test_header_present_by_default(
+        self,
+        firefox_dir: Path,
+        capsys: Any,
+    ) -> None:
+        """A labelled header row leads the output by default."""
+        with patch.object(
+            fc,
+            "find_firefox_dir",
+            autospec=True,
+            return_value=firefox_dir,
+        ):
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=False
+            )
+        captured = capsys.readouterr()
+        header = captured.out.splitlines()[0].split()
+        assert header == ["cookie-count", "container-id", "domain"]
+
+    @pytest.mark.usefixtures("profile_dir", "cookies_db")
+    def test_no_header_suppresses_header(
+        self,
+        firefox_dir: Path,
+        capsys: Any,
+    ) -> None:
+        """--no-header drops the header so the first line is data."""
+        with patch.object(
+            fc,
+            "find_firefox_dir",
+            autospec=True,
+            return_value=firefox_dir,
+        ):
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=True
+            )
+        captured = capsys.readouterr()
+        assert "cookie-count" not in captured.out
+        assert captured.out.splitlines()[0].split()[0].isdigit()
 
 
 class TestDoList:
@@ -2016,9 +2100,43 @@ class TestDoListDomainsWithSession:
             autospec=True,
             return_value=firefox_dir,
         ):
-            fc.do_list_domains(profile=None, container=None, sources=None)
+            fc.do_list_domains(
+                profile=None, container=None, sources=None, no_header=False
+            )
         captured = capsys.readouterr()
         assert "wordpress.com" in captured.out
+
+
+class TestRenderTable:
+    """Test the shared columnar output helper."""
+
+    def test_aligns_columns_with_header(self, capsys: Any) -> None:
+        """Numeric columns right-justify; the last column is unpadded."""
+        fc.render_table(
+            ("cookie-count", "name"),
+            [(5, "short"), (1234, "x")],
+            right_align=frozenset({0}),
+        )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "cookie-count  name",
+            "           5  short",
+            "        1234  x",
+        ]
+
+    def test_show_header_false_omits_header(self, capsys: Any) -> None:
+        """show_header=False drops the header row."""
+        fc.render_table(
+            ("a", "b"),
+            [("1", "2")],
+            show_header=False,
+        )
+        assert capsys.readouterr().out == "1  2\n"
+
+    def test_no_rows_prints_nothing(self, capsys: Any) -> None:
+        """An empty row set emits no output, not a lone header."""
+        fc.render_table(("a", "b"), [])
+        assert capsys.readouterr().out == ""
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):

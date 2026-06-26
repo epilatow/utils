@@ -44,6 +44,9 @@ See which profiles, domains, and containers a profile holds:
 .EE
 .SH COMMON ARGUMENTS
 .TP
+\f[CR]\-\-no\-header\f[R]
+Omit the column header row.\&
+.TP
 \f[CR]\-c, \-\-container CONTAINER\f[R]
 Container ID, or name (case\-insensitive; an exact name wins, otherwise a unique substring match).\&
 .TP
@@ -60,23 +63,28 @@ Which cookie stores to read; repeatable (default: both).\&
 .SH SUBCOMMANDS
 .TP
 \f[B]list\f[R] [\-p PROFILE] [\-c CONTAINER] [\-d DOMAINS] [\-s {db,recovery}] [\-\-format {netscape,json}]
-Extract cookies from the resolved profile and write them to stdout in Netscape or JSON format.\&
-The Netscape format emits one tab\-separated row per cookie, with the columns host, subdomain flag, path, secure flag, expiry, name, and value.\&
+Extract cookies from the resolved profile and write them to stdout.\&
+The default Netscape format emits a commented header followed by one tab\-separated row per cookie, with the columns host, subdomain flag, path, secure flag, expiry, name, and value.\&
+The JSON format (\-\-format json) emits an array of cookie objects with host, name, value, path, expiry, and secure, plus httpOnly and sameSite.\&
 .RS
 .TP
 \f[CR]\-\-format {netscape,json}\f[R]
 Output format.\&
 .RE
 .TP
-\f[B]list\-domains\f[R] [\-p PROFILE] [\-c CONTAINER] [\-s {db,recovery}]
-List the domains that have cookies in the resolved profile, one per line, as the columns cookie count, container ID, and domain, sorted by domain.\&
-Container ID 0 is the default (no\-container) context.\&
+\f[B]list\-domains\f[R] [\-p PROFILE] [\-c CONTAINER] [\-s {db,recovery}] [\-\-no\-header]
+List the domains that have cookies in the resolved profile, one per line.\&
+The columns are: cookie\-count, container\-id, and domain, sorted by domain.\&
+container\-id 0 is the default (no\-container) context.\&
 .TP
-\f[B]list\-profiles\f[R]
-List the Firefox profiles found in profiles.ini, printing each profile\(aqs name (with a marker on the default profile) followed by its on\-disk path on the next line.\&
+\f[B]list\-profiles\f[R] [\-\-no\-header]
+List the Firefox profiles found in profiles.ini, one per line.\&
+The columns are: default, name, and path.\&
+The default column holds a * on the profile profiles.ini marks as the default.\&
 .TP
-\f[B]list\-containers\f[R] [\-p PROFILE] [\-s {db,recovery}]
-List the containers defined in the resolved profile, one per line, as the columns cookie count, container ID, and container name, sorted by name.\&
+\f[B]list\-containers\f[R] [\-p PROFILE] [\-s {db,recovery}] [\-\-no\-header]
+List the containers defined in the resolved profile, one per line.\&
+The columns are: cookie\-count, container\-id, and container\-name, sorted by container\-name.\&
 .SH FILES
 .TP
 \f[CR]<profile>/cookies.sqlite\f[R]

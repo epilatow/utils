@@ -67,6 +67,8 @@ See which profiles, domains, and containers a profile holds:
 
 ## COMMON ARGUMENTS
 
+- **`--no-header`**\
+  Omit the column header row.
 - **`-c, --container CONTAINER`**\
   Container ID, or name (case-insensitive; an exact name wins, otherwise a
   unique substring match).
@@ -85,30 +87,32 @@ See which profiles, domains, and containers a profile holds:
 
 ### `list [-p PROFILE] [-c CONTAINER] [-d DOMAINS] [-s {db,recovery}] [--format {netscape,json}]`
 
-Extract cookies from the resolved profile and write them to stdout in Netscape
-or JSON format. The Netscape format emits one tab-separated row per cookie,
-with the columns host, subdomain flag, path, secure flag, expiry, name, and
-value.
+Extract cookies from the resolved profile and write them to stdout. The
+default Netscape format emits a commented header followed by one tab-separated
+row per cookie, with the columns host, subdomain flag, path, secure flag,
+expiry, name, and value. The JSON format (--format json) emits an array of
+cookie objects with host, name, value, path, expiry, and secure, plus httpOnly
+and sameSite.
 
 - **`--format {netscape,json}`**\
   Output format.
 
-### `list-domains [-p PROFILE] [-c CONTAINER] [-s {db,recovery}]`
+### `list-domains [-p PROFILE] [-c CONTAINER] [-s {db,recovery}] [--no-header]`
 
-List the domains that have cookies in the resolved profile, one per line, as
-the columns cookie count, container ID, and domain, sorted by domain.
-Container ID 0 is the default (no-container) context.
+List the domains that have cookies in the resolved profile, one per line. The
+columns are: cookie-count, container-id, and domain, sorted by domain.
+container-id 0 is the default (no-container) context.
 
-### `list-profiles`
+### `list-profiles [--no-header]`
 
-List the Firefox profiles found in profiles.ini, printing each profile's name
-(with a marker on the default profile) followed by its on-disk path on the
-next line.
+List the Firefox profiles found in profiles.ini, one per line. The columns
+are: default, name, and path. The default column holds a * on the profile
+profiles.ini marks as the default.
 
-### `list-containers [-p PROFILE] [-s {db,recovery}]`
+### `list-containers [-p PROFILE] [-s {db,recovery}] [--no-header]`
 
-List the containers defined in the resolved profile, one per line, as the
-columns cookie count, container ID, and container name, sorted by name.
+List the containers defined in the resolved profile, one per line. The columns
+are: cookie-count, container-id, and container-name, sorted by container-name.
 
 ## FILES
 
