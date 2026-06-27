@@ -75,6 +75,26 @@ def test_docs_gfm_is_current(spec: ManSpec) -> None:
     assert spec.docs_path.read_text() == render_docs.build_gfm(spec)
 
 
+@pytest.mark.parametrize(
+    "spec", render_docs._discover_specs(), ids=lambda s: s.prog
+)
+def test_name_description_is_whatis_shaped(spec: ManSpec) -> None:
+    # name_description fills the man NAME line and the GFM title, so it
+    # must read like a whatis phrase, not a sentence -- the common slip is
+    # pasting the sentence-style parser `description=` (capitalization can't
+    # be checked since proper nouns legitimately lead, e.g. "Firefox").
+    nd = spec.name_description
+    assert "\n" not in nd, f"{spec.prog}: name_description must be one line"
+    assert not nd.endswith("."), (
+        f"{spec.prog}: name_description must not end with a period"
+    )
+    # whatis renders "prog(section) - desc"; keep that within an 80-col line.
+    line = f"{spec.prog}({spec.section}) - {nd}"
+    assert len(line) <= 80, (
+        f"{spec.prog}: whatis line is {len(line)} cols (> 80): {line!r}"
+    )
+
+
 def test_readme_is_current() -> None:
     # The repo README is regenerated (the documented list from the
     # discovered specs, the undocumented list from each `bin/` tool's

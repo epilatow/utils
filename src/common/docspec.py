@@ -70,6 +70,8 @@ class ManSpec:
     prog: str
     section: int
     build_parser: Callable[[], argparse.ArgumentParser]
+    # The man NAME line and GFM title ("prog - <name_description>"); a terse,
+    # single-line whatis phrase, no trailing period (gated by test_render_docs).
     name_description: str
     # DESCRIPTION body; falls back to the parser's own `description`.
     description: str = ""
