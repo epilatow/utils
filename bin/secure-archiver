@@ -32,7 +32,10 @@ from typing import Any
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    RawDescriptionDefaultsHelpFormatter,
+    StrictArgumentParser,
+)
 from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
@@ -1165,7 +1168,7 @@ def build_parser() -> StrictArgumentParser:
             "data that are encrypted using passwords stored in 1Password"
         ),
         epilog=ExitCode.epilog(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     subparsers = parser.add_command_subparsers(
         metavar="<command>", help="Subcommands"

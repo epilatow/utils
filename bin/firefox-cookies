@@ -41,6 +41,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from common.argparse_ext import (  # noqa: E402
+    RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
     add_argument_ext,
 )
@@ -1114,7 +1115,7 @@ def build_parser() -> StrictArgumentParser:
             f"Description:\n{textwrap.indent(_DESCRIPTION, '  ')}\n\n"
             f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}"
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     subparsers = parser.add_command_subparsers(metavar="<command>")
 
@@ -1218,7 +1219,6 @@ def build_parser() -> StrictArgumentParser:
             " cookies whose name matches it: a case-insensitive exact match"
             " if any name equals NAME, otherwise every name containing NAME."
         ),
-        formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_profile_arg(list_cmd)
     add_container_arg(list_cmd)
@@ -1252,7 +1252,6 @@ def build_parser() -> StrictArgumentParser:
             " domain, sorted by domain. container-id 0 is the default"
             " (no-container) context."
         ),
-        formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_profile_arg(list_domains)
     add_container_arg(list_domains)
@@ -1268,7 +1267,6 @@ def build_parser() -> StrictArgumentParser:
             " The columns are: default, name, and path. The default column"
             " holds a * on the profile profiles.ini marks as the default."
         ),
-        formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_no_header_arg(list_profiles)
 
@@ -1281,7 +1279,6 @@ def build_parser() -> StrictArgumentParser:
             " line. The columns are: cookie-count, container-id, and"
             " container-name, sorted by container-name."
         ),
-        formatter_class=(argparse.ArgumentDefaultsHelpFormatter),
     )
     add_profile_arg(list_containers)
     add_src_arg(list_containers)

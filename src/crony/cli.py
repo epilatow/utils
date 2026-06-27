@@ -27,7 +27,11 @@ import crony.errors
 import crony.model
 import crony.runner
 import crony.runtime
-from common.argparse_ext import StrictArgumentParser, add_argument_ext
+from common.argparse_ext import (
+    RawDescriptionDefaultsHelpFormatter,
+    StrictArgumentParser,
+    add_argument_ext,
+)
 from common.cli import cli_entrypoint
 from common.docspec import ItemListsSection, ManSpec, TextSection
 
@@ -327,7 +331,7 @@ def _build_parser() -> StrictArgumentParser:
             f"Getting Started:\n{textwrap.indent(_GETTING_STARTED, '  ')}\n\n"
             f"Platform Specifics:\n{textwrap.indent(_PLATFORM_SPECIFICS, '  ')}"
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     # `metavar=` overrides argparse's auto-generated `{a,b,c,...}`
     # choices summary so internal subcommands like `_run` (the
@@ -417,7 +421,7 @@ def _build_parser() -> StrictArgumentParser:
         "-v",
         "--verbose",
         action="store_true",
-        help="Also print 'unchanged' lines (default: suppressed).",
+        help="Also print 'unchanged' lines.",
     )
     _add_bundle_argument(p_apply)
 
@@ -516,7 +520,7 @@ def _build_parser() -> StrictArgumentParser:
         help="Print resolved state per job.",
         description=_STATUS_DESCRIPTION,
         epilog=crony.commands.STATUS_HELP_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     _add_jobs_argument(p_status)
     p_status.add_argument(

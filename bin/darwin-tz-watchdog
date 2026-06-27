@@ -49,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from common.argparse_ext import DefaultsHelpFormatter  # noqa: E402
 from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
@@ -261,6 +262,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Restart macOS UserEventAgent-Aqua when its cached "
             "timezone is stale relative to /etc/localtime."
         ),
+        formatter_class=DefaultsHelpFormatter,
     )
     parser.add_argument(
         "-v",

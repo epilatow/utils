@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -58,6 +59,91 @@ def is_common(action: argparse.Action) -> bool:
     """Whether the argument was tagged ``common=True`` (documented once
     under COMMON ARGUMENTS rather than per subcommand)."""
     return getattr(action, _COMMON_ATTR, False) is True
+
+
+def default_help_suffix(action: argparse.Action) -> str:
+    """`` (default: X)`` for an argument with a meaningful default, else ``''``.
+
+    Like ``argparse.ArgumentDefaultsHelpFormatter`` but omits the noise
+    defaults -- ``None``, ``False`` (a store-true flag's off state),
+    ``SUPPRESS``, and empty collections (a ``nargs="*"`` positional's
+    ``[]``) -- so only defaults worth surfacing are shown. A default under
+    the user's home is shown with a leading ``~`` so a home-derived path
+    (computed at parse time) does not bake the build machine's absolute home
+    into the generated docs. The ``DefaultsHelpFormatter`` classes use this
+    for ``--help`` and the doc renderer uses it for the generated docs, so
+    the two agree.
+    """
+    default = action.default
+    # Identity checks, not ``in``: ``0 == False`` would suppress a real 0.
+    if default is None or default is False or default is argparse.SUPPRESS:
+        return ""
+    # An empty collection or string (e.g. a variadic positional's []) reads
+    # as noise; a real 0 has no len() and is kept.
+    if hasattr(default, "__len__") and len(default) == 0:
+        return ""
+    # Mirror argparse: a positional carries a default only when it is
+    # optional or variadic.
+    if not (
+        action.option_strings
+        or action.nargs in (argparse.OPTIONAL, argparse.ZERO_OR_MORE)
+    ):
+        return ""
+    return f" (default: {_contract_home(str(default))})"
+
+
+def _contract_home(text: str) -> str:
+    """Replace a leading absolute home directory with ``~``.
+
+    A default expanded at parse time (e.g. ``Path("~/.x").expanduser()``)
+    would otherwise embed the build machine's home in the generated docs.
+    """
+    home = os.path.expanduser("~")
+    if home != "~" and (text == home or text.startswith(home + os.sep)):
+        return "~" + text[len(home) :]
+    return text
+
+
+def help_with_default(action: argparse.Action) -> str:
+    """An action's help text with ``default_help_suffix`` appended.
+
+    A help string that already names its default (literal ``(default:`` or
+    an argparse ``%(default)`` placeholder) is left untouched. Shared by the
+    ``--help`` formatters and the doc renderer so both surface the same
+    defaults.
+    """
+    help_text = action.help or ""
+    if "(default:" in help_text or "%(default)" in help_text:
+        return help_text
+    return help_text + default_help_suffix(action)
+
+
+class _DefaultsHelpMixin:
+    """``_get_help_string`` mix-in that appends the default suffix.
+
+    The suffix is an already-formatted literal (not argparse's
+    ``%(default)s`` placeholder), so it composes with either help-formatter
+    base below.
+    """
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = action.help or ""
+        # argparse runs this result through ``% params`` (`_expand_help`),
+        # so escape any ``%`` in the appended literal default (e.g. a
+        # "%Y-%m-%d" value) -- the original help is left as-is for argparse's
+        # own ``%(default)s``-style directives.
+        suffix = help_with_default(action)[len(help_text) :]
+        return help_text + suffix.replace("%", "%%")
+
+
+class DefaultsHelpFormatter(_DefaultsHelpMixin, argparse.HelpFormatter):
+    """HelpFormatter that shows defaults, minus the noise ones."""
+
+
+class RawDescriptionDefaultsHelpFormatter(
+    _DefaultsHelpMixin, argparse.RawDescriptionHelpFormatter
+):
+    """RawDescriptionHelpFormatter that also shows defaults."""
 
 
 if TYPE_CHECKING:
@@ -114,6 +200,9 @@ class StrictSubParsersAction(SubParsersActionBase):
             setattr(namespace, key, value)
 
     def add_parser(self, name: str, **kwargs: Any) -> StrictArgumentParser:
+        # Subcommand help shows option defaults by default (callers that
+        # need a raw-description epilog pass that formatter explicitly).
+        kwargs.setdefault("formatter_class", DefaultsHelpFormatter)
         # add_subparsers builds children from the owning parser's
         # class (StrictArgumentParser), so stamp the child's
         # command-tree depth here -- that is what lets a child know its

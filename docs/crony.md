@@ -118,7 +118,7 @@ is a full sync (install missing, fix drift, remove orphans); with names it
 surgically updates just those entries.
 
 - **`-v, --verbose`**\
-  Also print 'unchanged' lines (default: suppressed).
+  Also print 'unchanged' lines.
 
 ### `destroy [--all] [--orphans] [-b BUNDLE] [job ...]`
 

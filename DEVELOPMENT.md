@@ -209,3 +209,13 @@ tree, so it is safe to run on a dirty checkout.
   line before any dispatch. Usage errors that need runtime state -- a loaded
   config, on-disk state, the filesystem -- can't be decided at parse time, so
   they stay in the handler as a raised `UsageError`.
+
+- Argument defaults display automatically. Build parsers with
+  `common.argparse_ext`'s `DefaultsHelpFormatter` (or
+  `RawDescriptionDefaultsHelpFormatter` where the epilog must render verbatim)
+  rather than argparse's own; subcommands created via `add_command_subparsers`
+  get `DefaultsHelpFormatter` by default. They append `(default: X)` to each
+  option's help (omitting the noise defaults `None`, `False`, `SUPPRESS`, and
+  empty collections), and `render-docs` uses the same helper, so `--help` and
+  the generated docs surface the same defaults. A help string that already
+  states its own default is left untouched.

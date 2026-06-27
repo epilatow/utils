@@ -161,6 +161,34 @@ def test_common_arguments_uses_each_arg_extended_help() -> None:
     assert md.index("# COMMON ARGUMENTS") < md.index("# SUBCOMMANDS")
 
 
+def test_common_argument_default_appended_to_extended_help() -> None:
+    # A common argument with a meaningful default surfaces it in COMMON
+    # ARGUMENTS even when shown via extended_help, matching --help.
+    def build_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        subs = parser.add_subparsers()
+        for name in ("first", "second"):
+            sub = subs.add_parser(name, help=f"The {name} subcommand.")
+            add_argument_ext(
+                sub,
+                "--fmt",
+                default="netscape",
+                common=True,
+                help="terse",
+                extended_help="The output format.",
+            )
+        return parser
+
+    spec = ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=build_parser,
+        name_description="demo tool",
+    )
+    md = render_docs.build_markdown(spec)
+    assert "The output format. (default: netscape)" in md
+
+
 def test_items_post_section_renders_before_exit_status() -> None:
     # An ItemsSection in `post_sections` renders as a definition list
     # positioned after SUBCOMMANDS and before EXIT STATUS, in both the

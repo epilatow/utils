@@ -65,7 +65,11 @@ from typing import (
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import StrictArgumentParser  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    DefaultsHelpFormatter,
+    RawDescriptionDefaultsHelpFormatter,
+    StrictArgumentParser,
+)
 from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 
@@ -2178,13 +2182,6 @@ def do_environment() -> None:
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
-class HelpFormatter(
-    argparse.ArgumentDefaultsHelpFormatter,
-    argparse.RawDescriptionHelpFormatter,
-):
-    pass
-
-
 def _validate_repair(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -2207,14 +2204,14 @@ def _validate_repair(
 def args_parser() -> StrictArgumentParser:
     parser = StrictArgumentParser(
         description="Borg backup manager",
-        formatter_class=HelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
         epilog=ExitCode.epilog(),
     )
     subparsers = parser.add_command_subparsers(metavar="<command>")
 
     # Always set formatter_class so that we display default values.
     def add_parser(name: str, **kwargs: Any) -> StrictArgumentParser:
-        kwargs["formatter_class"] = HelpFormatter
+        kwargs["formatter_class"] = RawDescriptionDefaultsHelpFormatter
         return subparsers.add_parser(name, **kwargs)
 
     def add_delete(parser: argparse.ArgumentParser) -> None:
@@ -2276,17 +2273,17 @@ def args_parser() -> StrictArgumentParser:
     automate_subparsers.add_parser(
         "enable",
         help="Enable automated backup creation and checks",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
     automate_subparsers.add_parser(
         "disable",
         help="Disable automated backup creation and checks",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
     automate_subparsers.add_parser(
         "status",
         help="Show automation status (via crony)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
 
     add_parser("break-lock", help="Break repo lock")
@@ -2297,14 +2294,14 @@ def args_parser() -> StrictArgumentParser:
     check_age = check_subparsers.add_parser(
         "age",
         help="Check full backup age",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
     add_seconds(check_age)
 
     check_archives = check_subparsers.add_parser(
         "archives",
         help="Check archive metadata (borg check --archives-only)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
     check_archives_target = check_archives.add_mutually_exclusive_group()
     check_archives_target.add_argument(
@@ -2326,20 +2323,20 @@ def args_parser() -> StrictArgumentParser:
     check_subparsers.add_parser(
         "prune",
         help="Check for unpruned archives",
-        formatter_class=HelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
 
     check_repo = check_subparsers.add_parser(
         "repo",
         help="Check repo metadata (borg check --repository-only)",
-        formatter_class=HelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     add_progress(check_repo)
 
     check_full = check_subparsers.add_parser(
         "full",
         help="Check repo + archive metadata (borg check)",
-        formatter_class=HelpFormatter,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     add_progress(check_full)
 
@@ -2438,14 +2435,14 @@ def args_parser() -> StrictArgumentParser:
     repair_subparsers.add_parser(
         "delete-cache",
         help="Delete the local borg cache for the repository",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=DefaultsHelpFormatter,
     )
 
     def add_repair_check(name: str, help_text: str) -> None:
         sub = repair_subparsers.add_parser(
             name,
             help=help_text,
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            formatter_class=DefaultsHelpFormatter,
         )
         add_progress(sub)
         sub.add_argument(

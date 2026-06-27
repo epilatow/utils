@@ -103,7 +103,7 @@ matches it: a case-insensitive exact match if any name equals NAME, otherwise
 every name containing NAME.
 
 - **`--format {netscape,json}`**\
-  Output format.
+  Output format. (default: netscape)
 - **`NAME`**\
   Optional cookie name to filter by (case-insensitive: an exact name wins,
   otherwise every name containing NAME).

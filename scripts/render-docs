@@ -75,7 +75,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # importing any utility's parser, the same way each bin/ entry does.
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from common.argparse_ext import get_extended_help, is_common  # noqa: E402
+from common.argparse_ext import (  # noqa: E402
+    default_help_suffix,
+    get_extended_help,
+    help_with_default,
+    is_common,
+)
 from common.docspec import (  # noqa: E402
     ItemListsSection,
     ItemsSection,
@@ -274,7 +279,7 @@ def _options(
 ) -> list[tuple[str, str]]:
     """(invocation, help) for each documented option / positional."""
     return [
-        (_invocation(action), action.help or "")
+        (_invocation(action), help_with_default(action))
         for action in _documented_actions(parser)
     ]
 
@@ -375,10 +380,18 @@ def _shared_options(
         for action in _documented_actions(sub):
             if not is_common(action):
                 continue
+            # A common arg is documented once via extended_help (if set) or
+            # help; append the default to whichever the renderer will use so
+            # the docs and --help agree.
+            extended = get_extended_help(action)
+            if extended is not None and not (
+                "(default:" in extended or "%(default)" in extended
+            ):
+                extended += default_help_suffix(action)
             arg = _CommonArg(
                 _invocation(action),
-                action.help or "",
-                get_extended_help(action),
+                help_with_default(action),
+                extended,
                 not action.option_strings,
             )
             existing = by_invocation.setdefault(arg.invocation, arg)

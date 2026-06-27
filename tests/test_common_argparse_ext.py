@@ -19,10 +19,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from common.argparse_ext import (  # noqa: E402
+    DefaultsHelpFormatter,
+    RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
     StrictSubParsersAction,
     add_argument_ext,
+    default_help_suffix,
     get_extended_help,
+    help_with_default,
     is_common,
 )
 
@@ -195,6 +199,123 @@ class TestAddArgumentExt:
         action = argparse.ArgumentParser().add_argument("--foo")
         assert get_extended_help(action) is None
         assert is_common(action) is False
+
+
+class TestDefaultDisplay:
+    """default_help_suffix / help_with_default and the formatters."""
+
+    def test_suffix_shows_meaningful_default(self) -> None:
+        action = argparse.ArgumentParser().add_argument(
+            "--fmt", default="netscape"
+        )
+        assert default_help_suffix(action) == " (default: netscape)"
+
+    def test_suffix_shows_falsy_but_real_default(self) -> None:
+        # 0 and "" are real defaults; only None/False/SUPPRESS are noise.
+        action = argparse.ArgumentParser().add_argument("--n", default=0)
+        assert default_help_suffix(action) == " (default: 0)"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"action": "store_true"},  # default False
+            {},  # default None
+            {"default": argparse.SUPPRESS},
+        ],
+    )
+    def test_suffix_suppresses_noise_defaults(
+        self, kwargs: dict[str, Any]
+    ) -> None:
+        action = argparse.ArgumentParser().add_argument("--x", **kwargs)
+        assert default_help_suffix(action) == ""
+
+    def test_suffix_skips_plain_required_positional(self) -> None:
+        action = argparse.ArgumentParser().add_argument("name")
+        assert default_help_suffix(action) == ""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"nargs": "*", "default": []},  # variadic positional
+            {"default": ""},  # empty string
+        ],
+    )
+    def test_suffix_suppresses_empty_collection_default(
+        self, kwargs: dict[str, Any]
+    ) -> None:
+        name = "items" if "nargs" in kwargs else "--s"
+        action = argparse.ArgumentParser().add_argument(name, **kwargs)
+        assert default_help_suffix(action) == ""
+
+    def test_suffix_contracts_home_to_tilde(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A home-derived default must not bake the absolute home into docs.
+        monkeypatch.setenv("HOME", "/home/fake")
+        action = argparse.ArgumentParser().add_argument(
+            "--config", default="/home/fake/.borgadm"
+        )
+        assert default_help_suffix(action) == " (default: ~/.borgadm)"
+
+    def test_suffix_leaves_non_home_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", "/home/fake")
+        action = argparse.ArgumentParser().add_argument(
+            "--config", default="/etc/borgadm"
+        )
+        assert default_help_suffix(action) == " (default: /etc/borgadm)"
+
+    def test_help_with_default_appends(self) -> None:
+        action = argparse.ArgumentParser().add_argument(
+            "--fmt", default="json", help="Output format."
+        )
+        assert help_with_default(action) == "Output format. (default: json)"
+
+    def test_help_with_default_left_alone_when_already_present(self) -> None:
+        action = argparse.ArgumentParser().add_argument(
+            "--p", default="x", help="Path (default: auto)."
+        )
+        assert help_with_default(action) == "Path (default: auto)."
+
+    def test_formatter_escapes_percent_in_default(self) -> None:
+        # argparse %-formats the help string; a literal % in the default
+        # (e.g. a strftime pattern) must not be mis-parsed or crash --help.
+        parser = argparse.ArgumentParser(
+            prog="t", formatter_class=DefaultsHelpFormatter
+        )
+        parser.add_argument("--fmt", default="%Y-%m-%d", help="Date format.")
+        assert "Date format. (default: %Y-%m-%d)" in parser.format_help()
+
+    def test_formatter_shows_and_suppresses(self) -> None:
+        parser = argparse.ArgumentParser(
+            prog="t", formatter_class=DefaultsHelpFormatter
+        )
+        parser.add_argument("--fmt", default="netscape", help="Format.")
+        parser.add_argument("--quiet", action="store_true", help="Quiet.")
+        text = parser.format_help()
+        assert "Format. (default: netscape)" in text
+        assert "(default: None)" not in text
+        assert "(default: False)" not in text
+
+    def test_subparser_defaults_to_defaults_formatter(self) -> None:
+        parser = StrictArgumentParser(prog="t")
+        sub = parser.add_command_subparsers()
+        cmd = sub.add_parser("cmd")
+        cmd.add_argument("--fmt", default="netscape", help="Format.")
+        assert isinstance(cmd.formatter_class(prog="t"), DefaultsHelpFormatter)
+        assert "Format. (default: netscape)" in cmd.format_help()
+
+    def test_raw_defaults_formatter_keeps_epilog_verbatim(self) -> None:
+        parser = argparse.ArgumentParser(
+            prog="t",
+            epilog="line1\n  indented line2",
+            formatter_class=RawDescriptionDefaultsHelpFormatter,
+        )
+        parser.add_argument("--fmt", default="json", help="Format.")
+        text = parser.format_help()
+        assert "  indented line2" in text
+        assert "Format. (default: json)" in text
 
 
 if __name__ == "__main__":
