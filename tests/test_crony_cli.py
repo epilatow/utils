@@ -270,7 +270,7 @@ class TestConfigSubcommandDispatch:
         out = capsys.readouterr().out
         # The subcommand's full help (usage line + the action list),
         # not just a usage stub.
-        assert "config [-h] <action>" in out
+        assert "config [-h] <command>" in out
         assert "init" in out and "generate-uuid" in out
 
     def test_config_unknown_action_errors(self, capsys: Any) -> None:

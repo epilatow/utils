@@ -510,6 +510,23 @@ class HelpWidthBase:
             + "\n".join(overflow)
         )
 
+    def test_subcommand_groups_set_command_metavar(self) -> None:
+        """Every subcommand group sets ``metavar="<command>"`` so its usage
+        line shows the placeholder, not the full (unwrappable) choices set
+        that would otherwise blow the width budget."""
+        offenders: list[str] = []
+        for sub in self._all_parsers(type(self).PARSER_FUNC()):
+            for action in sub._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    if action.metavar != "<command>":
+                        offenders.append(
+                            f"{sub.prog}: metavar={action.metavar!r}"
+                        )
+        assert not offenders, (
+            'subcommand groups must set metavar="<command>":\n'
+            + "\n".join(offenders)
+        )
+
 
 def run_tests(
     test_file: str,

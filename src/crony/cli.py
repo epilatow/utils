@@ -348,7 +348,7 @@ def _build_parser() -> StrictArgumentParser:
         help="Manage the config file.",
     )
     config_subparsers = p_config.add_command_subparsers(
-        metavar="<action>",
+        metavar="<command>",
     )
 
     p_config_init = config_subparsers.add_parser(
