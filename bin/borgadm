@@ -29,6 +29,7 @@ import stat
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import typing
@@ -161,26 +162,29 @@ logger = logging.getLogger()
 
 
 # -----------------------------------------------------------------------------
-# Configuration, optional
+# Configuration schema
 # -----------------------------------------------------------------------------
-_BORG_PASSPHRASE_FILE: str = "~/.borg_passphrase"
-_BORG_SSHKEY_FILE: str = "~/.ssh/id_borg.net"
-_BORG_REMOTE_PATH: str = ""
-_BORG_CMD_TIMEOUT: int = 4 * 3600  # Timeout for borg commands: 4 hours
-_CMD_TIMEOUT: int = 60  # Timeout for non-borg commands: 1 minute
-_LOCK_CHECK_TIMEOUT: int = 5  # Lock-held probe wait: 5 seconds
+# CONFIG_FIELDS is the single source for every ~/.borgadm setting: the
+# default Config falls back to, its description, and the value `config
+# init` writes. A field with a template_value is written active
+# (uncommented) in the generated config; the rest are written commented at
+# their default. The test_config_fields_match_config gate asserts it
+# covers exactly the settings Config reads.
 
-_BACKUP_NAME: str = "home"
-_BACKUP_ROOT: str = "~"
-_BACKUP_MOUNTS: list[str] = []
 
-_CHECK_AGE_SECONDS: int = 24 * 3600  # Max backup age: 24 hours
+@dataclasses.dataclass(frozen=True)
+class ConfigField:
+    name: str
+    default: object
+    description: str
+    template_value: object | None = None
+    # The user-facing "you must set this" label for the docs and the
+    # generated config. Enforcement is separate and context-dependent
+    # (BORG_REPO is checked always; BACKUP_SETS only when a backup is
+    # about to run), so this flag is presentational, not a validation
+    # driver.
+    required: bool = False
 
-_PRUNE_KEEP_HOURLY: int = 24
-_PRUNE_KEEP_DAILY: int = 7
-_PRUNE_KEEP_WEEKLY: int = 4
-_PRUNE_KEEP_MONTHLY: int = 12
-_PRUNE_KEEP_YEARLY: int = 2
 
 # macOS paths auto-excluded on Darwin to prevent backup failures.
 _MACOS_EXCLUDES: list[str] = [
@@ -191,46 +195,181 @@ _MACOS_EXCLUDES: list[str] = [
     "Library/Google/GoogleSoftwareUpdate",
 ]
 
+# Shared by the two example backup sets `config init` writes.
+_EXAMPLE_EXCLUDES: list[str] = [
+    "sh:**/.venv",
+    "sh:**/node_modules",
+    "sh:**/__pycache__",
+    "sh:**/.pytest_cache",
+    "sh:**/.mypy_cache",
+    "sh:**/.ruff_cache",
+]
+_EXAMPLE_BACKUP_SETS: dict[str, dict[str, list[str]]] = {
+    "local": {
+        "excludes": _EXAMPLE_EXCLUDES,
+        "paths": ["Documents/", "Projects/"],
+    },
+    "fuse": {
+        "create_options": ["--noacls", "--noctime", "--noxattrs"],
+        "excludes": _EXAMPLE_EXCLUDES,
+        "paths": ["Shared/"],
+    },
+}
 
-# -----------------------------------------------------------------------------
-# Configuration, required
-# -----------------------------------------------------------------------------
-_BORG_REPO: str = ""
-_BORG_REPO_HOSTKEY: str = ""
-
-# Format:
-# BACKUP_SETS = {
-#   $set1_name: {
-#       "create_options": ["opt1", ...],
-#       "excludes": ["pattern1", ...], # optional
-#       "paths": ["path1", ...]
-#   }
-# }
-#
 # Archive names emitted by `borgadm create` follow
 #   {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM
-# where M is the count of configured sets and N is the 1-based
-# position of the set's name in sorted set-name order. When M has
-# two or more digits, N is zero-padded to match (e.g. 01of11,
-# ..., 11of11) so archive names sort correctly in alphabetical
-# listings. The suffix is required: an archive whose name shares
-# the BACKUP_NAME- prefix but does not parse into this shape is
-# surfaced as "unknown" by list and removable via `prune
-# --cleanup-unknown`.
+# where M is the count of configured sets and N is the 1-based position of
+# the set's name in sorted set-name order. When M has two or more digits,
+# N is zero-padded to match (e.g. 01of11, ..., 11of11) so archive names
+# sort correctly in alphabetical listings. The suffix is required: an
+# archive whose name shares the BACKUP_NAME- prefix but does not parse
+# into this shape is surfaced as "unknown" by list and removable via
+# `prune --cleanup-unknown`.
 #
-# The NofM suffix is the source of truth for set completeness: a
-# timestamp is "full" when every N in 1..M is present and "partial"
-# otherwise. Adding, removing, or renaming a set changes which N
-# future archives get but does NOT retroactively reclassify existing
-# archives -- old archives keep their original NofM.
-_BACKUP_SETS: dict[str, dict[str, list[str]]] = {}
+# The NofM suffix is the source of truth for set completeness: a timestamp
+# is "full" when every N in 1..M is present and "partial" otherwise.
+# Adding, removing, or renaming a set changes which N future archives get
+# but does NOT retroactively reclassify existing archives -- old archives
+# keep their original NofM.
+CONFIG_FIELDS: list[ConfigField] = [
+    ConfigField(
+        "BORG_REPO",
+        "",
+        "Path or ssh URL of the borg repository to manage",
+        template_value="ssh://user@host/./path/to/repo",
+        required=True,
+    ),
+    ConfigField(
+        "BORG_REPO_HOSTKEY",
+        "",
+        "known_hosts entry for the remote repository host",
+    ),
+    ConfigField(
+        "BORG_PASSPHRASE_FILE",
+        "~/.borg_passphrase",
+        "File holding the repository passphrase",
+    ),
+    ConfigField(
+        "BORG_SSHKEY_FILE",
+        "~/.ssh/id_borg.net",
+        "SSH private key used to reach a remote repository",
+    ),
+    ConfigField(
+        "BORG_REMOTE_PATH",
+        "",
+        "Path to the borg executable on the remote host",
+    ),
+    ConfigField(
+        "BORG_CMD_TIMEOUT",
+        4 * 3600,
+        "Timeout for borg commands, in seconds",
+    ),
+    ConfigField(
+        "CMD_TIMEOUT",
+        60,
+        "Timeout for non-borg commands, in seconds",
+    ),
+    ConfigField(
+        "LOCK_CHECK_TIMEOUT",
+        5,
+        "Seconds to wait probing whether the repository lock is held",
+    ),
+    ConfigField(
+        "BACKUP_NAME",
+        "home",
+        "Prefix for archive names",
+    ),
+    ConfigField(
+        "BACKUP_ROOT",
+        "~",
+        "Directory `create` runs from and that backup-set paths are "
+        "resolved against",
+    ),
+    ConfigField(
+        "CHECK_AGE_SECONDS",
+        24 * 3600,
+        "Maximum age `check age` tolerates for the latest full backup, "
+        "in seconds",
+    ),
+    ConfigField(
+        "PRUNE_KEEP_HOURLY",
+        24,
+        "Hourly archives `prune` retains",
+    ),
+    ConfigField(
+        "PRUNE_KEEP_DAILY",
+        7,
+        "Daily archives `prune` retains",
+    ),
+    ConfigField(
+        "PRUNE_KEEP_WEEKLY",
+        4,
+        "Weekly archives `prune` retains",
+    ),
+    ConfigField(
+        "PRUNE_KEEP_MONTHLY",
+        12,
+        "Monthly archives `prune` retains",
+    ),
+    ConfigField(
+        "PRUNE_KEEP_YEARLY",
+        2,
+        "Yearly archives `prune` retains",
+    ),
+    ConfigField(
+        "BACKUP_MOUNTS",
+        [],
+        "JSON list of paths (relative to BACKUP_ROOT) that must be "
+        "mountpoints before `create` proceeds",
+        template_value=["Shared"],
+    ),
+    ConfigField(
+        "BACKUP_SETS",
+        {},
+        "JSON object mapping each backup-set name to its `paths`, "
+        "optional `excludes`, and optional `create_options`; `create` "
+        "writes one archive per set",
+        template_value=_EXAMPLE_BACKUP_SETS,
+        required=True,
+    ),
+]
+
+_FIELDS: dict[str, ConfigField] = {f.name: f for f in CONFIG_FIELDS}
+
+
+def _str_field(config: configparser.ConfigParser, name: str) -> str:
+    return config.get(
+        "default", name, fallback=cast(str, _FIELDS[name].default)
+    )
+
+
+def _path_field(config: configparser.ConfigParser, name: str) -> Path:
+    return Path(os.path.expanduser(_str_field(config, name)))
+
+
+def _int_field(config: configparser.ConfigParser, name: str) -> int:
+    return config.getint(
+        "default", name, fallback=cast(int, _FIELDS[name].default)
+    )
+
+
+def _json_field(config: configparser.ConfigParser, name: str) -> Any:
+    return json.loads(
+        config.get("default", name, fallback=json.dumps(_FIELDS[name].default))
+    )
 
 
 # -----------------------------------------------------------------------------
 # Classes
 # -----------------------------------------------------------------------------
 class Config:
-    def __init__(self, path: str, args: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        path: str,
+        args: dict[str, Any],
+        require_backup_sets: bool = False,
+    ) -> None:
+        self.path: Path = Path(path)
         try:
             with open(path) as f:
                 content = f.read()
@@ -249,103 +388,64 @@ class Config:
         except configparser.ParsingError as e:
             raise ConfigError(f"Failed to parse config file {path}: {e}") from e
 
-        self.BORG_PASSPHRASE_FILE: Path = Path(
-            os.path.expanduser(
-                config.get(
-                    "default",
-                    "BORG_PASSPHRASE_FILE",
-                    fallback=_BORG_PASSPHRASE_FILE,
-                )
-            )
+        self.BORG_PASSPHRASE_FILE: Path = _path_field(
+            config, "BORG_PASSPHRASE_FILE"
         )
-        self.BORG_SSHKEY_FILE: Path = Path(
-            os.path.expanduser(
-                config.get(
-                    "default", "BORG_SSHKEY_FILE", fallback=_BORG_SSHKEY_FILE
-                )
-            )
-        )
-        self.BORG_REMOTE_PATH: str = config.get(
-            "default", "BORG_REMOTE_PATH", fallback=_BORG_REMOTE_PATH
-        )
-        self.BORG_CMD_TIMEOUT: int = config.getint(
-            "default", "BORG_CMD_TIMEOUT", fallback=_BORG_CMD_TIMEOUT
-        )
-        self.CMD_TIMEOUT: int = config.getint(
-            "default", "CMD_TIMEOUT", fallback=_CMD_TIMEOUT
-        )
-        self.LOCK_CHECK_TIMEOUT: int = config.getint(
-            "default", "LOCK_CHECK_TIMEOUT", fallback=_LOCK_CHECK_TIMEOUT
-        )
+        self.BORG_SSHKEY_FILE: Path = _path_field(config, "BORG_SSHKEY_FILE")
+        self.BORG_REMOTE_PATH: str = _str_field(config, "BORG_REMOTE_PATH")
+        self.BORG_CMD_TIMEOUT: int = _int_field(config, "BORG_CMD_TIMEOUT")
+        self.CMD_TIMEOUT: int = _int_field(config, "CMD_TIMEOUT")
+        self.LOCK_CHECK_TIMEOUT: int = _int_field(config, "LOCK_CHECK_TIMEOUT")
 
-        self.BACKUP_NAME: str = config.get(
-            "default", "BACKUP_NAME", fallback=_BACKUP_NAME
-        )
-        self.BACKUP_ROOT: Path = Path(
-            os.path.expanduser(
-                config.get("default", "BACKUP_ROOT", fallback=_BACKUP_ROOT)
-            )
-        )
+        self.BACKUP_NAME: str = _str_field(config, "BACKUP_NAME")
+        self.BACKUP_ROOT: Path = _path_field(config, "BACKUP_ROOT")
 
+        # CHECK_AGE_SECONDS and the PRUNE_KEEP_* counts take an optional
+        # per-run CLI override; absent that they come from the config (or
+        # the field default).
         if (v := args.pop("seconds", None)) is not None:
             self.CHECK_AGE_SECONDS: int = v
         else:
-            self.CHECK_AGE_SECONDS = config.getint(
-                "default", "CHECK_AGE_SECONDS", fallback=_CHECK_AGE_SECONDS
-            )
+            self.CHECK_AGE_SECONDS = _int_field(config, "CHECK_AGE_SECONDS")
 
         if (v := args.pop("keep_hourly", None)) is not None:
             self.PRUNE_KEEP_HOURLY: int = v
         else:
-            self.PRUNE_KEEP_HOURLY = config.getint(
-                "default", "PRUNE_KEEP_HOURLY", fallback=_PRUNE_KEEP_HOURLY
-            )
+            self.PRUNE_KEEP_HOURLY = _int_field(config, "PRUNE_KEEP_HOURLY")
         if (v := args.pop("keep_daily", None)) is not None:
             self.PRUNE_KEEP_DAILY: int = v
         else:
-            self.PRUNE_KEEP_DAILY = config.getint(
-                "default", "PRUNE_KEEP_DAILY", fallback=_PRUNE_KEEP_DAILY
-            )
+            self.PRUNE_KEEP_DAILY = _int_field(config, "PRUNE_KEEP_DAILY")
         if (v := args.pop("keep_weekly", None)) is not None:
             self.PRUNE_KEEP_WEEKLY: int = v
         else:
-            self.PRUNE_KEEP_WEEKLY = config.getint(
-                "default", "PRUNE_KEEP_WEEKLY", fallback=_PRUNE_KEEP_WEEKLY
-            )
+            self.PRUNE_KEEP_WEEKLY = _int_field(config, "PRUNE_KEEP_WEEKLY")
         if (v := args.pop("keep_monthly", None)) is not None:
             self.PRUNE_KEEP_MONTHLY: int = v
         else:
-            self.PRUNE_KEEP_MONTHLY = config.getint(
-                "default", "PRUNE_KEEP_MONTHLY", fallback=_PRUNE_KEEP_MONTHLY
-            )
+            self.PRUNE_KEEP_MONTHLY = _int_field(config, "PRUNE_KEEP_MONTHLY")
 
         if (v := args.pop("keep_yearly", None)) is not None:
             self.PRUNE_KEEP_YEARLY: int = v
         else:
-            self.PRUNE_KEEP_YEARLY = config.getint(
-                "default", "PRUNE_KEEP_YEARLY", fallback=_PRUNE_KEEP_YEARLY
-            )
+            self.PRUNE_KEEP_YEARLY = _int_field(config, "PRUNE_KEEP_YEARLY")
 
-        self.BORG_REPO: str = config.get(
-            "default", "BORG_REPO", fallback=_BORG_REPO
-        )
-        self.BORG_REPO_HOSTKEY: str = config.get(
-            "default", "BORG_REPO_HOSTKEY", fallback=_BORG_REPO_HOSTKEY
-        )
-        self.BACKUP_MOUNTS: list[str] = json.loads(
-            config.get(
-                "default", "BACKUP_MOUNTS", fallback=json.dumps(_BACKUP_MOUNTS)
-            )
-        )
-        self.BACKUP_SETS: dict[str, dict[str, list[str]]] = json.loads(
-            config.get(
-                "default", "BACKUP_SETS", fallback=json.dumps(_BACKUP_SETS)
-            )
+        self.BORG_REPO: str = _str_field(config, "BORG_REPO")
+        self.BORG_REPO_HOSTKEY: str = _str_field(config, "BORG_REPO_HOSTKEY")
+        self.BACKUP_MOUNTS: list[str] = _json_field(config, "BACKUP_MOUNTS")
+        self.BACKUP_SETS: dict[str, dict[str, list[str]]] = _json_field(
+            config, "BACKUP_SETS"
         )
 
         errors: list[str] = []
         if not self.BORG_REPO:
             errors.append(f"BORG_REPO not defined in config: {path}")
+        # BACKUP_SETS is required to back anything up but is consumed only
+        # by the create path, so most commands run without it. `validate`
+        # opts into the stricter check so it can flag the gap before the
+        # first backup rather than letting create fail later.
+        if require_backup_sets and not self.BACKUP_SETS:
+            errors.append(f"BACKUP_SETS not defined in config: {path}")
         if not any(
             [
                 self.PRUNE_KEEP_HOURLY,
@@ -637,12 +737,13 @@ def run_cmd(
     track_warning: bool = True,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
-    slow_cmds = borg_cmd() + ["rsync"]
-    timeout: int = _BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else _CMD_TIMEOUT
+    slow = cmd[0] in borg_cmd() + ["rsync"]
+    # Before CFG is loaded, fall back to the field defaults.
+    timeout: int = cast(
+        int, _FIELDS["BORG_CMD_TIMEOUT" if slow else "CMD_TIMEOUT"].default
+    )
     if CFG:
-        timeout = (
-            CFG.BORG_CMD_TIMEOUT if cmd[0] in slow_cmds else CFG.CMD_TIMEOUT
-        )
+        timeout = CFG.BORG_CMD_TIMEOUT if slow else CFG.CMD_TIMEOUT
     if sudo:
         cmd = ["sudo", "-n", "-E"] + cmd
     cmd_str = shlex.join(cmd)
@@ -2332,6 +2433,81 @@ def do_environment() -> None:
         logger.info(f"export BORG_REMOTE_PATH={cfg.BORG_REMOTE_PATH}")
 
 
+_CONFIG_HEADER = """\
+# borgadm configuration file (~/.borgadm)
+#
+# INI-style "key = value" settings read by borgadm. Edit BORG_REPO and
+# BACKUP_SETS below, then uncomment any other key whose default you want
+# to override. Regenerate this template with `borgadm config init`.
+"""
+
+
+def _fmt_ini_value(value: object) -> str:
+    """Render a field value as it appears after `KEY = ` in the config.
+
+    A non-empty object is pretty-printed and every continuation line
+    indented so configparser reads the whole block as one multi-line
+    value; everything else is a single token.
+    """
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, dict) and value:
+        head, *rest = json.dumps(value, indent=4).split("\n")
+        return "\n".join([head, *(f"    {line}" for line in rest)])
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _render_default_config() -> str:
+    """Render the starter config from CONFIG_FIELDS: the authored header,
+    then each field as a wrapped description comment followed by an active
+    `KEY = template_value` (when the field carries one) or a commented
+    `# KEY = default`."""
+    lines = [_CONFIG_HEADER.rstrip("\n")]
+    for field in CONFIG_FIELDS:
+        suffix = " (required)" if field.required else ""
+        lines.append("")
+        for line in textwrap.wrap(f"{field.description}{suffix}.", width=76):
+            lines.append(f"# {line}")
+        if field.template_value is not None:
+            lines.append(
+                f"{field.name} = {_fmt_ini_value(field.template_value)}"
+            )
+        else:
+            lines.append(f"# {field.name} = {_fmt_ini_value(field.default)}")
+    # An empty value leaves a trailing "= "; strip per physical line.
+    body = "\n".join(lines)
+    return "\n".join(line.rstrip() for line in body.split("\n")) + "\n"
+
+
+def do_config_init(config: str, force: bool) -> None:
+    """Write a generated starter config to `config` (the --config path,
+    default ~/.borgadm)."""
+    dest = Path(config)
+    if dest.exists() and not force:
+        raise ConfigError(
+            f"Config file already exists: {dest} (pass --force to overwrite)"
+        )
+    try:
+        dest.write_text(_render_default_config(), encoding="utf-8")
+    except OSError as e:
+        raise ConfigError(f"Failed to write config file {dest}: {e}") from e
+    logger.info(f"Wrote config template to {dest}")
+
+
+def do_config_validate(config: str) -> None:
+    """Load the config at `config` and report whether it is structurally
+    valid.
+
+    Construction IS the validation: a malformed or incomplete config
+    (including a missing BACKUP_SETS, which create requires) raises
+    ConfigError before this returns.
+    """
+    cfg = Config(config, {}, require_backup_sets=True)
+    logger.info(f"config valid: {cfg.path}")
+
+
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
@@ -2516,6 +2692,36 @@ def args_parser() -> StrictArgumentParser:
 
     compact = add_parser("compact", help="Check full backup metadata")
     add_progress(compact)
+
+    config = add_parser(
+        "config",
+        help="Create or validate the config file",
+    )
+    config_subparsers = config.add_command_subparsers(metavar="<command>")
+    config_init = config_subparsers.add_parser(
+        "init",
+        help="Write a starter config file",
+        description=(
+            "Write the shipped example config to ~/.borgadm, refusing to "
+            "overwrite an existing file unless --force is given."
+        ),
+        formatter_class=DefaultsHelpFormatter,
+    )
+    config_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing config file",
+    )
+    config_subparsers.add_parser(
+        "validate",
+        help="Validate the config file",
+        description=(
+            "Load the config file (see --config) and report whether it is "
+            "structurally valid, listing any errors. Does not connect to "
+            "the repository."
+        ),
+        formatter_class=DefaultsHelpFormatter,
+    )
 
     delete_cmd = add_parser(
         "delete", help="Delete archives by timestamp or name"
@@ -2724,6 +2930,8 @@ COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
     "check prune": do_check_prune,
     "check repo": do_check_repo,
     "compact": do_compact,
+    "config init": do_config_init,
+    "config validate": do_config_validate,
     "create": do_create,
     "delete": do_delete,
     "environment": do_environment,
@@ -2751,6 +2959,7 @@ def main(
     top_command = command.split(" ", 1)[0]
     quick_commands = {
         "automate",
+        "config",
         "environment",
         "list",
         "log-files",
@@ -2767,20 +2976,29 @@ def main(
         atexit.register(report_runtime)
 
         global CFG
-        CFG = Config(config, args_dict)
-        initialize_borg_environment()
+        # `config` subcommands operate on the config file itself, so they
+        # skip the usual load + borg-env setup: init writes a starter file
+        # before any config exists, and validate builds and checks the
+        # Config on its own. They still need the --config path, so it
+        # rejoins the dispatch kwargs; every other command gets a loaded
+        # CFG and a ready borg environment first.
+        if top_command == "config":
+            args_dict["config"] = config
+        else:
+            CFG = Config(config, args_dict)
+            initialize_borg_environment()
 
-        backup_set_commands = {
-            "check",
-            "create",
-            "delete",
-            "extract",
-            "list",
-            "prune",
-            "rsync",
-        }
-        if top_command in backup_set_commands:
-            logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
+            backup_set_commands = {
+                "check",
+                "create",
+                "delete",
+                "extract",
+                "list",
+                "prune",
+                "rsync",
+            }
+            if top_command in backup_set_commands:
+                logger.debug(f"BACKUP_SETS={CFG.BACKUP_SETS}")
 
         if timed:
             logger.info(f"borgadm {cmd_label}: started")

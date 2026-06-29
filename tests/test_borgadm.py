@@ -114,7 +114,13 @@ _CONFIG_CONSUMED_KEYS = (
 def mock_config_constructor(cfg: Any) -> Any:
     """Return a Config side_effect that pops args like the real one."""
 
-    def constructor(_config_path: str, args: dict[str, Any]) -> Any:
+    def constructor(
+        _config_path: str,
+        args: dict[str, Any],
+        require_backup_sets: bool = False,  # noqa: ARG001
+    ) -> Any:
+        # require_backup_sets mirrors the real Config signature so the
+        # `config validate` path's keyword call binds; the mock ignores it.
         for key in _CONFIG_CONSUMED_KEYS:
             args.pop(key, None)
         return cfg
@@ -465,6 +471,8 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
         (["list", "--bogus"], "list"),
         (["check", "age", "--bogus"], "check age"),
         (["repair", "repo", "--bogus"], "repair repo"),
+        (["config", "init", "--bogus"], "config init"),
+        (["config", "validate", "--bogus"], "config validate"),
     ]
 
 
@@ -515,6 +523,13 @@ class TestCmdCallbacks(CmdCallbacksBase):
         "keep_yearly",
         # Consumed by the repair-check parser validator:
         "yes",
+    }
+    # main() re-injects the --config path for the config subcommands (they
+    # operate on the file itself); keep in sync with the dispatcher's
+    # `if top_command == "config"` branch.
+    INJECTED_GLOBALS = {
+        "config init": {"config"},
+        "config validate": {"config"},
     }
 
     @pytest.fixture(autouse=True)
@@ -2337,6 +2352,178 @@ class TestDoEnvironment:
                 ba.do_environment()
         messages = [r.message for r in caplog.records]
         assert any("ssh-add -q" in m for m in messages)
+
+
+class TestConfigCommands:
+    """config init / config validate subcommands."""
+
+    def test_init_writes_template(self) -> None:
+        """config init writes the shipped template to the config path."""
+        assert not ba.CONFIG.exists()
+        ba.do_config_init(str(ba.CONFIG), force=False)
+        assert ba.CONFIG.exists()
+        text = ba.CONFIG.read_text(encoding="utf-8")
+        assert "BORG_REPO" in text
+        assert "BACKUP_SETS" in text
+
+    def test_init_refuses_existing_without_force(self) -> None:
+        """An existing config is left intact unless --force is given."""
+        ba.CONFIG.write_text("KEEP ME", encoding="utf-8")
+        with pytest.raises(ba.ConfigError, match="already exists"):
+            ba.do_config_init(str(ba.CONFIG), force=False)
+        assert ba.CONFIG.read_text(encoding="utf-8") == "KEEP ME"
+
+    def test_init_force_overwrites(self) -> None:
+        """--force replaces an existing config with the template."""
+        ba.CONFIG.write_text("OLD", encoding="utf-8")
+        ba.do_config_init(str(ba.CONFIG), force=True)
+        text = ba.CONFIG.read_text(encoding="utf-8")
+        assert "OLD" not in text
+        assert "BACKUP_SETS" in text
+
+    def test_init_honors_config_flag(self, tmp_path: Path) -> None:
+        """config init writes to the --config path, not the default."""
+        dest = tmp_path / "custom.borgadm"
+        ba.do_config_init(str(dest), force=False)
+        assert dest.exists()
+        assert "BACKUP_SETS" in dest.read_text(encoding="utf-8")
+        assert not ba.CONFIG.exists()
+
+    def test_validate_reports_resolved_path(
+        self, tmp_path: Path, caplog: Any
+    ) -> None:
+        """do_config_validate builds the Config and reports its path."""
+        cfg_file = tmp_path / "ok"
+        cfg_file.write_text(
+            'BORG_REPO = /repo\nBACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.INFO):
+            ba.do_config_validate(str(cfg_file))
+        assert any(
+            f"config valid: {cfg_file}" in r.message for r in caplog.records
+        )
+
+    def test_init_cli_writes_then_refuses_then_forces(self) -> None:
+        """`config init` writes, refuses a second run, and --force wins."""
+        with patch("sys.argv", ["borgadm", "config", "init"]):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+        assert ba.CONFIG.exists()
+        with patch("sys.argv", ["borgadm", "config", "init"]):
+            assert ba.cli() == ba.ExitCode.CONFIG
+        with patch("sys.argv", ["borgadm", "config", "init", "--force"]):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+
+    def test_init_cli_honors_config_flag(self, tmp_path: Path) -> None:
+        """`config init --config PATH` writes PATH, not the default."""
+        dest = tmp_path / "elsewhere.borgadm"
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "init", "--config", str(dest)],
+        ):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+        assert dest.exists()
+        assert not ba.CONFIG.exists()
+
+    def test_validate_cli_passes_on_good_config(
+        self, tmp_path: Path, caplog: Any
+    ) -> None:
+        cfg_file = tmp_path / "good"
+        cfg_file.write_text(
+            'BORG_REPO = /repo\nBACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "sys.argv",
+                ["borgadm", "config", "validate", "--config", str(cfg_file)],
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+        assert any("config valid:" in r.message for r in caplog.records)
+
+    def test_validate_cli_reports_errors(self, tmp_path: Path) -> None:
+        """A config missing BORG_REPO fails validation with CONFIG."""
+        cfg_file = tmp_path / "bad"
+        cfg_file.write_text(
+            'BACKUP_SETS = {"s": {"paths": ["x"]}}\n', encoding="utf-8"
+        )
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "validate", "--config", str(cfg_file)],
+        ):
+            assert ba.cli() == ba.ExitCode.CONFIG
+
+    def test_validate_cli_flags_missing_backup_sets(
+        self, tmp_path: Path
+    ) -> None:
+        """validate fails when BACKUP_SETS is absent, even with a repo set:
+        create needs it, so the gap surfaces here, not at first backup."""
+        cfg_file = tmp_path / "no_sets"
+        cfg_file.write_text("BORG_REPO = /repo\n", encoding="utf-8")
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "validate", "--config", str(cfg_file)],
+        ):
+            assert ba.cli() == ba.ExitCode.CONFIG
+
+    def test_validate_cli_missing_file(self, tmp_path: Path) -> None:
+        """Validating an absent config file fails with CONFIG."""
+        with patch(
+            "sys.argv",
+            [
+                "borgadm",
+                "config",
+                "validate",
+                "--config",
+                str(tmp_path / "nope"),
+            ],
+        ):
+            assert ba.cli() == ba.ExitCode.CONFIG
+
+    def test_generated_config_is_valid(self, tmp_path: Path) -> None:
+        """The config `config init` generates is ASCII, parses as INI,
+        carries valid-JSON BACKUP_SETS, and loads through Config."""
+        cfg_file = tmp_path / "generated"
+        ba.do_config_init(str(cfg_file), force=False)
+        text = cfg_file.read_text(encoding="utf-8")
+        text.encode("ascii")  # raises if non-ASCII slips in
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BORG_REPO
+        assert set(cfg.BACKUP_SETS) == {"local", "fuse"}
+        assert cfg.BACKUP_SETS["fuse"]["create_options"] == [
+            "--noacls",
+            "--noctime",
+            "--noxattrs",
+        ]
+        assert "create_options" not in cfg.BACKUP_SETS["local"]
+
+    def test_config_fields_match_config(self, tmp_path: Path) -> None:
+        """CONFIG_FIELDS covers exactly the settings Config reads -- so a
+        field added to one without the other (the historical drift) fails
+        here rather than silently dropping from the docs or generated
+        config."""
+        cfg_file = tmp_path / "generated"
+        ba.do_config_init(str(cfg_file), force=False)
+        cfg = ba.Config(str(cfg_file), {})
+        read_attrs = {k for k in vars(cfg) if k.isupper()}
+        schema_names = {f.name for f in ba.CONFIG_FIELDS}
+        assert read_attrs == schema_names
+
+    def test_init_then_validate_roundtrip(self, tmp_path: Path) -> None:
+        """A freshly generated config passes `config validate` unedited."""
+        cfg_file = tmp_path / "generated"
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "init", "--config", str(cfg_file)],
+        ):
+            assert ba.cli() == ba.ExitCode.SUCCESS
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "validate", "--config", str(cfg_file)],
+        ):
+            assert ba.cli() == ba.ExitCode.SUCCESS
 
 
 class TestRequireBorgOrFail:

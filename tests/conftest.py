@@ -177,6 +177,12 @@ class CmdCallbacksBase:
     CLI_FUNC: ClassVar[Any]
     EXIT_CODE_USAGE: ClassVar[int]
     POPPED_ARGS: ClassVar[set[str]] = set()
+    # Popped globals the dispatcher re-injects for specific commands, keyed
+    # by command (e.g. a command whose handler is passed the --config path
+    # explicitly). Modelled independently of the handler signature so the
+    # gate still fails a handler that should receive an injected global but
+    # forgets to declare it.
+    INJECTED_GLOBALS: ClassVar[dict[str, set[str]]] = {}
     TEST_SUBCOMMAND: ClassVar[str] = ""
     EXCEPTION_EXIT_CODE_MAP: ClassVar[list[tuple[Exception, int]]] = []
 
@@ -226,7 +232,6 @@ class CmdCallbacksBase:
         """Callback signatures match their subparser args."""
         parser = type(self).PARSER_FUNC()
         subs = dict(self._leaf_subparsers(parser))
-        skip = {"command"} | self.POPPED_ARGS
 
         for cmd, fn in self.CALLBACKS.items():
             sub = subs[cmd]
@@ -242,7 +247,12 @@ class CmdCallbacksBase:
                 ):
                     continue
                 arg_names.add(action.dest)
-            arg_names -= skip
+            # Pass exactly what the dispatcher passes: the per-subcommand
+            # args, minus the popped globals, plus any global main()
+            # re-injects for this command. Independent of fn's signature,
+            # so a handler that omits an injected global still fails.
+            arg_names -= {"command"} | self.POPPED_ARGS
+            arg_names |= self.INJECTED_GLOBALS.get(cmd, set())
             arg_names = {n for n in arg_names if not n.startswith("_")}
 
             # autospec enforces the real signature
