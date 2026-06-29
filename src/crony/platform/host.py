@@ -19,8 +19,6 @@ backend documents how it realizes a service; this interface states only
 the contract.
 """
 
-from __future__ import annotations
-
 import abc
 import enum
 

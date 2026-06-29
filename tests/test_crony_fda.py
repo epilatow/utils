@@ -7,8 +7,6 @@
 
 """Unit tests for crony.platform.fda (the Crony.app FDA wrapper)."""
 
-from __future__ import annotations
-
 import os
 import platform
 import shutil

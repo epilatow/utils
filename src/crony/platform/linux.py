@@ -10,8 +10,6 @@ unsupported (`supports_interactive` is False): the idle / lock probes
 and dialogs raise.
 """
 
-from __future__ import annotations
-
 import os
 import select
 import shutil

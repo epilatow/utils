@@ -35,8 +35,6 @@ bug, so there's nothing to watch); it still parses its arguments
 first, so --help behaves the same everywhere.
 """
 
-from __future__ import annotations
-
 import argparse
 import datetime
 import logging

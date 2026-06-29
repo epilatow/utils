@@ -7,8 +7,6 @@
 
 """Unit tests for the crony CLI entry point."""
 
-from __future__ import annotations
-
 import logging
 import os
 import sys

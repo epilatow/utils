@@ -7,8 +7,6 @@
 
 """Unit tests for crony.model."""
 
-from __future__ import annotations
-
 import dataclasses
 import json
 import sys

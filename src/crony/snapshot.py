@@ -22,8 +22,6 @@ parse the stored strings / booleans back into their `crony.unit` /
 knowing the on-disk encoding.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 

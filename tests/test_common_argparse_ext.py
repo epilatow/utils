@@ -7,8 +7,6 @@
 
 """Unit tests for common.argparse_ext (shared by every bin/ utility)."""
 
-from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path

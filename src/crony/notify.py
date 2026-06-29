@@ -13,8 +13,6 @@ host keychain or a mode-checked file. Best-effort by contract: a single
 channel's failure is captured and never suppresses the others.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import os
 import re
@@ -569,7 +567,7 @@ def resolve_notify_at_runtime(
     bn, short = crony.config.parse_full_name(full_name)
     try:
         bundles = crony.config.TomlConfig.load_all()
-    except (OSError, crony.errors.ConfigError, crony.errors.UsageError):
+    except OSError, crony.errors.ConfigError, crony.errors.UsageError:
         return [], crony.config.Defaults()
     bundle = bundles.by_name(bn)
     if bundle is None:

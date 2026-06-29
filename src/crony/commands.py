@@ -12,8 +12,6 @@ shelling out to the crony CLI; it orchestrates the lower layers
 lifecycle itself (apply_one / destroy_one) lives in crony.runtime.
 """
 
-from __future__ import annotations
-
 import argparse
 import dataclasses
 import datetime

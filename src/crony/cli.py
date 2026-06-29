@@ -10,8 +10,6 @@ closed consumer (e.g. `head`) terminates cleanly rather than killing the
 process mid-line.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -143,7 +141,7 @@ class _BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
         if isinstance(exc, BrokenPipeError):
             try:
                 self.stream.close()
-            except (BrokenPipeError, OSError):
+            except BrokenPipeError, OSError:
                 pass
             self.stream = open(os.devnull, "w")
             return

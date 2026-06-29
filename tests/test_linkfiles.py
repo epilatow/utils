@@ -15,8 +15,6 @@ discovery rules (ignore files, dotfile-skipping), and per-record install
 / audit / remove spanning distinct targets.
 """
 
-from __future__ import annotations
-
 import shutil
 import sys
 from pathlib import Path

@@ -10,8 +10,6 @@ malformed config; per-entity failures demote into the bundle's errored_*
 maps rather than aborting the whole bundle.
 """
 
-from __future__ import annotations
-
 import contextvars
 import enum
 import logging

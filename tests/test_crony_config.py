@@ -7,8 +7,6 @@
 
 """Unit tests for crony.config."""
 
-from __future__ import annotations
-
 import logging
 import sys
 import uuid

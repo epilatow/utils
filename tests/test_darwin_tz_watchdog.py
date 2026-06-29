@@ -7,8 +7,6 @@
 
 """Tests for bin/darwin-tz-watchdog."""
 
-from __future__ import annotations
-
 import subprocess
 import sys
 from pathlib import Path

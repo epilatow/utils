@@ -9,8 +9,6 @@ sleep-inhibitor wrap, and the desktop-interaction primitives (HID idle
 `osascript`).
 """
 
-from __future__ import annotations
-
 import select
 import shutil
 import subprocess
@@ -73,7 +71,7 @@ class DarwinHost(HostPlatform):
         argv.append("-w")
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError, subprocess.TimeoutExpired:
             return None
         if r.returncode == 0:
             return r.stdout.rstrip("\n")
@@ -132,7 +130,7 @@ class DarwinHost(HostPlatform):
                 check=False,
                 timeout=5,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError, subprocess.TimeoutExpired:
             return 0.0
         for line in proc.stdout.splitlines():
             if '"HIDIdleTime"' not in line:
@@ -157,7 +155,7 @@ class DarwinHost(HostPlatform):
                 check=False,
                 timeout=5,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError, subprocess.TimeoutExpired:
             return False
         return '"CGSSessionScreenIsLocked"=Yes' in proc.stdout
 

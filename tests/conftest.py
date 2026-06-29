@@ -1,8 +1,6 @@
 """Pytest configuration - runs before test collection."""
 # This is AI generated code
 
-from __future__ import annotations
-
 import argparse
 import atexit
 import inspect

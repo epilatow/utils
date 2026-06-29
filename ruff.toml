@@ -1,10 +1,6 @@
 line-length = 80
-# Pinned so this stays decoupled from the >=3.14 requires-python floor:
-# without it, ruff would infer a py314 target and its formatter/linter
-# would demand the 3.14 syntax modernizations (e.g. PEP 758 parenless
-# except) here. Those land together in their own change, which lifts this
-# to py314.
-target-version = "py311"
+# target-version is left unset: ruff infers it from pyproject's
+# requires-python (>=3.14), so the floor is the single source of truth.
 
 [lint]
 extend-select = ["RUF059"]

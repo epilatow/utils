@@ -13,8 +13,6 @@ synchronously for it to exit via a kernel pid-exit notification, then
 rolls the children up into the group's result.
 """
 
-from __future__ import annotations
-
 import contextlib
 import dataclasses
 import datetime
@@ -671,7 +669,7 @@ def _child_full_name_from_uuid(child_ref: crony.unit.EntityRef) -> str | None:
         return None
     try:
         raw = json.loads(snap_p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return None
     name = raw.get("name")
     return name if isinstance(name, str) else None
@@ -1119,7 +1117,7 @@ def trigger_unit_sync(
             try:
                 parsed = json.loads(last_run_path.read_text(encoding="utf-8"))
                 rec = parsed if isinstance(parsed, dict) else None
-            except (OSError, json.JSONDecodeError):
+            except OSError, json.JSONDecodeError:
                 rec = None
             ended_at = rec.get("ended_at") if rec is not None else None
             if ended_at:

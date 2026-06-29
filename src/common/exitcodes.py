@@ -12,8 +12,6 @@ and CRASHED are carried by every utility; the rest (e.g. TIMEOUT) are
 used only where they apply.
 """
 
-from __future__ import annotations
-
 import enum
 import signal
 from collections.abc import Container

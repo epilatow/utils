@@ -6,8 +6,6 @@
 #
 # IMPORTANT: This script has tests in tests/test_secure_archiver.py
 
-from __future__ import annotations
-
 import argparse
 import datetime as dt
 import glob
@@ -20,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,14 +37,6 @@ from common.argparse_ext import (  # noqa: E402
 )
 from common.cli import cli_entrypoint  # noqa: E402
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
-
-try:
-    import tomllib
-except ImportError:
-    raise RuntimeError(
-        "Python 3.11+ required (tomllib not available)."
-    ) from None
-
 
 # =============================================================================
 # ARCHIVE DESIGN

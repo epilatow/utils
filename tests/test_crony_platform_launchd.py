@@ -7,8 +7,6 @@
 
 """Unit tests for crony.platform.launchd (the macOS backend)."""
 
-from __future__ import annotations
-
 import plistlib
 import subprocess
 import sys

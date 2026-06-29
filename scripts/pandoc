@@ -41,8 +41,6 @@ review). If it changed, `--push` refuses and leaves the worktree for a
 human.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import io

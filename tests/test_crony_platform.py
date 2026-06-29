@@ -10,8 +10,6 @@ get_scheduler / get_host factories). Backend-specific tests live in
 test_crony_platform_{launchd,systemd}.py (schedulers) and
 test_crony_platform_host_{darwin,linux}.py (host platforms)."""
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 

@@ -8,8 +8,6 @@
 """Unit tests for crony.paths: the tool basename and the CRONY_<KEY>
 env override helper the config / state directories resolve through."""
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 

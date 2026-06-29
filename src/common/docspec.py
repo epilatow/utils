@@ -17,8 +17,6 @@ lets each utility own its documentation content while render-docs stays
 pure formatting.
 """
 
-from __future__ import annotations
-
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field

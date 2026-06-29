@@ -30,8 +30,6 @@ failure here, not a skip, because without it the man page can't be
 regenerated at all.
 """
 
-from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path

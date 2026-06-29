@@ -14,8 +14,6 @@ Exit codes:
     2 - Script infrastructure error
 """
 
-from __future__ import annotations
-
 import argparse
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys

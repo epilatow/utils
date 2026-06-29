@@ -22,8 +22,6 @@ group -> children fan-out happens at run time, so the platform layer
 never needs to be job/group aware.
 """
 
-from __future__ import annotations
-
 import enum
 import re
 import uuid

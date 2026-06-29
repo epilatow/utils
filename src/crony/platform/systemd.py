@@ -7,8 +7,6 @@ that arms it. Schedule-less entries install only the static `.service`,
 which sits dormant until `crony trigger` or a parent group fires it.
 """
 
-from __future__ import annotations
-
 import configparser
 import os
 import shlex
@@ -130,7 +128,7 @@ def _is_enabled(unit: str) -> str:
             text=True,
             timeout=5,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return ""
     return r.stdout.strip()
 
@@ -163,7 +161,7 @@ def _show_services(units: list[str]) -> list[dict[str, str]]:
             text=True,
             timeout=5,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return []
     blocks: list[dict[str, str]] = []
     cur: dict[str, str] = {}
@@ -192,7 +190,7 @@ def _current_user() -> str:
         import pwd
 
         return pwd.getpwuid(os.getuid()).pw_name
-    except (ImportError, KeyError):
+    except ImportError, KeyError:
         return ""
 
 
@@ -213,7 +211,7 @@ def _linger_enabled(user: str) -> bool | None:
             text=True,
             timeout=5,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return None
     if result.returncode != 0:
         return None

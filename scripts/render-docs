@@ -55,8 +55,6 @@ writing (no pandoc needed); the pandoc-built roff is gated by the pytest
 freshness test instead.
 """
 
-from __future__ import annotations
-
 import argparse
 import importlib
 import json
@@ -511,7 +509,7 @@ def _pandoc_version(pandoc: str) -> str | None:
             text=True,
             check=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return None
     first = out.splitlines()[0].split() if out else []
     return first[1] if len(first) >= 2 and first[0] == "pandoc" else None

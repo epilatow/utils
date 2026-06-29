@@ -7,8 +7,6 @@ Each entity is a single LaunchAgent plist: a scheduled entry carries a
 dormant (`RunAtLoad=false`) until something fires it.
 """
 
-from __future__ import annotations
-
 import os
 import plistlib
 import shlex
@@ -114,7 +112,7 @@ def _plist_argv(content: str) -> list[str] | None:
     `/bin/sh -c 'exec <argv>'` ProgramArguments back to the argv list."""
     try:
         data = plistlib.loads(content.encode("utf-8"))
-    except (plistlib.InvalidFileException, ValueError, OSError):
+    except plistlib.InvalidFileException, ValueError, OSError:
         return None
     if not isinstance(data, dict):
         return None
@@ -141,7 +139,7 @@ def _launchctl_list() -> str:
             text=True,
             timeout=5,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return ""
     return r.stdout
 

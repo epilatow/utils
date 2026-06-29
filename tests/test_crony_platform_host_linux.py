@@ -12,8 +12,6 @@ exercise a real Linux-only syscall (the pidfd pid-exit wait) are guarded
 with a Linux skipif.
 """
 
-from __future__ import annotations
-
 import shutil
 import subprocess
 import sys

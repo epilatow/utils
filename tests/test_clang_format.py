@@ -14,8 +14,6 @@ the Xcode toolchain and is reached through `xcrun`; where it is
 unavailable (no Xcode), the check skips.
 """
 
-from __future__ import annotations
-
 import shutil
 import subprocess
 from pathlib import Path

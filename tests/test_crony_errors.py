@@ -8,8 +8,6 @@
 """Unit tests for crony.errors: the ExitCode enum and the exception
 hierarchy every crony layer raises."""
 
-from __future__ import annotations
-
 import subprocess
 import sys
 from pathlib import Path

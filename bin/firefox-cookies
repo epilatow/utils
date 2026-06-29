@@ -7,8 +7,6 @@
 #
 # IMPORTANT: This script has tests in tests/test_firefox_cookies.py
 
-from __future__ import annotations
-
 import argparse
 import configparser
 import json

@@ -7,8 +7,6 @@
 
 """Unit tests for common.exitcodes (shared by every bin/ utility)."""
 
-from __future__ import annotations
-
 import enum
 import sys
 from pathlib import Path

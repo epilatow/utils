@@ -18,8 +18,6 @@ already-resolved entry), which it uses to bake each node's normalized
 config / timer units for the `config=stale` comparison.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import os
 from dataclasses import dataclass, field

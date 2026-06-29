@@ -17,6 +17,4 @@ scheduler-query runtime layer (`crony.runtime`), the notification layer
 (`crony.cli`).
 """
 
-from __future__ import annotations
-
 BASENAME: str = "crony"

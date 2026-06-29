@@ -12,8 +12,6 @@ exercise a real darwin-only syscall (the kqueue pid-exit wait) are
 guarded with a darwin skipif.
 """
 
-from __future__ import annotations
-
 import shutil
 import subprocess
 import sys

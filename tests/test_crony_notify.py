@@ -7,8 +7,6 @@
 
 """Unit tests for crony.notify."""
 
-from __future__ import annotations
-
 import logging
 import sys
 from email.message import Message

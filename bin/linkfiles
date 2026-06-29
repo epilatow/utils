@@ -6,8 +6,6 @@
 #
 # IMPORTANT: This script has tests in tests/test_linkfiles.py.
 
-from __future__ import annotations
-
 import argparse
 import fnmatch
 import logging
@@ -740,7 +738,7 @@ def _ignore_search_dirs(source_dir: Path) -> list[Path]:
     dirs = [abs_dir]
     try:
         home = Path.home().resolve()
-    except (OSError, RuntimeError):
+    except OSError, RuntimeError:
         return dirs
     if abs_dir == home:
         return dirs

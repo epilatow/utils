@@ -8,8 +8,6 @@ it imports only the standard library and the package's own `BASENAME`,
 so any crony module can import it without risking a cycle.
 """
 
-from __future__ import annotations
-
 import os
 from pathlib import Path
 

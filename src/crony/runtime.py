@@ -14,8 +14,6 @@ locks, and scheduler queries the pure crony.model deliberately omits
 live here.
 """
 
-from __future__ import annotations
-
 import contextlib
 import dataclasses
 import datetime
@@ -124,7 +122,7 @@ def _read_runtime_state(
     if last_run_path.is_file():
         try:
             raw = json.loads(last_run_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             raw = None
         if isinstance(raw, dict):
             last_run = crony.model.LastRun.from_raw(raw)
@@ -646,7 +644,7 @@ def recover_full_name(state_dir: Path) -> str | None:
         return None
     try:
         raw = json.loads(snap_p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return None
     name = raw.get("name")
     return name if isinstance(name, str) else None

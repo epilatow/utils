@@ -12,8 +12,6 @@ The build is darwin-only (mach-o/dyld.h, codesign); callers gate on the
 platform before invoking `build_wrapper`.
 """
 
-from __future__ import annotations
-
 import enum
 import hashlib
 import logging

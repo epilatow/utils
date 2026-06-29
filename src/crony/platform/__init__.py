@@ -25,8 +25,6 @@ identity through them, so the tests redirect identity by patching them
 here.
 """
 
-from __future__ import annotations
-
 import socket
 import sys
 from pathlib import Path

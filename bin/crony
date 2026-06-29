@@ -11,8 +11,6 @@
 # <repo>/src; this entry is just the platform-unit-invocable shim that
 # puts that package on sys.path and hands off to crony.cli.
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 

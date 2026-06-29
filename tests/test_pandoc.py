@@ -23,8 +23,6 @@ and, for the fetch half, by CI's `pandoc install` -- so it is not
 unit-tested here (mocking the whole of git would test the mock).
 """
 
-from __future__ import annotations
-
 import platform
 import sys
 from pathlib import Path

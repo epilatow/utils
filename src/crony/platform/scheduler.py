@@ -10,8 +10,6 @@ behind one API over `UnitSpec`; `crony.platform.launchd` and
 the running host.
 """
 
-from __future__ import annotations
-
 import abc
 from dataclasses import dataclass
 from pathlib import Path

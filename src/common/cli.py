@@ -7,20 +7,15 @@ Ctrl-C and an otherwise-unhandled exception -- into stable exit codes,
 so neither escapes to a raw traceback a scheduler can't interpret.
 """
 
-from __future__ import annotations
-
 import functools
 import sys
 import traceback
 from collections.abc import Callable
-from typing import ParamSpec
 
 from common.exitcodes import SIGINT_EXIT_CODE, CommonExitCode
 
-_P = ParamSpec("_P")
 
-
-def cli_entrypoint(fn: Callable[_P, int]) -> Callable[_P, int]:
+def cli_entrypoint[**P](fn: Callable[P, int]) -> Callable[P, int]:
     """Wrap a CLI entry point so an uncaught Ctrl-C or unexpected
     exception becomes a stable exit code instead of a traceback.
 
@@ -32,7 +27,7 @@ def cli_entrypoint(fn: Callable[_P, int]) -> Callable[_P, int]:
     """
 
     @functools.wraps(fn)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> int:
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> int:
         try:
             return fn(*args, **kwargs)
         except KeyboardInterrupt:

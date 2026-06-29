@@ -7,8 +7,6 @@
 
 """Unit tests for crony.runner."""
 
-from __future__ import annotations
-
 import json
 import math
 import os

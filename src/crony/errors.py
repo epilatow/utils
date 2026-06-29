@@ -7,8 +7,6 @@ first-party dependency beyond `common.exitcodes`. Each exception carries
 the `ExitCode` the CLI maps it to when it surfaces.
 """
 
-from __future__ import annotations
-
 import subprocess
 
 from common.exitcodes import CommonExitCode, ExitCodeBase

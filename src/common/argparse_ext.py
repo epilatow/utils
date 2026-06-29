@@ -9,8 +9,6 @@ entered subparser's own help when a required level is omitted, instead
 of argparse's terse "the following arguments are required" error.
 """
 
-from __future__ import annotations
-
 import argparse
 import functools
 import os

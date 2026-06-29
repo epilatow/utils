@@ -11,8 +11,6 @@ per-module crony test files. Named so pytest does not auto-load it as a
 plugin; it carries no test classes and is never run as a test.
 """
 
-from __future__ import annotations
-
 import json
 import re
 import subprocess
@@ -576,7 +574,7 @@ def _last_run(state: Path, name: str) -> dict[str, Any]:
                 continue
             try:
                 raw = json.loads(snap.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except OSError, json.JSONDecodeError:
                 continue
             if raw.get("name") == name:
                 last_run_path = uuid_dir / "last-run.json"

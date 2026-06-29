@@ -7,8 +7,6 @@
 #
 # IMPORTANT: This script has tests in tests/test_borgadm.py
 
-from __future__ import annotations
-
 import argparse
 import atexit
 import collections
@@ -442,7 +440,7 @@ class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
         if isinstance(exc, BrokenPipeError):
             try:
                 self.stream.close()
-            except (BrokenPipeError, OSError):
+            except BrokenPipeError, OSError:
                 pass
             self.stream = open(os.devnull, "w")
             return
