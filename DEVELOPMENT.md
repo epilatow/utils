@@ -19,6 +19,11 @@ Development conventions for working in this repo are layered:
 ## Prerequisites
 
 - `uv` (the test suite and every PEP 723 script run through it).
+- Python 3.14. The repo pins the interpreter with a `.python-version` file so
+  `uv run` resolves the same version locally and in CI (uv downloads it if
+  absent), rather than letting each environment pick the newest it happens to
+  have. The `>=3.14` floor in every PEP 723 block and in `pyproject.toml` is
+  kept in lockstep with the pin; bump both together to adopt a newer Python.
 - A pinned pandoc, fetched into `.tools/` (gitignored) by
   **`scripts/pandoc install`** -- run it once after cloning. The man-page
   freshness gate renders with this exact binary and nothing else (not a system

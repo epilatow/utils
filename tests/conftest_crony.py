@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
 # dependencies = ["pytest", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code

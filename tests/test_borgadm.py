@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
 # dependencies = ["pytest", "pytest-cov", "pytest-xdist", "tomlkit"]
 # ///
 # This is human generated code that's been AI modified

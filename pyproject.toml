@@ -1,7 +1,7 @@
 [project]
 name = "utils"
 version = "0.0.0"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "epilatow-repo-shared",
     "pytest>=9.0.3",
@@ -37,6 +37,11 @@ markers = [
 wrap = 78
 
 [tool.repo-shared.code-quality]
+# Non-PEP-723 files (the src/common and src/crony packages, the test
+# conftest modules) carry no per-file requires-python, so the gate types
+# them against this fallback. Kept in lockstep with the >=3.14 floor and
+# the .python-version pin.
+mypy-python-version = "3.14"
 # Most bin/* entries are shebang scripts without a ``.py`` extension,
 # which ruff/mypy auto-discovery (it globs ``*.py``) can't see. Each is
 # exposed to discovery -- and made importable as a typed module by the
