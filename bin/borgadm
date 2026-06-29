@@ -168,6 +168,7 @@ _BORG_SSHKEY_FILE: str = "~/.ssh/id_borg.net"
 _BORG_REMOTE_PATH: str = ""
 _BORG_CMD_TIMEOUT: int = 4 * 3600  # Timeout for borg commands: 4 hours
 _CMD_TIMEOUT: int = 60  # Timeout for non-borg commands: 1 minute
+_LOCK_CHECK_TIMEOUT: int = 5  # Lock-held probe wait: 5 seconds
 
 _BACKUP_NAME: str = "home"
 _BACKUP_ROOT: str = "~"
@@ -272,6 +273,9 @@ class Config:
         )
         self.CMD_TIMEOUT: int = config.getint(
             "default", "CMD_TIMEOUT", fallback=_CMD_TIMEOUT
+        )
+        self.LOCK_CHECK_TIMEOUT: int = config.getint(
+            "default", "LOCK_CHECK_TIMEOUT", fallback=_LOCK_CHECK_TIMEOUT
         )
 
         self.BACKUP_NAME: str = config.get(
@@ -629,6 +633,8 @@ def run_cmd(
     sudo: bool = False,
     errok: bool = False,
     allow_output: bool = False,
+    log_error: bool = True,
+    track_warning: bool = True,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
     slow_cmds = borg_cmd() + ["rsync"]
@@ -687,21 +693,26 @@ def run_cmd(
     if is_borg and proc.returncode == ExitCode.WARNING:
         # Borg exit code 1 means the operation completed with
         # non-fatal warnings (e.g., files changed during backup).
-        logger.warning(
-            "Command %s completed with warnings (exit code %s):\n%s",
-            cmd_str,
-            proc.returncode,
-            stderr_str.strip(),
-        )
-        global _warning_occurred
-        _warning_occurred = True
+        # track_warning lets an advisory call (the lock probe) opt out
+        # so its incidental warning neither logs nor promotes borgadm's
+        # own exit code.
+        if track_warning:
+            logger.warning(
+                "Command %s completed with warnings (exit code %s):\n%s",
+                cmd_str,
+                proc.returncode,
+                stderr_str.strip(),
+            )
+            global _warning_occurred
+            _warning_occurred = True
     elif proc.returncode != 0:
-        logger.error(
-            "Command %s failed with exit code %s and stderr:\n%s",
-            cmd_str,
-            proc.returncode,
-            stderr_str.strip(),
-        )
+        if log_error:
+            logger.error(
+                "Command %s failed with exit code %s and stderr:\n%s",
+                cmd_str,
+                proc.returncode,
+                stderr_str.strip(),
+            )
         if not errok:
             raise SubprocessError(
                 proc.returncode,
@@ -715,6 +726,87 @@ def run_cmd(
         returncode=proc.returncode,
         stdout=stdout_str,
         stderr=stderr_str,
+    )
+
+
+def _is_lock_timeout(stderr: str) -> bool:
+    """True if `stderr` is borg's LockTimeout (the lock is held by
+    another borg process and our wait elapsed). Distinct from other
+    borg errors (network, corruption) so callers can wait on a held
+    lock while still surfacing real failures."""
+    s = stderr.lower()
+    return "failed to create/acquire the lock" in s and "timeout" in s
+
+
+def repo_lock_held() -> bool:
+    """Probe whether the repo lock is currently held, waiting at most
+    `LOCK_CHECK_TIMEOUT` seconds. Advisory only: it lets a blocking
+    operation warn the user before it waits on the lock for what could
+    be a full backup's duration. A non-lock failure (network, etc.) is
+    reported as not-held so the real operation surfaces it."""
+    cfg = get_cfg()
+    proc = run_cmd(
+        borg_cmd()
+        + [
+            "list",
+            "--short",
+            "--lock-wait",
+            str(cfg.LOCK_CHECK_TIMEOUT),
+            cfg.BORG_REPO,
+        ],
+        errok=True,
+        log_error=False,
+        track_warning=False,
+    )
+    if proc.returncode == 0:
+        return False
+    return _is_lock_timeout(proc.stderr)
+
+
+def run_borg(
+    cmd: list[str],
+    *,
+    repo_write: bool,
+    bypass_lock: bool = False,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """Run a borg `cmd` (a full argv built from `borg_cmd()`) with the
+    repo lock handled.
+
+    By default the operation blocks on the lock: if the lock is already
+    held it logs that it is waiting (probing via `repo_lock_held`), then
+    runs with a `BORG_CMD_TIMEOUT` lock-wait so it proceeds once the
+    holder releases. With `bypass_lock` it skips the lock entirely
+    (`--bypass-lock`), trading the wait for the risk of racing a
+    concurrent writer -- only read-only commands expose that choice.
+
+    `repo_write` must be True for any operation that mutates the repo;
+    such an operation may never bypass the lock, and the assert makes
+    that unrepresentable rather than relying on call sites to remember."""
+    assert not (repo_write and bypass_lock), (
+        f"repo-writing borg op must never bypass the lock: {shlex.join(cmd)}"
+    )
+
+    def with_flags(flags: list[str]) -> list[str]:
+        # Lock flags go right after the borg subcommand verb -- the one
+        # position valid for every borg command, regardless of how many
+        # positionals (paths, mountpoint) trail it. cmd is built as
+        # `borg_cmd() + [verb, ...]`, so the verb sits at index
+        # len(borg_cmd()).
+        verb_idx = len(borg_cmd()) + 1
+        return [*cmd[:verb_idx], *flags, *cmd[verb_idx:]]
+
+    if bypass_lock:
+        return run_cmd(with_flags(["--bypass-lock"]), **kwargs)
+    cfg = get_cfg()
+    if repo_lock_held():
+        logger.info(
+            "Repository lock is held (a backup is likely running); "
+            "waiting up to %ss for it to release...",
+            cfg.BORG_CMD_TIMEOUT,
+        )
+    return run_cmd(
+        with_flags(["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)]), **kwargs
     )
 
 
@@ -756,19 +848,15 @@ def load_passphrase() -> str:
 
 
 @functools.cache
-def list_backups_raw() -> subprocess.CompletedProcess[Any]:
+def list_backups_raw(
+    bypass_lock: bool = False,
+) -> subprocess.CompletedProcess[Any]:
     cfg = get_cfg()
 
-    return run_cmd(
-        borg_cmd()
-        + [
-            "list",
-            "--bypass-lock",
-            "--lock-wait",
-            str(cfg.BORG_CMD_TIMEOUT),
-            "--short",
-            cfg.BORG_REPO,
-        ]
+    return run_borg(
+        borg_cmd() + ["list", "--short", cfg.BORG_REPO],
+        repo_write=False,
+        bypass_lock=bypass_lock,
     )
 
 
@@ -874,11 +962,13 @@ def _archive_entries_are_complete(entries: list[_ArchiveName]) -> bool:
 
 
 def list_backups(
-    latest: bool = False, partial: bool = False
+    latest: bool = False,
+    partial: bool = False,
+    bypass_lock: bool = False,
 ) -> dict[str, list[str]]:
     cfg = get_cfg()
 
-    result = list_backups_raw()
+    result = list_backups_raw(bypass_lock)
 
     archives_by_ts: dict[str, list[_ArchiveName]] = {}
     for line in result.stdout.strip().splitlines():
@@ -912,7 +1002,7 @@ _BORG_CHECKPOINT_RE = re.compile(
 )
 
 
-def list_unknown_archives() -> list[str]:
+def list_unknown_archives(bypass_lock: bool = False) -> list[str]:
     """Return archive names that look like borgadm's own but don't
     parse into the expected shape.
 
@@ -922,7 +1012,7 @@ def list_unknown_archives() -> list[str]:
     / `.checkpoint.N` shape are filtered out for the same reason.
     """
     cfg = get_cfg()
-    result = list_backups_raw()
+    result = list_backups_raw(bypass_lock)
     prefix = f"{cfg.BACKUP_NAME}-"
     unknown: list[str] = []
     for line in result.stdout.strip().splitlines():
@@ -1418,10 +1508,10 @@ def do_break_lock() -> None:
     )
 
 
-def do_check_age() -> None:
+def do_check_age(bypass_lock: bool) -> None:
     cfg = get_cfg()
     seconds = cfg.CHECK_AGE_SECONDS
-    backups = list_backups(latest=True)
+    backups = list_backups(latest=True, bypass_lock=bypass_lock)
     if not backups:
         raise CheckNoBackupsError("No full backups found.")
     assert len(backups.keys()) == 1, backups
@@ -1476,12 +1566,19 @@ def _borg_check_cmd(
     return args
 
 
-def _check_archive_targets(targets: list[str], progress: bool) -> None:
+def _check_archive_targets(
+    targets: list[str], progress: bool, bypass_lock: bool
+) -> None:
     for target in targets:
         logger.info(f"Checking archive metadata: {target}")
         cmd = _borg_check_cmd(target, progress=progress)
         try:
-            run_cmd(cmd, allow_output=progress)
+            run_borg(
+                cmd,
+                repo_write=False,
+                bypass_lock=bypass_lock,
+                allow_output=progress,
+            )
         except SubprocessError as e:
             raise CheckArchivesError(
                 f"Archive metadata check failed: {target}"
@@ -1489,48 +1586,53 @@ def _check_archive_targets(targets: list[str], progress: bool) -> None:
 
 
 def do_check_archives(
-    progress: bool, latest: bool, archives: list[str]
+    progress: bool, latest: bool, archives: list[str], bypass_lock: bool
 ) -> None:
     cfg = get_cfg()
     assert not (latest and archives), (
         "latest and archives are mutually exclusive"
     )
     if archives:
-        raw_names = list_backups_raw().stdout.strip().splitlines()
+        raw_names = list_backups_raw(bypass_lock).stdout.strip().splitlines()
         targets: list[str] = []
         for name in archives:
             if name not in raw_names:
                 raise BorgadmError(f"Archive not found: {name}")
             targets.append(f"{cfg.BORG_REPO}::{name}")
-        _check_archive_targets(targets, progress)
+        _check_archive_targets(targets, progress, bypass_lock)
     elif latest:
-        backups = list_backups(latest=True)
+        backups = list_backups(latest=True, bypass_lock=bypass_lock)
         if not backups:
             raise CheckNoBackupsError("No full backups found.")
         assert len(backups.keys()) == 1
-        _check_archive_targets(list(backups.values())[0], progress)
+        _check_archive_targets(list(backups.values())[0], progress, bypass_lock)
     else:
         logger.info("Checking archive metadata.")
         cmd = _borg_check_cmd(
             cfg.BORG_REPO, progress=progress, archives_only=True
         )
         try:
-            run_cmd(cmd, allow_output=progress)
+            run_borg(
+                cmd,
+                repo_write=False,
+                bypass_lock=bypass_lock,
+                allow_output=progress,
+            )
         except SubprocessError as e:
             raise CheckArchivesError("Archive metadata check failed.") from e
 
 
-def do_check_prune() -> None:
+def do_check_prune(bypass_lock: bool) -> None:
     cfg = get_cfg()
     problems: list[str] = []
 
-    partial_backups = list_backups(partial=True)
+    partial_backups = list_backups(partial=True, bypass_lock=bypass_lock)
     if partial_backups:
         for _ts, archives in partial_backups.items():
             names = [a.removeprefix(f"{cfg.BORG_REPO}::") for a in archives]
             problems.append(f"Partial archive(s): {', '.join(names)}")
 
-    full_backups = list_backups()
+    full_backups = list_backups(bypass_lock=bypass_lock)
     ts_keep = ts_to_keep(set(full_backups.keys()))
     ts_prune = full_backups.keys() - ts_keep.keys()
     if ts_prune:
@@ -1544,24 +1646,34 @@ def do_check_prune() -> None:
     logger.info("No unpruned archives found.")
 
 
-def do_check_repo(progress: bool) -> None:
+def do_check_repo(progress: bool, bypass_lock: bool) -> None:
     cfg = get_cfg()
     logger.info("Checking repo metadata.")
     cmd = _borg_check_cmd(
         cfg.BORG_REPO, progress=progress, repository_only=True
     )
     try:
-        run_cmd(cmd, allow_output=progress)
+        run_borg(
+            cmd,
+            repo_write=False,
+            bypass_lock=bypass_lock,
+            allow_output=progress,
+        )
     except SubprocessError as e:
         raise CheckRepoError("Repo metadata check failed.") from e
 
 
-def do_check_full(progress: bool) -> None:
+def do_check_full(progress: bool, bypass_lock: bool) -> None:
     cfg = get_cfg()
     logger.info("Checking full repo and archive metadata.")
     cmd = _borg_check_cmd(cfg.BORG_REPO, progress=progress)
     try:
-        run_cmd(cmd, allow_output=progress)
+        run_borg(
+            cmd,
+            repo_write=False,
+            bypass_lock=bypass_lock,
+            allow_output=progress,
+        )
     except SubprocessError as e:
         raise CheckFullError(
             "Full repo and archive metadata check failed."
@@ -1572,7 +1684,7 @@ def do_compact(progress: bool) -> None:
     cfg = get_cfg()
     logger.info(f"Compacting repo: {cfg.BORG_REPO}")
     args = ["compact", *(["--progress"] if progress else []), cfg.BORG_REPO]
-    run_cmd(borg_cmd() + args, allow_output=progress)
+    run_borg(borg_cmd() + args, repo_write=True, allow_output=progress)
 
 
 def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
@@ -1679,7 +1791,12 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
             + [archive]
             + [os.path.expanduser(p) for p in set_cfg["paths"]]
         )
-        run_cmd(cmd, cwd=cfg.BACKUP_ROOT, allow_output=progress)
+        run_borg(
+            cmd,
+            repo_write=True,
+            cwd=cfg.BACKUP_ROOT,
+            allow_output=progress,
+        )
         logger.info(f"Create archive, finish: {archive}{dry})")
 
     if not no_prune:
@@ -1739,7 +1856,7 @@ def do_delete(
         cmd.append("--stats")
     cmd.append(cfg.BORG_REPO)
     cmd += archives_to_delete
-    run_cmd(cmd, allow_output=progress or dry_run)
+    run_borg(cmd, repo_write=True, allow_output=progress or dry_run)
 
 
 def do_extract(
@@ -1748,8 +1865,9 @@ def do_extract(
     dry_run: bool,
     delete: bool,
     progress: bool,
+    bypass_lock: bool,
 ) -> None:
-    backups = list_backups(latest=True)
+    backups = list_backups(latest=True, bypass_lock=bypass_lock)
     if not backups:
         raise BorgadmError("No full backups found.")
     assert len(backups.keys()) == 1
@@ -1776,7 +1894,8 @@ def do_extract(
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
             cmd.append(archive)
-            for line in run_cmd(cmd).stdout.splitlines():
+            proc = run_borg(cmd, repo_write=False, bypass_lock=bypass_lock)
+            for line in proc.stdout.splitlines():
                 if not line:
                     continue
                 entry_path = Path(line[2:])
@@ -1870,7 +1989,13 @@ def do_extract(
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
             cmd.append(archive)
-            run_cmd(cmd, cwd=target_dir, allow_output=progress)
+            run_borg(
+                cmd,
+                repo_write=False,
+                bypass_lock=bypass_lock,
+                cwd=target_dir,
+                allow_output=progress,
+            )
 
     if cleanup_paths:
         delete_paths(target_dir, cleanup_paths, dry_run=dry_run)
@@ -1882,13 +2007,16 @@ def do_list(
     include_partial: bool,
     only_partial: bool,
     keep_tags: bool,
+    bypass_lock: bool,
 ) -> None:
     full_backups: dict[str, list[str]] = {}
     partial_backups: dict[str, list[str]] = {}
     if not only_partial:
-        full_backups = list_backups(latest=latest)
+        full_backups = list_backups(latest=latest, bypass_lock=bypass_lock)
     if include_partial or only_partial:
-        partial_backups = list_backups(latest=latest, partial=True)
+        partial_backups = list_backups(
+            latest=latest, partial=True, bypass_lock=bypass_lock
+        )
     backups = full_backups | partial_backups
 
     ts_keep: OrderedDict[str, str] = collections.OrderedDict()
@@ -1912,7 +2040,7 @@ def do_list(
         else:
             logger.info(f"{ts}{keep_tag}")
 
-    for name in list_unknown_archives():
+    for name in list_unknown_archives(bypass_lock):
         logger.warning(f"Unknown archive in repo: {name}")
 
 
@@ -1930,7 +2058,7 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
             cmd.append("--stats")
         cmd.append(cfg.BORG_REPO)
         cmd += unknown
-        run_cmd(cmd, allow_output=progress)
+        run_borg(cmd, repo_write=True, allow_output=progress)
     elif unknown:
         for name in unknown:
             logger.warning(
@@ -1953,7 +2081,7 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
             cmd.append("--stats")
         cmd.append(cfg.BORG_REPO)
         cmd += partial_archives
-        run_cmd(cmd, allow_output=progress)
+        run_borg(cmd, repo_write=True, allow_output=progress)
 
     archives = list_backups()
     ts_keep = ts_to_keep(set(archives.keys()))
@@ -1977,13 +2105,17 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
             cmd.append("--stats")
         cmd.append(cfg.BORG_REPO)
         cmd += prune_archives
-        run_cmd(cmd, allow_output=progress)
+        run_borg(cmd, repo_write=True, allow_output=progress)
 
     do_compact(progress)
 
 
 def do_rsync(
-    target_dir: Path, dry_run: bool, delete: bool, progress: bool
+    target_dir: Path,
+    dry_run: bool,
+    delete: bool,
+    progress: bool,
+    bypass_lock: bool,
 ) -> None:
     if platform.system() != "Linux":
         raise BorgadmError("Rsync subcommand is only supported on linux")
@@ -1995,7 +2127,7 @@ def do_rsync(
             " variables."
         )
 
-    backups = list_backups(latest=True)
+    backups = list_backups(latest=True, bypass_lock=bypass_lock)
     if not backups:
         raise BorgadmError("No full backups found.")
     assert len(backups.keys()) == 1
@@ -2043,12 +2175,16 @@ def do_rsync(
                     "mount",
                     "-o",
                     "allow_other",
-                    "--bypass-lock",
                     archive,
                     mount_dir.as_posix(),
                 ]
                 logger.info(f"Mounting {archive} to: {mount_dir}")
-                run_cmd(cmd, sudo=True)
+                run_borg(
+                    cmd,
+                    repo_write=False,
+                    bypass_lock=bypass_lock,
+                    sudo=True,
+                )
                 cleanup_mounts.append(mount_dir)
                 archive_mounts.append(mount_dir)
 
@@ -2151,7 +2287,7 @@ def _repair_check(
         **os.environ,
         "BORG_CHECK_I_KNOW_WHAT_I_AM_DOING": "YES",
     }
-    run_cmd(cmd, allow_output=True, env=env)
+    run_borg(cmd, repo_write=True, allow_output=True, env=env)
     logger.info("Repo repair completed.")
 
 
@@ -2229,6 +2365,22 @@ def args_parser() -> StrictArgumentParser:
             "--progress", action="store_true", help="show progress information"
         )
 
+    def add_bypass_lock(
+        parser: argparse.ArgumentParser, *, default: bool
+    ) -> None:
+        # Read-only commands only: a bypassing read skips the repo lock
+        # (fast, but may race a concurrent writer); the blocking form
+        # waits for the lock. Writers never bypass, so they omit this.
+        parser.add_argument(
+            "--bypass-lock",
+            action=argparse.BooleanOptionalAction,
+            default=default,
+            help=(
+                "skip the repo lock instead of waiting for it (faster, "
+                "but may race a concurrent backup)"
+            ),
+        )
+
     def add_prune_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--keep-hourly", type=int, help="Number of hourly backups to keep"
@@ -2295,6 +2447,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=DefaultsHelpFormatter,
     )
     add_seconds(check_age)
+    add_bypass_lock(check_age, default=False)
 
     check_archives = check_subparsers.add_parser(
         "archives",
@@ -2317,12 +2470,14 @@ def args_parser() -> StrictArgumentParser:
         help="Check only the latest full backup set",
     )
     add_progress(check_archives)
+    add_bypass_lock(check_archives, default=False)
 
-    check_subparsers.add_parser(
+    check_prune = check_subparsers.add_parser(
         "prune",
         help="Check for unpruned archives",
         formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
+    add_bypass_lock(check_prune, default=False)
 
     check_repo = check_subparsers.add_parser(
         "repo",
@@ -2330,6 +2485,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     add_progress(check_repo)
+    add_bypass_lock(check_repo, default=False)
 
     check_full = check_subparsers.add_parser(
         "full",
@@ -2337,6 +2493,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
     add_progress(check_full)
+    add_bypass_lock(check_full, default=False)
 
     compact = add_parser("compact", help="Check full backup metadata")
     add_progress(compact)
@@ -2385,6 +2542,7 @@ def args_parser() -> StrictArgumentParser:
     add_delete(extract)
     add_dry_run(extract)
     add_progress(extract)
+    add_bypass_lock(extract, default=True)
 
     list_cmd = add_parser("list", help="List backups")
     list_cmd.add_argument(
@@ -2419,6 +2577,7 @@ def args_parser() -> StrictArgumentParser:
         action="store_true",
         help="Only list partial",
     )
+    add_bypass_lock(list_cmd, default=False)
 
     add_parser(
         "log-files",
@@ -2485,6 +2644,7 @@ def args_parser() -> StrictArgumentParser:
     add_delete(rsync)
     add_dry_run(rsync)
     add_progress(rsync)
+    add_bypass_lock(rsync, default=True)
 
     add_parser(
         "environment", help="Display environment settings to run borg cli"

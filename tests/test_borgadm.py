@@ -557,10 +557,11 @@ class TestRepair:
             )
 
     def _assert_repair_argv(
-        self, mock_run_cmd: Any, repo: str, expected_args: list[str]
+        self, mock_run_borg: Any, repo: str, expected_args: list[str]
     ) -> None:
-        mock_run_cmd.assert_called_once_with(
+        mock_run_borg.assert_called_once_with(
             ["borg", "check", "--repair", *expected_args, repo],
+            repo_write=True,
             allow_output=True,
             env={
                 **os.environ,
@@ -571,23 +572,23 @@ class TestRepair:
     def test_repair_repo(self, mock_cfg: Any) -> None:
         """repair repo scopes the repair to --repository-only."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_repo(progress=False)
         self._assert_repair_argv(
-            mock_run_cmd, mock_cfg.BORG_REPO, ["--repository-only"]
+            mock_run_borg, mock_cfg.BORG_REPO, ["--repository-only"]
         )
 
     def test_repair_repo_progress(self, mock_cfg: Any) -> None:
         """repair repo passes --progress through to borg."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_repo(progress=True)
         self._assert_repair_argv(
-            mock_run_cmd,
+            mock_run_borg,
             mock_cfg.BORG_REPO,
             ["--repository-only", "--progress"],
         )
@@ -595,22 +596,22 @@ class TestRepair:
     def test_repair_archives(self, mock_cfg: Any) -> None:
         """repair archives scopes the repair to --archives-only."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_archives(progress=False)
         self._assert_repair_argv(
-            mock_run_cmd, mock_cfg.BORG_REPO, ["--archives-only"]
+            mock_run_borg, mock_cfg.BORG_REPO, ["--archives-only"]
         )
 
     def test_repair_full(self, mock_cfg: Any) -> None:
         """repair full repairs both phases (no --*-only flag)."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.do_repair_full(progress=False)
-        self._assert_repair_argv(mock_run_cmd, mock_cfg.BORG_REPO, [])
+        self._assert_repair_argv(mock_run_borg, mock_cfg.BORG_REPO, [])
 
 
 class TestDelete:
@@ -680,7 +681,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive=None,
@@ -696,6 +697,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=False,
             )
 
@@ -747,7 +749,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive="20250101_120000",
@@ -763,6 +765,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=False,
             )
 
@@ -813,7 +816,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive="home-set1-20250101_120000",
@@ -829,6 +832,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=False,
             )
 
@@ -879,7 +883,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive="home-set1-20250101_120000",
@@ -895,6 +899,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=True,
             )
 
@@ -920,7 +925,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive="home-set1-20250101_120000",
@@ -937,6 +942,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=True,
             )
 
@@ -969,7 +975,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive="20250101_120000",
@@ -985,6 +991,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=False,
             )
 
@@ -1022,7 +1029,7 @@ class TestDelete:
                 autospec=True,
                 return_value=["borg"],
             ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "run_borg", autospec=True) as mock_run,
         ):
             ba.do_delete(
                 archive=None,
@@ -1039,6 +1046,7 @@ class TestDelete:
                     repo,
                     "home-set1-20250101_120000",
                 ],
+                repo_write=True,
                 allow_output=False,
             )
 
@@ -1061,7 +1069,9 @@ class TestList:
         partial_backups: dict[str, list[str]],
     ) -> Any:
         def side_effect(
-            latest: bool = False, partial: bool = False
+            latest: bool = False,
+            partial: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             src = partial_backups if partial else full_backups
             if latest and src:
@@ -1117,6 +1127,7 @@ class TestList:
                 include_partial=kwargs.get("include_partial", True),
                 only_partial=kwargs.get("only_partial", False),
                 keep_tags=kwargs.get("keep_tags", True),
+                bypass_lock=kwargs.get("bypass_lock", False),
             )
         return [r.message for r in caplog.records]
 
@@ -1556,7 +1567,7 @@ class TestCheck:
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             pytest.raises(ba.CheckNoBackupsError),
         ):
-            ba.do_check_age()
+            ba.do_check_age(bypass_lock=False)
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_age_too_old(self) -> None:
@@ -1573,7 +1584,7 @@ class TestCheck:
             ),
             pytest.raises(ba.CheckAgeError),
         ):
-            ba.do_check_age()
+            ba.do_check_age(bypass_lock=False)
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_age_ok(self) -> None:
@@ -1587,7 +1598,7 @@ class TestCheck:
             autospec=True,
             return_value={recent_ts: ["repo::backup"]},
         ):
-            ba.do_check_age()  # Should not raise
+            ba.do_check_age(bypass_lock=False)  # Should not raise
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_archives_latest_no_backups(self) -> None:
@@ -1596,29 +1607,35 @@ class TestCheck:
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             pytest.raises(ba.CheckNoBackupsError),
         ):
-            ba.do_check_archives(progress=False, latest=True, archives=[])
+            ba.do_check_archives(
+                progress=False, latest=True, archives=[], bypass_lock=False
+            )
 
     def test_check_repo_argv(self, mock_cfg: Any) -> None:
         """check repo runs borg check --repository-only."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_check_repo(progress=False)
-        mock_run_cmd.assert_called_once_with(
+            ba.do_check_repo(progress=False, bypass_lock=False)
+        mock_run_borg.assert_called_once_with(
             ["borg", "check", "--repository-only", mock_cfg.BORG_REPO],
+            repo_write=False,
+            bypass_lock=False,
             allow_output=False,
         )
 
     def test_check_full_argv(self, mock_cfg: Any) -> None:
         """check full runs borg check with no --*-only flag."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_check_full(progress=True)
-        mock_run_cmd.assert_called_once_with(
+            ba.do_check_full(progress=True, bypass_lock=False)
+        mock_run_borg.assert_called_once_with(
             ["borg", "check", "--progress", mock_cfg.BORG_REPO],
+            repo_write=False,
+            bypass_lock=False,
             allow_output=True,
         )
 
@@ -1626,21 +1643,25 @@ class TestCheck:
         """A failing borg check surfaces as CheckFullError."""
         err = ba.SubprocessError(2, ["borg", "check", mock_cfg.BORG_REPO])
         with (
-            patch.object(ba, "run_cmd", autospec=True, side_effect=err),
+            patch.object(ba, "run_borg", autospec=True, side_effect=err),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             pytest.raises(ba.CheckFullError),
         ):
-            ba.do_check_full(progress=False)
+            ba.do_check_full(progress=False, bypass_lock=False)
 
     def test_check_archives_whole_repo_argv(self, mock_cfg: Any) -> None:
         """check archives with no target runs --archives-only."""
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.do_check_archives(progress=False, latest=False, archives=[])
-        mock_run_cmd.assert_called_once_with(
+            ba.do_check_archives(
+                progress=False, latest=False, archives=[], bypass_lock=False
+            )
+        mock_run_borg.assert_called_once_with(
             ["borg", "check", "--archives-only", mock_cfg.BORG_REPO],
+            repo_write=False,
+            bypass_lock=False,
             allow_output=False,
         )
 
@@ -1664,11 +1685,13 @@ class TestCheck:
                 return_value=latest,
             ) as mock_list,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
         ):
-            ba.do_check_archives(progress=False, latest=True, archives=[])
-        mock_list.assert_called_once_with(latest=True)
-        assert [c.args[0] for c in mock_run_cmd.call_args_list] == [
+            ba.do_check_archives(
+                progress=False, latest=True, archives=[], bypass_lock=False
+            )
+        mock_list.assert_called_once_with(latest=True, bypass_lock=False)
+        assert [c.args[0] for c in mock_run_borg.call_args_list] == [
             ["borg", "check", f"{repo}::home-fuse-20250101_120000"],
             ["borg", "check", f"{repo}::home-local-20250101_120000"],
         ]
@@ -1683,15 +1706,18 @@ class TestCheck:
                 ba, "list_backups_raw", autospec=True, return_value=raw
             ),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
         ):
             ba.do_check_archives(
                 progress=False,
                 latest=False,
                 archives=["home-fuse-20250101_120000"],
+                bypass_lock=False,
             )
-        mock_run_cmd.assert_called_once_with(
+        mock_run_borg.assert_called_once_with(
             ["borg", "check", f"{repo}::home-fuse-20250101_120000"],
+            repo_write=False,
+            bypass_lock=False,
             allow_output=False,
         )
 
@@ -1705,13 +1731,16 @@ class TestCheck:
                 ba, "list_backups_raw", autospec=True, return_value=raw
             ),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
             pytest.raises(ba.BorgadmError),
         ):
             ba.do_check_archives(
-                progress=False, latest=False, archives=["nope"]
+                progress=False,
+                latest=False,
+                archives=["nope"],
+                bypass_lock=False,
             )
-        mock_run_cmd.assert_not_called()
+        mock_run_borg.assert_not_called()
 
     def test_check_archives_latest_and_names_parse_error(self) -> None:
         """--latest with archive name(s) is a parser error."""
@@ -1742,6 +1771,7 @@ class TestCheck:
 
         def list_backups_side_effect(
             partial: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 return {
@@ -1758,7 +1788,7 @@ class TestCheck:
             ),
             pytest.raises(ba.CheckPruneError),
         ):
-            ba.do_check_prune()
+            ba.do_check_prune(bypass_lock=False)
 
     def test_check_prune_unpruned_backups(self, mock_cfg: Any) -> None:
         """Test check prune fails when old backups need pruning."""
@@ -1770,6 +1800,7 @@ class TestCheck:
 
         def list_backups_side_effect(
             partial: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 return {}
@@ -1788,7 +1819,7 @@ class TestCheck:
             ),
             pytest.raises(ba.CheckPruneError),
         ):
-            ba.do_check_prune()
+            ba.do_check_prune(bypass_lock=False)
 
     def test_check_prune_ok(self, mock_cfg: Any) -> None:
         """Test check prune succeeds when no pruning needed."""
@@ -1800,6 +1831,7 @@ class TestCheck:
 
         def list_backups_side_effect(
             partial: bool = False,
+            **_kwargs: object,
         ) -> dict[str, list[str]]:
             if partial:
                 return {}
@@ -1811,7 +1843,221 @@ class TestCheck:
             autospec=True,
             side_effect=list_backups_side_effect,
         ):
-            ba.do_check_prune()  # Should not raise
+            ba.do_check_prune(bypass_lock=False)  # Should not raise
+
+
+# borg 1.4's LockTimeout stderr, verified against a real held lock.
+_LOCK_TIMEOUT_STDERR = (
+    "Failed to create/acquire the lock /repo/lock.exclusive (timeout).\n"
+)
+
+
+class TestIsLockTimeout:
+    """Test the borg LockTimeout stderr classifier."""
+
+    def test_matches_real_lock_timeout(self) -> None:
+        assert ba._is_lock_timeout(_LOCK_TIMEOUT_STDERR) is True
+
+    def test_case_insensitive(self) -> None:
+        assert ba._is_lock_timeout(_LOCK_TIMEOUT_STDERR.upper()) is True
+
+    def test_non_lock_errors_are_not_lock_timeout(self) -> None:
+        assert ba._is_lock_timeout("Connection closed by remote host") is False
+        assert ba._is_lock_timeout("Repository has no manifest.") is False
+        assert ba._is_lock_timeout("") is False
+
+
+class TestRepoLockHeld:
+    """Test the lock-held probe."""
+
+    def _probe(self, returncode: int, stderr: str) -> tuple[bool, Any]:
+        proc = subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout="", stderr=stderr
+        )
+        with (
+            patch.object(
+                ba, "run_cmd", autospec=True, return_value=proc
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            result = ba.repo_lock_held()
+        return result, mock_run
+
+    def test_free_lock_returns_false(self, mock_cfg: Any) -> None:
+        result, mock_run = self._probe(0, "")
+        assert result is False
+        # The probe waits only LOCK_CHECK_TIMEOUT and never logs its own
+        # (expected) failure as an error.
+        mock_run.assert_called_once_with(
+            [
+                "borg",
+                "list",
+                "--short",
+                "--lock-wait",
+                str(mock_cfg.LOCK_CHECK_TIMEOUT),
+                mock_cfg.BORG_REPO,
+            ],
+            errok=True,
+            log_error=False,
+            track_warning=False,
+        )
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_held_lock_returns_true(self) -> None:
+        result, _ = self._probe(2, _LOCK_TIMEOUT_STDERR)
+        assert result is True
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_non_lock_failure_returns_false(self) -> None:
+        # A real failure (network, etc.) is reported as not-held so the
+        # blocking operation surfaces it rather than the probe masking it.
+        result, _ = self._probe(2, "Connection closed by remote host")
+        assert result is False
+
+
+class TestRunBorg:
+    """Test the lock-aware borg runner."""
+
+    def test_bypass_inserts_bypass_lock_after_verb(self, mock_cfg: Any) -> None:
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "repo_lock_held", autospec=True) as mock_probe,
+        ):
+            ba.run_borg(
+                ["borg", "list", mock_cfg.BORG_REPO],
+                repo_write=False,
+                bypass_lock=True,
+            )
+        mock_probe.assert_not_called()
+        mock_run.assert_called_once_with(
+            ["borg", "list", "--bypass-lock", mock_cfg.BORG_REPO]
+        )
+
+    def test_bypass_position_with_multitoken_borg_cmd(
+        self, mock_cfg: Any
+    ) -> None:
+        launcher = ["uvx", "-q", "--from", "borgbackup", "borg"]
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=launcher),
+            patch.object(
+                ba, "repo_lock_held", autospec=True, return_value=False
+            ),
+        ):
+            ba.run_borg(
+                [*launcher, "list", mock_cfg.BORG_REPO],
+                repo_write=False,
+                bypass_lock=True,
+            )
+        mock_run.assert_called_once_with(
+            [*launcher, "list", "--bypass-lock", mock_cfg.BORG_REPO]
+        )
+
+    def test_blocking_free_lock_no_message(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(
+                ba, "repo_lock_held", autospec=True, return_value=False
+            ),
+        ):
+            ba.run_borg(["borg", "list", mock_cfg.BORG_REPO], repo_write=False)
+        mock_run.assert_called_once_with(
+            [
+                "borg",
+                "list",
+                "--lock-wait",
+                str(mock_cfg.BORG_CMD_TIMEOUT),
+                mock_cfg.BORG_REPO,
+            ]
+        )
+        assert "lock is held" not in caplog.text.lower()
+
+    def test_blocking_held_lock_logs_waiting_message(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(
+                ba, "repo_lock_held", autospec=True, return_value=True
+            ),
+        ):
+            ba.run_borg(["borg", "create", mock_cfg.BORG_REPO], repo_write=True)
+        assert "Repository lock is held" in caplog.text
+        mock_run.assert_called_once_with(
+            [
+                "borg",
+                "create",
+                "--lock-wait",
+                str(mock_cfg.BORG_CMD_TIMEOUT),
+                mock_cfg.BORG_REPO,
+            ]
+        )
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_repo_write_cannot_bypass_lock(self) -> None:
+        with pytest.raises(AssertionError):
+            ba.run_borg(
+                ["borg", "create", "repo"],
+                repo_write=True,
+                bypass_lock=True,
+            )
+
+    def test_kwargs_pass_through(self, mock_cfg: Any) -> None:
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(
+                ba, "repo_lock_held", autospec=True, return_value=False
+            ),
+        ):
+            ba.run_borg(
+                ["borg", "extract", "repo::a"],
+                repo_write=False,
+                cwd=mock_cfg.BACKUP_ROOT,
+                allow_output=True,
+            )
+        _, kwargs = mock_run.call_args
+        assert kwargs["cwd"] == mock_cfg.BACKUP_ROOT
+        assert kwargs["allow_output"] is True
+
+
+class TestRunCmdLogError:
+    """run_cmd's log_error / track_warning flags keep an advisory call
+    (the lock probe) from logging or affecting borgadm's exit status."""
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_log_error_false_suppresses_error_log(self, caplog: Any) -> None:
+        caplog.set_level(logging.ERROR)
+        ba.run_cmd(["false"], errok=True, log_error=False)
+        assert caplog.text == ""
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_log_error_default_logs_failure(self, caplog: Any) -> None:
+        caplog.set_level(logging.ERROR)
+        ba.run_cmd(["false"], errok=True)
+        assert "failed with exit code" in caplog.text
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_track_warning_false_does_not_flip_global_warning(self) -> None:
+        # `false borg` exits 1 and is classified as a borg command (the
+        # is_borg heuristic keys off "borg" anywhere in argv), so it
+        # exercises the WARNING branch without a real borg repo.
+        with patch.object(ba, "_warning_occurred", False):
+            ba.run_cmd(["false", "borg"], errok=True, track_warning=False)
+            assert ba._warning_occurred is False
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_track_warning_default_flips_global_warning(self) -> None:
+        with patch.object(ba, "_warning_occurred", False):
+            ba.run_cmd(["false", "borg"], errok=True)
+            assert ba._warning_occurred is True
 
 
 class TestIsRemoteRepo:
@@ -1992,9 +2238,16 @@ class TestRsyncMountCleanup:
             ),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba.os, "listdir", return_value=["x"]),
+            patch.object(ba, "run_borg", autospec=True),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
         ):
-            ba.do_rsync(target, dry_run=False, delete=True, progress=False)
+            ba.do_rsync(
+                target,
+                dry_run=False,
+                delete=True,
+                progress=False,
+                bypass_lock=True,
+            )
         umounts = [
             Path(c.args[0][2]).name
             for c in mock_run.call_args_list
@@ -4038,6 +4291,105 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
 class TestHelpWidth(HelpWidthBase):
     PROG = "borgadm"
     PARSER_FUNC = staticmethod(ba.args_parser)
+
+
+@pytest.mark.e2e
+class TestLockAwareE2E:
+    """End-to-end: real held repo lock vs. blocking / bypassing reads."""
+
+    def _hold_lock(
+        self, borg_e2e: BorgE2EFixture, seconds: int
+    ) -> subprocess.Popen[bytes]:
+        """Hold the repo's exclusive lock for `seconds` in a background
+        `borg with-lock` process."""
+        return subprocess.Popen(
+            [
+                "borg",
+                "with-lock",
+                str(borg_e2e.repo_path),
+                "sleep",
+                str(seconds),
+            ],
+            env=borg_e2e._subprocess_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _await_lock_held(self, borg_e2e: BorgE2EFixture) -> None:
+        """Block until the holder has actually taken the lock."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                [
+                    "borg",
+                    "list",
+                    "--short",
+                    "--lock-wait",
+                    "0",
+                    str(borg_e2e.repo_path),
+                ],
+                env=borg_e2e._subprocess_env(),
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode != 0 and "lock" in probe.stderr.lower():
+                return
+            time.sleep(0.1)
+        pytest.fail("background holder never acquired the repo lock")
+
+    def test_bypass_lock_does_not_wait_for_held_lock(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`list --bypass-lock` returns while the lock is held; if it
+        waited it would trip the 15s timeout against the 30s holder."""
+        borg_e2e.run("create", "--no-prune")
+        holder = self._hold_lock(borg_e2e, 30)
+        try:
+            self._await_lock_held(borg_e2e)
+            result = borg_e2e.run("list", "--bypass-lock", timeout=15)
+        finally:
+            holder.terminate()
+            holder.wait()
+        assert result.returncode == 0
+        assert result.stdout.strip(), "expected the held archive to be listed"
+        assert "Repository lock is held" not in (result.stdout + result.stderr)
+
+    def test_default_list_waits_for_lock_then_succeeds(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A default (blocking) `list` announces the held lock, waits for
+        it to release, then succeeds. The shortened lock timeouts keep
+        borg's poll interval small so the test stays fast."""
+        borg_e2e.config_path.write_text(
+            borg_e2e.config_path.read_text()
+            + "LOCK_CHECK_TIMEOUT = 2\n"
+            + "BORG_CMD_TIMEOUT = 20\n"
+        )
+        borg_e2e.run("create", "--no-prune")
+        # Hold well past borgadm's startup so the probe is guaranteed to
+        # observe the lock held and emit the waiting message; only then
+        # release it (via terminate) and let the blocked list proceed.
+        holder = self._hold_lock(borg_e2e, 60)
+        try:
+            self._await_lock_held(borg_e2e)
+            proc = subprocess.Popen(
+                [str(borg_e2e.borgadm_bin), "list"],
+                env=borg_e2e._subprocess_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # Long enough for borgadm to start, probe (LOCK_CHECK_TIMEOUT),
+            # log the waiting message, and begin blocking -- all while the
+            # lock is still held.
+            time.sleep(8)
+        finally:
+            holder.terminate()
+            holder.wait()
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0, f"output:\n{out}"
+        assert "Repository lock is held" in out
+        assert out.strip(), "expected the archive to be listed"
 
 
 if __name__ == "__main__":
