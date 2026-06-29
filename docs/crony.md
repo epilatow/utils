@@ -2,9 +2,7 @@
 
 ## SYNOPSIS
 
-```text
-crony <command> ...
-```
+`crony <command> ...`
 
 ## DESCRIPTION
 
@@ -18,19 +16,17 @@ independently of the underlying scheduler, and run at will via the `trigger`
 subcommand). Crony supports the following notification mechanisms for job
 failures: email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
-```text
 Subcommands fall into categories:
-  - configuration (config):              manage config files
-  - deployment (apply, destroy):         deploy configured jobs
-  - runtime state (enable, disable):     manage scheduler arming
-  - operational (status, logs, trigger): manage deployed jobs
-```
 
-```text
+- configuration (`config`): manage config files
+- deployment (`apply`, `destroy`): deploy configured jobs
+- runtime state (`enable`, `disable`): manage scheduler arming
+- operational (`status`, `logs`, `trigger`): manage deployed jobs
+
 Configuration is managed via bundles:
-  ~/.config/crony/config.toml     -> bundle name "default"
-  ~/.config/crony/config/<x>.toml -> bundle name "<x>"
-```
+
+- `~/.config/crony/config.toml` -> bundle name "default"
+- `~/.config/crony/config/<x>.toml` -> bundle name "\<x>"
 
 Bundles are independent. Job and group names are namespaced as
 \<bundle>.\<name>; bare CLI input (`crony trigger foo`) is shorthand for

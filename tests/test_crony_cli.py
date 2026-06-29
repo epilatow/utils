@@ -104,8 +104,8 @@ class TestHelpOutput:
         # and the bundle-config layout, not per-column / per-subcommand
         # detail (that lives in each subcommand's own --help).
         assert "Subcommands fall into categories:" in text
-        assert "configuration (config)" in text
-        assert "deployment (apply, destroy)" in text
+        assert "configuration (`config`)" in text
+        assert "deployment (`apply`, `destroy`)" in text
         # The epilog's Title-Case section headers are present.
         for header in (
             "Exit Status:",

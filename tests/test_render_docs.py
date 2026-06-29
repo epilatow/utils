@@ -258,6 +258,62 @@ def test_item_lists_post_section_renders_titled_sublists() -> None:
     assert "## COLUMNS" in gfm and "### Group A" in gfm
 
 
+def test_overview_lead_in_line_renders_as_prose_not_code() -> None:
+    # A flush-left lead-in line before an indented block stays prose -- it
+    # is not pulled into the verbatim code block under it.
+    out = render_docs._overview_md("Heading line:\n  a -> 1\n  bb -> 2")
+    assert out == [
+        "Heading line:",
+        "",
+        "```text",
+        "  a -> 1",
+        "  bb -> 2",
+        "```",
+        "",
+    ]
+
+
+def test_overview_blank_line_inside_indented_block_is_kept() -> None:
+    # A blank line between indented lines stays inside one code block,
+    # rather than splitting the example into two.
+    out = render_docs._overview_md("  first = 1\n\n  second = 2")
+    assert out == ["```text", "  first = 1", "", "  second = 2", "```", ""]
+
+
+def test_overview_bullet_lines_render_as_list_under_lead_in() -> None:
+    # A flush-left lead-in stays prose; the `- ` lines below it render as
+    # bullet items (each preserved, not reflowed into the paragraph),
+    # separated from the lead-in by the blank line markdown requires.
+    out = render_docs._overview_md("Kinds:\n- first one\n- second one")
+    assert out == ["Kinds:", "", "- first one", "- second one", ""]
+
+
+def test_overview_bullet_wrapped_continuation_folds_into_item() -> None:
+    # A bullet item that wraps onto a flush-left continuation line folds
+    # back into that item rather than starting a new one.
+    out = render_docs._overview_md("- item one\ncontinued\n- item two")
+    assert out == ["- item one continued", "- item two", ""]
+
+
+def test_gfm_synopsis_is_inline_code_not_a_fenced_block() -> None:
+    # The GFM SYNOPSIS is an inline code span, not a fenced code block.
+    def build_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        parser.add_subparsers().add_parser("go", help="Do the thing.")
+        return parser
+
+    spec = ManSpec(
+        prog="demo",
+        section=1,
+        build_parser=build_parser,
+        name_description="demo tool",
+    )
+    gfm = render_docs.build_gfm(spec)
+    assert "## SYNOPSIS\n\n`demo" in gfm
+    synopsis = gfm.split("## SYNOPSIS", 1)[1].split("## ", 1)[0]
+    assert "```" not in synopsis
+
+
 class TestInvocation:
     """`_invocation` formats an action the way `--help` shows it, built
     from public attributes (not argparse's formatter)."""

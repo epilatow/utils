@@ -13,19 +13,25 @@ Jobs can be grouped, and groups or jobs run on a schedule.\&
 Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gatrigger\(ga subcommand).\&
 Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
 .PP
-.EX
 Subcommands fall into categories:
-  \- configuration (config):              manage config files
-  \- deployment (apply, destroy):         deploy configured jobs
-  \- runtime state (enable, disable):     manage scheduler arming
-  \- operational (status, logs, trigger): manage deployed jobs
-.EE
+.PD 0
+.IP \(bu 2
+configuration (\(gaconfig\(ga): manage config files
+.IP \(bu 2
+deployment (\(gaapply\(ga, \(gadestroy\(ga): deploy configured jobs
+.IP \(bu 2
+runtime state (\(gaenable\(ga, \(gadisable\(ga): manage scheduler arming
+.IP \(bu 2
+operational (\(gastatus\(ga, \(galogs\(ga, \(gatrigger\(ga): manage deployed jobs
+.PD
 .PP
-.EX
 Configuration is managed via bundles:
-  \(ti/.config/crony/config.toml     \-> bundle name \(dqdefault\(dq
-  \(ti/.config/crony/config/<x>.toml \-> bundle name \(dq<x>\(dq
-.EE
+.PD 0
+.IP \(bu 2
+\(ga\(ti/.config/crony/config.toml\(ga \-> bundle name \(dqdefault\(dq
+.IP \(bu 2
+\(ga\(ti/.config/crony/config/<x>.toml\(ga \-> bundle name \(dq<x>\(dq
+.PD
 .PP
 Bundles are independent.\&
 Job and group names are namespaced as <bundle>.<name>; bare CLI input (\(gacrony trigger foo\(ga) is shorthand for \(gadefault.foo\(ga.\&

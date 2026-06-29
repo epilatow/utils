@@ -2,9 +2,7 @@
 
 ## SYNOPSIS
 
-```text
-linkfiles <command> ...
-```
+`linkfiles <command> ...`
 
 ## DESCRIPTION
 

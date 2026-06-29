@@ -2,9 +2,7 @@
 
 ## SYNOPSIS
 
-```text
-firefox-cookies <command> ...
-```
+`firefox-cookies <command> ...`
 
 ## DESCRIPTION
 

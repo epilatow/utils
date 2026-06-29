@@ -318,25 +318,75 @@ def _code_block(text: str) -> list[str]:
     return ["```text", *text.splitlines(), "```", ""]
 
 
+def _next_is_indented(lines: list[str], i: int) -> bool:
+    """Whether the next non-blank line at or after index `i` is indented."""
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return i < len(lines) and lines[i][:1].isspace()
+
+
+def _is_bullet(line: str) -> bool:
+    """Whether `line` is a flush-left Markdown bullet (`- `)."""
+    return line.startswith("- ")
+
+
 def _overview_md(
     overview: str,
     inline: Callable[[str], str] = _md,
 ) -> list[str]:
-    """A description / overview as Markdown: prose paragraphs reflow,
-    while a block containing any indented line (an aligned table) is kept
-    verbatim as a code block. `inline` escapes prose for the target dialect
+    """A description / overview as Markdown, segmented by line into prose
+    paragraphs (flush-left text, reflowed), bullet lists (`- ` lines), and
+    verbatim code blocks (indented lines, e.g. a shell example).
+
+    A flush-left lead-in line stays prose -- it is not pulled into a
+    following bullet list or indented block. (A blank line still separates
+    the lead-in from the list / block: both pandoc and mdformat require it
+    to recognise the list / block, so it is structural, not cosmetic.) A
+    blank line between indented lines is kept inside the one code block, so
+    a single example with an internal blank renders whole. A bullet item
+    that wraps continues on flush-left lines (an indented line would start
+    a code block instead). `inline` escapes prose for the target dialect
     (`_md` for pandoc/man, `_gfm_inline` for GFM)."""
     out: list[str] = []
-    for block in overview.split("\n\n"):
-        lines = block.strip("\n").split("\n")
-        if not any(lines):
+    lines = overview.split("\n")
+    n = len(lines)
+    i = 0
+    while i < n:
+        if not lines[i].strip():
+            i += 1
             continue
-        if any(line[:1].isspace() for line in lines):
-            out += _code_block("\n".join(lines))
+        if lines[i][:1].isspace():
+            run: list[str] = []
+            while i < n:
+                if lines[i].strip() and lines[i][:1].isspace():
+                    run.append(lines[i])
+                elif not lines[i].strip() and _next_is_indented(lines, i + 1):
+                    run.append("")
+                else:
+                    break
+                i += 1
+            out += _code_block("\n".join(run))
+        elif _is_bullet(lines[i]):
+            while i < n and lines[i].strip() and not lines[i][:1].isspace():
+                if _is_bullet(lines[i]):
+                    out.append(f"- {inline(lines[i][2:])}")
+                elif out:
+                    out[-1] += f" {inline(lines[i].strip())}"
+                i += 1
+            out.append("")
         else:
             # Join the wrapped source lines before escaping so a code span
             # that wraps across lines is seen (and preserved) whole.
-            out += [inline(" ".join(lines)), ""]
+            run = []
+            while (
+                i < n
+                and lines[i].strip()
+                and not lines[i][:1].isspace()
+                and not _is_bullet(lines[i])
+            ):
+                run.append(lines[i])
+                i += 1
+            out += [inline(" ".join(run)), ""]
     return out
 
 
@@ -592,7 +642,24 @@ def _render_roff(markdown: str) -> str:
         # the last section, so no reset is needed.
         if line == ".SH EXIT STATUS":
             out.append(".PD 0")
-    return "\n".join(out).strip("\n") + "\n"
+    # Bullet lists get the same compaction: groff spaces consecutive
+    # `.IP \(bu` items by `.PD`'s default paragraph distance (a blank line
+    # between bullets). Wrap each run in `.PD 0` / `.PD` (reset) so the
+    # items render tight without affecting the surrounding paragraphs.
+    tightened: list[str] = []
+    in_bullets = False
+    for line in out:
+        is_bullet = line.startswith(".IP \\(bu")
+        if is_bullet and not in_bullets:
+            tightened.append(".PD 0")
+            in_bullets = True
+        elif in_bullets and not is_bullet and line.startswith("."):
+            tightened.append(".PD")
+            in_bullets = False
+        tightened.append(line)
+    if in_bullets:
+        tightened.append(".PD")
+    return "\n".join(tightened).strip("\n") + "\n"
 
 
 def _md_wrap() -> int:
@@ -672,12 +739,14 @@ def build_gfm(spec: ManSpec) -> str:
     result satisfies the repo's prose mdformat / markdownlint gates. Pure
     Python (no pandoc); deterministic."""
     parser = _build_parser(spec)
+    synopsis = f"{spec.prog} {_signature(parser)}".rstrip()
     out: list[str] = [
         f"# {spec.prog} - {spec.name_description}",
         "",
         "## SYNOPSIS",
         "",
-        *_code_block(f"{spec.prog} {_signature(parser)}".rstrip()),
+        f"`{synopsis}`",
+        "",
         "## DESCRIPTION",
         "",
     ]
