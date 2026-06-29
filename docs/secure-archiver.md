@@ -31,6 +31,26 @@ To get started, write a sample config, edit it to point at your files and
     secure-archiver create
 ```
 
+Schedule secure-archiver(1) to run weekly as an interactive crony(1) job. We
+run it interactively so you can confirm when runs start, so the 1Password
+vault-access authorization prompts don't surprise you.
+
+```text
+    mkdir -p ~/.config/crony/config/
+    cat > ~/.config/crony/config/secure-archiver.toml <<-EOF
+    [defaults]
+    notify-channels = ["default"]
+
+    [job.create]
+    command   = "secure-archiver create"
+    env.PATH  = "\$PATH:\$HOME/.local/bin"
+    interval = "1w"
+    flags = ["interactive"]
+    uuid = "$(crony config generate-uuid)"
+    EOF
+    crony apply -b secure-archiver
+```
+
 ## COMMON ARGUMENTS
 
 - **`--config CONFIG`**\

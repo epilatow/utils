@@ -20,6 +20,25 @@ To get started, write a sample config, edit it to point at your files and 1Passw
     secure\-archiver config validate
     secure\-archiver create
 .EE
+.PP
+Schedule secure\-archiver(1) to run weekly as an interactive crony(1) job.\&
+We run it interactively so you can confirm when runs start, so the 1Password vault\-access authorization prompts don\(aqt surprise you.\&
+.PP
+.EX
+    mkdir \-p \(ti/.config/crony/config/
+    cat > \(ti/.config/crony/config/secure\-archiver.toml <<\-EOF
+    [defaults]
+    notify\-channels = [\(dqdefault\(dq]
+
+    [job.create]
+    command   = \(dqsecure\-archiver create\(dq
+    env.PATH  = \(dq\(rs$PATH:\(rs$HOME/.local/bin\(dq
+    interval = \(dq1w\(dq
+    flags = [\(dqinteractive\(dq]
+    uuid = \(dq$(crony config generate\-uuid)\(dq
+    EOF
+    crony apply \-b secure\-archiver
+.EE
 .SH COMMON ARGUMENTS
 .TP
 \f[CR]\-\-config CONFIG\f[R]
