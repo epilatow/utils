@@ -1141,9 +1141,9 @@ def trigger_unit_sync(
             )
         pid = crony.runtime.read_pid_file(pid_path)
         if pid is not None and _pid_alive(pid):
-            # A live runner: block on kernel-level pid-exit, capped at
-            # the remaining budget (None = no cap, for an uncapped
-            # child). After the wait, loop back to re-read last-run.json
+            # A live runner: block on its pid-exit, capped at the
+            # remaining budget (None = no cap, for an uncapped child).
+            # After the wait, loop back to re-read last-run.json
             # (the runner writes it just before unlinking the pid).
             pid_wait = (
                 None

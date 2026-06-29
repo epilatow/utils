@@ -31,11 +31,11 @@ _script_path = REPO_ROOT / "src" / "crony" / "platform" / "linux.py"
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux", reason="pidfd pid-exit wait is Linux-only"
+    sys.platform != "linux", reason="/proc pid-exit wait is Linux-only"
 )
 class TestLinuxWaitForPidExit:
-    """The pidfd-based pid-exit wait, exercised against real processes.
-    Must be reliable without polling."""
+    """The /proc-polling pid-exit wait, exercised against real
+    processes."""
 
     def test_live_pid_exits_during_wait(self) -> None:
         proc = subprocess.Popen(["sleep", "0.3"])
@@ -51,10 +51,10 @@ class TestLinuxWaitForPidExit:
     def test_already_dead_pid_returns_exited(self) -> None:
         proc = subprocess.Popen(["true"])
         proc.wait()
-        # Either the kernel still has zombie info (pidfd_open succeeds
-        # and poll returns) or the pid has been recycled (we wait for a
-        # new process to exit, possibly hitting timeout). Both are
-        # acceptable; the call must not hang past the timeout.
+        # The pid is either gone (no /proc entry) or, if reaped late, a
+        # zombie -- both read as exited. If the number raced into reuse,
+        # the wait runs to timeout instead. Both are acceptable; the call
+        # must not hang past the timeout.
         result = LinuxHost().wait_for_pid_exit(proc.pid, timeout=2.0)
         assert result in {PidWait.EXITED, PidWait.TIMED_OUT}
 

@@ -49,13 +49,12 @@ class HostPlatform(abc.ABC):
 
     @abc.abstractmethod
     def wait_for_pid_exit(self, pid: int, timeout: float | None) -> PidWait:
-        """Block until `pid` exits, via a kernel-level exit notification
-        rather than polling.
+        """Block until `pid` exits.
 
-        Returns `PidWait.EXITED` once the pid is gone -- whether it
-        exited, never existed, or raced into reuse -- and
-        `PidWait.TIMED_OUT` if `timeout` seconds elapse first.
-        `timeout=None` waits indefinitely.
+        Returns `PidWait.EXITED` once the pid is gone (it exited or never
+        existed) and `PidWait.TIMED_OUT` if `timeout` seconds elapse
+        first. `timeout=None` waits indefinitely. Backends choose their
+        own wait mechanism; see each for any pid-reuse caveat.
         """
 
     @abc.abstractmethod

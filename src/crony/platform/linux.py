@@ -2,22 +2,45 @@
 
 """Linux host-platform backend.
 
-Implements the `HostPlatform` services on Linux: a pidfd-based pid-exit
-wait and a `systemd-inhibit` sleep-inhibitor wrap. Linux has no keychain
+Implements the `HostPlatform` services on Linux: a /proc-polling
+pid-exit wait and a `systemd-inhibit` sleep-inhibitor wrap. Linux has
+no keychain
 integration, so `keychain_secret` reports None and the credential
 resolver falls through to its env / file path. Desktop interaction is
 unsupported (`supports_interactive` is False): the idle / lock probes
 and dialogs raise.
 """
 
-import os
-import select
 import shutil
+import time
 
 from crony.platform.fda import FDAWrapper
 from crony.platform.host import HostPlatform, PidWait
 
 _NO_INTERACTIVE = "interactive jobs / dialogs are not supported on Linux"
+
+# Poll cadence for the /proc-based pid-exit wait (seconds).
+_PROC_POLL_INTERVAL = 0.05
+
+
+def _proc_pid_gone(pid: int) -> bool:
+    """True once `pid` has exited, read from /proc.
+
+    Matches the pidfd path's notion of "exited": a missing /proc entry
+    (reaped or never existed) and a zombie (`Z`, exited but not yet
+    reaped) both count as gone. /proc/<pid>/stat is `pid (comm) state
+    ...`; comm may hold spaces and parens, so the state char is the one
+    after the last `)`.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return True
+    rparen = data.rfind(b")")
+    if rparen == -1 or rparen + 2 >= len(data):
+        return True
+    return data[rparen + 2 : rparen + 3] == b"Z"
 
 
 class LinuxHost(HostPlatform):
@@ -28,18 +51,24 @@ class LinuxHost(HostPlatform):
         return False
 
     def wait_for_pid_exit(self, pid: int, timeout: float | None) -> PidWait:
-        try:
-            fd = os.pidfd_open(pid)  # type: ignore[attr-defined, unused-ignore]
-        except ProcessLookupError:
-            return PidWait.EXITED
-        try:
-            poll = select.poll()
-            poll.register(fd, select.POLLIN)
-            ms = -1 if timeout is None else int(timeout * 1000)
-            events = poll.poll(ms)
-            return PidWait.EXITED if events else PidWait.TIMED_OUT
-        finally:
-            os.close(fd)
+        # Poll /proc for the exit. The edge-triggered alternative,
+        # os.pidfd_open, is absent from the python-build-standalone
+        # interpreters uv ships (every version), so it is not usable here.
+        # The cost is a pid-reuse window: if `pid` exits and the number is
+        # recycled before the next poll, the replacement reads as alive
+        # and the wait runs to `timeout`. crony's job pids plus the
+        # timeout bound make that immaterial.
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if _proc_pid_gone(pid):
+                return PidWait.EXITED
+            if deadline is None:
+                time.sleep(_PROC_POLL_INTERVAL)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return PidWait.TIMED_OUT
+            time.sleep(min(_PROC_POLL_INTERVAL, remaining))
 
     def keychain_secret(
         self, _service: str, _account: str | None
