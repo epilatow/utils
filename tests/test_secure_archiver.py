@@ -11,6 +11,7 @@ Comprehensive unit tests for secure_archiver
 
 import json
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1587,6 +1588,19 @@ class TestWriteExampleConfig:
         cfg = sa.load_config(output_file)
         assert isinstance(cfg, sa.Config)
         assert cfg.general.output_dir == "~/secure_archives"
+
+    def test_shipped_default_config_is_valid(self, tmp_path: Path) -> None:
+        """The shipped data file `config init` writes must exist, be
+        ASCII, parse as TOML, and pass the config loader. Guard against
+        the file (or the repo-relative path to it) going missing."""
+        shipped = sa._DEFAULT_CONFIG_PATH
+        assert shipped.is_file()
+        text = shipped.read_text(encoding="utf-8")
+        text.encode("ascii")  # raises if non-ASCII slips in
+        tomllib.loads(text)
+        config_file = tmp_path / "secure-archiver.toml"
+        config_file.write_text(text, encoding="utf-8")
+        assert isinstance(sa.load_config(config_file), sa.Config)
 
 
 class TestCheckConfig:

@@ -1,0 +1,52 @@
+# Example configuration for secure-archiver
+#
+# Run: secure-archiver create --config <this-file>
+
+[general]
+# Required: Directory where archives will be written. Supports ~ and env vars.
+output_dir = "~/secure_archives"
+
+# Optional: Number of old archive versions to keep (default: 3)
+keep_revisions = 3
+
+# Optional: Content to write to README.txt in the output directory.
+# Use triple quotes for multi-line text. The file is updated on each run.
+readme = """
+This directory contains encrypted archives.
+See each .txt file for instructions on opening the corresponding .7z archive.
+"""
+
+# Each [archive.NAME] section defines one encrypted archive.
+# NAME becomes part of the output filename: NAME.YYYYMMDD_HHMMSS.7z
+
+[archive.Example_Archive]
+# Required: 1Password reference to the encryption password
+op_password = "op://Vault/Item/password"
+
+# Required: Description included in the readme file
+description = """
+This archive contains important documents.
+The readme will include instructions for opening the .7z file.
+"""
+
+# Required: List of files to include in the archive
+include = [
+  # Include files matching a glob pattern:
+  { path = "~/Documents/*.pdf" },
+
+  # Include a directory (non-recursive by default):
+  { path = "~/Documents/folder" },
+
+  # Include a directory recursively:
+  { path = "~/Documents/nested", recurse = true },
+
+  # Include only the latest file matching a pattern (by name sort):
+  { path = "~/Backups/backup_*.tar.gz", latest = true },
+
+  # Fetch content from 1Password and save as a file:
+  { op_ref = "op://Vault/Item/notes", filename = "secrets.txt" },
+
+  # Store files in a subdirectory within the archive using 'dir':
+  { path = "~/Work/*.doc", dir = "work_docs" },
+  { op_ref = "op://Vault/Item/key", filename = "key.pem", dir = "certs" },
+]
