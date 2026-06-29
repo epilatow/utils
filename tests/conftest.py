@@ -448,14 +448,23 @@ class UnknownArgRoutedToSubparserBase:
 
 
 class HelpWidthBase:
-    """Assert every utility's --help fits a narrow terminal.
+    """Assert every utility's --help fits the terminal argparse formats for.
 
-    Rendered at an 80-column terminal, argparse wraps the parts it manages
-    to 78 columns, but text it copies verbatim -- a long ``description=``,
-    ``RawDescriptionHelpFormatter`` epilog text, or a wide subparser
-    metavar -- does not wrap and can overflow. This base walks the parser
-    and every subparser, renders each ``--help``, and asserts no line
-    exceeds ``MAX_WIDTH``.
+    argparse targets ``terminal_columns - 2`` as its wrap width (it keeps a
+    two-column margin: ``HelpFormatter`` does ``width = columns; width -=
+    2``). The test pins the terminal to ``TERMINAL_COLUMNS`` and checks
+    each line against ``TERMINAL_COLUMNS - 2`` -- one knob feeds both the
+    pinned terminal and the asserted limit, so they cannot drift apart.
+
+    A line exceeds the target only where argparse hits a part it cannot
+    break: verbatim text it copies (a long ``description=`` /
+    ``RawDescriptionHelpFormatter`` epilog, a wide subparser metavar) or,
+    before Python 3.13, a wide mutually-exclusive group. The interpreter is
+    pinned (see ``.python-version``) so that wrapping behavior is fixed too,
+    leaving genuinely over-wide CLI surface as the only thing this catches.
+
+    This base walks the parser and every subparser, renders each
+    ``--help``, and asserts no line exceeds ``TERMINAL_COLUMNS - 2``.
 
     Subclasses set:
       PROG: the command name as users invoke it (e.g. "firefox-cookies").
@@ -464,7 +473,10 @@ class HelpWidthBase:
 
     PROG: ClassVar[str]
     PARSER_FUNC: ClassVar[Callable[[], argparse.ArgumentParser]]
-    MAX_WIDTH: ClassVar[int] = 78
+    # The single knob: the terminal width the test pins. The asserted
+    # limit is argparse's wrap target (this minus 2), computed in the test
+    # so overriding this alone cannot desync the terminal and the limit.
+    TERMINAL_COLUMNS: ClassVar[int] = 80
 
     @staticmethod
     def _all_parsers(
@@ -492,10 +504,13 @@ class HelpWidthBase:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """No --help line (top level or any subcommand) exceeds the width
-        when rendered at an 80-column terminal."""
+        argparse targets at the pinned terminal size."""
         # argparse derives help width from the terminal; pin it so the gate
-        # is deterministic wherever the suite runs.
-        monkeypatch.setenv("COLUMNS", "80")
+        # is deterministic wherever the suite runs, and derive the limit
+        # (TERMINAL_COLUMNS - 2) from that same value so the two stay tied.
+        columns = type(self).TERMINAL_COLUMNS
+        max_width = columns - 2
+        monkeypatch.setenv("COLUMNS", str(columns))
         # Build under the real program name: argparse derives each parser's
         # prog (and so its usage-line width) from argv[0] at build time, and
         # under pytest that would otherwise be the runner's path.
@@ -503,11 +518,10 @@ class HelpWidthBase:
         overflow: list[str] = []
         for sub in self._all_parsers(type(self).PARSER_FUNC()):
             for line in sub.format_help().splitlines():
-                if len(line) > self.MAX_WIDTH:
+                if len(line) > max_width:
                     overflow.append(f"{sub.prog}: ({len(line)}) {line!r}")
         assert not overflow, (
-            f"--help lines exceed {self.MAX_WIDTH} columns:\n"
-            + "\n".join(overflow)
+            f"--help lines exceed {max_width} columns:\n" + "\n".join(overflow)
         )
 
     def test_subcommand_groups_set_command_metavar(self) -> None:
