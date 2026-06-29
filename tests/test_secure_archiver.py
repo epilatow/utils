@@ -1495,8 +1495,8 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     PARSER_FUNC = staticmethod(sa.build_parser)
     CASES = [
         (["create", "--bogus"], "create"),
-        (["check-config", "--bogus"], "check-config"),
-        (["write-example-config", "--bogus"], "write-example-config"),
+        (["config", "validate", "--bogus"], "config validate"),
+        (["config", "init", "--bogus"], "config init"),
     ]
 
 
@@ -1507,7 +1507,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     PARSER_FUNC = staticmethod(sa.build_parser)
     CLI_FUNC = staticmethod(sa.cli)
     EXIT_CODE_USAGE = sa.ExitCode.USAGE
-    TEST_SUBCOMMAND = "check-config"
+    TEST_SUBCOMMAND = "create"
     EXCEPTION_EXIT_CODE_MAP = [
         (sa.UsageError("t"), sa.ExitCode.USAGE),
         (sa.ConfigError("t"), sa.ExitCode.CONFIG),
@@ -1521,31 +1521,66 @@ class TestCmdCallbacks(CmdCallbacksBase):
     ]
 
 
+class TestConfigGroupDispatch:
+    """The `config` group routes the space-joined COMMAND_CALLBACKS keys
+    (`config init` / `config validate`) through cli() to the right
+    handler. A flat dispatch table without the join would key on the
+    bare leaf name and silently fail to match."""
+
+    def test_config_init_dispatches(self, tmp_path: Path) -> None:
+        mock_cb = MagicMock()
+        output_file = tmp_path / "example.toml"
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"config init": mock_cb}),
+            patch(
+                "sys.argv",
+                ["prog", "config", "init", str(output_file)],
+            ),
+        ):
+            result = sa.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(output_file=output_file)
+
+    def test_config_validate_dispatches(self, tmp_path: Path) -> None:
+        mock_cb = MagicMock()
+        config_file = tmp_path / "secure-archiver.toml"
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"config validate": mock_cb}),
+            patch(
+                "sys.argv",
+                ["prog", "config", "validate", "--config", str(config_file)],
+            ),
+        ):
+            result = sa.cli()
+        assert result == 0
+        mock_cb.assert_called_once_with(config=config_file)
+
+
 class TestWriteExampleConfig:
-    """Test write-example-config subcommand."""
+    """Test the `config init` subcommand."""
 
     def test_writes_example_config(self, tmp_path: Path) -> None:
-        """Test that write-example-config creates a file."""
+        """Test that `config init` creates a file."""
         output_file = tmp_path / "example.toml"
-        sa.do_write_example_config(output_file)
+        sa.do_config_init(output_file)
         assert output_file.exists()
         content = output_file.read_text()
         assert "[general]" in content
         assert "[archive." in content
 
     def test_fails_if_file_exists(self, tmp_path: Path) -> None:
-        """Test that write-example-config raises if file already exists."""
+        """Test that `config init` raises if file already exists."""
         output_file = tmp_path / "example.toml"
         output_file.write_text("existing content")
         with pytest.raises(sa.ConfigError, match="already exists"):
-            sa.do_write_example_config(output_file)
+            sa.do_config_init(output_file)
         # Original content should be preserved
         assert output_file.read_text() == "existing content"
 
     def test_generated_config_is_valid(self, tmp_path: Path) -> None:
         """Test that the generated example config passes validation."""
         output_file = tmp_path / "example.toml"
-        sa.do_write_example_config(output_file)
+        sa.do_config_init(output_file)
 
         # Load config - validation happens inside load_config
         # If it returns without raising, the config is valid
@@ -1555,7 +1590,7 @@ class TestWriteExampleConfig:
 
 
 class TestCheckConfig:
-    """Test check-config subcommand."""
+    """Test the `config validate` subcommand."""
 
     def test_valid_config_passes(self, tmp_path: Path) -> None:
         """Test that a valid config passes validation."""
@@ -1572,7 +1607,7 @@ include = [
   { path = "~/Documents" },
 ]
 """)
-        sa.do_check_config(config_file)  # Should not raise
+        sa.do_config_validate(config_file)  # Should not raise
 
     def test_missing_general_section(self, tmp_path: Path) -> None:
         """Test that missing [general] section is caught."""
@@ -1584,7 +1619,7 @@ description = "Test archive"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_missing_output_dir(self, tmp_path: Path) -> None:
         """Test that missing output_dir is caught."""
@@ -1599,7 +1634,7 @@ description = "Test archive"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_missing_archive_section(self, tmp_path: Path) -> None:
         """Test that missing archive section is caught."""
@@ -1609,7 +1644,7 @@ include = [{ path = "~/Documents" }]
 output_dir = "~/archives"
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_missing_op_password(self, tmp_path: Path) -> None:
         """Test that missing op_password is caught."""
@@ -1623,7 +1658,7 @@ description = "Test archive"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_missing_description(self, tmp_path: Path) -> None:
         """Test that missing description is caught."""
@@ -1637,7 +1672,7 @@ op_password = "op://vault/item/password"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_missing_include(self, tmp_path: Path) -> None:
         """Test that missing include is caught."""
@@ -1651,7 +1686,7 @@ op_password = "op://vault/item/password"
 description = "Test archive"
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_include(self, tmp_path: Path) -> None:
         """Test that empty include array is caught."""
@@ -1666,7 +1701,7 @@ description = "Test archive"
 include = []
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_output_dir(self, tmp_path: Path) -> None:
         """Test that empty output_dir is caught."""
@@ -1681,7 +1716,7 @@ description = "Test archive"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_op_password(self, tmp_path: Path) -> None:
         """Test that empty op_password is caught."""
@@ -1696,7 +1731,7 @@ description = "Test archive"
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_description(self, tmp_path: Path) -> None:
         """Test that empty description is caught."""
@@ -1711,7 +1746,7 @@ description = ""
 include = [{ path = "~/Documents" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_path(self, tmp_path: Path) -> None:
         """Test that empty path in include entry is caught."""
@@ -1726,7 +1761,7 @@ description = "Test archive"
 include = [{ path = "" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_op_ref(self, tmp_path: Path) -> None:
         """Test that empty op_ref in include entry is caught."""
@@ -1741,7 +1776,7 @@ description = "Test archive"
 include = [{ op_ref = "", filename = "test.txt" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_empty_filename(self, tmp_path: Path) -> None:
         """Test that empty filename in include entry is caught."""
@@ -1756,7 +1791,7 @@ description = "Test archive"
 include = [{ op_ref = "op://vault/item/notes", filename = "" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_include_entry_without_path_or_op_ref(self, tmp_path: Path) -> None:
         """Test that include entry without path or op_ref is caught."""
@@ -1771,7 +1806,7 @@ description = "Test archive"
 include = [{ recurse = true }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_include_entry_with_both_path_and_op_ref(
         self, tmp_path: Path
@@ -1788,7 +1823,7 @@ description = "Test archive"
 include = [{ path = "~/Documents", op_ref = "op://vault/item/notes" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_op_ref_without_filename(self, tmp_path: Path) -> None:
         """Test that op_ref entry without filename is caught."""
@@ -1803,7 +1838,7 @@ description = "Test archive"
 include = [{ op_ref = "op://vault/item/notes" }]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_valid_config_with_op_ref(self, tmp_path: Path) -> None:
         """Test that valid config with op_ref entry passes."""
@@ -1820,20 +1855,20 @@ include = [
   { op_ref = "op://vault/item/notes", filename = "secrets.txt" },
 ]
 """)
-        sa.do_check_config(config_file)  # Should not raise
+        sa.do_config_validate(config_file)  # Should not raise
 
     def test_nonexistent_config_file(self, tmp_path: Path) -> None:
         """Test that nonexistent config file raises ConfigError."""
         config_file = tmp_path / "nonexistent.toml"
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_invalid_toml_syntax(self, tmp_path: Path) -> None:
         """Test that invalid TOML syntax raises ConfigError."""
         config_file = tmp_path / "invalid.toml"
         config_file.write_text("this is not valid [[[toml")
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_path_entry_with_invalid_key(self, tmp_path: Path) -> None:
         """Test that path entry with invalid key is caught."""
@@ -1850,7 +1885,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_path_entry_with_filename_is_invalid(self, tmp_path: Path) -> None:
         """Test that path entry with filename key is caught."""
@@ -1867,7 +1902,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_path_entry_with_dir_is_valid(self, tmp_path: Path) -> None:
         """Test that path entry with dir key is accepted."""
@@ -1883,7 +1918,7 @@ include = [
   { path = "~/Documents/*.pdf", dir = "pdfs" },
 ]
 """)
-        sa.do_check_config(config_file)  # Should not raise
+        sa.do_config_validate(config_file)  # Should not raise
 
     def test_op_ref_entry_with_dir_is_valid(self, tmp_path: Path) -> None:
         """Test that op_ref entry with dir key is accepted."""
@@ -1899,7 +1934,7 @@ include = [
   { op_ref = "op://vault/item/notes", filename = "s.txt", dir = "secrets" },
 ]
 """)
-        sa.do_check_config(config_file)  # Should not raise
+        sa.do_config_validate(config_file)  # Should not raise
 
     def test_path_entry_with_empty_dir_is_invalid(self, tmp_path: Path) -> None:
         """Test that path entry with empty dir is rejected."""
@@ -1916,7 +1951,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_op_ref_entry_with_empty_dir_is_invalid(
         self, tmp_path: Path
@@ -1935,7 +1970,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_op_ref_entry_with_invalid_key(self, tmp_path: Path) -> None:
         """Test that op_ref entry with invalid key is caught."""
@@ -1952,7 +1987,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
     def test_op_ref_entry_with_latest_is_invalid(self, tmp_path: Path) -> None:
         """Test that op_ref entry with latest key is caught."""
@@ -1969,7 +2004,7 @@ include = [
 ]
 """)
         with pytest.raises(sa.ConfigError):
-            sa.do_check_config(config_file)
+            sa.do_config_validate(config_file)
 
 
 class TestConfigFromDict:

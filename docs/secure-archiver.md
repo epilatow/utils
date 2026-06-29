@@ -14,11 +14,11 @@ revisions are pruned to a configurable count. The 1Password CLI (`op`) and the
 7-Zip CLI (`7zz`) must be on PATH.
 
 Each archive is defined by an [archive.NAME] section in the config (see the
-example config written by `write-example-config`). On every run it stages an
-archive's files into a temporary directory, computes a SHA256 manifest of the
-contents, and publishes a new revision only when the contents changed since
-the latest existing archive -- unless --force-update forces a write. All
-archives produced by a single run share one timestamp.
+example config written by `config init`). On every run it stages an archive's
+files into a temporary directory, computes a SHA256 manifest of the contents,
+and publishes a new revision only when the contents changed since the latest
+existing archive -- unless --force-update forces a write. All archives
+produced by a single run share one timestamp.
 
 ## GETTING STARTED
 
@@ -26,13 +26,16 @@ To get started, write a sample config, edit it to point at your files and
 1Password references, then create archives from it:
 
 ```text
-    secure-archiver write-example-config ./secure-archiver.toml
-    secure-archiver check-config --config ./secure-archiver.toml
-    secure-archiver create --config ./secure-archiver.toml
+    secure-archiver config init ./secure-archiver.toml
+    secure-archiver config validate
+    secure-archiver create
 ```
 
-When --config is omitted, secure-archiver looks for `secure-archiver.toml` in
-the current directory, then `~/.secure-archiver.toml`.
+## COMMON ARGUMENTS
+
+- **`--config CONFIG`**\
+  Path to the config TOML. When omitted, secure-archiver searches
+  ./secure-archiver.toml, then ~/.secure-archiver.toml.
 
 ## SUBCOMMANDS
 
@@ -42,27 +45,22 @@ Build the archives defined in the config, publishing a new timestamped
 revision of each archive whose contents changed (or all of them with
 --force-update) and pruning old revisions.
 
-- **`--config CONFIG`**\
-  Path to config TOML
 - **`--dry-run`**\
   Do all work but never modify output directory
 - **`--force-update`**\
   Publish even if archive contents are unchanged
 
-### `write-example-config output_file`
+### `config init output_file`
 
 Write a commented example config to output_file, which must not already exist.
 
 - **`output_file`**\
   Path to write the example config
 
-### `check-config [--config CONFIG]`
+### `config validate [--config CONFIG]`
 
 Load and validate the config file, reporting the resolved path on success and
 the validation errors on failure.
-
-- **`--config CONFIG`**\
-  Path to config TOML
 
 ## FILES
 

@@ -9,27 +9,27 @@ secure\-archiver builds 7z encrypted archives from a TOML config, bundling local
 Each archive is timestamped and paired with a plaintext readme describing how to open it, and old revisions are pruned to a configurable count.\&
 The 1Password CLI (\(gaop\(ga) and the 7\-Zip CLI (\(ga7zz\(ga) must be on PATH.\&
 .PP
-Each archive is defined by an [archive.NAME] section in the config (see the example config written by \(gawrite\-example\-config\(ga).\&
+Each archive is defined by an [archive.NAME] section in the config (see the example config written by \(gaconfig init\(ga).\&
 On every run it stages an archive\(aqs files into a temporary directory, computes a SHA256 manifest of the contents, and publishes a new revision only when the contents changed since the latest existing archive \-\- unless \-\-force\-update forces a write.\&
 All archives produced by a single run share one timestamp.\&
 .SH GETTING STARTED
 To get started, write a sample config, edit it to point at your files and 1Password references, then create archives from it:
 .PP
 .EX
-    secure\-archiver write\-example\-config ./secure\-archiver.toml
-    secure\-archiver check\-config \-\-config ./secure\-archiver.toml
-    secure\-archiver create \-\-config ./secure\-archiver.toml
+    secure\-archiver config init ./secure\-archiver.toml
+    secure\-archiver config validate
+    secure\-archiver create
 .EE
-.PP
-When \-\-config is omitted, secure\-archiver looks for \(gasecure\-archiver.toml\(ga in the current directory, then \(ga\(ti/.secure\-archiver.toml\(ga.\&
+.SH COMMON ARGUMENTS
+.TP
+\f[CR]\-\-config CONFIG\f[R]
+Path to the config TOML.\&
+When omitted, secure\-archiver searches ./secure\-archiver.toml, then \(ti/.secure\-archiver.toml.\&
 .SH SUBCOMMANDS
 .TP
 \f[B]create\f[R] [\-\-config CONFIG] [\-\-dry\-run] [\-\-force\-update]
 Build the archives defined in the config, publishing a new timestamped revision of each archive whose contents changed (or all of them with \-\-force\-update) and pruning old revisions.\&
 .RS
-.TP
-\f[CR]\-\-config CONFIG\f[R]
-Path to config TOML
 .TP
 \f[CR]\-\-dry\-run\f[R]
 Do all work but never modify output directory
@@ -38,7 +38,7 @@ Do all work but never modify output directory
 Publish even if archive contents are unchanged
 .RE
 .TP
-\f[B]write\-example\-config\f[R] output_file
+\f[B]config init\f[R] output_file
 Write a commented example config to output_file, which must not already exist.\&
 .RS
 .TP
@@ -46,13 +46,8 @@ Write a commented example config to output_file, which must not already exist.\&
 Path to write the example config
 .RE
 .TP
-\f[B]check\-config\f[R] [\-\-config CONFIG]
+\f[B]config validate\f[R] [\-\-config CONFIG]
 Load and validate the config file, reporting the resolved path on success and the validation errors on failure.\&
-.RS
-.TP
-\f[CR]\-\-config CONFIG\f[R]
-Path to config TOML
-.RE
 .SH FILES
 .TP
 \f[CR]./secure\-archiver.toml\f[R]

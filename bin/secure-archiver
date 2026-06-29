@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from common.argparse_ext import (  # noqa: E402
     RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
+    add_argument_ext,
 )
 from common.cli import cli_entrypoint  # noqa: E402
 from common.docspec import (  # noqa: E402
@@ -1157,7 +1158,7 @@ and old revisions are pruned to a configurable count. The 1Password CLI
 (`op`) and the 7-Zip CLI (`7zz`) must be on PATH.
 
 Each archive is defined by an [archive.NAME] section in the config (see the
-example config written by `write-example-config`). On every run it stages
+example config written by `config init`). On every run it stages
 an archive's files into a temporary directory, computes a SHA256 manifest
 of the contents, and publishes a new revision only when the
 contents changed since the latest existing archive -- unless --force-update
@@ -1168,12 +1169,9 @@ _GETTING_STARTED = """\
 To get started, write a sample config, edit it to point at your files and
 1Password references, then create archives from it:
 
-    secure-archiver write-example-config ./secure-archiver.toml
-    secure-archiver check-config --config ./secure-archiver.toml
-    secure-archiver create --config ./secure-archiver.toml
-
-When --config is omitted, secure-archiver looks for `secure-archiver.toml`
-in the current directory, then `~/.secure-archiver.toml`."""
+    secure-archiver config init ./secure-archiver.toml
+    secure-archiver config validate
+    secure-archiver create"""
 
 
 def build_parser() -> StrictArgumentParser:
@@ -1185,10 +1183,17 @@ def build_parser() -> StrictArgumentParser:
     """
 
     def add_config(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
+        add_argument_ext(
+            parser,
             "--config",
             type=Path,
+            common=True,
             help="Path to config TOML",
+            extended_help=(
+                "Path to the config TOML. When omitted, secure-archiver "
+                "searches ./secure-archiver.toml, then "
+                "~/.secure-archiver.toml."
+            ),
         )
 
     parser = StrictArgumentParser(
@@ -1230,31 +1235,38 @@ def build_parser() -> StrictArgumentParser:
         help="Publish even if archive contents are unchanged",
     )
 
-    # Write-example-config subcommand
-    example_parser = subparsers.add_parser(
-        "write-example-config",
+    # Config subcommand group (init / validate)
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Manage the config file.",
+    )
+    config_subparsers = config_parser.add_command_subparsers(
+        metavar="<command>"
+    )
+
+    config_init_parser = config_subparsers.add_parser(
+        "init",
         help="Write an example config file",
         description=(
             "Write a commented example config to output_file, which must "
             "not already exist."
         ),
     )
-    example_parser.add_argument(
+    config_init_parser.add_argument(
         "output_file",
         type=Path,
         help="Path to write the example config",
     )
 
-    # Check-config subcommand
-    check_parser = subparsers.add_parser(
-        "check-config",
+    config_validate_parser = config_subparsers.add_parser(
+        "validate",
         help="Validate a config file",
         description=(
             "Load and validate the config file, reporting the resolved "
             "path on success and the validation errors on failure."
         ),
     )
-    add_config(check_parser)
+    add_config(config_validate_parser)
 
     return parser
 
@@ -1323,7 +1335,7 @@ def do_update(
     eprint("Done." if published_any else "Done (no archives updated).")
 
 
-def do_write_example_config(output_file: Path) -> None:
+def do_config_init(output_file: Path) -> None:
     """Write an example config file."""
     if output_file.exists():
         raise ConfigError(f"File already exists: {output_file}")
@@ -1331,7 +1343,7 @@ def do_write_example_config(output_file: Path) -> None:
     eprint(f"Wrote example config to: {output_file}")
 
 
-def do_check_config(config: Path | None) -> None:
+def do_config_validate(config: Path | None) -> None:
     """
     Check if a config file is valid.
 
@@ -1348,8 +1360,8 @@ def do_check_config(config: Path | None) -> None:
 
 COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "create": do_update,
-    "write-example-config": do_write_example_config,
-    "check-config": do_check_config,
+    "config init": do_config_init,
+    "config validate": do_config_validate,
 }
 
 
