@@ -102,12 +102,30 @@ def test_name_description_is_whatis_shaped(spec: ManSpec) -> None:
 
 
 def test_readme_is_current() -> None:
-    # The repo README is regenerated (the documented list from the
-    # discovered specs, the undocumented list from each `bin/` tool's
-    # `--help`) and gated for drift. No pandoc, but it does run each
-    # undocumented tool's `--help`.
+    # The repo README is regenerated (one entry per discovered spec) and
+    # gated for drift. Pure Python plus mdformat, no pandoc.
     readme = REPO_ROOT / "README.md"
     assert readme.read_text() == render_docs.build_readme()
+
+
+def test_every_bin_utility_is_documented() -> None:
+    # Every executable under bin/ must be discoverable by render-docs: it
+    # must expose a MAN_SPEC, and (for all but crony, which is imported by
+    # name) carry the src/ alias discovery reaches it through. A tool
+    # missing either silently vanishes from the docs; this gate lists it
+    # instead.
+    bin_dir = REPO_ROOT / "bin"
+    utilities = {
+        entry.name
+        for entry in bin_dir.iterdir()
+        if entry.is_file() and not entry.name.startswith(".")
+    }
+    documented = {spec.prog for spec in render_docs._discover_specs()}
+    missing = sorted(utilities - documented)
+    assert not missing, (
+        f"bin/ utilities render-docs can't discover: {missing}. Every "
+        "utility must expose a module-level MAN_SPEC (see DEVELOPMENT.md)."
+    )
 
 
 def test_gfm_has_single_title_and_demoted_sections() -> None:

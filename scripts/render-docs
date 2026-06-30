@@ -45,17 +45,16 @@ module-level `MAN_SPEC`; `_discover_specs` finds them, so adding one
 touches only that utility.
 
 It also generates the repo `README.md`: the authored preamble from
-`scripts/readme-intro.md`, the documented utilities (those with a
-`MAN_SPEC`, blurbed from their DESCRIPTION and linked to their `docs/`
-page), and the undocumented `bin/` utilities (blurbed from each one's
-`--help`). See `build_readme`.
+`scripts/readme-intro.md` followed by one entry per utility (each blurbed
+from its DESCRIPTION and linked to its `docs/` page). Every `bin/` utility
+carries a `MAN_SPEC`, so the list is exactly the discovered specs. See
+`build_readme`.
 
 Run with no arguments to (re)write every utility's man page and GFM doc
 plus the README (pandoc required for the roff). `--check` re-renders the
-GFM docs and the README -- pure Python plus mdformat (and each
-undocumented tool's `--help`) -- and exits non-zero on drift without
-writing (no pandoc needed); the pandoc-built roff is gated by the pytest
-freshness test instead.
+GFM docs and the README -- pure Python plus mdformat -- and exits non-zero
+on drift without writing (no pandoc needed); the pandoc-built roff is
+gated by the pytest freshness test instead.
 """
 
 import argparse
@@ -144,10 +143,10 @@ def _gfm_inline(text: str) -> str:
 # (see `common.docspec.ManSpec`). Discovery imports each `src/*.py` alias
 # that points at a `bin/` entry and collects any `MAN_SPEC`, so adding a
 # utility's docs touches only that utility -- never this file. The alias
-# is imported only when its source actually defines `MAN_SPEC`, so an
-# undocumented tool's dependencies aren't pulled in here. crony is the one
-# exception: it has no alias (its logic is the `src/crony` package), so it
-# is imported by name.
+# is imported only when its source actually names `MAN_SPEC`, so a source
+# that lacks one is never imported and its dependencies stay out of this
+# process. crony is the one exception: it has no alias (its logic is the
+# `src/crony` package), so it is imported by name.
 
 
 def _discover_specs() -> list[ManSpec]:
@@ -160,8 +159,8 @@ def _discover_specs() -> list[ManSpec]:
             continue
         target = alias.resolve()
         # Only bin/ utilities, and only import one whose source names
-        # MAN_SPEC -- so an undocumented tool's deps aren't pulled in
-        # here. The substring check can false-positive (a mention in a
+        # MAN_SPEC, so importing never pulls in deps from a source that
+        # lacks it. The substring check can false-positive (a mention in a
         # comment), so confirm the attribute actually exists.
         if target.parent.name != "bin" or "MAN_SPEC" not in target.read_text():
             continue
@@ -828,12 +827,10 @@ def build_gfm(spec: ManSpec) -> str:
 # Repo README
 # ---------------------------------------------------------------------------
 
-_BIN_DIR = _REPO_ROOT / "bin"
-
 # The authored README preamble (title, intro, Installation). Everything
-# below it is derived -- documented utilities from their DESCRIPTION,
-# undocumented ones from their `--help` -- so this fragment is the only
-# hand-edited part of the generated README.
+# below it is derived -- one entry per utility, blurbed from its
+# DESCRIPTION and linked to its generated docs -- so this fragment is the
+# only hand-edited part of the generated README.
 _README_INTRO_PATH = _REPO_ROOT / "scripts" / "readme-intro.md"
 
 
@@ -847,49 +844,21 @@ def _first_paragraph(text: str) -> str:
     return ""
 
 
-def _help_blurb(prog: str) -> str:
-    """The first paragraph of an undocumented utility's `--help`: the text
-    after the usage block, which argparse renders from its parser
-    `description`."""
-    output = subprocess.run(
-        [str(_BIN_DIR / prog), "--help"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    lines = output.splitlines()
-    cursor = 0
-    if lines and lines[0].startswith("usage:"):
-        cursor = 1
-        while cursor < len(lines) and lines[cursor].strip():
-            cursor += 1
-    return _first_paragraph("\n".join(lines[cursor:]))
-
-
 def build_readme() -> str:
     """Render the repo README: the authored preamble from
-    `scripts/readme-intro.md`, the documented utilities (linked to their
-    generated docs, blurbed from their DESCRIPTION), then the undocumented
-    utilities (blurbed from their `--help`). Run through mdformat so it
-    satisfies the repo's prose gates. Needs no pandoc, but runs each
-    undocumented utility's `--help`."""
+    `scripts/readme-intro.md` followed by one entry per utility -- each
+    linked to its generated docs and blurbed from its DESCRIPTION -- in
+    `prog` order. Run through mdformat so it satisfies the repo's prose
+    gates; needs no pandoc. Every `bin/` utility carries a MAN_SPEC (the
+    `test_every_bin_utility_is_documented` gate enforces it), so the list
+    is exactly the discovered specs."""
     specs = sorted(_discover_specs(), key=lambda s: s.prog)
-    documented = {spec.prog for spec in specs}
     intro = _README_INTRO_PATH.read_text().strip()
-    out = [intro, "", "## Documented utilities", ""]
+    out = [intro, "", "## Utilities", ""]
     for spec in specs:
         blurb = _first_paragraph(spec.description)
         term = f"**[{spec.prog}](docs/{spec.prog}.md)**"
         out.append(_gfm_break_item(term, blurb))
-    out += ["", "## Undocumented utilities", ""]
-    undocumented = sorted(
-        entry.name
-        for entry in _BIN_DIR.iterdir()
-        if entry.is_file() and not entry.name.startswith(".")
-        if entry.name not in documented
-    )
-    for prog in undocumented:
-        out.append(_gfm_break_item(f"**{prog}**", _help_blurb(prog)))
     return mdformat.text(
         "\n".join(out),
         options={"wrap": _md_wrap(), "number": True},
@@ -931,8 +900,8 @@ def main() -> int:
             spec.docs_path.write_text(gfm)
             print(f"wrote {spec.man_path}\nwrote {spec.docs_path}")
 
-    # The README is pure Python plus each undocumented utility's `--help`
-    # (no pandoc), so --check gates it alongside the GFM docs.
+    # The README is pure Python (no pandoc), so --check gates it
+    # alongside the GFM docs.
     readme = build_readme()
     readme_path = _REPO_ROOT / "README.md"
     if args.check:

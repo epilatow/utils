@@ -25,7 +25,7 @@ utils/bin/linkfiles install utils/bin $HOME/.local/bin
 utils/bin/linkfiles install utils/share $HOME/.local/share
 ```
 
-## Documented utilities
+## Utilities
 
 - **[borgadm](docs/borgadm.md)**\
   borgadm is a wrapper around borgbackup designed to manage backup sets, where
@@ -78,5 +78,3 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   timestamped and paired with a plaintext readme describing how to open it,
   and old revisions are pruned to a configurable count. The 1Password CLI
   (`op`) and the 7-Zip CLI (`7zz`) must be on PATH.
-
-## Undocumented utilities
