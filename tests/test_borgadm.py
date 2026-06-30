@@ -1998,7 +1998,7 @@ class TestIsLockTimeout:
         assert ba._is_lock_timeout("") is False
 
 
-class TestRepoLockHeld:
+class TestBorgLocksHeld:
     """Test the lock-held probe."""
 
     def _probe(self, returncode: int, stderr: str) -> tuple[bool, Any]:
@@ -2011,7 +2011,7 @@ class TestRepoLockHeld:
             ) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            result = ba.repo_lock_held()
+            result = ba.borg_locks_held()
         return result, mock_run
 
     def test_free_lock_returns_false(self, mock_cfg: Any) -> None:
@@ -2067,7 +2067,7 @@ class TestRunBorg:
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(ba, "repo_lock_held", autospec=True) as mock_probe,
+            patch.object(ba, "borg_locks_held", autospec=True) as mock_probe,
         ):
             ba.run_borg(
                 ["borg", "list", mock_cfg.BORG_REPO],
@@ -2088,7 +2088,7 @@ class TestRunBorg:
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=launcher),
             patch.object(
-                ba, "repo_lock_held", autospec=True, return_value=False
+                ba, "borg_locks_held", autospec=True, return_value=False
             ),
         ):
             ba.run_borg(
@@ -2114,7 +2114,7 @@ class TestRunBorg:
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "repo_lock_held", autospec=True, return_value=False
+                ba, "borg_locks_held", autospec=True, return_value=False
             ),
         ):
             ba.run_borg(["borg", "list", mock_cfg.BORG_REPO], repo_write=False)
@@ -2137,11 +2137,11 @@ class TestRunBorg:
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "repo_lock_held", autospec=True, return_value=True
+                ba, "borg_locks_held", autospec=True, return_value=True
             ),
         ):
             ba.run_borg(["borg", "create", mock_cfg.BORG_REPO], repo_write=True)
-        assert "Repository lock is held" in caplog.text
+        assert "A borg lock is held" in caplog.text
         mock_run.assert_called_once_with(
             [
                 "borg",
@@ -2166,7 +2166,7 @@ class TestRunBorg:
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "repo_lock_held", autospec=True, return_value=False
+                ba, "borg_locks_held", autospec=True, return_value=False
             ),
         ):
             ba.run_borg(
@@ -4658,7 +4658,8 @@ class TestHelpWidth(HelpWidthBase):
 
 @pytest.mark.e2e
 class TestLockAwareE2E:
-    """End-to-end: real held repo lock vs. blocking / bypassing reads."""
+    """End-to-end: real held locks (repository and local cache) vs.
+    blocking / bypassing reads."""
 
     def _hold_lock(
         self, borg_e2e: BorgE2EFixture, seconds: int
@@ -4727,7 +4728,7 @@ class TestLockAwareE2E:
             if probe.returncode != 0 and "lock" in probe.stderr.lower():
                 return
             time.sleep(0.1)
-        pytest.fail("background holder never acquired the repo lock")
+        pytest.fail("background holder never acquired the lock")
 
     def test_bypass_lock_does_not_wait_for_held_lock(
         self, borg_e2e: BorgE2EFixture
@@ -4744,7 +4745,7 @@ class TestLockAwareE2E:
             holder.wait()
         assert result.returncode == 0
         assert result.stdout.strip(), "expected the held archive to be listed"
-        assert "Repository lock is held" not in (result.stdout + result.stderr)
+        assert "A borg lock is held" not in (result.stdout + result.stderr)
 
     def test_bypass_lock_reads_through_held_cache_lock(
         self, borg_e2e: BorgE2EFixture
@@ -4803,7 +4804,7 @@ class TestLockAwareE2E:
             holder.wait()
         out, _ = proc.communicate(timeout=60)
         assert proc.returncode == 0, f"output:\n{out}"
-        assert "Repository lock is held" in out
+        assert "A borg lock is held" in out
         assert out.strip(), "expected the archive to be listed"
 
 

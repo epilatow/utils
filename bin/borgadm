@@ -278,7 +278,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "LOCK_CHECK_TIMEOUT",
         5,
-        "Seconds to wait probing whether the repository lock is held",
+        "Seconds to wait probing whether a borg lock is held",
     ),
     ConfigField(
         "BACKUP_NAME",
@@ -845,12 +845,16 @@ def _is_lock_timeout(stderr: str) -> bool:
     return "failed to create/acquire the lock" in s and "timeout" in s
 
 
-def repo_lock_held() -> bool:
-    """Probe whether the repo lock is currently held, waiting at most
-    `LOCK_CHECK_TIMEOUT` seconds. Advisory only: it lets a blocking
-    operation warn the user before it waits on the lock for what could
-    be a full backup's duration. A non-lock failure (network, etc.) is
-    reported as not-held so the real operation surfaces it."""
+def borg_locks_held() -> bool:
+    """Probe whether a borg lock that would block a normal read is
+    currently held, waiting at most `LOCK_CHECK_TIMEOUT` seconds. borg
+    takes both a repository lock and a local cache lock, and a blocking
+    read waits on whichever is held; this probe runs the same kind of
+    non-bypassing read, so it contends on the same locks and predicts
+    that wait. Advisory only: it lets a blocking operation warn the user
+    before it waits for what could be a full backup's duration. A
+    non-lock failure (network, etc.) is reported as not-held so the real
+    operation surfaces it."""
     cfg = get_cfg()
     proc = run_cmd(
         borg_cmd()
@@ -877,11 +881,11 @@ def run_borg(
     bypass_lock: bool = False,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
-    """Run a borg `cmd` (a full argv built from `borg_cmd()`) with the
-    repo lock handled.
+    """Run a borg `cmd` (a full argv built from `borg_cmd()`) with
+    locking handled.
 
     By default the operation blocks on the lock: if the lock is already
-    held it logs that it is waiting (probing via `repo_lock_held`), then
+    held it logs that it is waiting (probing via `borg_locks_held`), then
     runs with a `BORG_CMD_TIMEOUT` lock-wait so it proceeds once the
     holder releases. With `bypass_lock` it skips the wait entirely
     (`--bypass-lock` plus throwaway cache and security dirs so it
@@ -924,9 +928,9 @@ def run_borg(
             }
             return run_cmd(with_flags(["--bypass-lock"]), env=env, **kwargs)
     cfg = get_cfg()
-    if repo_lock_held():
+    if borg_locks_held():
         logger.info(
-            "Repository lock is held, waiting up to %ss for it to release.",
+            "A borg lock is held, waiting up to %ss for it to release.",
             cfg.BORG_CMD_TIMEOUT,
         )
     return run_cmd(

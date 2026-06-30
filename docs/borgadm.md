@@ -306,7 +306,7 @@ configured repository.
 - **`CMD_TIMEOUT`**\
   Timeout for non-borg commands, in seconds (default: 60).
 - **`LOCK_CHECK_TIMEOUT`**\
-  Seconds to wait probing whether the repository lock is held (default: 5).
+  Seconds to wait probing whether a borg lock is held (default: 5).
 - **`BACKUP_NAME`**\
   Prefix for archive names (default: home).
 - **`BACKUP_ROOT`**\
