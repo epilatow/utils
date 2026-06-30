@@ -31,6 +31,7 @@ regenerated at all.
 """
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -109,16 +110,24 @@ def test_readme_is_current() -> None:
 
 
 def test_every_bin_utility_is_documented() -> None:
-    # Every executable under bin/ must be discoverable by render-docs: it
-    # must expose a MAN_SPEC, and (for all but crony, which is imported by
-    # name) carry the src/ alias discovery reaches it through. A tool
+    # Every git-tracked file under bin/ must be discoverable by render-docs:
+    # it must expose a MAN_SPEC, and (for all but crony, which is imported
+    # by name) carry the src/ alias discovery reaches it through. A tool
     # missing either silently vanishes from the docs; this gate lists it
-    # instead.
-    bin_dir = REPO_ROOT / "bin"
+    # instead. Enumerating via `git ls-files` (rather than scanning the
+    # directory) keeps gitignored editor/build scratch -- vim `name~`
+    # backups, swap files -- out of the utility set.
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "bin"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
     utilities = {
-        entry.name
-        for entry in bin_dir.iterdir()
-        if entry.is_file() and not entry.name.startswith(".")
+        Path(rel).name
+        for rel in tracked.split("\0")
+        if rel and "/" not in rel[len("bin/") :]
     }
     documented = {spec.prog for spec in render_docs._discover_specs()}
     missing = sorted(utilities - documented)
