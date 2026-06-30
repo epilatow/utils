@@ -1705,6 +1705,47 @@ def _check_archive_targets(
             ) from e
 
 
+def _resolve_archives(
+    selectors: list[str], bypass_lock: bool = False
+) -> list[str]:
+    """Resolve archive selectors to full archive names. Each selector is a
+    full archive name (verified to exist) or a YYYYMMDD_HHMMSS timestamp
+    standing for every archive at that time (partials included). Shared by
+    `delete` and `check archives` so the two read the argument the same
+    way."""
+    cfg = get_cfg()
+    ts_pattern = re.compile(r"^\d{8}_\d{6}$")
+    # Resolved lazily so a name-only or timestamp-only call makes only the
+    # borg list it needs.
+    by_timestamp: dict[str, list[str]] | None = None
+    raw_names: list[str] | None = None
+    resolved: list[str] = []
+    for selector in selectors:
+        if ts_pattern.match(selector):
+            if by_timestamp is None:
+                by_timestamp = list_backups(bypass_lock=bypass_lock)
+                by_timestamp |= list_backups(
+                    partial=True, bypass_lock=bypass_lock
+                )
+            if selector not in by_timestamp:
+                raise BorgadmError(
+                    f"No archives found for timestamp: {selector}"
+                )
+            resolved += [
+                a.removeprefix(f"{cfg.BORG_REPO}::")
+                for a in by_timestamp[selector]
+            ]
+        else:
+            if raw_names is None:
+                raw_names = (
+                    list_backups_raw(bypass_lock).stdout.strip().splitlines()
+                )
+            if selector not in raw_names:
+                raise BorgadmError(f"Archive not found: {selector}")
+            resolved.append(selector)
+    return resolved
+
+
 def do_check_archives(
     progress: bool, latest: bool, archives: list[str], bypass_lock: bool
 ) -> None:
@@ -1713,12 +1754,8 @@ def do_check_archives(
         "latest and archives are mutually exclusive"
     )
     if archives:
-        raw_names = list_backups_raw(bypass_lock).stdout.strip().splitlines()
-        targets: list[str] = []
-        for name in archives:
-            if name not in raw_names:
-                raise BorgadmError(f"Archive not found: {name}")
-            targets.append(f"{cfg.BORG_REPO}::{name}")
+        names = _resolve_archives(archives, bypass_lock=bypass_lock)
+        targets = [f"{cfg.BORG_REPO}::{name}" for name in names]
         _check_archive_targets(targets, progress, bypass_lock)
     elif latest:
         backups = list_backups(latest=True, bypass_lock=bypass_lock)
@@ -1934,39 +1971,22 @@ def do_delete(
     assert not (latest and archive), "latest and archive are mutually exclusive"
     assert latest or archive, "one of latest or archive is required"
 
-    include_partial = True
     if latest:
         backups = list_backups(latest=True)
         if not backups:
             raise BorgadmError("No full backups found.")
-        archive = list(backups.keys())[0]
-        include_partial = False
-
-    assert archive is not None
-    archives_to_delete: list[str] = []
-    ts_pattern = re.compile(r"^\d{8}_\d{6}$")
-
-    if ts_pattern.match(archive):
-        all_backups = list_backups()
-        if include_partial:
-            all_backups |= list_backups(partial=True)
-        if archive not in all_backups:
-            raise BorgadmError(f"No archives found for timestamp: {archive}")
+        ts = list(backups.keys())[0]
         archives_to_delete = [
-            a.removeprefix(f"{cfg.BORG_REPO}::") for a in all_backups[archive]
+            a.removeprefix(f"{cfg.BORG_REPO}::") for a in backups[ts]
         ]
         logger.info(
-            f"Deleting {len(archives_to_delete)} archive(s)"
-            f" at timestamp: {archive}"
+            f"Deleting {len(archives_to_delete)} archive(s) at the latest "
+            f"full backup ({ts})"
         )
     else:
-        # Full archive name: verify it exists.
-        result = list_backups_raw()
-        raw_names = result.stdout.strip().splitlines()
-        if archive not in raw_names:
-            raise BorgadmError(f"Archive not found: {archive}")
-        archives_to_delete = [archive]
-        logger.info(f"Deleting archive: {archive}")
+        assert archive is not None
+        archives_to_delete = _resolve_archives([archive])
+        logger.info(f"Deleting {len(archives_to_delete)} archive(s): {archive}")
 
     cmd = borg_cmd() + ["delete"]
     cmd += ["--progress"] if progress else []

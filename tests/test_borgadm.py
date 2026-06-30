@@ -1796,6 +1796,62 @@ class TestCheck:
             allow_output=False,
         )
 
+    def test_check_archives_by_timestamp(self, mock_cfg: Any) -> None:
+        """check archives <timestamp> expands to every archive at that
+        time and checks each, the same way delete does."""
+        repo = mock_cfg.BORG_REPO
+
+        def list_backups_side_effect(
+            partial: bool = False, **_kwargs: object
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {}
+            return {
+                "20250101_120000": [
+                    f"{repo}::home-fuse-20250101_120000",
+                    f"{repo}::home-local-20250101_120000",
+                ]
+            }
+
+        with (
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                side_effect=list_backups_side_effect,
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
+        ):
+            ba.do_check_archives(
+                progress=False,
+                latest=False,
+                archives=["20250101_120000"],
+                bypass_lock=False,
+            )
+        checked = {c.args[0][-1] for c in mock_run_borg.call_args_list}
+        assert checked == {
+            f"{repo}::home-fuse-20250101_120000",
+            f"{repo}::home-local-20250101_120000",
+        }
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_check_archives_timestamp_not_found(self) -> None:
+        """An unknown timestamp fails before any borg check runs."""
+        with (
+            patch.object(ba, "list_backups", autospec=True, return_value={}),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
+            pytest.raises(ba.BorgadmError, match="timestamp"),
+        ):
+            ba.do_check_archives(
+                progress=False,
+                latest=False,
+                archives=["20250101_120000"],
+                bypass_lock=False,
+            )
+        mock_run_borg.assert_not_called()
+
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_archives_unknown_name_errors(self) -> None:
         """An unknown archive name fails before any borg check runs."""
@@ -4228,6 +4284,45 @@ class TestE2EExtract:
         result = borg_e2e.run("extract", str(target), check=False)
         assert result.returncode != 0
         assert "no full backups found" in result.stderr.lower()
+
+
+@pytest.mark.e2e
+class TestE2ECheckArchives:
+    """E2E coverage for `borgadm check archives` argument resolution: it
+    reads a name or a YYYYMMDD_HHMMSS timestamp the same way delete does
+    (via the shared _resolve_archives)."""
+
+    def test_check_archives_by_timestamp_checks_that_timestamp(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`borgadm check archives TIMESTAMP` checks every archive at that
+        timestamp and leaves other timestamps unchecked."""
+        check_ts = "20260101_120000"
+        other_ts = "20260102_120000"
+        checked = [
+            _archive_name("set-a", check_ts, 1, 2),
+            _archive_name("set-b", check_ts, 2, 2),
+        ]
+        other = _archive_name("set-a", other_ts, 1, 2)
+        for name in (*checked, other):
+            borg_e2e.make_archive(name)
+        result = borg_e2e.run("check", "archives", check_ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        for name in checked:
+            assert name in result.stdout
+        assert other not in result.stdout
+
+    def test_check_archives_unknown_timestamp_fails(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """An unknown timestamp fails rather than silently checking all."""
+        borg_e2e.make_archive(_archive_name("set-a", "20260101_120000", 1, 2))
+        result = borg_e2e.run(
+            "check", "archives", "20990101_000000", check=False
+        )
+        assert result.returncode != 0
 
 
 @pytest.mark.e2e
