@@ -113,7 +113,7 @@ Verify that the latest full backup is no older than the configured (or given) ma
 Maximum backup age, in seconds
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]check archives\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [\-\-latest | archive ...]\&
@@ -121,7 +121,7 @@ Verify archive metadata with borg check \-\-archives\-only, over the given archi
 .RS
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]check prune\f[R] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -129,7 +129,7 @@ Report any partial or unpruned archives left in the repository.\&
 .RS
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]check repo\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -137,7 +137,7 @@ Verify repository metadata with borg check \-\-repository\-only.\&
 .RS
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]check full\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -145,7 +145,7 @@ Verify both repository and archive metadata with a full borg check.\&
 .RS
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]compact\f[R] [\-\-progress] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -188,7 +188,7 @@ include/exclude paths matching PATTERN, see \(aqborg help patterns\(aq for detai
 Delete files in destination not in backup
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup) (default: True)
+skip waiting for any locks (faster, but may race a concurrent backup) (default: True)
 .RE
 .TP
 \f[B]list\f[R] [\-\-latest] [\-\-full\-names] [\-\-keep\-tags | \-\-no\-keep\-tags] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-include\-partial | \-\-no\-include\-partial | \-\-only\-partial] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -208,7 +208,7 @@ Include partial backups (default: True)
 Only list partial
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup)
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]log\-files\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -262,7 +262,7 @@ Target directory for extracted backup
 Delete files in destination not in backup
 .TP
 \f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip the repo lock instead of waiting for it (faster, but may race a concurrent backup) (default: True)
+skip waiting for any locks (faster, but may race a concurrent backup) (default: True)
 .RE
 .TP
 \f[B]environment\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]

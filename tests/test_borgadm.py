@@ -2049,6 +2049,20 @@ class TestRepoLockHeld:
 class TestRunBorg:
     """Test the lock-aware borg runner."""
 
+    def _assert_throwaway_cache_env(self, kwargs: dict[str, Any]) -> None:
+        """The bypass path points borg's cache and security dirs at a
+        shared throwaway location so the read contends on neither the
+        repository nor the cache lock. The dirs sit under one
+        `borgadm-bypass-` parent and inherit the ambient environment."""
+        env = kwargs["env"]
+        assert env["PATH"] == os.environ["PATH"]
+        cache = Path(env["BORG_CACHE_DIR"])
+        security = Path(env["BORG_SECURITY_DIR"])
+        assert cache.name == "cache"
+        assert security.name == "security"
+        assert cache.parent == security.parent
+        assert cache.parent.name.startswith("borgadm-bypass-")
+
     def test_bypass_inserts_bypass_lock_after_verb(self, mock_cfg: Any) -> None:
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
@@ -2061,9 +2075,10 @@ class TestRunBorg:
                 bypass_lock=True,
             )
         mock_probe.assert_not_called()
-        mock_run.assert_called_once_with(
-            ["borg", "list", "--bypass-lock", mock_cfg.BORG_REPO]
-        )
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        assert args[0] == ["borg", "list", "--bypass-lock", mock_cfg.BORG_REPO]
+        self._assert_throwaway_cache_env(kwargs)
 
     def test_bypass_position_with_multitoken_borg_cmd(
         self, mock_cfg: Any
@@ -2081,9 +2096,15 @@ class TestRunBorg:
                 repo_write=False,
                 bypass_lock=True,
             )
-        mock_run.assert_called_once_with(
-            [*launcher, "list", "--bypass-lock", mock_cfg.BORG_REPO]
-        )
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        assert args[0] == [
+            *launcher,
+            "list",
+            "--bypass-lock",
+            mock_cfg.BORG_REPO,
+        ]
+        self._assert_throwaway_cache_env(kwargs)
 
     def test_blocking_free_lock_no_message(
         self, mock_cfg: Any, caplog: Any
@@ -4657,6 +4678,35 @@ class TestLockAwareE2E:
             stderr=subprocess.DEVNULL,
         )
 
+    def _hold_cache_lock(
+        self, borg_e2e: BorgE2EFixture, seconds: int
+    ) -> subprocess.Popen[bytes]:
+        """Hold the local cache lock for `seconds` in a background create.
+
+        A `borg create` takes the cache lock exclusively for its whole
+        run; blocking it on a slow `--content-from-command` source keeps
+        that lock held. `borg with-lock` would not -- it takes only the
+        repository lock -- so this is the holder that reproduces a create
+        running concurrently with a read.
+        """
+        return subprocess.Popen(
+            [
+                "borg",
+                "create",
+                "--content-from-command",
+                "--stdin-name",
+                "held",
+                f"{borg_e2e.repo_path}::cache-lock-holder",
+                "--",
+                "sh",
+                "-c",
+                f"sleep {seconds}",
+            ],
+            env=borg_e2e._subprocess_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def _await_lock_held(self, borg_e2e: BorgE2EFixture) -> None:
         """Block until the holder has actually taken the lock."""
         deadline = time.monotonic() + 15
@@ -4695,6 +4745,29 @@ class TestLockAwareE2E:
         assert result.returncode == 0
         assert result.stdout.strip(), "expected the held archive to be listed"
         assert "Repository lock is held" not in (result.stdout + result.stderr)
+
+    def test_bypass_lock_reads_through_held_cache_lock(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """`list --bypass-lock` returns while a concurrent create holds
+        the local cache lock. borg's --bypass-lock skips only the
+        repository lock, so the bypass path also redirects borg's cache
+        (and security) dir to a throwaway location -- without that the
+        read would block on the held cache lock and trip the 15s timeout
+        against the 30s holder."""
+        borg_e2e.run("create", "--no-prune")
+        holder = self._hold_cache_lock(borg_e2e, 30)
+        try:
+            self._await_lock_held(borg_e2e)
+            result = borg_e2e.run("list", "--bypass-lock", timeout=15)
+        finally:
+            holder.terminate()
+            holder.wait()
+        assert result.returncode == 0
+        assert result.stdout.strip(), "expected the held archive to be listed"
+        assert "Failed to create/acquire the lock" not in (
+            result.stdout + result.stderr
+        )
 
     def test_default_list_waits_for_lock_then_succeeds(
         self, borg_e2e: BorgE2EFixture

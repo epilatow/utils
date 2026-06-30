@@ -134,8 +134,7 @@ maximum age.
 - **`seconds`**\
   Maximum backup age, in seconds
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `check archives [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] [--latest | archive ...]`
 
@@ -143,32 +142,28 @@ Verify archive metadata with borg check --archives-only, over the given
 archives, the latest full set (--latest), or every archive in the repository.
 
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `check prune [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Report any partial or unpruned archives left in the repository.
 
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `check repo [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Verify repository metadata with borg check --repository-only.
 
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `check full [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Verify both repository and archive metadata with a full borg check.
 
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `compact [--progress] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -211,8 +206,8 @@ include/exclude patterns.
 - **`--delete`**\
   Delete files in destination not in backup
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup) (default: True)
+  skip waiting for any locks (faster, but may race a concurrent backup)
+  (default: True)
 
 ### `list [--latest] [--full-names] [--keep-tags | --no-keep-tags] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--include-partial | --no-include-partial | --only-partial] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -229,8 +224,7 @@ showing prune keep tags.
 - **`--only-partial`**\
   Only list partial
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup)
+  skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `log-files [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -286,8 +280,8 @@ Mirror the contents of the latest archive to a target directory with rsync
 - **`--delete`**\
   Delete files in destination not in backup
 - **`--bypass-lock, --no-bypass-lock`**\
-  skip the repo lock instead of waiting for it (faster, but may race a
-  concurrent backup) (default: True)
+  skip waiting for any locks (faster, but may race a concurrent backup)
+  (default: True)
 
 ### `environment [--config CONFIG] [--verbose] [--timestamp-messages]`
 
