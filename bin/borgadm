@@ -908,8 +908,7 @@ def run_borg(
     cfg = get_cfg()
     if repo_lock_held():
         logger.info(
-            "Repository lock is held (a backup is likely running); "
-            "waiting up to %ss for it to release...",
+            "Repository lock is held, waiting up to %ss for it to release.",
             cfg.BORG_CMD_TIMEOUT,
         )
     return run_cmd(
