@@ -175,64 +175,25 @@ def _stale_fields(
 # other changes.
 
 
-# Maps a recorded ExitClass to the JobStatus shown in the STATUS cell:
-# `signal` folds to `fail`; `dispatched` (absent here) and an
-# unparseable class fall through to UNKNOWN at the call site.
-_EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
-    crony.model.ExitClass.OK: crony.model.JobStatus.OK,
-    crony.model.ExitClass.FAIL: crony.model.JobStatus.FAIL,
-    crony.model.ExitClass.SIGNAL: crony.model.JobStatus.FAIL,
-    crony.model.ExitClass.TIMEOUT: crony.model.JobStatus.TIMEOUT,
-    crony.model.ExitClass.GATED: crony.model.JobStatus.GATED,
-    crony.model.ExitClass.CANCELED: crony.model.JobStatus.CANCELED,
-}
-
-
 def _job_status(
     config: crony.model.Config, full_name: str
 ) -> crony.model.JobStatus:
-    """Return the STATUS-column value (a `JobStatus`) for a stamped
-    entity.
+    """The STATUS-column value (a `JobStatus`) for a stamped entity, read
+    from `RuntimeState.job_status`.
 
-    `JobStatus` is a superset of a run's exit outcome: beyond the
-    mapped exit classes it also reports the no-run states (`never`,
-    `pending`, `running`, `crashed`), so this is the entry's current
-    run status, not strictly its last recorded exit.
-
-    Lock-held implies a run is currently in flight: "pending" when
-    the in-flight run is an interactive job sitting in its wait
-    loop (signaled by a `pending.flag` file in the state dir),
-    "running" otherwise. Otherwise "crashed" when the scheduler's
-    last launch ended without recording a run -- killed, or exited
-    before the runner wrote its record (so the last-run.json that
-    remains is stale; see RuntimeState.crashed) -- then
-    last-run.json's recorded exit_class. Absence of all of these
-    means the entity has never run -- new install, group-only job
-    that's never been triggered, etc.
-
-    Resolution is current-first, pending-fallback. Runtime is
-    uuid-keyed, and a rename keeps the uuid, so the run history
-    lives at the same state dir under the new name. The current
-    graph is keyed by the applied (old) name, so a not-yet-applied
-    rename misses there; the pending graph carries the new name at
-    the unchanged uuid and recovers the record. A genuinely new
-    pending-only entry resolves to a uuid with no state dir, so
-    `runtime.get` is None and it still reports "never".
+    Resolution is current-first, pending-fallback. Runtime is uuid-keyed,
+    and a rename keeps the uuid, so the run history lives at the same
+    state dir under the new name. The current graph is keyed by the
+    applied (old) name, so a not-yet-applied rename misses there; the
+    pending graph carries the new name at the unchanged uuid and recovers
+    the record. A genuinely new pending-only entry resolves to a uuid
+    with no state dir, so `runtime.get` is None and it reports "never".
     """
-    js = crony.model.JobStatus
     ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
-        return js.NEVER
+        return crony.model.JobStatus.NEVER
     rt = config.runtime.get(ref)
-    if rt is None:
-        return js.NEVER
-    if rt.is_running:
-        return js.PENDING if rt.is_pending else js.RUNNING
-    if rt.crashed:
-        return js.CRASHED
-    if rt.last_run is None or rt.last_run.exit_class is None:
-        return js.NEVER if rt.last_run is None else js.UNKNOWN
-    return _EXIT_TO_JOBSTATUS.get(rt.last_run.exit_class, js.UNKNOWN)
+    return rt.job_status if rt is not None else crony.model.JobStatus.NEVER
 
 
 def _format_elapsed(secs: int) -> str:

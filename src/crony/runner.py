@@ -453,7 +453,8 @@ def _run_job(snap: crony.model.Job) -> int:
             # Publish our pid for waiters (parent groups, `crony
             # trigger --wait`) to watch for exit, and leave it in place
             # on exit: run.pid persists across runs as the record of the
-            # last launch, consumed afterward by RuntimeState.
+            # last launch, read afterward by the dispatch waiter and when
+            # status is built.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_size_before = (
@@ -1355,8 +1356,8 @@ def _record_precondition_cancel(
         "exit_code": int(crony.errors.ExitCode.PRECONDITION),
         # The process exits with this code (do_run re-raises and cli
         # maps it), so it matches what the scheduler records for this
-        # launch -- otherwise status would reconcile the cancel as a
-        # `crashed` launch that left no record (RuntimeState.crashed).
+        # launch -- a mismatch would read as a launch that recorded no
+        # result (a crash).
         "process_exit": int(crony.errors.ExitCode.PRECONDITION),
         "reason": str(exc),
     }

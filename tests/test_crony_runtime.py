@@ -41,6 +41,7 @@ from crony.config import (  # noqa: E402
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
+    ExitCode,
     UsageError,
 )
 from crony.model import (  # noqa: E402
@@ -1736,8 +1737,8 @@ class TestSnapshotBackwardLoad:
 
 
 class TestRuntimeUnitLastExit:
-    """load_config captures each entry's scheduler last-launch outcome
-    on its RuntimeState via one bulk query."""
+    """load_config reconciles each entry's scheduler last-launch outcome
+    (fetched via one bulk query) into its RuntimeState.job_status."""
 
     def _ref(self, config: Any, full: str) -> Any:
         return config.pending.by_full_name.get(
@@ -1761,9 +1762,7 @@ class TestRuntimeUnitLastExit:
         )
         config = crony_runtime.load_config()
         rt = config.runtime[self._ref(config, "default.j")]
-        assert rt.unit_last_exit is not None
-        assert rt.unit_last_exit.exit_status == -9
-        assert rt.crashed is True
+        assert rt.job_status == crony_model.JobStatus.CRASHED
 
     def test_clean_launch_leaves_runtime_state_clean(
         self, tmp_path: Path, monkeypatch: Any
@@ -1781,8 +1780,9 @@ class TestRuntimeUnitLastExit:
         )
         config = crony_runtime.load_config()
         rt = config.runtime[self._ref(config, "default.j")]
-        assert rt.unit_last_exit == crony_platform.UnitLastExit(exit_status=0)
-        assert rt.crashed is False
+        # exit 0 is not a crash; with no last-run.json the job reads as
+        # never-run rather than crashed.
+        assert rt.job_status == crony_model.JobStatus.NEVER
 
 
 class TestRuntimePidCrashSignal:
@@ -1822,9 +1822,204 @@ class TestRuntimePidCrashSignal:
         monkeypatch.setattr(launchd, "_launchctl_list", lambda: "")
         config = crony_runtime.load_config()
         rt = config.runtime[self._ref(config, "default.j")]
-        assert rt.run_pid == 999999
-        assert rt.unit_last_exit is None
-        assert rt.crashed is True
+        assert rt.job_status == crony_model.JobStatus.CRASHED
+
+
+class TestCrashedSignal:
+    """`runtime._crashed` flags a launch that ended without recording its
+    result, via two independent signals: a surviving run.pid naming a
+    different pid than the last record wrote (the launch never reached
+    cleanup), or the scheduler's last-launch status disagreeing with the
+    recorded process exit. A status matching the recorded exit, or an
+    in-flight run, is not a crash."""
+
+    def _crashed(
+        self,
+        unit_last_exit: crony_platform.UnitLastExit | None = None,
+        *,
+        last_run: crony_model.LastRun | None = None,
+        run_pid: int | None = None,
+        is_running: bool = False,
+    ) -> bool:
+        return crony_runtime._crashed(
+            is_running, run_pid, last_run, unit_last_exit
+        )
+
+    def _last(
+        self,
+        exit_class: str,
+        process_exit: int | None,
+        *,
+        pid: int | None = None,
+    ) -> crony_model.LastRun:
+        return crony_model.LastRun(
+            exit_class=crony_model.ExitClass(exit_class),
+            started_at="2026-01-01T00:00",
+            process_exit=process_exit,
+            pid=pid,
+        )
+
+    def test_lingering_run_pid_unrecorded_is_crashed(self) -> None:
+        # A launch wrote run.pid (7397) then died; the surviving record
+        # is from an earlier launch (pid 100), so the two pids differ.
+        assert (
+            self._crashed(last_run=self._last("ok", 0, pid=100), run_pid=7397)
+            is True
+        )
+
+    def test_run_pid_without_any_record_is_crashed(self) -> None:
+        # First-ever launch died before writing any record.
+        assert self._crashed(run_pid=7397) is True
+
+    def test_run_pid_matching_record_is_not_crashed(self) -> None:
+        # The record carries the same pid as the surviving run.pid, so
+        # that launch did record (run.pid just wasn't unlinked yet).
+        assert (
+            self._crashed(last_run=self._last("ok", 0, pid=7397), run_pid=7397)
+            is False
+        )
+
+    def test_run_pid_while_running_is_not_crashed(self) -> None:
+        # An in-flight run holds the lock; its run.pid is expected.
+        assert (
+            self._crashed(
+                last_run=self._last("ok", 0, pid=100),
+                run_pid=7397,
+                is_running=True,
+            )
+            is False
+        )
+
+    def test_signal_kill_over_stale_ok_is_crashed(self) -> None:
+        # Stale "ok" (process_exit 0) survives a launch the scheduler
+        # killed (negative status); the two don't match.
+        assert (
+            self._crashed(
+                crony_platform.UnitLastExit(exit_status=-9),
+                last_run=self._last("ok", 0),
+            )
+            is True
+        )
+
+    def test_nonzero_exit_without_matching_record_is_crashed(self) -> None:
+        # uv-not-found (127) before the runner recorded; stale "ok".
+        assert (
+            self._crashed(
+                crony_platform.UnitLastExit(exit_status=127),
+                last_run=self._last("ok", 0),
+            )
+            is True
+        )
+
+    def test_abnormal_without_record_is_crashed(self) -> None:
+        assert (
+            self._crashed(crony_platform.UnitLastExit(exit_status=-11)) is True
+        )
+
+    def test_recorded_failure_matching_status_is_not_crashed(self) -> None:
+        # A normal job failure: the runner recorded it and exited the
+        # process with the same code the scheduler reports.
+        assert (
+            self._crashed(
+                crony_platform.UnitLastExit(exit_status=1),
+                last_run=self._last("fail", 1),
+            )
+            is False
+        )
+
+    def test_recorded_cancel_matching_status_is_not_crashed(self) -> None:
+        # A snapshot-load-failure cancel exits PRECONDITION and records
+        # the same process_exit, so it stays `canceled`, not `crashed`.
+        code = int(ExitCode.PRECONDITION)
+        assert (
+            self._crashed(
+                crony_platform.UnitLastExit(exit_status=code),
+                last_run=self._last("canceled", code),
+            )
+            is False
+        )
+
+    def test_clean_exit_is_not_crashed(self) -> None:
+        assert (
+            self._crashed(
+                crony_platform.UnitLastExit(exit_status=0),
+                last_run=self._last("ok", 0),
+            )
+            is False
+        )
+
+    def test_no_scheduler_record_is_not_crashed(self) -> None:
+        # Also the in-flight case: a running unit is omitted from the
+        # map, so nothing feeds the reconciliation.
+        assert self._crashed(None) is False
+
+
+class TestDeriveJobStatus:
+    """`runtime._derive_job_status` maps the runtime facts to a JobStatus:
+    a held lock to running / pending, an unrecorded launch to crashed,
+    and otherwise the recorded exit class (or never / unknown)."""
+
+    def _status(
+        self,
+        *,
+        last_run: crony_model.LastRun | None = None,
+        run_pid: int | None = None,
+        is_running: bool = False,
+        is_pending: bool = False,
+    ) -> crony_model.JobStatus:
+        return crony_runtime._derive_job_status(
+            is_running, is_pending, run_pid, last_run, None
+        )
+
+    def _last(
+        self, exit_class: str | None, *, pid: int | None = None
+    ) -> crony_model.LastRun:
+        return crony_model.LastRun(
+            exit_class=(
+                crony_model.ExitClass(exit_class) if exit_class else None
+            ),
+            started_at="2026-01-01T00:00",
+            process_exit=0,
+            pid=pid,
+        )
+
+    def test_running(self) -> None:
+        assert self._status(is_running=True) == crony_model.JobStatus.RUNNING
+
+    def test_pending_when_interactive_wait(self) -> None:
+        # A held lock plus the pending flag: an interactive job waiting
+        # in its dialog loop.
+        status = self._status(is_running=True, is_pending=True)
+        assert status == crony_model.JobStatus.PENDING
+
+    def test_crashed_when_launch_left_no_record(self) -> None:
+        # run.pid (999) disagrees with the last record's pid (100): a
+        # launch that never recorded.
+        status = self._status(last_run=self._last("ok", pid=100), run_pid=999)
+        assert status == crony_model.JobStatus.CRASHED
+
+    @pytest.mark.parametrize(
+        ("exit_class", "expected"),
+        [
+            ("ok", crony_model.JobStatus.OK),
+            ("fail", crony_model.JobStatus.FAIL),
+            ("signal", crony_model.JobStatus.FAIL),
+            ("timeout", crony_model.JobStatus.TIMEOUT),
+            ("gated", crony_model.JobStatus.GATED),
+            ("canceled", crony_model.JobStatus.CANCELED),
+        ],
+    )
+    def test_recorded_exit_class(
+        self, exit_class: str, expected: crony_model.JobStatus
+    ) -> None:
+        assert self._status(last_run=self._last(exit_class)) == expected
+
+    def test_never_when_no_record(self) -> None:
+        assert self._status() == crony_model.JobStatus.NEVER
+
+    def test_unknown_when_record_has_no_exit_class(self) -> None:
+        status = self._status(last_run=self._last(None))
+        assert status == crony_model.JobStatus.UNKNOWN
 
 
 class TestLastStartedAt:

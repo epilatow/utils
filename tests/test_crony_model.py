@@ -34,7 +34,6 @@ from crony.config import (  # noqa: E402
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
-    ExitCode,
     UsageError,
 )
 from crony.model import (  # noqa: E402
@@ -46,14 +45,11 @@ from crony.model import (  # noqa: E402
     JobGroup,
     JobOrphan,
     JobStatus,
-    LastRun,
-    RuntimeState,
     ScheduleValue,
     _JobCommon,
     _resolve_snapshot_for,
     snapshot_from_dict,
 )
-from crony.platform import UnitLastExit  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.snapshot import (  # noqa: E402
     _COMPAT_FLOOR_SCHEMA,
@@ -625,132 +621,6 @@ class TestJobFromRefAndFullName:
         # difference from the node's always-set `str`.
         nameless = JobOrphan(bundle="default", uuid=snap.uuid, name=None)
         assert nameless.full_name is None
-
-
-class TestRuntimeStateCrashed:
-    """`crashed` flags a launch that ended without recording its result,
-    via two independent signals: a surviving run.pid naming a different
-    pid than the last record wrote (the launch never reached cleanup),
-    or the scheduler's last-launch status disagreeing with the recorded
-    process exit. A status matching the recorded exit, or an in-flight
-    run, is not a crash."""
-
-    def _rs(
-        self,
-        unit_last_exit: UnitLastExit | None = None,
-        *,
-        last_run: LastRun | None = None,
-        run_pid: int | None = None,
-        is_running: bool = False,
-    ) -> RuntimeState:
-        return RuntimeState(
-            state_dir=Path("/x"),
-            last_run=last_run,
-            is_running=is_running,
-            is_pending=False,
-            has_user_trigger_flag=False,
-            unit_last_exit=unit_last_exit,
-            run_pid=run_pid,
-        )
-
-    def _last(
-        self,
-        exit_class: str,
-        process_exit: int | None,
-        *,
-        pid: int | None = None,
-    ) -> LastRun:
-        return LastRun(
-            exit_class=ExitClass(exit_class),
-            started_at="2026-01-01T00:00",
-            process_exit=process_exit,
-            pid=pid,
-        )
-
-    def test_lingering_run_pid_unrecorded_is_crashed(self) -> None:
-        # A launch wrote run.pid (7397) then died; the surviving record
-        # is from an earlier launch (pid 100), so the two pids differ.
-        rs = self._rs(
-            last_run=self._last("ok", 0, pid=100),
-            run_pid=7397,
-        )
-        assert rs.crashed is True
-
-    def test_run_pid_without_any_record_is_crashed(self) -> None:
-        # First-ever launch died before writing any record.
-        rs = self._rs(run_pid=7397)
-        assert rs.crashed is True
-
-    def test_run_pid_matching_record_is_not_crashed(self) -> None:
-        # The record carries the same pid as the surviving run.pid, so
-        # that launch did record (run.pid just wasn't unlinked yet).
-        rs = self._rs(
-            last_run=self._last("ok", 0, pid=7397),
-            run_pid=7397,
-        )
-        assert rs.crashed is False
-
-    def test_run_pid_while_running_is_not_crashed(self) -> None:
-        # An in-flight run holds the lock; its run.pid is expected.
-        rs = self._rs(
-            last_run=self._last("ok", 0, pid=100),
-            run_pid=7397,
-            is_running=True,
-        )
-        assert rs.crashed is False
-
-    def test_signal_kill_over_stale_ok_is_crashed(self) -> None:
-        # Stale "ok" (process_exit 0) survives a launch the scheduler
-        # killed (negative status); the two don't match.
-        rs = self._rs(
-            UnitLastExit(exit_status=-9),
-            last_run=self._last("ok", 0),
-        )
-        assert rs.crashed is True
-
-    def test_nonzero_exit_without_matching_record_is_crashed(self) -> None:
-        # uv-not-found (127) before the runner recorded; stale "ok".
-        rs = self._rs(
-            UnitLastExit(exit_status=127),
-            last_run=self._last("ok", 0),
-        )
-        assert rs.crashed is True
-
-    def test_abnormal_without_record_is_crashed(self) -> None:
-        rs = self._rs(UnitLastExit(exit_status=-11))
-        assert rs.crashed is True
-
-    def test_recorded_failure_matching_status_is_not_crashed(self) -> None:
-        # A normal job failure: the runner recorded it and exited the
-        # process with the same code the scheduler reports.
-        rs = self._rs(
-            UnitLastExit(exit_status=1),
-            last_run=self._last("fail", 1),
-        )
-        assert rs.crashed is False
-
-    def test_recorded_cancel_matching_status_is_not_crashed(self) -> None:
-        # A snapshot-load-failure cancel exits PRECONDITION and records
-        # the same process_exit, so it stays `canceled`, not `crashed`.
-        code = int(ExitCode.PRECONDITION)
-        rs = self._rs(
-            UnitLastExit(exit_status=code),
-            last_run=self._last("canceled", code),
-        )
-        assert rs.crashed is False
-
-    def test_clean_exit_is_not_crashed(self) -> None:
-        rs = self._rs(
-            UnitLastExit(exit_status=0),
-            last_run=self._last("ok", 0),
-        )
-        assert rs.crashed is False
-
-    def test_no_scheduler_record_is_not_crashed(self) -> None:
-        # Also the in-flight case: a running unit is omitted from the
-        # map, so its RuntimeState carries no unit_last_exit.
-        rs = self._rs(None)
-        assert rs.crashed is False
 
 
 class TestStatusEnums:

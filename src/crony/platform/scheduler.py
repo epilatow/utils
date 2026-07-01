@@ -34,15 +34,6 @@ class UnitLastExit:
     normalizes to. A unit with a launch in flight, or one the scheduler
     has no readable status for, is omitted from `unit_last_exits`
     entirely (its in-flight state is the lock's job, not this).
-
-    Reconciled against the run record by `RuntimeState.crashed`: the
-    runner writes `last-run.json` and exits the process with that same
-    code on every path it controls, so a status matching the recorded
-    exit is a normal result. Anything else -- a signal (OOM, jetsam, a
-    manual kill, macOS OS_REASON_CODESIGNING) or a nonzero exit reached
-    before the runner recorded (e.g. a missing uv -> 127) -- is a launch
-    that left no matching record, and whatever `last-run.json` holds is
-    stale from an earlier launch.
     """
 
     exit_status: int

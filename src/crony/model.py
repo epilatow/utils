@@ -1442,61 +1442,13 @@ class RuntimeState:
 
     state_dir: Path
     last_run: LastRun | None
-    is_running: bool
-    is_pending: bool
-    has_user_trigger_flag: bool
+    # The entity's current run status, derived from the runtime facts at
+    # load (see `runtime._derive_job_status`).
+    job_status: JobStatus
     unit_config: Path | None = None
     unit_timer: Path | None = None
-    # The scheduler's last-launch outcome, captured at load alongside
-    # `last_run`. None when the scheduler has no record (or wasn't
-    # queried). Reconciled against `last_run` by `crashed`.
-    unit_last_exit: crony.platform.UnitLastExit | None = None
-    # The pid in run.pid -- the last launch's pid -- or None when the
-    # job has never run (run.pid persists across runs, so absence means
-    # no launch ever wrote it).
-    run_pid: int | None = None
     # When the job last started, or None when it has never run.
     last_started_at: datetime.datetime | None = None
-
-    @property
-    def crashed(self) -> bool:
-        """True when a launch ended without recording its own result --
-        killed by a signal (OOM, jetsam, a manual kill, macOS
-        OS_REASON_CODESIGNING, launchd unloading the unit) or exited
-        before the runner wrote `last-run.json`. Two independent signals:
-
-        - run.pid naming a different pid than the last record wrote: the
-          last-started launch reached launch (wrote run.pid) but never
-          wrote a record. A clean run overwrites run.pid here and records
-          the same pid, so a disagreement is a launch that never
-          recorded. Catches a kill even when the scheduler kept no exit
-          record (e.g. the unit was unloaded).
-        - The scheduler's last-launch status disagreeing with the
-          recorded `process_exit`: catches a kill the scheduler saw
-          after the runner wrote its own record (so run.pid matches the
-          record and the first signal stays quiet).
-
-        Never fires for an in-flight run (it holds the lock) or a clean
-        exit (0). A scheduler-recorded exit is effectively never
-        LOCK_BUSY: the scheduler coalesces a repeat fire of one unit
-        into a no-op, and crony only ever invokes `_run` from a platform
-        unit (group dispatch goes through the scheduler too), so a
-        scheduled fire is normally the sole contender for its run.lock. A
-        degenerate case that records one (a SIGKILLed guard leaving an
-        orphaned `_run` holding the lock) still reconciles correctly: the
-        orphan keeps the lock so `is_running` short-circuits, or has
-        finished so the mismatch is a genuine `crashed`."""
-        if self.is_running:
-            return False
-        if self.run_pid is not None:
-            recorded_pid = self.last_run.pid if self.last_run else None
-            if self.run_pid != recorded_pid:
-                return True
-        ule = self.unit_last_exit
-        if ule is None or ule.exit_status == 0:
-            return False
-        recorded = self.last_run.process_exit if self.last_run else None
-        return ule.exit_status != recorded
 
 
 @dataclass

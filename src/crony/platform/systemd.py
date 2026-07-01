@@ -314,9 +314,9 @@ class SystemdScheduler(Scheduler):
         # the `.timer`). ExecMainStatus is the exit code for a normal
         # exit and the signal number for a kill; Result distinguishes
         # them. Normalize to the launchctl convention -- exit codes
-        # positive, signals negated -- so RuntimeState.crashed compares
-        # uniformly across backends. A unit with a launch in flight (its
-        # status is stale) or no readable status is left out.
+        # positive, signals negated -- so both backends report the exit
+        # uniformly. A unit with a launch in flight (its status is stale)
+        # or no readable status is left out.
         services = {service_filename(n): n for n in self.installed_names()}
         out: dict[str, UnitLastExit] = {}
         for blk in _show_services(list(services)):

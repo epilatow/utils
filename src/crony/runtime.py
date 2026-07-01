@@ -138,24 +138,104 @@ def _last_started_at(
     return run_pid_mtime
 
 
+# Maps a recorded ExitClass to the JobStatus a completed run reports:
+# `signal` folds to `fail`; `dispatched` (absent here) and an unparseable
+# class fall through to UNKNOWN.
+_EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
+    crony.model.ExitClass.OK: crony.model.JobStatus.OK,
+    crony.model.ExitClass.FAIL: crony.model.JobStatus.FAIL,
+    crony.model.ExitClass.SIGNAL: crony.model.JobStatus.FAIL,
+    crony.model.ExitClass.TIMEOUT: crony.model.JobStatus.TIMEOUT,
+    crony.model.ExitClass.GATED: crony.model.JobStatus.GATED,
+    crony.model.ExitClass.CANCELED: crony.model.JobStatus.CANCELED,
+}
+
+
+def _crashed(
+    is_running: bool,
+    run_pid: int | None,
+    last_run: crony.model.LastRun | None,
+    unit_last_exit: crony.platform.UnitLastExit | None,
+) -> bool:
+    """True when a launch ended without recording its own result --
+    killed by a signal (OOM, jetsam, a manual kill, macOS
+    OS_REASON_CODESIGNING, launchd unloading the unit) or exited before
+    the runner wrote `last-run.json`. Two independent signals:
+
+    - run.pid naming a different pid than the last record wrote: the
+      last-started launch reached launch (wrote run.pid) but never wrote
+      a record. A clean run overwrites run.pid and records the same pid,
+      so a disagreement is a launch that never recorded. Catches a kill
+      even when the scheduler kept no exit record (e.g. the unit was
+      unloaded).
+    - The scheduler's last-launch status disagreeing with the recorded
+      `process_exit`: catches a kill the scheduler saw after the runner
+      wrote its own record (so run.pid matches the record and the first
+      signal stays quiet).
+
+    Never fires for an in-flight run (it holds the lock) or a clean exit
+    (0). A degenerate case (a SIGKILLed guard leaving an orphaned `_run`
+    holding the lock) still reconciles correctly: the orphan keeps the
+    lock so `is_running` short-circuits, or has finished so the mismatch
+    is a genuine crash.
+    """
+    if is_running:
+        return False
+    if run_pid is not None:
+        recorded_pid = last_run.pid if last_run else None
+        if run_pid != recorded_pid:
+            return True
+    if unit_last_exit is None or unit_last_exit.exit_status == 0:
+        return False
+    recorded = last_run.process_exit if last_run else None
+    return unit_last_exit.exit_status != recorded
+
+
+def _derive_job_status(
+    is_running: bool,
+    is_pending: bool,
+    run_pid: int | None,
+    last_run: crony.model.LastRun | None,
+    unit_last_exit: crony.platform.UnitLastExit | None,
+) -> crony.model.JobStatus:
+    """The entity's current run status from its runtime facts.
+
+    A superset of a run's exit outcome: beyond the mapped exit classes
+    it also reports the no-run states (`never`, `pending`, `running`,
+    `crashed`). A held lock means a run is in flight -- `pending` when it
+    is an interactive job sitting in its wait loop (the `pending.flag`
+    file), `running` otherwise. Otherwise `crashed` when a launch ended
+    without recording (see `_crashed`), then the recorded exit_class, and
+    `never` / `unknown` when no usable record exists.
+    """
+    js = crony.model.JobStatus
+    if is_running:
+        return js.PENDING if is_pending else js.RUNNING
+    if _crashed(is_running, run_pid, last_run, unit_last_exit):
+        return js.CRASHED
+    if last_run is None or last_run.exit_class is None:
+        return js.NEVER if last_run is None else js.UNKNOWN
+    return _EXIT_TO_JOBSTATUS.get(last_run.exit_class, js.UNKNOWN)
+
+
 def _read_runtime_state(
     state_dir: Path,
     *,
     full_name: str | None,
     last_exits: dict[str, crony.platform.UnitLastExit] | None = None,
 ) -> crony.model.RuntimeState:
-    """Snapshot the runtime-only state inside one state dir: the
-    parsed last-run record and presence of the lock / pending /
-    user-trigger flag files. When `full_name` is known, also probe
-    the platform unit file path so subcommands can read it from
-    RuntimeState instead of walking the unit dirs ad-hoc.
-    `full_name` is None only for a broken entry whose snapshot
-    didn't yield a recoverable name.
+    """Snapshot the runtime state inside one state dir into a
+    RuntimeState: the parsed last-run record, the last launch's start
+    (`_last_started_at`), and the derived `job_status` (from the lock /
+    pending flag, run.pid, and the scheduler's last exit). When
+    `full_name` is known, also probe the platform unit file paths so
+    subcommands read them from RuntimeState instead of walking the unit
+    dirs ad-hoc. `full_name` is None only for a broken entry whose
+    snapshot didn't yield a recoverable name.
 
-    `last_exits` is the scheduler's bulk last-launch map (keyed by
-    full name); the entry for `full_name`, if any, is stored so
-    status can reconcile a killed-but-unrecorded launch against the
-    parsed `last_run`.
+    `last_exits` is the scheduler's bulk last-launch map (keyed by full
+    name); the entry for `full_name`, if any, feeds the crash
+    reconciliation in `_derive_job_status`.
     """
     last_run: crony.model.LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -188,16 +268,20 @@ def _read_runtime_state(
         else None
     )
     pid_path = state_dir / "run.pid"
+    is_pending = (state_dir / "pending.flag").is_file()
+    job_status = _derive_job_status(
+        is_running,
+        is_pending,
+        read_pid_file(pid_path),
+        last_run,
+        unit_last_exit,
+    )
     return crony.model.RuntimeState(
         state_dir=state_dir,
         last_run=last_run,
-        is_running=is_running,
-        is_pending=(state_dir / "pending.flag").is_file(),
-        has_user_trigger_flag=(state_dir / "user-trigger.flag").is_file(),
+        job_status=job_status,
         unit_config=unit_config,
         unit_timer=unit_timer,
-        unit_last_exit=unit_last_exit,
-        run_pid=read_pid_file(pid_path),
         last_started_at=_last_started_at(pid_path, last_run_path, last_run),
     )
 
@@ -370,10 +454,10 @@ def _build_current_graph(
             )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
-    # run.lock / pending.flag / user-trigger.flag) as a normal
-    # current entry, plus the platform unit path. Without this
-    # the unit-config / last / last-ran columns render empty
-    # for broken rows even when those files are on disk.
+    # run.lock / pending.flag) as a normal current entry, plus the
+    # platform unit path. Without this the unit-config / last / last-ran
+    # columns render empty for broken rows even when those files are on
+    # disk.
     for ref, orphan in orphans.items():
         state_dir = orphan.state_dir
         runtime[ref] = _read_runtime_state(
@@ -497,16 +581,15 @@ def load_config() -> crony.model.Config:
         runtime[ref] = crony.model.RuntimeState(
             state_dir=orphan.state_dir,
             last_run=None,
-            is_running=False,
-            is_pending=False,
-            has_user_trigger_flag=False,
+            job_status=_derive_job_status(
+                False, False, None, None, last_exits.get(full_name)
+            ),
             unit_config=(
                 _platform_unit_config_path(full_name) if has_unit else None
             ),
             unit_timer=(
                 _platform_unit_timer_path(full_name) if has_unit else None
             ),
-            unit_last_exit=last_exits.get(full_name),
         )
 
     return crony.model.Config(
