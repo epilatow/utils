@@ -7892,9 +7892,8 @@ class TestJobStatusInteractive:
 class TestJobStatusCrashed:
     """When the scheduler's last launch ended without recording (killed,
     or exited nonzero before the runner wrote its record), the surviving
-    last-run.json is stale: STATUS reads `crashed` and LAST RAN reads
-    `unknown`. A status matching the recorded process exit is a normal
-    result and is left alone."""
+    last-run.json is stale: STATUS reads `crashed`. A status matching the
+    recorded process exit is a normal result and is left alone."""
 
     def _setup(
         self,
@@ -7945,7 +7944,6 @@ class TestJobStatusCrashed:
         )
         config = crony_runtime.load_config()
         assert crony_commands._job_status(config, full) == "crashed"
-        assert crony_commands._last_ran_at(config, full) == "unknown"
 
     def test_nonzero_exit_without_record_is_crashed(
         self, tmp_path: Path, monkeypatch: Any
@@ -7964,6 +7962,59 @@ class TestJobStatusCrashed:
         )
         config = crony_runtime.load_config()
         assert crony_commands._job_status(config, full) == "fail"
+
+
+class TestFormatElapsed:
+    """`_format_elapsed` coarsens a second span to its largest whole
+    unit, with no suffix (the caller adds "ago")."""
+
+    @pytest.mark.parametrize(
+        ("secs", "expected"),
+        [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3599, "59m"),
+            (3600, "1h"),
+            (86399, "23h"),
+            (86400, "1d"),
+            (8 * 86400, "8d"),
+        ],
+    )
+    def test_boundaries(self, secs: int, expected: str) -> None:
+        assert crony_commands._format_elapsed(secs) == expected
+
+
+class TestLastRanColumn:
+    """LAST RAN renders the relative time since the last job start."""
+
+    def test_reports_launch_start_from_run_pid_mtime(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        import datetime
+
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        full = h.full("iv")
+        sd = h.fabricate_orphan("iv")
+        # A run.pid with no completion record: an in-flight / crashed
+        # launch whose start is run.pid's mtime.
+        pid_path = sd / "run.pid"
+        pid_path.write_text("4242\n", encoding="utf-8")
+        five_min_ago = (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+        ).timestamp()
+        os.utime(pid_path, (five_min_ago, five_min_ago))
+        config = crony_runtime.load_config()
+        assert crony_commands._last_ran_at(config, full) == "5m ago"
+
+    def test_never_when_no_run(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        h.config({}, default_target_jobs=[])
+        full = h.full("iv")
+        h.fabricate_orphan("iv")  # snapshot only: no run.pid, no record
+        config = crony_runtime.load_config()
+        assert crony_commands._last_ran_at(config, full) == "never"
 
 
 class TestStatusRenameUuidModel:

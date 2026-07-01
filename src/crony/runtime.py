@@ -98,6 +98,46 @@ def load_snapshot(
         ) from e
 
 
+def _file_mtime(path: Path) -> datetime.datetime | None:
+    """`path`'s mtime as an aware UTC datetime, or None when absent."""
+    try:
+        return datetime.datetime.fromtimestamp(
+            path.stat().st_mtime, tz=datetime.UTC
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _last_started_at(
+    pid_path: Path,
+    last_run_path: Path,
+    last_run: crony.model.LastRun | None,
+) -> datetime.datetime | None:
+    """When the job last started, or None when it has never run.
+
+    run.pid's mtime dates the last launch (the runner writes run.pid at
+    lock acquisition); last-run.json's mtime dates the last completion.
+    When the completion is the newer of the two, run.pid belongs to that
+    completed run, so its recorded `started_at` -- sampled before run.pid
+    was written, hence a hair earlier than run.pid's mtime -- is the
+    authoritative start. Otherwise a launch began after the last
+    completion (in-flight or crashed) and run.pid's mtime is its start.
+    """
+    recorded: datetime.datetime | None = None
+    if last_run is not None and last_run.started_at:
+        try:
+            recorded = datetime.datetime.fromisoformat(last_run.started_at)
+        except ValueError:
+            recorded = None
+    run_pid_mtime = _file_mtime(pid_path)
+    if run_pid_mtime is None:
+        return recorded
+    last_run_mtime = _file_mtime(last_run_path)
+    if last_run_mtime is not None and last_run_mtime > run_pid_mtime:
+        return recorded if recorded is not None else run_pid_mtime
+    return run_pid_mtime
+
+
 def _read_runtime_state(
     state_dir: Path,
     *,
@@ -147,6 +187,7 @@ def _read_runtime_state(
         if last_exits is not None and full_name is not None
         else None
     )
+    pid_path = state_dir / "run.pid"
     return crony.model.RuntimeState(
         state_dir=state_dir,
         last_run=last_run,
@@ -156,7 +197,8 @@ def _read_runtime_state(
         unit_config=unit_config,
         unit_timer=unit_timer,
         unit_last_exit=unit_last_exit,
-        run_pid=read_pid_file(state_dir / "run.pid"),
+        run_pid=read_pid_file(pid_path),
+        last_started_at=_last_started_at(pid_path, last_run_path, last_run),
     )
 
 

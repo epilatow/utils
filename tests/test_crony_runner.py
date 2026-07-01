@@ -292,6 +292,24 @@ class TestRunJobBasics:
         # process), the basis for the run.pid crash signal.
         assert rec["pid"] == os.getpid()
 
+    def test_clean_run_leaves_run_pid_naming_own_pid(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # run.pid persists across runs (its mtime dates the launch, its
+        # pid is the crash signal). A clean run leaves it naming its own
+        # pid, matching the record -- so it reads as a clean run, not a
+        # crash.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"ok": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["ok"],
+        )
+        assert crony_runner._run_job(h.snap(cfg, "ok")) == 0
+        pid_path = h.state_dir("ok") / "run.pid"
+        assert pid_path.is_file()
+        assert pid_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert h.last_run("ok")["pid"] == os.getpid()
+
     def test_log_header_reports_timeout_and_pid(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -830,6 +848,29 @@ class TestRunGroup:
         assert "timeout=" in log
         assert "pid=" in log
         assert f"group {h.full('g')} " in log
+
+    def test_clean_group_run_leaves_run_pid(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # As for a job, a group leaves its run.pid in place after a
+        # clean run, naming its own pid.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+        _stub_trigger_sync(
+            monkeypatch,
+            {h.full("a"): {"exit_code": 0, "exit_class": "ok"}},
+        )
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        pid_path = h.state_dir("g") / "run.pid"
+        assert pid_path.is_file()
+        assert pid_path.read_text(encoding="utf-8").strip() == str(os.getpid())
 
     def test_group_continues_on_child_failure(
         self, tmp_path: Path, monkeypatch: Any
@@ -2104,43 +2145,42 @@ class TestTriggerUnitSync:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # `trigger_timeout` is the "did the platform respond?"
-        # detector, not a completion deadline. Once the runner's
-        # pid file appears, the waiter must switch to
-        # `job_timeout`-bounded watching so a long but
-        # well-behaved run completes normally; otherwise a job
-        # whose execution exceeds `trigger_timeout` would record
-        # as `timeout` even after a clean `ok` exit.
+        # detector, not a completion deadline. Once the runner is in
+        # flight (run.lock held, pid published), the waiter must switch
+        # to `job_timeout`-bounded watching so a long but well-behaved
+        # run completes normally; otherwise a job whose execution
+        # exceeds `trigger_timeout` would record as `timeout` even after
+        # a clean `ok` exit.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
 
-        # Stub the platform trigger to write a pid file
-        # immediately. The pid points at the real test process
-        # (which won't exit during the test) -- we additionally
-        # stub `_wait_for_pid_exit` to simulate the runner
-        # finishing AFTER trigger_timeout has already elapsed.
+        # Model a running runner: it holds run.lock and published its
+        # pid (this test process, which won't exit during the test). We
+        # stub `_wait_for_pid_exit` to simulate it finishing AFTER
+        # trigger_timeout has already elapsed.
         (sd / "run.pid").write_text(f"{os.getpid()}\n")
         wait_calls: list[float] = []
 
         def _stub_wait(_pid: int, timeout: float) -> PidWait:
             wait_calls.append(timeout)
             # Simulate the runner completing now: write a fresh
-            # last-run.json and unlink the pid.
+            # last-run.json.
             (sd / "last-run.json").write_text(
                 f'{{"ended_at": "{crony_runtime.now_iso()}",'
                 ' "exit_code": 0, "exit_class": "ok"}',
                 encoding="utf-8",
             )
-            (sd / "run.pid").unlink(missing_ok=True)
             return PidWait.EXITED
 
         monkeypatch.setattr(
             crony_runner, "trigger_unit", lambda *_a, **_kw: None
         )
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _stub_wait)
-        rec = crony_runner.trigger_unit_sync(
-            full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
-        )
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            rec = crony_runner.trigger_unit_sync(
+                full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
+            )
         # The runner completed, even though trigger_timeout (1s)
         # was tighter than what a real-world startup might take.
         assert rec["exit_class"] == "ok"
@@ -2152,14 +2192,14 @@ class TestTriggerUnitSync:
     def test_dead_pid_does_not_spin_raises_start_timeout(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A run.pid that names a dead process (a launch that wrote
-        # the pid then died without recording a result) must not be
-        # treated as a live runner: re-attaching to a corpse whose
-        # kernel pid-exit notification returns instantly is what
-        # busy-spun the group dispatch. The waiter checks liveness
-        # and falls to the bounded poll path, so even with an
-        # uncapped job_timeout it surfaces TriggerStartTimeout within
-        # trigger_timeout instead of looping forever.
+        # A run.pid that names a dead process must not be treated as a
+        # live runner even while run.lock is held -- a SIGKILLed guard
+        # can leave the lock held with no live runner. Re-attaching to a
+        # corpse whose kernel pid-exit notification returns instantly is
+        # what busy-spun the group dispatch, so the liveness probe gates
+        # the pid-exit wait: the corpse falls to the bounded poll path and
+        # surfaces TriggerStartTimeout within trigger_timeout instead of
+        # looping forever, even with an uncapped job_timeout.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
@@ -2178,7 +2218,10 @@ class TestTriggerUnitSync:
             crony_runner, "trigger_unit", lambda *_a, **_kw: None
         )
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _no_wait)
-        with pytest.raises(TriggerStartTimeout, match="never produced"):
+        with (
+            crony_runtime.acquire_lock(sd / "run.lock"),
+            pytest.raises(TriggerStartTimeout, match="never produced"),
+        ):
             crony_runner.trigger_unit_sync(
                 full,
                 state_dir=sd,
@@ -2189,15 +2232,89 @@ class TestTriggerUnitSync:
         # gates the wait, so the corpse never re-armed the loop.
         assert waited == []
 
+    def test_leftover_run_pid_without_held_lock_is_ignored(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # run.pid persists across runs, so it can name a live but stale
+        # pid (an earlier run's number recycled to another process). With
+        # no run.lock held, no run is in flight, so the pid is a leftover
+        # -- its liveness must not be waited on; the waiter polls until
+        # the start-timeout instead.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        # A live pid (this process) but no run.lock held.
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        waited: list[int] = []
+
+        def _record_wait(
+            pid: int,
+            timeout: float | None,  # noqa: ARG001
+        ) -> PidWait:
+            waited.append(pid)
+            return PidWait.EXITED
+
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _record_wait)
+        with pytest.raises(TriggerStartTimeout, match="never produced"):
+            crony_runner.trigger_unit_sync(
+                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+            )
+        assert waited == []
+
+    def test_attaches_to_already_running_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child already running (its own schedule, another dispatch, a
+        # manual trigger) holds run.lock and named its pid before this
+        # trigger. run.lock -- not run.pid's age -- marks it in flight, so
+        # the waiter attaches to that live pid and returns its result.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        pid_path = sd / "run.pid"
+        pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        old = time.time() - 3600  # started well before this trigger
+        os.utime(pid_path, (old, old))
+        waited: list[int] = []
+
+        def _wait_then_complete(
+            pid: int,
+            timeout: float | None,  # noqa: ARG001
+        ) -> PidWait:
+            waited.append(pid)
+            # The running child finishes: write a fresh record.
+            (sd / "last-run.json").write_text(
+                f'{{"ended_at": "{crony_runtime.now_iso()}",'
+                ' "exit_code": 0, "exit_class": "ok"}',
+                encoding="utf-8",
+            )
+            return PidWait.EXITED
+
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            crony_runner, "_wait_for_pid_exit", _wait_then_complete
+        )
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            rec = crony_runner.trigger_unit_sync(
+                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+            )
+        assert rec["exit_class"] == "ok"
+        assert waited == [os.getpid()]
+
     def test_wedged_live_pid_raises_job_timeout(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A live child that never completes must not hold the group
         # forever: the hard job_timeout cap stops the wait and raises
-        # JobTimeoutError. The pid points at the test process
-        # (live for the test's duration); the pid-exit wait is stubbed
-        # to model a bounded wait that times out without the pid
-        # exiting, shortened so the test stays fast.
+        # JobTimeoutError. The child holds run.lock (in flight) and its
+        # pid points at the test process (live for the test's duration);
+        # the pid-exit wait is stubbed to model a bounded wait that times
+        # out without the pid exiting, shortened so the test stays fast.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
@@ -2214,7 +2331,10 @@ class TestTriggerUnitSync:
             crony_runner, "trigger_unit", lambda *_a, **_kw: None
         )
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _timeout_wait)
-        with pytest.raises(JobTimeoutError, match="did not complete"):
+        with (
+            crony_runtime.acquire_lock(sd / "run.lock"),
+            pytest.raises(JobTimeoutError, match="did not complete"),
+        ):
             crony_runner.trigger_unit_sync(
                 full,
                 state_dir=sd,

@@ -19,6 +19,7 @@ config / timer units for the `config=stale` comparison.
 """
 
 import dataclasses
+import datetime
 import os
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -1318,8 +1319,6 @@ class CommonRunResult:
     # The runner's pid -- the same value it wrote to run.pid at launch.
     # Captured at construction (in the runner process), so a recorded
     # result always carries the pid of the launch that produced it.
-    # `RuntimeState.crashed` compares it to the surviving run.pid to spot
-    # a launch that started but died before writing this record.
     # Keyword-only so the subclasses can append their own non-default
     # fields after it.
     pid: int = field(default_factory=os.getpid, kw_only=True)
@@ -1388,13 +1387,10 @@ class LastRun:
     started_at: str | None
     # The process exit the run recorded (JobRunResult / GroupRunResult
     # `process_exit`). None for a record predating the field or a
-    # partial / corrupt one. `RuntimeState.crashed` compares it to the
-    # scheduler's reported status to spot a launch that left no record.
+    # partial / corrupt one.
     process_exit: int | None
     # The pid the recording run wrote (its own pid). None for a record
-    # predating the field. `RuntimeState.crashed` compares it to the
-    # surviving run.pid: a different pid means the last-started launch
-    # never wrote a record.
+    # predating the field.
     pid: int | None
 
     @classmethod
@@ -1455,12 +1451,12 @@ class RuntimeState:
     # `last_run`. None when the scheduler has no record (or wasn't
     # queried). Reconciled against `last_run` by `crashed`.
     unit_last_exit: crony.platform.UnitLastExit | None = None
-    # The pid in the surviving run.pid file, or None when no run.pid is
-    # present (the normal resting state -- the runner unlinks it on a
-    # clean exit). A lingering run.pid is the fingerprint of a launch
-    # that didn't reach its own cleanup; `crashed` compares it to the
-    # pid the last record was written by.
+    # The pid in run.pid -- the last launch's pid -- or None when the
+    # job has never run (run.pid persists across runs, so absence means
+    # no launch ever wrote it).
     run_pid: int | None = None
+    # When the job last started, or None when it has never run.
+    last_started_at: datetime.datetime | None = None
 
     @property
     def crashed(self) -> bool:
@@ -1469,14 +1465,16 @@ class RuntimeState:
         OS_REASON_CODESIGNING, launchd unloading the unit) or exited
         before the runner wrote `last-run.json`. Two independent signals:
 
-        - A surviving run.pid naming a different pid than the last record
-          wrote: the last-started launch reached launch (wrote run.pid)
-          but never wrote a record (which would have carried that pid and
-          unlinked run.pid). Catches a kill even when the scheduler kept
-          no exit record (e.g. the unit was unloaded).
+        - run.pid naming a different pid than the last record wrote: the
+          last-started launch reached launch (wrote run.pid) but never
+          wrote a record. A clean run overwrites run.pid here and records
+          the same pid, so a disagreement is a launch that never
+          recorded. Catches a kill even when the scheduler kept no exit
+          record (e.g. the unit was unloaded).
         - The scheduler's last-launch status disagreeing with the
-          recorded `process_exit`: catches a kill after the record was
-          written, when run.pid was already unlinked.
+          recorded `process_exit`: catches a kill the scheduler saw
+          after the runner wrote its own record (so run.pid matches the
+          record and the first signal stays quiet).
 
         Never fires for an in-flight run (it holds the lock) or a clean
         exit (0). A scheduler-recorded exit is effectively never

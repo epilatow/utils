@@ -451,9 +451,9 @@ def _run_job(snap: crony.model.Job) -> int:
     try:
         with crony.runtime.acquire_lock(lock_path):
             # Publish our pid for waiters (parent groups, `crony
-            # trigger --wait`) to watch for exit. The pid file lives
-            # only for the duration of the lock-holding run; cleaned
-            # up in `finally`.
+            # trigger --wait`) to watch for exit, and leave it in place
+            # on exit: run.pid persists across runs as the record of the
+            # last launch, consumed afterward by RuntimeState.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_size_before = (
@@ -644,7 +644,6 @@ def _run_job(snap: crony.model.Job) -> int:
                 return surfaced_rc
             finally:
                 log_file.close()
-                pid_path.unlink(missing_ok=True)
     except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
@@ -759,6 +758,8 @@ def _run_group(snap: crony.model.JobGroup) -> int:
 
     try:
         with crony.runtime.acquire_lock(lock_path):
+            # Left in place on exit; see `_run_job` for the run.pid
+            # lifecycle.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
             log_file = open(log_path, "ab", buffering=0)
@@ -965,7 +966,6 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                 return 0
             finally:
                 log_file.close()
-                pid_path.unlink(missing_ok=True)
     except crony.errors.LockBusyError:
         with open(log_path, "ab", buffering=0) as f:
             f.write(
@@ -1065,23 +1065,28 @@ def trigger_unit_sync(
     fresh last-run.json appears within `trigger_timeout` seconds -- the
     "platform never started anything" detector (broken plist, stalled
     queue, unloaded unit), which also covers a launch that wrote run.pid
-    then died without recording (the dead pid no longer counts as a
-    live runner). Raises `JobTimeoutError` when `job_timeout` is finite
-    and the wait reaches that budget without completing; the budget
-    hard-bounds the whole wait. A dead or vanished pid can never spin
-    this loop -- a liveness probe gates the pid-exit wait, so a corpse
-    falls through to the bounded start-timeout poll instead of re-arming
-    the wait. An uncapped child (`job_timeout` is `math.inf`) with a
-    genuinely live runner waits as long as that runner lives.
+    then died without recording (its pid no longer counts as a live
+    runner). Raises `JobTimeoutError` when `job_timeout` is finite and
+    the wait reaches that budget without completing; the budget
+    hard-bounds the whole wait. A dead, vanished, or leftover pid can
+    never spin this loop -- run.pid persists across runs, so the waiter
+    attaches only while run.lock is held (a run in flight; see
+    Mechanism); a leftover with no held lock falls through to the bounded
+    start-timeout poll instead of re-arming the wait. An uncapped child
+    (`job_timeout` is `math.inf`) with a genuinely live runner waits as
+    long as that runner lives.
 
-    Mechanism: a pre-trigger timestamp T is taken, the platform
-    is asked to fire the unit, and the waiter watches for the
-    runner's pid (published via `<state>/<bundle>/<uuid>/run.pid`) to
-    exit via kernel-level pid-exit notification. When the
-    pid is gone, last-run.json is read; if its `ended_at` is at
-    or after T, the run is "ours" (semantics: the next completion
-    after the trigger). Otherwise we sleep briefly, re-read the
-    pid file, and try again.
+    Mechanism: a pre-trigger timestamp T is taken, the platform is asked
+    to fire the unit, and the waiter watches for the runner's pid
+    (published via `<state>/<bundle>/<uuid>/run.pid`) to exit via
+    kernel-level pid-exit notification. run.pid persists across runs, so
+    the waiter attaches to its pid only while run.lock is held -- a run
+    genuinely in flight, the kernel having released the lock on any
+    earlier runner's exit -- and treats a leftover run.pid with no held
+    lock as no live runner. When the pid is gone, last-run.json is read;
+    if its `ended_at` is at or after T, the run is "ours" (semantics: the
+    next completion after the trigger). Otherwise we sleep briefly,
+    re-read the pid file, and try again.
 
     Triggering an already-running unit is a no-op on both
     platforms; the waiter still attaches to the in-flight pid and
@@ -1140,11 +1145,23 @@ def trigger_unit_sync(
                 f"{full_name!r} did not complete within {job_timeout:.0f}s"
             )
         pid = crony.runtime.read_pid_file(pid_path)
-        if pid is not None and _pid_alive(pid):
+        # run.pid persists across runs, so it can name a stale (dead or
+        # recycled) pid from an earlier run. run.lock is held only while
+        # a run is genuinely in flight -- the kernel releases the flock
+        # when the runner exits -- so it, not run.pid's presence, tells a
+        # live runner from a leftover. Attach only when a run is in
+        # progress (which also covers a child already running from its
+        # own schedule or another dispatch); a leftover pid with no held
+        # lock falls through to the start-timeout poll.
+        if (
+            pid is not None
+            and crony.runtime.run_in_progress(state_dir)
+            and _pid_alive(pid)
+        ):
             # A live runner: block on its pid-exit, capped at the
             # remaining budget (None = no cap, for an uncapped child).
             # After the wait, loop back to re-read last-run.json
-            # (the runner writes it just before unlinking the pid).
+            # (the runner writes it just before the process exits).
             pid_wait = (
                 None
                 if math.isinf(job_timeout)
@@ -1152,10 +1169,10 @@ def trigger_unit_sync(
             )
             _wait_for_pid_exit(pid, timeout=pid_wait)
             continue
-        # No live runner: not started yet, or it wrote run.pid and died
-        # without a fresh result (a dead pid lingers). Bound this by
+        # No live runner for this dispatch: not started yet, or run.pid
+        # is a stale leftover (a dead or pre-trigger pid). Bound this by
         # trigger_timeout and poll with a sleep -- never re-attach to a
-        # corpse and busy-loop.
+        # corpse or stale pid and busy-loop.
         if elapsed > trigger_timeout:
             raise crony.errors.TriggerStartTimeout(
                 f"trigger of {full_name!r} never produced a fresh "

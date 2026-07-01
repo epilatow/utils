@@ -235,17 +235,29 @@ def _job_status(
     return _EXIT_TO_JOBSTATUS.get(rt.last_run.exit_class, js.UNKNOWN)
 
 
-def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
-    """Return a compact "when did this last run" string for status.
+def _format_elapsed(secs: int) -> str:
+    """A compact magnitude label ("3s" / "5m" / "2h" / "8d") for a
+    non-negative span of `secs` seconds, coarsened to its largest whole
+    unit."""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
 
-    Returns "never" when there's no last-run record and "unknown"
-    when the recorded timestamp is unreadable or the recorded run
-    was superseded by a launch that ended without recording (a
-    crash, so the surviving timestamp is from an earlier run).
-    Resolution is current-first, pending-fallback: runtime is
-    uuid-keyed, so a not-yet-applied rename (new name, unchanged
-    uuid) is recovered via the pending graph when the applied-name
-    lookup misses.
+
+def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
+    """Return a compact "when did this job last start" string for status
+    (e.g. "5m ago"), from `RuntimeState.last_started_at`.
+
+    Returns "never" when the job has never run, "unknown" when a record
+    exists but yields no usable start, and "future" for a start ahead of
+    now (clock skew). Resolution is current-first, pending-fallback:
+    runtime is uuid-keyed, so a not-yet-applied rename (new name,
+    unchanged uuid) is recovered via the pending graph when the
+    applied-name lookup misses.
     """
     ref = config.resolve_current(full_name) or config.resolve_pending(full_name)
     if ref is None:
@@ -253,30 +265,17 @@ def _last_ran_at(config: crony.model.Config, full_name: str) -> str:
     rt = config.runtime.get(ref)
     if rt is None:
         return "never"
-    if rt.crashed:
-        return "unknown"
-    if rt.last_run is None:
-        return "never"
-    started = rt.last_run.started_at
-    if not started:
-        return "unknown"
-    try:
-        dt = datetime.datetime.fromisoformat(started)
-    except ValueError:
-        return "unknown"
+    if rt.last_started_at is None:
+        # A record with an unreadable start is "unknown"; with no record
+        # at all the job has never run.
+        return "unknown" if rt.last_run is not None else "never"
     now = datetime.datetime.now(datetime.UTC).astimezone()
-    secs = int((now - dt).total_seconds())
+    secs = int((now - rt.last_started_at).total_seconds())
     if secs < 0:
-        # Clock skew or a future-dated record; surface explicitly
-        # rather than rendering "0s ago" which would mislead.
+        # Clock skew or a future-dated start; surface explicitly rather
+        # than rendering "0s ago" which would mislead.
         return "future"
-    if secs < 60:
-        return f"{secs}s ago"
-    if secs < 3600:
-        return f"{secs // 60}m ago"
-    if secs < 86400:
-        return f"{secs // 3600}h ago"
-    return f"{secs // 86400}d ago"
+    return f"{_format_elapsed(secs)} ago"
 
 
 def _cfg_status(
@@ -1426,7 +1425,7 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
     StatusColumn(
         StatusCols.LAST_RAN,
         "LAST RAN",
-        'Relative time of the last job run, e.g. "5m ago".',
+        "Relative time of the last job start.",
     ),
     StatusColumn(
         StatusCols.MASKED_BY,

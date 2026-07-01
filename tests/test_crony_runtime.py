@@ -8,8 +8,10 @@
 """Unit tests for crony.runtime."""
 
 import dataclasses
+import datetime
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -1823,6 +1825,78 @@ class TestRuntimePidCrashSignal:
         assert rt.run_pid == 999999
         assert rt.unit_last_exit is None
         assert rt.crashed is True
+
+
+class TestLastStartedAt:
+    """`_last_started_at` picks the last launch's start: the recorded
+    completion start when the completion is newer than run.pid, else
+    run.pid's mtime (an in-flight or crashed launch that hasn't
+    recorded)."""
+
+    @staticmethod
+    def _utime(path: Path, dt: datetime.datetime) -> None:
+        path.touch()
+        os.utime(path, (dt.timestamp(), dt.timestamp()))
+
+    @staticmethod
+    def _record(started_at: str) -> crony_model.LastRun:
+        return crony_model.LastRun.from_raw(
+            {
+                "exit_class": "ok",
+                "started_at": started_at,
+                "process_exit": 0,
+                "pid": 100,
+            }
+        )
+
+    def test_completed_run_uses_recorded_start(self, tmp_path: Path) -> None:
+        # last-run.json newer than run.pid: run.pid belongs to that
+        # completed run, so its recorded started_at (a hair before
+        # run.pid's mtime) is authoritative.
+        now = datetime.datetime.now(datetime.UTC)
+        started = now - datetime.timedelta(minutes=5)
+        pid_path = tmp_path / "run.pid"
+        lr_path = tmp_path / "last-run.json"
+        self._utime(pid_path, started)
+        self._utime(lr_path, started + datetime.timedelta(seconds=1))
+        got = crony_runtime._last_started_at(
+            pid_path, lr_path, self._record(started.isoformat())
+        )
+        assert got == started
+
+    def test_inflight_launch_uses_run_pid_mtime(self, tmp_path: Path) -> None:
+        # run.pid newer than last-run.json: a launch began after the last
+        # completion, so run.pid's mtime is the start, not the stale
+        # recorded completion.
+        now = datetime.datetime.now(datetime.UTC)
+        stale = now - datetime.timedelta(days=8)
+        launch = now - datetime.timedelta(minutes=5)
+        pid_path = tmp_path / "run.pid"
+        lr_path = tmp_path / "last-run.json"
+        self._utime(lr_path, stale)
+        self._utime(pid_path, launch)
+        got = crony_runtime._last_started_at(
+            pid_path, lr_path, self._record(stale.isoformat())
+        )
+        assert got is not None
+        assert abs((got - launch).total_seconds()) < 1
+
+    def test_no_run_pid_falls_back_to_record(self, tmp_path: Path) -> None:
+        started = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+            hours=2
+        )
+        got = crony_runtime._last_started_at(
+            tmp_path / "run.pid",
+            tmp_path / "last-run.json",
+            self._record(started.isoformat()),
+        )
+        assert got == started
+
+    def test_never_ran_is_none(self, tmp_path: Path) -> None:
+        got = crony_runtime._last_started_at(
+            tmp_path / "run.pid", tmp_path / "last-run.json", None
+        )
+        assert got is None
 
 
 if __name__ == "__main__":

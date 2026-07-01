@@ -212,7 +212,7 @@ Send a synthetic failure notification.
 - **`status`**\
   See "STATUS values".
 - **`last-ran`**\
-  Relative time of the last job run, e.g. "5m ago".
+  Relative time of the last job start.
 
 ### Optional Columns
 
