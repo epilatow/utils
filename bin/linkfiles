@@ -488,7 +488,12 @@ class LinkRecord(LineRecord):
         if status == LinkStatus.NONLINK_CONFLICT:
             return LinkStatus.NONLINK_CONFLICT
         if status == LinkStatus.LINK_CONFLICT and not dry_run:
-            self.tgt.unlink()
+            # The cached status can pre-date this call: when the same target
+            # is a prior install's remove and this install's create, the
+            # remove pass (which always runs first) has already unlinked it.
+            # missing_ok tolerates that; the symlink_to below still lands the
+            # correct link.
+            self.tgt.unlink(missing_ok=True)
         if not dry_run:
             self.tgt.parent.mkdir(parents=True, exist_ok=True)
             rel = Path(os.path.relpath(self.src, self.tgt.parent))

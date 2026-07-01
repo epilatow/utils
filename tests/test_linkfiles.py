@@ -357,6 +357,63 @@ class TestLinkfilesInstall:
         assert (d1 / "a").is_symlink()
         assert (d2 / "b").is_symlink()
 
+    def test_resync_installs_target_a_prior_remove_unlinked(
+        self, tracked: Path
+    ) -> None:
+        # Two installs share one target. One install's source dropped the
+        # file, so its recorded link is a REMOVE; the other still wants the
+        # target, which on disk is a now-foreign symlink -- an INSTALL under
+        # --force. The remove pass (which always runs first) unlinks the
+        # shared target, so the install pass must land its link on the
+        # now-absent path rather than choke unlinking what is already gone.
+        gone = _make_tree(tracked / "gone", {})  # source dropped its config
+        want = _make_tree(tracked / "want", {"config": "v"})
+        home = tracked / "home"
+        home.mkdir()
+        shared = home / "config"
+        link_tgt = home.resolve() / "config"
+        # The stale on-disk link still points at the dropped source, which
+        # makes it OK for gone's REMOVE and a conflict for want's INSTALL.
+        shared.symlink_to((gone / "config").resolve())
+        lf.save_install_records(
+            [
+                lf.InstallRecord(
+                    tgt=home.resolve(),
+                    src=gone.resolve(),
+                    dotfiles=False,
+                    no_recurse=False,
+                ),
+                lf.InstallRecord(
+                    tgt=home.resolve(),
+                    src=want.resolve(),
+                    dotfiles=False,
+                    no_recurse=False,
+                ),
+            ]
+        )
+        lf._atomic_write(
+            lf.LINKED_FILE,
+            lf._serialize(
+                [
+                    lf.LinkRecord(
+                        tgt=link_tgt,
+                        src=(gone / "config").resolve(),
+                    )
+                ]
+            ),
+        )
+        lf.do_install(
+            None,
+            None,
+            dotfiles=False,
+            no_recurse=False,
+            dry_run=False,
+            force=True,
+            verbose=False,
+        )
+        assert shared.is_symlink()
+        assert shared.resolve() == (want / "config").resolve()
+
     def test_rejects_source_nested_in_tracked_source(
         self, tracked: Path
     ) -> None:
