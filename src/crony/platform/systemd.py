@@ -82,7 +82,12 @@ def render_service(
 def render_timer(name: str, timing: Timing) -> str:
     """Render the systemd `.timer` unit."""
     if isinstance(timing, Interval):
-        spec_line = f"OnUnitActiveSec={timing}\n"
+        # OnUnitActiveSec alone measures from the last service
+        # activation, so a timer whose service has never run has no
+        # anchor and never elapses. OnActiveSec seeds the first firing
+        # relative to timer activation (enable / boot); OnUnitActiveSec
+        # then drives the recurring cadence off each completed run.
+        spec_line = f"OnActiveSec={timing}\nOnUnitActiveSec={timing}\n"
     else:
         spec_line = f"OnCalendar={timing}\n"
     return (

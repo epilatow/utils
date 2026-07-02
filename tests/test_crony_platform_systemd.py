@@ -65,6 +65,10 @@ class TestSystemdRendering:
     def test_timer_interval(self) -> None:
         timer = systemd.render_timer("j", Interval.from_str("1h"))
         assert "OnUnitActiveSec=1h" in timer
+        # OnActiveSec anchors the first firing to timer activation;
+        # without it OnUnitActiveSec has no service run to measure from
+        # and the timer never elapses.
+        assert "OnActiveSec=1h" in timer
 
     def test_service_invokes_uv_with_absolute_path(self) -> None:
         # systemd user services run with a minimal default PATH; render
