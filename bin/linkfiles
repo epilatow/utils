@@ -46,7 +46,11 @@ from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
 # Conflicts:
 #   A conflict occurs when a target path exists but doesn't point to the
 #   expected source. With --force, conflicting symlinks are replaced.
-#   Regular files/directories are never removed by --force.
+#   Regular files/directories are never removed by --force. A conflict
+#   whose target another in-scope install removes in the same run is not
+#   blocked -- the remove pass vacates it first, so the wanted link is
+#   installed without --force (the occupant was a tracked link, not a
+#   foreign one).
 #
 # Stale and dangling links:
 #   A recorded link is "stale" when its source no longer wants it (the
@@ -481,7 +485,9 @@ class LinkRecord(LineRecord):
         already-correct link stays OK; a missing target becomes INSTALLED.
         A foreign symlink in the way is replaced (the plan schedules a link
         for creation only once replacement is authorized); a real file/dir
-        is never touched (NONLINK_CONFLICT)."""
+        is never touched (NONLINK_CONFLICT). A symlink that cannot be
+        unlinked leaves the target occupied, so the link stays a
+        LINK_CONFLICT rather than crashing the run."""
         status = self.status()
         if status == LinkStatus.OK:
             return LinkStatus.OK
@@ -492,8 +498,16 @@ class LinkRecord(LineRecord):
             # is a prior install's remove and this install's create, the
             # remove pass (which always runs first) has already unlinked it.
             # missing_ok tolerates that; the symlink_to below still lands the
-            # correct link.
-            self.tgt.unlink(missing_ok=True)
+            # correct link. An unlink that fails outright (e.g. a locked
+            # parent) leaves the foreign link in place -- report the conflict
+            # instead of letting the OSError abort the whole run.
+            try:
+                self.tgt.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "could not replace conflicting link %s: %s", self.tgt, exc
+                )
+                return LinkStatus.LINK_CONFLICT
         if not dry_run:
             self.tgt.parent.mkdir(parents=True, exist_ok=True)
             rel = Path(os.path.relpath(self.src, self.tgt.parent))
@@ -602,6 +616,32 @@ class LinkPlan:
                 self.install.append(link)
             else:
                 self.conflict.append(link)
+
+    def clear_conflicts_freed_by_removes(self) -> None:
+        """Reclassify as INSTALL any conflict whose target a REMOVE in this
+        same run will vacate. A wanted target blocked by a symlink is only
+        truly blocked if it stays occupied; when another in-scope install's
+        REMOVE link owns that same target (its live status OK, so the remove
+        pass -- which runs first -- unlinks it), the target is free before
+        `install_links` runs, making the link a plain install. No --force is
+        needed: the occupant is a tracked link being torn down, not a foreign
+        one. Only REMOVE links this run will actually process qualify --
+        out-of-scope installs' links sit in KEEP, never REMOVE, so a conflict
+        they occupy stays blocked. Invoked only by the executing install path;
+        audit leaves the conflict standing, since without the remove the
+        target stays occupied."""
+        freed = {
+            link.tgt for link in self.remove if link.status() is LinkStatus.OK
+        }
+        if not freed:
+            return
+        blocked: list[LinkRecord] = []
+        for link in self.conflict:
+            if link.tgt in freed:
+                self.install.append(link)
+            else:
+                blocked.append(link)
+        self.conflict = blocked
 
     def keep_links(self) -> list[OperationResult]:
         """The keep links, each reported OK. Taken before `install_links`
@@ -1324,14 +1364,17 @@ def _run_install(state: WorldState, *, dry_run: bool, verbose: bool) -> None:
     link, persist the tracking files (.installed then .linked) recording the
     wanted links *before* they exist, then create them. A crash at any step
     leaves a state the next run reconciles. A CONFLICT is a hard error unless
-    the plan already resolved it (a foreign symlink under --force, which the
-    plan placed in INSTALL); a non-link is never touched. Raises
-    ConflictsFound if any wanted link stays blocked."""
+    the plan resolved it: a foreign symlink under --force, or a target this
+    run's REMOVE pass vacates -- both placed in INSTALL; a non-link is never
+    touched. Raises ConflictsFound if any wanted link stays blocked."""
     plan = state.plan
     for install in state.missing_sources:
         logger.warning(
             "tracked source is missing, pruning its links: %s", install.src
         )
+    # A conflict a REMOVE in this run will clear is installable, not blocked;
+    # reclassify before executing so the freed target is filled, not reported.
+    plan.clear_conflicts_freed_by_removes()
     # Take the keep report before install_links moves the freshly created
     # links into KEEP, so the two don't overlap.
     keep_results = plan.keep_links()

@@ -63,6 +63,48 @@ def _make_tree(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
+def _shared_target_remove_and_want(tracked: Path) -> tuple[Path, Path]:
+    """Set up two installs sharing one target, `home/config`. `gone`
+    dropped the file, so its recorded link is a REMOVE; `want` now delivers
+    it. On disk the target is still gone's stale symlink -- OK for gone's
+    REMOVE, a LINK_CONFLICT for want's INSTALL. Returns (want source dir,
+    the shared target path)."""
+    gone = _make_tree(tracked / "gone", {})  # source dropped its config
+    want = _make_tree(tracked / "want", {"config": "v"})
+    home = tracked / "home"
+    home.mkdir()
+    shared = home / "config"
+    shared.symlink_to((gone / "config").resolve())
+    lf.save_install_records(
+        [
+            lf.InstallRecord(
+                tgt=home.resolve(),
+                src=gone.resolve(),
+                dotfiles=False,
+                no_recurse=False,
+            ),
+            lf.InstallRecord(
+                tgt=home.resolve(),
+                src=want.resolve(),
+                dotfiles=False,
+                no_recurse=False,
+            ),
+        ]
+    )
+    lf._atomic_write(
+        lf.LINKED_FILE,
+        lf._serialize(
+            [
+                lf.LinkRecord(
+                    tgt=home.resolve() / "config",
+                    src=(gone / "config").resolve(),
+                )
+            ]
+        ),
+    )
+    return want, shared
+
+
 class TestFieldEscaping:
     """Record fields round-trip through escape/unescape, including the
     separator (tab), the escape char, and newlines."""
@@ -360,48 +402,12 @@ class TestLinkfilesInstall:
     def test_resync_installs_target_a_prior_remove_unlinked(
         self, tracked: Path
     ) -> None:
-        # Two installs share one target. One install's source dropped the
-        # file, so its recorded link is a REMOVE; the other still wants the
-        # target, which on disk is a now-foreign symlink -- an INSTALL under
-        # --force. The remove pass (which always runs first) unlinks the
-        # shared target, so the install pass must land its link on the
-        # now-absent path rather than choke unlinking what is already gone.
-        gone = _make_tree(tracked / "gone", {})  # source dropped its config
-        want = _make_tree(tracked / "want", {"config": "v"})
-        home = tracked / "home"
-        home.mkdir()
-        shared = home / "config"
-        link_tgt = home.resolve() / "config"
-        # The stale on-disk link still points at the dropped source, which
-        # makes it OK for gone's REMOVE and a conflict for want's INSTALL.
-        shared.symlink_to((gone / "config").resolve())
-        lf.save_install_records(
-            [
-                lf.InstallRecord(
-                    tgt=home.resolve(),
-                    src=gone.resolve(),
-                    dotfiles=False,
-                    no_recurse=False,
-                ),
-                lf.InstallRecord(
-                    tgt=home.resolve(),
-                    src=want.resolve(),
-                    dotfiles=False,
-                    no_recurse=False,
-                ),
-            ]
-        )
-        lf._atomic_write(
-            lf.LINKED_FILE,
-            lf._serialize(
-                [
-                    lf.LinkRecord(
-                        tgt=link_tgt,
-                        src=(gone / "config").resolve(),
-                    )
-                ]
-            ),
-        )
+        # Two installs share one target; one dropped the file (its link a
+        # REMOVE), the other wants it over the now-foreign symlink (an
+        # INSTALL under --force). The remove pass (which always runs first)
+        # unlinks the shared target, so the install pass must land its link
+        # on the now-absent path rather than choke unlinking what is gone.
+        want, shared = _shared_target_remove_and_want(tracked)
         lf.do_install(
             None,
             None,
@@ -413,6 +419,70 @@ class TestLinkfilesInstall:
         )
         assert shared.is_symlink()
         assert shared.resolve() == (want / "config").resolve()
+
+    def test_resync_installs_over_conflict_a_remove_clears(
+        self, tracked: Path
+    ) -> None:
+        # Same shared-target setup, but re-synced *without* --force. want's
+        # link is a conflict only because gone's stale link occupies the
+        # target; gone's REMOVE (in scope in a full re-sync) vacates it
+        # first, so want installs without --force -- the occupant was a
+        # tracked link being torn down, not a foreign one.
+        want, shared = _shared_target_remove_and_want(tracked)
+        lf.do_install(
+            None,
+            None,
+            dotfiles=False,
+            no_recurse=False,
+            dry_run=False,
+            force=False,
+            verbose=False,
+        )
+        assert shared.is_symlink()
+        assert shared.resolve() == (want / "config").resolve()
+
+    def test_scoped_install_keeps_conflict_a_remove_would_clear(
+        self, tracked: Path
+    ) -> None:
+        # Installing only `want` leaves gone out of scope, so gone's link is
+        # preserved (KEEP), never removed -- this run does not vacate the
+        # target. The conflict is therefore real and blocks without --force.
+        want, shared = _shared_target_remove_and_want(tracked)
+        home = tracked / "home"
+        with pytest.raises(lf.ConflictsFound):
+            lf.do_install(
+                want,
+                home,
+                dotfiles=False,
+                no_recurse=False,
+                dry_run=False,
+                force=False,
+                verbose=False,
+            )
+        # The target is untouched: still gone's stale link, not want's.
+        assert shared.is_symlink()
+        assert shared.resolve() == (tracked / "gone" / "config").resolve()
+
+    def test_create_reports_conflict_when_unlink_fails(
+        self, tracked: Path, monkeypatch: Any
+    ) -> None:
+        # A foreign symlink that cannot be unlinked (a locked parent, say)
+        # must leave the target occupied and report LINK_CONFLICT, not abort
+        # the run with an uncaught OSError.
+        src = _make_tree(tracked / "s", {"x": "v"})
+        home = tracked / "home"
+        home.mkdir()
+        tgt = home / "x"
+        tgt.symlink_to((tracked / "other").resolve())
+        link = lf.LinkRecord(tgt=tgt, src=(src / "x").resolve())
+        assert link.status() is lf.LinkStatus.LINK_CONFLICT
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise PermissionError("locked")
+
+        monkeypatch.setattr(Path, "unlink", _boom)
+        assert link.create(dry_run=False) is lf.LinkStatus.LINK_CONFLICT
+        assert tgt.is_symlink()  # the foreign link is left in place
 
     def test_rejects_source_nested_in_tracked_source(
         self, tracked: Path
@@ -511,6 +581,17 @@ class TestLinkfilesAuditRemove:
         self._install(src, tgt)
         # Remove a source file; its managed link is now stale.
         (src / "gone").unlink()
+        with pytest.raises(lf.ConflictsFound):
+            lf.do_audit(verbose=False)
+
+    def test_audit_reports_conflict_a_remove_would_clear(
+        self, tracked: Path
+    ) -> None:
+        # audit reads the same plan install does but changes nothing, so it
+        # never runs the remove pass that would vacate the target. The
+        # conflict is real from audit's standpoint and must be reported, not
+        # silently reclassified as install would.
+        _shared_target_remove_and_want(tracked)
         with pytest.raises(lf.ConflictsFound):
             lf.do_audit(verbose=False)
 
