@@ -697,12 +697,13 @@ def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
 def scheduler(platform: str | None = None) -> crony.platform.Scheduler:
     """The platform Scheduler for the host. `platform` defaults to the
     running host's `crony.platform.current_platform()`; tests pass it
-    explicitly to exercise a specific backend. Built per call; the
-    backend resolves its own unit directory (honoring its CRONY_*_DIR
-    env override), so tests that redirect that env are picked up."""
+    explicitly to exercise a specific backend. Built per call; the unit
+    directory is the `CRONY_UNIT_DIR` override when set (else the
+    backend's per-OS default), so a test can redirect it to a throwaway
+    tree via that env."""
     if platform is None:
         platform = crony.platform.current_platform()
-    return crony.platform.get_scheduler(platform)
+    return crony.platform.get_scheduler(platform, crony.paths.UNIT_DIR)
 
 
 def host() -> crony.platform.HostPlatform:

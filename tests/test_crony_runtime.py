@@ -120,6 +120,23 @@ class TestIsLoadedLinux:
         assert sched.is_loaded("default.j") is False
 
 
+class TestSchedulerUnitDirOverride:
+    # runtime.scheduler() resolves the unit dir through crony.paths.UNIT_DIR
+    # (the CRONY_UNIT_DIR override): a path redirects it; None leaves the
+    # backend's per-OS default.
+    def test_override_redirects_unit_dir(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr("crony.paths.UNIT_DIR", tmp_path)
+        assert crony_runtime.scheduler("linux").unit_dir == tmp_path
+        assert crony_runtime.scheduler("darwin").unit_dir == tmp_path
+
+    def test_default_unit_dir_when_unset(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr("crony.paths.UNIT_DIR", None)
+        sched = crony_runtime.scheduler("linux")
+        assert sched.unit_dir == sched.default_unit_dir()
+
+
 class TestUnitNameDelegatesTolerateRefForm:
     """A broken entity whose snapshot can't be read has no recoverable
     `<bundle>.<short>` name, so the status path probes it by its

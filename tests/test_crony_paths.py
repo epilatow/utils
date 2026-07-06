@@ -47,6 +47,20 @@ class TestEnvPath:
         assert paths._env_path("FOO_DIR", "/tmp/d") == Path("/tmp/d")
 
 
+class TestEnvPathOptional:
+    def test_none_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CRONY_FOO_DIR", raising=False)
+        assert paths._env_path("FOO_DIR") is None
+
+    def test_none_when_env_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CRONY_FOO_DIR", "")
+        assert paths._env_path("FOO_DIR") is None
+
+    def test_env_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CRONY_FOO_DIR", "/tmp/override")
+        assert paths._env_path("FOO_DIR") == Path("/tmp/override")
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 
