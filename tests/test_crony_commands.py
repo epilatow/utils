@@ -2085,7 +2085,9 @@ class TestEnableDisable:
         crony_commands.do_trigger(
             jobs=["j"], wait=False, trigger_timeout=None, bundle=None
         )
-        cmd = next(c for c in h.calls if c[0] == "systemctl")
+        cmd = next(
+            c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
+        )
         assert cmd == [
             "systemctl",
             "--user",

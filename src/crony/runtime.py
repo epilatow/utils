@@ -414,10 +414,17 @@ def _build_current_graph(
                     if en is not None
                     else None
                 )
-                config_disk, timer_disk, inst_uv, inst_crony, loaded = (
+                (
+                    config_disk,
+                    timer_disk,
+                    inst_uv,
+                    inst_crony,
+                    loaded,
+                    armed,
+                ) = (
                     _current_unit_disk_inputs(str(en), sched)
                     if en is not None
-                    else (None, None, None, None, False)
+                    else (None, None, None, None, False, None)
                 )
                 snap = crony.model.snapshot_from_dict(
                     raw,
@@ -431,6 +438,7 @@ def _build_current_graph(
                     installed_uv=inst_uv,
                     installed_crony=inst_crony,
                     unit_loaded=loaded,
+                    unit_armed=armed,
                 )
             except (TypeError, ValueError) as exc:
                 orphans[ref] = crony.model.JobOrphan(
@@ -716,14 +724,15 @@ def _read_unit_file(path: Path | None) -> str | None:
 
 def _current_unit_disk_inputs(
     name: str, sched: crony.platform.Scheduler
-) -> tuple[str | None, str | None, Path | None, Path | None, bool]:
+) -> tuple[str | None, str | None, Path | None, Path | None, bool, bool | None]:
     """The on-disk / scheduler inputs `snapshot_from_dict` needs to bake
     a current node: the config and timer unit contents, the uv / crony
     executable paths extracted from the installed run command and
     confirmed still present on disk (None when a baked binary is gone),
-    and whether the scheduler has the unit loaded. `cfg_status` reads
-    these to tell a reproducible unit from a `stale` / `broken` / gone
-    one."""
+    whether the scheduler has the unit loaded, and whether its schedule is
+    armed (None when there is no timer to judge). `cfg_status` reads these
+    to tell a reproducible, armed unit from a `stale` / `broken` / gone /
+    dead one."""
     config_disk = _read_unit_file(sched.unit_config_path(name))
     timer_disk = _read_unit_file(sched.unit_timer_path(name))
     uv_s, crony_s = crony.model.exec_path_strings(
@@ -734,7 +743,15 @@ def _current_unit_disk_inputs(
         Path(crony_s) if crony_s and Path(crony_s).is_file() else None
     )
     unit_loaded = sched.is_loaded(name)
-    return config_disk, timer_disk, installed_uv, installed_crony, unit_loaded
+    unit_armed = sched.schedule_armed(name)
+    return (
+        config_disk,
+        timer_disk,
+        installed_uv,
+        installed_crony,
+        unit_loaded,
+        unit_armed,
+    )
 
 
 def _unit_config_changing(

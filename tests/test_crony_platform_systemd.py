@@ -146,6 +146,114 @@ class TestSystemdScheduler:
         get_scheduler("linux", tmp_path).remove_files("default.absent")
 
 
+class TestSystemdScheduleArmed:
+    """schedule_armed reads `systemctl show`'s next-elapse to tell an
+    armed timer from a loaded-but-dead one (the failure mode where an
+    interval timer with no valid anchor reports NextElapse=infinity and
+    never fires). A missing / inactive / unqueryable timer is None."""
+
+    NAME = "default.brew"
+
+    def _sched(self, tmp_path: Path, *, timer: bool) -> Any:
+        if timer:
+            (tmp_path / f"crony-{self.NAME}.timer").write_text("x")
+        return get_scheduler("linux", tmp_path)
+
+    def _stub_show(
+        self, monkeypatch: Any, props: dict[str, str] | None
+    ) -> None:
+        def fake_run(*_a: Any, **_k: Any) -> subprocess.CompletedProcess[str]:
+            if props is None:
+                raise FileNotFoundError("systemctl")
+            body = "".join(f"{k}={v}\n" for k, v in props.items())
+            return subprocess.CompletedProcess([], 0, stdout=body)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+    def test_dead_interval_timer_is_false(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An active interval timer with no anchor: infinity monotonic
+        # elapse, no realtime elapse -> will never fire.
+        self._stub_show(
+            monkeypatch,
+            {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "infinity",
+                "NextElapseUSecRealtime": "",
+            },
+        )
+        sched = self._sched(tmp_path, timer=True)
+        assert sched.schedule_armed(self.NAME) is False
+
+    def test_healthy_calendar_timer_is_true(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A calendar timer arms on the realtime clock (a date string);
+        # its monotonic elapse is unused (0).
+        self._stub_show(
+            monkeypatch,
+            {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "0",
+                "NextElapseUSecRealtime": "Tue 2026-07-07 03:30:00 PDT",
+            },
+        )
+        sched = self._sched(tmp_path, timer=True)
+        assert sched.schedule_armed(self.NAME) is True
+
+    def test_healthy_interval_timer_is_true(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A healthy interval timer arms on the monotonic clock (a finite
+        # span), with no realtime elapse.
+        self._stub_show(
+            monkeypatch,
+            {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "1h 2min 3s",
+                "NextElapseUSecRealtime": "",
+            },
+        )
+        sched = self._sched(tmp_path, timer=True)
+        assert sched.schedule_armed(self.NAME) is True
+
+    def test_inactive_timer_is_none(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An inactive / not-loaded timer is indeterminate here; the
+        # not-loaded case is scored off is_loaded, not this probe.
+        self._stub_show(
+            monkeypatch,
+            {
+                "ActiveState": "inactive",
+                "NextElapseUSecMonotonic": "infinity",
+                "NextElapseUSecRealtime": "",
+            },
+        )
+        sched = self._sched(tmp_path, timer=True)
+        assert sched.schedule_armed(self.NAME) is None
+
+    def test_no_timer_file_is_none(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A grouped / disabled entry installs no .timer: nothing to judge.
+        # The probe must not even shell out.
+        def boom(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("systemctl queried with no timer on disk")
+
+        monkeypatch.setattr(subprocess, "run", boom)
+        sched = self._sched(tmp_path, timer=False)
+        assert sched.schedule_armed(self.NAME) is None
+
+    def test_systemctl_absent_is_none(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._stub_show(monkeypatch, None)
+        sched = self._sched(tmp_path, timer=True)
+        assert sched.schedule_armed(self.NAME) is None
+
+
 class TestSystemdVerify:
     """verify() reports linger health: silent when enabled, a
     SchedulerWarning (with the enable-linger fix) when disabled, and a

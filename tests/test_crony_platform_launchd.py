@@ -182,6 +182,14 @@ class TestLaunchdScheduler:
         units = get_scheduler("darwin", _DIR).render(spec)
         assert list(units) == ["org.crony.default.brew.plist"]
 
+    def test_schedule_armed_is_none(self, tmp_path: Path) -> None:
+        # launchd carries the schedule in the plist and has no loaded-but-
+        # dead state, so schedule_armed is always not-applicable (None) --
+        # status never flags a launchd job on this axis.
+        (tmp_path / "org.crony.default.brew.plist").write_text("x")
+        sched = get_scheduler("darwin", tmp_path)
+        assert sched.schedule_armed("default.brew") is None
+
     def test_installed_names_includes_non_namespaced(
         self, tmp_path: Path
     ) -> None:

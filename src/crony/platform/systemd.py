@@ -183,6 +183,37 @@ def _show_services(units: list[str]) -> list[dict[str, str]]:
     return blocks
 
 
+def _show_timer(unit: str) -> dict[str, str] | None:
+    """Parse `systemctl --user show` for a `.timer`'s liveness and next
+    firing. Returns the `key=value` property map, or None when systemctl
+    is absent or times out (indeterminate)."""
+    try:
+        r = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "-p",
+                "ActiveState",
+                "-p",
+                "NextElapseUSecMonotonic",
+                "-p",
+                "NextElapseUSecRealtime",
+                unit,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError, subprocess.TimeoutExpired:
+        return None
+    props: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition("=")
+        props[key] = value
+    return props
+
+
 def _current_user() -> str:
     """Best-effort resolution of the invoking user's name, for the
     linger check. Falls back through env vars and getpwuid so the
@@ -313,6 +344,29 @@ class SystemdScheduler(Scheduler):
             timer_filename(name) if timer.exists() else service_filename(name)
         )
         return _is_enabled(unit) in ("enabled", "static")
+
+    def schedule_armed(self, name: str) -> bool | None:
+        # Only a scheduled entry installs a `.timer`; a grouped / disabled
+        # entry has none, so there is no schedule to judge (None). For a
+        # timer that is on disk, ask systemd whether it has a live next
+        # firing: an active timer with a next elapse on either clock is
+        # armed; an active timer whose only monotonic anchor never
+        # elapses reports NextElapseUSecMonotonic=infinity (and no
+        # realtime elapse) and will never fire -- loaded but dead. An
+        # inactive / unqueryable timer is indeterminate (None); the
+        # not-loaded case is already scored off `is_loaded`.
+        timer = self.unit_dir / timer_filename(name)
+        if not timer.is_file():
+            return None
+        props = _show_timer(timer_filename(name))
+        if props is None or props.get("ActiveState") != "active":
+            return None
+        if props.get("NextElapseUSecRealtime", ""):
+            return True
+        monotonic = props.get("NextElapseUSecMonotonic", "")
+        if monotonic and monotonic not in ("infinity", "0"):
+            return True
+        return False
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # The `.service` is the unit that runs the job; query it (not

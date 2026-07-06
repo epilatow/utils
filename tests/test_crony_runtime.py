@@ -1443,6 +1443,32 @@ class TestUnitDriftDetection:
         ref = config.current.by_full_name[h.full("j")]
         assert config.cfg_status(ref) == "broken"
 
+    def test_linux_dead_timer_flags_broken(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The `.timer` is present and loaded, but the scheduler reports it
+        # will never fire (an interval timer with no anchor: next elapse
+        # infinity, no realtime elapse). A schedule that can't fire reads
+        # broken, not synced -- re-apply re-arms it.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        monkeypatch.setattr(
+            systemd,
+            "_show_timer",
+            lambda _u: {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "infinity",
+                "NextElapseUSecRealtime": "",
+            },
+        )
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.cfg_status(ref) == "broken"
+
     def test_grouped_entry_is_synced_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
