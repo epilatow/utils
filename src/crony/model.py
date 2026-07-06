@@ -265,17 +265,22 @@ class _JobCommon:
     # Live on-disk / scheduler facts the current graph pins so
     # `cfg_status` can tell `broken` from `missing` for a unit whose
     # file is gone: whether the config unit (launchd plist / systemd
-    # `.service`) is on disk, whether the scheduler has the entry's
-    # unit loaded -- the schedule-bearing one a backend arms (the
-    # plist on launchd, the `.timer` on systemd, falling back to the
-    # static `.service`) -- and whether that schedule is actually armed
-    # (`unit_armed`: True armed, False loaded-but-will-never-fire,
-    # None not-applicable / indeterminate; see `Scheduler.schedule_armed`).
-    # `compare=False` (they are runtime facts, not config); a pending
-    # node leaves the defaults. Keyword-only.
+    # `.service`) is on disk (`unit_config_exists`), and whether the
+    # scheduler has the entry's unit loaded (`unit_loaded`) -- the
+    # schedule-bearing one a backend arms (the plist on launchd, the
+    # `.timer` on systemd, falling back to the static `.service`). Both
+    # `compare=False` (runtime facts, not config); a pending node leaves
+    # the defaults. Keyword-only.
     unit_config_exists: bool = field(default=False, compare=False, kw_only=True)
     unit_loaded: bool = field(default=False, compare=False, kw_only=True)
-    unit_armed: bool | None = field(default=None, compare=False, kw_only=True)
+    # Whether the deployed schedule will actually fire, from the
+    # scheduler's `schedule_armed` probe. A pending node defaults True (a
+    # fresh render is meant to fire); the current graph pins the probed
+    # value. Unlike the runtime facts above it is `compare=True`: a schedule
+    # that won't fire is genuine drift the snapshot `==` must catch, not a
+    # benign runtime detail, so a re-apply re-activates it rather than
+    # no-opping an entry whose content still matches. Keyword-only.
+    unit_armed: bool = field(default=True, compare=True, kw_only=True)
 
     @property
     def entity_ref(self) -> crony.unit.EntityRef:
@@ -694,7 +699,7 @@ class Job(_JobCommon):
         installed_uv: Path | None = None,
         installed_crony: Path | None = None,
         unit_loaded: bool = False,
-        unit_armed: bool | None = None,
+        unit_armed: bool = True,
     ) -> Job:
         """Build a Job from its on-disk snapshot model, parsing the typed
         value-object fields back from their source strings, plus the
@@ -889,7 +894,7 @@ class JobGroup(_JobCommon):
         installed_uv: Path | None = None,
         installed_crony: Path | None = None,
         unit_loaded: bool = False,
-        unit_armed: bool | None = None,
+        unit_armed: bool = True,
     ) -> JobGroup:
         """Build a JobGroup from its on-disk snapshot model plus the
         derived runtime state the caller probed (see `snapshot_from_dict`
@@ -1047,7 +1052,7 @@ def snapshot_from_dict(
     installed_uv: Path | None = None,
     installed_crony: Path | None = None,
     unit_loaded: bool = False,
-    unit_armed: bool | None = None,
+    unit_armed: bool = True,
 ) -> Job | JobGroup:
     """Build a snapshot's node from its JSON dict: parse the on-disk shape
     (`crony.snapshot.parse`), then construct the Job / JobGroup, baking in
@@ -1072,8 +1077,8 @@ def snapshot_from_dict(
     paths it extracted from the installed run command and confirmed still
     exist (`installed_uv` / `installed_crony`, None when a baked binary is
     gone), whether the scheduler has the unit loaded (`unit_loaded`), and
-    whether its schedule is actually armed (`unit_armed`; None when the
-    entry has no timer to judge). The node's normalized config unit is the
+    whether its schedule is armed (`unit_armed`; True for an entry with no
+    arming timer to judge). The node's normalized config unit is the
     blank-path render only when a render with those installed paths
     reproduces the on-disk file -- so a hand-edited / drifted unit, or one
     whose binary is gone, gets None and reads `stale` against the pending
@@ -1802,13 +1807,13 @@ class Config:
             and c.unit_timer_normalized is None
         ):
             return ConfigStatus.BROKEN
-        # The timer file can be present and loaded yet dead: a systemd
-        # interval timer with no valid anchor reports a next elapse of
-        # infinity and will never fire. The scheduler-probed `unit_armed`
-        # flag is False only for that loaded-but-will-never-fire case
-        # (None when there is no timer to judge), so an armed-but-dead
-        # schedule reads broken.
-        if c.unit_armed is False:
+        # The timer can be present and loaded yet dead: a systemd interval
+        # timer with no valid anchor reports a next elapse of infinity and
+        # will never fire. `unit_armed` is False for that loaded-but-dead
+        # case (a loaded entry with no arming timer stays armed), and the
+        # not-loaded case already returned above, so an armed-but-dead
+        # schedule reads broken here.
+        if not c.unit_armed:
             return ConfigStatus.BROKEN
         return ConfigStatus.SYNCED if p == c else ConfigStatus.STALE
 

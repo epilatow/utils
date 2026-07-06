@@ -240,12 +240,11 @@ class LaunchdScheduler(Scheduler):
     def is_loaded(self, name: str) -> bool:
         return _is_loaded(label(name))
 
-    def schedule_armed(self, _name: str) -> bool | None:
+    def schedule_armed(self, name: str) -> bool:
         # launchd carries the schedule in the job's own plist (StartInterval
-        # / StartCalendarInterval), not a separate arming unit, and a loaded
-        # agent with a schedule is always armed -- there is no loaded-but-
-        # will-never-fire state for status to flag. Not applicable (None).
-        return None
+        # / StartCalendarInterval), not a separate arming unit that could be
+        # loaded yet dead. A loaded agent is armed, so armed tracks loaded.
+        return self.is_loaded(name)
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # `launchctl list` lines are `<pid>\t<status>\t<label>`. The

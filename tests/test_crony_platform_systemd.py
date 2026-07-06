@@ -196,7 +196,8 @@ class TestSystemdScheduleArmed:
     """schedule_armed reads `systemctl show`'s next-elapse to tell an
     armed timer from a loaded-but-dead one (the failure mode where an
     interval timer with no valid anchor reports NextElapse=infinity and
-    never fires). A missing / inactive / unqueryable timer is None."""
+    never fires). An inactive / unqueryable timer is not confirmed armed
+    (False); an entry with no timer falls back to whether it is loaded."""
 
     NAME = "default.brew"
 
@@ -264,11 +265,10 @@ class TestSystemdScheduleArmed:
         sched = self._sched(tmp_path, timer=True)
         assert sched.schedule_armed(self.NAME) is True
 
-    def test_inactive_timer_is_none(
+    def test_inactive_timer_is_false(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # An inactive / not-loaded timer is indeterminate here; the
-        # not-loaded case is scored off is_loaded, not this probe.
+        # An inactive timer is not confirmed armed -> False.
         self._stub_show(
             monkeypatch,
             {
@@ -278,26 +278,25 @@ class TestSystemdScheduleArmed:
             },
         )
         sched = self._sched(tmp_path, timer=True)
-        assert sched.schedule_armed(self.NAME) is None
+        assert sched.schedule_armed(self.NAME) is False
 
-    def test_no_timer_file_is_none(
+    def test_no_timer_falls_back_to_loaded(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A grouped / disabled entry installs no .timer: nothing to judge.
-        # The probe must not even shell out.
-        def boom(*_a: Any, **_k: Any) -> None:
-            raise AssertionError("systemctl queried with no timer on disk")
-
-        monkeypatch.setattr(subprocess, "run", boom)
+        # A grouped / disabled entry installs no .timer -- its schedule
+        # rides on the loaded `.service`, so armed tracks loaded.
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         sched = self._sched(tmp_path, timer=False)
-        assert sched.schedule_armed(self.NAME) is None
+        assert sched.schedule_armed(self.NAME) is True
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        assert sched.schedule_armed(self.NAME) is False
 
-    def test_systemctl_absent_is_none(
+    def test_systemctl_absent_is_false(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         self._stub_show(monkeypatch, None)
         sched = self._sched(tmp_path, timer=True)
-        assert sched.schedule_armed(self.NAME) is None
+        assert sched.schedule_armed(self.NAME) is False
 
 
 class TestSystemdVerify:

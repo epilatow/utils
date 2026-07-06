@@ -159,22 +159,18 @@ class Scheduler(abc.ABC):
         (`Job.unit_disabled`)."""
 
     @abc.abstractmethod
-    def schedule_armed(self, name: str) -> bool | None:
-        """Whether the scheduler will actually fire `name`'s schedule.
+    def schedule_armed(self, name: str) -> bool:
+        """Whether the scheduler has a live firing scheduled for `name`.
 
         `is_loaded` says the unit is registered; this says the registered
-        schedule has a live next firing. The two differ: a systemd
-        interval `.timer` can be loaded and enabled yet have no valid
-        anchor, so it reports a next elapse of infinity and never fires --
-        loaded but dead.
-
-        `True` -- a finite next firing exists (the schedule is armed).
-        `False` -- the entry carries a loaded schedule that will never
-        fire (a dead timer). Status reads this as `broken`.
-        `None` -- not applicable / indeterminate: the entry has no
-        schedule-arming timer (a grouped / disabled entry, or a backend
-        whose config unit carries its own schedule and cannot enter this
-        dead state), or the scheduler could not be queried. Never flagged.
+        schedule will actually fire. An entry with a separate arming unit
+        (a systemd `.timer`) is armed only when that unit confirms a live
+        next firing -- such a timer can be loaded and enabled yet have no
+        valid anchor, reporting a next elapse of infinity so it never
+        fires. An entry whose schedule rides on the loaded config unit
+        (launchd, or a grouped / disabled entry with no timer) has no such
+        state and is armed whenever loaded. Each backend hides that
+        distinction and returns a plain armed / not-armed answer.
         """
 
     @abc.abstractmethod

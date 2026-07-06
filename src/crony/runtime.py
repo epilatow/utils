@@ -424,7 +424,7 @@ def _build_current_graph(
                 ) = (
                     _current_unit_disk_inputs(str(en), sched)
                     if en is not None
-                    else (None, None, None, None, False, None)
+                    else (None, None, None, None, False, True)
                 )
                 snap = crony.model.snapshot_from_dict(
                     raw,
@@ -725,15 +725,14 @@ def _read_unit_file(path: Path | None) -> str | None:
 
 def _current_unit_disk_inputs(
     name: str, sched: crony.platform.Scheduler
-) -> tuple[str | None, str | None, Path | None, Path | None, bool, bool | None]:
+) -> tuple[str | None, str | None, Path | None, Path | None, bool, bool]:
     """The on-disk / scheduler inputs `snapshot_from_dict` needs to bake
     a current node: the config and timer unit contents, the uv / crony
     executable paths extracted from the installed run command and
     confirmed still present on disk (None when a baked binary is gone),
     whether the scheduler has the unit loaded, and whether its schedule is
-    armed (None when there is no timer to judge). `cfg_status` reads these
-    to tell a reproducible, armed unit from a `stale` / `broken` / gone /
-    dead one."""
+    armed. `cfg_status` reads these to tell a reproducible, armed unit
+    from a `stale` / `broken` / gone / dead one."""
     config_disk = _read_unit_file(sched.unit_config_path(name))
     timer_disk = _read_unit_file(sched.unit_timer_path(name))
     uv_s, crony_s = crony.model.exec_path_strings(

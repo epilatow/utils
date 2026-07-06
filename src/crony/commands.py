@@ -126,8 +126,9 @@ def _stale_fields(
     pending: crony.model.Job | crony.model.JobGroup | None,
     current: crony.model.Job | crony.model.JobGroup | None,
 ) -> str:
-    """Comma-joined reasons a `config=stale` entry diverges: the
-    snapshot fields that differ between the pending and applied versions.
+    """Comma-joined reasons an entry diverges from its applied version:
+    the snapshot fields that differ between the pending and applied
+    versions.
 
     Only `compare=True` fields are diffed, mirroring the dataclass `==`
     the stale verdict itself uses. A config knob is reported by the name
@@ -135,8 +136,10 @@ def _stale_fields(
     field falls back to its dash-spelled attribute (`snapshot_schema` ->
     `snapshot-schema`, `state_dir_symlink` -> `state-dir-symlink`). The
     `flags` bitmask is expanded to the individual capability flags that
-    changed (e.g. `keep-awake`) rather than the field name. Empty for a
-    synced entry, or a stale verdict with no current snapshot to diff (a
+    changed (e.g. `keep-awake`) rather than the field name. A dead
+    schedule reports `unit-armed` -- so a `broken` dead-timer entry, whose
+    content is otherwise synced, still says why it broke. Empty for a
+    synced entry, or a verdict with no current snapshot to diff (a
     missing / unparseable remnant). A kind flip between job and group
     reports `kind`.
     """

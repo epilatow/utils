@@ -669,6 +669,18 @@ class _ApplyHarness(_RunnerHarness):
         # `systemd._is_enabled` -> "").
         monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "enabled")
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: True)
+        # A freshly-applied systemd timer reads back armed (a finite next
+        # firing); `schedule_armed` reads this via `_show_timer`. Tests
+        # simulating a dead timer override it to report infinity.
+        monkeypatch.setattr(
+            systemd,
+            "_show_timer",
+            lambda _u: {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "1h",
+                "NextElapseUSecRealtime": "",
+            },
+        )
         # activate's reload waits for the booted-out label to clear by
         # polling `_is_loaded` -- which is stubbed True above, so the
         # bounded wait would otherwise spin to its timeout every apply.

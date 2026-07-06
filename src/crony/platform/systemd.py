@@ -351,28 +351,26 @@ class SystemdScheduler(Scheduler):
         )
         return _is_enabled(unit) in ("enabled", "static")
 
-    def schedule_armed(self, name: str) -> bool | None:
-        # Only a scheduled entry installs a `.timer`; a grouped / disabled
-        # entry has none, so there is no schedule to judge (None). For a
-        # timer that is on disk, ask systemd whether it has a live next
-        # firing: an active timer with a next elapse on either clock is
-        # armed; an active timer whose only monotonic anchor never
-        # elapses reports NextElapseUSecMonotonic=infinity (and no
-        # realtime elapse) and will never fire -- loaded but dead. An
-        # inactive / unqueryable timer is indeterminate (None); the
-        # not-loaded case is already scored off `is_loaded`.
+    def schedule_armed(self, name: str) -> bool:
+        # A scheduled entry installs a `.timer` and is armed only when
+        # that timer has a live next firing: an active timer with a next
+        # elapse on either clock is armed; an active timer whose only
+        # monotonic anchor never elapses reports NextElapseUSecMonotonic=
+        # infinity (and no realtime elapse) and will never fire -- loaded
+        # but dead. An inactive / unqueryable timer is not confirmed
+        # armed. A grouped / disabled entry installs no timer -- its
+        # schedule rides on the loaded `.service`, so it is armed whenever
+        # the scheduler has it loaded.
         timer = self.unit_dir / timer_filename(name)
         if not timer.is_file():
-            return None
+            return self.is_loaded(name)
         props = _show_timer(timer_filename(name))
         if props is None or props.get("ActiveState") != "active":
-            return None
+            return False
         if props.get("NextElapseUSecRealtime", ""):
             return True
         monotonic = props.get("NextElapseUSecMonotonic", "")
-        if monotonic and monotonic not in ("infinity", "0"):
-            return True
-        return False
+        return bool(monotonic and monotonic not in ("infinity", "0"))
 
     def unit_last_exits(self) -> dict[str, UnitLastExit]:
         # The `.service` is the unit that runs the job; query it (not

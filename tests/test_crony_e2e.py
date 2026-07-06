@@ -331,6 +331,35 @@ class TestSystemdTimerArming:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    def test_apply_re_arms_dead_timer_matching_content(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # The production case: the on-disk timer already matches crony's
+        # render (a reboot / reload left it un-restarted), so it is dead
+        # yet content-synced. apply must re-arm it even though there is no
+        # content drift -- otherwise it no-ops the entry it calls broken.
+        e2e.write_bundle(
+            '[job.probe]\ncommand = "true"\ninterval = "8h"\n', ["probe"]
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        timer = e2e.unit_dir / f"crony-{e2e.full('probe')}.timer"
+        rendered = timer.read_text()
+        # Drive it dead without diverging the content from crony's render:
+        # activate the pre-anchor shape (dead), then swap the rendered
+        # content back via a reload only -- the active timer keeps its
+        # stale anchor, so it stays dead with the correct file on disk.
+        timer.write_text(
+            "[Unit]\nDescription=e2e\n\n[Timer]\nOnUnitActiveSec=8h\n\n"
+            "[Install]\nWantedBy=timers.target\n"
+        )
+        e2e.systemctl_user("daemon-reload", check=True)
+        e2e.systemctl_user("restart", timer.name, check=True)
+        timer.write_text(rendered)
+        e2e.systemctl_user("daemon-reload", check=True)
+        assert e2e.status_config(e2e.full("probe")) == "broken"
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.status_config(e2e.full("probe")) == "synced"
+
 
 @pytest.mark.skipif(not _IS_DARWIN, reason="launchd backend is darwin-only")
 class TestLaunchdInterval:

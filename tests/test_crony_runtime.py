@@ -1485,6 +1485,44 @@ class TestUnitDriftDetection:
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.cfg_status(ref) == "broken"
+        # The dead schedule is the reason, surfaced in the stale-field
+        # list even though the content is otherwise synced.
+        assert (
+            crony_commands._stale_fields(
+                config.pending.job_from_ref(ref),
+                config.current.job_from_ref(ref),
+            )
+            == "unit-armed"
+        )
+
+    def test_apply_reactivates_content_matching_dead_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A timer that is content-synced but dead at runtime (next elapse
+        # infinity) is drift the snapshot `==` catches via `unit_armed`,
+        # so apply re-activates it (restart re-arms) rather than no-opping
+        # it as unchanged. Without that, `crony apply` cannot repair the
+        # `broken` verdict it reports.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "interval": "8h"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        # Report the on-disk timer as dead; its content is unchanged.
+        monkeypatch.setattr(
+            systemd,
+            "_show_timer",
+            lambda _u: {
+                "ActiveState": "active",
+                "NextElapseUSecMonotonic": "infinity",
+                "NextElapseUSecRealtime": "",
+            },
+        )
+        h.calls.clear()
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        timer = f"crony-{h.full('j')}.timer"
+        assert ["systemctl", "--user", "--quiet", "restart", timer] in h.calls
 
     def test_grouped_entry_is_synced_on_linux(
         self, tmp_path: Path, monkeypatch: Any
