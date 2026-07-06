@@ -27,10 +27,12 @@
 #   - a non-root user: test_secure_archiver asserts a 0o555 dir is "not
 #     writable", which root bypasses -- so the suite runs as `tester`.
 #
-# We extract `git archive HEAD` (a clean tree with no `.git`), so the
-# repo-shared quality gate discovers files by walking the tree rather than
-# via `git ls-files`; keeping uv's project venv out of the tree
-# (UV_PROJECT_ENVIRONMENT) keeps that walk from linting a stray .venv.
+# We extract `git archive HEAD` (the clean committed tree) and re-init a
+# throwaway git repo from it in the container, so tests that shell out to
+# git (test_render_docs enumerates `bin/` via `git ls-files`) work as on
+# a real CI checkout. `git add -A` honors `.gitignore`, and uv's project
+# venv lives outside the tree (UV_PROJECT_ENVIRONMENT), so neither a stray
+# `.venv` nor build output enters the snapshot.
 #
 # Tests the committed HEAD (a clean `git archive`, not the working tree).
 # Extra args pass through to run_all.py, e.g.:
@@ -58,6 +60,13 @@ curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin s
 useradd -m tester
 mkdir -p /app
 tar -xf /in/repo.tar -C /app
+# Re-init a throwaway git repo from the extracted tree so tests that
+# shell out to git (test_render_docs enumerates bin/ via `git ls-files`)
+# work as on a real CI checkout. `git add -A` honors .gitignore.
+git -C /app init -q
+git -C /app add -A
+git -C /app -c user.email=ci@crony.test -c user.name=crony-ci \
+    commit -qm "linux-docker-test snapshot" >/dev/null
 chown -R tester:tester /app
 echo "### $(uname -srm)  node=$(node --version)  uv=$(uv --version)"
 echo "### systemd-analyze=$(command -v systemd-analyze)  borg=$(command -v borg)"
