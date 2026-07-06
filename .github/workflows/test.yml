@@ -46,6 +46,20 @@ jobs:
       - name: Install pinned pandoc
         run: uv run scripts/pandoc install
 
+      # The crony e2e timer tests drive a real `systemctl --user`, which
+      # needs a lingering user manager. Bring one up; the e2e run fails
+      # (it does not skip) if it is missing, so this must succeed for the
+      # Linux e2e leg to pass.
+      - name: Enable systemd user manager (Linux, for crony e2e)
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER" || true
+          sudo systemctl start "user@$(id -u).service" || true
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          systemctl --user show-environment >/dev/null 2>&1 \
+            && echo "user manager up: crony systemd e2e will run" \
+            || echo "no user manager: crony systemd e2e will FAIL (by design)"
+
       - name: Run tests
         # The borgadm e2e suite forks uv+python+borgadm+borg per test --
         # a process-spawn-heavy workload. GitHub's hosted macOS runners
@@ -56,4 +70,20 @@ jobs:
         # on Linux only; macOS still runs the full non-e2e suite, which
         # is where the macOS-specific code lives (the Crony.app C wrapper
         # and the launchd automate path).
-        run: tests/run_all.py ${{ runner.os == 'Linux' && '--e2e' || '' }}
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            tests/run_all.py --e2e
+          else
+            tests/run_all.py
+          fi
+
+      # The full `--e2e` set is Linux-only because the borgadm suite is
+      # too slow on macOS runners (see above). The crony e2e is light,
+      # though, and is the only e2e coverage of the launchd backend -- so
+      # run just that file here. It fails (does not skip) if the runner
+      # has no usable launchd GUI session, so this leg proves the launchd
+      # path actually ran.
+      - name: Run crony e2e (macOS, launchd)
+        if: runner.os == 'macOS'
+        run: tests/test_crony_e2e.py --e2e

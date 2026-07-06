@@ -12,9 +12,11 @@
 # CI gets most of its toolchain implicitly from the GitHub runner; a bare
 # container has to add it, so the deps below are explicit. Each one is
 # required by a specific phase:
-#   - systemd (systemd-analyze): test_crony_platform_systemd.py's
-#     TestSystemdAnalyzeVerify, which validates rendered systemd units --
-#     it is skipped (not run) without systemd-analyze.
+#   - systemd + systemd-sysv: booted as PID 1 so the crony e2e suite can
+#     drive a real `systemctl --user`, and for systemd-analyze
+#     (test_crony_platform_systemd.py's TestSystemdAnalyzeVerify).
+#   - dbus + dbus-user-session: the per-user systemd manager the crony
+#     e2e timer tests need; started via lingering (see below).
 #   - borgbackup: the borgadm `--e2e` suite forks the real borg binary.
 #   - the pinned pandoc (via `scripts/pandoc install`): test_render_docs.py
 #     renders the roff man page and compares it to the checked-in copy; the
@@ -26,6 +28,11 @@
 #     (see pyproject.toml), so git must be present to resolve deps.
 #   - a non-root user: test_secure_archiver asserts a 0o555 dir is "not
 #     writable", which root bypasses -- so the suite runs as `tester`.
+#
+# The container boots systemd as PID 1 (needs --privileged + the cgroup
+# mount), then starts a lingering user manager for `tester` so the crony
+# e2e can reach `systemctl --user`. Without a user manager those tests
+# skip rather than run; here they run.
 #
 # We extract `git archive HEAD` (the clean committed tree) and re-init a
 # throwaway git repo from it in the container, so tests that shell out to
@@ -41,38 +48,69 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+cid=""
+cleanup() {
+    [ -n "$cid" ] && docker rm -f "$cid" >/dev/null 2>&1 || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
 git -C "$repo_root" archive HEAD -o "$work/repo.tar"
 
-# `bash -s` reads the in-container script from stdin (the quoted heredoc,
-# so $RUN_ARGS stays literal and expands inside the container from -e).
-docker run --rm -i \
-    -e RUN_ARGS="$*" \
+# Boot systemd as PID 1 so `systemctl --user` works. The initial process
+# installs the toolchain and unpacks the repo, then execs /sbin/init;
+# subsequent `docker exec` calls drive the booted system.
+cid=$(docker run -d --privileged --cgroupns=host \
+    --tmpfs /run --tmpfs /run/lock \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     -v "$work":/in:ro \
     node:20-bookworm \
-    bash -s <<'IN_CONTAINER'
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git borgbackup systemd sudo ca-certificates curl >/dev/null
-# uv into a system dir so the non-root test user can run it.
-curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null 2>&1
-useradd -m tester
-mkdir -p /app
-tar -xf /in/repo.tar -C /app
-# Re-init a throwaway git repo from the extracted tree so tests that
-# shell out to git (test_render_docs enumerates bin/ via `git ls-files`)
-# work as on a real CI checkout. `git add -A` honors .gitignore.
-git -C /app init -q
-git -C /app add -A
-git -C /app -c user.email=ci@crony.test -c user.name=crony-ci \
-    commit -qm "linux-docker-test snapshot" >/dev/null
-chown -R tester:tester /app
-echo "### $(uname -srm)  node=$(node --version)  uv=$(uv --version)"
-echo "### systemd-analyze=$(command -v systemd-analyze)  borg=$(command -v borg)"
-# Non-root, with uv's project venv outside /app (see header for both).
-# Fetch the pinned pandoc into /app/.tools (the same installer local devs
-# and CI use) before the suite, so the man-page gate renders with it.
-sudo -u tester env HOME=/home/tester UV_PROJECT_ENVIRONMENT=/home/tester/uvenv \
-    bash -c "cd /app && uv run scripts/pandoc install && exec uv run tests/run_all.py $RUN_ARGS"
-IN_CONTAINER
+    bash -c '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq git borgbackup systemd systemd-sysv \
+            dbus dbus-user-session sudo ca-certificates curl >/dev/null
+        curl -LsSf https://astral.sh/uv/install.sh \
+            | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null 2>&1
+        useradd -m tester
+        mkdir -p /app
+        tar -xf /in/repo.tar -C /app
+        # Re-init a throwaway git repo from the extracted tree so tests
+        # that shell out to git (test_render_docs enumerates bin/ via
+        # `git ls-files`) work as they do on a real CI checkout, which has
+        # a .git. `git add -A` honors .gitignore, so no stray build output
+        # enters the snapshot.
+        git -C /app init -q
+        git -C /app add -A
+        git -C /app -c user.email=ci@crony.test -c user.name=crony-ci \
+            commit -qm "linux-docker-test snapshot" >/dev/null
+        chown -R tester:tester /app
+        exec /sbin/init
+    ')
+
+# Wait for the toolchain install + systemd boot to finish. The install
+# runs before `exec /sbin/init`, so systemctl is absent until then.
+echo "### waiting for systemd to boot in the container ..."
+for _ in $(seq 1 120); do
+    state=$(docker exec "$cid" systemctl is-system-running 2>/dev/null || true)
+    case "$state" in
+        running | degraded) break ;;
+    esac
+    sleep 2
+done
+
+# Start a lingering user manager for tester so `systemctl --user` (the
+# crony e2e timer tests) has a bus to talk to.
+uid=$(docker exec "$cid" id -u tester)
+docker exec "$cid" loginctl enable-linger tester
+docker exec "$cid" systemctl start "user@${uid}.service"
+
+echo "### $(docker exec "$cid" uname -srm)"
+docker exec -u tester \
+    -e HOME=/home/tester \
+    -e XDG_RUNTIME_DIR="/run/user/${uid}" \
+    -e UV_PROJECT_ENVIRONMENT=/home/tester/uvenv \
+    -e RUN_ARGS="$*" \
+    "$cid" \
+    bash -c 'cd /app && uv run scripts/pandoc install \
+        && exec uv run tests/run_all.py $RUN_ARGS'

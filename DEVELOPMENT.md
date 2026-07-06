@@ -145,32 +145,50 @@ gated by platform checks.
   `description=` or `RawDescriptionHelpFormatter` epilog prose); wrap such
   prose narrower so a 2-space epilog indent still fits.
 - Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
-  subprocess the script under test (currently just the borgadm suite under
-  `tests/test_borgadm.py`). They are slow (tens of minutes serially) and are
-  excluded from the default `tests/run_all.py` run. Run them via
-  `tests/run_all.py --e2e` (or the individual test file with `--e2e`). When
-  making changes to a utility that has an e2e suite, run with `--e2e` before
-  declaring the change complete.
-- CI runs `--e2e` on the Linux leg only. GitHub's hosted macOS runners are
-  weak, throttled VMs that run this process-spawn-heavy suite ~20x slower than
-  Linux and intermittently cross its 120s per-call timeout, while Linux runs
-  the identical suite reliably in under a minute (borg is cross-platform, so
-  coverage is the same). The macOS CI leg runs only the non-e2e suite -- which
-  is where the macOS-specific code lives (the Crony.app C wrapper, the
-  `automate` subcommand's macOS-only Full Disk Access path) -- so a local
-  `--e2e` run is the way to exercise the e2e suite on macOS.
+  subprocess the script under test: the borgadm suite under
+  `tests/test_borgadm.py`, and the crony suite under `tests/test_crony_e2e.py`
+  (which drives the real `crony` CLI against the host's real scheduler --
+  launchd on darwin, `systemd --user` on linux). They are slow (tens of
+  minutes serially) and are excluded from the default `tests/run_all.py` run.
+  Run them via `tests/run_all.py --e2e` (or the individual test file with
+  `--e2e`). When making changes to a utility that has an e2e suite, run with
+  `--e2e` before declaring the change complete.
+- The crony e2e suite installs jobs only in a reserved `crony-e2e` bundle
+  under a throwaway config / state / unit-dir namespace (via the `CRONY_*`
+  path overrides, including `CRONY_UNIT_DIR` on darwin) and tears them down at
+  fixture teardown, so a run never touches real jobs. It needs a drivable
+  scheduler: the systemd timer tests need a running `systemd --user` manager
+  (a booted-systemd host with lingering enabled and `XDG_RUNTIME_DIR` set),
+  and the launchd tests need a usable GUI (Aqua) session. A requested `--e2e`
+  run that cannot reach the running platform's scheduler **fails** rather than
+  skipping -- a suite the caller explicitly asked for that silently passed
+  would hide the missing coverage (a genuine platform mismatch, like a systemd
+  test on macOS, still skips). The module docstring documents manual cleanup
+  for the rare case a run is hard-killed before teardown.
+- CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
+  runners are weak, throttled VMs that run the process-spawn-heavy borgadm
+  suite ~20x slower than Linux and intermittently cross its 120s per-call
+  timeout, while Linux runs the identical suite reliably in under a minute
+  (borg is cross-platform, so coverage is the same). The macOS leg runs the
+  non-e2e suite plus, as a separate step, just the crony e2e file
+  (`tests/test_crony_e2e.py --e2e`) -- the light suite that carries the only
+  coverage of the launchd backend. The heavy borgadm e2e stays Linux-only, so
+  a local `--e2e` run remains the way to exercise it on macOS.
 - `tests/linux-docker-test.sh` reproduces the CI Linux leg from a non-Linux
   host: it runs the full suite (extra args pass through to `run_all.py`, e.g.
   `--e2e`) in a throwaway Linux container. It is a manual tool -- `run_all.py`
   discovers only `test_*.py` and CI invokes `run_all.py` directly, so it never
-  runs automatically. The container adds what the GitHub runner supplies
-  implicitly -- Node 20+ (the markdownlint gate), systemd-analyze (the
-  systemd-unit verify test), borg (the e2e suite), the pinned pandoc (the
-  `test_render_docs` man-page gate, via `scripts/pandoc install`), and git (uv
-  builds the repo-shared gate from a git source) -- and runs as a non-root
-  user (the secure_archiver permission test); the script header maps each dep
-  to the test that needs it. It tests the committed HEAD, not the working
-  tree.
+  runs automatically. The container boots systemd as PID 1 (so the crony e2e
+  can drive a real `systemctl --user`) and starts a lingering user manager for
+  the test user, then adds what the GitHub runner supplies implicitly -- Node
+  20+ (the markdownlint gate), systemd-analyze (the systemd-unit verify test),
+  borg (the borgadm e2e suite), the pinned pandoc (the `test_render_docs`
+  man-page gate, via `scripts/pandoc install`), and git (uv builds the
+  repo-shared gate from a git source) -- and runs as a non-root user (the
+  secure_archiver permission test); the script header maps each dep to the
+  test that needs it. Booting systemd needs `--privileged` and the cgroup
+  mount, so the container is more heavyweight than a plain `bash` one. It
+  tests the committed HEAD, not the working tree.
 
 ### Updating the pinned pandoc
 

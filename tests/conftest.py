@@ -621,4 +621,10 @@ def run_tests(
         os.environ["PYTHONPATH"] = str(repo_root / "bin")
         os.environ["COVERAGE_FILE"] = str(cov_dir / f"{module}.coverage")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    raise SystemExit(pytest.main(pytest_args))
+    code = pytest.main(pytest_args)
+    # A file whose every test is deselected collected nothing (an all-e2e
+    # file in a default run, or a platform-gated file off its platform).
+    # That is a clean pass, not a failure, so run_all's phase stays green.
+    if code == pytest.ExitCode.NO_TESTS_COLLECTED:
+        code = pytest.ExitCode.OK
+    raise SystemExit(code)
