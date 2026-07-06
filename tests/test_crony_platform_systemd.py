@@ -146,6 +146,52 @@ class TestSystemdScheduler:
         get_scheduler("linux", tmp_path).remove_files("default.absent")
 
 
+class TestSystemdActivate:
+    """activate() reloads units then, for a scheduled entry, enables the
+    timer (boot symlink) and restarts it. The restart -- not a plain
+    `enable --now` -- is what re-arms an already-active interval timer:
+    `enable --now` no-ops the start on a running unit, so the schedule
+    would stay on its stale activation."""
+
+    def _record(self, monkeypatch: Any) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def fake_run(*a: Any, **k: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(list(a[0] if a else k.get("args", [])))
+            return subprocess.CompletedProcess([], 0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    def test_scheduled_enables_then_restarts_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._record(monkeypatch)
+        get_scheduler("linux", tmp_path).activate(
+            "default.brew", scheduled=True
+        )
+        timer = "crony-default.brew.timer"
+        reload_c = ["systemctl", "--user", "--quiet", "daemon-reload"]
+        enable_c = ["systemctl", "--user", "--quiet", "enable", timer]
+        restart_c = ["systemctl", "--user", "--quiet", "restart", timer]
+        assert reload_c in calls
+        assert enable_c in calls
+        assert restart_c in calls
+        # A running timer only re-arms if restart follows the reload that
+        # loaded the fresh unit and the enable that linked it.
+        assert calls.index(reload_c) < calls.index(enable_c)
+        assert calls.index(enable_c) < calls.index(restart_c)
+
+    def test_scheduleless_only_reloads(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._record(monkeypatch)
+        get_scheduler("linux", tmp_path).activate(
+            "default.grp", scheduled=False
+        )
+        assert calls == [["systemctl", "--user", "--quiet", "daemon-reload"]]
+
+
 class TestSystemdScheduleArmed:
     """schedule_armed reads `systemctl show`'s next-elapse to tell an
     armed timer from a loaded-but-dead one (the failure mode where an

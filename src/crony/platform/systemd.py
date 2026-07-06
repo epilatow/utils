@@ -26,9 +26,14 @@ from crony.unit import (
     UnitSpec,
 )
 
-# --now enables/disables the unit and starts/stops it in one call;
-# --quiet drops the success-path symlink chatter.
-_SYSTEMCTL_ENABLE = ["systemctl", "--user", "--quiet", "enable", "--now"]
+# --quiet drops the success-path symlink chatter. Enable (create the
+# boot symlink) and restart (activate now) are separate calls: `enable
+# --now` only *starts* an inactive unit, so it would leave an
+# already-active timer on its stale activation; `restart` re-activates it
+# unconditionally so a monotonic anchor (OnActiveSec) is re-seeded on
+# every apply. --now disable stops and de-links in one call.
+_SYSTEMCTL_ENABLE = ["systemctl", "--user", "--quiet", "enable"]
+_SYSTEMCTL_RESTART = ["systemctl", "--user", "--quiet", "restart"]
 _SYSTEMCTL_DISABLE = ["systemctl", "--user", "--quiet", "disable", "--now"]
 
 
@@ -263,9 +268,10 @@ class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
 
-    # A reload is `daemon-reload` plus (re)enabling the timer; neither
-    # stops a running `.service`, so a job can rewrite its own unit while
-    # in flight without killing its runner.
+    # A reload is `daemon-reload` plus enabling and restarting the timer;
+    # restarting the `.timer` re-arms the schedule but does not touch the
+    # `.service`, so a job can rewrite its own unit while in flight
+    # without killing its runner.
     reload_terminates_running_job = False
 
     @staticmethod
@@ -402,13 +408,17 @@ class SystemdScheduler(Scheduler):
         subprocess.run(
             ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
         )
-        # enable --now only applies to the .timer, rendered only for a
-        # scheduled entry; a schedule-less .service (grouped or disabled)
-        # sits dormant.
+        # Only a scheduled entry has a `.timer`; a schedule-less `.service`
+        # (grouped or disabled) sits dormant. Enable creates the boot
+        # symlink; restart re-activates the timer so its monotonic anchor
+        # (OnActiveSec) is re-seeded even when the timer was already
+        # running -- a plain `enable --now` would no-op the start on an
+        # active timer and leave an interval schedule stuck on its stale
+        # activation, unable to fire.
         if scheduled:
-            subprocess.run(
-                _SYSTEMCTL_ENABLE + [timer_filename(name)], check=True
-            )
+            timer = timer_filename(name)
+            subprocess.run(_SYSTEMCTL_ENABLE + [timer], check=True)
+            subprocess.run(_SYSTEMCTL_RESTART + [timer], check=True)
 
     def deactivate(self, name: str) -> None:
         subprocess.run(

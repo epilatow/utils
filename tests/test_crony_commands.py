@@ -1904,7 +1904,7 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # disable removes the .timer (schedule-less re-render); enable
-        # re-renders it and arms it via `systemctl enable --now`.
+        # re-renders it, links it (`enable`) and arms it (`restart`).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -1915,16 +1915,10 @@ class TestEnableDisable:
         assert not (h.sysd / f"crony-{h.full('j')}.timer").exists()
         h.calls.clear()
         crony_commands.do_enable(jobs=["j"], bundle=None)
-        cmd = next(c for c in h.calls if c[0] == "systemctl" and "enable" in c)
-        assert cmd == [
-            "systemctl",
-            "--user",
-            "--quiet",
-            "enable",
-            "--now",
-            f"crony-{h.full('j')}.timer",
-        ]
-        assert (h.sysd / f"crony-{h.full('j')}.timer").exists()
+        timer = f"crony-{h.full('j')}.timer"
+        assert ["systemctl", "--user", "--quiet", "enable", timer] in h.calls
+        assert ["systemctl", "--user", "--quiet", "restart", timer] in h.calls
+        assert (h.sysd / timer).exists()
 
     def test_disable_strips_schedule_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
