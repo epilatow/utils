@@ -926,7 +926,7 @@ class TestConfigBroken:
         config = crony_runtime.load_config()
         assert ref in config.orphans
         assert ref not in config.current.jobs
-        # Broken entries get a runtime entry so the unit-config /
+        # Broken entries get a runtime entry so the unit-config-1 /
         # last / last-ran columns can read the same state-dir
         # files normal current entries read.
         assert ref in config.runtime
@@ -1365,7 +1365,7 @@ class TestUnitDriftDetection:
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.cfg_status(ref) == "stale"
-        assert "unit-config" in crony_commands._stale_fields(
+        assert "unit-config-1" in crony_commands._stale_fields(
             config.pending.job_from_ref(ref),
             config.current.job_from_ref(ref),
         )
@@ -1432,7 +1432,7 @@ class TestUnitDriftDetection:
     ) -> None:
         assert (
             self._linux_stale_reasons(tmp_path, monkeypatch, "service")
-            == "unit-config"
+            == "unit-config-1"
         )
 
     def test_linux_timer_edit_is_timer_drift(
@@ -1440,7 +1440,7 @@ class TestUnitDriftDetection:
     ) -> None:
         assert (
             self._linux_stale_reasons(tmp_path, monkeypatch, "timer")
-            == "unit-timer"
+            == "unit-config-2"
         )
 
     def test_linux_deleted_timer_flags_broken(

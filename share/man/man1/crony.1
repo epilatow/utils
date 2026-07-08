@@ -255,17 +255,16 @@ Job wallclock cap: \(ga<n>s\(ga.\&
 The job will be killed if its wallclock execution time exceeds this cap.\&
 May be \(ganone\(ga for uncapped jobs.\&
 .TP
-\f[I]unit\-config\f[R]
+\f[I]unit\-config\-1\f[R]
 Filesystem path of the platform config unit.\&
 Empty when no config unit exists on disk.\&
 .TP
+\f[I]unit\-config\-2\f[R]
+Filesystem path of the platform\(aqs second unit \-\- the systemd timer.\&
+Empty for an unscheduled / grouped job, and always empty on macOS/darwin (launchd has no second unit).\&
+.TP
 \f[I]unit\-name\f[R]
 Platform unit identifier.\&
-.TP
-\f[I]unit\-timer\f[R]
-Filesystem path of the platform timer unit.\&
-Empty for an unscheduled / grouped job.\&
-Only used by systemd, and always empty on macOS/darwin.\&
 .TP
 \f[I]uuid\f[R]
 The job\(aqs \(ga<bundle>:<UUID>\(ga name.\&
@@ -275,11 +274,11 @@ The job\(aqs \(ga<bundle>:<UUID>\(ga name.\&
 The columns shown when \(ga\-\-cols\(ga is omitted: job\-or\-uuid, config, schedule, status, last\-ran.\&
 .TP
 \f[I]all\f[R]
-Every column except the per\-flag columns (use the compact \(gaflags\(ga instead), \(gamasked\-by\(ga (kept only when a masked entry is present), and \-\- on macOS \-\- \(gaunit\-timer\(ga (launchd has no timer file).\&
+Every column except the per\-flag columns (use the compact \(gaflags\(ga instead), \(gamasked\-by\(ga (kept only when a masked entry is present), and the optional \(gaunit\-config\-2\(ga (shown only where a second unit is present).\&
 Naming an excluded column explicitly still shows it.\&
 .TP
 \f[I]unit\-files\f[R]
-unit\-config, plus unit\-timer on Linux.\&
+unit\-config\-1, plus the optional unit\-config\-2 where present.\&
 .SS CONFIG values
 .TP
 \f[I]synced\f[R]

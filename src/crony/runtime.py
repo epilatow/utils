@@ -463,7 +463,7 @@ def _build_current_graph(
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
     # run.lock / pending.flag) as a normal current entry, plus the
-    # platform unit path. Without this the unit-config / last / last-ran
+    # platform unit path. Without this the unit-config-1 / last / last-ran
     # columns render empty for broken rows even when those files are on
     # disk.
     for ref, orphan in orphans.items():
@@ -583,7 +583,7 @@ def load_config() -> crony.model.Config:
         orphans[ref] = orphan
         orphans_by_full_name[full_name] = ref
         # Surface the platform unit paths through RuntimeState (so
-        # status's unit-config / unit-timer columns don't re-walk the
+        # status's unit-config-1 / unit-config-2 columns don't re-walk the
         # unit dirs); a symlink-only orphan has no unit file, so leave
         # them None.
         runtime[ref] = crony.model.RuntimeState(
@@ -675,7 +675,7 @@ def _platform_unit_config_path(
     name: str, platform: str | None = None
 ) -> Path | None:
     """The on-disk platform config unit file backing `name`, or None.
-    The status `unit-config` column reads this from `RuntimeState`."""
+    The status `unit-config-1` column reads this from `RuntimeState`."""
     return scheduler(platform).unit_config_path(name)
 
 
@@ -684,7 +684,7 @@ def _platform_unit_timer_path(
 ) -> Path | None:
     """The on-disk timer unit arming `name`'s schedule, or None when the
     platform has no separate timer unit or the entry is unscheduled. The
-    status `unit-timer` column reads this from `RuntimeState`."""
+    status `unit-config-2` column reads this from `RuntimeState`."""
     return scheduler(platform).unit_timer_path(name)
 
 

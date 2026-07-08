@@ -117,8 +117,8 @@ _STALE_FIELD_LABELS: dict[str, str] = {
     "timeout": "job-timeout-sec",
     "interactive_active_sec": "interactive-active",
     "interactive_delay_sec": "interactive-delay",
-    "unit_config_normalized": "unit-config",
-    "unit_timer_normalized": "unit-timer",
+    "unit_config_normalized": "unit-config-1",
+    "unit_timer_normalized": "unit-config-2",
 }
 
 
@@ -1301,8 +1301,8 @@ class StatusCols(StrEnum):
     MASKED_BY = "masked-by"
     UNIT_NAME = "unit-name"
     UUID = "uuid"
-    UNIT_CONFIG = "unit-config"
-    UNIT_TIMER = "unit-timer"
+    UNIT_CONFIG_1 = "unit-config-1"
+    UNIT_CONFIG_2 = "unit-config-2"
     LOG_FILE = "log-file"
     FLAGS = "flags"
     TIMEOUT = "timeout"
@@ -1409,17 +1409,17 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
         "The job's `<bundle>:<UUID>` name.",
     ),
     StatusColumn(
-        StatusCols.UNIT_CONFIG,
-        "UNIT CONFIG",
+        StatusCols.UNIT_CONFIG_1,
+        "UNIT CONFIG 1",
         "Filesystem path of the platform config unit. Empty when no "
         "config unit exists on disk.",
     ),
     StatusColumn(
-        StatusCols.UNIT_TIMER,
-        "UNIT TIMER",
-        "Filesystem path of the platform timer unit. Empty for an "
-        "unscheduled / grouped job. Only used by systemd, and always "
-        "empty on macOS/darwin.",
+        StatusCols.UNIT_CONFIG_2,
+        "UNIT CONFIG 2",
+        "Filesystem path of the platform's second unit -- the systemd "
+        "timer. Empty for an unscheduled / grouped job, and always empty "
+        "on macOS/darwin (launchd has no second unit).",
         ColVisibility.IF_PLATFORM_HAS_TIMER,
     ),
     StatusColumn(
@@ -1629,13 +1629,14 @@ _STATUS_ALIASES: tuple[StatusAlias, ...] = (
         tuple(StatusCols),
         "Every column except the per-flag columns (use the compact "
         "`flags` instead), `masked-by` (kept only when a masked entry is "
-        "present), and -- on macOS -- `unit-timer` (launchd has no timer "
-        "file). Naming an excluded column explicitly still shows it.",
+        "present), and the optional `unit-config-2` (shown only where a "
+        "second unit is present). Naming an excluded column explicitly "
+        "still shows it.",
     ),
     StatusAlias(
         StatusAliases.UNIT_FILES,
-        (StatusCols.UNIT_CONFIG, StatusCols.UNIT_TIMER),
-        "unit-config, plus unit-timer on Linux.",
+        (StatusCols.UNIT_CONFIG_1, StatusCols.UNIT_CONFIG_2),
+        "unit-config-1, plus the optional unit-config-2 where present.",
     ),
 )
 _STATUS_ALIAS_BY_NAME: dict[str, StatusAlias] = {
@@ -1671,7 +1672,7 @@ def _expand_status_alias(
     so the same pass serves every alias and a future conditional column
     is trimmed without touching this function. Trimming applies only to
     the alias; a column named explicitly is always honored (`--cols
-    all,unit-timer` still shows the timer).
+    all,unit-config-2` still shows the timer).
     """
     return tuple(
         col
@@ -2513,16 +2514,16 @@ def do_status(
             job_cell = display_name
             job_or_uuid_cell = display_name
         uuid_cell = str(row_ref) if row_ref is not None else ""
-        # `unit-config` / `unit-timer`: the platform unit paths captured
+        # `unit-config-1` / `unit-config-2`: the platform unit paths captured
         # at load time (uuid-keyed RuntimeState). Empty for entries with
-        # no runtime, and unit-timer is empty where the platform has no
+        # no runtime, and unit-config-2 is empty where the platform has no
         # separate timer unit / for an unscheduled entry.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
         unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
         # Flag the specific unit file whose install drifted from the
         # snapshot (re-apply re-renders it), mirroring the `stale`
-        # column's `unit-config` / `unit-timer` tokens. Drift is the
+        # column's `unit-config-1` / `unit-config-2` tokens. Drift is the
         # normalized unit differing between the pending and current
         # nodes; an orphan / broken / pending-only row lacks one side and
         # goes unflagged.
@@ -2577,8 +2578,8 @@ def do_status(
             _priority_display(pending_node), _priority_display(current_node)
         )
         # The `stale` column summarizes why an entry reads stale -- the
-        # snapshot fields that differ, including `unit-config` /
-        # `unit-timer` for an installed-unit drift.
+        # snapshot fields that differ, including `unit-config-1` /
+        # `unit-config-2` for an installed-unit drift.
         stale_cell = _stale_fields(pending_node, current_node)
         flag_cells: dict[str, str] = {}
         flags_summary_parts: list[str] = []
@@ -2616,8 +2617,8 @@ def do_status(
             StatusCols.MASKED_BY: mask_reason,
             StatusCols.UNIT_NAME: unit_name,
             StatusCols.UUID: uuid_cell,
-            StatusCols.UNIT_CONFIG: unit_config_cell,
-            StatusCols.UNIT_TIMER: unit_timer_cell,
+            StatusCols.UNIT_CONFIG_1: unit_config_cell,
+            StatusCols.UNIT_CONFIG_2: unit_timer_cell,
             StatusCols.LOG_FILE: log_file_cell,
             StatusCols.FLAGS: ",".join(flags_summary_parts),
             StatusCols.TIMEOUT: timeout_cell,

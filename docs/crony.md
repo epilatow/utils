@@ -249,14 +249,15 @@ Send a synthetic failure notification.
 - **`timeout`**\
   Job wallclock cap: `<n>s`. The job will be killed if its wallclock execution
   time exceeds this cap. May be `none` for uncapped jobs.
-- **`unit-config`**\
+- **`unit-config-1`**\
   Filesystem path of the platform config unit. Empty when no config unit
   exists on disk.
+- **`unit-config-2`**\
+  Filesystem path of the platform's second unit -- the systemd timer. Empty
+  for an unscheduled / grouped job, and always empty on macOS/darwin (launchd
+  has no second unit).
 - **`unit-name`**\
   Platform unit identifier.
-- **`unit-timer`**\
-  Filesystem path of the platform timer unit. Empty for an unscheduled /
-  grouped job. Only used by systemd, and always empty on macOS/darwin.
 - **`uuid`**\
   The job's `<bundle>:<UUID>` name.
 
@@ -267,11 +268,11 @@ Send a synthetic failure notification.
   status, last-ran.
 - **`all`**\
   Every column except the per-flag columns (use the compact `flags` instead),
-  `masked-by` (kept only when a masked entry is present), and -- on macOS --
-  `unit-timer` (launchd has no timer file). Naming an excluded column
-  explicitly still shows it.
+  `masked-by` (kept only when a masked entry is present), and the optional
+  `unit-config-2` (shown only where a second unit is present). Naming an
+  excluded column explicitly still shows it.
 - **`unit-files`**\
-  unit-config, plus unit-timer on Linux.
+  unit-config-1, plus the optional unit-config-2 where present.
 
 ### CONFIG values
 

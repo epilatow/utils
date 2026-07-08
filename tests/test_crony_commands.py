@@ -2914,7 +2914,7 @@ class TestStatusFieldColumns:
     ) -> None:
         # A snapshot whose installed unit file drifted reads stale; the
         # launchd plist is the config unit, so the stale column reports
-        # `unit-config`.
+        # `unit-config-1`.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {"job": {"j": {"command": "true", "schedule": "daily"}}},
@@ -2926,8 +2926,8 @@ class TestStatusFieldColumns:
         # unchanged.
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         plist.write_text(plist.read_text() + "\n<!-- edited -->\n")
-        out = self._status("job,stale,unit-config", capsys)
-        assert "unit-config" in out
+        out = self._status("job,stale,unit-config-1", capsys)
+        assert "unit-config-1" in out
         # The drifted unit's own column is flagged.
         row = next(
             line for line in out.splitlines() if line.startswith(h.full("j"))
@@ -2962,13 +2962,13 @@ class TestStatusFieldColumns:
         assert d(jnode, gnode) == "kind"  # job vs group
         assert d(jnode, jnode) == ""  # identical snapshots
         # The normalized units are ordinary compared fields, so a
-        # divergent one reports `unit-config` / `unit-timer`.
+        # divergent one reports `unit-config-1` / `unit-config-2`.
         cfg_drift = dataclasses.replace(jnode, unit_config_normalized="edited")
-        assert d(jnode, cfg_drift) == "unit-config"
+        assert d(jnode, cfg_drift) == "unit-config-1"
         both = dataclasses.replace(
             jnode, unit_config_normalized="x", unit_timer_normalized="y"
         )
-        assert d(jnode, both) == "unit-config,unit-timer"
+        assert d(jnode, both) == "unit-config-1,unit-config-2"
         # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
         bumped = dataclasses.replace(jnode, snapshot_schema=4)
         assert d(jnode, bumped) == "snapshot-schema"
@@ -3802,7 +3802,7 @@ class TestStatusReport:
     ) -> None:
         # On darwin without -a, `all` carries the broad set but drops the
         # columns that would always be blank here: masked-by (no -a),
-        # unit-timer (launchd has none), and the per-flag columns (FLAGS
+        # unit-config-2 (launchd has none), and the per-flag columns (FLAGS
         # covers them).
         header = self._all_header(
             tmp_path, monkeypatch, capsys, platform="darwin", show_masked=False
@@ -3816,14 +3816,14 @@ class TestStatusReport:
             "STATUS",
             "LAST RAN",
             "UUID",
-            "UNIT CONFIG",
+            "UNIT CONFIG 1",
             "FLAGS",
             "TIMEOUT",
             "STALE",
         ):
             assert present in header
         assert "MASKED BY" not in header
-        assert "UNIT TIMER" not in header
+        assert "UNIT CONFIG 2" not in header
         assert "INTERACTIVE" not in header
 
     def test_cols_all_alias_includes_masked_by_with_show_masked(
@@ -3895,7 +3895,7 @@ class TestStatusReport:
         header = self._all_header(
             tmp_path, monkeypatch, capsys, platform="linux", show_masked=False
         )
-        assert "UNIT TIMER" in header
+        assert "UNIT CONFIG 2" in header
 
     def test_cols_all_alias_keeps_masked_by_for_orphan_remnant(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3989,8 +3989,8 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "UNIT CONFIG" in out
-        assert "UNIT TIMER" in out
+        assert "UNIT CONFIG 1" in out
+        assert "UNIT CONFIG 2" in out
         assert "crony-default.j.service" in out
         assert "crony-default.j.timer" in out
 
@@ -3998,7 +3998,7 @@ class TestStatusReport:
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # launchd pins the schedule in the plist, so there is no timer
-        # file; `unit-files` is just unit-config on darwin.
+        # file; `unit-files` is just unit-config-1 on darwin.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -4015,13 +4015,13 @@ class TestStatusReport:
             exclude_healthy=False,
         )
         header = capsys.readouterr().out.splitlines()[0]
-        assert "UNIT CONFIG" in header
-        assert "UNIT TIMER" not in header
+        assert "UNIT CONFIG 1" in header
+        assert "UNIT CONFIG 2" not in header
 
     def test_explicit_column_overrides_alias_trimming(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # `all` drops unit-timer on darwin, but naming it explicitly
+        # `all` drops unit-config-2 on darwin, but naming it explicitly
         # alongside the alias still shows it.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
@@ -4031,14 +4031,14 @@ class TestStatusReport:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols=crony_commands.parse_cols_arg("all,unit-timer"),
+            cols=crony_commands.parse_cols_arg("all,unit-config-2"),
             show_masked=False,
             bundle=None,
             config_current=False,
             config_pending=False,
             exclude_healthy=False,
         )
-        assert "UNIT TIMER" in capsys.readouterr().out.splitlines()[0]
+        assert "UNIT CONFIG 2" in capsys.readouterr().out.splitlines()[0]
 
     def test_cols_default_combined_with_extra_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -4690,9 +4690,9 @@ class TestStatusReport:
         assert "unit-files" in text
         # The `all` description notes the context-sensitive trimming.
         assert "Every column except the per-flag columns" in flat
-        assert "launchd has no timer file" in flat
-        # `unit-files` documents its Linux-only timer.
-        assert "unit-config, plus unit-timer on Linux" in flat
+        assert "shown only where a second unit is present" in flat
+        # `unit-files` documents its optional second column.
+        assert "plus the optional unit-config-2 where present" in flat
 
     def test_status_reference_sections_are_well_formed(self) -> None:
         # `status_reference_sections()` is the structured single source
@@ -4786,7 +4786,7 @@ class TestStatusReport:
     def test_alias_expansion_trims_by_column_visibility(self) -> None:
         # The `all` alias lists every column but drops the conditional
         # ones whose `ColVisibility` fails: `masked-by` only when a masked
-        # row is shown, `unit-timer` only off darwin. The trim is driven
+        # row is shown, `unit-config-2` only off darwin. The trim is driven
         # by the column property, so the expansion tracks each context.
         StatusCols = crony_commands.StatusCols
 
@@ -4801,8 +4801,8 @@ class TestStatusReport:
 
         assert StatusCols.MASKED_BY in expand(True, "linux")
         assert StatusCols.MASKED_BY not in expand(False, "linux")
-        assert StatusCols.UNIT_TIMER in expand(True, "linux")
-        assert StatusCols.UNIT_TIMER not in expand(True, "darwin")
+        assert StatusCols.UNIT_CONFIG_2 in expand(True, "linux")
+        assert StatusCols.UNIT_CONFIG_2 not in expand(True, "darwin")
         # An unconditional column rides through every context.
         for masked in (False, True):
             for platform in ("linux", "darwin"):
@@ -6416,7 +6416,7 @@ class TestAliasOrphan:
 
 
 class TestStatusUnitConfigColumn:
-    """`crony status --cols ...,unit-config,unit-timer` shows the on-disk
+    """`crony status --cols ...,unit-config-1,unit-config-2` shows the on-disk
     paths of the platform config / timer units. The cell values come
     from `RuntimeState.unit_config` / `unit_timer` so subcommands don't
     re-walk the unit dirs themselves.
@@ -6433,7 +6433,9 @@ class TestStatusUnitConfigColumn:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols=crony_commands.parse_cols_arg("job,unit-config,unit-timer"),
+            cols=crony_commands.parse_cols_arg(
+                "job,unit-config-1,unit-config-2"
+            ),
             show_masked=False,
             bundle=None,
             config_current=False,
@@ -6441,10 +6443,10 @@ class TestStatusUnitConfigColumn:
             exclude_healthy=False,
         )
         out = capsys.readouterr().out
-        assert "UNIT CONFIG" in out
+        assert "UNIT CONFIG 1" in out
         assert "org.crony.default.j.plist" in out
         # launchd has no separate timer unit: the column renders empty.
-        assert "UNIT TIMER" in out
+        assert "UNIT CONFIG 2" in out
         assert ".timer" not in out
 
     def test_unit_config_and_timer_render_on_linux(
@@ -6458,7 +6460,9 @@ class TestStatusUnitConfigColumn:
         h.apply("j")
         crony_commands.do_status(
             jobs=[],
-            cols=crony_commands.parse_cols_arg("job,unit-config,unit-timer"),
+            cols=crony_commands.parse_cols_arg(
+                "job,unit-config-1,unit-config-2"
+            ),
             show_masked=False,
             bundle=None,
             config_current=False,
