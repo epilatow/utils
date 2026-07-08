@@ -355,6 +355,15 @@ class TestParseJob:
         cfg = _parse(self._cfg({"command": "x", "interval": "1h30min"}))
         assert cfg.jobs["j"].timing == Interval.from_str("1h30min")
 
+    def test_interval_below_minimum_rejected(self) -> None:
+        _assert_errored_job(
+            self._cfg({"command": "x", "interval": "30s"}), "j", "minimum"
+        )
+
+    def test_interval_at_minimum_accepted(self) -> None:
+        cfg = _parse(self._cfg({"command": "x", "interval": "1m"}))
+        assert cfg.jobs["j"].timing == Interval.from_str("1m")
+
     def test_invalid_platforms_value(self) -> None:
         _assert_errored_job(
             self._cfg(_job(platforms=["windows"])), "j", "not in"
@@ -513,6 +522,16 @@ class TestParseJobGroup:
             },
             "g",
             "mutually exclusive",
+        )
+
+    def test_interval_below_minimum_rejected(self) -> None:
+        _assert_errored_job_group(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "interval": "30s"}},
+            },
+            "g",
+            "minimum",
         )
 
     def test_unknown_group_key(self) -> None:

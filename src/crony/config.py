@@ -1176,7 +1176,18 @@ class TomlConfig:
 # Schedules use systemd OnCalendar syntax; intervals use systemd
 # time-span syntax. Both are parsed and validated by the crony.unit
 # value objects (Schedule / Interval); `_parse_timing` wraps them for
-# the config loader.
+# the config loader and adds the loader's own interval floor
+# (MIN_INTERVAL_SECONDS), a constraint the value objects do not impose.
+
+# The shortest interval crony accepts. Below a minute the two backends
+# stop honoring the spacing consistently -- systemd's default timer
+# accuracy is one minute (AccuracySec=1min) and launchd throttles
+# respawns to roughly ten seconds -- so a sub-minute interval cannot be
+# delivered the same way on both, and jobs that expect tight spacing get
+# it on neither. Reject it at config load rather than silently rounding.
+# The check lives here (config parse), not in `Interval.from_str`, so it
+# never rejects an already-applied job on snapshot rehydration.
+MIN_INTERVAL_SECONDS = 60
 
 
 def _parse_timing(
@@ -1185,7 +1196,7 @@ def _parse_timing(
     """Build a unit's timing from the config's mutually-exclusive
     `schedule` / `interval` keys, or None for an on-demand entry.
     Surfaces the value objects' validation as a config error tied to
-    `where`."""
+    `where`. Intervals below `MIN_INTERVAL_SECONDS` are rejected."""
     if schedule_str is not None and interval_str is not None:
         raise crony.errors.ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
@@ -1193,11 +1204,17 @@ def _parse_timing(
     try:
         if schedule_str is not None:
             return crony.unit.Schedule.from_str(schedule_str)
-        if interval_str is not None:
-            return crony.unit.Interval.from_str(interval_str)
+        if interval_str is None:
+            return None
+        interval = crony.unit.Interval.from_str(interval_str)
     except ValueError as e:
         raise crony.errors.ConfigError(f"{where}: {e}") from e
-    return None
+    if interval.total_seconds < MIN_INTERVAL_SECONDS:
+        raise crony.errors.ConfigError(
+            f"{where}: interval {interval_str!r} is below the "
+            f"{MIN_INTERVAL_SECONDS}s minimum"
+        )
+    return interval
 
 
 def _parse_priority(
