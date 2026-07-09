@@ -945,9 +945,12 @@ def discover_entries(record: InstallRecord) -> list[LinkRecord]:
     LinkRecord per discovered entry (with `install` set).
 
     Common rules:
-    - Skip any dotfile -- an entry with a leading-'.' component at any
-      depth (so .git / .hg / .github, the ignore files, and editor
-      state never link).
+    - Skip a top-level dotfile -- an entry whose first path component
+      starts with '.'. Under --dotfiles it would double-prefix
+      (bashrc -> .bashrc, so .bashrc -> ..bashrc); in either mode it
+      lets a source be a whole repo (its .git is not linked) and keeps
+      top-level config like .linkfiles.ignore out of the target. A
+      dotfile below the top level is linked as ordinary content.
     - Skip files matching patterns in .gitignore / .hgignore /
       .linkfiles.ignore from the source dir and each ancestor up to the
       enclosing repo root, plus a hardcoded set of editor / swap /
@@ -982,11 +985,18 @@ def discover_entries(record: InstallRecord) -> list[LinkRecord]:
         if not (item.is_file() or item.is_symlink()):
             continue
         relative = item.relative_to(abs_source_dir)
-        # Skip any dotfile -- a leading-'.' component at any depth. This
-        # covers VCS / metadata dirs (.git, .hg, .github), the ignore
-        # files themselves, and editor state, without linking them into
-        # the target tree.
-        if any(part.startswith(".") for part in relative.parts):
+        # Skip a top-level dotfile -- one whose first path component
+        # starts with '.'. Under --dotfiles each top-level entry is
+        # dot-prefixed (see _target_path; bashrc -> .bashrc), so a name
+        # already starting with a dot would gain a nonsensical second
+        # one (.bashrc -> ..bashrc). And in either mode, skipping a
+        # top-level dot entry lets a source be a whole repo (its .git
+        # is not linked) and keeps top-level config like .linkfiles.ignore
+        # or .gitignore out of the target. A dotfile below the top level
+        # is real content (a plugin's .claude-plugin/ manifest, a nested
+        # .mcp.json) and links; nested editor swap / backup files are
+        # dropped by the ignore-pattern check below.
+        if relative.parts[0].startswith("."):
             continue
         if matches_ignore_pattern(relative, ignore_patterns):
             continue
@@ -1577,9 +1587,12 @@ repository files into $HOME/ (as dotfiles) and $HOME/.local/.
 By default linkfiles descends into the source and links the leaf files,
 recreating any subdirectories in the target; --no-recurse links each
 top-level entry directly instead. --dotfiles dot-prefixes each top-level
-entry in the target (`bashrc` becomes `.bashrc`). Files matched by an
-ignore file (.gitignore, .hgignore, or .linkfiles.ignore, in or above the
-source) are skipped, as are editor backup and swap files."""
+entry in the target (`bashrc` becomes `.bashrc`). A source entry whose
+top-level name begins with a dot (like .git or .github) is skipped,
+though dot-names below the top level are linked as ordinary content.
+Files matched by an ignore file (.gitignore, .hgignore, or
+.linkfiles.ignore, in or above the source) are skipped, as are editor
+backup and swap files."""
 
 _GETTING_STARTED = """\
 To install files from repos in your $HOME you can do:

@@ -11,6 +11,7 @@ While linkfiles can be used to link files from any source to any destination, it
 .PP
 By default linkfiles descends into the source and links the leaf files, recreating any subdirectories in the target; \-\-no\-recurse links each top\-level entry directly instead.\&
 \-\-dotfiles dot\-prefixes each top\-level entry in the target (\(gabashrc\(ga becomes \(ga.bashrc\(ga).\&
+A source entry whose top\-level name begins with a dot (like .git or .github) is skipped, though dot\-names below the top level are linked as ordinary content.\&
 Files matched by an ignore file (.gitignore, .hgignore, or .linkfiles.ignore, in or above the source) are skipped, as are editor backup and swap files.\&
 .SH GETTING STARTED
 To install files from repos in your $HOME you can do:

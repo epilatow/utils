@@ -509,7 +509,8 @@ class TestLinkfilesInstall:
 
 class TestLinkfilesDiscovery:
     """linkfiles shares the discovery rules: it honors .linkfiles.ignore
-    (and the other ignore files) and skips every dotfile."""
+    (and the other ignore files) and skips top-level dotfiles while
+    linking dotfiles below the top level."""
 
     def _install(self, src: Path, tgt: Path) -> None:
         lf.do_install(
@@ -538,7 +539,9 @@ class TestLinkfilesDiscovery:
         # The ignore file is itself a dotfile, so it is never linked.
         assert not (tgt / ".linkfiles.ignore").exists()
 
-    def test_skips_dotfiles_at_any_depth(self, tracked: Path) -> None:
+    def test_skips_top_level_dotfiles_but_links_nested(
+        self, tracked: Path
+    ) -> None:
         src = _make_tree(
             tracked / "s",
             {
@@ -552,8 +555,43 @@ class TestLinkfilesDiscovery:
         self._install(src, tgt)
         assert (tgt / "visible").is_symlink()
         assert (tgt / "sub" / "visible").is_symlink()
-        assert not (tgt / "sub" / ".hidden").exists()
+        # A dotfile below the top level is real content and links.
+        assert (tgt / "sub" / ".hidden").is_symlink()
+        # A top-level dotfile is skipped.
         assert not (tgt / ".top").exists()
+
+    def test_links_nested_dot_directory_contents(self, tracked: Path) -> None:
+        # A dot-directory below the top level (e.g. a plugin's
+        # .claude-plugin/ manifest dir) has its contents linked.
+        src = _make_tree(
+            tracked / "s",
+            {
+                "plugin/.claude-plugin/manifest.json": "{}",
+                "plugin/hooks/hooks.json": "{}",
+            },
+        )
+        tgt = tracked / "d"
+        self._install(src, tgt)
+        assert (
+            tgt / "plugin" / ".claude-plugin" / "manifest.json"
+        ).is_symlink()
+        assert (tgt / "plugin" / "hooks" / "hooks.json").is_symlink()
+
+    def test_skips_top_level_dot_directory(self, tracked: Path) -> None:
+        # A top-level dot-directory (e.g. .git) is skipped entirely:
+        # none of its contents link.
+        src = _make_tree(
+            tracked / "s",
+            {
+                "keep": "y",
+                ".git/config": "x",
+                ".git/HEAD": "ref",
+            },
+        )
+        tgt = tracked / "d"
+        self._install(src, tgt)
+        assert (tgt / "keep").is_symlink()
+        assert not (tgt / ".git").exists()
 
 
 class TestLinkfilesAuditRemove:
