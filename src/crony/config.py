@@ -2225,12 +2225,33 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             f"[job.*] and [job-group.*]"
         )
 
+    all_names = all_job_names | all_group_names
+
+    # No entity name may be a dotted-prefix of another (`foo` and
+    # `foo.bar`); see `crony.unit.name_is_dotted_prefix` for why such a
+    # pair yields overlapping unit files. This is the config half of the
+    # rule; `runtime` enforces the same relation at apply time against
+    # what is already on disk. Structural / unattributable -> raise.
+    sorted_names = sorted(all_names)
+    prefix_collisions = [
+        (a, b)
+        for a in sorted_names
+        for b in sorted_names
+        if crony.unit.name_is_dotted_prefix(a, b)
+    ]
+    if prefix_collisions:
+        pairs = ", ".join(f"{a!r} < {b!r}" for a, b in prefix_collisions)
+        raise crony.errors.ConfigError(
+            f"name collision: one entity name is a dotted-prefix of "
+            f"another ({pairs}); rename one so no name is a "
+            f"dotted-prefix of another"
+        )
+
     # Group children must reference a defined job or group. A bad
     # reference demotes just the offending group; siblings remain
     # loadable. Nested groups are supported -- the per-target chain
     # validation below ensures every reachable path bottoms out in
     # a schedule.
-    all_names = all_job_names | all_group_names
     bad_group: dict[str, str] = {}
     for gname, group in config.job_groups.items():
         for child in group.jobs:

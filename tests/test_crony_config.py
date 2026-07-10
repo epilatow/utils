@@ -851,6 +851,36 @@ class TestValidateConfig:
                 }
             )
 
+    def test_dotted_prefix_name_collision(self) -> None:
+        # `foo` is a dotted-prefix of `foo.bar`, so their unit files
+        # would overlap once a backend suffixes a companion unit.
+        with pytest.raises(ConfigError, match="dotted-prefix"):
+            _parse({"job": {"foo": _job(), "foo.bar": _job()}})
+
+    def test_dotted_prefix_collision_across_job_and_group(self) -> None:
+        with pytest.raises(ConfigError, match="dotted-prefix"):
+            _parse(
+                {
+                    "job": {"foo": _job()},
+                    "job-group": {
+                        "foo.bar": {"jobs": ["foo"], "schedule": "daily"}
+                    },
+                }
+            )
+
+    def test_non_dotted_prefix_names_allowed(self) -> None:
+        # `foo` is a plain prefix of `foobar` but not a dotted-prefix,
+        # so their unit files do not overlap -- both are allowed.
+        cfg = _parse({"job": {"foo": _job(), "foobar": _job()}})
+        assert set(cfg.jobs) == {"foo", "foobar"}
+
+    def test_dotted_string_prefix_names_allowed(self) -> None:
+        # `foo.a` is a string-prefix of `foo.ab` but not a dotted-prefix
+        # (the next character is not the `.` separator), so the derived
+        # filenames stay distinct -- both are allowed.
+        cfg = _parse({"job": {"foo.a": _job(), "foo.ab": _job()}})
+        assert set(cfg.jobs) == {"foo.a", "foo.ab"}
+
     def test_group_references_undefined_name(self) -> None:
         _assert_errored_job_group(
             {"job-group": {"g": {"jobs": ["nope"], "schedule": "daily"}}},

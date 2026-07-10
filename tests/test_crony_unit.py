@@ -21,12 +21,39 @@ from crony.unit import (  # noqa: E402
     PriorityClass,
     Schedule,
     UnitSpec,
+    name_is_dotted_prefix,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "unit.py"
 
 _UUID = "12345678-9abc-def0-1234-56789abcdef0"
+
+
+class TestNameIsDottedPrefix:
+    @pytest.mark.parametrize(
+        ("prefix", "name"),
+        [
+            ("foo", "foo.bar"),
+            ("foo", "foo.bar.baz"),
+            ("foo.bar", "foo.bar.baz"),
+        ],
+    )
+    def test_proper_dotted_prefix(self, prefix: str, name: str) -> None:
+        assert name_is_dotted_prefix(prefix, name)
+
+    @pytest.mark.parametrize(
+        ("prefix", "name"),
+        [
+            ("foo", "foo"),  # equal, not a proper prefix
+            ("foo", "foobar"),  # string-prefix, no dot boundary
+            ("foo.a", "foo.ab"),  # dotted string-prefix, no dot boundary
+            ("foo.bar", "foo.baz"),  # unrelated
+            ("foo.bar", "foo"),  # reversed
+        ],
+    )
+    def test_not_a_dotted_prefix(self, prefix: str, name: str) -> None:
+        assert not name_is_dotted_prefix(prefix, name)
 
 
 class TestEntityRef:

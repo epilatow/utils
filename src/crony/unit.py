@@ -34,6 +34,19 @@ _BUNDLE_NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _NAME_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def name_is_dotted_prefix(prefix: str, name: str) -> bool:
+    """True when `name` extends `prefix` by one or more dotted components
+    -- `prefix` is a proper dotted-prefix of `name` (`foo` of `foo.bar`).
+
+    crony embeds an entity's name in its on-disk unit filenames, so a
+    scheme that derives an extra unit by extending an entity's name would
+    give one member of such a pair a filename that clashes with the
+    other's. crony forbids the pair -- in config validation, and at apply
+    time against what is already on disk.
+    """
+    return name.startswith(prefix + ".")
+
+
 @dataclass(frozen=True)
 class EntityRef:
     """Stable per-(bundle, uuid) identity for a Job or JobGroup.

@@ -1095,6 +1095,37 @@ def apply_one(
         )
         return ApplyResult.DEFERRED
 
+    # A targeted apply does not reclaim entities the config dropped, so a
+    # removed entity's units can still be on disk under a name that is a
+    # dotted-prefix relative of this one (`foo.bar.baz` on disk while
+    # applying `foo.bar`). Their unit filenames overlap under the
+    # name-extension scheme (see `crony.unit.name_is_dotted_prefix`), so
+    # installing over the leftover would leave an on-disk set that can no
+    # longer be resolved to entities. Refuse it and point at the fix. A
+    # full apply reclaims such leftovers before this runs, so only a
+    # surgical apply reaches here with the conflict live. This entity's
+    # own names -- the current `full_name` and any prior name this apply
+    # is reconciling (the rename cleanup below removes its unit) -- are
+    # not conflicts.
+    own_names = {full_name}
+    if current_snapshot is not None:
+        own_names.add(str(current_snapshot.entity_name))
+    conflicts = sorted(
+        n
+        for n in sched.installed_names()
+        if n not in own_names
+        and (
+            crony.unit.name_is_dotted_prefix(n, full_name)
+            or crony.unit.name_is_dotted_prefix(full_name, n)
+        )
+    )
+    if conflicts:
+        raise crony.errors.PreconditionError(
+            f"cannot apply {full_name!r}: on-disk units for {conflicts} "
+            f"have dotted-prefix-conflicting names; run a full "
+            f"`crony apply` or `crony destroy` them first"
+        )
+
     # Same uuid, new name: the entry was renamed in config. The
     # state dir (uuid-keyed) is reused under the new name, but the
     # old name's platform unit is now stale -- remove it so only

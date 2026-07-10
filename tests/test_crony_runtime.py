@@ -42,6 +42,7 @@ from crony.config import (  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
     ExitCode,
+    PreconditionError,
     UsageError,
 )
 from crony.model import (  # noqa: E402
@@ -1715,6 +1716,75 @@ class TestUnitDriftDetection:
         # The transit group renders no timer (pending timer None), but
         # one is on disk -- the timer comparison catches it as drift.
         assert config.cfg_status(ref) == "stale"
+
+
+class TestApplyDottedPrefixGuard:
+    """A targeted apply does not reclaim entities the config dropped, so a
+    removed entity's units can linger on disk. Applying a name that is a
+    dotted-prefix relative of such a leftover would overlap its unit
+    filenames, leaving an unresolvable on-disk set; the apply refuses.
+    A full apply reclaims the leftover first, so it installs cleanly.
+    """
+
+    def _apply_job(self, h: _ApplyHarness, short: str) -> None:
+        h.config(
+            {"job": {short: {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=[short],
+        )
+        crony_commands.do_apply(
+            jobs=[h.full(short)], verbose=False, bundle=None
+        )
+
+    def _reconfigure_to(self, h: _ApplyHarness, short: str) -> None:
+        # Replace the config with a single job `short`; the previously
+        # applied job's units stay on disk (its uuid differs, so this is a
+        # delete + add, and a targeted apply does not reclaim the drop).
+        h.config(
+            {"job": {short: {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=[short],
+        )
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_targeted_apply_over_leftover_raises(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._apply_job(h, "foo.bar.baz")
+        self._reconfigure_to(h, "foo.bar")
+        with pytest.raises(PreconditionError, match="dotted-prefix"):
+            crony_commands.do_apply(
+                jobs=[h.full("foo.bar")], verbose=False, bundle=None
+            )
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_full_apply_reclaims_leftover_then_installs(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._apply_job(h, "foo.bar.baz")
+        self._reconfigure_to(h, "foo.bar")
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        config = crony_runtime.load_config()
+        assert h.full("foo.bar") in config.current.by_full_name
+        assert h.full("foo.bar.baz") not in config.current.by_full_name
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_targeted_apply_with_unrelated_leftover_installs(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # `foo.ab` is a string-prefix but not a dotted-prefix of the
+        # leftover `foo.abc`, so their filenames do not overlap and the
+        # targeted apply is allowed. This is the case where a naive
+        # `<name>*` glob (rather than the dot-anchored strip both backends
+        # use) would spuriously collide, so it is checked on both.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._apply_job(h, "foo.abc")
+        self._reconfigure_to(h, "foo.ab")
+        crony_commands.do_apply(
+            jobs=[h.full("foo.ab")], verbose=False, bundle=None
+        )
+        config = crony_runtime.load_config()
+        assert h.full("foo.ab") in config.current.by_full_name
 
 
 class TestSnapshotBackwardLoad:
