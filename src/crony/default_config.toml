@@ -41,7 +41,6 @@
 #notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
 #trigger-timeout-sec  = 15           # `crony trigger --wait` deadline
-#log-keep-runs        = 30
 #priority             = "high"       # priority class; jobs may override
 #keep-awake           = true         # default; jobs may override
 # Optional: capabilities can also be set as a cascading list --

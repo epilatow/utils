@@ -78,7 +78,6 @@ class TestParseDefaults:
                     "notify_attach_log": False,
                     "notify_attach_max_kb": 512,
                     "job_timeout_sec": 3600,
-                    "log_keep_runs": 50,
                     "priority": "high",
                     "keep_awake": True,
                     "env": {"PATH": "$HOME/.local/bin:$PATH"},
@@ -90,7 +89,6 @@ class TestParseDefaults:
         assert cfg.defaults.notify_attach_log is False
         assert cfg.defaults.notify_attach_max_kb == 512
         assert cfg.defaults.job_timeout_sec == 3600
-        assert cfg.defaults.log_keep_runs == 50
         assert cfg.defaults.priority == PriorityClass.HIGH
         assert cfg.defaults.keep_awake is True
         assert cfg.defaults.env == {"PATH": "$HOME/.local/bin:$PATH"}

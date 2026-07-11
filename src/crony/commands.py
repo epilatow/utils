@@ -2891,11 +2891,10 @@ def _follow_log(log_path: Path, *, n: int = 0) -> None:
             if n > 0:
                 # Print the last `n` lines, then continue from
                 # wherever those landed in the file. Using
-                # readlines() over f then slicing is fine at log
-                # sizes crony manages (run.log rotates per
-                # `log_keep_runs`); a streaming reverse-read
-                # would matter for multi-GB files we don't
-                # produce.
+                # readlines() over f then slicing is fine at the
+                # log sizes crony produces; a streaming
+                # reverse-read would only matter for very large
+                # files.
                 lines = f.readlines()
                 tail = lines[-n:] if len(lines) > n else lines
                 try:

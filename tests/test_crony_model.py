@@ -94,10 +94,6 @@ class TestTypeStrictness:
         with pytest.raises(ConfigError, match="positive"):
             _parse({"defaults": {"notify_attach_max_kb": -1}})
 
-    def test_negative_default_log_keep_rejected(self) -> None:
-        with pytest.raises(ConfigError, match="positive"):
-            _parse({"defaults": {"log_keep_runs": 0}})
-
     def test_invalid_default_priority_rejected(self) -> None:
         with pytest.raises(ConfigError, match="invalid priority"):
             _parse({"defaults": {"priority": "turbo"}})

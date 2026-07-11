@@ -357,7 +357,6 @@ class Defaults:
     # Catches "trigger seemed to succeed but nothing happened"
     # cases (broken plist, queue stalled, etc.).
     trigger_timeout_sec: int = 15
-    log_keep_runs: int = 30
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior
     # when a bundle sets no default.
@@ -1256,7 +1255,6 @@ _KNOWN_DEFAULTS: frozenset[str] = (
             "notify-attach-max-kb",
             "job-timeout-sec",
             "trigger-timeout-sec",
-            "log-keep-runs",
             "priority",
             "flags",
             "env",
@@ -1945,7 +1943,6 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         trigger_timeout_sec=_positive_int(
             raw, "trigger-timeout-sec", where, default=15
         ),
-        log_keep_runs=_positive_int(raw, "log-keep-runs", where, default=30),
         priority=_parse_priority_field(raw, where),
         keep_awake=flags.get(JobFlags.KEEP_AWAKE, False),
         flags=flags,
