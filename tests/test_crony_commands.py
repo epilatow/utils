@@ -6368,7 +6368,6 @@ class TestAliasOrphan:
         assert ref is not None
         orphan = config.orphans[ref]
         assert orphan.has_symlink
-        assert not orphan.has_unit_file
         assert config.cfg_status(ref) == "orphan"
 
     def test_destroy_orphans_unlinks_stray_alias(

@@ -411,20 +411,6 @@ class _JobCommon:
             priority=self._unit_priority,
         )
 
-    def normalized_unit_spec(self) -> crony.unit.UnitSpec:
-        """This node's UnitSpec rendered with blank (`Path("")`)
-        executable paths -- the path-independent form both graphs
-        normalize to for the drift compare. Mirrors `unit_spec` (a
-        disabled entry drops its timing) but bakes blank paths, so it is
-        buildable even for a node with no resolved executables."""
-        return _normalized_spec(
-            self.entity_name,
-            self.entity_ref,
-            None if self.unit_disabled else self.timing,
-            self._unit_priority,
-            self.guard_timeout,
-        )
-
     def with_unit_disabled(
         self, disabled: bool, platform: str | None = None
     ) -> Self:
@@ -1689,7 +1675,7 @@ class JobOrphan:
 
     - When a state-dir snapshot exists but can't be loaded (wrong
       schema, unrecognized kind, dataclass `TypeError`, unreadable
-      JSON), `reason` (and `source_path`) are set; `is_broken` is True
+      JSON), `reason` is set; `is_broken` is True
       and `crony status` reports `config=broken` -- re-apply territory.
       The `uuid` is the real state-dir uuid; `name` is recovered from
       `raw["name"]` when the JSON parsed far enough, else None.
@@ -1700,17 +1686,14 @@ class JobOrphan:
       repeat loads address the same entity -- with a unit and an alias
       under one name resolving to one ref.
 
-    `has_unit_file` / `has_symlink` flag which stray artifacts are
-    present (independently; some names carry both).
+    `has_symlink` flags whether a stray alias symlink is present.
     """
 
     bundle: str
     uuid: str
     name: str | None
-    has_unit_file: bool = False
     has_symlink: bool = False
     reason: str | None = None
-    source_path: Path | None = None
 
     @property
     def is_broken(self) -> bool:

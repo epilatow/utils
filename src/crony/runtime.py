@@ -366,7 +366,6 @@ def _build_current_graph(
                     uuid=uuid_dir.name,
                     name=None,
                     reason=f"snapshot.json unreadable: {exc}",
-                    source_path=snap_path,
                 )
                 continue
             raw_name = raw.get("name") if isinstance(raw, dict) else None
@@ -377,7 +376,6 @@ def _build_current_graph(
                     uuid=uuid_dir.name,
                     name=name_hint,
                     reason="snapshot.json is not a JSON object",
-                    source_path=snap_path,
                 )
                 continue
             if raw.get("schema") not in crony.snapshot.COMPAT_SNAPSHOT_SCHEMA:
@@ -390,7 +388,6 @@ def _build_current_graph(
                         f"snapshot schema {raw.get('schema')!r} "
                         f"not a supported version {supported}"
                     ),
-                    source_path=snap_path,
                 )
                 continue
             # Read the alias as it is on disk and pin it at construction
@@ -444,7 +441,6 @@ def _build_current_graph(
                     uuid=uuid_dir.name,
                     name=name_hint,
                     reason=f"snapshot conversion failed: {exc}",
-                    source_path=snap_path,
                 )
                 continue
             full = str(snap.entity_name)
@@ -575,7 +571,6 @@ def load_config() -> crony.model.Config:
             bundle=bundle_name,
             uuid=synthetic,
             name=full_name,
-            has_unit_file=has_unit,
             has_symlink=full_name in alias_names,
         )
         orphans[ref] = orphan
@@ -736,22 +731,6 @@ def _units_changing(
         if on_disk.get(u.filename) != u.content:
             return True
     return False
-
-
-def recover_full_name(state_dir: Path) -> str | None:
-    """Return the full namespaced name a state dir was last
-    applied under, or None when the snapshot is missing or
-    unreadable.
-    """
-    snap_p = state_dir / "snapshot.json"
-    if not snap_p.is_file():
-        return None
-    try:
-        raw = json.loads(snap_p.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
-        return None
-    name = raw.get("name")
-    return name if isinstance(name, str) else None
 
 
 def _read_symlink_pair(link: Path) -> tuple[Path, str] | None:

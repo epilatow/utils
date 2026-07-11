@@ -2497,23 +2497,6 @@ def _mask_reason(
     return ",".join(parts)
 
 
-def _entry_applies_here(
-    platforms: list[str],
-    hosts: _HostList,
-    *,
-    host: str,
-    platform: str,
-) -> bool:
-    """True if the entry's `platforms` / `hosts` allow this host.
-
-    Empty list = "applies everywhere" (the common case).
-    Non-empty = restricts selection to listed values. A non-match
-    on either axis filters the entry out at selection time;
-    apply / status then never see it on this host.
-    """
-    return _mask_reason(platforms, hosts, host=host, platform=platform) is None
-
-
 # Padding factor applied to a group's effective timeout. The 5%
 # slack lets a leaf job hit its own timeout (and propagate the
 # error up through last-run.json) before the parent group's own

@@ -319,8 +319,6 @@ def _cfg_status(
 # =============================================================================
 # Each handler's signature must match its argparse subparser's argument
 # `dest` names exactly; the shared CmdCallbacksBase test enforces this.
-# Handlers without behavior yet raise NotImplementedError so an
-# unfinished feature surfaces immediately rather than silently no-oping.
 
 
 def do_init(force: bool, bundle: str | None) -> None:
