@@ -24,6 +24,7 @@ from conftest_crony import (  # noqa: E402
     _isolate_home,  # noqa: E402, F401
     _job,
     _parse,
+    _resolve_snapshot_for,
 )
 
 from crony.config import (  # noqa: E402
@@ -47,7 +48,6 @@ from crony.model import (  # noqa: E402
     JobStatus,
     ScheduleValue,
     _JobCommon,
-    _resolve_snapshot_for,
     snapshot_from_dict,
 )
 from crony.platform import RenderedUnits  # noqa: E402

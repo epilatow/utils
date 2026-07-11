@@ -38,14 +38,41 @@ from crony.config import (  # noqa: E402
     TomlBundleConfig,
     TomlConfig,
 )
+from crony.errors import PreconditionError  # noqa: E402
 from crony.model import (  # noqa: E402
-    _resolve_snapshot_for,
+    Job,
+    JobGroup,
 )
 from crony.platform import (  # noqa: E402
     launchd,
     systemd,
 )
 from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
+from crony.unit import EntityName  # noqa: E402
+
+
+def _resolve_snapshot_for(
+    config: TomlBundleConfig,
+    short: str,
+    bundle_name: str = DEFAULT_BUNDLE_NAME,
+) -> Job | JobGroup:
+    """Resolve a Job / JobGroup from a TomlBundleConfig + short name.
+
+    Test convenience for model / runner tests that exercise a resolved
+    node without going through a full apply.
+    """
+    name = EntityName(bundle_name, short)
+    target = config.resolve_target()
+    if short in config.jobs:
+        flags = config.resolved_flags(short, target)
+        return Job.from_config(config, config.jobs[short], name, flags=flags)
+    if short in config.job_groups:
+        flags = config.resolved_flags(short, target)
+        return JobGroup.from_config(
+            config, target, config.job_groups[short], name, flags=flags
+        )
+    raise PreconditionError(f"unknown job/group: {short!r}")
+
 
 # Scratch namespace published to the crony test files. The runner
 # harness's `trigger_unit_sync` stub records each dispatched call on

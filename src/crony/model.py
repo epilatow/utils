@@ -1093,30 +1093,6 @@ def _resolve_script(script: str) -> Path:
     return p
 
 
-def _resolve_snapshot_for(
-    config: crony.config.TomlBundleConfig,
-    short: str,
-    bundle_name: str = crony.config.DEFAULT_BUNDLE_NAME,
-) -> Job | JobGroup:
-    """Resolve a snapshot for a single config entry by short name.
-
-    Convenience for callers that have a TomlBundleConfig + short name and
-    want the resolved snapshot in one step (apply pipeline + tests
-    that exercise the runner without going through full apply).
-    """
-    name = crony.unit.EntityName(bundle_name, short)
-    target = config.resolve_target()
-    if short in config.jobs:
-        flags = config.resolved_flags(short, target)
-        return Job.from_config(config, config.jobs[short], name, flags=flags)
-    if short in config.job_groups:
-        flags = config.resolved_flags(short, target)
-        return JobGroup.from_config(
-            config, target, config.job_groups[short], name, flags=flags
-        )
-    raise crony.errors.PreconditionError(f"unknown job/group: {short!r}")
-
-
 # =============================================================================
 # SNAPSHOT <-> NODE
 # =============================================================================

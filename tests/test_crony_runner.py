@@ -31,6 +31,7 @@ from conftest_crony import (  # noqa: E402
     _job,
     _ntfy_block,
     _parse,
+    _resolve_snapshot_for,
     _RunnerHarness,
     _stub_trigger_sync,
     crony,
@@ -59,7 +60,6 @@ from crony.model import (  # noqa: E402
     GroupChildResult,
     Job,
     _resolve_script,
-    _resolve_snapshot_for,
 )
 from crony.platform import (  # noqa: E402
     PidWait,
