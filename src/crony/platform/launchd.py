@@ -16,6 +16,8 @@ from pathlib import Path
 
 from crony.platform.scheduler import (
     UNIT_PREFIX,
+    RenderedUnit,
+    RenderedUnits,
     Scheduler,
     UnitLastExit,
 )
@@ -74,7 +76,7 @@ def render_plist(
 
     Serialized with `plistlib` so the XML is well-formed by
     construction (escaping, typed values, DOCTYPE); `sort_keys`
-    keeps the byte output deterministic for the drift check.
+    keeps the byte output deterministic across renders.
     """
     # launchd execs ProgramArguments[0] through xpcproxy, which
     # enforces AMFI launch constraints. uv ships ad-hoc-signed, and
@@ -188,19 +190,31 @@ class LaunchdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / "Library" / "LaunchAgents"
 
-    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
+    def render_units(self, spec: UnitSpec) -> RenderedUnits:
+        # One LaunchAgent plist carries both the command and the schedule
+        # keys, so the entity has a single unit slot.
         name = str(spec.name)
-        return Path(plist_filename(name)), render_plist(
-            name,
-            spec.cmd,
-            spec.timing,
-            spec.priority,
+        return RenderedUnits(
+            (
+                RenderedUnit(
+                    Path(plist_filename(name)),
+                    render_plist(name, spec.cmd, spec.timing, spec.priority),
+                ),
+            )
         )
 
-    def render_timer(self, _spec: UnitSpec) -> tuple[Path, str] | None:
-        # A LaunchAgent carries its own schedule keys in the plist; there
-        # is no separate timer unit.
-        return None
+    def config_filename(self, name: str) -> Path:
+        return Path(plist_filename(name))
+
+    def _discover_unit_files(self, name: str) -> list[Path]:
+        if not self.unit_dir.exists():
+            return []
+        prefix = f"{label(name)}."
+        return [
+            Path(p.name)
+            for p in self.unit_dir.iterdir()
+            if p.name.startswith(prefix) and p.name.endswith(".plist")
+        ]
 
     def installed_cmd(self, name: str) -> list[str] | None:
         p = self.unit_dir / plist_filename(name)
@@ -209,15 +223,6 @@ class LaunchdScheduler(Scheduler):
         except OSError:
             return None
         return _plist_argv(content)
-
-    def unit_config_path(self, name: str) -> Path | None:
-        p = self.unit_dir / plist_filename(name)
-        return p if p.is_file() else None
-
-    def unit_timer_path(self, _name: str) -> Path | None:
-        # A LaunchAgent carries its own schedule keys; there is no
-        # separate timer unit.
-        return None
 
     def dispatch_unit_path(self, name: str) -> Path:
         # launchctl kickstart targets the loaded plist by label.
@@ -337,7 +342,8 @@ class LaunchdScheduler(Scheduler):
 
     def remove_files(self, name: str) -> None:
         self.deactivate(name)
-        (self.unit_dir / plist_filename(name)).unlink(missing_ok=True)
+        for filename in self._discover_unit_files(name):
+            (self.unit_dir / filename).unlink(missing_ok=True)
 
     def verify(self) -> None:
         # launchd loads a logged-in user's agents automatically; there is
@@ -349,9 +355,14 @@ class LaunchdScheduler(Scheduler):
         subprocess.run(["launchctl", "kickstart", self._gui(name)], check=True)
 
     def prune_units(self, name: str, keep: set[str]) -> None:
-        # One plist per name, which render always produces, so there is
-        # normally nothing to prune.
-        fn = plist_filename(name)
-        if fn not in keep:
-            self.deactivate(name)
-            (self.unit_dir / fn).unlink(missing_ok=True)
+        # Remove every discovered plist not in `keep`. The config plist
+        # render always produces, so normally nothing is pruned; a stale
+        # file from an old naming scheme is found and cleaned. Unloading
+        # the label first covers the config plist (the loaded unit).
+        config = str(self.config_filename(name))
+        for filename in self._discover_unit_files(name):
+            if str(filename) in keep:
+                continue
+            if str(filename) == config:
+                self.deactivate(name)
+            (self.unit_dir / filename).unlink(missing_ok=True)

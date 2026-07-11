@@ -117,8 +117,6 @@ _STALE_FIELD_LABELS: dict[str, str] = {
     "timeout": "job-timeout-sec",
     "interactive_active_sec": "interactive-active",
     "interactive_delay_sec": "interactive-delay",
-    "unit_config_normalized": "unit-config-1",
-    "unit_timer_normalized": "unit-config-2",
 }
 
 
@@ -136,12 +134,13 @@ def _stale_fields(
     field falls back to its dash-spelled attribute (`snapshot_schema` ->
     `snapshot-schema`, `state_dir_symlink` -> `state-dir-symlink`). The
     `flags` bitmask is expanded to the individual capability flags that
-    changed (e.g. `keep-awake`) rather than the field name. A dead
-    schedule reports `unit-armed` -- so a `broken` dead-timer entry, whose
-    content is otherwise synced, still says why it broke. Empty for a
-    synced entry, or a verdict with no current snapshot to diff (a
-    missing / unparseable remnant). A kind flip between job and group
-    reports `kind`.
+    changed (e.g. `keep-awake`), and `rendered_units` to the per-unit
+    labels that drifted (`unit-config-1` / `unit-config-2`), rather than
+    the field name. A dead schedule reports `unit-armed` -- so a `broken`
+    dead-timer entry, whose content is otherwise synced, still says why it
+    broke. Empty for a synced entry, or a verdict with no current snapshot
+    to diff (a missing / unparseable remnant). A kind flip between job and
+    group reports `kind`.
     """
     parts: list[str] = []
     if pending is not None and current is not None:
@@ -157,6 +156,12 @@ def _stale_fields(
                         m.token
                         for m in crony.config.JobFlags.members()
                         if (m in pv) != (m in cv)
+                    )
+                elif f.name == "rendered_units":
+                    parts.extend(
+                        _UNIT_SLOT_LABELS[i]
+                        for i in crony.model.rendered_drifted_indices(pv, cv)
+                        if i < len(_UNIT_SLOT_LABELS)
                     )
                 else:
                     parts.append(
@@ -1308,6 +1313,17 @@ class StatusCols(StrEnum):
     TIMEOUT = "timeout"
     PRIORITY = "priority"
     STALE = "stale"
+
+
+# Display labels for the platform's ordered rendered-unit slots, assigned
+# by position (the platform carries no labels): slot 0 is the config /
+# service unit, slot 1 the schedule-arming companion. `crony status` maps
+# a drifted slot index onto these for the STALE column and the per-unit
+# path columns' divergence marker.
+_UNIT_SLOT_LABELS: tuple[str, ...] = (
+    StatusCols.UNIT_CONFIG_1.value,
+    StatusCols.UNIT_CONFIG_2.value,
+)
 
 
 # Documentation entry for the per-flag column family (one opt-in
@@ -2515,12 +2531,14 @@ def do_status(
             job_or_uuid_cell = display_name
         uuid_cell = str(row_ref) if row_ref is not None else ""
         # `unit-config-1` / `unit-config-2`: the platform unit paths captured
-        # at load time (uuid-keyed RuntimeState). Empty for entries with
-        # no runtime, and unit-config-2 is empty where the platform has no
-        # separate timer unit / for an unscheduled entry.
+        # at load time (uuid-keyed RuntimeState), read positionally from
+        # the ordered per-unit view. Empty for entries with no runtime, and
+        # unit-config-2 is empty where the backend installs no second unit
+        # (launchd) / for an unscheduled entry.
         rt = config.runtime.get(row_ref) if row_ref is not None else None
-        unit_config_cell = str(rt.unit_config) if rt and rt.unit_config else ""
-        unit_timer_cell = str(rt.unit_timer) if rt and rt.unit_timer else ""
+        views = rt.unit_paths if rt is not None else []
+        unit_1_cell = str(views[0]) if len(views) > 0 and views[0] else ""
+        unit_2_cell = str(views[1]) if len(views) > 1 and views[1] else ""
         # Flag the specific unit file whose install drifted from the
         # snapshot (re-apply re-renders it), mirroring the `stale`
         # column's `unit-config-1` / `unit-config-2` tokens. Drift is the
@@ -2528,18 +2546,16 @@ def do_status(
         # nodes; an orphan / broken / pending-only row lacks one side and
         # goes unflagged.
         if pending_node is not None and current_node is not None:
-            if (
-                unit_config_cell
-                and pending_node.unit_config_normalized
-                != current_node.unit_config_normalized
-            ):
-                unit_config_cell = f"{unit_config_cell}{_DIVERGENCE_MARKER}"
-            if (
-                unit_timer_cell
-                and pending_node.unit_timer_normalized
-                != current_node.unit_timer_normalized
-            ):
-                unit_timer_cell = f"{unit_timer_cell}{_DIVERGENCE_MARKER}"
+            drifted = set(
+                crony.model.rendered_drifted_indices(
+                    pending_node.rendered_units,
+                    current_node.rendered_units,
+                )
+            )
+            if unit_1_cell and 0 in drifted:
+                unit_1_cell = f"{unit_1_cell}{_DIVERGENCE_MARKER}"
+            if unit_2_cell and 1 in drifted:
+                unit_2_cell = f"{unit_2_cell}{_DIVERGENCE_MARKER}"
         # `log-file`: the reported log path, read off each side's node
         # via the same `log_path` accessor `crony logs` uses. Dual-
         # source, so a not-yet-applied rename flags `^`. An orphan row
@@ -2617,8 +2633,8 @@ def do_status(
             StatusCols.MASKED_BY: mask_reason,
             StatusCols.UNIT_NAME: unit_name,
             StatusCols.UUID: uuid_cell,
-            StatusCols.UNIT_CONFIG_1: unit_config_cell,
-            StatusCols.UNIT_CONFIG_2: unit_timer_cell,
+            StatusCols.UNIT_CONFIG_1: unit_1_cell,
+            StatusCols.UNIT_CONFIG_2: unit_2_cell,
             StatusCols.LOG_FILE: log_file_cell,
             StatusCols.FLAGS: ",".join(flags_summary_parts),
             StatusCols.TIMEOUT: timeout_cell,

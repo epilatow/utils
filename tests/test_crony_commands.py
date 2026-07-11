@@ -2961,12 +2961,23 @@ class TestStatusFieldColumns:
         assert d(jnode, None) == ""
         assert d(jnode, gnode) == "kind"  # job vs group
         assert d(jnode, jnode) == ""  # identical snapshots
-        # The normalized units are ordinary compared fields, so a
-        # divergent one reports `unit-config-1` / `unit-config-2`.
-        cfg_drift = dataclasses.replace(jnode, unit_config_normalized="edited")
+        # The opaque rendered_units field expands to the per-unit labels
+        # that drifted (`unit-config-1` / `unit-config-2`).
+        cfg_drift = dataclasses.replace(
+            jnode,
+            rendered_units=crony_platform.RenderedUnits(
+                (crony_platform.RenderedUnit(Path("f1"), "edited"),)
+            ),
+        )
         assert d(jnode, cfg_drift) == "unit-config-1"
         both = dataclasses.replace(
-            jnode, unit_config_normalized="x", unit_timer_normalized="y"
+            jnode,
+            rendered_units=crony_platform.RenderedUnits(
+                (
+                    crony_platform.RenderedUnit(Path("f1"), "x"),
+                    crony_platform.RenderedUnit(Path("f2"), "y"),
+                )
+            ),
         )
         assert d(jnode, both) == "unit-config-1,unit-config-2"
         # A snapshot-format bump labels as `snapshot-schema`, not `schema`.
@@ -6278,7 +6289,7 @@ class TestUnitOnlyOrphan:
         assert config2.orphans_by_full_name["default.ghost"] == ref
         # The platform unit path is captured in RuntimeState.
         rt = config.runtime[ref]
-        assert rt.unit_config == plist
+        assert rt.unit_paths[0] == plist
         # `cfg_status` reports orphan, not broken / synced /
         # stale.
         assert config.cfg_status(ref) == "orphan"
@@ -6313,9 +6324,10 @@ class TestUnitOnlyOrphan:
         assert ref is not None
         assert config.cfg_status(ref) == "orphan"
         rt = config.runtime[ref]
-        # The orphan is the timer with no config unit on disk.
-        assert rt.unit_timer == timer
-        assert rt.unit_config is None
+        # The orphan is the timer (unit-config-2) with no config unit
+        # (unit-config-1) on disk.
+        assert rt.unit_paths[0] is None
+        assert rt.unit_paths[1] == timer
 
     def test_destroy_wipes_stray_timer_by_name(
         self, tmp_path: Path, monkeypatch: Any
@@ -6418,8 +6430,8 @@ class TestAliasOrphan:
 class TestStatusUnitConfigColumn:
     """`crony status --cols ...,unit-config-1,unit-config-2` shows the on-disk
     paths of the platform config / timer units. The cell values come
-    from `RuntimeState.unit_config` / `unit_timer` so subcommands don't
-    re-walk the unit dirs themselves.
+    from `RuntimeState.unit_paths` (the platform's ordered per-unit view)
+    so subcommands don't re-walk the unit dirs themselves.
     """
 
     def test_unit_config_renders_plist_path(

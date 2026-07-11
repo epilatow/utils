@@ -1,6 +1,6 @@
 # This is AI generated code
 
-"""The platform scheduler abstraction.
+"""The platform scheduler layer.
 
 crony manages each entity as a per-platform scheduler unit: a launchd
 LaunchAgent plist on macOS, a systemd `.service` (plus a `.timer` for
@@ -8,6 +8,33 @@ scheduled entries) on Linux. The `Scheduler` interface hides that split
 behind one API over `UnitSpec`; `crony.platform.launchd` and
 `crony.platform.systemd` implement it, and `get_scheduler` picks one for
 the running host.
+
+This layer translates one entity's platform-neutral `UnitSpec` into a
+specific host scheduler's unit files and live state, and reports back
+what that scheduler currently holds. Its whole responsibility, and its
+whole vocabulary:
+
+  - render a `UnitSpec` into unit file(s) (filename + content);
+  - write, load, reload, trigger, and remove those files with the
+    scheduler;
+  - read back what is on disk and what the scheduler reports (paths,
+    content, loaded / armed state, last exit).
+
+It works from exactly two inputs -- the single `UnitSpec` it is handed,
+and what it reads from the scheduler and disk -- and that is the entire
+allowed surface. If a task needs anything beyond it, the task does not
+belong here.
+
+Concretely, this layer never decides whether one state matches, or
+should differ from, another: it renders one spec, or reports one on-disk
+/ scheduler fact, at a time. The types it defines are plain data
+carriers; they hold no method that judges one instance against another
+or decides whether two states match. (Their frozen-dataclass value
+equality is fine -- a caller may compare two of them with `==`; what that
+equality *means* is decided above this layer.) Any "does A match B /
+should this change" question is answered above this layer, which hands
+this layer a finished `UnitSpec` and interprets whatever this layer
+reports.
 """
 
 import abc
@@ -22,6 +49,32 @@ from crony.unit import UnitSpec
 # how the entry script is invoked, and is deliberately not derived from
 # the script filename.
 UNIT_PREFIX = "crony"
+
+
+@dataclass(frozen=True)
+class RenderedUnit:
+    """One platform unit -- its bare `filename` and its `content`. Both a
+    `render_units` unit and an `ondisk_units` unit carry real content (a
+    fresh render, or a file's bytes): a `RenderedUnit` exists only where
+    there is something, so an absent file has no unit rather than an empty
+    one. A plain data holder; the backend fills it, and what a unit's
+    content means (a fresh render, a normalized form) is the caller's
+    concern, not this layer's."""
+
+    filename: Path
+    content: str
+
+
+@dataclass(frozen=True)
+class RenderedUnits:
+    """An ordered set of `RenderedUnit`s for one crony entity, config unit
+    first. A plain data holder: callers read `.units`. `render_units`
+    emits only the units the spec actually produces (a systemd `.timer`
+    is present only for a scheduled entry); `ondisk_units` emits one per
+    file actually present. A caller relating a render to disk aligns the
+    two by `filename`."""
+
+    units: tuple[RenderedUnit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -73,35 +126,90 @@ class Scheduler(abc.ABC):
         """The backend's standard on-disk unit directory under the
         user's home. Used when no explicit dir is given."""
 
-    def render(self, spec: UnitSpec) -> dict[str, str]:
-        """`{filename: content}` for `spec`'s platform units, composed
-        from `render_config` plus `render_timer`.
-
-        Embeds `spec.cmd` as the unit's command and adds the schedule /
-        priority directives. Callers that need one unit specifically
-        reach for `render_config` / `render_timer` directly rather than
-        re-splitting this dict by filename.
-        """
-        fname, content = self.render_config(spec)
-        units = {str(fname): content}
-        timer = self.render_timer(spec)
-        if timer is not None:
-            units[str(timer[0])] = timer[1]
-        return units
+    @abc.abstractmethod
+    def render_units(self, spec: UnitSpec) -> RenderedUnits:
+        """`spec`'s platform units, in slot order (the config / service
+        unit first, the companion next where the backend has one) -- only
+        the slots this spec actually produces, each carrying a real render
+        (a systemd `.timer` is included only for a scheduled entry). Each
+        `content` is the render of `spec` for that unit, with whatever
+        executable paths `spec.cmd` carries. To relate a render to what is
+        on disk, align by `filename` against `ondisk_units`."""
 
     @abc.abstractmethod
-    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
-        """The (filename, content) of `spec`'s config unit -- the one
-        that defines and runs the job (systemd `.service`, launchd
-        plist). Always present. `filename` is the bare basename; the
-        caller joins it onto the unit dir."""
+    def config_filename(self, name: str) -> Path:
+        """`name`'s primary (config / service) unit filename -- the one
+        unit every entity has, independent of schedule or companions. The
+        on-disk views lead with it when it is present; the model reads its
+        presence as `unit_config_exists`."""
 
     @abc.abstractmethod
-    def render_timer(self, spec: UnitSpec) -> tuple[Path, str] | None:
-        """The (filename, content) of `spec`'s schedule-arming timer unit
-        (systemd `.timer`), or None when the backend has no separate
-        timer (launchd embeds the schedule in the config unit) or `spec`
-        is unscheduled."""
+    def _discover_unit_files(self, name: str) -> list[Path]:
+        """Every crony unit file for `name` currently on disk, in any
+        order. A backend finds them by matching its filename namespace for
+        `name` -- `<label>.<*>` -- not by enumerating a fixed slot list, so
+        a leftover from a renamed companion scheme (an unknown suffix) is
+        still found and can be cleaned. The dotted-prefix naming rule is
+        what makes that namespace match only this entity's files."""
+
+    def ondisk_units(self, name: str) -> RenderedUnits:
+        """`name`'s on-disk units: one `RenderedUnit` per file actually
+        present (the config unit first, then the discovered rest sorted),
+        each carrying its file content. A pure disk read -- the on-disk
+        counterpart to `render_units` -- with no comparison; the caller
+        relates it to a render by `filename`. An absent file has no unit."""
+        units: list[RenderedUnit] = []
+        for filename in self._ondisk_slots(name):
+            path = self.unit_dir / filename
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                # Vanished between discovery and read -- treat as absent.
+                continue
+            units.append(RenderedUnit(filename, content))
+        return RenderedUnits(tuple(units))
+
+    def unit_paths(self, name: str) -> tuple[Path | None, ...]:
+        """`name`'s on-disk unit paths in slot order: the config unit
+        first (its path, or None when absent), then every other discovered
+        file sorted. A plain locate of the unit dir -- no content read, no
+        comparison. Keeping the config slot lets status anchor it in the
+        first path column even when its file is gone; the caller decides
+        what to do with the paths."""
+        paths: list[Path | None] = []
+        for filename in self._ondisk_slots(name):
+            path = self.unit_dir / filename
+            paths.append(path if path.is_file() else None)
+        return tuple(paths)
+
+    def _ondisk_slots(self, name: str) -> list[Path]:
+        """The on-disk-view slot order shared by `ondisk_units` and
+        `unit_paths`: the config unit first (always, so `unit_paths` can
+        anchor it in the first display column even when its file is
+        absent), then every other discovered file sorted. `ondisk_units`
+        skips a slot whose file is absent (present-only content);
+        `unit_paths` reports None for it."""
+        config = self.config_filename(name)
+        rest = sorted(f for f in self._discover_unit_files(name) if f != config)
+        return [config, *rest]
+
+    def install(self, spec: UnitSpec, *, activate: bool = True) -> None:
+        """Write `spec`'s live unit files, prune any stale unit files a
+        prior install left that this spec no longer produces, and -- when
+        `activate` -- load / re-arm every unit together so none carries a
+        stale anchor. All files are written before any reload. `activate`
+        is False only for a self-reload that fell through because the unit
+        did not change (reloading would kill the running job for nothing).
+        Whether the entry arms a schedule is `spec.timing is not None` --
+        `unit_spec` already drops the timing for a disabled entry."""
+        rendered = self.render_units(spec)
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        keep = {str(u.filename) for u in rendered.units}
+        self.prune_units(str(spec.name), keep)
+        for u in rendered.units:
+            (self.unit_dir / u.filename).write_text(u.content, encoding="utf-8")
+        if activate:
+            self.activate(str(spec.name), scheduled=spec.timing is not None)
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:
@@ -111,18 +219,6 @@ class Scheduler(abc.ABC):
 
         The inverse of the `spec.cmd` embedding `render` performs.
         """
-
-    @abc.abstractmethod
-    def unit_config_path(self, name: str) -> Path | None:
-        """The on-disk config unit file backing `name` -- the unit that
-        defines and runs the job (systemd `.service`, launchd plist) --
-        or None if absent."""
-
-    @abc.abstractmethod
-    def unit_timer_path(self, name: str) -> Path | None:
-        """The on-disk timer unit that arms `name`'s schedule (systemd
-        `.timer`), or None when the backend has no separate timer
-        (launchd) or the entry is unscheduled."""
 
     @abc.abstractmethod
     def dispatch_unit_path(self, name: str) -> Path:
@@ -220,5 +316,5 @@ class Scheduler(abc.ABC):
     def prune_units(self, name: str, keep: set[str]) -> None:
         """Remove `name`'s installed unit files not in `keep` (disabling
         them first) -- e.g. an orphaned `.timer` after a scheduled ->
-        unscheduled transition. `keep` is the filename set `render`
-        currently produces."""
+        unscheduled transition. `keep` is the filename set `install`
+        currently writes."""

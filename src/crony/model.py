@@ -14,8 +14,13 @@ crony.snapshot.
 The model does no I/O of its own: no disk reads, no locks, no live
 scheduler-state queries -- those live in crony.runtime. It may render
 platform units through crony.platform (a pure string transform of an
-already-resolved entry), which it uses to bake each node's normalized
-config / timer units for the `config=stale` comparison.
+already-resolved entry), which it uses to bake each node's opaque
+`rendered_units` for the `config=stale` comparison: a pending node from
+the platform render alone, a current node from that render scored
+against the on-disk unit contents crony.runtime reads and hands in. The
+config-vs-reality drift concept (which units differ, which are missing)
+is the model's -- the platform layer only renders and reads, never
+compares.
 """
 
 import dataclasses
@@ -142,39 +147,30 @@ def exec_path_strings(argv: list[str]) -> tuple[str | None, str | None]:
     return uv, crony
 
 
-def _render_normalized_units(
-    platform: str | None,
+def _normalized_spec(
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
     timing: crony.unit.Timing | None,
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
-    *,
-    uv: Path,
-    crony_path: Path,
-) -> tuple[str, str | None]:
-    """Render the entry's (config unit content, timer unit content) with
-    the given uv / crony executable paths.
-
-    The model renders through the platform layer (no disk I/O); a
-    config-built node renders with blank (`Path("")`) paths so the
-    normalized form is path-independent -- a moved-but-present binary
-    collapses to the same content as the live one. `platform` defaults
-    to the running host's when omitted so tests can force a backend. The
-    scheduler reports the two units separately, so the model never needs
-    to know how a backend names them. Timer is None when the backend has
-    no separate timer (launchd) or the entry is unscheduled.
-    """
-    sched = crony.platform.get_scheduler(
-        platform or crony.platform.current_platform()
-    )
-    cmd = _guarded_argv(uv, crony_path, ref, guard_timeout)
-    spec = crony.unit.UnitSpec(
+) -> crony.unit.UnitSpec:
+    """A UnitSpec with blank (`Path("")`) executable paths -- the
+    path-independent form both graphs normalize to for the drift compare.
+    Rendering it drops any dependence on where the uv / crony binaries
+    live, so a moved-but-present binary collapses to the same content as
+    the live one and does not read as drift. Buildable even for a node
+    with no resolved executables."""
+    cmd = _guarded_argv(Path(""), Path(""), ref, guard_timeout)
+    return crony.unit.UnitSpec(
         name=name, cmd=cmd, timing=timing, priority=priority
     )
-    _, config = sched.render_config(spec)
-    timer = sched.render_timer(spec)
-    return config, timer[1] if timer is not None else None
+
+
+# The empty RenderedUnits a node carries until a graph fills it in: a
+# config-built node has its pending units rendered onto it, and the
+# current-graph scan stamps the on-disk view. A node only ever read
+# (a bare snapshot load) keeps this -- it has no units to compare.
+_EMPTY_RENDERED_UNITS = crony.platform.RenderedUnits(())
 
 
 @dataclass(frozen=True)
@@ -249,19 +245,20 @@ class _JobCommon:
     # never serialized. Keyword-only.
     uv_path: Path | None = field(default=None, compare=False, kw_only=True)
     crony_path: Path | None = field(default=None, compare=False, kw_only=True)
-    # The entry's platform units (config: launchd plist / systemd
-    # `.service`; timer: systemd `.timer`) rendered with blank uv / crony
-    # executable paths, or None when the on-disk unit is absent or
-    # diverges from what its own embedded paths would render. A pending
-    # node carries what `render` would produce; the current graph carries
-    # the blank-path render only when the install matches, else None. The
-    # blank-path normalization makes the form independent of where the
-    # binaries live, so a moved-but-present binary doesn't read as drift.
-    # Compared in `==` so a hand-edited / drifted unit surfaces as
-    # `config=stale` through the same snapshot comparison as any field
-    # difference. Derived, never serialized. Keyword-only.
-    unit_config_normalized: str | None = field(default=None, kw_only=True)
-    unit_timer_normalized: str | None = field(default=None, kw_only=True)
+    # The entry's platform units as one opaque, comparable value, holding
+    # each unit's normalized (blank-path) content. A pending node carries
+    # what the platform would render; the current graph carries the
+    # on-disk view (blank render where the install reproduces the file,
+    # else the file as-is). The blank-path normalization makes the form
+    # independent of where the binaries live, so a moved-but-present
+    # binary doesn't read as drift. Compared in `==` so a hand-edited /
+    # drifted / missing unit surfaces as `config=stale` through the same
+    # snapshot comparison as any field difference -- the model compares it
+    # wholesale and never names or counts the individual units. Derived,
+    # never serialized. Keyword-only.
+    rendered_units: crony.platform.RenderedUnits = field(
+        default=_EMPTY_RENDERED_UNITS, kw_only=True
+    )
     # Live on-disk / scheduler facts the current graph pins so
     # `cfg_status` can tell `broken` from `missing` for a unit whose
     # file is gone: whether the config unit (launchd plist / systemd
@@ -414,28 +411,38 @@ class _JobCommon:
             priority=self._unit_priority,
         )
 
+    def normalized_unit_spec(self) -> crony.unit.UnitSpec:
+        """This node's UnitSpec rendered with blank (`Path("")`)
+        executable paths -- the path-independent form both graphs
+        normalize to for the drift compare. Mirrors `unit_spec` (a
+        disabled entry drops its timing) but bakes blank paths, so it is
+        buildable even for a node with no resolved executables."""
+        return _normalized_spec(
+            self.entity_name,
+            self.entity_ref,
+            None if self.unit_disabled else self.timing,
+            self._unit_priority,
+            self.guard_timeout,
+        )
+
     def with_unit_disabled(
         self, disabled: bool, platform: str | None = None
     ) -> Self:
         """A copy with `unit_disabled` set and its normalized units
-        re-rendered (blank paths) for the resulting schedule shape, so a
-        pending node mirrored onto a disabled current node reads
-        `synced` rather than stale."""
-        node = dataclasses.replace(self, unit_disabled=disabled)
-        config, timer = _render_normalized_units(
-            platform,
-            node.entity_name,
-            node.entity_ref,
-            None if disabled else node.timing,
-            node._unit_priority,
-            node.guard_timeout,
-            uv=Path(""),
-            crony_path=Path(""),
-        )
+        re-rendered for the resulting schedule shape, so a pending node
+        mirrored onto a disabled current node reads `synced` rather than
+        stale."""
         return dataclasses.replace(
-            node,
-            unit_config_normalized=config,
-            unit_timer_normalized=timer,
+            self,
+            unit_disabled=disabled,
+            rendered_units=_pending_rendered_units(
+                platform,
+                self.entity_name,
+                self.entity_ref,
+                None if disabled else self.timing,
+                self._unit_priority,
+                self.guard_timeout,
+            ),
         )
 
     def _schedule_str(self) -> str | None:
@@ -612,15 +619,13 @@ class Job(_JobCommon):
         priority = config.resolved_priority(job)
         timeout = config.resolved_job_timeout_sec(job)
         interactive = crony.config.JobFlags.INTERACTIVE in flags
-        norm_config, norm_timer = _render_normalized_units(
+        rendered_units = _pending_rendered_units(
             platform,
             name,
             crony.unit.EntityRef(name.bundle, job.uuid),
             job.timing,
             priority,
             0 if interactive else timeout,
-            uv=Path(""),
-            crony_path=Path(""),
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -643,8 +648,7 @@ class Job(_JobCommon):
             flags=flags,
             uv_path=uv_path,
             crony_path=crony_path,
-            unit_config_normalized=norm_config,
-            unit_timer_normalized=norm_timer,
+            rendered_units=rendered_units,
             success_exit_codes=list(job.success_exit_codes),
             interactive_active_sec=(
                 job.interactive_active_sec
@@ -694,8 +698,7 @@ class Job(_JobCommon):
         state_dir_symlink: tuple[Path, str] | None = None,
         fda_wrapper: FDAWrapper | None = None,
         platform: str | None = None,
-        unit_config_disk: str | None = None,
-        unit_timer_disk: str | None = None,
+        ondisk_units: crony.platform.RenderedUnits = _EMPTY_RENDERED_UNITS,
         installed_uv: Path | None = None,
         installed_crony: Path | None = None,
         unit_loaded: bool = False,
@@ -704,7 +707,10 @@ class Job(_JobCommon):
         """Build a Job from its on-disk snapshot model, parsing the typed
         value-object fields back from their source strings, plus the
         derived runtime state the caller probed (see `snapshot_from_dict`
-        for what the current-graph scan supplies)."""
+        for what the current-graph scan supplies). `ondisk_units` is the
+        units the caller read from disk -- one per file present; the
+        node's `rendered_units` and `unit_config_exists` are derived from
+        it here (empty for a bare load that does no drift compare)."""
         en = snap.entity_name()
         timing = snap.timing()
         flags = snap.job_flags()
@@ -713,18 +719,18 @@ class Job(_JobCommon):
         # that reproduces the on-disk file must drop the timing too.
         eff_timing = None if snap.unit_disabled else timing
         interactive = crony.config.JobFlags.INTERACTIVE in flags
-        config_norm, timer_norm = _current_normalized(
-            name=en,
-            ref=snap.entity_ref(),
-            eff_timing=eff_timing,
-            priority=priority,
-            guard_timeout=0 if interactive else snap.timeout,
-            platform=platform,
-            unit_config_disk=unit_config_disk,
-            unit_timer_disk=unit_timer_disk,
-            installed_uv=installed_uv,
-            installed_crony=installed_crony,
+        rendered_units = _current_rendered_units(
+            platform,
+            en,
+            snap.entity_ref(),
+            eff_timing,
+            priority,
+            0 if interactive else snap.timeout,
+            ondisk_units,
+            installed_uv,
+            installed_crony,
         )
+        unit_config_exists = _unit_config_exists(platform, en, ondisk_units)
         return cls(
             snapshot_schema=snap.snapshot_schema,
             kind=snap.kind,
@@ -751,9 +757,8 @@ class Job(_JobCommon):
             fda_wrapper=cls._fda_wrapper_for(flags, fda_wrapper),
             uv_path=installed_uv,
             crony_path=installed_crony,
-            unit_config_normalized=config_norm,
-            unit_timer_normalized=timer_norm,
-            unit_config_exists=unit_config_disk is not None,
+            rendered_units=rendered_units,
+            unit_config_exists=unit_config_exists,
             unit_loaded=unit_loaded,
             unit_armed=unit_armed,
             state_dir_symlink=state_dir_symlink,
@@ -835,15 +840,13 @@ class JobGroup(_JobCommon):
         if flags is None:
             flags = config.composed_flags(group.flags)
         timeout = config.resolved_group_timeout_sec(target, group.name)
-        norm_config, norm_timer = _render_normalized_units(
+        rendered_units = _pending_rendered_units(
             platform,
             name,
             crony.unit.EntityRef(name.bundle, group.uuid),
             group.timing,
             crony.unit.PriorityClass.NORMAL,
             timeout,
-            uv=Path(""),
-            crony_path=Path(""),
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -859,8 +862,7 @@ class JobGroup(_JobCommon):
             flags=flags,
             uv_path=uv_path,
             crony_path=crony_path,
-            unit_config_normalized=norm_config,
-            unit_timer_normalized=norm_timer,
+            rendered_units=rendered_units,
         )
 
     def to_snapshot(self) -> crony.snapshot.GroupSnapshot:
@@ -889,8 +891,7 @@ class JobGroup(_JobCommon):
         *,
         state_dir_symlink: tuple[Path, str] | None = None,
         platform: str | None = None,
-        unit_config_disk: str | None = None,
-        unit_timer_disk: str | None = None,
+        ondisk_units: crony.platform.RenderedUnits = _EMPTY_RENDERED_UNITS,
         installed_uv: Path | None = None,
         installed_crony: Path | None = None,
         unit_loaded: bool = False,
@@ -898,23 +899,26 @@ class JobGroup(_JobCommon):
     ) -> JobGroup:
         """Build a JobGroup from its on-disk snapshot model plus the
         derived runtime state the caller probed (see `snapshot_from_dict`
-        for what the current-graph scan supplies)."""
+        for what the current-graph scan supplies). `ondisk_units` is the
+        units the caller read from disk -- one per file present; the
+        node's `rendered_units` and `unit_config_exists` are derived from
+        it here (empty for a bare load that does no drift compare)."""
         en = snap.entity_name()
         timing = snap.timing()
         flags = snap.job_flags()
         eff_timing = None if snap.unit_disabled else timing
-        config_norm, timer_norm = _current_normalized(
-            name=en,
-            ref=snap.entity_ref(),
-            eff_timing=eff_timing,
-            priority=crony.unit.PriorityClass.NORMAL,
-            guard_timeout=snap.timeout,
-            platform=platform,
-            unit_config_disk=unit_config_disk,
-            unit_timer_disk=unit_timer_disk,
-            installed_uv=installed_uv,
-            installed_crony=installed_crony,
+        rendered_units = _current_rendered_units(
+            platform,
+            en,
+            snap.entity_ref(),
+            eff_timing,
+            crony.unit.PriorityClass.NORMAL,
+            snap.timeout,
+            ondisk_units,
+            installed_uv,
+            installed_crony,
         )
+        unit_config_exists = _unit_config_exists(platform, en, ondisk_units)
         return cls(
             snapshot_schema=snap.snapshot_schema,
             kind=snap.kind,
@@ -929,13 +933,157 @@ class JobGroup(_JobCommon):
             unit_disabled=snap.unit_disabled,
             uv_path=installed_uv,
             crony_path=installed_crony,
-            unit_config_normalized=config_norm,
-            unit_timer_normalized=timer_norm,
-            unit_config_exists=unit_config_disk is not None,
+            rendered_units=rendered_units,
+            unit_config_exists=unit_config_exists,
             unit_loaded=unit_loaded,
             unit_armed=unit_armed,
             state_dir_symlink=state_dir_symlink,
         )
+
+
+def _pending_rendered_units(
+    platform: str | None,
+    name: crony.unit.EntityName,
+    ref: crony.unit.EntityRef,
+    timing: crony.unit.Timing | None,
+    priority: crony.unit.PriorityClass,
+    guard_timeout: int,
+) -> crony.platform.RenderedUnits:
+    """The normalized `RenderedUnits` for a config-built (pending) node:
+    the platform render of the entry's blank-path unit spec, so the form
+    is path-independent (a moved-but-present binary is not drift). The
+    config unit renders first, matching a current node's on-disk view, so
+    the two relate slot-for-slot and any extra on-disk file (a leftover)
+    surfaces as a trailing difference. Pure (no disk I/O); `platform`
+    defaults to the running host's."""
+    sched = crony.platform.get_scheduler(
+        platform or crony.platform.current_platform()
+    )
+    return sched.render_units(
+        _normalized_spec(name, ref, timing, priority, guard_timeout)
+    )
+
+
+def _current_rendered_units(
+    platform: str | None,
+    name: crony.unit.EntityName,
+    ref: crony.unit.EntityRef,
+    timing: crony.unit.Timing | None,
+    priority: crony.unit.PriorityClass,
+    guard_timeout: int,
+    ondisk_units: crony.platform.RenderedUnits,
+    installed_uv: Path | None,
+    installed_crony: Path | None,
+) -> crony.platform.RenderedUnits:
+    """The normalized `RenderedUnits` for a current (applied) node, scored
+    against what is on disk. The model owns this compare; the platform
+    only renders and reads. The result follows `ondisk_units`' order
+    (config unit first, then the discovered rest sorted), so it aligns
+    with a pending node's render by filename.
+
+    Each present on-disk unit, matched to a render by filename: the
+    blank-path normalized render when a render with the installed uv /
+    crony paths reproduces the on-disk file (so it equals the pending
+    node's unit and reads synced); else the on-disk content as-is -- a
+    hand-edit, a schema drift, a gone binary, or a leftover the render no
+    longer produces (a stale `.timer` after a scheduled -> unscheduled
+    transition) all read as drift. `installed_uv` / `installed_crony` are
+    None when a baked binary is gone, so no installed-path render is
+    possible and any present unit reads as drift.
+
+    `ondisk_units` empty is a bare load with no disk view (the runner
+    reading its own snapshot): there is nothing to score, so the node
+    carries no units to compare."""
+    if not ondisk_units.units:
+        return _EMPTY_RENDERED_UNITS
+    sched = crony.platform.get_scheduler(
+        platform or crony.platform.current_platform()
+    )
+    normalized_units = {
+        u.filename: u.content
+        for u in sched.render_units(
+            _normalized_spec(name, ref, timing, priority, guard_timeout)
+        ).units
+    }
+    # `comparison_units` renders with the installed (on-disk) uv / crony
+    # paths. It is only a yardstick for the synced test below and is never
+    # stored: unlike the pending node's units (rendered with blank paths
+    # so a moved-but-present binary is not drift), it is what a clean
+    # on-disk unit should byte-match, so an on-disk file equal to it is a
+    # faithful install of this entry.
+    comparison_units: dict[Path, str] = {}
+    if installed_uv is not None and installed_crony is not None:
+        cmd = _guarded_argv(installed_uv, installed_crony, ref, guard_timeout)
+        comparison_units = {
+            u.filename: u.content
+            for u in sched.render_units(
+                crony.unit.UnitSpec(
+                    name=name, cmd=cmd, timing=timing, priority=priority
+                )
+            ).units
+        }
+    # Score each present on-disk unit by filename: one `comparison_units`
+    # reproduces is synced (pin the path-independent `normalized_units`
+    # form); anything else -- a hand-edit, a schema drift, or a leftover
+    # the render no longer produces -- keeps the on-disk content so it
+    # reads as drift. `comparison_units` and `normalized_units` share the
+    # same filenames (both from this entry's `render_units`), so a match
+    # in one is a key in the other; a leftover misses both and drifts.
+    current_units: list[crony.platform.RenderedUnit] = []
+    for od in ondisk_units.units:
+        disk = od.content
+        if comparison_units.get(od.filename) == disk:
+            content = normalized_units[od.filename]
+        else:
+            content = disk
+        current_units.append(crony.platform.RenderedUnit(od.filename, content))
+    return crony.platform.RenderedUnits(tuple(current_units))
+
+
+def _unit_config_exists(
+    platform: str | None,
+    name: crony.unit.EntityName,
+    ondisk_units: crony.platform.RenderedUnits,
+) -> bool:
+    """Whether the entity's config unit is on disk: its `config_filename`
+    is among the discovered on-disk units. `cfg_status` reads this to tell
+    a `broken` unit (file gone) from a `missing` one."""
+    config = crony.platform.get_scheduler(
+        platform or crony.platform.current_platform()
+    ).config_filename(str(name))
+    return any(u.filename == config for u in ondisk_units.units)
+
+
+def rendered_drifted_indices(
+    pending: crony.platform.RenderedUnits,
+    current: crony.platform.RenderedUnits,
+) -> list[int]:
+    """The slot positions whose normalized content differs between the
+    `pending` view and the `current` on-disk view -- each a unit a
+    re-apply would re-render. Compared by position over the common length,
+    plus any trailing index present on only one side. Feeds the status
+    `stale` column so it reports WHICH unit drifted. Drift is a
+    config-vs-reality concept, so it lives in the model, not the platform
+    layer."""
+    n = max(len(pending.units), len(current.units))
+    indices: list[int] = []
+    for i in range(n):
+        pv = pending.units[i].content if i < len(pending.units) else None
+        cv = current.units[i].content if i < len(current.units) else None
+        if i >= len(pending.units) or i >= len(current.units) or pv != cv:
+            indices.append(i)
+    return indices
+
+
+def rendered_unit_missing(
+    pending: crony.platform.RenderedUnits,
+    current: crony.platform.RenderedUnits,
+) -> bool:
+    """Whether `current` has fewer units than the `pending` view renders
+    -- a unit pending fills with no same-index counterpart on disk. Such
+    an entry renders a unit it has no file for, so it cannot fire through
+    it. Used by `cfg_status`."""
+    return len(pending.units) > len(current.units)
 
 
 def _expand_path_field(value: str) -> str:
@@ -993,62 +1141,13 @@ def _resolve_snapshot_for(
 # entry point the runtime / runner call.
 
 
-def _current_normalized(
-    *,
-    name: crony.unit.EntityName,
-    ref: crony.unit.EntityRef,
-    eff_timing: crony.unit.Timing | None,
-    priority: crony.unit.PriorityClass,
-    guard_timeout: int,
-    platform: str | None,
-    unit_config_disk: str | None,
-    unit_timer_disk: str | None,
-    installed_uv: Path | None,
-    installed_crony: Path | None,
-) -> tuple[str | None, str | None]:
-    """The current node's (config, timer) normalized units from the
-    on-disk inputs. The config unit is the blank-path render only when a
-    render with the installed paths reproduces the on-disk file; the
-    timer carries no uv / crony paths, so its normalized form is the
-    on-disk content as-is (None when absent)."""
-    config_norm: str | None = None
-    if (
-        unit_config_disk is not None
-        and installed_uv is not None
-        and installed_crony is not None
-    ):
-        rendered, _ = _render_normalized_units(
-            platform,
-            name,
-            ref,
-            eff_timing,
-            priority,
-            guard_timeout,
-            uv=installed_uv,
-            crony_path=installed_crony,
-        )
-        if rendered == unit_config_disk:
-            config_norm, _ = _render_normalized_units(
-                platform,
-                name,
-                ref,
-                eff_timing,
-                priority,
-                guard_timeout,
-                uv=Path(""),
-                crony_path=Path(""),
-            )
-    return config_norm, unit_timer_disk
-
-
 def snapshot_from_dict(
     raw: dict[str, Any],
     *,
     state_dir_symlink: tuple[Path, str] | None = None,
     fda_wrapper: FDAWrapper | None = None,
     platform: str | None = None,
-    unit_config_disk: str | None = None,
-    unit_timer_disk: str | None = None,
+    ondisk_units: crony.platform.RenderedUnits = _EMPTY_RENDERED_UNITS,
     installed_uv: Path | None = None,
     installed_crony: Path | None = None,
     unit_loaded: bool = False,
@@ -1072,20 +1171,19 @@ def snapshot_from_dict(
     (None otherwise; ignored for a group). Like the alias, it is derived
     runtime state, never serialized.
 
-    The current-graph scan passes the on-disk unit contents
-    (`unit_config_disk` / `unit_timer_disk`), the uv / crony executable
-    paths it extracted from the installed run command and confirmed still
-    exist (`installed_uv` / `installed_crony`, None when a baked binary is
-    gone), whether the scheduler has the unit loaded (`unit_loaded`), and
+    The current-graph scan passes the on-disk content of the entry's unit
+    slots (`ondisk_units`, read from the scheduler's `ondisk_units`), from
+    which the node's `rendered_units` (its normalized unit view, scored
+    against disk) and `unit_config_exists` are derived; the uv / crony
+    executable paths it extracted from the installed run command and
+    confirmed still exist (`installed_uv` / `installed_crony`, None when a
+    baked binary is gone); whether the scheduler has the unit loaded
+    (`unit_loaded`); and
     whether its schedule is armed (`unit_armed`; True for an entry with no
-    arming timer to judge). The node's normalized config unit is the
-    blank-path render only when a render with those installed paths
-    reproduces the on-disk file -- so a hand-edited / drifted unit, or one
-    whose binary is gone, gets None and reads `stale` against the pending
-    node; the extracted paths, file presence, loaded flag, and armed flag
-    let `cfg_status` tell `broken` from `missing`. A load that doesn't
-    supply them (the runner reading its own snapshot) leaves the derived
-    fields empty."""
+    arming timer to judge). Those let `cfg_status` tell `broken` from
+    `missing` and `synced` from `stale`. A load that doesn't supply them
+    (the runner reading its own snapshot) leaves the derived fields
+    empty."""
     model = crony.snapshot.parse(raw)
     if isinstance(model, crony.snapshot.JobSnapshot):
         return Job.from_snapshot(
@@ -1093,8 +1191,7 @@ def snapshot_from_dict(
             state_dir_symlink=state_dir_symlink,
             fda_wrapper=fda_wrapper,
             platform=platform,
-            unit_config_disk=unit_config_disk,
-            unit_timer_disk=unit_timer_disk,
+            ondisk_units=ondisk_units,
             installed_uv=installed_uv,
             installed_crony=installed_crony,
             unit_loaded=unit_loaded,
@@ -1104,8 +1201,7 @@ def snapshot_from_dict(
         model,
         state_dir_symlink=state_dir_symlink,
         platform=platform,
-        unit_config_disk=unit_config_disk,
-        unit_timer_disk=unit_timer_disk,
+        ondisk_units=ondisk_units,
         installed_uv=installed_uv,
         installed_crony=installed_crony,
         unit_loaded=unit_loaded,
@@ -1443,17 +1539,13 @@ class RuntimeState:
     pending-only entities don't have one. Built once at load and
     never re-read.
 
-    `unit_config` is the path of the platform config unit -- the unit
-    that defines and runs the job -- when present, else None.
-    `unit_timer` is the path of the separate schedule-arming timer unit
-    when the platform has one, else None (None too on a platform whose
-    config unit carries its own schedule, and for an unscheduled entry).
-    Both are captured here so subcommands read them from Config rather
-    than walking the platform unit directory themselves; `unit_config is
-    not None` is the "a config unit exists on disk" test. No scheduler
-    state lives on RuntimeState: the current `Job` / `JobGroup` node pins
-    both the unit-file drift (`unit_config_normalized` /
-    `unit_timer_normalized`) and the load-time scheduler facts
+    `unit_paths` is the on-disk unit paths in slot order (config unit
+    first, None where absent, then the discovered rest) for the status
+    path columns. Status reads it positionally for the `unit-config-1` /
+    `unit-config-2` path columns, so subcommands never walk the unit dir
+    themselves. No scheduler state lives on RuntimeState:
+    the current `Job` / `JobGroup` node pins both the unit-file drift (its
+    opaque `rendered_units`) and the load-time scheduler facts
     (`unit_loaded` and the schedule-armed `unit_armed`) that `cfg_status`
     scores, so a config verdict is a pure node comparison that needs no
     RuntimeState lookup.
@@ -1464,8 +1556,7 @@ class RuntimeState:
     # The entity's current run status, derived from the runtime facts at
     # load (see `runtime._derive_job_status`).
     job_status: JobStatus
-    unit_config: Path | None = None
-    unit_timer: Path | None = None
+    unit_paths: list[Path | None] = field(default_factory=list)
     # When the job last started, or None when it has never run.
     last_started_at: datetime.datetime | None = None
 
@@ -1796,16 +1887,13 @@ class Config:
         # reads loaded). Re-apply reloads it.
         if not c.unit_loaded:
             return ConfigStatus.BROKEN
-        # A scheduled, enabled entry fires through its schedule-arming
-        # timer: when the pending node renders one (only systemd does --
-        # launchd carries the schedule in the config unit) but it is gone
-        # from disk, the entry never fires on its schedule -- broken
-        # (re-apply re-renders it). A disabled / grouped entry renders no
-        # timer, so this does not trip for them.
-        if (
-            p.unit_timer_normalized is not None
-            and c.unit_timer_normalized is None
-        ):
+        # A unit the pending node renders that is gone from disk means the
+        # entry can't fire through it -- broken (re-apply re-renders it).
+        # The config unit's absence was handled above; this catches a
+        # schedule-arming companion the pending node renders but the
+        # install lacks (a systemd `.timer` deleted while the `.service`
+        # stays). The model asks the opaque units, never naming which.
+        if rendered_unit_missing(p.rendered_units, c.rendered_units):
             return ConfigStatus.BROKEN
         # The timer can be present and loaded yet dead: a systemd interval
         # timer with no valid anchor reports a next elapse of infinity and

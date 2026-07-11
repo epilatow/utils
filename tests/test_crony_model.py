@@ -50,6 +50,7 @@ from crony.model import (  # noqa: E402
     _resolve_snapshot_for,
     snapshot_from_dict,
 )
+from crony.platform import RenderedUnits  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.snapshot import (  # noqa: E402
     _COMPAT_FLOOR_SCHEMA,
@@ -361,8 +362,7 @@ class TestJobFlagsBacking:
         assert snapshot_from_dict(group.to_dict()) == dataclasses.replace(
             group,
             state_dir_symlink=None,
-            unit_config_normalized=None,
-            unit_timer_normalized=None,
+            rendered_units=RenderedUnits(()),
         )
 
 
@@ -419,8 +419,7 @@ class TestFdaWrapperField:
             snap,
             state_dir_symlink=None,
             fda_wrapper=None,
-            unit_config_normalized=None,
-            unit_timer_normalized=None,
+            rendered_units=RenderedUnits(()),
         )
 
     def test_group_has_no_fda_wrapper_field(self) -> None:
@@ -499,8 +498,7 @@ class TestSharedSnapshotSurface:
         assert snapshot_from_dict(d) == dataclasses.replace(
             group,
             state_dir_symlink=None,
-            unit_config_normalized=None,
-            unit_timer_normalized=None,
+            rendered_units=RenderedUnits(()),
         )
 
     def test_timeout_is_a_shared_base_field(self) -> None:

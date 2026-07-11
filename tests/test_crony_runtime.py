@@ -83,8 +83,11 @@ def _install_units(snap: Any) -> None:
     )
     sched = crony_runtime.scheduler()
     sched.unit_dir.mkdir(parents=True, exist_ok=True)
-    for fname, content in crony_runtime._render_units(snap).items():
-        (sched.unit_dir / fname).write_text(content, encoding="utf-8")
+    for u in sched.render_units(snap.unit_spec()).units:
+        if u.content:
+            (sched.unit_dir / u.filename).write_text(
+                u.content, encoding="utf-8"
+            )
 
 
 class TestIsLoadedDarwin:
@@ -157,12 +160,10 @@ class TestUnitNameDelegatesTolerateRefForm:
             False
         )
 
-    def test_unit_config_path_none_for_ref_form(self) -> None:
+    def test_unit_paths_absent_for_ref_form(self) -> None:
         for platform in ("darwin", "linux"):
-            got = crony_runtime._platform_unit_config_path(
-                self._REF_FORM, platform
-            )
-            assert got is None
+            paths = crony_runtime.scheduler(platform).unit_paths(self._REF_FORM)
+            assert all(p is None for p in paths)
 
     def test_dispatch_unit_path_absent_for_ref_form(self) -> None:
         for platform in ("darwin", "linux"):
@@ -1370,6 +1371,26 @@ class TestUnitDriftDetection:
             config.pending.job_from_ref(ref),
             config.current.job_from_ref(ref),
         )
+
+    def test_extra_leftover_unit_flags_stale(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An on-disk file the render does not produce (a leftover from an
+        # old naming scheme) is discovered, misses the render lookups, and
+        # reads as drift -- the entry flips to `stale` so the operator
+        # re-applies (which prunes it). Guards the drift scoring against an
+        # on-disk filename absent from the render dicts.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        leftover = h.agents / f"org.crony.{h.full('j')}.oldscheme.plist"
+        leftover.write_text("stale junk", encoding="utf-8")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("j")]
+        assert config.cfg_status(ref) == "stale"
 
     def test_deleted_unit_loaded_flags_broken(
         self, tmp_path: Path, monkeypatch: Any

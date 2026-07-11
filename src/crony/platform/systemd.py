@@ -15,6 +15,8 @@ from pathlib import Path
 
 from crony.platform.scheduler import (
     UNIT_PREFIX,
+    RenderedUnit,
+    RenderedUnits,
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
@@ -278,19 +280,42 @@ class SystemdScheduler(Scheduler):
     def default_unit_dir() -> Path:
         return Path.home() / ".config" / "systemd" / "user"
 
-    def render_config(self, spec: UnitSpec) -> tuple[Path, str]:
+    def render_units(self, spec: UnitSpec) -> RenderedUnits:
+        # A `.service` defines / runs the job; a scheduled entry also gets
+        # a `.timer` that arms it. An unscheduled entry renders the
+        # `.service` alone -- no `.timer`. A stale `.timer` from a
+        # scheduled -> unscheduled transition is found by
+        # `_discover_unit_files` (not a fixed slot list) and pruned on
+        # install, and read back as drift.
         name = str(spec.name)
-        return Path(service_filename(name)), render_service(
-            name,
-            spec.cmd,
-            spec.priority,
-        )
+        units = [
+            RenderedUnit(
+                Path(service_filename(name)),
+                render_service(name, spec.cmd, spec.priority),
+            )
+        ]
+        if spec.timing is not None:
+            units.append(
+                RenderedUnit(
+                    Path(timer_filename(name)),
+                    render_timer(name, spec.timing),
+                )
+            )
+        return RenderedUnits(tuple(units))
 
-    def render_timer(self, spec: UnitSpec) -> tuple[Path, str] | None:
-        if spec.timing is None:
-            return None
-        name = str(spec.name)
-        return Path(timer_filename(name)), render_timer(name, spec.timing)
+    def config_filename(self, name: str) -> Path:
+        return Path(service_filename(name))
+
+    def _discover_unit_files(self, name: str) -> list[Path]:
+        if not self.unit_dir.exists():
+            return []
+        prefix = f"{UNIT_PREFIX}-{name}."
+        return [
+            Path(p.name)
+            for p in self.unit_dir.iterdir()
+            if p.name.startswith(prefix)
+            and p.name.endswith((".service", ".timer"))
+        ]
 
     def installed_cmd(self, name: str) -> list[str] | None:
         service = self.unit_dir / service_filename(name)
@@ -299,17 +324,6 @@ class SystemdScheduler(Scheduler):
         except OSError:
             return None
         return _service_argv(content)
-
-    def unit_config_path(self, name: str) -> Path | None:
-        # The `.service` defines and runs the job (every entry has one,
-        # scheduled or grouped); the schedule lives in the separate
-        # `.timer` reported by unit_timer_path.
-        service = self.unit_dir / service_filename(name)
-        return service if service.is_file() else None
-
-    def unit_timer_path(self, name: str) -> Path | None:
-        timer = self.unit_dir / timer_filename(name)
-        return timer if timer.is_file() else None
 
     def dispatch_unit_path(self, name: str) -> Path:
         # `systemctl --user start crony-<name>.service` fires the
@@ -429,9 +443,17 @@ class SystemdScheduler(Scheduler):
         )
 
     def remove_files(self, name: str) -> None:
+        # `deactivate` disables the canonical service / timer; a discovered
+        # `.timer` under any other suffix (a leftover) is disabled here too
+        # so no enabled `timers.target.wants` symlink survives its unlink.
         self.deactivate(name)
-        (self.unit_dir / service_filename(name)).unlink(missing_ok=True)
-        (self.unit_dir / timer_filename(name)).unlink(missing_ok=True)
+        for filename in self._discover_unit_files(name):
+            if filename.suffix == ".timer":
+                subprocess.run(
+                    _SYSTEMCTL_DISABLE + [str(filename)],
+                    stderr=subprocess.DEVNULL,
+                )
+            (self.unit_dir / filename).unlink(missing_ok=True)
 
     def verify(self) -> None:
         # Linger is what keeps the user's systemd manager running across
@@ -462,11 +484,16 @@ class SystemdScheduler(Scheduler):
         )
 
     def prune_units(self, name: str, keep: set[str]) -> None:
-        # The .service is always kept; an orphaned .timer (scheduled ->
-        # unscheduled) is disabled in the scheduler before unlinking.
-        timer = self.unit_dir / timer_filename(name)
-        if timer.name not in keep and timer.is_file():
-            subprocess.run(
-                _SYSTEMCTL_DISABLE + [timer.name], stderr=subprocess.DEVNULL
-            )
-            timer.unlink()
+        # Remove every discovered unit file not in `keep`: an orphaned
+        # .timer (scheduled -> unscheduled), or any stale file left by an
+        # old naming scheme. A .timer is disabled in the scheduler before
+        # it is unlinked.
+        for filename in self._discover_unit_files(name):
+            if str(filename) in keep:
+                continue
+            if filename.suffix == ".timer":
+                subprocess.run(
+                    _SYSTEMCTL_DISABLE + [str(filename)],
+                    stderr=subprocess.DEVNULL,
+                )
+            (self.unit_dir / filename).unlink(missing_ok=True)

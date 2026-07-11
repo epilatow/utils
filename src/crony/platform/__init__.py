@@ -37,6 +37,8 @@ from crony.platform.launchd import LaunchdScheduler
 from crony.platform.linux import LinuxHost
 from crony.platform.scheduler import (
     UNIT_PREFIX,
+    RenderedUnit,
+    RenderedUnits,
     Scheduler,
     SchedulerWarning,
     UnitLastExit,
@@ -50,6 +52,8 @@ __all__ = [
     "LaunchdScheduler",
     "LinuxHost",
     "PidWait",
+    "RenderedUnit",
+    "RenderedUnits",
     "Scheduler",
     "SchedulerWarning",
     "SystemdScheduler",

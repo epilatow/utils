@@ -111,17 +111,23 @@ class TestSystemdScheduler:
         )
 
     def test_service_and_timer_when_scheduled(self) -> None:
-        units = get_scheduler("linux", _DIR).render(
+        units = get_scheduler("linux", _DIR).render_units(
             self._spec(Interval.from_str("1h")),
         )
-        assert set(units) == {
-            "crony-default.brew.service",
-            "crony-default.brew.timer",
-        }
+        assert [u.filename for u in units.units] == [
+            Path("crony-default.brew.service"),
+            Path("crony-default.brew.timer"),
+        ]
+        assert all(u.content for u in units.units)
 
     def test_service_only_when_scheduleless(self) -> None:
-        units = get_scheduler("linux", _DIR).render(self._spec(None))
-        assert list(units) == ["crony-default.brew.service"]
+        # An unscheduled entry renders the `.service` alone -- no empty
+        # `.timer` slot in the render.
+        units = get_scheduler("linux", _DIR).render_units(self._spec(None))
+        assert [u.filename for u in units.units] == [
+            Path("crony-default.brew.service")
+        ]
+        assert all(u.content for u in units.units)
 
     def test_remove_files_unlinks_service_and_timer(
         self, tmp_path: Path, monkeypatch: Any
@@ -136,6 +142,26 @@ class TestSystemdScheduler:
         get_scheduler("linux", tmp_path).remove_files("default.brew")
         assert not service.exists()
         assert not timer.exists()
+
+    def test_remove_files_disables_leftover_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A leftover .timer under an unknown suffix must be disabled (not
+        # just unlinked) so no enabled wants-symlink survives it.
+        calls: list[list[str]] = []
+
+        def fake_run(*args: Any, **kwargs: Any) -> None:
+            calls.append(list(args[0] if args else kwargs.get("args", [])))
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        service = tmp_path / "crony-default.j.service"
+        leftover = tmp_path / "crony-default.j.oldscheme.timer"
+        service.write_text("x")
+        leftover.write_text("x")
+        get_scheduler("linux", tmp_path).remove_files("default.j")
+        assert not service.exists()
+        assert not leftover.exists()
+        assert any("crony-default.j.oldscheme.timer" in c for c in calls)
 
     def test_remove_files_tolerates_absent(
         self, tmp_path: Path, monkeypatch: Any
@@ -396,10 +422,11 @@ class TestSystemdAnalyzeVerify:
                 timing=timing,
                 priority=prio,
             )
-            units = sched.render(spec)
-            for fname, content in units.items():
-                path = tmp_path / fname
-                path.write_text(content, encoding="utf-8")
+            for u in sched.render_units(spec).units:
+                if not u.content:
+                    continue
+                path = tmp_path / u.filename
+                path.write_text(u.content, encoding="utf-8")
                 written.append(path)
         assert written
         # `systemd-analyze verify` exits non-zero on structural errors
@@ -499,32 +526,76 @@ class TestSystemdUnitName:
 
 
 class TestSystemdUnitPaths:
-    """unit_config_path is the `.service` (defines / runs the job);
-    unit_timer_path is the separate `.timer` (the schedule arm)."""
+    """unit_paths is the `.service` config slot (slot 0, always first,
+    None when absent) followed by every other discovered file, sorted.
+    An entry with no companion on disk yields just the config slot."""
 
     def test_scheduled_splits_service_and_timer(self, tmp_path: Path) -> None:
         (tmp_path / "crony-default.j.service").write_text("x")
         (tmp_path / "crony-default.j.timer").write_text("x")
         sched = get_scheduler("linux", tmp_path)
-        assert sched.unit_config_path("default.j") == (
-            tmp_path / "crony-default.j.service"
-        )
-        assert sched.unit_timer_path("default.j") == (
-            tmp_path / "crony-default.j.timer"
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "crony-default.j.service",
+            tmp_path / "crony-default.j.timer",
         )
 
     def test_grouped_has_service_but_no_timer(self, tmp_path: Path) -> None:
         (tmp_path / "crony-default.g.service").write_text("x")
         sched = get_scheduler("linux", tmp_path)
-        assert sched.unit_config_path("default.g") == (
-            tmp_path / "crony-default.g.service"
+        assert sched.unit_paths("default.g") == (
+            tmp_path / "crony-default.g.service",
         )
-        assert sched.unit_timer_path("default.g") is None
 
     def test_absent_paths_are_none(self, tmp_path: Path) -> None:
+        # Only the config slot is always present in the view; absent, it
+        # reports None.
         sched = get_scheduler("linux", tmp_path)
-        assert sched.unit_config_path("default.x") is None
-        assert sched.unit_timer_path("default.x") is None
+        assert sched.unit_paths("default.x") == (None,)
+
+    def test_discovers_unknown_suffix_leftover(self, tmp_path: Path) -> None:
+        # A leftover from a renamed companion scheme (an unknown suffix)
+        # is discovered by the `crony-<name>.` namespace match, not a
+        # fixed slot list, so it can be surfaced and cleaned.
+        (tmp_path / "crony-default.j.service").write_text("x")
+        (tmp_path / "crony-default.j.oldscheme.timer").write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "crony-default.j.service",
+            tmp_path / "crony-default.j.oldscheme.timer",
+        )
+
+    def test_discovery_excludes_string_prefix_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        # `default.jj` is a string-prefix but not a dotted-prefix of
+        # `default.j`, so its unit must not be discovered as `default.j`'s.
+        (tmp_path / "crony-default.j.service").write_text("x")
+        (tmp_path / "crony-default.jj.service").write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "crony-default.j.service",
+        )
+
+
+class TestSystemdPruneDiscovers:
+    """prune_units removes every discovered file not in `keep`, including
+    a leftover with an unknown suffix a fixed slot list would miss; a
+    kept file stays."""
+
+    def test_prune_removes_unknown_suffix_leftover(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `_systemctl disable` on the leftover .timer would shell out;
+        # stub it so the test exercises only the discovery + unlink.
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        service = tmp_path / "crony-default.j.service"
+        leftover = tmp_path / "crony-default.j.oldscheme.timer"
+        service.write_text("x")
+        leftover.write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        sched.prune_units("default.j", {"crony-default.j.service"})
+        assert service.exists()
+        assert not leftover.exists()
 
 
 class TestSystemdDefaultUnitDir:

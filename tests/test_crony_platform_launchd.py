@@ -179,8 +179,10 @@ class TestLaunchdScheduler:
             timing=Schedule.from_str("daily"),
             priority=PriorityClass.NORMAL,
         )
-        units = get_scheduler("darwin", _DIR).render(spec)
-        assert list(units) == ["org.crony.default.brew.plist"]
+        units = get_scheduler("darwin", _DIR).render_units(spec)
+        assert [u.filename for u in units.units] == [
+            Path("org.crony.default.brew.plist")
+        ]
 
     def test_schedule_armed_tracks_loaded(
         self, tmp_path: Path, monkeypatch: Any
@@ -407,21 +409,62 @@ class TestLaunchdUnitName:
 
 
 class TestLaunchdUnitPaths:
-    """unit_config_path is the plist; launchd has no separate timer
-    unit, so unit_timer_path is always None."""
+    """unit_paths is the single plist slot; launchd installs no second
+    unit. An absent plist reports None in its slot."""
 
-    def test_config_is_plist_timer_is_none(self, tmp_path: Path) -> None:
+    def test_present_plist(self, tmp_path: Path) -> None:
         (tmp_path / "org.crony.default.j.plist").write_text("x")
         sched = get_scheduler("darwin", tmp_path)
-        assert sched.unit_config_path("default.j") == (
-            tmp_path / "org.crony.default.j.plist"
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "org.crony.default.j.plist",
         )
-        assert sched.unit_timer_path("default.j") is None
 
-    def test_absent_config_is_none(self, tmp_path: Path) -> None:
+    def test_absent_plist_reports_no_path(self, tmp_path: Path) -> None:
+        paths = get_scheduler("darwin", tmp_path).unit_paths("default.x")
+        assert paths == (None,)
+
+    def test_discovers_unknown_suffix_leftover(self, tmp_path: Path) -> None:
+        # A leftover from a renamed companion scheme is discovered by the
+        # `org.crony.<name>.` namespace match, not a fixed slot list.
+        (tmp_path / "org.crony.default.j.plist").write_text("x")
+        (tmp_path / "org.crony.default.j.oldscheme.plist").write_text("x")
         sched = get_scheduler("darwin", tmp_path)
-        assert sched.unit_config_path("default.x") is None
-        assert sched.unit_timer_path("default.x") is None
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "org.crony.default.j.plist",
+            tmp_path / "org.crony.default.j.oldscheme.plist",
+        )
+
+    def test_discovery_excludes_string_prefix_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        # `default.jj` is a string-prefix but not a dotted-prefix of
+        # `default.j`; its plist must not be discovered as `default.j`'s.
+        (tmp_path / "org.crony.default.j.plist").write_text("x")
+        (tmp_path / "org.crony.default.jj.plist").write_text("x")
+        sched = get_scheduler("darwin", tmp_path)
+        assert sched.unit_paths("default.j") == (
+            tmp_path / "org.crony.default.j.plist",
+        )
+
+
+class TestLaunchdPruneDiscovers:
+    """prune_units removes every discovered plist not in `keep`, including
+    a leftover with an unknown suffix; a kept plist stays."""
+
+    def test_prune_removes_unknown_suffix_leftover(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Removing a non-config leftover does not unload the label, but
+        # stub subprocess so no launchctl call escapes regardless.
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: None)
+        plist = tmp_path / "org.crony.default.j.plist"
+        leftover = tmp_path / "org.crony.default.j.oldscheme.plist"
+        plist.write_text("x")
+        leftover.write_text("x")
+        sched = get_scheduler("darwin", tmp_path)
+        sched.prune_units("default.j", {"org.crony.default.j.plist"})
+        assert plist.exists()
+        assert not leftover.exists()
 
 
 class TestLaunchdDefaultUnitDir:

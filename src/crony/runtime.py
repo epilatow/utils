@@ -8,7 +8,7 @@ RuntimeState), loads and schema-checks applied snapshots, applies and
 destroys individual entries (apply_one / destroy_one -- rendering,
 installing, and removing platform units, alias symlinks, and state
 dirs), writes last-run records, holds the run-lock, and answers
-scheduler queries (install paths, installed units, enable state)
+scheduler queries (install paths, unit paths, enable state)
 through the per-host platform backend. All disk reads, mutations,
 locks, and scheduler queries the pure crony.model deliberately omits
 live here.
@@ -256,11 +256,9 @@ def _read_runtime_state(
         except crony.errors.LockBusyError:
             is_running = True
 
-    unit_config: Path | None = None
-    unit_timer: Path | None = None
-    if full_name is not None:
-        unit_config = _platform_unit_config_path(full_name)
-        unit_timer = _platform_unit_timer_path(full_name)
+    unit_paths: list[Path | None] = (
+        list(scheduler().unit_paths(full_name)) if full_name is not None else []
+    )
 
     unit_last_exit = (
         last_exits.get(full_name)
@@ -280,8 +278,7 @@ def _read_runtime_state(
         state_dir=state_dir,
         last_run=last_run,
         job_status=job_status,
-        unit_config=unit_config,
-        unit_timer=unit_timer,
+        unit_paths=unit_paths,
         last_started_at=_last_started_at(pid_path, last_run_path, last_run),
     )
 
@@ -306,10 +303,10 @@ def _build_current_graph(
     (`reason` set, "re-apply required"); a dir with no snapshot at all
     is recorded as a nameless, non-broken orphan (leftover junk).
 
-    Each node's normalized config / timer units are baked from the
-    entry's on-disk unit files and installed run command (read here,
-    rendered by `snapshot_from_dict` against `platform`) so a
-    `config=stale` verdict is a pure node comparison.
+    Each node's normalized units are baked from the entry's on-disk unit
+    files and installed run command: this scan reads them and hands them
+    to `snapshot_from_dict`, which scores them against a render (against
+    `platform`) so a `config=stale` verdict is a pure node comparison.
     """
     sched = scheduler(platform)
     current = crony.model.Graph()
@@ -414,18 +411,20 @@ def _build_current_graph(
                     if en is not None
                     else None
                 )
-                (
-                    config_disk,
-                    timer_disk,
-                    inst_uv,
-                    inst_crony,
-                    loaded,
-                    armed,
-                ) = (
-                    _current_unit_disk_inputs(str(en), sched)
-                    if en is not None
-                    else (None, None, None, None, False, True)
-                )
+                if en is not None:
+                    inst_uv, inst_crony, loaded, armed = _current_unit_facts(
+                        str(en), sched
+                    )
+                    ondisk = sched.ondisk_units(str(en))
+                else:
+                    inst_uv = inst_crony = None
+                    loaded, armed = False, True
+                    ondisk = crony.platform.RenderedUnits()
+                # Read the on-disk unit slots and hand them to the model,
+                # which scores them against a render to build the node's
+                # `rendered_units` and `unit_config_exists`. The drift
+                # compare is the model's, not the platform's -- the platform
+                # only rendered and read the files.
                 snap = crony.model.snapshot_from_dict(
                     raw,
                     state_dir_symlink=_read_symlink_pair(alias)
@@ -433,8 +432,7 @@ def _build_current_graph(
                     else None,
                     fda_wrapper=_fda_wrapper_for(raw),
                     platform=platform,
-                    unit_config_disk=config_disk,
-                    unit_timer_disk=timer_disk,
+                    ondisk_units=ondisk,
                     installed_uv=inst_uv,
                     installed_crony=inst_crony,
                     unit_loaded=loaded,
@@ -584,19 +582,18 @@ def load_config() -> crony.model.Config:
         orphans_by_full_name[full_name] = ref
         # Surface the platform unit paths through RuntimeState (so
         # status's unit-config-1 / unit-config-2 columns don't re-walk the
-        # unit dirs); a symlink-only orphan has no unit file, so leave
-        # them None.
+        # unit dirs); a symlink-only orphan has no unit file, so it has no
+        # view.
         runtime[ref] = crony.model.RuntimeState(
             state_dir=orphan.state_dir,
             last_run=None,
             job_status=_derive_job_status(
                 False, False, None, None, last_exits.get(full_name)
             ),
-            unit_config=(
-                _platform_unit_config_path(full_name) if has_unit else None
-            ),
-            unit_timer=(
-                _platform_unit_timer_path(full_name) if has_unit else None
+            unit_paths=(
+                list(scheduler(platform).unit_paths(full_name))
+                if has_unit
+                else []
             ),
         )
 
@@ -671,23 +668,6 @@ def write_last_run(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _platform_unit_config_path(
-    name: str, platform: str | None = None
-) -> Path | None:
-    """The on-disk platform config unit file backing `name`, or None.
-    The status `unit-config-1` column reads this from `RuntimeState`."""
-    return scheduler(platform).unit_config_path(name)
-
-
-def _platform_unit_timer_path(
-    name: str, platform: str | None = None
-) -> Path | None:
-    """The on-disk timer unit arming `name`'s schedule, or None when the
-    platform has no separate timer unit or the entry is unscheduled. The
-    status `unit-config-2` column reads this from `RuntimeState`."""
-    return scheduler(platform).unit_timer_path(name)
-
-
 def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
     """File `trigger_unit` fires for `name` (may not exist). Used to
     refuse early when the unit was never installed."""
@@ -712,29 +692,15 @@ def host() -> crony.platform.HostPlatform:
     return crony.platform.get_host(crony.platform.current_platform())
 
 
-def _read_unit_file(path: Path | None) -> str | None:
-    """The content of an on-disk unit file, or None when absent /
-    unreadable (or the backend reports no such unit)."""
-    if path is None:
-        return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
-def _current_unit_disk_inputs(
+def _current_unit_facts(
     name: str, sched: crony.platform.Scheduler
-) -> tuple[str | None, str | None, Path | None, Path | None, bool, bool]:
-    """The on-disk / scheduler inputs `snapshot_from_dict` needs to bake
-    a current node: the config and timer unit contents, the uv / crony
-    executable paths extracted from the installed run command and
-    confirmed still present on disk (None when a baked binary is gone),
-    whether the scheduler has the unit loaded, and whether its schedule is
-    armed. `cfg_status` reads these to tell a reproducible, armed unit
-    from a `stale` / `broken` / gone / dead one."""
-    config_disk = _read_unit_file(sched.unit_config_path(name))
-    timer_disk = _read_unit_file(sched.unit_timer_path(name))
+) -> tuple[Path | None, Path | None, bool, bool]:
+    """The scheduler facts `_build_current_graph` bakes onto a current
+    node beyond its unit view: the uv / crony executable paths extracted
+    from the installed run command and confirmed still present on disk
+    (None when a baked binary is gone), whether the scheduler has the unit
+    loaded, and whether its schedule is armed. `cfg_status` reads these to
+    tell a runnable, armed unit from a `broken` / gone / dead one."""
     uv_s, crony_s = crony.model.exec_path_strings(
         sched.installed_cmd(name) or []
     )
@@ -742,38 +708,34 @@ def _current_unit_disk_inputs(
     installed_crony = (
         Path(crony_s) if crony_s and Path(crony_s).is_file() else None
     )
-    unit_loaded = sched.is_loaded(name)
-    unit_armed = sched.schedule_armed(name)
     return (
-        config_disk,
-        timer_disk,
         installed_uv,
         installed_crony,
-        unit_loaded,
-        unit_armed,
+        sched.is_loaded(name),
+        sched.schedule_armed(name),
     )
 
 
-def _unit_config_changing(
+def _units_changing(
     snapshot: crony.model.Job | crony.model.JobGroup,
     sched: crony.platform.Scheduler,
 ) -> bool:
-    """Whether applying `snapshot` would rewrite its config unit -- the
-    content a fresh apply would render (with the live uv / crony paths it
-    would bake in) differs from what's installed. Drives the launchd
-    self-apply defer; launchd's config unit (the plist) carries the
-    schedule, so comparing it is sufficient there.
+    """Whether applying `snapshot`'s live units would rewrite any on-disk
+    unit -- a rendered slot missing from disk, or differing from what's
+    there. Drives the launchd self-apply defer: reloading terminates the
+    running job, so it must happen only when something actually changed.
 
-    `snapshot` is the pending node, which carries the live executables an
-    apply would bake in -- not the installed unit's existing paths -- so
-    a moved binary is a real change the defer must honor (re-rendering it
-    would terminate the running job on launchd)."""
+    A live-path compare: `snapshot` is the pending node carrying the live
+    executables an apply would bake in -- not the installed unit's
+    existing paths -- so a moved binary is a real change the defer must
+    honor. The comparison is the runtime's, not the platform's; the
+    platform only renders and reads."""
     name = str(snapshot.entity_name)
-    installed = _read_unit_file(sched.unit_config_path(name))
-    if installed is None:
-        return True
-    _, rendered = sched.render_config(snapshot.unit_spec())
-    return rendered != installed
+    on_disk = {u.filename: u.content for u in sched.ondisk_units(name).units}
+    for u in sched.render_units(snapshot.unit_spec()).units:
+        if on_disk.get(u.filename) != u.content:
+            return True
+    return False
 
 
 def recover_full_name(state_dir: Path) -> str | None:
@@ -952,19 +914,6 @@ def _uv_executable() -> Path:
     return Path(path).resolve()
 
 
-def _render_units(
-    snap: crony.model.Job | crony.model.JobGroup, platform: str | None = None
-) -> dict[str, str]:
-    """Return {filename: content} for `snap`'s platform units.
-
-    `snap.unit_spec()` builds the run command from the executables the
-    node already carries (the live ones for a pending node), so nothing
-    re-derives them here. (Drift detection renders with blank uv / crony
-    paths instead, so a moved-but-present binary doesn't read as drift.)
-    """
-    return scheduler(platform).render(snap.unit_spec())
-
-
 def _write_apply_state(
     snapshot: crony.model.Job | crony.model.JobGroup,
 ) -> None:
@@ -1085,7 +1034,7 @@ def apply_one(
         os.environ.get(RUNNING_REF_ENV, "")
     )
     self_reload = running_ref == ref and sched.reload_terminates_running_job
-    if self_reload and _unit_config_changing(snapshot, sched):
+    if self_reload and _units_changing(snapshot, sched):
         logger.warning(
             "%s: deferring update -- cannot reload the unit of a "
             "running job without terminating it; re-run "
@@ -1171,17 +1120,11 @@ def _install_unit(
 
     Shared by `apply_one` and `set_disabled`. A disabled or schedule-less
     snapshot renders with no schedule (`unit_spec` drops the timing), so
-    it loads dormant (`scheduled=False`) -- registered and triggerable,
-    just not armed."""
-    full_name = str(snapshot.entity_name)
-    units = _render_units(snapshot)
-    sched.unit_dir.mkdir(parents=True, exist_ok=True)
-    sched.prune_units(full_name, set(units))
-    for fname, content in units.items():
-        (sched.unit_dir / fname).write_text(content, encoding="utf-8")
-    if activate:
-        scheduled = snapshot.timing is not None and not snapshot.unit_disabled
-        sched.activate(full_name, scheduled=scheduled)
+    it loads dormant -- registered and triggerable, just not armed. The
+    platform writes every unit file before any reload and re-arms them
+    together; `activate=False` skips the reload for a self-apply whose
+    unit didn't change."""
+    sched.install(snapshot.unit_spec(), activate=activate)
     _write_apply_state(snapshot)
 
 
