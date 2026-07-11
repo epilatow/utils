@@ -1436,7 +1436,6 @@ class JobRunResult(CommonRunResult):
     # diagnosis, this field is the binary answer "did the gate let the
     # job run?".
     gate: GateResult
-    log_bytes_this_run: int
     # Per-channel outcomes. Keys are channel names that were
     # attempted (e.g. "email", "ntfy"); values are NotificationResult
     # records. Empty dict means no external dispatch was attempted

@@ -457,9 +457,6 @@ def _run_job(snap: crony.model.Job) -> int:
             # status is built.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
-            log_size_before = (
-                log_path.stat().st_size if log_path.exists() else 0
-            )
             log_file = open(log_path, "ab", buffering=0)
             try:
                 timeout_label = (
@@ -509,9 +506,6 @@ def _run_job(snap: crony.model.Job) -> int:
                             process_exit=0,
                             gate=gate,
                             log_path=str(log_path),
-                            log_bytes_this_run=(
-                                log_path.stat().st_size - log_size_before
-                            ),
                             notifications={},
                         )
                         crony.runtime.write_last_run(
@@ -556,9 +550,6 @@ def _run_job(snap: crony.model.Job) -> int:
                                 process_exit=0,
                                 gate=gate,
                                 log_path=str(log_path),
-                                log_bytes_this_run=(
-                                    log_path.stat().st_size - log_size_before
-                                ),
                                 notifications={},
                             )
                             crony.runtime.write_last_run(
@@ -621,9 +612,6 @@ def _run_job(snap: crony.model.Job) -> int:
                     process_exit=surfaced_rc,
                     gate=gate,
                     log_path=str(log_path),
-                    log_bytes_this_run=(
-                        log_path.stat().st_size - log_size_before
-                    ),
                     notifications=notifications,
                 )
 

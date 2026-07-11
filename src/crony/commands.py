@@ -3320,7 +3320,6 @@ def _notify_test_one_bundle(
         process_exit=1,
         gate=crony.model.GateResult.NONE,
         log_path="(synthetic)",
-        log_bytes_this_run=0,
         notifications={
             ch: crony.model.NotificationResult(sent=False)
             for ch in use_channels

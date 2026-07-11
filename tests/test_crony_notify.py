@@ -184,7 +184,6 @@ class TestEmailNotify:
             process_exit=2,
             gate=GateResult.NONE,
             log_path="/tmp/run.log",
-            log_bytes_this_run=42,
             notifications={
                 ch: NotificationResult(sent=False) for ch in channels
             },
@@ -374,7 +373,6 @@ class TestNtfyNotify:
             process_exit=2,
             gate=GateResult.NONE,
             log_path="/tmp/run.log",
-            log_bytes_this_run=42,
             notifications={
                 ch: NotificationResult(sent=False) for ch in channels
             },
@@ -662,7 +660,6 @@ class TestDialogPopupNotify:
             process_exit=2,
             gate=GateResult.NONE,
             log_path="/tmp/run.log",
-            log_bytes_this_run=42,
             notifications={
                 ch: NotificationResult(sent=False) for ch in channels
             },
@@ -852,7 +849,6 @@ class TestMultiChannelDispatch:
             process_exit=2,
             gate=GateResult.NONE,
             log_path="/tmp/run.log",
-            log_bytes_this_run=42,
             notifications={
                 "email": NotificationResult(sent=False),
                 "ntfy": NotificationResult(sent=False),
