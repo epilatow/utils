@@ -10,6 +10,7 @@ of argparse's terse "the following arguments are required" error.
 """
 
 import argparse
+import difflib
 import functools
 import os
 from collections.abc import Callable
@@ -247,6 +248,37 @@ class StrictArgumentParser(argparse.ArgumentParser):
         )
         action._child_command_level = self._command_level + 1
         return action
+
+    def _check_value(self, action: argparse.Action, value: Any) -> None:
+        """Reject an unrecognized command with a filtered, hint-carrying
+        error instead of argparse's raw ``invalid choice``.
+
+        argparse's default lists every registered subparser name --
+        including internal ones added without a ``help=`` (which are
+        omitted from ``--help``) and hidden aliases -- so a mistyped
+        command leaks the private surface. For a subparsers group this
+        lists only the help-visible commands (those with a non-``SUPPRESS``
+        help), adds a ``difflib`` best guess, and reports through this
+        parser's own ``error`` so the usage line matches the level the bad
+        command was typed at. Every other ``choices=`` argument keeps
+        argparse's default check.
+        """
+        if not isinstance(action, StrictSubParsersAction):
+            super()._check_value(action, value)
+            return
+        if value in action.choices:
+            return
+        visible = [
+            pseudo.dest
+            for pseudo in action._choices_actions
+            if pseudo.help is not argparse.SUPPRESS
+        ]
+        guess = difflib.get_close_matches(value, visible, n=1)
+        hint = f"; did you mean {guess[0]!r}?" if guess else ""
+        self.error(
+            f"unrecognized command {value!r}{hint}\n"
+            f"available commands: {', '.join(visible)}"
+        )
 
     def add_validate_callback(self, callback: ValidateCallback) -> None:
         """Register a post-parse argument-combination validator.

@@ -132,6 +132,75 @@ class TestCommandSubparsers:
             p.parse_command(["bogus"])
         assert "bogus" in capsys.readouterr().err
 
+    @staticmethod
+    def _with_hidden() -> StrictArgumentParser:
+        # `visible` shows in help; `_internal` is added without a help=
+        # string, so argparse omits it from `--help` -- and the error
+        # listing must omit it too.
+        p = StrictArgumentParser(prog="tool")
+        # metavar keeps the auto-generated usage line from listing every
+        # choice (the brace form leaks hidden names); the help-width gate
+        # requires it on every real subcommand group.
+        sub = p.add_command_subparsers(metavar="<command>")
+        sub.add_parser("visible", help="Shown.")
+        sub.add_parser("_internal")
+        return p
+
+    def test_unknown_command_lists_only_visible(self, capsys: Any) -> None:
+        p = self._with_hidden()
+        with pytest.raises(SystemExit) as exc:
+            p.parse_command(["nope"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "unrecognized command 'nope'" in err
+        assert "available commands: visible" in err
+        assert "_internal" not in err
+
+    def test_unknown_command_excludes_suppressed_help(
+        self, capsys: Any
+    ) -> None:
+        # A subcommand added with help=SUPPRESS enters _choices_actions
+        # but is hidden from --help, so the listing must drop it too.
+        p = StrictArgumentParser(prog="tool")
+        sub = p.add_command_subparsers(metavar="<command>")
+        sub.add_parser("visible", help="Shown.")
+        sub.add_parser("quiet", help=argparse.SUPPRESS)
+        with pytest.raises(SystemExit):
+            p.parse_command(["nope"])
+        err = capsys.readouterr().err
+        assert "available commands: visible" in err
+        assert "quiet" not in err
+
+    def test_unknown_nested_command_reports_at_that_level(
+        self, capsys: Any
+    ) -> None:
+        # An unknown command under `group` reports through group's own
+        # usage line and lists group's subcommands, not the root's.
+        p = StrictArgumentParser(prog="tool")
+        top = p.add_command_subparsers(metavar="<command>")
+        grp = top.add_parser("group", help="A group.")
+        mid = grp.add_command_subparsers(metavar="<command>")
+        mid.add_parser("do", help="Do it.")
+        with pytest.raises(SystemExit):
+            p.parse_command(["group", "bogus"])
+        err = capsys.readouterr().err
+        assert "usage: tool group" in err
+        assert "available commands: do" in err
+
+    def test_unknown_command_suggests_close_match(self, capsys: Any) -> None:
+        p = self._with_hidden()
+        with pytest.raises(SystemExit):
+            p.parse_command(["visable"])
+        assert "did you mean 'visible'?" in capsys.readouterr().err
+
+    def test_unknown_command_omits_hint_when_no_close_match(
+        self, capsys: Any
+    ) -> None:
+        p = self._with_hidden()
+        with pytest.raises(SystemExit):
+            p.parse_command(["zzzzz"])
+        assert "did you mean" not in capsys.readouterr().err
+
 
 class TestValidateHook:
     @staticmethod
