@@ -1177,17 +1177,7 @@ class TomlConfig:
 # time-span syntax. Both are parsed and validated by the crony.unit
 # value objects (Schedule / Interval); `_parse_timing` wraps them for
 # the config loader and adds the loader's own interval floor
-# (MIN_INTERVAL_SECONDS), a constraint the value objects do not impose.
-
-# The shortest interval crony accepts. Below a minute the two backends
-# stop honoring the spacing consistently -- systemd's default timer
-# accuracy is one minute (AccuracySec=1min) and launchd throttles
-# respawns to roughly ten seconds -- so a sub-minute interval cannot be
-# delivered the same way on both, and jobs that expect tight spacing get
-# it on neither. Reject it at config load rather than silently rounding.
-# The check lives here (config parse), not in `Interval.from_str`, so it
-# never rejects an already-applied job on snapshot rehydration.
-MIN_INTERVAL_SECONDS = 60
+# (`min_interval_seconds`), a constraint the value objects do not impose.
 
 
 def _env_int(key: str, default: int) -> int:
@@ -1213,13 +1203,27 @@ def jitter_floor_seconds() -> int:
     return _env_int("JITTER_FLOOR_SECONDS", 600)
 
 
+def min_interval_seconds() -> int:
+    """The shortest interval crony accepts at config load, in seconds --
+    1 minute by default. Below a minute the two backends stop honoring the
+    spacing consistently (systemd's default timer accuracy is one minute,
+    launchd throttles respawns to roughly ten seconds), so a sub-minute
+    interval cannot be delivered the same way on both; reject it at config
+    load rather than silently rounding. The check lives here (config
+    parse), not in `Interval.from_str`, so it never rejects an
+    already-applied job on snapshot rehydration. Read live from
+    `CRONY_MIN_INTERVAL_SECONDS` so a test can drive a short interval; a
+    non-integer override falls back to the default."""
+    return _env_int("MIN_INTERVAL_SECONDS", 60)
+
+
 def _parse_timing(
     schedule_str: str | None, interval_str: str | None, where: str
 ) -> crony.unit.Timing | None:
     """Build a unit's timing from the config's mutually-exclusive
     `schedule` / `interval` keys, or None for an on-demand entry.
     Surfaces the value objects' validation as a config error tied to
-    `where`. Intervals below `MIN_INTERVAL_SECONDS` are rejected."""
+    `where`. Intervals below `min_interval_seconds` are rejected."""
     if schedule_str is not None and interval_str is not None:
         raise crony.errors.ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
@@ -1232,10 +1236,11 @@ def _parse_timing(
         interval = crony.unit.Interval.from_str(interval_str)
     except ValueError as e:
         raise crony.errors.ConfigError(f"{where}: {e}") from e
-    if interval.total_seconds < MIN_INTERVAL_SECONDS:
+    minimum = min_interval_seconds()
+    if interval.total_seconds < minimum:
         raise crony.errors.ConfigError(
             f"{where}: interval {interval_str!r} is below the "
-            f"{MIN_INTERVAL_SECONDS}s minimum"
+            f"{minimum}s minimum"
         )
     return interval
 

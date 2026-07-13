@@ -43,8 +43,10 @@ suite that silently passed would hide the missing coverage.
 """
 
 import os
+import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -202,6 +204,29 @@ class _CronyE2E:
             check=check,
         )
 
+    def darwin_label(self, short: str, *, jitter: bool = False) -> str:
+        """The launchd Label for `short`'s service (or its jitter
+        companion) in the reserved bundle."""
+        suffix = ".jitter" if jitter else ""
+        return f"org.crony.{self.full(short)}{suffix}"
+
+    def darwin_plist(self, short: str, *, jitter: bool = False) -> Path:
+        """The on-disk plist path for `short`'s service (or companion)."""
+        return (
+            self.unit_dir / f"{self.darwin_label(short, jitter=jitter)}.plist"
+        )
+
+    def launchctl_loaded(self, label: str) -> bool:
+        """Whether `label` is registered in the user's GUI domain."""
+        return (
+            subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        )
+
     def status_config(self, full_name: str) -> str | None:
         """The CONFIG cell `crony status` shows for `full_name`, or None
         when the entry has no row."""
@@ -331,6 +356,23 @@ class TestSystemdTimerArming:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    def test_eligible_interval_timer_seeds_onactive_with_offset(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # An interval at or above the 10m jitter floor delays its first
+        # fire by the model's per-job offset (OnActiveSec = a bare-seconds
+        # value, not the interval) while the cadence stays the full
+        # interval. No RandomizedDelaySec -- the offset is ours.
+        e2e.write_bundle(
+            '[job.probe]\ncommand = "true"\ninterval = "8h"\n', ["probe"]
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        body = (e2e.unit_dir / f"crony-{e2e.full('probe')}.timer").read_text()
+        assert "OnUnitActiveSec=8h" in body
+        assert re.search(r"OnActiveSec=\d+s", body)
+        assert "OnActiveSec=8h" not in body
+        assert "RandomizedDelaySec" not in body
+
     def test_apply_re_arms_dead_timer_matching_content(
         self, e2e: _CronyE2E
     ) -> None:
@@ -372,6 +414,95 @@ class TestLaunchdInterval:
         )
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
+
+
+@pytest.mark.skipif(
+    not _IS_DARWIN, reason="launchd jitter companion is darwin-only"
+)
+class TestLaunchdJitter:
+    """launchd has no native start-time randomization, so a jittered
+    interval job (>= the 10m floor) gets a second LaunchAgent -- a jitter
+    companion -- installed and loaded beside its service, sharing the
+    entity's apply / disable / destroy lifecycle. An 8h interval sits above
+    the production floor, so it is jittered without any test seam; the
+    fires-and-self-unloads case drives a short interval through the live
+    env floors."""
+
+    _JITTERED = '[job.probe]\ncommand = "true"\ninterval = "8h"\n'
+
+    def test_companion_installed_and_loaded(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(self._JITTERED, ["probe"])
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.status_config(e2e.full("probe")) == "synced"
+        assert e2e.darwin_plist("probe").exists()
+        assert e2e.darwin_plist("probe", jitter=True).exists()
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe"))
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+
+    def test_calendar_job_has_no_companion(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(
+            '[job.probe]\ncommand = "true"\nschedule = "*-*-* 03:00"\n',
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.darwin_plist("probe").exists()
+        assert not e2e.darwin_plist("probe", jitter=True).exists()
+
+    def test_status_surfaces_companion_path(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(self._JITTERED, ["probe"])
+        e2e.crony("apply", e2e.full("probe"))
+        out = e2e.crony(
+            "status",
+            "-b",
+            E2E_BUNDLE,
+            "--cols",
+            "job-or-uuid,unit-config-2",
+        ).stdout
+        assert str(e2e.darwin_plist("probe", jitter=True)) in out
+
+    def test_disable_removes_companion_enable_restores(
+        self, e2e: _CronyE2E
+    ) -> None:
+        e2e.write_bundle(self._JITTERED, ["probe"])
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.crony("disable", e2e.full("probe"))
+        assert e2e.darwin_plist("probe").exists()
+        assert not e2e.darwin_plist("probe", jitter=True).exists()
+        assert not e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+        e2e.crony("enable", e2e.full("probe"))
+        assert e2e.darwin_plist("probe", jitter=True).exists()
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+
+    def test_reapply_keeps_companion_loaded(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(self._JITTERED, ["probe"])
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe"))
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+
+    def test_companion_fires_and_self_boots_out(self, e2e: _CronyE2E) -> None:
+        # Drive a short interval so the companion fires within seconds --
+        # both floors are read live from the env. When it fires it unloads
+        # its own label (via the scheduler), so the label disappears while
+        # the service stays loaded.
+        e2e.env["CRONY_MIN_INTERVAL_SECONDS"] = "5"
+        e2e.env["CRONY_JITTER_FLOOR_SECONDS"] = "5"
+        e2e.write_bundle(
+            '[job.probe]\ncommand = "true"\ninterval = "15s"\n', ["probe"]
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+        deadline = time.monotonic() + 60
+        while (
+            e2e.launchctl_loaded(e2e.darwin_label("probe", jitter=True))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(2)
+        assert not e2e.launchctl_loaded(
+            e2e.darwin_label("probe", jitter=True)
+        ), "jitter companion did not self-unload after firing"
+        # The service is untouched: still loaded, firing on its interval.
+        assert e2e.launchctl_loaded(e2e.darwin_label("probe"))
 
 
 if __name__ == "__main__":

@@ -164,7 +164,12 @@ gated by platform checks.
   skipping -- a suite the caller explicitly asked for that silently passed
   would hide the missing coverage (a genuine platform mismatch, like a systemd
   test on macOS, still skips). The module docstring documents manual cleanup
-  for the rare case a run is hard-killed before teardown.
+  for the rare case a run is hard-killed before teardown. The launchd jitter
+  self-unload test additionally drives a sub-floor interval through two
+  test-only live env seams -- `CRONY_MIN_INTERVAL_SECONDS` (the config floor)
+  and `CRONY_JITTER_FLOOR_SECONDS` (the jitter-eligibility floor) -- so the
+  companion fires within seconds instead of the 10m production floor; both
+  read live per call and default to the production values when unset.
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm
   suite ~20x slower than Linux and intermittently cross its 120s per-call

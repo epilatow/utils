@@ -47,6 +47,7 @@ from crony.config import (  # noqa: E402
     TomlBundleConfig,
     TomlConfig,
     jitter_floor_seconds,
+    min_interval_seconds,
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -362,6 +363,15 @@ class TestParseJob:
     def test_interval_at_minimum_accepted(self) -> None:
         cfg = _parse(self._cfg({"command": "x", "interval": "1m"}))
         assert cfg.jobs["j"].timing == Interval.from_str("1m")
+
+    def test_min_interval_floor_read_live_from_env(
+        self, monkeypatch: Any
+    ) -> None:
+        # The floor is read live from CRONY_MIN_INTERVAL_SECONDS -- the
+        # test seam the jitter e2e drives a sub-minute interval through.
+        monkeypatch.setenv("CRONY_MIN_INTERVAL_SECONDS", "10")
+        cfg = _parse(self._cfg({"command": "x", "interval": "30s"}))
+        assert cfg.jobs["j"].timing == Interval.from_str("30s")
 
     def test_invalid_platforms_value(self) -> None:
         _assert_errored_job(
@@ -2770,20 +2780,32 @@ class TestJobFlags:
         ]
 
 
-class TestJitterFloor:
-    def test_default_is_10m(self, monkeypatch: Any) -> None:
+class TestPolicyFloors:
+    def test_jitter_floor_default_is_10m(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_JITTER_FLOOR_SECONDS", raising=False)
         assert jitter_floor_seconds() == 600
 
-    def test_env_override_read_live(self, monkeypatch: Any) -> None:
+    def test_jitter_floor_override_read_live(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "30")
         assert jitter_floor_seconds() == 30
         monkeypatch.delenv("CRONY_JITTER_FLOOR_SECONDS")
         assert jitter_floor_seconds() == 600
 
-    def test_non_integer_override_falls_back(self, monkeypatch: Any) -> None:
+    def test_jitter_floor_non_integer_falls_back(
+        self, monkeypatch: Any
+    ) -> None:
         monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "not-a-number")
         assert jitter_floor_seconds() == 600
+
+    def test_min_interval_default_is_1m(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("CRONY_MIN_INTERVAL_SECONDS", raising=False)
+        assert min_interval_seconds() == 60
+
+    def test_min_interval_override_read_live(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("CRONY_MIN_INTERVAL_SECONDS", "5")
+        assert min_interval_seconds() == 5
+        monkeypatch.delenv("CRONY_MIN_INTERVAL_SECONDS")
+        assert min_interval_seconds() == 60
 
 
 if __name__ == "__main__":
