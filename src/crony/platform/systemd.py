@@ -87,15 +87,23 @@ def render_service(
     )
 
 
-def render_timer(name: str, timing: Timing) -> str:
-    """Render the systemd `.timer` unit."""
+def _render_timer(name: str, timing: Timing, jitter: Interval | None) -> str:
+    """Render the systemd `.timer` unit.
+
+    `jitter` is the fixed per-job start-time offset for a jittered interval
+    job, or None. When set, the first fire is delayed by it instead of by
+    the full interval, spreading a herd of same-interval jobs off each
+    unit's own offset. It has no effect on a calendar timer."""
     if isinstance(timing, Interval):
         # OnUnitActiveSec alone measures from the last service
         # activation, so a timer whose service has never run has no
         # anchor and never elapses. OnActiveSec seeds the first firing
-        # relative to timer activation (enable / boot); OnUnitActiveSec
-        # then drives the recurring cadence off each completed run.
-        spec_line = f"OnActiveSec={timing}\nOnUnitActiveSec={timing}\n"
+        # relative to timer activation (enable / boot); a jittered job
+        # seeds it with its per-job offset so same-interval jobs do not
+        # fire in lockstep, while OnUnitActiveSec keeps the recurring
+        # cadence at the full interval off each completed run.
+        first = jitter if jitter is not None else timing
+        spec_line = f"OnActiveSec={first}\nOnUnitActiveSec={timing}\n"
     else:
         spec_line = f"OnCalendar={timing}\n"
     return (
@@ -296,10 +304,11 @@ class SystemdScheduler(Scheduler):
             )
         ]
         if spec.timing is not None:
+            jitter = spec.jitter.offset if spec.jitter is not None else None
             units.append(
                 RenderedUnit(
                     Path(timer_filename(name)),
-                    render_timer(name, spec.timing),
+                    _render_timer(name, spec.timing, jitter),
                 )
             )
         return RenderedUnits(tuple(units))

@@ -57,18 +57,33 @@ class TestSystemdRendering:
         assert "WorkingDirectory=%h" in svc
 
     def test_timer_oncalendar(self) -> None:
-        timer = systemd.render_timer("j", Schedule.from_str("*-*-* 03:00"))
+        timer = systemd._render_timer(
+            "j", Schedule.from_str("*-*-* 03:00"), None
+        )
         assert "OnCalendar=*-*-* 03:00" in timer
         assert "Persistent=true" in timer
         assert "WantedBy=timers.target" in timer
 
-    def test_timer_interval(self) -> None:
-        timer = systemd.render_timer("j", Interval.from_str("1h"))
+    def test_timer_interval_unjittered(self) -> None:
+        timer = systemd._render_timer("j", Interval.from_str("1h"), None)
         assert "OnUnitActiveSec=1h" in timer
         # OnActiveSec anchors the first firing to timer activation;
         # without it OnUnitActiveSec has no service run to measure from
-        # and the timer never elapses.
+        # and the timer never elapses. Unjittered, it is the full interval.
         assert "OnActiveSec=1h" in timer
+
+    def test_timer_interval_jittered_seeds_onactive_with_offset(self) -> None:
+        # A jittered interval delays the first fire by the per-job offset
+        # (OnActiveSec), spreading a herd, while the cadence stays the full
+        # interval. No RandomizedDelaySec -- the offset is fixed and
+        # computed by the model, not delegated to systemd.
+        timer = systemd._render_timer(
+            "j", Interval.from_str("1h"), Interval("1685s", 1685)
+        )
+        assert "OnActiveSec=1685s" in timer
+        assert "OnUnitActiveSec=1h" in timer
+        assert "RandomizedDelaySec" not in timer
+        assert "FixedRandomDelay" not in timer
 
     def test_service_invokes_uv_with_absolute_path(self) -> None:
         # systemd user services run with a minimal default PATH; render

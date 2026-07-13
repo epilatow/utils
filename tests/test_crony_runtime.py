@@ -1728,8 +1728,8 @@ class TestUnitDriftDetection:
         crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
-            systemd.render_timer(
-                h.full("transit"), Schedule.from_str("*-*-* 03:00")
+            systemd._render_timer(
+                h.full("transit"), Schedule.from_str("*-*-* 03:00"), None
             )
         )
         config = crony_runtime.load_config()

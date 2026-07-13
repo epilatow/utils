@@ -410,8 +410,8 @@ class JitterSpec:
 
     offset      The fixed per-job first-fire offset as an Interval, in
                 `[1, N)` for an interval of `N`. A backend delays the first
-                fire by it (on launchd, a companion that fires at it and
-                triggers the service).
+                fire by it (systemd `OnActiveSec`, launchd a companion that
+                fires at it and triggers the service).
     cmd         The argv a phasing companion runs -- an opaque crony
                 invocation the model bakes, exactly like `UnitSpec.cmd`.
                 Consumed by backends that implement jitter via a separate
