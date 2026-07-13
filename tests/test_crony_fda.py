@@ -30,7 +30,7 @@ _script_path = REPO_ROOT / "src" / "crony" / "platform" / "fda.py"
 
 
 class TestNeedsRebuild:
-    """`needs_rebuild` compares the checked-in source against the
+    """`_needs_rebuild` compares the checked-in source against the
     stored hash, with the binary and hash files redirected to tmp."""
 
     @pytest.fixture
@@ -39,7 +39,7 @@ class TestNeedsRebuild:
         binary = tmp_path / "Crony"
         hash_file = tmp_path / ".Crony.source-sha256"
         with (
-            patch.object(fda, "source_path", return_value=src),
+            patch.object(fda, "_source_path", return_value=src),
             patch.object(fda, "wrapper_binary", return_value=binary),
             patch.object(fda, "_hash_path", return_value=hash_file),
         ):
@@ -48,7 +48,7 @@ class TestNeedsRebuild:
     def test_no_binary(self, env: tuple[Path, Path, Path]) -> None:
         src, _binary, _hash_file = env
         src.write_text("int main(){}")
-        stale, reason = fda.needs_rebuild()
+        stale, reason = fda._needs_rebuild()
         assert stale is True
         assert "binary" in reason
 
@@ -56,7 +56,7 @@ class TestNeedsRebuild:
         src, binary, _hash_file = env
         src.write_text("int main(){}")
         binary.write_text("binary")
-        stale, reason = fda.needs_rebuild()
+        stale, reason = fda._needs_rebuild()
         assert stale is True
         assert "hash" in reason
 
@@ -65,7 +65,7 @@ class TestNeedsRebuild:
         src.write_text("int main(){}")
         binary.write_text("binary")
         hash_file.write_text("stale\n")
-        stale, reason = fda.needs_rebuild()
+        stale, reason = fda._needs_rebuild()
         assert stale is True
         assert "mismatch" in reason
 
@@ -74,7 +74,7 @@ class TestNeedsRebuild:
         src.write_text("int main(){}")
         binary.write_text("binary")
         hash_file.write_text(fda._source_sha256() + "\n")
-        stale, reason = fda.needs_rebuild()
+        stale, reason = fda._needs_rebuild()
         assert stale is False
         assert reason == ""
 
@@ -82,7 +82,7 @@ class TestNeedsRebuild:
     def test_missing_source_raises(self) -> None:
         # src not written -> does not exist
         with pytest.raises(PreconditionError, match="source missing"):
-            fda.needs_rebuild()
+            fda._needs_rebuild()
 
 
 class TestWrapperState:
@@ -97,7 +97,7 @@ class TestWrapperState:
         hash_file = tmp_path / ".Crony.source-sha256"
         src.write_text("int main(){}")
         with (
-            patch.object(fda, "source_path", return_value=src),
+            patch.object(fda, "_source_path", return_value=src),
             patch.object(fda, "wrapper_binary", return_value=binary),
             patch.object(fda, "_hash_path", return_value=hash_file),
         ):
@@ -126,7 +126,7 @@ class TestWrapperState:
         _src, binary, hash_file = env
         binary.write_text("binary")
         hash_file.write_text(fda._source_sha256() + "\n")
-        with patch.object(fda, "probe_fda", return_value=True):
+        with patch.object(fda, "_probe_fda", return_value=True):
             assert fda.wrapper_state() is fda.FDAWrapper.OK
 
     def test_missing_grant_when_current_but_denied(
@@ -135,7 +135,7 @@ class TestWrapperState:
         _src, binary, hash_file = env
         binary.write_text("binary")
         hash_file.write_text(fda._source_sha256() + "\n")
-        with patch.object(fda, "probe_fda", return_value=False):
+        with patch.object(fda, "_probe_fda", return_value=False):
             assert fda.wrapper_state() is fda.FDAWrapper.MISSING_FDA_GRANT
 
     def test_stale_does_not_probe_grant(
@@ -145,7 +145,7 @@ class TestWrapperState:
         # probe (a subprocess) must not run.
         _src, binary, _hash_file = env
         binary.write_text("binary")
-        with patch.object(fda, "probe_fda", autospec=True) as probe:
+        with patch.object(fda, "_probe_fda", autospec=True) as probe:
             assert fda.wrapper_state() is fda.FDAWrapper.STALE
         probe.assert_not_called()
 
@@ -175,7 +175,7 @@ class TestBuildWrapper:
         hash_file = tmp_path / ".Crony.source-sha256"
         src.write_text("int main(){}")
         with (
-            patch.object(fda, "source_path", return_value=src),
+            patch.object(fda, "_source_path", return_value=src),
             patch.object(fda, "wrapper_binary", return_value=binary),
             patch.object(fda, "_hash_path", return_value=hash_file),
             patch.object(fda, "_app_path", return_value=tmp_path / "Crony.app"),
@@ -259,7 +259,7 @@ class TestBuildWrapper:
 
 
 class TestProbe:
-    """`probe_fda` runs the wrapper's `--check-fda` and reads its exit
+    """`_probe_fda` runs the wrapper's `--check-fda` and reads its exit
     code; the subprocess is mocked so it runs on any platform."""
 
     def test_granted(self) -> None:
@@ -268,15 +268,15 @@ class TestProbe:
             autospec=True,
             return_value=subprocess.CompletedProcess([], 0),
         ):
-            assert fda.probe_fda() is True
+            assert fda._probe_fda() is True
 
     def test_denied(self) -> None:
         with patch(
             "crony.platform.fda.subprocess.run",
             autospec=True,
-            return_value=subprocess.CompletedProcess([], fda.FDA_EXIT_CODE),
+            return_value=subprocess.CompletedProcess([], fda._FDA_EXIT_CODE),
         ):
-            assert fda.probe_fda() is False
+            assert fda._probe_fda() is False
 
     def test_grant_instructions_name_the_bundle(self) -> None:
         msg = fda.grant_instructions()
@@ -440,7 +440,7 @@ class TestWrapperBinary:
             )
         finally:
             tcc.chmod(0o700)
-        assert result.returncode == fda.FDA_EXIT_CODE
+        assert result.returncode == fda._FDA_EXIT_CODE
         assert result.stderr == ""
 
     def test_run_mode_denied_logs_guidance(
@@ -459,7 +459,7 @@ class TestWrapperBinary:
             )
         finally:
             tcc.chmod(0o700)
-        assert result.returncode == fda.FDA_EXIT_CODE
+        assert result.returncode == fda._FDA_EXIT_CODE
         assert "Full Disk Access" in result.stderr
 
     def test_forwards_termination_signal_to_command(
@@ -543,7 +543,7 @@ class TestBuildWrapperDarwin:
         macos = app / "Contents" / "MacOS"
         with (
             patch.object(fda, "_app_path", return_value=app),
-            patch.object(fda, "source_path", return_value=macos / "Crony.c"),
+            patch.object(fda, "_source_path", return_value=macos / "Crony.c"),
             patch.object(fda, "wrapper_binary", return_value=macos / "Crony"),
             patch.object(
                 fda, "_hash_path", return_value=macos / ".Crony.source-sha256"
@@ -559,10 +559,10 @@ class TestBuildWrapperDarwin:
             ["file", str(binary)], capture_output=True, text=True
         ).stdout
         assert "Mach-O" in out
-        # The build leaves a current binary: needs_rebuild is satisfied
+        # The build leaves a current binary: _needs_rebuild is satisfied
         # and the state reflects only the grant (OK or, on a test host
         # without the grant, MISSING_FDA_GRANT) -- never MISSING / STALE.
-        assert fda.needs_rebuild()[0] is False
+        assert fda._needs_rebuild()[0] is False
         assert fda.wrapper_state() in (
             fda.FDAWrapper.OK,
             fda.FDAWrapper.MISSING_FDA_GRANT,

@@ -49,7 +49,7 @@ _DIR = Path("/unused")
 
 class TestSystemdRendering:
     def test_service_unit(self) -> None:
-        svc = systemd.render_service("brew", _CMD)
+        svc = systemd._render_service("brew", _CMD)
         assert "[Unit]" in svc
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
@@ -89,7 +89,7 @@ class TestSystemdRendering:
     def test_service_invokes_uv_with_absolute_path(self) -> None:
         # systemd user services run with a minimal default PATH; render
         # uv's absolute path so the unit doesn't depend on PATH.
-        svc = systemd.render_service("j", _CMD)
+        svc = systemd._render_service("j", _CMD)
         assert (
             "ExecStart=/abs/uv run --script /abs/crony _run default:u-test"
             in svc
@@ -98,19 +98,19 @@ class TestSystemdRendering:
 
 class TestSystemdPriority:
     def test_high_records_intent(self) -> None:
-        svc = systemd.render_service("j", _CMD, PriorityClass.HIGH)
+        svc = systemd._render_service("j", _CMD, PriorityClass.HIGH)
         assert "# crony priority=high" in svc
         # high leaves CPU/IO at the Linux defaults.
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
 
     def test_low_sets_scheduling(self) -> None:
-        svc = systemd.render_service("j", _CMD, PriorityClass.LOW)
+        svc = systemd._render_service("j", _CMD, PriorityClass.LOW)
         assert "Nice=10" in svc
         assert "IOSchedulingClass=idle" in svc
 
     def test_normal_emits_nothing(self) -> None:
-        svc = systemd.render_service("j", _CMD, PriorityClass.NORMAL)
+        svc = systemd._render_service("j", _CMD, PriorityClass.NORMAL)
         assert "Nice=" not in svc
         assert "IOSchedulingClass" not in svc
 

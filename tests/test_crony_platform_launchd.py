@@ -250,7 +250,7 @@ class TestLaunchdReload:
         loaded_seq: list[bool] | None = None,
     ) -> tuple[Any, list[list[str]]]:
         sched = get_scheduler("darwin", tmp_path)
-        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        (tmp_path / launchd._plist_filename("default.j")).write_text("x")
         calls: list[list[str]] = []
         rcs = list(bootstrap_rcs)
 
@@ -328,7 +328,7 @@ class TestLaunchdReload:
         # A plist that fails `plutil -s` aborts activate with a crony
         # SubprocessError (a proper exit code), before any bootstrap.
         sched = get_scheduler("darwin", tmp_path)
-        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        (tmp_path / launchd._plist_filename("default.j")).write_text("x")
         calls: list[list[str]] = []
 
         def fake_run(cmd: Any, **_kw: Any) -> subprocess.CompletedProcess[str]:
@@ -368,7 +368,7 @@ class TestLaunchdReload:
             return seq[len(polled) - 1] if len(polled) <= len(seq) else False
 
         sched = get_scheduler("darwin", tmp_path)
-        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        (tmp_path / launchd._plist_filename("default.j")).write_text("x")
         calls: list[list[str]] = []
 
         def fake_run(cmd: Any, **_k: Any) -> subprocess.CompletedProcess[str]:

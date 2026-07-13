@@ -84,7 +84,7 @@ class JobFlags(enum.Flag):
         return _FLAG_DESCRIPTIONS[self]
 
     @classmethod
-    def from_token(cls, token: str) -> JobFlags:
+    def _from_token(cls, token: str) -> JobFlags:
         """The flag member named by `token`.
 
         The canonical spelling is the dash token, but input is
@@ -112,7 +112,7 @@ class JobFlagNames(enum.StrEnum):
     `JobFlags` is a bitmask; this is its name side -- the spelling a
     flag carries when addressed as text (a scalar `keep-awake = true`
     config key, a `status --cols interactive` column). It is the single
-    source of those spellings: `JobFlags.token` / `from_token` pivot
+    source of those spellings: `JobFlags.token` / `_from_token` pivot
     through it by member name, so callers selecting or displaying a flag
     by token get a typed value. One member per `JobFlags` member, named
     identically; the assert below fails the import if that drifts or a
@@ -253,7 +253,7 @@ class NotifyChannel:
     ntfy: NotifyNtfy | None = None
 
     @classmethod
-    def from_raw(cls, name: str, raw: dict[str, Any]) -> NotifyChannel:
+    def _from_raw(cls, name: str, raw: dict[str, Any]) -> NotifyChannel:
         """Parse a single [defaults.notify.<name>] block.
 
         Channel-level keys: `transport` (defaults to the channel name
@@ -650,12 +650,12 @@ class TomlBundleConfig:
     errored_platform_targets: dict[str, str] = field(default_factory=dict)
     errored_host_targets: dict[str, str] = field(default_factory=dict)
     # Legacy underscore-spelled field keys this bundle still uses (the
-    # dash spelling is canonical). Populated by `from_raw`; surfaced as a
+    # dash spelling is canonical). Populated by `_from_raw`; surfaced as a
     # single deprecation warning per file by `crony config validate`.
     legacy_underscore_keys: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_raw(
+    def _from_raw(
         cls,
         raw: dict[str, Any],
         *,
@@ -688,7 +688,7 @@ class TomlBundleConfig:
         return config
 
     @classmethod
-    def load(cls, path: Path) -> TomlBundleConfig:
+    def _load(cls, path: Path) -> TomlBundleConfig:
         """Load a single config file as a `TomlBundleConfig`.
 
         Suited to tests and any caller that has one specific config
@@ -704,7 +704,7 @@ class TomlBundleConfig:
             raise crony.errors.ConfigError(
                 f"TOML parse error in {path}: {e}"
             ) from e
-        config = cls.from_raw(raw)
+        config = cls._from_raw(raw)
         _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
         return config
 
@@ -919,17 +919,6 @@ class TomlBundleConfig:
             _walk(name, base, set())
         return out
 
-    def resolved_flags(self, short: str, target: Target | None) -> JobFlags:
-        """The resolved flags for one entry. Falls back to the defaults
-        composed with the entry's own delta when the entry is not
-        reached through the target (no ancestor groups to inherit)."""
-        by_name = self.resolved_flags_by_name(target)
-        if short in by_name:
-            return by_name[short]
-        entry = self.jobs.get(short) or self.job_groups.get(short)
-        delta = entry.flags if entry is not None else {}
-        return self.composed_flags(delta)
-
     def composed_flags(self, delta: dict[JobFlags, bool]) -> JobFlags:
         """The bundle defaults composed with one entry's own `delta` --
         the resolved flags for an entry that inherits only the defaults,
@@ -1026,7 +1015,7 @@ class TomlBundle:
 
         Per-entity ConfigErrors (a single bad job, group, or target
         inside an otherwise-valid bundle) do not raise:
-        `TomlBundleConfig.from_raw` and `_validate_config` record them
+        `TomlBundleConfig._from_raw` and `_validate_config` record them
         on `TomlBundleConfig.errored_jobs` / `errored_job_groups` /
         `errored_platform_targets` / `errored_host_targets`, and they
         surface at status time with `config=error` plus a logged line
@@ -1039,7 +1028,7 @@ class TomlBundle:
                 f"TOML parse error in {path}: {e}"
             ) from e
         try:
-            config = TomlBundleConfig.from_raw(raw, bundle_name=name)
+            config = TomlBundleConfig._from_raw(raw, bundle_name=name)
         except crony.errors.ConfigError as e:
             raise crony.errors.ConfigError(f"{path}: {e}") from e
         _demote_duplicate_uuids(config, name)
@@ -1177,7 +1166,7 @@ class TomlConfig:
 # time-span syntax. Both are parsed and validated by the crony.unit
 # value objects (Schedule / Interval); `_parse_timing` wraps them for
 # the config loader and adds the loader's own interval floor
-# (`min_interval_seconds`), a constraint the value objects do not impose.
+# (`_min_interval_seconds`), a constraint the value objects do not impose.
 
 
 def _env_int(key: str, default: int) -> int:
@@ -1203,7 +1192,7 @@ def jitter_floor_seconds() -> int:
     return _env_int("JITTER_FLOOR_SECONDS", 600)
 
 
-def min_interval_seconds() -> int:
+def _min_interval_seconds() -> int:
     """The shortest interval crony accepts at config load, in seconds --
     1 minute by default. Below a minute the two backends stop honoring the
     spacing consistently (systemd's default timer accuracy is one minute,
@@ -1223,7 +1212,7 @@ def _parse_timing(
     """Build a unit's timing from the config's mutually-exclusive
     `schedule` / `interval` keys, or None for an on-demand entry.
     Surfaces the value objects' validation as a config error tied to
-    `where`. Intervals below `min_interval_seconds` are rejected."""
+    `where`. Intervals below `_min_interval_seconds` are rejected."""
     if schedule_str is not None and interval_str is not None:
         raise crony.errors.ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
@@ -1236,7 +1225,7 @@ def _parse_timing(
         interval = crony.unit.Interval.from_str(interval_str)
     except ValueError as e:
         raise crony.errors.ConfigError(f"{where}: {e}") from e
-    minimum = min_interval_seconds()
+    minimum = _min_interval_seconds()
     if interval.total_seconds < minimum:
         raise crony.errors.ConfigError(
             f"{where}: interval {interval_str!r} is below the "
@@ -1427,9 +1416,9 @@ def _reject_unknown_keys(
 
 
 # Collects the legacy underscore-spelled field keys folded while parsing
-# one bundle, so `from_raw` can attach them to the config for
+# one bundle, so `_from_raw` can attach them to the config for
 # `crony config validate` to warn about. Set to a fresh set for the
-# duration of a `from_raw` call; None outside one, when folding records
+# duration of a `_from_raw` call; None outside one, when folding records
 # nothing.
 _legacy_keys_seen: contextvars.ContextVar[set[str] | None] = (
     contextvars.ContextVar("crony_legacy_keys", default=None)
@@ -1717,7 +1706,7 @@ def _parse_flags_field(raw: dict[str, Any], where: str) -> dict[JobFlags, bool]:
         token, sep, value_str = entry.partition("=")
         token = token.strip()
         try:
-            flag = JobFlags.from_token(token)
+            flag = JobFlags._from_token(token)
         except ValueError as e:
             raise crony.errors.ConfigError(f"{where}: {e}") from e
         if not sep:
@@ -1956,7 +1945,9 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
             raise crony.errors.ConfigError(
                 f"[defaults.notify.{sub_key}]: must be a table"
             )
-        notify_channel_defs[sub_key] = NotifyChannel.from_raw(sub_key, sub_body)
+        notify_channel_defs[sub_key] = NotifyChannel._from_raw(
+            sub_key, sub_body
+        )
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     return Defaults(
         notify_channels=channels or [],
@@ -2451,7 +2442,7 @@ def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:
     in the same bundle into the errored maps. Operates in-place.
 
     UUIDs are bundle-scoped, so this check runs after each bundle's
-    `TomlBundleConfig.from_raw` rather than across bundles. Duplicates
+    `TomlBundleConfig._from_raw` rather than across bundles. Duplicates
     are almost
     always a copy-paste mistake; both sides are demoted rather than
     picking a winner so the user sees the conflict on both rows and

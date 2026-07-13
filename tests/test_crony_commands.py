@@ -205,7 +205,7 @@ class TestInit:
         Commented-out directives carry a bare `#` (no space); prose
         carries `# ` (a space). Extract the directive lines (section
         headers `#[foo]` and `#foo = ...`), strip the single leading
-        `#`, and feed the result to from_raw. Prose, dividers, and
+        `#`, and feed the result to _from_raw. Prose, dividers, and
         inline-comment continuations all keep the space, so the
         strict patterns skip them.
         """
@@ -3195,13 +3195,13 @@ class TestStatusReport:
         # Each token resolves to its enum: column, alias, per-flag.
         tokens = crony_commands.parse_cols_arg("job,default,interactive")
         assert tokens == [
-            crony_commands.StatusCols.JOB,
-            crony_commands.StatusAliases.DEFAULT,
+            crony_commands._StatusCols.JOB,
+            crony_commands._StatusAliases.DEFAULT,
             JobFlagNames.INTERACTIVE,
         ]
         assert [type(t).__name__ for t in tokens] == [
-            "StatusCols",
-            "StatusAliases",
+            "_StatusCols",
+            "_StatusAliases",
             "JobFlagNames",
         ]
 
@@ -4742,21 +4742,21 @@ class TestStatusReport:
         assert config_labels == {m.value for m in crony_model.ConfigStatus}
 
     def test_every_selectable_column_is_documented(self) -> None:
-        # `StatusCols` is the authoritative column set: the registry must
+        # `_StatusCols` is the authoritative column set: the registry must
         # document every member exactly once (with a non-empty
         # description), and the selectable headers must be exactly the
-        # members plus the per-flag tokens. Adding a `StatusCols` member
+        # members plus the per-flag tokens. Adding a `_StatusCols` member
         # without a registry entry, or vice versa, fails here.
         documented = {
             c.name
             for c in crony_commands._STATUS_COLUMNS
             if not c.name.startswith("<")
         }
-        assert documented == set(crony_commands.StatusCols)
+        assert documented == set(crony_commands._StatusCols)
         flag_tokens = {f.token for f in JobFlags.members()}
         assert (
             set(crony_commands._STATUS_COL_HEADERS)
-            == set(crony_commands.StatusCols) | flag_tokens
+            == set(crony_commands._StatusCols) | flag_tokens
         )
         # Per-flag columns share the `<flag>` documentation entry.
         assert crony_commands._FLAG_COL_DOC in {
@@ -4766,18 +4766,18 @@ class TestStatusReport:
             assert col.description, f"column {col.name!r} has no description"
 
     def test_every_alias_is_documented(self) -> None:
-        # `StatusAliases` is the authoritative alias set: `_STATUS_ALIASES`
+        # `_StatusAliases` is the authoritative alias set: `_STATUS_ALIASES`
         # documents every member, each with a description, and every
-        # alias expands only to `StatusCols` members.
+        # alias expands only to `_StatusCols` members.
         documented = {a.name for a in crony_commands._STATUS_ALIASES}
-        assert documented == set(crony_commands.StatusAliases)
+        assert documented == set(crony_commands._StatusAliases)
         assert set(crony_commands._STATUS_COL_ALIAS_NAMES) == set(
-            crony_commands.StatusAliases
+            crony_commands._StatusAliases
         )
         for alias in crony_commands._STATUS_ALIASES:
             assert alias.description, f"alias {alias.name!r} has no desc"
             for col in alias.cols:
-                assert col in crony_commands.StatusCols, (
+                assert col in crony_commands._StatusCols, (
                     f"alias {alias.name!r} expands to non-column {col!r}"
                 )
 
@@ -4785,8 +4785,8 @@ class TestStatusReport:
         # Every alias expansion, under either masked / second-unit
         # context, is a subset of the selectable column set -- so an alias
         # can never select a column the renderer doesn't produce.
-        selectable = set(crony_commands.StatusCols)
-        for alias in crony_commands.StatusAliases:
+        selectable = set(crony_commands._StatusCols)
+        for alias in crony_commands._StatusAliases:
             for second in (False, True):
                 for masked in (False, True):
                     cols = crony_commands._expand_status_alias(
@@ -4798,36 +4798,36 @@ class TestStatusReport:
 
     def test_alias_expansion_trims_by_column_visibility(self) -> None:
         # The `all` alias lists every column but drops the conditional
-        # ones whose `ColVisibility` fails: `masked-by` only when a masked
+        # ones whose `_ColVisibility` fails: `masked-by` only when a masked
         # row is shown, `unit-config-2` only when a shown row carries a
         # second unit. The trim is driven by the column property, so the
         # expansion tracks each context.
-        StatusCols = crony_commands.StatusCols
+        _StatusCols = crony_commands._StatusCols
 
         def expand(masked: bool, second: bool) -> set[str]:
             return set(
                 crony_commands._expand_status_alias(
-                    crony_commands.StatusAliases.ALL,
+                    crony_commands._StatusAliases.ALL,
                     masked_present=masked,
                     second_unit_present=second,
                 )
             )
 
-        assert StatusCols.MASKED_BY in expand(True, False)
-        assert StatusCols.MASKED_BY not in expand(False, False)
-        assert StatusCols.UNIT_CONFIG_2 in expand(False, True)
-        assert StatusCols.UNIT_CONFIG_2 not in expand(False, False)
+        assert _StatusCols.MASKED_BY in expand(True, False)
+        assert _StatusCols.MASKED_BY not in expand(False, False)
+        assert _StatusCols.UNIT_CONFIG_2 in expand(False, True)
+        assert _StatusCols.UNIT_CONFIG_2 not in expand(False, False)
         # An unconditional column rides through every context.
         for masked in (False, True):
             for second in (False, True):
-                assert StatusCols.CONFIG in expand(masked, second)
+                assert _StatusCols.CONFIG in expand(masked, second)
 
     def test_every_column_visibility_value_is_used(self) -> None:
-        # Each `ColVisibility` value is exercised by at least one column,
+        # Each `_ColVisibility` value is exercised by at least one column,
         # so a value can't be added without a column that needs it (and
         # the corresponding `_column_in_context` branch stays covered).
         used = {col.visibility for col in crony_commands._STATUS_COLUMNS}
-        assert used == set(crony_commands.ColVisibility)
+        assert used == set(crony_commands._ColVisibility)
 
     def test_status_renders_every_selectable_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any

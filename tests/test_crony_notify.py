@@ -703,7 +703,7 @@ class TestDialogPopupNotify:
 
     def test_explicit_block_rejects_extra_keys(self) -> None:
         with pytest.raises(ConfigError, match="unknown key"):
-            NotifyChannel.from_raw(
+            NotifyChannel._from_raw(
                 "dialog-popup",
                 {"transport": "dialog-popup", "headers": {"X": "y"}},
             )

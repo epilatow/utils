@@ -46,8 +46,8 @@ from crony.config import (  # noqa: E402
     TomlBundle,
     TomlBundleConfig,
     TomlConfig,
+    _min_interval_seconds,
     jitter_floor_seconds,
-    min_interval_seconds,
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -626,14 +626,14 @@ class TestUuidField:
     def test_job_missing_uuid_is_errored(self) -> None:
         # Bypass `_parse` so `_inject_uuids` doesn't paper over the
         # condition we're verifying.
-        cfg = TomlBundleConfig.from_raw({"job": {"j": _job()}})
+        cfg = TomlBundleConfig._from_raw({"job": {"j": _job()}})
         assert "j" in cfg.errored_jobs
         assert "uuid" in cfg.errored_jobs["j"]
         assert "crony config update" in cfg.errored_jobs["j"]
         assert "j" not in cfg.jobs
 
     def test_group_missing_uuid_is_errored(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             {
                 "job": {
                     "a": {"command": "true", "uuid": self.GOOD},
@@ -723,7 +723,7 @@ class TestUuidField:
 
 class TestDuplicateUuidInBundle:
     """UUIDs are bundle-scoped, so this check runs after each
-    bundle's TomlBundleConfig.from_raw. Both entries sharing the
+    bundle's TomlBundleConfig._from_raw. Both entries sharing the
     duplicate UUID are demoted into the errored maps with the same
     message -- the user sees the conflict on every side, not just
     one, and other bundles/entries remain operational.
@@ -1197,7 +1197,7 @@ class TestLoadConfigFromFile:
         )
         f = tmp_path / "config.toml"
         f.write_text(cfg_text)
-        cfg = TomlBundleConfig.load(f)
+        cfg = TomlBundleConfig._load(f)
         assert "brew-update" in cfg.jobs
         assert cfg.jobs["brew-update"].timing == Schedule.from_str(
             "*-*-* 03:15"
@@ -1205,13 +1205,13 @@ class TestLoadConfigFromFile:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError, match="not found"):
-            TomlBundleConfig.load(tmp_path / "absent.toml")
+            TomlBundleConfig._load(tmp_path / "absent.toml")
 
     def test_bad_toml(self, tmp_path: Path) -> None:
         f = tmp_path / "config.toml"
         f.write_text("this is not [toml")
         with pytest.raises(ConfigError, match="TOML parse error"):
-            TomlBundleConfig.load(f)
+            TomlBundleConfig._load(f)
 
 
 class TestResolution:
@@ -1414,13 +1414,13 @@ class TestNotifyInherit:
     """
 
     def test_implicit_default_for_nondefault_bundle(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         assert cfg.defaults.notify_channels == [NOTIFY_INHERIT_TOKEN]
 
     def test_implicit_default_with_defaults_but_no_notify(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {"defaults": {"job_timeout_sec": 60}, "job": {"a": _job()}}
             ),
@@ -1429,11 +1429,11 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == [NOTIFY_INHERIT_TOKEN]
 
     def test_default_bundle_stays_empty(self) -> None:
-        cfg = TomlBundleConfig.from_raw(_inject_uuids({"job": {"a": _job()}}))
+        cfg = TomlBundleConfig._from_raw(_inject_uuids({"job": {"a": _job()}}))
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_empty_opts_out(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {"defaults": {"notify_channels": []}, "job": {"a": _job()}}
             ),
@@ -1442,7 +1442,7 @@ class TestNotifyInherit:
         assert cfg.defaults.notify_channels == []
 
     def test_explicit_token_in_nondefault_ok(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {
                     "defaults": {"notify_channels": ["default"]},
@@ -1455,13 +1455,13 @@ class TestNotifyInherit:
 
     def test_token_rejected_in_default_bundle(self) -> None:
         with pytest.raises(ConfigError, match="cannot inherit its own"):
-            TomlBundleConfig.from_raw(
+            TomlBundleConfig._from_raw(
                 _inject_uuids({"defaults": {"notify_channels": ["default"]}})
             )
 
     def test_token_combines_with_siblings(self) -> None:
         # The sentinel may now sit alongside explicit channels.
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1482,7 +1482,7 @@ class TestNotifyInherit:
         # Even combined with siblings, the default bundle can't inherit
         # itself.
         with pytest.raises(ConfigError, match="cannot inherit its own"):
-            TomlBundleConfig.from_raw(
+            TomlBundleConfig._from_raw(
                 _inject_uuids(
                     {
                         "defaults": {
@@ -1494,14 +1494,14 @@ class TestNotifyInherit:
 
     def test_reserved_channel_name_rejected(self) -> None:
         with pytest.raises(ConfigError, match="reserved channel name"):
-            TomlBundleConfig.from_raw(
+            TomlBundleConfig._from_raw(
                 _inject_uuids(
                     {"defaults": {"notify": {"default": _ntfy_block()}}}
                 )
             )
 
     def test_job_level_token_ok_in_nondefault(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}}),
             bundle_name="borgadm",
         )
@@ -1509,14 +1509,14 @@ class TestNotifyInherit:
         assert cfg.jobs["a"].notify_channels == ["default"]
 
     def test_job_level_token_demoted_in_default(self) -> None:
-        cfg = TomlBundleConfig.from_raw(
+        cfg = TomlBundleConfig._from_raw(
             _inject_uuids({"job": {"a": _job(notify_channels=["default"])}})
         )
         assert "a" in cfg.errored_jobs
         assert "cannot inherit its own" in cfg.errored_jobs["a"]
 
     def _two_bundles(self, default_notify: list[str]) -> tuple[Any, Any]:
-        default_cfg = TomlBundleConfig.from_raw(
+        default_cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1529,7 +1529,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        borgadm_cfg = TomlBundleConfig.from_raw(
+        borgadm_cfg = TomlBundleConfig._from_raw(
             _inject_uuids({"job": {"a": _job()}}), bundle_name="borgadm"
         )
         return default_cfg, borgadm_cfg
@@ -1626,7 +1626,7 @@ class TestNotifyInherit:
     def test_expand_merges_local_def_for_new_sibling(self) -> None:
         # A sibling defined only in the inheriting bundle must still be
         # dispatchable: its def is merged alongside the inherited ones.
-        default_cfg = TomlBundleConfig.from_raw(
+        default_cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -1636,7 +1636,7 @@ class TestNotifyInherit:
                 }
             )
         )
-        local_cfg = TomlBundleConfig.from_raw(
+        local_cfg = TomlBundleConfig._from_raw(
             _inject_uuids(
                 {
                     "defaults": {
@@ -2742,7 +2742,7 @@ class TestInteractiveDarwinMasking:
 class TestJobFlags:
     def test_token_round_trips_for_every_member(self) -> None:
         for flag in JobFlags.members():
-            assert JobFlags.from_token(flag.token) is flag
+            assert JobFlags._from_token(flag.token) is flag
 
     def test_token_spellings(self) -> None:
         assert JobFlags.INTERACTIVE.token == "interactive"
@@ -2751,14 +2751,14 @@ class TestJobFlags:
 
     def test_from_token_rejects_unknown(self) -> None:
         with pytest.raises(ValueError, match="unknown flag"):
-            JobFlags.from_token("turbo")
+            JobFlags._from_token("turbo")
 
     def test_from_token_accepts_non_canonical_spellings(self) -> None:
         # Input is normalized, so case and `_`/`-` differences from the
         # canonical dash token still resolve.
-        assert JobFlags.from_token("keep_awake") is JobFlags.KEEP_AWAKE
-        assert JobFlags.from_token("KEEP-AWAKE") is JobFlags.KEEP_AWAKE
-        assert JobFlags.from_token("Interactive") is JobFlags.INTERACTIVE
+        assert JobFlags._from_token("keep_awake") is JobFlags.KEEP_AWAKE
+        assert JobFlags._from_token("KEEP-AWAKE") is JobFlags.KEEP_AWAKE
+        assert JobFlags._from_token("Interactive") is JobFlags.INTERACTIVE
 
     def test_combines_as_bitmask(self) -> None:
         only_iv = JobFlags.INTERACTIVE
@@ -2799,13 +2799,13 @@ class TestPolicyFloors:
 
     def test_min_interval_default_is_1m(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_MIN_INTERVAL_SECONDS", raising=False)
-        assert min_interval_seconds() == 60
+        assert _min_interval_seconds() == 60
 
     def test_min_interval_override_read_live(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("CRONY_MIN_INTERVAL_SECONDS", "5")
-        assert min_interval_seconds() == 5
+        assert _min_interval_seconds() == 5
         monkeypatch.delenv("CRONY_MIN_INTERVAL_SECONDS")
-        assert min_interval_seconds() == 60
+        assert _min_interval_seconds() == 60
 
 
 if __name__ == "__main__":

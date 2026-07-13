@@ -123,7 +123,7 @@ class TestPathFieldExpansion:
             script="/abs/path.sh",
             args=["~/data", "$HOME/cache", "--flag"],
         )
-        snap = Job.from_config(
+        snap = Job._from_config(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -152,7 +152,7 @@ class TestPathFieldExpansion:
             gate_script="/abs/gate.sh",
             gate_args=["$HOME/state"],
         )
-        snap = Job.from_config(
+        snap = Job._from_config(
             TomlBundleConfig(),
             job,
             EntityName.from_str("default.j"),
@@ -1496,14 +1496,14 @@ class TestJobPriority:
 
     def test_snapshot_carries_priority(self) -> None:
         cfg = _parse({"job": {"a": _job(priority="high")}})
-        snap = Job.from_config(
+        snap = Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority is PriorityClass.HIGH
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"priority": "high"}, "job": {"a": _job()}})
-        snap = Job.from_config(
+        snap = Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority == PriorityClass.HIGH
@@ -1515,7 +1515,7 @@ class TestJobPriority:
         unset = _parse({"job": {"a": _job()}})
         explicit = _parse({"job": {"a": _job(priority="normal")}})
         for cfg in (unset, explicit):
-            snap = Job.from_config(
+            snap = Job._from_config(
                 cfg, cfg.jobs["a"], EntityName.from_str("default.a")
             )
             assert snap.priority is PriorityClass.NORMAL
@@ -1527,7 +1527,7 @@ class TestJobPriority:
                 "job": {"a": _job(priority="low")},
             }
         )
-        snap = Job.from_config(
+        snap = Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.priority == PriorityClass.LOW
@@ -1620,7 +1620,7 @@ class TestKeepAwake:
 
     def _snap(self, keep_awake: bool) -> Any:
         cfg = _parse({"job": {"a": _job(keep_awake=keep_awake)}})
-        return Job.from_config(
+        return Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 
@@ -1636,7 +1636,7 @@ class TestKeepAwake:
 
     def test_default_cascades_to_unset_job(self) -> None:
         cfg = _parse({"defaults": {"keep_awake": True}, "job": {"a": _job()}})
-        snap = Job.from_config(
+        snap = Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.keep_awake is True
@@ -1648,7 +1648,7 @@ class TestKeepAwake:
                 "job": {"a": _job(keep_awake=False)},
             }
         )
-        snap = Job.from_config(
+        snap = Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
         assert snap.keep_awake is False
@@ -1784,7 +1784,7 @@ class TestFullDiskAccess:
 
     def _snap(self, **over: Any) -> Any:
         cfg = _parse({"job": {"a": _job(**over)}})
-        return Job.from_config(
+        return Job._from_config(
             cfg, cfg.jobs["a"], EntityName.from_str("default.a")
         )
 

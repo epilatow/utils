@@ -78,7 +78,7 @@ extern char **environ;
 #define FDA_EXIT_CODE 77
 
 /* First argument that switches the wrapper into probe mode (test FDA,
- * run nothing); mirrors CHECK_FDA_FLAG in crony.platform.fda. */
+ * run nothing); mirrors _CHECK_FDA_FLAG in crony.platform.fda. */
 #define CHECK_FDA_FLAG "--check-fda"
 
 /* Env marker set on the re-spawned (disclaimed) instance so its pass

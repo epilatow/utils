@@ -13,7 +13,7 @@ the persisted shape can't change without a version landing alongside it.
 
 This module knows nothing about `Job` / `JobGroup`: `parse` validates raw
 JSON into the model, and `crony.model` builds the nodes from it (and
-`<node>.to_snapshot` builds the model from a node to dump). The model owns
+`<node>._to_snapshot` builds the model from a node to dump). The model owns
 the rehydration of its own value-object fields: `kind` is typed as the
 `crony.unit.EntityKind` it decodes to, and `.entity_name()` /
 `.entity_ref()` / `.timing()` / `.job_flags()` / `.priority_class()`
@@ -55,7 +55,7 @@ class _SnapshotModel(BaseModel):
 # A field whose on-disk key differs from its Python name uses
 # validation_alias + serialization_alias (rather than `alias`) so the
 # field name stays the constructor keyword -- which keeps the
-# `to_snapshot` construction in crony.model statically type-checked
+# `_to_snapshot` construction in crony.model statically type-checked
 # without the pydantic mypy plugin (the plugin can't be a global mypy
 # setting: it would break the non-pydantic utilities' own mypy runs).
 def _disk_key(key: str, **kw: Any) -> Any:

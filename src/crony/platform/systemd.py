@@ -39,12 +39,12 @@ _SYSTEMCTL_RESTART = ["systemctl", "--user", "--quiet", "restart"]
 _SYSTEMCTL_DISABLE = ["systemctl", "--user", "--quiet", "disable", "--now"]
 
 
-def service_filename(name: str) -> str:
+def _service_filename(name: str) -> str:
     """Basename of the systemd `.service` unit for `name`."""
     return f"{UNIT_PREFIX}-{name}.service"
 
 
-def timer_filename(name: str) -> str:
+def _timer_filename(name: str) -> str:
     """Basename of the systemd `.timer` unit for `name`."""
     return f"{UNIT_PREFIX}-{name}.timer"
 
@@ -63,7 +63,7 @@ def _priority_block(priority: PriorityClass) -> str:
     return ""
 
 
-def render_service(
+def _render_service(
     name: str,
     cmd: tuple[str, ...],
     priority: PriorityClass = PriorityClass.NORMAL,
@@ -120,9 +120,9 @@ def _render_timer(name: str, timing: Timing, jitter: Interval | None) -> str:
 
 def _service_argv(content: str) -> list[str] | None:
     """Recover the argv from a `.service`'s ExecStart, or None when it
-    isn't in the shape `render_service` produces.
+    isn't in the shape `_render_service` produces.
 
-    The inverse of `render_service`'s ExecStart embedding."""
+    The inverse of `_render_service`'s ExecStart embedding."""
     parser = configparser.ConfigParser(
         interpolation=None, delimiters=("=",), strict=False
     )
@@ -298,22 +298,22 @@ class SystemdScheduler(Scheduler):
         name = str(spec.name)
         units = [
             RenderedUnit(
-                Path(service_filename(name)),
-                render_service(name, spec.cmd, spec.priority),
+                Path(_service_filename(name)),
+                _render_service(name, spec.cmd, spec.priority),
             )
         ]
         if spec.timing is not None:
             jitter = spec.jitter.offset if spec.jitter is not None else None
             units.append(
                 RenderedUnit(
-                    Path(timer_filename(name)),
+                    Path(_timer_filename(name)),
                     _render_timer(name, spec.timing, jitter),
                 )
             )
         return RenderedUnits(tuple(units))
 
     def config_filename(self, name: str) -> Path:
-        return Path(service_filename(name))
+        return Path(_service_filename(name))
 
     def _discover_unit_files(self, name: str) -> list[Path]:
         if not self.unit_dir.exists():
@@ -327,7 +327,7 @@ class SystemdScheduler(Scheduler):
         ]
 
     def installed_cmd(self, name: str) -> list[str] | None:
-        service = self.unit_dir / service_filename(name)
+        service = self.unit_dir / _service_filename(name)
         try:
             content = service.read_text(encoding="utf-8")
         except OSError:
@@ -337,7 +337,7 @@ class SystemdScheduler(Scheduler):
     def dispatch_unit_path(self, name: str) -> Path:
         # `systemctl --user start crony-<name>.service` fires the
         # service, not the timer (the scheduler-arm side).
-        return self.unit_dir / service_filename(name)
+        return self.unit_dir / _service_filename(name)
 
     def unit_name(self, name: str, scheduled: bool | None, /) -> str:
         # A scheduled entry is driven by its `.timer`; a grouped /
@@ -345,7 +345,7 @@ class SystemdScheduler(Scheduler):
         # caller can't decide which, so there is no name to report.
         if scheduled is None:
             return ""
-        fn = timer_filename if scheduled else service_filename
+        fn = _timer_filename if scheduled else _service_filename
         return fn(name)
 
     def installed_names(self) -> set[str]:
@@ -368,9 +368,9 @@ class SystemdScheduler(Scheduler):
         # still reads loaded. Anything else means the scheduler has no
         # unit. The operator-disabled state is not read here -- it is
         # flagged off the snapshot, not the scheduler.
-        timer = self.unit_dir / timer_filename(name)
+        timer = self.unit_dir / _timer_filename(name)
         unit = (
-            timer_filename(name) if timer.exists() else service_filename(name)
+            _timer_filename(name) if timer.exists() else _service_filename(name)
         )
         return _is_enabled(unit) in ("enabled", "static")
 
@@ -384,10 +384,10 @@ class SystemdScheduler(Scheduler):
         # armed. A grouped / disabled entry installs no timer -- its
         # schedule rides on the loaded `.service`, so it is armed whenever
         # the scheduler has it loaded.
-        timer = self.unit_dir / timer_filename(name)
+        timer = self.unit_dir / _timer_filename(name)
         if not timer.is_file():
             return self.is_loaded(name)
-        props = _show_timer(timer_filename(name))
+        props = _show_timer(_timer_filename(name))
         if props is None or props.get("ActiveState") != "active":
             return False
         if props.get("NextElapseUSecRealtime", ""):
@@ -403,7 +403,7 @@ class SystemdScheduler(Scheduler):
         # positive, signals negated -- so both backends report the exit
         # uniformly. A unit with a launch in flight (its status is stale)
         # or no readable status is left out.
-        services = {service_filename(n): n for n in self.installed_names()}
+        services = {_service_filename(n): n for n in self.installed_names()}
         out: dict[str, UnitLastExit] = {}
         for blk in _show_services(list(services)):
             name = services.get(blk.get("Id", ""))
@@ -435,13 +435,13 @@ class SystemdScheduler(Scheduler):
         # active timer and leave an interval schedule stuck on its stale
         # activation, unable to fire.
         if scheduled:
-            timer = timer_filename(name)
+            timer = _timer_filename(name)
             self._run_checked(_SYSTEMCTL_ENABLE + [timer])
             self._run_checked(_SYSTEMCTL_RESTART + [timer])
 
     def deactivate(self, name: str) -> None:
         subprocess.run(
-            _SYSTEMCTL_DISABLE + [timer_filename(name)],
+            _SYSTEMCTL_DISABLE + [_timer_filename(name)],
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
@@ -486,7 +486,7 @@ class SystemdScheduler(Scheduler):
     def trigger(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.
         self._run_checked(
-            ["systemctl", "--user", "start", service_filename(name)]
+            ["systemctl", "--user", "start", _service_filename(name)]
         )
 
     def prune_units(self, name: str, keep: set[str]) -> None:

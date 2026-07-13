@@ -56,11 +56,11 @@ class FDAWrapper(enum.Enum):
 # Exit code the wrapper returns when FDA is not granted; mirrors
 # FDA_EXIT_CODE in Crony.c. 77 is the conventional skip / not-configured
 # code, outside crony's own run-outcome range.
-FDA_EXIT_CODE = 77
+_FDA_EXIT_CODE = 77
 
 # First argument that switches the wrapper into probe mode (test FDA,
 # run nothing); mirrors CHECK_FDA_FLAG in Crony.c.
-CHECK_FDA_FLAG = "--check-fda"
+_CHECK_FDA_FLAG = "--check-fda"
 
 
 def _repo_root() -> Path:
@@ -73,7 +73,7 @@ def _app_path() -> Path:
     return _repo_root() / "Applications" / "Crony.app"
 
 
-def source_path() -> Path:
+def _source_path() -> Path:
     """The checked-in C source for the wrapper."""
     return _app_path() / "Contents" / "MacOS" / "Crony.c"
 
@@ -89,17 +89,17 @@ def _hash_path() -> Path:
 
 
 def _source_sha256() -> str:
-    return hashlib.sha256(source_path().read_bytes()).hexdigest()
+    return hashlib.sha256(_source_path().read_bytes()).hexdigest()
 
 
-def needs_rebuild() -> tuple[bool, str]:
+def _needs_rebuild() -> tuple[bool, str]:
     """Whether the wrapper binary must be (re)compiled, and why.
 
     The reason is empty when the binary is current. Raises
     PreconditionError if the C source is missing (an incomplete
     checkout).
     """
-    src = source_path()
+    src = _source_path()
     if not src.exists():
         raise crony.errors.PreconditionError(
             f"Crony.app wrapper source missing: {src}"
@@ -122,14 +122,14 @@ def wrapper_state() -> FDAWrapper:
     is current is the grant probed -- `--check-fda`, one short-lived
     subprocess -- yielding `OK` (granted) or `MISSING_FDA_GRANT`.
     """
-    if not source_path().exists() or not wrapper_binary().exists():
+    if not _source_path().exists() or not wrapper_binary().exists():
         return FDAWrapper.MISSING
     hash_file = _hash_path()
     if not hash_file.exists():
         return FDAWrapper.STALE
     if _source_sha256() != hash_file.read_text().strip():
         return FDAWrapper.STALE
-    if not probe_fda():
+    if not _probe_fda():
         return FDAWrapper.MISSING_FDA_GRANT
     return FDAWrapper.OK
 
@@ -141,7 +141,7 @@ def build_wrapper() -> None:
     the Xcode Command Line Tools (cc + codesign); raises
     PreconditionError when cc is absent or the compile / sign fails.
     """
-    stale, reason = needs_rebuild()
+    stale, reason = _needs_rebuild()
     if not stale:
         return
     if shutil.which("cc") is None:
@@ -150,7 +150,7 @@ def build_wrapper() -> None:
             "Tools (xcode-select --install) so crony can build Crony.app "
             "for full-disk-access jobs."
         )
-    src = source_path()
+    src = _source_path()
     binary = wrapper_binary()
     hash_file = _hash_path()
 
@@ -182,7 +182,7 @@ def build_wrapper() -> None:
     logger.info("Crony.app wrapper compiled (FDA may need granting)")
 
 
-def probe_fda() -> bool:
+def _probe_fda() -> bool:
     """Whether the Full Disk Access grant is in effect, by running the
     wrapper's `--check-fda` probe. The wrapper must already be built.
 
@@ -191,7 +191,7 @@ def probe_fda() -> bool:
     get. Returns True when granted, False when denied.
     """
     result = subprocess.run(
-        [str(wrapper_binary()), CHECK_FDA_FLAG],
+        [str(wrapper_binary()), _CHECK_FDA_FLAG],
         capture_output=True,
         text=True,
     )

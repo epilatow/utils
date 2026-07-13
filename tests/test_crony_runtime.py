@@ -75,7 +75,7 @@ def _install_units(snap: Any) -> None:
 
     Stamps the live uv / crony executables onto the node first, the way
     `load_config` does for a pending node, so rendering is self-contained
-    (a hand-built `from_config` node carries no paths)."""
+    (a hand-built `_from_config` node carries no paths)."""
     snap = dataclasses.replace(
         snap,
         uv_path=crony_runtime._uv_executable(),
@@ -778,7 +778,7 @@ class TestLoadConfig:
         )
         # Build a snapshot that matches what apply would write.
         bundles = TomlConfig.load_all()
-        snap = Job.from_config(
+        snap = Job._from_config(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
@@ -844,7 +844,7 @@ class TestLoadConfig:
             encoding="utf-8",
         )
         bundles = TomlConfig.load_all()
-        snap = Job.from_config(
+        snap = Job._from_config(
             bundles.bundles[0].config,
             bundles.bundles[0].config.jobs["a"],
             EntityName.from_str("default.a"),
@@ -1262,7 +1262,7 @@ class TestInstalledCmdParsing:
         assert launchd._plist_argv(plist) == list(self._CMD)
 
     def test_service_round_trips(self) -> None:
-        svc = systemd.render_service("j", self._CMD)
+        svc = systemd._render_service("j", self._CMD)
         assert systemd._service_argv(svc) == list(self._CMD)
 
     def test_none_for_malformed_plist(self) -> None:

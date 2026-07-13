@@ -47,9 +47,9 @@ from crony.model import (  # noqa: E402
     JobOrphan,
     JobStatus,
     ScheduleValue,
+    _is_jittered,
+    _jitter_offset_seconds,
     _JobCommon,
-    is_jittered,
-    jitter_offset_seconds,
     snapshot_from_dict,
 )
 from crony.platform import RenderedUnits  # noqa: E402
@@ -715,13 +715,13 @@ class TestSnapshotSchemaVersioning:
 
 class TestSnapshotFieldSync:
     """Every persisted snapshot field must be wired into both
-    `<node>.to_snapshot` and `<node>.from_snapshot`. The mapping is not
+    `<node>._to_snapshot` and `<node>._from_snapshot`. The mapping is not
     mechanical -- a source string becomes a value object, the per-flag
     booleans become a bitmask -- so there is no `**`-splat keeping the two
     directions in lockstep; this round-trip is the guard instead. A
     snapshot dict with every field at a distinctive non-default value must
     survive a node load and re-dump unchanged: a field that
-    `from_snapshot` drops (or `to_snapshot` fails to re-emit) shows up as a
+    `_from_snapshot` drops (or `_to_snapshot` fails to re-emit) shows up as a
     diff. The companion census tests assert the maximal dict still covers
     the full field set, so adding a field forces this coverage (and thus
     the round-trip) to be extended for it."""
@@ -883,30 +883,30 @@ class TestIsJittered:
     floor. The backends never decide -- they render `UnitSpec.jitter`."""
 
     def test_interval_at_floor_is_jittered(self) -> None:
-        assert is_jittered(Interval.from_str("10m"))
-        assert is_jittered(Interval.from_str("1h"))
+        assert _is_jittered(Interval.from_str("10m"))
+        assert _is_jittered(Interval.from_str("1h"))
 
     def test_short_interval_not_jittered(self) -> None:
-        assert not is_jittered(Interval.from_str("5m"))
-        assert not is_jittered(Interval.from_str("1m"))
+        assert not _is_jittered(Interval.from_str("5m"))
+        assert not _is_jittered(Interval.from_str("1m"))
 
     def test_calendar_and_none_not_jittered(self) -> None:
-        assert not is_jittered(Schedule.from_str("*-*-* 03:00"))
-        assert not is_jittered(None)
+        assert not _is_jittered(Schedule.from_str("*-*-* 03:00"))
+        assert not _is_jittered(None)
 
     def test_tracks_the_env_floor(self, monkeypatch: Any) -> None:
         # The floor is read live from config, so a lowered floor makes a
         # short interval eligible (the e2e test seam).
         monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "60")
-        assert is_jittered(Interval.from_str("1m"))
-        assert not is_jittered(Interval.from_str("30s"))
+        assert _is_jittered(Interval.from_str("1m"))
+        assert not _is_jittered(Interval.from_str("30s"))
 
     def test_floor_never_below_two(self, monkeypatch: Any) -> None:
         # Even a floor driven to 1 keeps N >= 2, so the [1, N) offset range
-        # is non-empty (jitter_offset_seconds' modulus can't hit N-1 == 0).
+        # is non-empty (_jitter_offset_seconds' modulus can't hit N-1 == 0).
         monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "1")
-        assert not is_jittered(Interval.from_str("1s"))
-        assert is_jittered(Interval.from_str("2s"))
+        assert not _is_jittered(Interval.from_str("1s"))
+        assert _is_jittered(Interval.from_str("2s"))
 
 
 class TestJitterOffsetSeconds:
@@ -915,27 +915,27 @@ class TestJitterOffsetSeconds:
     @pytest.mark.parametrize("spec", ["10m", "1h", "1d", "1month"])
     def test_offset_in_open_interval(self, spec: str) -> None:
         iv = Interval.from_str(spec)
-        r = jitter_offset_seconds(self._NAME, iv, "machine-x")
+        r = _jitter_offset_seconds(self._NAME, iv, "machine-x")
         assert 1 <= r < iv.total_seconds
 
     def test_deterministic(self) -> None:
         iv = Interval.from_str("1h")
-        assert jitter_offset_seconds(
+        assert _jitter_offset_seconds(
             self._NAME, iv, "m1"
-        ) == jitter_offset_seconds(self._NAME, iv, "m1")
+        ) == _jitter_offset_seconds(self._NAME, iv, "m1")
 
     def test_varies_by_machine(self) -> None:
         # The same job on two hosts draws different offsets.
         iv = Interval.from_str("1h")
-        assert jitter_offset_seconds(
+        assert _jitter_offset_seconds(
             self._NAME, iv, "m1"
-        ) != jitter_offset_seconds(self._NAME, iv, "m2")
+        ) != _jitter_offset_seconds(self._NAME, iv, "m2")
 
     def test_varies_by_name(self) -> None:
         iv = Interval.from_str("1h")
-        assert jitter_offset_seconds(
+        assert _jitter_offset_seconds(
             EntityName("default", "a"), iv, "m1"
-        ) != jitter_offset_seconds(EntityName("default", "b"), iv, "m1")
+        ) != _jitter_offset_seconds(EntityName("default", "b"), iv, "m1")
 
 
 if __name__ == "__main__":

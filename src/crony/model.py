@@ -7,7 +7,7 @@ config view to the current applied view, plus the runtime-state and
 last-run value types those graphs reference. Holds the pure
 config->graph construction (cascade resolution + host/platform
 selection) and the translation between a node and its snapshot.json
-form (`snapshot_from_dict` / `<node>.to_snapshot`). The on-disk format
+form (`snapshot_from_dict` / `<node>._to_snapshot`). The on-disk format
 itself -- the typed model, migration, and schema versions -- lives in
 crony.snapshot.
 
@@ -66,7 +66,7 @@ RUN_LOG_NAME: str = "run.log"
 # The on-disk snapshot format -- the `JobSnapshot` / `GroupSnapshot`
 # models and the `CURRENT_SNAPSHOT_SCHEMA` / `COMPAT_SNAPSHOT_SCHEMA`
 # constants -- lives in `crony.snapshot`. The node <-> snapshot
-# translation (`snapshot_from_dict`, `<node>.to_snapshot`) is below.
+# translation (`snapshot_from_dict`, `<node>._to_snapshot`) is below.
 
 
 # Hidden crony subcommand the platform unit invokes to perform a run.
@@ -99,7 +99,7 @@ GUARD_SUBCOMMAND = "_run-guard"
 JITTER_SUBCOMMAND = "_jitter"
 
 
-def is_jittered(timing: crony.unit.Timing | None) -> bool:
+def _is_jittered(timing: crony.unit.Timing | None) -> bool:
     """Whether an entry with this EFFECTIVE `timing` gets start-time
     jitter: an interval at or above `config.jitter_floor_seconds`. A
     calendar entry keeps its exact specified time; a disabled entry
@@ -108,7 +108,7 @@ def is_jittered(timing: crony.unit.Timing | None) -> bool:
     backends never decide, they render the `UnitSpec.jitter` this drives.
 
     The floor is `max(2, ...)`: an interval needs `N >= 2` for the `[1, N)`
-    offset range to be non-empty, which `jitter_offset_seconds` relies on
+    offset range to be non-empty, which `_jitter_offset_seconds` relies on
     (its `% (N - 1)` would divide by zero at `N == 1`). Production's 10m
     floor is far above 2; the clamp only matters if a test drives the
     floor below it via the env seam."""
@@ -119,7 +119,7 @@ def is_jittered(timing: crony.unit.Timing | None) -> bool:
     )
 
 
-def jitter_offset_seconds(
+def _jitter_offset_seconds(
     name: crony.unit.EntityName,
     interval: crony.unit.Interval,
     machine_id: str,
@@ -130,7 +130,7 @@ def jitter_offset_seconds(
     Deterministic from the machine id and the entity name: stable across
     re-applies (re-applying does not reshuffle the herd), distinct per host
     (the same job on two machines draws a different offset), and recomputed
-    rather than persisted. `is_jittered` guarantees an eligible `N >= 2`,
+    rather than persisted. `_is_jittered` guarantees an eligible `N >= 2`,
     so `N - 1 >= 1` and the modulus never divides by zero; `R < N`
     guarantees the first fire lands before one full interval elapses."""
     n = interval.total_seconds
@@ -162,12 +162,12 @@ def _jitter_spec(
     the result; the companion argv's uv / crony paths mirror `cmd`'s, so a
     normalized (blank-path) spec blanks them too and a moved binary is not
     drift."""
-    if not is_jittered(timing):
+    if not _is_jittered(timing):
         return None
-    # is_jittered is true only for an eligible Interval; narrow it for the
+    # _is_jittered is true only for an eligible Interval; narrow it for the
     # offset draw and the synthesized offset Interval.
     assert isinstance(timing, crony.unit.Interval)
-    offset = jitter_offset_seconds(name, timing, _current_machine_id())
+    offset = _jitter_offset_seconds(name, timing, _current_machine_id())
     # The companion argv mirrors `_run_argv`: absolute uv / crony paths are
     # baked in because schedulers start a unit with a minimal PATH. `ref`
     # locates the service state dir (its lock / log); `name` addresses the
@@ -443,12 +443,12 @@ class _JobCommon:
         return self.state_dir / RUN_LOG_NAME
 
     @classmethod
-    def state_dir_symlink_expected(
+    def _state_dir_symlink_expected(
         cls, name: crony.unit.EntityName, uuid: str
     ) -> tuple[Path, str]:
         """The alias pair a config-built node expects on disk: the
         short-name alias dir and its relative target (the bare uuid).
-        A classmethod so `from_config` can set `state_dir_symlink` at
+        A classmethod so `_from_config` can set `state_dir_symlink` at
         construction rather than building the node and replacing it."""
         return (cls.state_dir_symlink_path_from_name(name), uuid)
 
@@ -474,7 +474,7 @@ class _JobCommon:
         return crony.unit.PriorityClass.NORMAL
 
     @property
-    def guard_timeout(self) -> int:
+    def _guard_timeout(self) -> int:
         """The wallclock cap the hard-timeout guard wraps the unit's run
         in (0 = no guard). The entry's `timeout` here; `Job` overrides to
         drop the guard for an interactive job, whose pending wait /
@@ -502,7 +502,7 @@ class _JobCommon:
             )
         uv_path, crony_path = self.uv_path, self.crony_path
         cmd = _guarded_argv(
-            uv_path, crony_path, self.entity_ref, self.guard_timeout
+            uv_path, crony_path, self.entity_ref, self._guard_timeout
         )
         timing = None if self.unit_disabled else self.timing
         return crony.unit.UnitSpec(
@@ -531,7 +531,7 @@ class _JobCommon:
                 self.entity_ref,
                 None if disabled else self.timing,
                 self._unit_priority,
-                self.guard_timeout,
+                self._guard_timeout,
             ),
         )
 
@@ -553,7 +553,7 @@ class _JobCommon:
             else None
         )
 
-    def to_snapshot(
+    def _to_snapshot(
         self,
     ) -> crony.snapshot.JobSnapshot | crony.snapshot.GroupSnapshot:
         """The on-disk snapshot model for this entry (`Job` / `JobGroup`
@@ -567,7 +567,7 @@ class _JobCommon:
         snapshot model -- which keys the fields by their on-disk names and
         drops everything the model doesn't carry (the derived,
         never-persisted state)."""
-        return self.to_snapshot().model_dump(by_alias=True, mode="json")
+        return self._to_snapshot().model_dump(by_alias=True, mode="json")
 
 
 @dataclass(frozen=True)
@@ -659,7 +659,7 @@ class Job(_JobCommon):
         return self.priority
 
     @property
-    def guard_timeout(self) -> int:
+    def _guard_timeout(self) -> int:
         """An interactive job has no wallclock-bounded run: its pending
         wait, prompt, and re-promptable delay can outlast any cap, so the
         hard guard would kill a healthy waiting job. The guard is dropped
@@ -669,7 +669,7 @@ class Job(_JobCommon):
         return 0 if self.interactive else self.timeout
 
     @classmethod
-    def from_config(
+    def _from_config(
         cls,
         config: crony.config.TomlBundleConfig,
         job: crony.config.TomlJob,
@@ -723,7 +723,7 @@ class Job(_JobCommon):
             bundle=name.bundle,
             name=name.short,
             uuid=job.uuid,
-            state_dir_symlink=cls.state_dir_symlink_expected(name, job.uuid),
+            state_dir_symlink=cls._state_dir_symlink_expected(name, job.uuid),
             fda_wrapper=cls._fda_wrapper_for(flags, FDAWrapper.OK),
             command=job.command,
             script=script,
@@ -752,7 +752,7 @@ class Job(_JobCommon):
             ),
         )
 
-    def to_snapshot(self) -> crony.snapshot.JobSnapshot:
+    def _to_snapshot(self) -> crony.snapshot.JobSnapshot:
         return crony.snapshot.JobSnapshot(
             snapshot_schema=self.snapshot_schema,
             kind=crony.unit.EntityKind.JOB,
@@ -781,7 +781,7 @@ class Job(_JobCommon):
         )
 
     @classmethod
-    def from_snapshot(
+    def _from_snapshot(
         cls,
         snap: crony.snapshot.JobSnapshot,
         *,
@@ -871,7 +871,7 @@ class JobGroup(_JobCommon):
     trigger_timeout_sec: int
 
     @classmethod
-    def from_config(
+    def _from_config(
         cls,
         config: crony.config.TomlBundleConfig,
         target: crony.config.Target | None,
@@ -944,7 +944,7 @@ class JobGroup(_JobCommon):
             bundle=name.bundle,
             name=name.short,
             uuid=group.uuid,
-            state_dir_symlink=cls.state_dir_symlink_expected(name, group.uuid),
+            state_dir_symlink=cls._state_dir_symlink_expected(name, group.uuid),
             children=children,
             timeout=timeout,
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
@@ -955,7 +955,7 @@ class JobGroup(_JobCommon):
             rendered_units=rendered_units,
         )
 
-    def to_snapshot(self) -> crony.snapshot.GroupSnapshot:
+    def _to_snapshot(self) -> crony.snapshot.GroupSnapshot:
         return crony.snapshot.GroupSnapshot(
             snapshot_schema=self.snapshot_schema,
             kind=crony.unit.EntityKind.GROUP,
@@ -975,7 +975,7 @@ class JobGroup(_JobCommon):
         )
 
     @classmethod
-    def from_snapshot(
+    def _from_snapshot(
         cls,
         snap: crony.snapshot.GroupSnapshot,
         *,
@@ -1171,7 +1171,7 @@ def rendered_drifted_indices(
     return indices
 
 
-def rendered_unit_missing(
+def _rendered_unit_missing(
     pending: crony.platform.RenderedUnits,
     current: crony.platform.RenderedUnits,
 ) -> bool:
@@ -1209,7 +1209,7 @@ def _resolve_script(script: str) -> Path:
 # `crony.snapshot` owns the on-disk format (the typed model, migration,
 # and schema versions); these translate between that model and the
 # in-memory Job / JobGroup. The per-kind work lives on the nodes
-# (`to_snapshot` / `from_snapshot`); `snapshot_from_dict` is the load
+# (`_to_snapshot` / `_from_snapshot`); `snapshot_from_dict` is the load
 # entry point the runtime / runner call.
 
 
@@ -1258,7 +1258,7 @@ def snapshot_from_dict(
     empty."""
     model = crony.snapshot.parse(raw)
     if isinstance(model, crony.snapshot.JobSnapshot):
-        return Job.from_snapshot(
+        return Job._from_snapshot(
             model,
             state_dir_symlink=state_dir_symlink,
             fda_wrapper=fda_wrapper,
@@ -1269,7 +1269,7 @@ def snapshot_from_dict(
             unit_loaded=unit_loaded,
             unit_armed=unit_armed,
         )
-    return JobGroup.from_snapshot(
+    return JobGroup._from_snapshot(
         model,
         state_dir_symlink=state_dir_symlink,
         platform=platform,
@@ -1316,7 +1316,7 @@ class ExitClass(StrEnum):
             return None
 
 
-class DescribedStrEnum(StrEnum):
+class _DescribedStrEnum(StrEnum):
     """StrEnum whose members are ``(value, description)`` pairs, where
     the description is the human-facing meaning of the value.
 
@@ -1339,7 +1339,7 @@ class DescribedStrEnum(StrEnum):
         return obj
 
 
-class JobStatus(DescribedStrEnum):
+class JobStatus(_DescribedStrEnum):
     """The verdict `crony status` shows in its STATUS column: the run
     outcomes that actually reach the cell plus the display-only states
     derived at read time. Shares string values with `ExitClass` for the
@@ -1381,7 +1381,7 @@ class JobStatus(DescribedStrEnum):
     UNKNOWN = "unknown", "We're unable to determine the job status."
 
 
-class ConfigStatus(DescribedStrEnum):
+class ConfigStatus(_DescribedStrEnum):
     """The verdict `crony status` shows in its CONFIG column: how the
     live config view relates to the applied on-disk state.
 
@@ -1433,7 +1433,7 @@ class ConfigStatus(DescribedStrEnum):
     )
 
 
-class ScheduleValue(DescribedStrEnum):
+class ScheduleValue(_DescribedStrEnum):
     """The kinds of value the `crony status` SCHEDULE column shows. Each
     member's value is its `--help` display label. GROUPED and DISABLED's
     values are also the literal cell strings the renderer emits;
@@ -1476,7 +1476,7 @@ class GateResult(StrEnum):
 
 
 @dataclass
-class CommonRunResult:
+class _CommonRunResult:
     """The fields every completed run records, shared by JobRunResult
     and GroupRunResult.
 
@@ -1511,7 +1511,7 @@ class CommonRunResult:
 
 
 @dataclass
-class JobRunResult(CommonRunResult):
+class JobRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed job run. Its
     `process_exit` is 0 for ok / gated / canceled, the job's own code
     for fail, the timeout code, or 128+sig for a signal-killed child."""
@@ -1539,7 +1539,7 @@ class GroupChildResult:
 
 
 @dataclass
-class GroupRunResult(CommonRunResult):
+class GroupRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed group run. Its
     `process_exit` is always 0 -- a group's rollup lives in `exit_class`,
     not its process exit -- but it is still reconciled against the
@@ -1717,7 +1717,7 @@ class Graph:
                 if toml_job is None:
                     continue
                 name = crony.unit.EntityName(bundle.name, short)
-                snap_j = Job.from_config(
+                snap_j = Job._from_config(
                     bundle.config,
                     toml_job,
                     name,
@@ -1733,7 +1733,7 @@ class Graph:
                 if toml_group is None:
                     continue
                 name = crony.unit.EntityName(bundle.name, short)
-                snap_g = JobGroup.from_config(
+                snap_g = JobGroup._from_config(
                     bundle.config,
                     target,
                     toml_group,
@@ -1862,7 +1862,7 @@ class Config:
         """
         return set(self.current.by_full_name) | set(self.orphans_by_full_name)
 
-    def installed_bundle_names(self) -> set[str]:
+    def _installed_bundle_names(self) -> set[str]:
         """Bundle names with on-disk orphans -- a current or broken
         snapshot, or a leftover platform unit / alias symlink. The
         bundle-scope analogue of `installed_full_names`: read-side
@@ -1888,7 +1888,7 @@ class Config:
             return
         if self.toml_config.by_name(bundle) is not None:
             return
-        if bundle in self.installed_bundle_names():
+        if bundle in self._installed_bundle_names():
             return
         raise crony.errors.UsageError(f"unknown bundle: {bundle!r}")
 
@@ -1961,7 +1961,7 @@ class Config:
         # schedule-arming companion the pending node renders but the
         # install lacks (a systemd `.timer` deleted while the `.service`
         # stays). The model asks the opaque units, never naming which.
-        if rendered_unit_missing(p.rendered_units, c.rendered_units):
+        if _rendered_unit_missing(p.rendered_units, c.rendered_units):
             return ConfigStatus.BROKEN
         # The timer can be present and loaded yet dead: a systemd interval
         # timer with no valid anchor reports a next elapse of infinity and

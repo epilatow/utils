@@ -1251,7 +1251,7 @@ def _build_status_tree(
     visited-set bounds the walk if a malformed config somehow
     bypasses `crony.config._validate_config` (e.g. tests building
     TomlBundleConfig directly without going through
-    `crony.config.TomlBundleConfig.from_raw`); under the single-parent
+    `crony.config.TomlBundleConfig._from_raw`); under the single-parent
     invariant from validation it never deduplicates a real traversal.
     """
     order: list[str] = []
@@ -1285,7 +1285,7 @@ def _build_status_tree(
     return order, depth
 
 
-class StatusCols(StrEnum):
+class _StatusCols(StrEnum):
     """The selectable `crony status` column names, in `--cols all`
     display order. This is the authoritative column set: a column has to
     appear here to be documented (`_STATUS_COLUMNS`), rendered
@@ -1319,8 +1319,8 @@ class StatusCols(StrEnum):
 # a drifted slot index onto these for the STALE column and the per-unit
 # path columns' divergence marker.
 _UNIT_SLOT_LABELS: tuple[str, ...] = (
-    StatusCols.UNIT_CONFIG_1.value,
-    StatusCols.UNIT_CONFIG_2.value,
+    _StatusCols.UNIT_CONFIG_1.value,
+    _StatusCols.UNIT_CONFIG_2.value,
 )
 
 
@@ -1329,12 +1329,12 @@ _UNIT_SLOT_LABELS: tuple[str, ...] = (
 _FLAG_COL_DOC = "<flag>"
 
 
-class ColVisibility(StrEnum):
+class _ColVisibility(StrEnum):
     """When an alias expansion keeps a column. `ALWAYS` is unconditional;
     the others are dropped from an alias's columns in a context where the
     column would only ever be blank (an explicitly named column is always
     honored regardless). The condition is an intrinsic property of the
-    column, so it lives on its `StatusColumn` rather than being hand-coded
+    column, so it lives on its `_StatusColumn` rather than being hand-coded
     per alias."""
 
     ALWAYS = "always"
@@ -1342,7 +1342,7 @@ class ColVisibility(StrEnum):
     IF_SECOND_UNIT_PRESENT = "if-second-unit-present"
 
 
-class StatusColumn(NamedTuple):
+class _StatusColumn(NamedTuple):
     """One `crony status` column: its `--cols` name, its table HEADER,
     the prose the `--help` column reference renders, and when an alias
     keeps it (`visibility`). The single description home keeps the help
@@ -1353,12 +1353,12 @@ class StatusColumn(NamedTuple):
     name: str
     header: str
     description: str
-    visibility: ColVisibility = ColVisibility.ALWAYS
+    visibility: _ColVisibility = _ColVisibility.ALWAYS
 
 
-_STATUS_COLUMNS: tuple[StatusColumn, ...] = (
-    StatusColumn(
-        StatusCols.JOB,
+_STATUS_COLUMNS: tuple[_StatusColumn, ...] = (
+    _StatusColumn(
+        _StatusCols.JOB,
         "JOB",
         "Full job name: `<bundle>.<short>`. This name may not be usable "
         "with subcommands if a pending configuration update will assign "
@@ -1366,110 +1366,110 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
         "`<bundle>:<UUID>` name to directly address this job. May be "
         "empty for a broken job with no recoverable name.",
     ),
-    StatusColumn(
-        StatusCols.JOB_OR_UUID,
+    _StatusColumn(
+        _StatusCols.JOB_OR_UUID,
         "JOB / UUID",
         "Normally the full job name `<bundle>.<short>`, but in the case "
         "of a job naming conflict or a broken job with no recoverable "
         "name this column may report `<bundle>:<UUID>`.",
     ),
-    StatusColumn(
-        StatusCols.KIND,
+    _StatusColumn(
+        _StatusCols.KIND,
         "KIND",
         'Job type: "job" or "group".',
     ),
-    StatusColumn(
-        StatusCols.CONFIG,
+    _StatusColumn(
+        _StatusCols.CONFIG,
         "CONFIG",
         'See "CONFIG values".',
     ),
-    StatusColumn(
-        StatusCols.SCHEDULE,
+    _StatusColumn(
+        _StatusCols.SCHEDULE,
         "SCHEDULE",
         'See "SCHEDULE values".',
     ),
-    StatusColumn(
-        StatusCols.GROUPS,
+    _StatusColumn(
+        _StatusCols.GROUPS,
         "GROUPS",
         "Comma-separated list of job groups containing this job. A job "
         "can only have one unmasked parent, but can have multiple masked "
         "parents. Empty when the job isn't part of any group.",
     ),
-    StatusColumn(
-        StatusCols.STATUS,
+    _StatusColumn(
+        _StatusCols.STATUS,
         "STATUS",
         'See "STATUS values".',
     ),
-    StatusColumn(
-        StatusCols.LAST_RAN,
+    _StatusColumn(
+        _StatusCols.LAST_RAN,
         "LAST RAN",
         "Relative time of the last job start.",
     ),
-    StatusColumn(
-        StatusCols.MASKED_BY,
+    _StatusColumn(
+        _StatusCols.MASKED_BY,
         "MASKED BY",
         "A comma-separated list of reasons why a job is masked (CONFIG = "
         'masked) on the current host. See "MASKED values".',
-        ColVisibility.IF_MASKED_PRESENT,
+        _ColVisibility.IF_MASKED_PRESENT,
     ),
-    StatusColumn(
-        StatusCols.UNIT_NAME,
+    _StatusColumn(
+        _StatusCols.UNIT_NAME,
         "UNIT NAME",
         "Platform unit identifier.",
     ),
-    StatusColumn(
-        StatusCols.UUID,
+    _StatusColumn(
+        _StatusCols.UUID,
         "UUID",
         "The job's `<bundle>:<UUID>` name.",
     ),
-    StatusColumn(
-        StatusCols.UNIT_CONFIG_1,
+    _StatusColumn(
+        _StatusCols.UNIT_CONFIG_1,
         "UNIT CONFIG 1",
         "Filesystem path of the platform config unit. Empty when no "
         "config unit exists on disk.",
     ),
-    StatusColumn(
-        StatusCols.UNIT_CONFIG_2,
+    _StatusColumn(
+        _StatusCols.UNIT_CONFIG_2,
         "UNIT CONFIG 2",
         "Filesystem path of the platform's second unit -- the systemd "
         "timer, or the launchd start-time-jitter companion for a jittered "
         "interval job. Empty for a job with no second unit (an unscheduled "
         "or grouped job, or a calendar / short-interval job on "
         "macOS/darwin).",
-        ColVisibility.IF_SECOND_UNIT_PRESENT,
+        _ColVisibility.IF_SECOND_UNIT_PRESENT,
     ),
-    StatusColumn(
-        StatusCols.LOG_FILE,
+    _StatusColumn(
+        _StatusCols.LOG_FILE,
         "LOG FILE",
         "Filesystem path of the job's log file.",
     ),
-    StatusColumn(
-        StatusCols.FLAGS,
+    _StatusColumn(
+        _StatusCols.FLAGS,
         "FLAGS",
         "Comma-separated list of capability flags enabled for the job. "
         'See "FLAG values".',
     ),
-    StatusColumn(
+    _StatusColumn(
         _FLAG_COL_DOC,
         "",
         "One opt-in true/false column per capability flag (`--cols "
         "interactive`, etc.). Request by name; the `all` alias omits "
         'these in favor of the compact `flags` column. See "FLAG values".',
     ),
-    StatusColumn(
-        StatusCols.TIMEOUT,
+    _StatusColumn(
+        _StatusCols.TIMEOUT,
         "TIMEOUT",
         "Job wallclock cap: `<n>s`. The job will be killed if its "
         "wallclock execution time exceeds this cap. May be `none` for "
         "uncapped jobs.",
     ),
-    StatusColumn(
-        StatusCols.PRIORITY,
+    _StatusColumn(
+        _StatusCols.PRIORITY,
         "PRIORITY",
         "Job scheduling priority: high | normal | low. Empty for groups.",
     ),
-    StatusColumn(
-        StatusCols.STALE,
+    _StatusColumn(
+        _StatusCols.STALE,
         "STALE",
         "A comma-separated list of the snapshot fields that have "
         "diverged between the pending config and the applied unit "
@@ -1478,25 +1478,25 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
         "its dash-spelled snapshot attribute.",
     ),
 )
-# Every `StatusCols` member must carry exactly one registry entry, so
+# Every `_StatusCols` member must carry exactly one registry entry, so
 # the help reference and headers can't diverge from the column set.
 _documented_cols = [
     col.name for col in _STATUS_COLUMNS if not col.name.startswith("<")
 ]
-assert sorted(_documented_cols) == sorted(StatusCols), (
-    "`_STATUS_COLUMNS` must document every `StatusCols` member exactly "
-    f"once: {sorted(_documented_cols)} != {sorted(StatusCols)}"
+assert sorted(_documented_cols) == sorted(_StatusCols), (
+    "`_STATUS_COLUMNS` must document every `_StatusCols` member exactly "
+    f"once: {sorted(_documented_cols)} != {sorted(_StatusCols)}"
 )
 
 # The per-flag column family: one opt-in column per capability flag,
 # keyed by the flag's token, so the set tracks `JobFlags` as members are
-# added. These are selectable but not `StatusCols` members.
+# added. These are selectable but not `_StatusCols` members.
 _FLAG_COL_TOKENS: frozenset[str] = frozenset(
     f.token for f in crony.config.JobFlags.members()
 )
 
 # Selectable columns map name -> HEADER (the `<...>` doc entries are not
-# selectable). The per-flag columns are appended after the `StatusCols`.
+# selectable). The per-flag columns are appended after the `_StatusCols`.
 _STATUS_COL_HEADERS: dict[str, str] = {
     col.name: col.header
     for col in _STATUS_COLUMNS
@@ -1507,7 +1507,7 @@ for _flag_member in crony.config.JobFlags.members():
 
 # Each selectable column's alias visibility, so `_expand_status_alias`
 # trims by column property rather than by hand-coded column name.
-_COL_VISIBILITY: dict[str, ColVisibility] = {
+_COL_VISIBILITY: dict[str, _ColVisibility] = {
     col.name: col.visibility
     for col in _STATUS_COLUMNS
     if not col.name.startswith("<")
@@ -1597,8 +1597,8 @@ def _color_items() -> list[tuple[str, str]]:
     ]
 
 
-class StatusAliases(StrEnum):
-    """The `--cols` alias names. Each expands to a list of `StatusCols`
+class _StatusAliases(StrEnum):
+    """The `--cols` alias names. Each expands to a list of `_StatusCols`
     via its `_STATUS_ALIASES` entry."""
 
     DEFAULT = "default"
@@ -1611,70 +1611,70 @@ class StatusAliases(StrEnum):
 # three are StrEnums with disjoint string values, so the union
 # round-trips to the on-disk / row-key spelling while staying closed
 # and type-checked.
-ColToken = StatusCols | StatusAliases | crony.config.JobFlagNames
+ColToken = _StatusCols | _StatusAliases | crony.config.JobFlagNames
 
 
-class StatusAlias(NamedTuple):
-    """A `--cols` alias: its name, the `StatusCols` it expands to (before
+class _StatusAlias(NamedTuple):
+    """A `--cols` alias: its name, the `_StatusCols` it expands to (before
     the context trim `_expand_status_alias` applies), and the prose the
     `--help` Aliases section renders. The single `cols` home keeps the
     expansion and its documentation from drifting from each other."""
 
-    name: StatusAliases
-    cols: tuple[StatusCols, ...]
+    name: _StatusAliases
+    cols: tuple[_StatusCols, ...]
     description: str
 
 
-_DEFAULT_STATUS_COLS: tuple[StatusCols, ...] = (
-    StatusCols.JOB_OR_UUID,
-    StatusCols.CONFIG,
-    StatusCols.SCHEDULE,
-    StatusCols.STATUS,
-    StatusCols.LAST_RAN,
+_DEFAULT_STATUS_COLS: tuple[_StatusCols, ...] = (
+    _StatusCols.JOB_OR_UUID,
+    _StatusCols.CONFIG,
+    _StatusCols.SCHEDULE,
+    _StatusCols.STATUS,
+    _StatusCols.LAST_RAN,
 )
-_STATUS_ALIASES: tuple[StatusAlias, ...] = (
-    StatusAlias(
-        StatusAliases.DEFAULT,
+_STATUS_ALIASES: tuple[_StatusAlias, ...] = (
+    _StatusAlias(
+        _StatusAliases.DEFAULT,
         _DEFAULT_STATUS_COLS,
         "The columns shown when `--cols` is omitted: "
         + ", ".join(_DEFAULT_STATUS_COLS)
         + ".",
     ),
-    StatusAlias(
-        StatusAliases.ALL,
-        tuple(StatusCols),
+    _StatusAlias(
+        _StatusAliases.ALL,
+        tuple(_StatusCols),
         "Every column except the per-flag columns (use the compact "
         "`flags` instead), `masked-by` (kept only when a masked entry is "
         "present), and the optional `unit-config-2` (shown only where a "
         "second unit is present). Naming an excluded column explicitly "
         "still shows it.",
     ),
-    StatusAlias(
-        StatusAliases.UNIT_FILES,
-        (StatusCols.UNIT_CONFIG_1, StatusCols.UNIT_CONFIG_2),
+    _StatusAlias(
+        _StatusAliases.UNIT_FILES,
+        (_StatusCols.UNIT_CONFIG_1, _StatusCols.UNIT_CONFIG_2),
         "unit-config-1, plus the optional unit-config-2 where present.",
     ),
 )
-_STATUS_ALIAS_BY_NAME: dict[str, StatusAlias] = {
+_STATUS_ALIAS_BY_NAME: dict[str, _StatusAlias] = {
     a.name: a for a in _STATUS_ALIASES
 }
-_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(StatusAliases)
+_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(_StatusAliases)
 _JOB_FLAG_COL_NAMES: frozenset[str] = frozenset(crony.config.JobFlagNames)
 
 
 def _column_in_context(
     col: str, *, masked_present: bool, second_unit_present: bool
 ) -> bool:
-    """Whether a column's `ColVisibility` keeps it in this context. A
+    """Whether a column's `_ColVisibility` keeps it in this context. A
     column would only ever be blank here when its condition fails -- a
     masked-reason column with no masked row shown, or the second-unit
     column when no shown row carries a second unit. The condition is an
     intrinsic per-column property, so this same pass serves every
     backend."""
     visibility = _COL_VISIBILITY[col]
-    if visibility is ColVisibility.IF_MASKED_PRESENT:
+    if visibility is _ColVisibility.IF_MASKED_PRESENT:
         return masked_present
-    if visibility is ColVisibility.IF_SECOND_UNIT_PRESENT:
+    if visibility is _ColVisibility.IF_SECOND_UNIT_PRESENT:
         return second_unit_present
     return True
 
@@ -1684,7 +1684,7 @@ def _expand_status_alias(
 ) -> tuple[str, ...]:
     """Expand a `--cols` alias to its column list for this context.
 
-    A column whose `ColVisibility` condition fails here would only ever
+    A column whose `_ColVisibility` condition fails here would only ever
     be blank, so the alias drops it to keep the wide views useful rather
     than padded with dead space. The rule is the column's own property,
     so the same pass serves every alias and a future conditional column
@@ -1722,7 +1722,7 @@ _ANSI_RESET: str = "\033[0m"
 # / `JobStatus` member (both StrEnums, so plain strings) or a literal
 # cell string.
 _RED_CELLS: dict[str, frozenset[str]] = {
-    StatusCols.CONFIG: frozenset(
+    _StatusCols.CONFIG: frozenset(
         {
             crony.model.ConfigStatus.MISSING,
             crony.model.ConfigStatus.ERROR,
@@ -1730,7 +1730,7 @@ _RED_CELLS: dict[str, frozenset[str]] = {
             crony.model.ConfigStatus.ORPHAN,
         }
     ),
-    StatusCols.STATUS: frozenset(
+    _StatusCols.STATUS: frozenset(
         {
             crony.model.JobStatus.FAIL,
             crony.model.JobStatus.TIMEOUT,
@@ -1738,14 +1738,14 @@ _RED_CELLS: dict[str, frozenset[str]] = {
             crony.model.JobStatus.CRASHED,
         }
     ),
-    StatusCols.SCHEDULE: frozenset({crony.model.ScheduleValue.DISABLED.value}),
+    _StatusCols.SCHEDULE: frozenset({crony.model.ScheduleValue.DISABLED.value}),
 }
 _YELLOW_CELLS: dict[str, frozenset[str]] = {
-    StatusCols.CONFIG: frozenset({crony.model.ConfigStatus.STALE}),
+    _StatusCols.CONFIG: frozenset({crony.model.ConfigStatus.STALE}),
 }
 
 
-class ReferenceSection(NamedTuple):
+class _ReferenceSection(NamedTuple):
     """One `crony status` reference section: a heading, optional lead
     paragraph, and `(label, description)` items. The single source for
     both the `--help` epilog text and the man page's STATUS COLUMNS
@@ -1756,41 +1756,41 @@ class ReferenceSection(NamedTuple):
     lead: str = ""
 
 
-def status_reference_sections() -> list[ReferenceSection]:
+def status_reference_sections() -> list[_ReferenceSection]:
     """The `crony status` column / value / alias / color reference as
     structured sections, sourced from the registries and enums."""
     return [
-        ReferenceSection("Default Columns", _column_items(default=True)),
-        ReferenceSection("Optional Columns", _column_items(default=False)),
-        ReferenceSection(
+        _ReferenceSection("Default Columns", _column_items(default=True)),
+        _ReferenceSection("Optional Columns", _column_items(default=False)),
+        _ReferenceSection(
             "Column Aliases",
             [(a.name, a.description) for a in _STATUS_ALIASES],
         ),
-        ReferenceSection(
+        _ReferenceSection(
             "CONFIG values",
             [(m.value, m.description) for m in crony.model.ConfigStatus],
         ),
-        ReferenceSection(
+        _ReferenceSection(
             "SCHEDULE values",
             [(m.value, m.description) for m in crony.model.ScheduleValue],
         ),
-        ReferenceSection(
+        _ReferenceSection(
             "STATUS values",
             [(m.value, m.description) for m in crony.model.JobStatus],
         ),
-        ReferenceSection(
+        _ReferenceSection(
             "FLAG values",
             [(f.token, f.description) for f in crony.config.JobFlags.members()],
         ),
-        ReferenceSection(
+        _ReferenceSection(
             "MASKED values",
             [(r.value, r.description) for r in crony.config.MaskReason],
         ),
-        ReferenceSection("Colors", _color_items(), lead=_COLOR_LEAD),
+        _ReferenceSection("Colors", _color_items(), lead=_COLOR_LEAD),
     ]
 
 
-def _reference_section_text(section: ReferenceSection) -> str:
+def _reference_section_text(section: _ReferenceSection) -> str:
     """A reference section as `--help` text: a `Title:` header with the
     body indented two spaces beneath it, matching the top-level `crony
     --help` epilog. The body is an optional wrapped lead, then the value
@@ -1819,10 +1819,10 @@ STATUS_HELP_EPILOG: str = (
 def _classify_col_token(name: str) -> ColToken:
     """Map a validated `--cols` name to its column / alias / flag enum."""
     if name in _STATUS_COL_ALIAS_NAMES:
-        return StatusAliases(name)
+        return _StatusAliases(name)
     if name in _JOB_FLAG_COL_NAMES:
         return crony.config.JobFlagNames(name)
-    return StatusCols(name)
+    return _StatusCols(name)
 
 
 def parse_cols_arg(value: str) -> list[ColToken]:
@@ -1831,7 +1831,7 @@ def parse_cols_arg(value: str) -> list[ColToken]:
     Splits the comma-separated spec (whitespace around names ignored)
     and rejects any name that is neither a column, a per-flag column,
     nor an alias, so a typo is loud at parse time rather than a silent
-    missing column. Returns each name as its `StatusCols` / `StatusAliases`
+    missing column. Returns each name as its `_StatusCols` / `_StatusAliases`
     / `JobFlagNames` enum member; `_parse_status_cols` expands the aliases
     among them once the displayed rows and platform are known.
     """
@@ -1870,7 +1870,7 @@ def _parse_status_cols(
         return list(_DEFAULT_STATUS_COLS)
     expanded: list[str] = []
     for token in raw:
-        if isinstance(token, StatusAliases):
+        if isinstance(token, _StatusAliases):
             expanded.extend(
                 _expand_status_alias(
                     token,
@@ -1887,9 +1887,9 @@ def _parse_status_cols(
             continue
         seen.add(col)
         cols.append(col)
-    if StatusCols.JOB_OR_UUID in cols:
-        cols.remove(StatusCols.JOB_OR_UUID)
-    return [StatusCols.JOB_OR_UUID] + cols
+    if _StatusCols.JOB_OR_UUID in cols:
+        cols.remove(_StatusCols.JOB_OR_UUID)
+    return [_StatusCols.JOB_OR_UUID] + cols
 
 
 def _resolve_states(
@@ -2632,24 +2632,24 @@ def do_status(
                     token = f"{token}{_DIVERGENCE_MARKER}"
                 flags_summary_parts.append(token)
         row_cells: dict[str, str] = {
-            StatusCols.JOB: job_cell,
-            StatusCols.JOB_OR_UUID: job_or_uuid_cell,
-            StatusCols.KIND: kind,
-            StatusCols.CONFIG: cfg_status,
-            StatusCols.SCHEDULE: sched_cell,
-            StatusCols.GROUPS: groups_cell,
-            StatusCols.STATUS: job_status,
-            StatusCols.LAST_RAN: last_ran,
-            StatusCols.MASKED_BY: mask_reason,
-            StatusCols.UNIT_NAME: unit_name,
-            StatusCols.UUID: uuid_cell,
-            StatusCols.UNIT_CONFIG_1: unit_1_cell,
-            StatusCols.UNIT_CONFIG_2: unit_2_cell,
-            StatusCols.LOG_FILE: log_file_cell,
-            StatusCols.FLAGS: ",".join(flags_summary_parts),
-            StatusCols.TIMEOUT: timeout_cell,
-            StatusCols.PRIORITY: priority_cell,
-            StatusCols.STALE: stale_cell,
+            _StatusCols.JOB: job_cell,
+            _StatusCols.JOB_OR_UUID: job_or_uuid_cell,
+            _StatusCols.KIND: kind,
+            _StatusCols.CONFIG: cfg_status,
+            _StatusCols.SCHEDULE: sched_cell,
+            _StatusCols.GROUPS: groups_cell,
+            _StatusCols.STATUS: job_status,
+            _StatusCols.LAST_RAN: last_ran,
+            _StatusCols.MASKED_BY: mask_reason,
+            _StatusCols.UNIT_NAME: unit_name,
+            _StatusCols.UUID: uuid_cell,
+            _StatusCols.UNIT_CONFIG_1: unit_1_cell,
+            _StatusCols.UNIT_CONFIG_2: unit_2_cell,
+            _StatusCols.LOG_FILE: log_file_cell,
+            _StatusCols.FLAGS: ",".join(flags_summary_parts),
+            _StatusCols.TIMEOUT: timeout_cell,
+            _StatusCols.PRIORITY: priority_cell,
+            _StatusCols.STALE: stale_cell,
         }
         row_cells.update(flag_cells)
         # Every selectable column must produce a cell, and no row may
@@ -2657,10 +2657,10 @@ def do_status(
         # the renderer stay in lockstep so `--cols` can never select a
         # column the row lacks (a KeyError at print time) or render one
         # the help reference omits.
-        assert set(row_cells) == set(StatusCols) | _FLAG_COL_TOKENS, (
+        assert set(row_cells) == set(_StatusCols) | _FLAG_COL_TOKENS, (
             "`row_cells` keys must equal the selectable column set: "
             f"{sorted(set(row_cells))} != "
-            f"{sorted(set(StatusCols) | _FLAG_COL_TOKENS)}"
+            f"{sorted(set(_StatusCols) | _FLAG_COL_TOKENS)}"
         )
         built.append((config_name, row_cells))
 
@@ -2689,13 +2689,13 @@ def do_status(
             r
             for r in rows
             if not (
-                r[StatusCols.CONFIG] == crony.model.ConfigStatus.SYNCED
-                and r[StatusCols.SCHEDULE]
+                r[_StatusCols.CONFIG] == crony.model.ConfigStatus.SYNCED
+                and r[_StatusCols.SCHEDULE]
                 != crony.model.ScheduleValue.DISABLED.value
-                and r[StatusCols.STATUS] in healthy_status
+                and r[_StatusCols.STATUS] in healthy_status
             )
         ]
-        rows = sorted(rows, key=lambda r: r[StatusCols.JOB_OR_UUID])
+        rows = sorted(rows, key=lambda r: r[_StatusCols.JOB_OR_UUID])
     else:
         # Order rows by tree DFS to surface execution order rather
         # than alphabetical: roots from each active target first, then
@@ -2719,14 +2719,14 @@ def do_status(
             consumed.add(id(tree_row))
             tree_row = dict(tree_row)
             indent = "  " * tree_depth[full]
-            tree_row[StatusCols.JOB_OR_UUID] = (
-                indent + tree_row[StatusCols.JOB_OR_UUID]
+            tree_row[_StatusCols.JOB_OR_UUID] = (
+                indent + tree_row[_StatusCols.JOB_OR_UUID]
             )
-            if tree_row[StatusCols.JOB]:
-                tree_row[StatusCols.JOB] = indent + tree_row[StatusCols.JOB]
+            if tree_row[_StatusCols.JOB]:
+                tree_row[_StatusCols.JOB] = indent + tree_row[_StatusCols.JOB]
             ordered.append(tree_row)
         off_tree = [row for _, row in built if id(row) not in consumed]
-        for row in sorted(off_tree, key=lambda r: r[StatusCols.JOB_OR_UUID]):
+        for row in sorted(off_tree, key=lambda r: r[_StatusCols.JOB_OR_UUID]):
             ordered.append(row)
         rows = ordered
 
@@ -2734,8 +2734,8 @@ def do_status(
     # masked-by and unit-config-2 trims key on whether any shown row
     # carries a masked reason / a second unit, which only the built rows
     # can answer.
-    masked_present = any(row[StatusCols.MASKED_BY] for row in rows)
-    second_unit_present = any(row[StatusCols.UNIT_CONFIG_2] for row in rows)
+    masked_present = any(row[_StatusCols.MASKED_BY] for row in rows)
+    second_unit_present = any(row[_StatusCols.UNIT_CONFIG_2] for row in rows)
     selected_cols = _parse_status_cols(
         cols,
         masked_present=masked_present,

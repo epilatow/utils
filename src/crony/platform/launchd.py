@@ -41,19 +41,19 @@ from crony.unit import (
 _JITTER_SUFFIX = ".jitter"
 
 
-def label(name: str) -> str:
+def _label(name: str) -> str:
     """launchd Label for a job/group."""
     return f"org.{UNIT_PREFIX}.{name}"
 
 
-def plist_filename(name: str) -> str:
+def _plist_filename(name: str) -> str:
     """Basename of the LaunchAgent plist for `name`."""
-    return f"{label(name)}.plist"
+    return f"{_label(name)}.plist"
 
 
 def _name_from_plist_filename(filename: str) -> str:
     """The `<name>` embedded in a LaunchAgent plist basename -- the inverse
-    of `plist_filename`. `<name>` is what `label` / `_gui` derive a unit's
+    of `_plist_filename`. `<name>` is what `_label` / `_gui` derive a unit's
     Label and launchctl target from, so this recovers a discovered unit's
     (service or companion) addressable name from its filename."""
     prefix, suffix = f"org.{UNIT_PREFIX}.", ".plist"
@@ -110,7 +110,7 @@ def _render_plist(
     # process; its pid and exit code propagate straight to launchd).
     inner = shlex.join(cmd)
     contents: dict[str, object] = {
-        "Label": label(name),
+        "Label": _label(name),
         "ProgramArguments": ["/bin/sh", "-c", f"exec {inner}"],
         "RunAtLoad": False,
         "KeepAlive": False,
@@ -223,7 +223,7 @@ class LaunchdScheduler(Scheduler):
         name = str(spec.name)
         units = [
             RenderedUnit(
-                Path(plist_filename(name)),
+                Path(_plist_filename(name)),
                 _render_plist(name, spec.cmd, spec.timing, spec.priority),
             ),
         ]
@@ -231,7 +231,7 @@ class LaunchdScheduler(Scheduler):
             jitter_name = f"{name}{_JITTER_SUFFIX}"
             units.append(
                 RenderedUnit(
-                    Path(plist_filename(jitter_name)),
+                    Path(_plist_filename(jitter_name)),
                     _render_plist(
                         jitter_name,
                         spec.jitter.cmd,
@@ -243,12 +243,12 @@ class LaunchdScheduler(Scheduler):
         return RenderedUnits(tuple(units))
 
     def config_filename(self, name: str) -> Path:
-        return Path(plist_filename(name))
+        return Path(_plist_filename(name))
 
     def _discover_unit_files(self, name: str) -> list[Path]:
         if not self.unit_dir.exists():
             return []
-        prefix = f"{label(name)}."
+        prefix = f"{_label(name)}."
         return [
             Path(p.name)
             for p in self.unit_dir.iterdir()
@@ -256,7 +256,7 @@ class LaunchdScheduler(Scheduler):
         ]
 
     def installed_cmd(self, name: str) -> list[str] | None:
-        p = self.unit_dir / plist_filename(name)
+        p = self.unit_dir / _plist_filename(name)
         try:
             content = p.read_text(encoding="utf-8")
         except OSError:
@@ -265,11 +265,11 @@ class LaunchdScheduler(Scheduler):
 
     def dispatch_unit_path(self, name: str) -> Path:
         # launchctl kickstart targets the loaded plist by label.
-        return self.unit_dir / plist_filename(name)
+        return self.unit_dir / _plist_filename(name)
 
     def unit_name(self, name: str, _scheduled: bool | None, /) -> str:
         # One label per entity, regardless of schedule.
-        return label(name)
+        return _label(name)
 
     def installed_names(self) -> set[str]:
         if not self.unit_dir.exists():
@@ -299,7 +299,7 @@ class LaunchdScheduler(Scheduler):
         return names
 
     def is_loaded(self, name: str) -> bool:
-        return _is_loaded(label(name))
+        return _is_loaded(_label(name))
 
     def schedule_armed(self, name: str) -> bool:
         # launchd carries the schedule in the job's own plist (StartInterval
@@ -330,7 +330,7 @@ class LaunchdScheduler(Scheduler):
         return out
 
     def _gui(self, name: str) -> str:
-        return f"gui/{os.getuid()}/{label(name)}"
+        return f"gui/{os.getuid()}/{_label(name)}"
 
     def _gui_domain(self) -> str:
         return f"gui/{os.getuid()}"
@@ -351,7 +351,7 @@ class LaunchdScheduler(Scheduler):
         finishes deregistering the label, and a `bootstrap` of a
         still-present label fails with errno 5; a stuck teardown can't
         hang the caller past the bound."""
-        lbl = label(name)
+        lbl = _label(name)
         deadline = time.monotonic() + _BOOTOUT_SETTLE_TIMEOUT_SEC
         while _is_loaded(lbl) and time.monotonic() < deadline:
             time.sleep(_BOOTOUT_POLL_INTERVAL_SEC)
@@ -405,7 +405,7 @@ class LaunchdScheduler(Scheduler):
         # runs on load; companion-before-service order is a convention,
         # immaterial under the jitter floor.
         for unit_name in self._discovered_unit_names(name):
-            plist = self.unit_dir / plist_filename(unit_name)
+            plist = self.unit_dir / _plist_filename(unit_name)
             # Validate before asking launchd to load (`-s` keeps stdout
             # quiet on success). A disabled entry's plist is schedule-less
             # but still bootstrapped -- loaded and triggerable, just

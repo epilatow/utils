@@ -316,7 +316,7 @@ def _delay_or_bypass(
 _INTERACTIVE_BUTTONS = ["Cancel Job", "Delay Job", "Run Job"]
 
 
-class InteractiveChoice(StrEnum):
+class _InteractiveChoice(StrEnum):
     """An interactive job's resolved decision: run the command now,
     delay and re-prompt later, or cancel this fire. Logged into the
     run.log, so a StrEnum that reads as its plain value."""
@@ -326,7 +326,7 @@ class InteractiveChoice(StrEnum):
     CANCEL = "cancel"
 
 
-def _show_interactive_dialog(job_name: str, message: str) -> InteractiveChoice:
+def _show_interactive_dialog(job_name: str, message: str) -> _InteractiveChoice:
     """Pop the three-button approval dialog and map the click to a
     decision.
 
@@ -340,15 +340,15 @@ def _show_interactive_dialog(job_name: str, message: str) -> InteractiveChoice:
         f"crony: {job_name}", message, _INTERACTIVE_BUTTONS
     )
     if clicked == "Run Job":
-        return InteractiveChoice.RUN
+        return _InteractiveChoice.RUN
     if clicked == "Delay Job":
-        return InteractiveChoice.DELAY
-    return InteractiveChoice.CANCEL
+        return _InteractiveChoice.DELAY
+    return _InteractiveChoice.CANCEL
 
 
 def _interactive_wait_and_prompt(
     snap: crony.model.Job, log_file: IO[bytes]
-) -> InteractiveChoice:
+) -> _InteractiveChoice:
     """Run the wait/prompt/delay loop for an interactive job.
 
     Returns RUN or CANCEL. Logs each phase transition into the run.log
@@ -384,14 +384,14 @@ def _interactive_wait_and_prompt(
             log_file.write(
                 b"interactive: bypass (user-triggered during wait)\n"
             )
-            return InteractiveChoice.RUN
+            return _InteractiveChoice.RUN
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
             str(snap.entity_name),
             f"crony wants to run '{snap.entity_name}'. Now?",
         )
         log_file.write(f"interactive: user chose {choice}\n".encode())
-        if choice in (InteractiveChoice.RUN, InteractiveChoice.CANCEL):
+        if choice in (_InteractiveChoice.RUN, _InteractiveChoice.CANCEL):
             return choice
         log_file.write(
             f"interactive: delaying for "
@@ -403,7 +403,7 @@ def _interactive_wait_and_prompt(
             log_file.write(
                 b"interactive: bypass (user-triggered during delay)\n"
             )
-            return InteractiveChoice.RUN
+            return _InteractiveChoice.RUN
 
 
 def _run_job(snap: crony.model.Job) -> int:
@@ -537,7 +537,7 @@ def _run_job(snap: crony.model.Job) -> int:
                             )
                         finally:
                             pending_flag.unlink(missing_ok=True)
-                        if choice == InteractiveChoice.CANCEL:
+                        if choice == _InteractiveChoice.CANCEL:
                             result = crony.model.JobRunResult(
                                 host=host,
                                 platform=platform,

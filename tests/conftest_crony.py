@@ -34,6 +34,8 @@ from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
+    JobFlags,
+    Target,
     TomlBundle,
     TomlBundleConfig,
     TomlConfig,
@@ -51,6 +53,20 @@ from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 from crony.unit import EntityName  # noqa: E402
 
 
+def _resolved_flags(
+    config: TomlBundleConfig, short: str, target: Target | None
+) -> JobFlags:
+    """The resolved flags for one entry. Falls back to the defaults
+    composed with the entry's own delta when the entry is not reached
+    through the target (no ancestor groups to inherit)."""
+    by_name = config.resolved_flags_by_name(target)
+    if short in by_name:
+        return by_name[short]
+    entry = config.jobs.get(short) or config.job_groups.get(short)
+    delta = entry.flags if entry is not None else {}
+    return config.composed_flags(delta)
+
+
 def _resolve_snapshot_for(
     config: TomlBundleConfig,
     short: str,
@@ -64,11 +80,11 @@ def _resolve_snapshot_for(
     name = EntityName(bundle_name, short)
     target = config.resolve_target()
     if short in config.jobs:
-        flags = config.resolved_flags(short, target)
-        return Job.from_config(config, config.jobs[short], name, flags=flags)
+        flags = _resolved_flags(config, short, target)
+        return Job._from_config(config, config.jobs[short], name, flags=flags)
     if short in config.job_groups:
-        flags = config.resolved_flags(short, target)
-        return JobGroup.from_config(
+        flags = _resolved_flags(config, short, target)
+        return JobGroup._from_config(
             config, target, config.job_groups[short], name, flags=flags
         )
     raise PreconditionError(f"unknown job/group: {short!r}")
@@ -171,7 +187,7 @@ def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _parse(raw: dict[str, Any]) -> Any:
     """Auto-stamp missing uuids and parse. The dominant test path."""
-    return TomlBundleConfig.from_raw(_inject_uuids(raw))
+    return TomlBundleConfig._from_raw(_inject_uuids(raw))
 
 
 def _uuid_toml(text: str) -> str:
@@ -188,7 +204,7 @@ def _uuid_toml(text: str) -> str:
 
 
 def _assert_errored_job(raw: dict[str, Any], short: str, match: str) -> None:
-    """Assert from_raw records a per-entity error for job `short`.
+    """Assert _from_raw records a per-entity error for job `short`.
 
     Per-entity parse failures land in `TomlBundleConfig.errored_jobs` instead
     of raising, so tests of bad-shape inputs check the recorded
@@ -574,7 +590,7 @@ class _RunnerHarness:
                 if isinstance(body, dict) and isinstance(body.get("uuid"), str):
                     self._uuid_pins[(section, short)] = body["uuid"]
         self.cfg_file.write_text(tomlkit.dumps(full), encoding="utf-8")
-        cfg = TomlBundleConfig.from_raw(full)
+        cfg = TomlBundleConfig._from_raw(full)
         self._last_cfg = cfg
         return cfg
 
