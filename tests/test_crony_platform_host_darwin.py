@@ -335,6 +335,40 @@ class TestDarwinInteractive:
         assert captured["kwargs"].get("start_new_session") is True
 
 
+class TestDarwinMachineId:
+    """DarwinHost.machine_id parses IOPlatformUUID from `ioreg`, falling
+    back to the hostname; subprocess is stubbed so it runs anywhere."""
+
+    _IOREG = (
+        "+-o IOPlatformExpertDevice  <class IOPlatformExpertDevice>\n"
+        '    "IOPlatformUUID" = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"\n'
+        '    "model" = <"MacBookPro">\n'
+    )
+
+    def test_parses_platform_uuid(self, monkeypatch: Any) -> None:
+        def fake_run(argv: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(argv, 0, stdout=self._IOREG)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert (
+            DarwinHost().machine_id() == "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )
+
+    def test_falls_back_when_ioreg_absent(self, monkeypatch: Any) -> None:
+        def fake_run(*_a: object, **_k: object) -> Any:
+            raise FileNotFoundError
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().machine_id() == DarwinHost._hostname_fallback()
+
+    def test_falls_back_when_uuid_missing(self, monkeypatch: Any) -> None:
+        def fake_run(argv: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(argv, 0, stdout="no uuid\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().machine_id() == DarwinHost._hostname_fallback()
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

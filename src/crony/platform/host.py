@@ -21,6 +21,7 @@ the contract.
 
 import abc
 import enum
+import socket
 
 from crony.platform.fda import FDAWrapper
 
@@ -38,6 +39,20 @@ class PidWait(enum.Enum):
 
 class HostPlatform(abc.ABC):
     """Host-OS services crony needs that diverge by platform."""
+
+    @staticmethod
+    def _hostname_fallback() -> str:
+        """The short hostname, the `machine_id` fallback a backend uses
+        when it cannot read the OS machine identity. Guaranteed
+        non-empty. Protected: the backends' `machine_id` implementations
+        share it, but it is not part of the public host interface."""
+        return socket.gethostname().split(".")[0] or "localhost"
+
+    @abc.abstractmethod
+    def machine_id(self) -> str:
+        """A stable, per-host-unique identifier for this machine. Opaque
+        -- only its stability across time and its distinctness across
+        hosts are guaranteed -- and always non-empty."""
 
     @property
     @abc.abstractmethod

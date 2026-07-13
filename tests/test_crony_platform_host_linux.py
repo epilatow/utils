@@ -23,6 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import crony.platform.linux as linux  # noqa: E402
 from crony.platform import LinuxHost, PidWait  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
 
@@ -145,6 +146,38 @@ class TestLinuxNoDesktop:
     def test_show_failure_dialog_raises(self) -> None:
         with pytest.raises(NotImplementedError):
             LinuxHost().show_failure_dialog("t", "b")
+
+
+class TestLinuxMachineId:
+    """LinuxHost.machine_id reads the OS machine-id file, falling back to
+    the hostname. The candidate paths are patched to a tmp file so it runs
+    anywhere."""
+
+    def test_reads_machine_id_file(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        mid = tmp_path / "machine-id"
+        mid.write_text("deadbeefcafebabe0123456789abcdef\n")
+        monkeypatch.setattr(linux, "_MACHINE_ID_PATHS", (str(mid),))
+        assert LinuxHost().machine_id() == "deadbeefcafebabe0123456789abcdef"
+
+    def test_skips_empty_file_for_next_candidate(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        empty = tmp_path / "empty"
+        empty.write_text("\n")
+        good = tmp_path / "good"
+        good.write_text("realid\n")
+        monkeypatch.setattr(linux, "_MACHINE_ID_PATHS", (str(empty), str(good)))
+        assert LinuxHost().machine_id() == "realid"
+
+    def test_falls_back_to_hostname_when_unreadable(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(
+            linux, "_MACHINE_ID_PATHS", (str(tmp_path / "nope"),)
+        )
+        assert LinuxHost().machine_id() == LinuxHost._hostname_fallback()
 
 
 if __name__ == "__main__":

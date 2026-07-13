@@ -19,6 +19,10 @@ from crony.platform.host import HostPlatform, PidWait
 
 _NO_INTERACTIVE = "interactive jobs / dialogs are not supported on Linux"
 
+# Where systemd / dbus record the persistent machine identity. Either is
+# a 32-char hex string stable for the life of the install.
+_MACHINE_ID_PATHS = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+
 # Poll cadence for the /proc-based pid-exit wait (seconds).
 _PROC_POLL_INTERVAL = 0.05
 
@@ -45,6 +49,17 @@ def _proc_pid_gone(pid: int) -> bool:
 
 class LinuxHost(HostPlatform):
     """Linux host services."""
+
+    def machine_id(self) -> str:
+        for path in _MACHINE_ID_PATHS:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    value = f.read().strip()
+            except OSError:
+                continue
+            if value:
+                return value
+        return self._hostname_fallback()
 
     @property
     def supports_interactive(self) -> bool:

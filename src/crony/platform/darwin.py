@@ -34,6 +34,29 @@ def _applescript_escape(s: str) -> str:
 class DarwinHost(HostPlatform):
     """darwin host services."""
 
+    def machine_id(self) -> str:
+        # IOPlatformUUID is the per-machine hardware UUID, stable for the
+        # life of the machine. `ioreg -rd1 -c IOPlatformExpertDevice`
+        # prints one record whose line reads `"IOPlatformUUID" = "<uuid>"`.
+        try:
+            proc = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except FileNotFoundError, subprocess.TimeoutExpired:
+            return self._hostname_fallback()
+        for line in proc.stdout.splitlines():
+            if '"IOPlatformUUID"' not in line:
+                continue
+            _, _, rhs = line.partition("=")
+            value = rhs.strip().strip('"')
+            if value:
+                return value
+        return self._hostname_fallback()
+
     @property
     def supports_interactive(self) -> bool:
         return True
