@@ -3188,8 +3188,15 @@ class TestStatusReport:
         # The type= converter names the offending column(s).
         with pytest.raises(
             argparse.ArgumentTypeError, match="unknown status column"
-        ):
+        ) as exc:
             crony_commands.parse_cols_arg("job,bogus")
+        # The valid-name lists are plain string values, not enum reprs
+        # (`<_StatusCols.CONFIG: 'config'>`) leaked from the registries.
+        msg = str(exc.value)
+        assert "'config'" in msg and "'default'" in msg
+        assert "_StatusCols" not in msg
+        assert "_StatusAliases" not in msg
+        assert "<" not in msg
 
     def test_parse_cols_arg_classifies_token_kinds(self) -> None:
         # Each token resolves to its enum: column, alias, per-flag.

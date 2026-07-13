@@ -1485,7 +1485,8 @@ _documented_cols = [
 ]
 assert sorted(_documented_cols) == sorted(_StatusCols), (
     "`_STATUS_COLUMNS` must document every `_StatusCols` member exactly "
-    f"once: {sorted(_documented_cols)} != {sorted(_StatusCols)}"
+    f"once: {sorted(map(str, _documented_cols))} != "
+    f"{sorted(map(str, _StatusCols))}"
 )
 
 # The per-flag column family: one opt-in column per capability flag,
@@ -1497,13 +1498,17 @@ _FLAG_COL_TOKENS: frozenset[str] = frozenset(
 
 # Selectable columns map name -> HEADER (the `<...>` doc entries are not
 # selectable). The per-flag columns are appended after the `_StatusCols`.
+# Keys are the plain string column names (not the `_StatusCols` /
+# `JobFlagNames` members they derive from) so the registry matches its
+# `dict[str, str]` type and never leaks an enum repr when a name list is
+# formatted into a `--cols` error.
 _STATUS_COL_HEADERS: dict[str, str] = {
-    col.name: col.header
+    str(col.name): col.header
     for col in _STATUS_COLUMNS
     if not col.name.startswith("<")
 }
 for _flag_member in crony.config.JobFlags.members():
-    _STATUS_COL_HEADERS[_flag_member.token] = _flag_member.token.upper()
+    _STATUS_COL_HEADERS[str(_flag_member.token)] = _flag_member.token.upper()
 
 # Each selectable column's alias visibility, so `_expand_status_alias`
 # trims by column property rather than by hand-coded column name.
@@ -1658,7 +1663,10 @@ _STATUS_ALIASES: tuple[_StatusAlias, ...] = (
 _STATUS_ALIAS_BY_NAME: dict[str, _StatusAlias] = {
     a.name: a for a in _STATUS_ALIASES
 }
-_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(_StatusAliases)
+# Plain string alias names (not `_StatusAliases` members), so the
+# registry matches its `tuple[str, ...]` type and formats as bare values
+# in a `--cols` error rather than enum reprs.
+_STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(str(a) for a in _StatusAliases)
 _JOB_FLAG_COL_NAMES: frozenset[str] = frozenset(crony.config.JobFlagNames)
 
 # Silent `--cols` spellings accepted but never advertised: `defaults` is
@@ -2674,8 +2682,8 @@ def do_status(
         # the help reference omits.
         assert set(row_cells) == set(_StatusCols) | _FLAG_COL_TOKENS, (
             "`row_cells` keys must equal the selectable column set: "
-            f"{sorted(set(row_cells))} != "
-            f"{sorted(set(_StatusCols) | _FLAG_COL_TOKENS)}"
+            f"{sorted(map(str, row_cells))} != "
+            f"{sorted(map(str, set(_StatusCols) | _FLAG_COL_TOKENS))}"
         )
         built.append((config_name, row_cells))
 
