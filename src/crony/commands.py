@@ -3054,9 +3054,12 @@ def _validate_bundle_warnings(
     for j in config.jobs.values():
         if j.notify_channels is not None:
             listed.update(j.notify_channels)
-    for t in list(config.platform_targets.values()) + list(
+    all_targets = list(config.platform_targets.values()) + list(
         config.host_targets.values()
-    ):
+    )
+    if config.all_target is not None:
+        all_targets.append(config.all_target)
+    for t in all_targets:
         if t.notify_channels is not None:
             listed.update(t.notify_channels)
 
@@ -3183,6 +3186,7 @@ def _validate_file(path: Path) -> None:
         + len(cfg.errored_job_groups)
         + len(cfg.errored_platform_targets)
         + len(cfg.errored_host_targets)
+        + (1 if cfg.errored_all_target else 0)
     )
     if errored:
         raise crony.errors.ConfigError(
@@ -3266,6 +3270,8 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             warnings.append(f"{b.source}: {msg}")
         for msg in sorted(config.errored_host_targets.values()):
             warnings.append(f"{b.source}: {msg}")
+        if config.errored_all_target:
+            warnings.append(f"{b.source}: {config.errored_all_target}")
         for w in _validate_bundle_warnings(b):
             warnings.append(f"{b.source}: {w}")
         if config.legacy_underscore_keys:
@@ -3282,13 +3288,15 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             + len(config.errored_job_groups)
             + len(config.errored_platform_targets)
             + len(config.errored_host_targets)
+            + (1 if config.errored_all_target else 0)
         )
         errored_suffix = f", errored={errored}" if errored else ""
         print(
             f"  {b.name} ({b.source}): "
             f"jobs={len(config.jobs)}, groups={len(config.job_groups)}, "
             f"targets: platform={len(config.platform_targets)} "
-            f"host={len(config.host_targets)}{errored_suffix}"
+            f"host={len(config.host_targets)} "
+            f"all={1 if config.all_target else 0}{errored_suffix}"
         )
     if warnings:
         print("warnings:")

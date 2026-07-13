@@ -5322,6 +5322,26 @@ class TestValidate:
         assert "[target.darwin]" in out
         assert "undefined name" in out
 
+    def test_warns_on_errored_all_target(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A broken `[target.all]` must flip the validate exit code and
+        # surface its message, like any other errored target.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[target.all]\njobs = ["nope"]\n',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "[target.all]" in out
+        assert "undefined name" in out
+
     def test_file_mode_valid(self, tmp_path: Path, capsys: Any) -> None:
         # Mirrors a borgadm-style drop-in: a non-default bundle whose
         # check job omits notify-channels (implicit inherit) and whose

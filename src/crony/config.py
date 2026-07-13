@@ -515,7 +515,8 @@ class TomlJobGroup:
 class Target:
     """Per-platform or per-host selection of jobs/groups + cascading settings.
 
-    `kind` is "platform" (e.g. darwin/linux) or "host" (a specific host).
+    `kind` is "platform" (e.g. darwin/linux), "host" (a specific host), or
+    "all" (the catch-all applied on any host no more-specific target matches).
 
     A target deliberately carries no timeout knob: timeouts are a
     per-leaf-job concern (`TomlJob.job_timeout_sec` cascading to
@@ -601,6 +602,11 @@ def _parse_bundle_sections(
                 config.host_targets[hostname] = _parse_target(
                     hostname, "host", hostbody
                 )
+        elif name == "all":
+            # [target.all] catch-all entry
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError("[target.all] must be a table")
+            config.all_target = _parse_target("all", "all", body)
         else:
             # [target.<platform>] entry
             if not isinstance(body, dict):
@@ -619,12 +625,13 @@ class TomlBundleConfig:
     Per-entity ConfigErrors from `[job.*]`, `[job-group.*]`, and
     `[target.*]` sections are caught and recorded in
     `errored_jobs` / `errored_job_groups` /
-    `errored_platform_targets` / `errored_host_targets` rather
+    `errored_platform_targets` / `errored_host_targets` (and, for a
+    bad `[target.all]`, the single `errored_all_target`) rather
     than aborting the whole bundle. Each errored short-name maps
     to its error message. The corresponding entries do NOT appear
     in the live `jobs` / `job_groups` / `platform_targets` /
-    `host_targets` maps -- consumers that need to act on a parsed
-    entity must check the errored map first.
+    `host_targets` / `all_target` slots -- consumers that need to act
+    on a parsed entity must check the errored map first.
 
     Surface points for errored entries:
       - Always: logged at ERROR by `TomlBundle.load`, and
@@ -647,8 +654,13 @@ class TomlBundleConfig:
     errored_job_groups: dict[str, str] = field(default_factory=dict)
     platform_targets: dict[str, Target] = field(default_factory=dict)
     host_targets: dict[str, Target] = field(default_factory=dict)
+    # The single `[target.all]` catch-all, or None. Lowest-precedence
+    # selection: `resolve_target` uses it only when no host or platform
+    # target matches.
+    all_target: Target | None = None
     errored_platform_targets: dict[str, str] = field(default_factory=dict)
     errored_host_targets: dict[str, str] = field(default_factory=dict)
+    errored_all_target: str | None = None
     # Legacy underscore-spelled field keys this bundle still uses (the
     # dash spelling is canonical). Populated by `_from_raw`; surfaced as a
     # single deprecation warning per file by `crony config validate`.
@@ -714,8 +726,10 @@ class TomlBundleConfig:
         """Pick the effective target for (host, platform).
 
         Host and platform default to the current machine's values
-        when omitted. Host target wins; otherwise the platform
-        target; otherwise None (nothing selected on this host).
+        when omitted. Most-specific wins: the host target, else the
+        platform target, else the `[target.all]` catch-all, else None
+        (nothing selected on this host). Exactly one target is chosen --
+        its `jobs` list is the whole selection; matches are not merged.
         """
         if host is None:
             host = crony.platform.current_host()
@@ -725,7 +739,7 @@ class TomlBundleConfig:
             return self.host_targets[host]
         if platform in self.platform_targets:
             return self.platform_targets[platform]
-        return None
+        return self.all_target
 
     def selected_jobs_and_groups(
         self, target: Target | None
@@ -1034,8 +1048,8 @@ class TomlBundle:
         _demote_duplicate_uuids(config, name)
         # Per-entity error messages are already prefixed with
         # `[job.X]` / `[job-group.X]` / `[target.X]` /
-        # `[target.host.X]`; we only prepend the bundle path so the
-        # user sees which file produced each error.
+        # `[target.host.X]` / `[target.all]`; we only prepend the bundle
+        # path so the user sees which file produced each error.
         for msg in sorted(config.errored_jobs.values()):
             logger.error("%s: %s", path, msg)
         for msg in sorted(config.errored_job_groups.values()):
@@ -1044,6 +1058,8 @@ class TomlBundle:
             logger.error("%s: %s", path, msg)
         for msg in sorted(config.errored_host_targets.values()):
             logger.error("%s: %s", path, msg)
+        if config.errored_all_target:
+            logger.error("%s: %s", path, config.errored_all_target)
         return cls(name=name, source=path, config=config)
 
 
@@ -2118,10 +2134,13 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
 
 
 def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
-    """Parse [target.<platform>] or [target.host.<name>]."""
-    where = (
-        f"[target.{name}]" if kind == "platform" else f"[target.host.{name}]"
-    )
+    """Parse [target.<platform>], [target.host.<name>], or [target.all]."""
+    if kind == "host":
+        where = f"[target.host.{name}]"
+    elif kind == "all":
+        where = "[target.all]"
+    else:
+        where = f"[target.{name}]"
     if kind == "host":
         _validate_name(name, where)
     raw = _canonical_keys(raw, where)
@@ -2330,10 +2349,8 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     # filters apply at selection time, not validate time -- a
     # bundle is allowed to describe both darwin and linux entries
     # and have each host pick up only its applicable subset.
-    def _validate_target(
-        label: str, tname: str, target: Target, is_host: bool
-    ) -> str | None:
-        if not is_host and tname not in _VALID_PLATFORMS:
+    def _validate_target(label: str, tname: str, target: Target) -> str | None:
+        if target.kind == "platform" and tname not in _VALID_PLATFORMS:
             return (
                 f"{label}: platform must be one of {sorted(_VALID_PLATFORMS)}"
             )
@@ -2416,9 +2433,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
 
     bad_platform: dict[str, str] = {}
     for tname, target in config.platform_targets.items():
-        err = _validate_target(
-            f"[target.{tname}]", tname, target, is_host=False
-        )
+        err = _validate_target(f"[target.{tname}]", tname, target)
         if err is not None:
             bad_platform[tname] = err
     for tname, msg in bad_platform.items():
@@ -2427,14 +2442,18 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
 
     bad_host: dict[str, str] = {}
     for hname, target in config.host_targets.items():
-        err = _validate_target(
-            f"[target.host.{hname}]", hname, target, is_host=True
-        )
+        err = _validate_target(f"[target.host.{hname}]", hname, target)
         if err is not None:
             bad_host[hname] = err
     for hname, msg in bad_host.items():
         del config.host_targets[hname]
         config.errored_host_targets[hname] = msg
+
+    if config.all_target is not None:
+        err = _validate_target("[target.all]", "all", config.all_target)
+        if err is not None:
+            config.all_target = None
+            config.errored_all_target = err
 
 
 def _demote_duplicate_uuids(config: TomlBundleConfig, bundle_name: str) -> None:

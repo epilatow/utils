@@ -838,6 +838,31 @@ class TestParseTarget:
             "platform must be one of",
         )
 
+    def test_all_target(self) -> None:
+        # `[target.all]` is the catch-all, not a platform, so it lands
+        # in all_target and is not rejected by the platform-name check.
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "target": {"all": {"jobs": ["a"]}},
+            }
+        )
+        assert cfg.all_target is not None
+        assert cfg.all_target.kind == "all"
+        assert cfg.all_target.jobs == ["a"]
+        assert cfg.errored_all_target is None
+
+    def test_all_target_references_undefined_name(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "target": {"all": {"jobs": ["nope"]}},
+            }
+        )
+        assert cfg.all_target is None
+        assert cfg.errored_all_target is not None
+        assert "undefined name" in cfg.errored_all_target
+
     def test_target_unknown_key(self) -> None:
         with pytest.raises(ConfigError, match="unknown key"):
             _parse(
@@ -1245,6 +1270,48 @@ class TestResolution:
     def test_no_target_returns_none(self) -> None:
         cfg = _parse({})
         assert cfg.resolve_target("h", "darwin") is None
+
+    def test_all_target_is_fallback(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "target": {"all": {"jobs": ["a"]}},
+            }
+        )
+        target = cfg.resolve_target("any-host", "linux")
+        assert target is not None
+        assert target.kind == "all"
+        assert target.jobs == ["a"]
+
+    def test_platform_target_beats_all(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job(), "b": _job()},
+                "target": {
+                    "all": {"jobs": ["a"]},
+                    "darwin": {"jobs": ["b"]},
+                },
+            }
+        )
+        # A specific platform match wins over the catch-all...
+        on_darwin = cfg.resolve_target("h", "darwin")
+        assert on_darwin is not None and on_darwin.kind == "platform"
+        # ...but a host with no platform target falls through to `all`.
+        on_linux = cfg.resolve_target("h", "linux")
+        assert on_linux is not None and on_linux.kind == "all"
+
+    def test_host_target_beats_all(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job(), "b": _job()},
+                "target": {
+                    "all": {"jobs": ["a"]},
+                    "host": {"my-host": {"jobs": ["b"]}},
+                },
+            }
+        )
+        target = cfg.resolve_target("my-host", "linux")
+        assert target is not None and target.kind == "host"
 
     def test_selected_includes_group_children(self) -> None:
         cfg = _parse(

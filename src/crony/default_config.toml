@@ -241,9 +241,11 @@
 # ----------------------------------------------------------------------------
 # target sections
 # ----------------------------------------------------------------------------
-# Selects which jobs and groups install on which hosts. A host
-# target replaces the platform target when both apply; the explicit
-# `jobs` list IS the selection (no inherits / exclude / add).
+# Selects which jobs and groups install on which hosts. Most-specific
+# wins: a host target beats a platform target beats the `[target.all]`
+# catch-all. Exactly one target applies on a host -- its `jobs` list IS
+# the selection (no inherits / exclude / add), and matches are not
+# merged.
 #
 # Single-parent rule: within one target's subtree, each name has
 # at most one parent. Listing both a group and one of its children
@@ -261,3 +263,9 @@
 #[target.host.work-laptop]
 #jobs            = ["brew-update", "git-pull-utils"]
 #notify-channels = []   # no external dispatch (run.log + last-run.json only)
+
+# The catch-all: applies on every host that no host / platform target
+# above matches. Handy for a single-job bundle that should just run
+# wherever it is installed, with no per-host tailoring.
+#[target.all]
+#jobs = ["daily-updates"]
