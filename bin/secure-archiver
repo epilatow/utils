@@ -1144,6 +1144,9 @@ We run it interactively so you can confirm when runs start, so the
     interval = "1w"
     flags = ["interactive"]
     uuid = "$(crony config generate-uuid)"
+
+    [target.all]
+    jobs = ["create"]
     EOF
     crony apply -b secure-archiver"""
 

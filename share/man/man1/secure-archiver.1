@@ -36,6 +36,9 @@ We run it interactively so you can confirm when runs start, so the 1Password vau
     interval = \(dq1w\(dq
     flags = [\(dqinteractive\(dq]
     uuid = \(dq$(crony config generate\-uuid)\(dq
+
+    [target.all]
+    jobs = [\(dqcreate\(dq]
     EOF
     crony apply \-b secure\-archiver
 .EE

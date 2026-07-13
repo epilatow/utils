@@ -39,8 +39,10 @@ daily, darwin-only job:
     command   = "darwin-tz-watchdog"
     env.PATH  = "\$PATH:\$HOME/.local/bin"
     interval = "1d"
-    platforms = ["darwin"]
     uuid = "$(crony config generate-uuid)"
+
+    [target.darwin]
+    jobs = ["doit"]
     EOF
     crony apply -b darwin-tz-watchdog
 ```

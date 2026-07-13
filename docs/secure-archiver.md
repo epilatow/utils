@@ -47,6 +47,9 @@ vault-access authorization prompts don't surprise you.
     interval = "1w"
     flags = ["interactive"]
     uuid = "$(crony config generate-uuid)"
+
+    [target.all]
+    jobs = ["create"]
     EOF
     crony apply -b secure-archiver
 ```
