@@ -38,9 +38,11 @@ reports.
 """
 
 import abc
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import crony.errors
 from crony.unit import UnitSpec
 
 # On-disk unit-naming prefix. Existing units are named
@@ -324,7 +326,21 @@ class Scheduler(abc.ABC):
         Raises `crony.errors.SubprocessError` when the scheduler rejects
         the fire, so a failed fire surfaces a proper crony exit code (the
         jitter companion and `crony trigger` both propagate it). A backend
-        must convert its own command failure to that type."""
+        routes its fire through `_run_checked`, which converts a command
+        failure to that type."""
+
+    @staticmethod
+    def _run_checked(argv: list[str]) -> None:
+        """Run `argv`, raising `crony.errors.SubprocessError` on a non-zero
+        exit so a failed scheduler command surfaces `ExitCode.SUBPROCESS`
+        through the CLI instead of a bare `CalledProcessError` (which the
+        CLI does not recognize, so it crashes with a traceback). This is
+        the shared fire path for a backend's mutating scheduler commands
+        (load, enable, restart, trigger); best-effort probes and teardowns
+        that tolerate failure run their own `subprocess` calls directly."""
+        result = subprocess.run(argv)
+        if result.returncode != 0:
+            raise crony.errors.SubprocessError(result.returncode, argv)
 
     @abc.abstractmethod
     def prune_units(self, name: str, keep: set[str]) -> None:

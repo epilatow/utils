@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from crony.errors import SubprocessError  # noqa: E402
 from crony.platform import (  # noqa: E402
     SchedulerWarning,
     UnitLastExit,
@@ -231,6 +232,34 @@ class TestSystemdActivate:
             "default.grp", scheduled=False
         )
         assert calls == [["systemctl", "--user", "--quiet", "daemon-reload"]]
+
+    def test_failed_command_raises_subprocess_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A non-zero systemctl on the apply path (here the daemon-reload)
+        # aborts activate with a crony SubprocessError, not a bare
+        # CalledProcessError the CLI would crash on.
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **_kw: subprocess.CompletedProcess(list(cmd), 1),
+        )
+        with pytest.raises(SubprocessError):
+            get_scheduler("linux", tmp_path).activate(
+                "default.brew", scheduled=True
+            )
+
+    def test_trigger_failure_raises_subprocess_error(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A rejected `systemctl start` surfaces as a crony SubprocessError.
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **_kw: subprocess.CompletedProcess(list(cmd), 1),
+        )
+        with pytest.raises(SubprocessError):
+            get_scheduler("linux", tmp_path).trigger("default.brew")
 
 
 class TestSystemdScheduleArmed:

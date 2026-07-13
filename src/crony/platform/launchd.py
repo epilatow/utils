@@ -379,7 +379,7 @@ class LaunchdScheduler(Scheduler):
             if attempt + 1 < _BOOTSTRAP_ATTEMPTS:
                 time.sleep(_BOOTSTRAP_BACKOFF_SEC * (attempt + 1))
         assert result is not None  # the loop ran at least once
-        raise subprocess.CalledProcessError(
+        raise crony.errors.SubprocessError(
             result.returncode, cmd, result.stdout, result.stderr
         )
 
@@ -410,7 +410,7 @@ class LaunchdScheduler(Scheduler):
             # quiet on success). A disabled entry's plist is schedule-less
             # but still bootstrapped -- loaded and triggerable, just
             # dormant.
-            subprocess.run(["plutil", "-s", str(plist)], check=True)
+            self._run_checked(["plutil", "-s", str(plist)])
             self._bootstrap(unit_name, plist)
 
     def deactivate(self, name: str) -> None:
@@ -441,10 +441,7 @@ class LaunchdScheduler(Scheduler):
 
     def trigger(self, name: str) -> None:
         # kickstart invokes now; `start` only queues the next fire.
-        argv = ["launchctl", "kickstart", self._gui(name)]
-        result = subprocess.run(argv)
-        if result.returncode != 0:
-            raise crony.errors.SubprocessError(result.returncode, argv)
+        self._run_checked(["launchctl", "kickstart", self._gui(name)])
 
     def prune_units(self, name: str, keep: set[str]) -> None:
         # Remove every discovered plist not in `keep`, booting out its own

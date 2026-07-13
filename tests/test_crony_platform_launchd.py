@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from crony.errors import SubprocessError  # noqa: E402
 from crony.platform import (  # noqa: E402
     UnitLastExit,
     get_scheduler,
@@ -305,7 +306,7 @@ class TestLaunchdReload:
         sched, calls = self._setup(
             monkeypatch, tmp_path, bootstrap_rcs=(5, 5, 5)
         )
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(SubprocessError):
             sched.activate("default.j", scheduled=True)
         assert (
             self._subs(calls).count("bootstrap") == launchd._BOOTSTRAP_ATTEMPTS
@@ -317,9 +318,42 @@ class TestLaunchdReload:
         # A non-errno-5 bootstrap failure is genuine, not the race, so it
         # surfaces at once rather than burning the retry budget.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(1,))
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(SubprocessError):
             sched.activate("default.j", scheduled=True)
         assert self._subs(calls).count("bootstrap") == 1
+
+    def test_plutil_validation_failure_raises_subprocess_error(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # A plist that fails `plutil -s` aborts activate with a crony
+        # SubprocessError (a proper exit code), before any bootstrap.
+        sched = get_scheduler("darwin", tmp_path)
+        (tmp_path / launchd.plist_filename("default.j")).write_text("x")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: Any, **_kw: Any) -> subprocess.CompletedProcess[str]:
+            argv = list(cmd)
+            calls.append(argv)
+            rc = 1 if argv[0] == "plutil" else 0
+            return subprocess.CompletedProcess(argv, rc)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        with pytest.raises(SubprocessError):
+            sched.activate("default.j", scheduled=True)
+        assert not any(c[:2] == ["launchctl", "bootstrap"] for c in calls)
+
+    def test_trigger_failure_raises_subprocess_error(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # A rejected kickstart surfaces as a crony SubprocessError.
+        sched = get_scheduler("darwin", tmp_path)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **_kw: subprocess.CompletedProcess(list(cmd), 1),
+        )
+        with pytest.raises(SubprocessError):
+            sched.trigger("default.j")
 
     def test_settle_waits_for_label_to_clear(
         self, monkeypatch: Any, tmp_path: Path

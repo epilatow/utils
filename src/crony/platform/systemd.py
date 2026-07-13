@@ -13,7 +13,6 @@ import shlex
 import subprocess
 from pathlib import Path
 
-import crony.errors
 from crony.platform.scheduler import (
     UNIT_PREFIX,
     RenderedUnit,
@@ -427,9 +426,7 @@ class SystemdScheduler(Scheduler):
     def activate(self, name: str, *, scheduled: bool) -> None:
         # --quiet suppresses systemctl's success-path "Created symlink"
         # chatter; real errors still print.
-        subprocess.run(
-            ["systemctl", "--user", "--quiet", "daemon-reload"], check=True
-        )
+        self._run_checked(["systemctl", "--user", "--quiet", "daemon-reload"])
         # Only a scheduled entry has a `.timer`; a schedule-less `.service`
         # (grouped or disabled) sits dormant. Enable creates the boot
         # symlink; restart re-activates the timer so its monotonic anchor
@@ -439,8 +436,8 @@ class SystemdScheduler(Scheduler):
         # activation, unable to fire.
         if scheduled:
             timer = timer_filename(name)
-            subprocess.run(_SYSTEMCTL_ENABLE + [timer], check=True)
-            subprocess.run(_SYSTEMCTL_RESTART + [timer], check=True)
+            self._run_checked(_SYSTEMCTL_ENABLE + [timer])
+            self._run_checked(_SYSTEMCTL_RESTART + [timer])
 
     def deactivate(self, name: str) -> None:
         subprocess.run(
@@ -488,10 +485,9 @@ class SystemdScheduler(Scheduler):
 
     def trigger(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.
-        argv = ["systemctl", "--user", "start", service_filename(name)]
-        result = subprocess.run(argv)
-        if result.returncode != 0:
-            raise crony.errors.SubprocessError(result.returncode, argv)
+        self._run_checked(
+            ["systemctl", "--user", "start", service_filename(name)]
+        )
 
     def prune_units(self, name: str, keep: set[str]) -> None:
         # Remove every discovered unit file not in `keep`: an orphaned
