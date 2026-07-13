@@ -2,9 +2,12 @@
 
 """launchd (macOS) scheduler backend.
 
-Each entity is a single LaunchAgent plist: a scheduled entry carries a
+An entity is a service LaunchAgent plist -- a scheduled entry carries a
 `StartInterval` / `StartCalendarInterval`, a schedule-less one just sits
-dormant (`RunAtLoad=false`) until something fires it.
+dormant (`RunAtLoad=false`) until something fires it. A jittered interval
+job (one whose `UnitSpec` carries a `jitter`) additionally gets a jitter
+companion plist that phases the service's first fire, since launchd has no
+native start-time randomization.
 """
 
 import os
@@ -14,6 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import crony.errors
 from crony.platform.scheduler import (
     UNIT_PREFIX,
     RenderedUnit,
@@ -29,6 +33,13 @@ from crony.unit import (
     UnitSpec,
 )
 
+# The dotted component appended to a jittered interval job's base name to
+# form its companion unit's name (`<name>.jitter`). The dotted-prefix name
+# rejection forbids a real entity from colliding with `<name>.jitter`, so a
+# `<name>.jitter` plist beside a `<name>` service is unambiguously `<name>`'s
+# companion.
+_JITTER_SUFFIX = ".jitter"
+
 
 def label(name: str) -> str:
     """launchd Label for a job/group."""
@@ -38,6 +49,15 @@ def label(name: str) -> str:
 def plist_filename(name: str) -> str:
     """Basename of the LaunchAgent plist for `name`."""
     return f"{label(name)}.plist"
+
+
+def _name_from_plist_filename(filename: str) -> str:
+    """The `<name>` embedded in a LaunchAgent plist basename -- the inverse
+    of `plist_filename`. `<name>` is what `label` / `_gui` derive a unit's
+    Label and launchctl target from, so this recovers a discovered unit's
+    (service or companion) addressable name from its filename."""
+    prefix, suffix = f"org.{UNIT_PREFIX}.", ".plist"
+    return filename[len(prefix) : -len(suffix)]
 
 
 def _priority_keys(priority: PriorityClass) -> dict[str, object]:
@@ -63,7 +83,7 @@ def _priority_keys(priority: PriorityClass) -> dict[str, object]:
     return {}
 
 
-def render_plist(
+def _render_plist(
     name: str,
     cmd: tuple[str, ...],
     timing: Timing | None,
@@ -108,9 +128,9 @@ def render_plist(
 
 def _plist_argv(content: str) -> list[str] | None:
     """Recover the argv embedded in a plist, or None when it isn't in the
-    shape `render_plist` produces.
+    shape `_render_plist` produces.
 
-    The inverse of `render_plist`'s embedding: it unwraps the
+    The inverse of `_render_plist`'s embedding: it unwraps the
     `/bin/sh -c 'exec <argv>'` ProgramArguments back to the argv list."""
     try:
         data = plistlib.loads(content.encode("utf-8"))
@@ -180,7 +200,8 @@ _LAUNCHD_EIO = 5
 
 
 class LaunchdScheduler(Scheduler):
-    """launchd backend: one LaunchAgent plist per entity."""
+    """launchd backend: a service LaunchAgent plist per entity, plus a
+    jitter companion plist for a jittered interval job."""
 
     # A reload is bootout+bootstrap; bootout terminates the running job's
     # process group, so reloading a job's own unit kills its runner.
@@ -191,17 +212,35 @@ class LaunchdScheduler(Scheduler):
         return Path.home() / "Library" / "LaunchAgents"
 
     def render_units(self, spec: UnitSpec) -> RenderedUnits:
-        # One LaunchAgent plist carries both the command and the schedule
-        # keys, so the entity has a single unit slot.
+        # The service plist carries the command and the real schedule. A
+        # jittered interval job (spec.jitter set by the model) also gets a
+        # companion plist (slot 1) that fires once, at the model's per-job
+        # offset, and kickstarts the service -- launchd has no native
+        # start-time randomization. The companion reuses _render_plist, so
+        # it inherits the /bin/sh exec wrapper the service uses, and runs
+        # the opaque argv the model baked (`spec.jitter.cmd`) -- this layer
+        # neither decides eligibility nor builds the argv.
         name = str(spec.name)
-        return RenderedUnits(
-            (
+        units = [
+            RenderedUnit(
+                Path(plist_filename(name)),
+                _render_plist(name, spec.cmd, spec.timing, spec.priority),
+            ),
+        ]
+        if spec.jitter is not None:
+            jitter_name = f"{name}{_JITTER_SUFFIX}"
+            units.append(
                 RenderedUnit(
-                    Path(plist_filename(name)),
-                    render_plist(name, spec.cmd, spec.timing, spec.priority),
-                ),
+                    Path(plist_filename(jitter_name)),
+                    _render_plist(
+                        jitter_name,
+                        spec.jitter.cmd,
+                        spec.jitter.offset,
+                        PriorityClass.NORMAL,
+                    ),
+                )
             )
-        )
+        return RenderedUnits(tuple(units))
 
     def config_filename(self, name: str) -> Path:
         return Path(plist_filename(name))
@@ -233,13 +272,30 @@ class LaunchdScheduler(Scheduler):
         return label(name)
 
     def installed_names(self) -> set[str]:
-        names: set[str] = set()
         if not self.unit_dir.exists():
-            return names
+            return set()
         prefix, suffix = f"org.{UNIT_PREFIX}.", ".plist"
-        for p in self.unit_dir.iterdir():
-            if p.name.startswith(prefix) and p.name.endswith(suffix):
-                names.add(p.name[len(prefix) : -len(suffix)])
+        stems = {
+            p.name[len(prefix) : -len(suffix)]
+            for p in self.unit_dir.iterdir()
+            if p.name.startswith(prefix) and p.name.endswith(suffix)
+        }
+        names: set[str] = set()
+        for stem in stems:
+            # A jitter companion collapses to its base service when that
+            # service is also on disk -- it is `<base>`'s companion, not a
+            # separate entity, so a normally-installed jittered job
+            # surfaces as one `<base>` name (not a spurious
+            # `<base>.jitter` unit-only orphan). A `<name>.jitter` whose
+            # service is ABSENT (a standalone job literally named that, or
+            # a companion left after its service was removed) keeps its own
+            # name so it stays reachable for orphan cleanup.
+            if stem.endswith(_JITTER_SUFFIX):
+                base = stem[: -len(_JITTER_SUFFIX)]
+                if base in stems:
+                    names.add(base)
+                    continue
+            names.add(stem)
         return names
 
     def is_loaded(self, name: str) -> bool:
@@ -327,18 +383,51 @@ class LaunchdScheduler(Scheduler):
             result.returncode, cmd, result.stdout, result.stderr
         )
 
+    def _discovered_unit_names(self, name: str) -> list[str]:
+        """The addressable names of `name`'s on-disk units (the service
+        plus any jitter companion), companion first by filename order.
+        Each is the `<name>`-form `_bootout` / `_bootstrap` derive a Label
+        and launchctl target from."""
+        return [
+            _name_from_plist_filename(f.name)
+            for f in sorted(
+                self._discover_unit_files(name), key=lambda p: p.name
+            )
+        ]
+
     def activate(self, name: str, *, scheduled: bool) -> None:
         del scheduled  # a plist with no Start* keys loads fine, dormant
-        plist = self.unit_dir / plist_filename(name)
-        # Validate before asking launchd to load (`-s` keeps stdout
-        # quiet on success). A disabled entry's plist is schedule-less
-        # but still bootstrapped -- loaded and triggerable, just dormant.
-        subprocess.run(["plutil", "-s", str(plist)], check=True)
-        self._bootstrap(name, plist)
+        # Bootstrap every unit the entity left on disk -- the service and,
+        # for a jittered interval job, its companion. A re-apply re-anchors
+        # the service, so the companion (which self-unloads after its one
+        # fire) must re-load too, or the re-anchored service has nothing to
+        # re-phase it and the herd reforms. RunAtLoad=false, so neither
+        # runs on load; companion-before-service order is a convention,
+        # immaterial under the jitter floor.
+        for unit_name in self._discovered_unit_names(name):
+            plist = self.unit_dir / plist_filename(unit_name)
+            # Validate before asking launchd to load (`-s` keeps stdout
+            # quiet on success). A disabled entry's plist is schedule-less
+            # but still bootstrapped -- loaded and triggerable, just
+            # dormant.
+            subprocess.run(["plutil", "-s", str(plist)], check=True)
+            self._bootstrap(unit_name, plist)
 
     def deactivate(self, name: str) -> None:
-        if (self.unit_dir / plist_filename(name)).exists():
-            self._bootout(name)
+        # Boot out every on-disk unit's label, not just the service's: a
+        # still-loaded jitter companion left registered would keep firing
+        # and re-kickstart a now-disabled service (whose lock is always
+        # free), so its label must clear too. Tolerant of an already-
+        # unloaded companion -- its steady state after the one fire, where
+        # a not-found bootout is a harmless no-op.
+        for unit_name in self._discovered_unit_names(name):
+            self._bootout(unit_name)
+
+    def deactivate_jitter(self, name: str) -> None:
+        # Unload only `name`'s jitter companion (not the service), the
+        # runner's self-unload of the fired companion. A not-found bootout
+        # (already unloaded, or never a jittered job) is a harmless no-op.
+        self._bootout(f"{name}{_JITTER_SUFFIX}")
 
     def remove_files(self, name: str) -> None:
         self.deactivate(name)
@@ -352,17 +441,22 @@ class LaunchdScheduler(Scheduler):
 
     def trigger(self, name: str) -> None:
         # kickstart invokes now; `start` only queues the next fire.
-        subprocess.run(["launchctl", "kickstart", self._gui(name)], check=True)
+        argv = ["launchctl", "kickstart", self._gui(name)]
+        result = subprocess.run(argv)
+        if result.returncode != 0:
+            raise crony.errors.SubprocessError(result.returncode, argv)
 
     def prune_units(self, name: str, keep: set[str]) -> None:
-        # Remove every discovered plist not in `keep`. The config plist
-        # render always produces, so normally nothing is pruned; a stale
-        # file from an old naming scheme is found and cleaned. Unloading
-        # the label first covers the config plist (the loaded unit).
-        config = str(self.config_filename(name))
+        # Remove every discovered plist not in `keep`, booting out its own
+        # label first. The service plist render always produces, so it
+        # stays in `keep`; a jitter companion that became ineligible (the
+        # job was disabled or its interval shortened below the floor) drops
+        # out of `keep` and is pruned here, as is a stale file from an old
+        # naming scheme. Booting out each pruned label before the unlink
+        # keeps a still-loaded companion from leaking as a live agent
+        # (tolerant of an already-unloaded one).
         for filename in self._discover_unit_files(name):
             if str(filename) in keep:
                 continue
-            if str(filename) == config:
-                self.deactivate(name)
+            self._bootout(_name_from_plist_filename(filename.name))
             (self.unit_dir / filename).unlink(missing_ok=True)

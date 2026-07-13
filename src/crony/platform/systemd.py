@@ -13,6 +13,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import crony.errors
 from crony.platform.scheduler import (
     UNIT_PREFIX,
     RenderedUnit,
@@ -478,10 +479,10 @@ class SystemdScheduler(Scheduler):
 
     def trigger(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.
-        subprocess.run(
-            ["systemctl", "--user", "start", service_filename(name)],
-            check=True,
-        )
+        argv = ["systemctl", "--user", "start", service_filename(name)]
+        result = subprocess.run(argv)
+        if result.returncode != 0:
+            raise crony.errors.SubprocessError(result.returncode, argv)
 
     def prune_units(self, name: str, keep: set[str]) -> None:
         # Remove every discovered unit file not in `keep`: an orphaned

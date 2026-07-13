@@ -401,6 +401,28 @@ Timing = Schedule | Interval
 
 
 @dataclass(frozen=True)
+class JitterSpec:
+    """The start-time jitter a jittered interval unit carries.
+
+    A pure carrier the model fills in and each backend renders per its own
+    mechanism -- it holds no policy (the eligibility decision and the
+    offset computation live in the model) and interprets neither field.
+
+    offset      The fixed per-job first-fire offset as an Interval, in
+                `[1, N)` for an interval of `N`. A backend delays the first
+                fire by it (on launchd, a companion that fires at it and
+                triggers the service).
+    cmd         The argv a phasing companion runs -- an opaque crony
+                invocation the model bakes, exactly like `UnitSpec.cmd`.
+                Consumed by backends that implement jitter via a separate
+                unit (e.g. launchd).
+    """
+
+    offset: Interval
+    cmd: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class UnitSpec:
     """One scheduled unit, described without crony's job/group model.
 
@@ -412,9 +434,14 @@ class UnitSpec:
     priority    The unit's priority class. NORMAL when no special
                 scheduling is requested (groups always render NORMAL);
                 only HIGH / LOW emit platform directives.
+    jitter      The start-time jitter the model computed for this unit, or
+                None when it is not jittered (a calendar / short-interval /
+                grouped / disabled entry). An eligibility decision the
+                model owns; the backends only render it.
     """
 
     name: EntityName
     cmd: tuple[str, ...]
     timing: Timing | None
     priority: PriorityClass
+    jitter: JitterSpec | None = None

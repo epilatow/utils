@@ -1258,7 +1258,7 @@ class TestInstalledCmdParsing:
     _CMD = ("/abs/uv", "run", "--script", "/abs/crony", "run", "x:y")
 
     def test_plist_round_trips(self) -> None:
-        plist = launchd.render_plist("j", self._CMD, None)
+        plist = launchd._render_plist("j", self._CMD, None)
         assert launchd._plist_argv(plist) == list(self._CMD)
 
     def test_service_round_trips(self) -> None:

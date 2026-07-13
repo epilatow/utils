@@ -293,6 +293,16 @@ class Scheduler(abc.ABC):
         """Remove the unit from the scheduler. Tolerant of an
         already-absent unit so destroy never fails on a missing one."""
 
+    # B027: the empty body is an intentional default no-op hook, not a
+    # forgotten @abstractmethod -- most backends render no companion.
+    def deactivate_jitter(self, _name: str) -> None:  # noqa: B027
+        """Unload only the entity's jitter companion, leaving the service
+        loaded -- the runner's self-unload of a fired companion. Defaults
+        to a no-op: a backend that renders no jitter companion (its
+        jitter, if any, is native) has nothing to unload. A backend that
+        phases via a separate unit overrides this to unload that unit,
+        tolerant of an already-absent companion."""
+
     @abc.abstractmethod
     def remove_files(self, name: str) -> None:
         """Deactivate `name` and unlink every unit file backing it.
@@ -309,8 +319,12 @@ class Scheduler(abc.ABC):
 
     @abc.abstractmethod
     def trigger(self, name: str) -> None:
-        """Fire `name` immediately (no-op if a run is already in
-        flight)."""
+        """Fire `name` immediately (no-op if a run is already in flight).
+
+        Raises `crony.errors.SubprocessError` when the scheduler rejects
+        the fire, so a failed fire surfaces a proper crony exit code (the
+        jitter companion and `crony trigger` both propagate it). A backend
+        must convert its own command failure to that type."""
 
     @abc.abstractmethod
     def prune_units(self, name: str, keep: set[str]) -> None:

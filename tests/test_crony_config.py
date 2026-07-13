@@ -46,6 +46,7 @@ from crony.config import (  # noqa: E402
     TomlBundle,
     TomlBundleConfig,
     TomlConfig,
+    jitter_floor_seconds,
 )
 from crony.errors import (  # noqa: E402
     ConfigError,
@@ -2767,6 +2768,22 @@ class TestJobFlags:
             JobFlags.KEEP_AWAKE,
             JobFlags.FULL_DISK_ACCESS,
         ]
+
+
+class TestJitterFloor:
+    def test_default_is_10m(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("CRONY_JITTER_FLOOR_SECONDS", raising=False)
+        assert jitter_floor_seconds() == 600
+
+    def test_env_override_read_live(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "30")
+        assert jitter_floor_seconds() == 30
+        monkeypatch.delenv("CRONY_JITTER_FLOOR_SECONDS")
+        assert jitter_floor_seconds() == 600
+
+    def test_non_integer_override_falls_back(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "not-a-number")
+        assert jitter_floor_seconds() == 600
 
 
 if __name__ == "__main__":

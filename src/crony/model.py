@@ -25,6 +25,8 @@ compares.
 
 import dataclasses
 import datetime
+import functools
+import hashlib
 import os
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -90,6 +92,99 @@ _HARD_TIMEOUT_PADDING_SEC = 60
 # launches the inner `crony _run` in its own session and kills that
 # process group if the cap elapses.
 GUARD_SUBCOMMAND = "_run-guard"
+
+# Hidden crony subcommand the platform unit layer can use to implement jitter
+# for an interval service's first fire, if the system job scheduler doesn't
+# support jitter directly (e.g. launchd).
+JITTER_SUBCOMMAND = "_jitter"
+
+
+def is_jittered(timing: crony.unit.Timing | None) -> bool:
+    """Whether an entry with this EFFECTIVE `timing` gets start-time
+    jitter: an interval at or above `config.jitter_floor_seconds`. A
+    calendar entry keeps its exact specified time; a disabled entry
+    renders schedule-less (timing None); a short interval is below the
+    floor -- none are jittered. The one eligibility predicate; the
+    backends never decide, they render the `UnitSpec.jitter` this drives.
+
+    The floor is `max(2, ...)`: an interval needs `N >= 2` for the `[1, N)`
+    offset range to be non-empty, which `jitter_offset_seconds` relies on
+    (its `% (N - 1)` would divide by zero at `N == 1`). Production's 10m
+    floor is far above 2; the clamp only matters if a test drives the
+    floor below it via the env seam."""
+    floor = max(2, crony.config.jitter_floor_seconds())
+    return (
+        isinstance(timing, crony.unit.Interval)
+        and timing.total_seconds >= floor
+    )
+
+
+def jitter_offset_seconds(
+    name: crony.unit.EntityName,
+    interval: crony.unit.Interval,
+    machine_id: str,
+) -> int:
+    """The fixed per-job start-time offset in seconds, in `[1, N)` for an
+    interval of `N = interval.total_seconds`.
+
+    Deterministic from the machine id and the entity name: stable across
+    re-applies (re-applying does not reshuffle the herd), distinct per host
+    (the same job on two machines draws a different offset), and recomputed
+    rather than persisted. `is_jittered` guarantees an eligible `N >= 2`,
+    so `N - 1 >= 1` and the modulus never divides by zero; `R < N`
+    guarantees the first fire lands before one full interval elapses."""
+    n = interval.total_seconds
+    seed = hashlib.sha256(f"{machine_id}:{name}".encode()).digest()
+    return 1 + (int.from_bytes(seed[:8], "big") % (n - 1))
+
+
+@functools.cache
+def _current_machine_id() -> str:
+    """The running host's machine id -- the per-host seed for jitter
+    offsets. Cached for the process: it is stable for the machine's life,
+    and the status / apply path draws it once per jittered unit on each of
+    the two drift-comparison renders, so an uncached lookup would re-shell
+    to the OS machine-id probe repeatedly in the interactive hot path."""
+    return crony.platform.get_host(
+        crony.platform.current_platform()
+    ).machine_id()
+
+
+def _jitter_spec(
+    name: crony.unit.EntityName,
+    ref: crony.unit.EntityRef,
+    timing: crony.unit.Timing | None,
+    uv_path: Path,
+    crony_path: Path,
+) -> crony.unit.JitterSpec | None:
+    """The `JitterSpec` for an eligible interval unit, else None. Owns the
+    eligibility decision and the offset draw so the backends only render
+    the result; the companion argv's uv / crony paths mirror `cmd`'s, so a
+    normalized (blank-path) spec blanks them too and a moved binary is not
+    drift."""
+    if not is_jittered(timing):
+        return None
+    # is_jittered is true only for an eligible Interval; narrow it for the
+    # offset draw and the synthesized offset Interval.
+    assert isinstance(timing, crony.unit.Interval)
+    offset = jitter_offset_seconds(name, timing, _current_machine_id())
+    # The companion argv mirrors `_run_argv`: absolute uv / crony paths are
+    # baked in because schedulers start a unit with a minimal PATH. `ref`
+    # locates the service state dir (its lock / log); `name` addresses the
+    # service and companion units through the scheduler, so the runner
+    # needs no launchctl strings baked in.
+    cmd = (
+        str(uv_path),
+        "run",
+        "--script",
+        str(crony_path),
+        JITTER_SUBCOMMAND,
+        str(ref),
+        str(name),
+    )
+    return crony.unit.JitterSpec(
+        offset=crony.unit.Interval(f"{offset}s", offset), cmd=cmd
+    )
 
 
 def _run_argv(
@@ -162,7 +257,11 @@ def _normalized_spec(
     with no resolved executables."""
     cmd = _guarded_argv(Path(""), Path(""), ref, guard_timeout)
     return crony.unit.UnitSpec(
-        name=name, cmd=cmd, timing=timing, priority=priority
+        name=name,
+        cmd=cmd,
+        timing=timing,
+        priority=priority,
+        jitter=_jitter_spec(name, ref, timing, Path(""), Path("")),
     )
 
 
@@ -401,14 +500,19 @@ class _JobCommon:
                 f"{self.entity_ref} carries no resolved uv / crony path "
                 f"to render its unit"
             )
+        uv_path, crony_path = self.uv_path, self.crony_path
         cmd = _guarded_argv(
-            self.uv_path, self.crony_path, self.entity_ref, self.guard_timeout
+            uv_path, crony_path, self.entity_ref, self.guard_timeout
         )
+        timing = None if self.unit_disabled else self.timing
         return crony.unit.UnitSpec(
             name=self.entity_name,
             cmd=cmd,
-            timing=None if self.unit_disabled else self.timing,
+            timing=timing,
             priority=self._unit_priority,
+            jitter=_jitter_spec(
+                self.entity_name, self.entity_ref, timing, uv_path, crony_path
+            ),
         )
 
     def with_unit_disabled(
@@ -1004,7 +1108,13 @@ def _current_rendered_units(
             u.filename: u.content
             for u in sched.render_units(
                 crony.unit.UnitSpec(
-                    name=name, cmd=cmd, timing=timing, priority=priority
+                    name=name,
+                    cmd=cmd,
+                    timing=timing,
+                    priority=priority,
+                    jitter=_jitter_spec(
+                        name, ref, timing, installed_uv, installed_crony
+                    ),
                 )
             ).units
         }

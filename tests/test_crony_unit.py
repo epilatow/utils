@@ -18,6 +18,7 @@ from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
     Interval,
+    JitterSpec,
     PriorityClass,
     Schedule,
     UnitSpec,
@@ -221,6 +222,30 @@ class TestUnitSpec:
         assert str(spec.name) == "default.job"
         assert spec.cmd == cmd
         assert isinstance(spec.timing, Schedule)
+
+    def test_jitter_defaults_none(self) -> None:
+        # A unit is unjittered unless the model stamps a JitterSpec.
+        spec = UnitSpec(
+            name=EntityName("default", "job"),
+            cmd=(),
+            timing=None,
+            priority=PriorityClass.NORMAL,
+        )
+        assert spec.jitter is None
+
+    def test_carries_jitter_spec(self) -> None:
+        jitter = JitterSpec(
+            offset=Interval("90s", 90), cmd=("uv", "crony", "_jitter")
+        )
+        spec = UnitSpec(
+            name=EntityName("default", "job"),
+            cmd=(),
+            timing=Interval.from_str("1h"),
+            priority=PriorityClass.NORMAL,
+            jitter=jitter,
+        )
+        assert spec.jitter is jitter
+        assert spec.jitter.offset.total_seconds == 90
 
 
 if __name__ == "__main__":

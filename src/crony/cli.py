@@ -652,6 +652,21 @@ def _build_parser() -> StrictArgumentParser:
         help="The `crony _run` command to run under the cap.",
     )
 
+    # _jitter -- internal launchd start-time jitter companion; baked into
+    # a jittered interval job's jitter LaunchAgent by apply, never invoked
+    # by hand. Hidden from `crony --help` for the same reason as `_run` (no
+    # `help=`). Takes the service's `<bundle>:<uuid>` and its `<bundle>.
+    # <short>` name.
+    p_jitter = subparsers.add_parser(crony.model.JITTER_SUBCOMMAND)
+    p_jitter.add_argument(
+        "ref",
+        help="Service entity address `<bundle>:<uuid>` (internal-only form).",
+    )
+    p_jitter.add_argument(
+        "name",
+        help="Service entity name `<bundle>.<short>` (internal-only form).",
+    )
+
     # notify-test
     p_nt = subparsers.add_parser(
         "notify-test",
@@ -691,6 +706,7 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     crony.model.RUN_SUBCOMMAND: crony.runner.do_run,
     crony.model.RUN_SUBCOMMAND_LEGACY: crony.runner.do_run,
     crony.model.GUARD_SUBCOMMAND: crony.runner.do_run_guard,
+    crony.model.JITTER_SUBCOMMAND: crony.runner.do_jitter,
     "notify-test": crony.commands.do_notify_test,
 }
 

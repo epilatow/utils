@@ -260,8 +260,8 @@ Filesystem path of the platform config unit.\&
 Empty when no config unit exists on disk.\&
 .TP
 \f[I]unit\-config\-2\f[R]
-Filesystem path of the platform\(aqs second unit \-\- the systemd timer.\&
-Empty for a job with no second unit (an unscheduled or grouped job, or any job on macOS/darwin, where launchd carries everything in one unit).\&
+Filesystem path of the platform\(aqs second unit \-\- the systemd timer, or the launchd start\-time\-jitter companion for a jittered interval job.\&
+Empty for a job with no second unit (an unscheduled or grouped job, or a calendar / short\-interval job on macOS/darwin).\&
 .TP
 \f[I]unit\-name\f[R]
 Platform unit identifier.\&

@@ -7,7 +7,9 @@
 
 """Unit tests for crony.platform.launchd (the macOS backend)."""
 
+import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import time
@@ -27,6 +29,7 @@ from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
     Interval,
+    JitterSpec,
     PriorityClass,
     Schedule,
     UnitSpec,
@@ -47,10 +50,10 @@ _DIR = Path("/unused")
 
 
 class TestPlistRendering:
-    """launchd.render_plist produces well-formed launchd plists."""
+    """launchd._render_plist produces well-formed launchd plists."""
 
     def test_keyword_daily(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "brew",
             _CMD,
             Schedule.from_str("daily"),
@@ -63,7 +66,7 @@ class TestPlistRendering:
         assert "<integer>0</integer>" in plist
 
     def test_oncalendar_simple_time(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("*-*-* 03:15"),
@@ -73,7 +76,7 @@ class TestPlistRendering:
         assert "<integer>15</integer>" in plist
 
     def test_oncalendar_dow_with_time(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("Mon *-*-* 09:00"),
@@ -82,7 +85,7 @@ class TestPlistRendering:
         assert "<integer>1</integer>" in plist  # Mon=1
 
     def test_oncalendar_first_of_month(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("*-*-01 03:00"),
@@ -91,7 +94,7 @@ class TestPlistRendering:
         assert "<integer>1</integer>" in plist
 
     def test_interval(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Interval.from_str("30min"),
@@ -100,7 +103,7 @@ class TestPlistRendering:
         assert "<integer>1800</integer>" in plist
 
     def test_program_args_wrap_uv_in_sh_with_absolute_path(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("daily"),
@@ -126,7 +129,7 @@ class TestPlistRendering:
             (None, PriorityClass.NORMAL),  # on-demand, normal priority
         ]
         for timing, priority in shapes:
-            plist = launchd.render_plist("j", _CMD, timing, priority)
+            plist = launchd._render_plist("j", _CMD, timing, priority)
             d = plistlib.loads(plist.encode("utf-8"))
             assert d["Label"] == "org.crony.j"
             assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
@@ -134,7 +137,7 @@ class TestPlistRendering:
 
 class TestLaunchdPriority:
     def test_high(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("daily"),
@@ -146,7 +149,7 @@ class TestLaunchdPriority:
         assert d["Nice"] == 0
 
     def test_low(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("daily"),
@@ -158,7 +161,7 @@ class TestLaunchdPriority:
         assert d["Nice"] == 10
 
     def test_normal_emits_nothing(self) -> None:
-        plist = launchd.render_plist(
+        plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("daily"),
@@ -481,6 +484,149 @@ class TestLaunchdDefaultUnitDir:
         assert get_scheduler("darwin", Path("/unit/dir")).unit_dir == Path(
             "/unit/dir"
         )
+
+
+def _bootout_recorder(booted: list[str]) -> Any:
+    """A `subprocess.run` stub recording each launchctl call's target (the
+    last argv element), so a test can assert which labels were booted
+    out."""
+
+    def fake_run(cmd: Any, **_kw: Any) -> None:
+        booted.append(list(cmd)[-1])
+
+    return fake_run
+
+
+class TestLaunchdJitter:
+    """A UnitSpec carrying a `jitter` renders a companion (slot 1) beside
+    the service; the companion collapses under installed_names and shares
+    the entity's bootout / bootstrap lifecycle. This backend renders
+    `spec.jitter` -- it does not decide eligibility or build the argv."""
+
+    _JITTER = JitterSpec(
+        offset=Interval("1685s", 1685),
+        cmd=(str(_UV), "run", "--script", str(_CRONY), "_jitter", "r", "n"),
+    )
+
+    def _spec(self, jitter: JitterSpec | None) -> UnitSpec:
+        return UnitSpec(
+            name=EntityName.from_str("default.brew"),
+            cmd=_CMD,
+            timing=Interval.from_str("1h"),
+            priority=PriorityClass.NORMAL,
+            jitter=jitter,
+        )
+
+    def test_companion_rendered_from_jitter_spec(self) -> None:
+        units = get_scheduler("darwin", _DIR).render_units(
+            self._spec(self._JITTER)
+        )
+        assert [u.filename for u in units.units] == [
+            Path("org.crony.default.brew.plist"),
+            Path("org.crony.default.brew.jitter.plist"),
+        ]
+        jp = plistlib.loads(units.units[1].content.encode("utf-8"))
+        assert jp["Label"] == "org.crony.default.brew.jitter"
+        assert jp["RunAtLoad"] is False
+        # StartInterval is the model's offset; ProgramArguments is the
+        # model's opaque argv, /bin/sh-wrapped (AMFI) -- not built here.
+        assert jp["StartInterval"] == 1685
+        assert jp["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+        assert jp["ProgramArguments"][2] == (
+            f"exec {shlex.join(self._JITTER.cmd)}"
+        )
+
+    def test_no_companion_when_jitter_none(self) -> None:
+        units = get_scheduler("darwin", _DIR).render_units(self._spec(None))
+        assert [u.filename for u in units.units] == [
+            Path("org.crony.default.brew.plist")
+        ]
+
+    def test_installed_names_collapses_companion_to_base(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "org.crony.default.brew.plist").write_text("x")
+        (tmp_path / "org.crony.default.brew.jitter.plist").write_text("x")
+        assert get_scheduler("darwin", tmp_path).installed_names() == {
+            "default.brew"
+        }
+
+    def test_installed_names_keeps_orphaned_companion(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "org.crony.default.brew.jitter.plist").write_text("x")
+        assert get_scheduler("darwin", tmp_path).installed_names() == {
+            "default.brew.jitter"
+        }
+
+    def test_activate_bootstraps_service_and_companion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        for fn in (
+            "org.crony.default.brew.plist",
+            "org.crony.default.brew.jitter.plist",
+        ):
+            (tmp_path / fn).write_text("x")
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: Any, **_kw: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+        monkeypatch.setattr(launchd, "_is_loaded", lambda _lbl: False)
+        get_scheduler("darwin", tmp_path).activate(
+            "default.brew", scheduled=True
+        )
+        bootstrapped = {
+            c[3].rsplit("/", 1)[-1]
+            for c in calls
+            if c[:2] == ["launchctl", "bootstrap"]
+        }
+        assert bootstrapped == {
+            "org.crony.default.brew.plist",
+            "org.crony.default.brew.jitter.plist",
+        }
+
+    def test_deactivate_boots_out_both_labels(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        for fn in (
+            "org.crony.default.brew.plist",
+            "org.crony.default.brew.jitter.plist",
+        ):
+            (tmp_path / fn).write_text("x")
+        booted: list[str] = []
+        monkeypatch.setattr(subprocess, "run", _bootout_recorder(booted))
+        get_scheduler("darwin", tmp_path).deactivate("default.brew")
+        uid = os.getuid()
+        assert set(booted) == {
+            f"gui/{uid}/org.crony.default.brew",
+            f"gui/{uid}/org.crony.default.brew.jitter",
+        }
+
+    def test_deactivate_jitter_unloads_only_companion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        booted: list[str] = []
+        monkeypatch.setattr(subprocess, "run", _bootout_recorder(booted))
+        get_scheduler("darwin", tmp_path).deactivate_jitter("default.brew")
+        assert booted == [f"gui/{os.getuid()}/org.crony.default.brew.jitter"]
+
+    def test_prune_boots_out_ineligible_companion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        (tmp_path / "org.crony.default.brew.plist").write_text("x")
+        companion = tmp_path / "org.crony.default.brew.jitter.plist"
+        companion.write_text("x")
+        booted: list[str] = []
+        monkeypatch.setattr(subprocess, "run", _bootout_recorder(booted))
+        get_scheduler("darwin", tmp_path).prune_units(
+            "default.brew", keep={"org.crony.default.brew.plist"}
+        )
+        assert not companion.exists()
+        assert booted == [f"gui/{os.getuid()}/org.crony.default.brew.jitter"]
 
 
 if __name__ == "__main__":

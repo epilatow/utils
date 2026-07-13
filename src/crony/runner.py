@@ -1354,3 +1354,77 @@ def _record_precondition_cancel(
     line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))
+
+
+def do_jitter(ref: str, name: str) -> None:
+    """Platform start-time jitter offset companion. On platforms that
+    don't have a native jitter offset implementation for interval-based
+    services (e.g. launchd), this subcommand can be invoked once via an
+    additional service unit to implement a jitter offset for the primary
+    service by triggering it before its scheduled interval time. Not
+    user-facing.
+
+    `ref` is the service's `<bundle>:<uuid>` (it locates the state dir);
+    `name` addresses the service and companion units through the platform
+    scheduler, so this common layer runs no scheduler-specific commands.
+
+    The service's own `run.lock` decides whether to act, and serializes
+    the trigger and its log line against a concurrent run:
+    - HELD -> a run is already in flight -> nothing to phase, so the
+      companion just unloads itself.
+    - FREE -> no run this epoch -> WHILE HOLDING the lock it triggers the
+      service through the scheduler and appends a line to the service's
+      run.log recording whether the trigger succeeded (so a failing
+      trigger is visible in the log), then releases. On success it unloads
+      itself -- its last act, since on launchd the unload boots out its
+      own label, which is synchronous and kills this process; on a failed
+      trigger it re-raises (so the failure surfaces a non-zero exit the
+      scheduler records) and stays loaded to retry at the next offset.
+    """
+    parsed = crony.unit.EntityRef.from_str(ref)
+    if parsed is None:
+        raise crony.errors.UsageError(
+            f"crony _jitter takes <bundle>:<uuid>, got {ref!r}; this "
+            f"entry point is for the platform jitter companion."
+        )
+    sched = crony.runtime.scheduler()
+    state_dir = crony.model.Job.state_dir_from_ref(parsed)
+    # A companion leaked past its service's removal (state dir gone) has
+    # nothing to phase; unload it rather than crash in acquire_lock's
+    # open() of a lock under a missing directory.
+    if not state_dir.is_dir():
+        sched.deactivate_jitter(name)
+        return
+    try:
+        with crony.runtime.acquire_lock(state_dir / "run.lock"):
+            # Trigger the service while holding the lock, then log the
+            # outcome under the same lock (so the line can't splice into a
+            # concurrent run's output, and so a failing trigger is
+            # recorded). The trigger is async -- it starts the service,
+            # which acquires this lock only after we release it here.
+            try:
+                sched.trigger(name)
+            except crony.errors.SubprocessError:
+                # Record the failure, then re-raise: surface a non-zero
+                # exit and stay loaded to retry next offset (no unload).
+                _append_jitter_log(state_dir, name, succeeded=False)
+                raise
+            _append_jitter_log(state_dir, name, succeeded=True)
+    except crony.errors.LockBusyError:
+        # A run is already in flight; it phases the cadence itself.
+        sched.deactivate_jitter(name)
+        return
+    # Triggered successfully; unload so it does not fire again this epoch.
+    sched.deactivate_jitter(name)
+
+
+def _append_jitter_log(state_dir: Path, name: str, *, succeeded: bool) -> None:
+    """Append the jitter companion's one-line trigger marker to the
+    service's run.log, recording whether the trigger succeeded. Called
+    only while run.lock is held, so it cannot interleave with a concurrent
+    run's output block."""
+    now = crony.runtime.now_iso()
+    outcome = "triggered" if succeeded else "trigger FAILED"
+    line = f"\n=== {now} JITTER {name} {outcome} ===\n"
+    with open(state_dir / crony.model.RUN_LOG_NAME, "ab") as f:
+        f.write(line.encode("utf-8"))

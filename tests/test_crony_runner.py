@@ -39,6 +39,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony import commands as crony_commands  # noqa: E402
 from crony import notify as crony_notify  # noqa: E402
+from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
@@ -52,10 +53,13 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     JobTimeoutError,
     PreconditionError,
+    SubprocessError,
     TriggerStartTimeout,
     UnitNotInstalledError,
+    UsageError,
 )
 from crony.model import (  # noqa: E402
+    RUN_LOG_NAME,
     ExitClass,
     GroupChildResult,
     Job,
@@ -69,6 +73,7 @@ from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
+    EntityRef,
     PriorityClass,
 )
 
@@ -2611,6 +2616,108 @@ class TestDoRunGuard:
             time.sleep(0.1)
         else:
             pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
+
+
+class _FakeScheduler:
+    """Records the scheduler calls do_jitter makes, so the test asserts it
+    goes through the platform layer (trigger / deactivate_jitter) rather
+    than shelling out itself. `trigger_fails` models a failed kickstart."""
+
+    def __init__(self, *, trigger_fails: bool = False) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._trigger_fails = trigger_fails
+
+    def trigger(self, name: str) -> None:
+        self.calls.append(("trigger", name))
+        if self._trigger_fails:
+            raise SubprocessError(1, ["launchctl", "kickstart"])
+
+    def deactivate_jitter(self, name: str) -> None:
+        self.calls.append(("deactivate_jitter", name))
+
+
+class TestDoJitter:
+    """The jitter companion drives the service's run.lock (held -> no-op;
+    free -> trigger the service then log the outcome, both under the lock),
+    self-unloads unless the trigger failed, and reaches the scheduler for
+    every platform action -- no scheduler-specific commands in the
+    runner."""
+
+    _UUID = "12345678-9abc-def0-1234-56789abcdef0"
+    _NAME = "default.brew"
+
+    def _setup(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        *,
+        trigger_fails: bool = False,
+    ) -> tuple[str, Path, _FakeScheduler]:
+        monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
+        ref = f"default:{self._UUID}"
+        state_dir = Job.state_dir_from_ref(EntityRef("default", self._UUID))
+        sched = _FakeScheduler(trigger_fails=trigger_fails)
+        monkeypatch.setattr(crony_runtime, "scheduler", lambda: sched)
+        return ref, state_dir, sched
+
+    def test_free_lock_triggers_and_logs_then_self_unloads(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        ref, sd, sched = self._setup(tmp_path, monkeypatch)
+        sd.mkdir(parents=True)
+        crony_runner.do_jitter(ref, self._NAME)
+        assert sched.calls == [
+            ("trigger", self._NAME),
+            ("deactivate_jitter", self._NAME),
+        ]
+        logged = (sd / RUN_LOG_NAME).read_text(encoding="utf-8")
+        assert self._NAME in logged and "triggered" in logged
+        assert "FAILED" not in logged
+
+    def test_held_lock_is_a_noop_but_self_unloads(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        ref, sd, sched = self._setup(tmp_path, monkeypatch)
+        sd.mkdir(parents=True)
+        import fcntl as _fcntl
+
+        held = open(sd / "run.lock", "w")
+        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        try:
+            crony_runner.do_jitter(ref, self._NAME)
+        finally:
+            _fcntl.flock(held, _fcntl.LOCK_UN)
+            held.close()
+        assert sched.calls == [("deactivate_jitter", self._NAME)]
+        assert not (sd / RUN_LOG_NAME).exists()
+
+    def test_failed_trigger_stays_loaded(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        ref, sd, sched = self._setup(tmp_path, monkeypatch, trigger_fails=True)
+        sd.mkdir(parents=True)
+        # A failed trigger re-raises (surfacing a non-zero exit) and skips
+        # the self-unload so it retries next epoch, recording the failure.
+        with pytest.raises(SubprocessError):
+            crony_runner.do_jitter(ref, self._NAME)
+        assert sched.calls == [("trigger", self._NAME)]
+        logged = (sd / RUN_LOG_NAME).read_text(encoding="utf-8")
+        assert "FAILED" in logged
+
+    def test_missing_state_dir_self_unloads(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        ref, sd, sched = self._setup(tmp_path, monkeypatch)
+        assert not sd.exists()
+        crony_runner.do_jitter(ref, self._NAME)
+        assert sched.calls == [("deactivate_jitter", self._NAME)]
+
+    def test_rejects_malformed_ref(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        with pytest.raises(UsageError):
+            crony_runner.do_jitter("not-a-ref", self._NAME)
 
 
 if __name__ == "__main__":

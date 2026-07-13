@@ -1432,9 +1432,10 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
         StatusCols.UNIT_CONFIG_2,
         "UNIT CONFIG 2",
         "Filesystem path of the platform's second unit -- the systemd "
-        "timer. Empty for a job with no second unit (an unscheduled or "
-        "grouped job, or any job on macOS/darwin, where launchd carries "
-        "everything in one unit).",
+        "timer, or the launchd start-time-jitter companion for a jittered "
+        "interval job. Empty for a job with no second unit (an unscheduled "
+        "or grouped job, or a calendar / short-interval job on "
+        "macOS/darwin).",
         ColVisibility.IF_SECOND_UNIT_PRESENT,
     ),
     StatusColumn(
@@ -2541,8 +2542,9 @@ def do_status(
         # `unit-config-1` / `unit-config-2`: the platform unit paths captured
         # at load time (uuid-keyed RuntimeState), read positionally from
         # the ordered per-unit view. Empty for entries with no runtime, and
-        # unit-config-2 is empty where the backend installs no second unit
-        # (launchd) / for an unscheduled entry.
+        # unit-config-2 is empty for a job with no second unit -- an
+        # unscheduled or grouped entry, or a calendar / short-interval job
+        # on launchd (only a jittered interval job there gets a companion).
         rt = config.runtime.get(row_ref) if row_ref is not None else None
         views = rt.unit_paths if rt is not None else []
         unit_1_cell = str(views[0]) if len(views) > 0 and views[0] else ""

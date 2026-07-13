@@ -253,9 +253,10 @@ Send a synthetic failure notification.
   Filesystem path of the platform config unit. Empty when no config unit
   exists on disk.
 - **`unit-config-2`**\
-  Filesystem path of the platform's second unit -- the systemd timer. Empty
-  for a job with no second unit (an unscheduled or grouped job, or any job on
-  macOS/darwin, where launchd carries everything in one unit).
+  Filesystem path of the platform's second unit -- the systemd timer, or the
+  launchd start-time-jitter companion for a jittered interval job. Empty for a
+  job with no second unit (an unscheduled or grouped job, or a calendar /
+  short-interval job on macOS/darwin).
 - **`unit-name`**\
   Platform unit identifier.
 - **`uuid`**\

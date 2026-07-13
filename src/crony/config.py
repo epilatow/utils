@@ -13,6 +13,7 @@ maps rather than aborting the whole bundle.
 import contextvars
 import enum
 import logging
+import os
 import re
 import uuid
 from collections.abc import Iterable
@@ -1187,6 +1188,29 @@ class TomlConfig:
 # The check lives here (config parse), not in `Interval.from_str`, so it
 # never rejects an already-applied job on snapshot rehydration.
 MIN_INTERVAL_SECONDS = 60
+
+
+def _env_int(key: str, default: int) -> int:
+    """The `CRONY_<KEY>` override as an int, read live on every call
+    (never cached), falling back to `default` when the var is unset or
+    does not parse as an int. Lets a test drive an interval policy floor
+    short without a config edit."""
+    value = os.environ.get(f"CRONY_{key}")
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return default
+
+
+def jitter_floor_seconds() -> int:
+    """The minimum interval, in seconds, at or above which an interval job
+    gets automatic start-time jitter -- 10 minutes by default. Below it the
+    spread window (`N`) is too small to decorrelate a herd usefully. Read
+    live from `CRONY_JITTER_FLOOR_SECONDS` so a test can drive jitter at a
+    short interval; a non-integer override falls back to the default."""
+    return _env_int("JITTER_FLOOR_SECONDS", 600)
 
 
 def _parse_timing(

@@ -48,6 +48,8 @@ from crony.model import (  # noqa: E402
     JobStatus,
     ScheduleValue,
     _JobCommon,
+    is_jittered,
+    jitter_offset_seconds,
     snapshot_from_dict,
 )
 from crony.platform import RenderedUnits  # noqa: E402
@@ -65,7 +67,9 @@ from crony.unit import (  # noqa: E402
     EntityKind,
     EntityName,
     EntityRef,
+    Interval,
     PriorityClass,
+    Schedule,
 )
 
 _script_path = REPO_ROOT / "src" / "crony" / "model.py"
@@ -872,6 +876,66 @@ class TestGroupChildRefs:
         loaded = snapshot_from_dict(d)
         assert isinstance(loaded, JobGroup)
         assert loaded.children == snap.child_refs()
+
+
+class TestIsJittered:
+    """The one jitter-eligibility predicate: an interval at or above the
+    floor. The backends never decide -- they render `UnitSpec.jitter`."""
+
+    def test_interval_at_floor_is_jittered(self) -> None:
+        assert is_jittered(Interval.from_str("10m"))
+        assert is_jittered(Interval.from_str("1h"))
+
+    def test_short_interval_not_jittered(self) -> None:
+        assert not is_jittered(Interval.from_str("5m"))
+        assert not is_jittered(Interval.from_str("1m"))
+
+    def test_calendar_and_none_not_jittered(self) -> None:
+        assert not is_jittered(Schedule.from_str("*-*-* 03:00"))
+        assert not is_jittered(None)
+
+    def test_tracks_the_env_floor(self, monkeypatch: Any) -> None:
+        # The floor is read live from config, so a lowered floor makes a
+        # short interval eligible (the e2e test seam).
+        monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "60")
+        assert is_jittered(Interval.from_str("1m"))
+        assert not is_jittered(Interval.from_str("30s"))
+
+    def test_floor_never_below_two(self, monkeypatch: Any) -> None:
+        # Even a floor driven to 1 keeps N >= 2, so the [1, N) offset range
+        # is non-empty (jitter_offset_seconds' modulus can't hit N-1 == 0).
+        monkeypatch.setenv("CRONY_JITTER_FLOOR_SECONDS", "1")
+        assert not is_jittered(Interval.from_str("1s"))
+        assert is_jittered(Interval.from_str("2s"))
+
+
+class TestJitterOffsetSeconds:
+    _NAME = EntityName("default", "brew")
+
+    @pytest.mark.parametrize("spec", ["10m", "1h", "1d", "1month"])
+    def test_offset_in_open_interval(self, spec: str) -> None:
+        iv = Interval.from_str(spec)
+        r = jitter_offset_seconds(self._NAME, iv, "machine-x")
+        assert 1 <= r < iv.total_seconds
+
+    def test_deterministic(self) -> None:
+        iv = Interval.from_str("1h")
+        assert jitter_offset_seconds(
+            self._NAME, iv, "m1"
+        ) == jitter_offset_seconds(self._NAME, iv, "m1")
+
+    def test_varies_by_machine(self) -> None:
+        # The same job on two hosts draws different offsets.
+        iv = Interval.from_str("1h")
+        assert jitter_offset_seconds(
+            self._NAME, iv, "m1"
+        ) != jitter_offset_seconds(self._NAME, iv, "m2")
+
+    def test_varies_by_name(self) -> None:
+        iv = Interval.from_str("1h")
+        assert jitter_offset_seconds(
+            EntityName("default", "a"), iv, "m1"
+        ) != jitter_offset_seconds(EntityName("default", "b"), iv, "m1")
 
 
 if __name__ == "__main__":
