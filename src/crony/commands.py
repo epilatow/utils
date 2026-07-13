@@ -1339,7 +1339,7 @@ class ColVisibility(StrEnum):
 
     ALWAYS = "always"
     IF_MASKED_PRESENT = "if-masked-present"
-    IF_PLATFORM_HAS_TIMER = "if-platform-has-timer"
+    IF_SECOND_UNIT_PRESENT = "if-second-unit-present"
 
 
 class StatusColumn(NamedTuple):
@@ -1432,9 +1432,10 @@ _STATUS_COLUMNS: tuple[StatusColumn, ...] = (
         StatusCols.UNIT_CONFIG_2,
         "UNIT CONFIG 2",
         "Filesystem path of the platform's second unit -- the systemd "
-        "timer. Empty for an unscheduled / grouped job, and always empty "
-        "on macOS/darwin (launchd has no second unit).",
-        ColVisibility.IF_PLATFORM_HAS_TIMER,
+        "timer. Empty for a job with no second unit (an unscheduled or "
+        "grouped job, or any job on macOS/darwin, where launchd carries "
+        "everything in one unit).",
+        ColVisibility.IF_SECOND_UNIT_PRESENT,
     ),
     StatusColumn(
         StatusCols.LOG_FILE,
@@ -1661,22 +1662,24 @@ _JOB_FLAG_COL_NAMES: frozenset[str] = frozenset(crony.config.JobFlagNames)
 
 
 def _column_in_context(
-    col: str, *, masked_present: bool, platform: str
+    col: str, *, masked_present: bool, second_unit_present: bool
 ) -> bool:
     """Whether a column's `ColVisibility` keeps it in this context. A
     column would only ever be blank here when its condition fails -- a
-    masked-reason column with no masked row shown, or a timer-file column
-    on a platform (darwin) with no timer unit."""
+    masked-reason column with no masked row shown, or the second-unit
+    column when no shown row carries a second unit. The condition is an
+    intrinsic per-column property, so this same pass serves every
+    backend."""
     visibility = _COL_VISIBILITY[col]
     if visibility is ColVisibility.IF_MASKED_PRESENT:
         return masked_present
-    if visibility is ColVisibility.IF_PLATFORM_HAS_TIMER:
-        return platform != "darwin"
+    if visibility is ColVisibility.IF_SECOND_UNIT_PRESENT:
+        return second_unit_present
     return True
 
 
 def _expand_status_alias(
-    name: str, *, masked_present: bool, platform: str
+    name: str, *, masked_present: bool, second_unit_present: bool
 ) -> tuple[str, ...]:
     """Expand a `--cols` alias to its column list for this context.
 
@@ -1686,13 +1689,15 @@ def _expand_status_alias(
     so the same pass serves every alias and a future conditional column
     is trimmed without touching this function. Trimming applies only to
     the alias; a column named explicitly is always honored (`--cols
-    all,unit-config-2` still shows the timer).
+    all,unit-config-2` still shows the second unit).
     """
     return tuple(
         col
         for col in _STATUS_ALIAS_BY_NAME[name].cols
         if _column_in_context(
-            col, masked_present=masked_present, platform=platform
+            col,
+            masked_present=masked_present,
+            second_unit_present=second_unit_present,
         )
     )
 
@@ -1842,7 +1847,10 @@ def parse_cols_arg(value: str) -> list[ColToken]:
 
 
 def _parse_status_cols(
-    raw: list[ColToken] | None, *, masked_present: bool, platform: str
+    raw: list[ColToken] | None,
+    *,
+    masked_present: bool,
+    second_unit_present: bool,
 ) -> list[str]:
     """Expand the parsed `--cols` tokens into an ordered column list.
 
@@ -1864,7 +1872,9 @@ def _parse_status_cols(
         if isinstance(token, StatusAliases):
             expanded.extend(
                 _expand_status_alias(
-                    token, masked_present=masked_present, platform=platform
+                    token,
+                    masked_present=masked_present,
+                    second_unit_present=second_unit_present,
                 )
             )
         else:
@@ -2719,11 +2729,15 @@ def do_status(
         rows = ordered
 
     # Deferred until the displayed rows exist: the `all` alias's
-    # masked-by trim keys on whether any shown row carries a reason,
-    # which only the built rows can answer.
+    # masked-by and unit-config-2 trims key on whether any shown row
+    # carries a masked reason / a second unit, which only the built rows
+    # can answer.
     masked_present = any(row[StatusCols.MASKED_BY] for row in rows)
+    second_unit_present = any(row[StatusCols.UNIT_CONFIG_2] for row in rows)
     selected_cols = _parse_status_cols(
-        cols, masked_present=masked_present, platform=platform
+        cols,
+        masked_present=masked_present,
+        second_unit_present=second_unit_present,
     )
 
     use_color = _color_supported()

@@ -4782,42 +4782,45 @@ class TestStatusReport:
                 )
 
     def test_expand_status_alias_yields_only_columns(self) -> None:
-        # Every alias expansion, under either platform and masked state,
-        # is a subset of the selectable column set -- so an alias can
-        # never select a column the renderer doesn't produce.
+        # Every alias expansion, under either masked / second-unit
+        # context, is a subset of the selectable column set -- so an alias
+        # can never select a column the renderer doesn't produce.
         selectable = set(crony_commands.StatusCols)
         for alias in crony_commands.StatusAliases:
-            for platform in ("linux", "darwin"):
+            for second in (False, True):
                 for masked in (False, True):
                     cols = crony_commands._expand_status_alias(
-                        alias, masked_present=masked, platform=platform
+                        alias,
+                        masked_present=masked,
+                        second_unit_present=second,
                     )
                     assert set(cols) <= selectable
 
     def test_alias_expansion_trims_by_column_visibility(self) -> None:
         # The `all` alias lists every column but drops the conditional
         # ones whose `ColVisibility` fails: `masked-by` only when a masked
-        # row is shown, `unit-config-2` only off darwin. The trim is driven
-        # by the column property, so the expansion tracks each context.
+        # row is shown, `unit-config-2` only when a shown row carries a
+        # second unit. The trim is driven by the column property, so the
+        # expansion tracks each context.
         StatusCols = crony_commands.StatusCols
 
-        def expand(masked: bool, platform: str) -> set[str]:
+        def expand(masked: bool, second: bool) -> set[str]:
             return set(
                 crony_commands._expand_status_alias(
                     crony_commands.StatusAliases.ALL,
                     masked_present=masked,
-                    platform=platform,
+                    second_unit_present=second,
                 )
             )
 
-        assert StatusCols.MASKED_BY in expand(True, "linux")
-        assert StatusCols.MASKED_BY not in expand(False, "linux")
-        assert StatusCols.UNIT_CONFIG_2 in expand(True, "linux")
-        assert StatusCols.UNIT_CONFIG_2 not in expand(True, "darwin")
+        assert StatusCols.MASKED_BY in expand(True, False)
+        assert StatusCols.MASKED_BY not in expand(False, False)
+        assert StatusCols.UNIT_CONFIG_2 in expand(False, True)
+        assert StatusCols.UNIT_CONFIG_2 not in expand(False, False)
         # An unconditional column rides through every context.
         for masked in (False, True):
-            for platform in ("linux", "darwin"):
-                assert StatusCols.CONFIG in expand(masked, platform)
+            for second in (False, True):
+                assert StatusCols.CONFIG in expand(masked, second)
 
     def test_every_column_visibility_value_is_used(self) -> None:
         # Each `ColVisibility` value is exercised by at least one column,

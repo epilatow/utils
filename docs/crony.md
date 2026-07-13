@@ -254,8 +254,8 @@ Send a synthetic failure notification.
   exists on disk.
 - **`unit-config-2`**\
   Filesystem path of the platform's second unit -- the systemd timer. Empty
-  for an unscheduled / grouped job, and always empty on macOS/darwin (launchd
-  has no second unit).
+  for a job with no second unit (an unscheduled or grouped job, or any job on
+  macOS/darwin, where launchd carries everything in one unit).
 - **`unit-name`**\
   Platform unit identifier.
 - **`uuid`**\
