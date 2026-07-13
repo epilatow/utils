@@ -3205,6 +3205,16 @@ class TestStatusReport:
             "JobFlagNames",
         ]
 
+    def test_defaults_is_silent_alias_for_default(self) -> None:
+        # `defaults` resolves identically to `default` but is never
+        # advertised: absent from the parse-error alias listing.
+        assert crony_commands.parse_cols_arg(
+            "defaults"
+        ) == crony_commands.parse_cols_arg("default")
+        with pytest.raises(argparse.ArgumentTypeError) as exc:
+            crony_commands.parse_cols_arg("bogus")
+        assert "defaults" not in str(exc.value)
+
     def test_last_ran_column_shows_relative_time(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:

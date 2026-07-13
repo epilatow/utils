@@ -1661,6 +1661,14 @@ _STATUS_ALIAS_BY_NAME: dict[str, _StatusAlias] = {
 _STATUS_COL_ALIAS_NAMES: tuple[str, ...] = tuple(_StatusAliases)
 _JOB_FLAG_COL_NAMES: frozenset[str] = frozenset(crony.config.JobFlagNames)
 
+# Silent `--cols` spellings accepted but never advertised: `defaults` is
+# easy to reach for in place of the canonical `default`. Kept out of the
+# `--help` Aliases section and the parse-error listing so the documented
+# surface stays a single spelling.
+_SILENT_COL_ALIASES: dict[str, ColToken] = {
+    "defaults": _StatusAliases.DEFAULT,
+}
+
 
 def _column_in_context(
     col: str, *, masked_present: bool, second_unit_present: bool
@@ -1818,6 +1826,8 @@ STATUS_HELP_EPILOG: str = (
 
 def _classify_col_token(name: str) -> ColToken:
     """Map a validated `--cols` name to its column / alias / flag enum."""
+    if name in _SILENT_COL_ALIASES:
+        return _SILENT_COL_ALIASES[name]
     if name in _STATUS_COL_ALIAS_NAMES:
         return _StatusAliases(name)
     if name in _JOB_FLAG_COL_NAMES:
@@ -1829,14 +1839,19 @@ def parse_cols_arg(value: str) -> list[ColToken]:
     """argparse `type=` for `status --cols`: parse into an ordered list.
 
     Splits the comma-separated spec (whitespace around names ignored)
-    and rejects any name that is neither a column, a per-flag column,
-    nor an alias, so a typo is loud at parse time rather than a silent
-    missing column. Returns each name as its `_StatusCols` / `_StatusAliases`
-    / `JobFlagNames` enum member; `_parse_status_cols` expands the aliases
+    and rejects any name that is not a column, a per-flag column, or an
+    alias (canonical or a silent `_SILENT_COL_ALIASES` spelling), so a
+    typo is loud at parse time rather than a silent missing column.
+    Returns each name as its `_StatusCols` / `_StatusAliases` /
+    `JobFlagNames` enum member; `_parse_status_cols` expands the aliases
     among them once the displayed rows and platform are known.
     """
     raw = [c.strip() for c in value.split(",") if c.strip()]
-    valid = set(_STATUS_COL_HEADERS) | set(_STATUS_COL_ALIAS_NAMES)
+    valid = (
+        set(_STATUS_COL_HEADERS)
+        | set(_STATUS_COL_ALIAS_NAMES)
+        | set(_SILENT_COL_ALIASES)
+    )
     unknown = [c for c in raw if c not in valid]
     if unknown:
         raise argparse.ArgumentTypeError(
