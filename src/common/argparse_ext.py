@@ -13,7 +13,7 @@ import argparse
 import difflib
 import functools
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 ValidateCallback = Callable[[argparse.ArgumentParser, argparse.Namespace], None]
@@ -175,6 +175,14 @@ class StrictSubParsersAction(SubParsersActionBase):
     # take part in ``parse_command`` dispatch.
     _child_command_level: int = 1
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Hidden-alias name -> its canonical subcommand name. A hidden
+        # alias is a valid, dispatchable choice (registered in
+        # ``_name_parser_map``) that never appears in ``--help`` or the
+        # unrecognized-command listing.
+        self._hidden_alias_canonical: dict[str, str] = {}
+
     def __call__(
         self,
         _parser: argparse.ArgumentParser,
@@ -184,8 +192,11 @@ class StrictSubParsersAction(SubParsersActionBase):
     ) -> None:
         parser_name = values[0]
         arg_strings = values[1:]
+        # Record the canonical name, not the alias the user typed, so
+        # dispatch keys on one spelling regardless of which alias led here.
+        canonical = self._hidden_alias_canonical.get(parser_name, parser_name)
         if self.dest is not argparse.SUPPRESS:
-            setattr(namespace, self.dest, parser_name)
+            setattr(namespace, self.dest, canonical)
         try:
             subparser = self._name_parser_map[parser_name]
         except KeyError as exc:
@@ -198,7 +209,13 @@ class StrictSubParsersAction(SubParsersActionBase):
         for key, value in vars(subnamespace).items():
             setattr(namespace, key, value)
 
-    def add_parser(self, name: str, **kwargs: Any) -> StrictArgumentParser:
+    def add_parser(
+        self,
+        name: str,
+        *,
+        hidden_aliases: Iterable[str] = (),
+        **kwargs: Any,
+    ) -> StrictArgumentParser:
         # Subcommand help shows option defaults by default (callers that
         # need a raw-description epilog pass that formatter explicitly).
         kwargs.setdefault("formatter_class", DefaultsHelpFormatter)
@@ -210,6 +227,17 @@ class StrictSubParsersAction(SubParsersActionBase):
             "StrictArgumentParser", super().add_parser(name, **kwargs)
         )
         parser._command_level = self._child_command_level
+        # A hidden alias resolves to the same parser but is left out of
+        # ``_choices_actions``, so it is a working, dispatchable spelling
+        # that stays absent from ``--help`` and the unrecognized-command
+        # listing. `__call__` canonicalizes it back to `name`. Staying out
+        # of the usage line too needs the group to carry a ``metavar`` --
+        # otherwise argparse builds the ``{a,b,...}`` choice string from
+        # ``_name_parser_map``, which includes aliases (the ``--help``
+        # width gate already requires that metavar on every command group).
+        for alias in hidden_aliases:
+            self._name_parser_map[alias] = parser
+            self._hidden_alias_canonical[alias] = name
         return parser
 
 

@@ -220,6 +220,46 @@ class TestRunLegacyAlias:
         )
 
 
+class TestLogsAlias:
+    """`log` is a silent alias for `logs`: accepted and dispatched, but
+    hidden from `--help` and from the unrecognized-command listing."""
+
+    def test_log_dispatches_to_do_logs(self) -> None:
+        mock_cb = MagicMock()
+        with (
+            patch.dict(crony_cli._COMMAND_CALLBACKS, {"logs": mock_cb}),
+            patch("sys.argv", ["prog", "log", "myjob"]),
+        ):
+            result = crony_cli.cli()
+        assert result == 0
+        mock_cb.assert_called_once()
+        assert mock_cb.call_args.kwargs["job"] == "myjob"
+
+    def test_unknown_command_hides_alias_and_privates(
+        self, capsys: Any
+    ) -> None:
+        with (
+            patch("sys.argv", ["prog", "zzzzz"]),
+            pytest.raises(SystemExit),
+        ):
+            crony_cli.cli()
+        line = next(
+            ln
+            for ln in capsys.readouterr().err.splitlines()
+            if ln.startswith("available commands:")
+        )
+        listed = line.split(":", 1)[1].strip().split(", ")
+        assert "logs" in listed
+        for hidden in (
+            "log",
+            crony_model.RUN_SUBCOMMAND,
+            crony_model.RUN_SUBCOMMAND_LEGACY,
+            crony_model.GUARD_SUBCOMMAND,
+            crony_model.JITTER_SUBCOMMAND,
+        ):
+            assert hidden not in listed
+
+
 class TestConfigSubcommandDispatch:
     """The `config` parent routes its nested actions through the
     "<command> <action>" key in _COMMAND_CALLBACKS. These tests pin

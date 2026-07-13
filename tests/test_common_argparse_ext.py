@@ -201,6 +201,41 @@ class TestCommandSubparsers:
             p.parse_command(["zzzzz"])
         assert "did you mean" not in capsys.readouterr().err
 
+    @staticmethod
+    def _with_alias() -> StrictArgumentParser:
+        # `logs` (alias `log`) plus a second command so the available
+        # listing has more than one entry to check against.
+        p = StrictArgumentParser(prog="tool")
+        sub = p.add_command_subparsers(metavar="<command>")
+        sub.add_parser("logs", help="Show logs.", hidden_aliases=["log"])
+        sub.add_parser("status", help="Show status.")
+        return p
+
+    def test_hidden_alias_dispatches_to_canonical(self) -> None:
+        p = self._with_alias()
+        assert p.parse_command(["log"]).command == "logs"
+        assert p.parse_command(["logs"]).command == "logs"
+
+    def test_hidden_alias_absent_from_available_listing(
+        self, capsys: Any
+    ) -> None:
+        p = self._with_alias()
+        with pytest.raises(SystemExit):
+            p.parse_command(["bogus"])
+        line = next(
+            ln
+            for ln in capsys.readouterr().err.splitlines()
+            if ln.startswith("available commands:")
+        )
+        listed = line.split(":", 1)[1].strip().split(", ")
+        assert listed == ["logs", "status"]
+
+    def test_hidden_alias_absent_from_help(self) -> None:
+        p = self._with_alias()
+        # The alias has no help pseudo-action, so its help text renders
+        # once (for `logs`), never a second line for `log`.
+        assert p.format_help().count("Show logs.") == 1
+
 
 class TestValidateHook:
     @staticmethod

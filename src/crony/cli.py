@@ -572,9 +572,12 @@ def _build_parser() -> StrictArgumentParser:
     )
 
     # logs
+    # `log` is a silent alias for `logs` (the singular reads natural for a
+    # single job); hidden from help, resolved to `logs` for dispatch.
     p_logs = subparsers.add_parser(
         "logs",
         help="Print a job's recent log output.",
+        hidden_aliases=["log"],
     )
     p_logs.add_argument(
         "job",

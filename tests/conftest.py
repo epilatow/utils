@@ -199,7 +199,13 @@ class CmdCallbacksBase:
         for action in parser._actions:
             if not isinstance(action, argparse._SubParsersAction):
                 continue
+            # A hidden alias shares its canonical command's subparser and
+            # dispatches under the canonical name, so it carries no callback
+            # of its own -- skip it here.
+            aliases = getattr(action, "_hidden_alias_canonical", {})
             for cmd, sub in action.choices.items():
+                if cmd in aliases:
+                    continue
                 label = f"{prefix} {cmd}".strip()
                 nested = list(CmdCallbacksBase._leaf_subparsers(sub, label))
                 if nested:
