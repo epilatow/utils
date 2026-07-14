@@ -757,6 +757,26 @@ class TestDialogPopupNotify:
         assert "logline199" in script  # tail kept
         assert "logline0\n" not in script  # head dropped
 
+    def test_dispatch_strips_ansi_from_body(self, monkeypatch: Any) -> None:
+        # ANSI color codes and control chars from a terminal log must be
+        # stripped before the log reaches any transport body (sanitized
+        # once at dispatch); the dialog transport captures the result.
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(
+            crony_commands.subprocess,
+            "Popen",
+            lambda cmd, **_k: captured.setdefault("cmd", cmd),
+        )
+        log = "\x1b[31mFAIL\x1b[0m test_thing\x07\n"
+        result = self._make_failed_result(["dialog-popup"])
+        crony_notify.dispatch_notify(result, "default.j", log, Defaults())
+        script = captured["cmd"][2]
+        assert "\x1b" not in script and "\x07" not in script
+        assert "FAIL test_thing" in script
+
     def test_dispatch_records_failure_off_darwin(
         self, monkeypatch: Any
     ) -> None:
@@ -1172,10 +1192,11 @@ class TestNotifyTestSubcommand:
 
 class TestLogHelpers:
     """Direct unit tests for `extract_latest_log_entry`, the
-    `_head_truncate_to_kb` / `_head_truncate_to_lines` caps, and the
-    `_format_log_for_dialog` combiner. Exercised end-to-end via TestLogs,
-    TestNtfyNotify, and TestDialogPopupNotify; this class isolates the
-    boundary conditions so a regression in a helper surfaces here first.
+    `_head_truncate_to_kb` / `_head_truncate_to_lines` caps, the
+    `_format_log_for_dialog` combiner, and `_strip_ansi`. Exercised
+    end-to-end via TestLogs, TestNtfyNotify, and TestDialogPopupNotify;
+    this class isolates the boundary conditions so a regression in a
+    helper surfaces here first.
     """
 
     def test_extract_returns_from_last_header(self) -> None:
@@ -1248,6 +1269,27 @@ class TestLogHelpers:
         wide = "=== run j pid=1 ===\n" + "x" * 10000 + "\n"
         out = crony_notify._format_log_for_dialog(wide, 20, 2)
         assert len(out.encode("utf-8")) <= 2 * 1024
+
+    def test_strip_ansi_removes_color_and_controls(self) -> None:
+        text = "\x1b[31mFAIL\x1b[0m t\n\x1b[1;32mok\x1b[0m\ty\r\ndone\x07\n"
+        out = crony_notify._strip_ansi(text)
+        assert out == "FAIL t\nok\ty\ndone\n"
+        assert "\x1b" not in out and "\x07" not in out and "\r" not in out
+
+    def test_strip_ansi_keeps_plain_text(self) -> None:
+        text = "plain log\n\twith tab\nand newline\n"
+        assert crony_notify._strip_ansi(text) == text
+
+    def test_strip_ansi_removes_osc_and_c1(self) -> None:
+        # OSC window-title (ESC ] ... BEL) is stripped whole, not just its
+        # introducer; a C1 control (U+009B, single-char CSI) also goes.
+        assert crony_notify._strip_ansi("\x1b]0;title\x07rest") == "rest"
+        assert crony_notify._strip_ansi("\x9bFAIL") == "FAIL"
+
+    def test_strip_ansi_preserves_multibyte(self) -> None:
+        # Legitimate printable UTF-8 (accents, emoji) must survive.
+        text = "caf\xe9 \U0001f600 done\n"
+        assert crony_notify._strip_ansi(text) == text
 
 
 if __name__ == "__main__":

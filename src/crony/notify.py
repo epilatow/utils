@@ -174,6 +174,31 @@ def _head_truncate_to_lines(text: str, max_lines: int) -> tuple[str, bool]:
     return marker + "".join(kept), True
 
 
+# ANSI escape sequences (color, cursor moves, window-title OSC) and other
+# non-printable control characters carry no meaning outside a terminal: in
+# a notification body -- an osascript dialog, an email, an ntfy message --
+# they render as garbage (and a stray control char can even confuse the
+# renderer). The escape matcher takes OSC first (`ESC ] ... BEL/ST`, whole
+# payload) so its `]` introducer is not half-consumed by the trailing
+# single-char Fe alternative, then CSI, then any other Fe escape. The
+# control matcher drops C0 and C1 controls plus DEL, keeping only tab and
+# newline (the whitespace controls that structure the text).
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] ... BEL or ST
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"  # CSI: ESC [ ... final
+    r"|\x1b[@-Z\\-_]"  # other two-char Fe escapes
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences and non-printable control characters
+    from `text`, keeping tab and newline, so a colorized / progress-bar
+    log reads as plain text in a notification instead of control-code
+    noise. Applied once at dispatch, so every transport shares it."""
+    return _CONTROL_CHARS_RE.sub("", _ANSI_ESCAPE_RE.sub("", text))
+
+
 def _build_email_message(
     result: crony.model.JobRunResult,
     full_name: str,
@@ -510,6 +535,11 @@ def dispatch_notify(
     transport's sender. Per-channel exceptions are recorded so one
     failure doesn't suppress the others.
     """
+    # Sanitize once here so every transport body -- dialog, email, ntfy
+    # -- shows plain text rather than a terminal's ANSI / control codes.
+    # `crony logs` keeps the raw log (terminal colors intact); only the
+    # notification path is cleaned.
+    log_text = _strip_ansi(log_text)
     for channel_name in list(result.notifications.keys()):
         try:
             channel = defaults.notify_channel_defs.get(channel_name)
