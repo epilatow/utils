@@ -325,12 +325,15 @@ It can be run manually via the \(gatrigger\(ga subcommand, and re\-enabled via t
 .TP
 \f[I]ok\f[R]
 The job\(aqs last run completed successfully.\&
+For a job group: the group got every child it was asked to run running (a disabled child is skipped, not run) \-\- whatever those children then did is reported on their own rows, and a failing child does not fail its group.\&
 .TP
 \f[I]fail\f[R]
 The job\(aqs last run failed (exited with a non\-zero status).\&
+For a job group: the group could not fire one of its children \-\- that child\(aqs unit or snapshot is missing on this host, or the scheduler refused to fire it.\&
 .TP
 \f[I]timeout\f[R]
 The job was killed after exceeding its wallclock execution timeout.\&
+For a job group: the group ran out of time on a child before it ever saw it running \-\- its cumulative budget was spent, or the scheduler never started the child.\&
 .TP
 \f[I]gated\f[R]
 The job was skipped due to an execution gate.\&

@@ -12,6 +12,7 @@ plugin; it carries no test classes and is never run as a test.
 """
 
 import json
+import math
 import re
 import subprocess
 import sys
@@ -645,8 +646,8 @@ def _stub_trigger_sync(
 
     `results` maps full child names -> the dict each call should
     return (mimicking last-run.json). The stub records each call's
-    args (job_timeout, trigger_timeout) on a ledger we can assert
-    against.
+    args (job_timeout, trigger_timeout, wait_budget) on a ledger we can
+    assert against.
     """
     ledger: list[dict[str, Any]] = []
 
@@ -656,6 +657,7 @@ def _stub_trigger_sync(
         state_dir: Path,
         job_timeout: float,
         trigger_timeout: float,
+        wait_budget: float = math.inf,
     ) -> dict[str, Any]:
         ledger.append(
             {
@@ -663,6 +665,7 @@ def _stub_trigger_sync(
                 "state_dir": state_dir,
                 "job_timeout": job_timeout,
                 "trigger_timeout": trigger_timeout,
+                "wait_budget": wait_budget,
             }
         )
         return results.get(full_name, {"exit_code": 0, "exit_class": "ok"})

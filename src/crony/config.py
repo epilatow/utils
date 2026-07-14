@@ -2536,9 +2536,10 @@ def _mask_reason(
     return ",".join(parts)
 
 
-# Padding factor applied to a group's effective timeout. The 5%
-# slack lets a leaf job hit its own timeout (and propagate the
-# error up through last-run.json) before the parent group's own
-# cumulative deadline fires. Compounds with nesting depth, by
-# design.
+# Padding factor applied to a group's effective timeout. The 5% slack
+# keeps the group's cumulative deadline from being the binding cap in a
+# normal run: a leaf that overruns hits its OWN timeout first, so its
+# runner records the timeout on the leaf's row, and the group still has
+# budget left to fire the siblings behind it. Compounds with nesting
+# depth, by design.
 _GROUP_TIMEOUT_PADDING: float = 1.05

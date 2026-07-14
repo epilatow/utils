@@ -7,6 +7,7 @@
 
 """Unit tests for crony.runner."""
 
+import datetime
 import json
 import math
 import os
@@ -53,6 +54,7 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     JobTimeoutError,
     PreconditionError,
+    RunnerCrashed,
     SubprocessError,
     TriggerStartTimeout,
     UnitNotInstalledError,
@@ -61,7 +63,6 @@ from crony.errors import (  # noqa: E402
 from crony.model import (  # noqa: E402
     RUN_LOG_NAME,
     ExitClass,
-    GroupChildResult,
     Job,
     _resolve_script,
 )
@@ -914,12 +915,186 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_code"] == 3
         assert rec["jobs_run"][1]["name"] == h.full("good")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
-        # Group-level rollup: any child failure -> "fail" at the
-        # group level (so status reflects the failure
-        # without re-deriving the rollup on every read).
+        # The group ran both children, so the group itself succeeded.
+        # The failing child owns its failure and reports it on its own
+        # row; it must not drag the group's STATUS down with it.
+        assert rec["exit_class"] == "ok"
+
+    def test_child_timeout_does_not_fail_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child that ran and overran its OWN pinned cap owns that
+        # timeout. The group started it, so the group did its job: its
+        # STATUS stays "ok" while the child reports timeout on its row.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"slow": {"command": "sleep 9", "job_timeout_sec": 5}},
+                "job-group": {"g": {"jobs": ["slow"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "slow")
+
+        def _overran(*_a: object, **_k: object) -> dict[str, Any]:
+            raise JobTimeoutError("child overran its own cap")
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _overran)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "timeout"
+        assert rec["exit_class"] == "ok"
+
+    def test_subgroup_fault_does_not_fail_parent_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Nested groups compose by the same rule. A subgroup that itself
+        # failed to run a child reports its own fault -- but from the
+        # PARENT's view the subgroup is just a child that ran and
+        # returned a bad outcome, which is the subgroup's problem and
+        # shows on the subgroup's row. The parent ran it, so it is ok.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "leaf": {"jobs": ["a"]},
+                    "root": {"jobs": ["leaf"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "leaf")
+        # The subgroup completed, reporting a fault of its own.
+        _stub_trigger_sync(
+            monkeypatch,
+            {h.full("leaf"): {"exit_class": "fail", "exit_code": 1}},
+        )
+        assert crony_runner._run_group(h.snap(cfg, "root")) == 0
+        rec = h.last_run("root")
+        assert rec["jobs_run"][0]["name"] == h.full("leaf")
+        assert rec["jobs_run"][0]["exit_class"] == "fail"
+        assert rec["exit_class"] == "ok"
+
+    def test_crashed_child_does_not_fail_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A child killed before it could record a result (OOM, SIGKILL,
+        # unit unloaded mid-run) surfaces as RunnerCrashed. The group
+        # DID run it -- the crash is the child's outcome, reported on the
+        # child's own row as `crashed` by pid reconciliation -- so the
+        # group must not double-report it as a failure of its own.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+
+        def _crashed(*_a: object, **_k: object) -> dict[str, Any]:
+            raise RunnerCrashed("runner exited without recording")
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _crashed)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "fail"
+        assert rec["jobs_run"][0]["exit_code"] == int(RunnerCrashed.exit_code)
+        assert rec["exit_class"] == "ok"
+
+    def test_group_fails_missing_unit_for_interactive_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The async (interactive) dispatch path has its own missing-unit
+        # arm: the group still could not run the child, so it is a fault
+        # of the group exactly as on the sync path.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"iv": {"command": "true", "flags": ["interactive"]}},
+                "job-group": {"g": {"jobs": ["iv"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "iv")
+
+        def _not_installed(*_a: object, **_k: object) -> None:
+            raise UnitNotInstalledError("unit not installed")
+
+        monkeypatch.setattr(crony_runner, "trigger_unit", _not_installed)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "fail"
         assert rec["exit_class"] == "fail"
 
-    def test_group_rollup_is_ok_when_all_children_ok(
+    def test_child_that_never_started_fails_group(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The platform never produced a runner, so the child never ran
+        # at all. The group failed to run it -- that IS the group's own
+        # fault, and exactly the infrastructure breakage (broken unit,
+        # stalled queue) a group's STATUS should surface.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+
+        def _never_started(*_a: object, **_k: object) -> dict[str, Any]:
+            raise TriggerStartTimeout("platform never produced a runner")
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _never_started)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "timeout"
+        assert rec["exit_class"] == "timeout"
+
+    def test_scheduler_rejecting_a_fire_fails_the_group_not_the_run(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The scheduler can reject the fire outright (an unbootstrapped
+        # plist, a systemctl that errors). That child did not run, so the
+        # group failed to run it -- but the group must still record the
+        # run and go on to fire its remaining children. Letting the error
+        # escape would take the group's whole record with it, along with
+        # every child after this one.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {"command": "true"},
+                    "b": {"command": "true"},
+                },
+                "job-group": {"g": {"jobs": ["a", "b"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
+
+        def _reject_a(full_name: str, **_k: object) -> dict[str, Any]:
+            if full_name == h.full("a"):
+                raise SubprocessError(1, ["launchctl", "kickstart"])
+            return {"exit_class": "ok", "exit_code": 0}
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _reject_a)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        # `b` still ran, and the group wears `a`'s failed dispatch.
+        assert rec["jobs_run"][0]["name"] == h.full("a")
+        assert rec["jobs_run"][0]["exit_class"] == "fail"
+        assert rec["jobs_run"][1]["name"] == h.full("b")
+        assert rec["jobs_run"][1]["exit_class"] == "ok"
+        assert rec["exit_class"] == "fail"
+
+    def test_group_ok_when_all_children_ok(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -952,8 +1127,9 @@ class TestRunGroup:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A child whose snapshot is operator-disabled is not dispatched;
-        # it records `gated` (which rolls up `ok`) and the group fires
-        # only the enabled children.
+        # it records `gated` and the group fires only the enabled
+        # children. Not running a child it was told not to run is the
+        # group doing as it was told, so the group stays `ok`.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -1048,6 +1224,44 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_class"] == "ok"
         assert rec["jobs_run"][1]["name"] == h.full("b")
         assert rec["jobs_run"][1]["exit_class"] == "timeout"
+        # The group blew its own budget, so `b` never ran: that is the
+        # group's own fault and it reports timeout.
+        assert rec["exit_class"] == "timeout"
+
+    def test_budget_giving_up_on_the_last_child_keeps_group_ok(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The mirror of the test above. There the budget starved a child
+        # of its turn, which is the group's fault. Here it runs out while
+        # the group waits on the LAST child: the child was dispatched and
+        # goes on running under its own unit, and no child was starved --
+        # so the group did run all of them and stays `ok`, even though the
+        # wait it gave that child was cut short. The child's own row
+        # reports whatever it ends up doing.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 5,
+                    }
+                },
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+
+        def _cut_short(*_a: object, **_k: object) -> dict[str, Any]:
+            raise JobTimeoutError("wait cut short by the group's budget")
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _cut_short)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["jobs_run"][0]["exit_class"] == "timeout"
+        assert rec["exit_class"] == "ok"
 
     def test_group_uncapped_child_dispatched_with_no_cap(
         self, tmp_path: Path, monkeypatch: Any
@@ -1123,9 +1337,9 @@ class TestRunGroup:
         h.write_snap(cfg, "missing")
         h.write_snap(cfg, "ok")
         rc = crony_runner._run_group(h.snap(cfg, "g"))
-        # Group orchestration succeeds (rc 0); the child failure
-        # surfaces in the rolled-up exit_class and per-child
-        # records so the runner's notification path fires.
+        # The group run itself completes (rc 0): a child it could not
+        # fire is recorded and its siblings still run, rather than the
+        # error taking down the whole group.
         assert rc == 0
         rec = h.last_run("g")
         missing_rec = rec["jobs_run"][0]
@@ -1135,7 +1349,9 @@ class TestRunGroup:
         # Sibling still ran.
         assert rec["jobs_run"][1]["name"] == h.full("ok")
         assert rec["jobs_run"][1]["exit_class"] == "ok"
-        # Group rollup: a fail child surfaces at the group level.
+        # The group could not RUN this child (its unit is not
+        # installed here), which is the group's own fault -- unlike a
+        # child that ran and failed, which would leave the group ok.
         assert rec["exit_class"] == "fail"
 
     def test_group_fails_child_with_no_snapshot_on_host(
@@ -1145,9 +1361,9 @@ class TestRunGroup:
         # unresolvable on this host: rename mid-flight, a partial
         # state wipe, or a stale snapshot referencing an uuid that
         # was never applied here. The runner records a synthetic
-        # `<bundle>:<uuid>` fail row so the rollup catches it
-        # and the dispatch loop continues for siblings whose
-        # snapshot does resolve.
+        # `<bundle>:<uuid>` fail row, counts it as a fault of the
+        # group (which could not run that child), and continues the
+        # dispatch loop for siblings whose snapshot does resolve.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -1241,9 +1457,10 @@ class TestRunGroupInteractive:
         assert async_calls == [h.full("iv")]
         assert sync_calls == [h.full("regular")]
 
-        # The group's last-run.json records the dispatch as a
-        # child with exit_class="dispatched"; rollup stays "ok"
-        # because dispatched has precedence 0.
+        # The group's last-run.json records the dispatch as a child with
+        # exit_class="dispatched". The group handed the child off, so
+        # that is not a fault of the group and its STATUS stays "ok" --
+        # it makes no claim about whether the user ever clicked Run Job.
         rec = h.last_run("g")
         iv_rec = next(c for c in rec["jobs_run"] if c["name"] == h.full("iv"))
         assert iv_rec["exit_class"] == "dispatched"
@@ -1362,34 +1579,41 @@ class TestRunGroupInteractive:
         assert cfg.resolved_group_timeout_sec(target, "leaf") == 0
         assert cfg.resolved_group_timeout_sec(target, "root") == 0
 
-    def test_dispatched_does_not_poison_rollup(self) -> None:
-        # `dispatched` has precedence 0 so it ties with ok / gated
-        # in the rollup; a group with only dispatched children
-        # rolls up as "ok".
-        rollup = crony_runner._rollup_group_exit_class(
-            [
-                GroupChildResult(
-                    name="a", exit_class=ExitClass.DISPATCHED, exit_code=0
-                ),
-                GroupChildResult(
-                    name="b", exit_class=ExitClass.OK, exit_code=0
-                ),
-            ]
+    def test_dispatched_alongside_failing_child_keeps_group_ok(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Neither an async-dispatched interactive child nor a child that
+        # ran and failed is a fault of the group: it handed off / ran
+        # both, so its own STATUS stays "ok" while the failing child
+        # reports its failure on its own row.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {"command": "true", "flags": ["interactive"]},
+                    "bad": {"command": "exit 3"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["iv", "bad"], "schedule": "daily"}
+                },
+            },
+            default_target_jobs=["g"],
         )
-        assert rollup == "ok"
-
-    def test_dispatched_rolls_up_under_fail(self) -> None:
-        rollup = crony_runner._rollup_group_exit_class(
-            [
-                GroupChildResult(
-                    name="a", exit_class=ExitClass.DISPATCHED, exit_code=0
-                ),
-                GroupChildResult(
-                    name="b", exit_class=ExitClass.FAIL, exit_code=1
-                ),
-            ]
+        h.write_snap(cfg, "iv")
+        h.write_snap(cfg, "bad")
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_k: None
         )
-        assert rollup == "fail"
+        _stub_trigger_sync(
+            monkeypatch,
+            {h.full("bad"): {"exit_code": 3, "exit_class": "fail"}},
+        )
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        classes = {c["name"]: c["exit_class"] for c in rec["jobs_run"]}
+        assert classes[h.full("iv")] == "dispatched"
+        assert classes[h.full("bad")] == "fail"
+        assert rec["exit_class"] == "ok"
 
 
 class TestTriggerUnitNotInstalled:
@@ -1948,107 +2172,97 @@ class TestFullDiskAccess:
         assert prompted == [], "user was prompted before the FDA cancel"
 
 
-class TestGroupExitClassRollup:
-    """Direct unit tests for `_rollup_group_exit_class`. The
-    STATUS column reads this rolled-up value from the group's
-    last-run.json instead of re-deriving it; coverage
-    here keeps the precedence ladder honest as new exit_class
-    values get introduced.
+class TestGroupExitClass:
+    """Direct unit tests for `_group_exit_class`. A group's STATUS is
+    its OWN outcome -- whether it ran every child -- not a rollup of
+    what the children did. The runner hands this only the faults the
+    group itself hit; a child that ran and failed never appears here.
     """
 
-    def _children(self, *classes: str) -> list[Any]:
-        return [
-            GroupChildResult(
-                name=f"default.c{i}",
-                exit_class=ExitClass(cls),
-                exit_code=0,
-            )
-            for i, cls in enumerate(classes)
-        ]
+    def test_no_faults_is_ok(self) -> None:
+        # The group ran every child. Whatever the children did with
+        # their turn is their business, so the group succeeded.
+        assert crony_runner._group_exit_class([]) == "ok"
 
-    def test_empty_rolls_up_to_ok(self) -> None:
-        assert crony_runner._rollup_group_exit_class([]) == "ok"
+    def test_single_fail_fault(self) -> None:
+        # A child the group could not run at all (unit or snapshot
+        # missing on this host).
+        assert crony_runner._group_exit_class([ExitClass.FAIL]) == "fail"
 
-    def test_all_ok_rolls_up_to_ok(self) -> None:
-        assert (
-            crony_runner._rollup_group_exit_class(self._children("ok", "ok"))
-            == "ok"
-        )
-
-    def test_gated_treated_as_success(self) -> None:
-        # Gating is per-child intent ("don't run today"), not a
-        # group-level outcome.
-        assert (
-            crony_runner._rollup_group_exit_class(self._children("ok", "gated"))
-            == "ok"
-        )
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("gated", "gated")
-            )
-            == "ok"
-        )
-
-    def test_any_fail_rolls_up_to_fail(self) -> None:
-        assert (
-            crony_runner._rollup_group_exit_class(self._children("ok", "fail"))
-            == "fail"
-        )
-
-    def test_signal_at_fail_grade(self) -> None:
-        # A signaled child surfaces its own exit_class so a
-        # downstream reader can distinguish abort signals from
-        # plain non-zero exits if it cares.
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("ok", "signal")
-            )
-            == "signal"
-        )
+    def test_single_timeout_fault(self) -> None:
+        # The group blew its own budget, or the platform never started
+        # a child, so that child never ran.
+        assert crony_runner._group_exit_class([ExitClass.TIMEOUT]) == "timeout"
 
     def test_timeout_outranks_fail(self) -> None:
-        # Group with both a fail and a timeout: timeout wins so
-        # the STATUS column surfaces the more severe condition.
+        # Both kinds of group fault in one run: the more severe one
+        # surfaces, regardless of the order they were hit in.
         assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("fail", "timeout", "ok")
-            )
+            crony_runner._group_exit_class([ExitClass.FAIL, ExitClass.TIMEOUT])
+            == "timeout"
+        )
+        assert (
+            crony_runner._group_exit_class([ExitClass.TIMEOUT, ExitClass.FAIL])
             == "timeout"
         )
 
-    def test_gated_does_not_mask_fail(self) -> None:
-        # gated ties with ok at the bottom; a fail child must
-        # still surface, not be masked by sibling gating.
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("gated", "fail")
-            )
-            == "fail"
-        )
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("fail", "gated")
-            )
-            == "fail"
+
+class TestTriggerExitCode:
+    """`crony trigger --wait` maps the record it waited for to its own
+    exit code. A group records no process exit -- its outcome lives
+    entirely in `exit_class` -- so the exit-class fallbacks carry it.
+    """
+
+    def test_group_ok_exits_zero(self) -> None:
+        # A group that ran every child, some of which failed. The
+        # children's own triggers surface their failures; the group's
+        # does not.
+        assert crony_runner.trigger_exit_code({"exit_class": "ok"}) == 0
+
+    def test_group_fail_exits_nonzero(self) -> None:
+        # The group could not run a child. There is no `exit_code` to
+        # fall back on, so the class alone has to carry it -- otherwise
+        # `crony trigger --wait <group>` would report success for a group
+        # that never dispatched.
+        assert crony_runner.trigger_exit_code({"exit_class": "fail"}) == int(
+            ExitCode.ERROR
         )
 
-    def test_signal_and_fail_are_equally_severe(self) -> None:
-        # signal and fail share severity 1; the first child of
-        # that tier wins, so the readout reflects the
-        # encountered-order outcome rather than swapping based on
-        # iteration. This pins the tie-break for either case.
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("signal", "fail")
-            )
-            == "signal"
+    def test_group_timeout_exits_timeout(self) -> None:
+        # The group blew its cumulative budget with children left to run.
+        assert crony_runner.trigger_exit_code({"exit_class": "timeout"}) == int(
+            ExitCode.TIMEOUT
         )
-        assert (
-            crony_runner._rollup_group_exit_class(
-                self._children("fail", "signal")
-            )
-            == "fail"
+
+    def test_signal_kill_exits_128_plus_signal(self) -> None:
+        # A job killed by a signal records no exit_code of its own; the
+        # code is derived as the shell's 128 + signal-number convention.
+        rec = {"exit_class": "signal", "signal": 9}
+        assert crony_runner.trigger_exit_code(rec) == 128 + 9
+
+    def test_signal_without_a_number_falls_back_to_error(self) -> None:
+        # A signal class with no recorded number (a partial record) has
+        # no 128 + N to compute, so it takes the general error code.
+        assert crony_runner.trigger_exit_code({"exit_class": "signal"}) == int(
+            ExitCode.ERROR
         )
+
+    def test_ok_with_a_nonzero_exit_code_still_exits_zero(self) -> None:
+        # A `success_exit_codes` match keeps the real code on the record
+        # but classifies the run ok, so the wait exits 0 regardless.
+        rec = {"exit_class": "ok", "exit_code": 3}
+        assert crony_runner.trigger_exit_code(rec) == 0
+
+    def test_recorded_exit_code_is_returned_verbatim(self) -> None:
+        # A record that carries its own exit_code returns it directly --
+        # the exit-class fallbacks are only for records that lack one.
+        rec = {"exit_class": "fail", "exit_code": 42}
+        assert crony_runner.trigger_exit_code(rec) == 42
+
+    def test_unrecognized_class_without_a_code_exits_zero(self) -> None:
+        # A corrupt or unknown exit_class with no exit_code is not a
+        # failure this can name, so it maps to 0 rather than guessing.
+        assert crony_runner.trigger_exit_code({"exit_class": "bogus"}) == 0
 
 
 class TestTriggerUnitSync:
@@ -2236,6 +2450,355 @@ class TestTriggerUnitSync:
         # The dead pid was never handed to the pid-exit wait: liveness
         # gates the wait, so the corpse never re-armed the loop.
         assert waited == []
+
+    def test_short_run_cap_does_not_cut_the_start_allowance_short(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A job's run cap says how long it may RUN, not how long the
+        # scheduler may take to launch it, so a cap shorter than
+        # trigger_timeout must not end the wait for the runner to appear.
+        # Otherwise a job that is merely slow to start reads as one that
+        # never started -- and for a group child, that failure is one the
+        # group would wear, which is exactly the false failure a group's
+        # status must not carry. The platform gets its full allowance,
+        # and a runner that shows up late is judged against its own cap.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+        # No runner on the first look; by the second the job has started,
+        # run, and recorded -- later than its own 1s cap allowed for.
+        looks = {"n": 0}
+
+        def _slow_to_start(*_a: object, **_k: object) -> bool:
+            looks["n"] += 1
+            if looks["n"] < 2:
+                return False
+            ended = datetime.datetime.now().astimezone().isoformat()
+            (sd / "last-run.json").write_text(
+                json.dumps(
+                    {"exit_class": "ok", "exit_code": 0, "ended_at": ended}
+                ),
+                encoding="utf-8",
+            )
+            return False
+
+        monkeypatch.setattr(crony_runtime, "run_in_progress", _slow_to_start)
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        rec = crony_runner.trigger_unit_sync(
+            full,
+            state_dir=sd,
+            job_timeout=1.0,
+            trigger_timeout=30.0,
+        )
+        assert rec["exit_class"] == "ok"
+
+    def test_run_cap_is_measured_from_when_the_job_started(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A job's cap bounds how long it may RUN, so it counts from when
+        # the job started -- not from when we asked the scheduler to start
+        # it. Charging the launch latency against it would time out a job
+        # that had been running for no time at all: here the runner
+        # appears a second after the trigger with a 2s cap, and must get
+        # its 2s. It is given the pid-exit wait rather than an immediate
+        # JobTimeoutError.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+        clock = {"now": 0.0}
+        real_monotonic = crony_commands.time.monotonic
+
+        def fake_monotonic() -> float:
+            return float(real_monotonic()) + clock["now"]
+
+        # Not running on the first look; running by the second, a full
+        # second after the trigger (longer than the cap it will be
+        # judged against).
+        looks = {"n": 0}
+
+        def _slow_to_start(*_a: object, **_k: object) -> bool:
+            looks["n"] += 1
+            if looks["n"] < 2:
+                clock["now"] += 1.5
+                return False
+            return True
+
+        waited: list[float | None] = []
+
+        def _record_wait(_pid: int, timeout: float | None) -> PidWait:
+            waited.append(timeout)
+            ended = datetime.datetime.now().astimezone().isoformat()
+            (sd / "last-run.json").write_text(
+                json.dumps(
+                    {"exit_class": "ok", "exit_code": 0, "ended_at": ended}
+                ),
+                encoding="utf-8",
+            )
+            return PidWait.EXITED
+
+        monkeypatch.setattr(crony_commands.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(crony_runtime, "run_in_progress", _slow_to_start)
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _record_wait)
+        rec = crony_runner.trigger_unit_sync(
+            full,
+            state_dir=sd,
+            job_timeout=2.0,
+            trigger_timeout=30.0,
+        )
+        assert rec["exit_class"] == "ok"
+        # The job got its full cap from the moment it was seen running,
+        # not what was left of it after the launch.
+        assert waited == [2.0]
+
+    def test_never_started_is_reported_after_the_start_allowance(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The flip side: once the platform has had its full allowance and
+        # produced nothing, "never started" IS the verdict -- the broken
+        # plist / stalled queue / unloaded unit detector, and the one
+        # dispatch failure a group does wear.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        # Nothing ever fires, so no runner and no record ever appear.
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        with pytest.raises(TriggerStartTimeout, match="never produced"):
+            crony_runner.trigger_unit_sync(
+                full,
+                state_dir=sd,
+                job_timeout=1.0,
+                trigger_timeout=1.0,
+            )
+
+    def test_caller_budget_bounds_the_start_allowance(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A caller that cannot wait indefinitely (a group, passing what is
+        # left of its cumulative budget) bounds the start allowance too --
+        # it cannot hand the platform 15s it does not have. The verdict is
+        # still "nothing ran", because no runner was ever seen: which
+        # clock stopped us does not change what we observed, and a group
+        # that ran out of time before its child even started did not get
+        # that child run.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        with pytest.raises(TriggerStartTimeout, match="never produced"):
+            crony_runner.trigger_unit_sync(
+                full,
+                state_dir=sd,
+                job_timeout=math.inf,
+                trigger_timeout=30.0,
+                wait_budget=1.0,
+            )
+
+    def test_in_flight_run_we_waited_out_is_returned_not_a_crash(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Firing a unit that is already running is a no-op: the platform
+        # coalesces it into the run in flight, which we attach to and wait
+        # out, so that run's result is the one we were promised. It can
+        # have ended before we ever fired (a record is written after
+        # `ended_at` is stamped -- a slow notify dispatch sits between),
+        # so the record is claimed by the pid that wrote it rather than by
+        # when it ended. Judging it by `ended_at` alone would call a run
+        # we watched to completion a runner that crashed.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        runner_pid = os.getpid()
+        (sd / "run.pid").write_text(f"{runner_pid}\n", encoding="utf-8")
+        # Its command finished before we fired; it is still holding the
+        # lock, dispatching notifications, and has yet to write its record.
+        ended = (
+            datetime.datetime.now().astimezone()
+            - datetime.timedelta(seconds=30)
+        ).isoformat()
+        in_flight = iter([True])
+
+        def _finishes_notifying(*_a: object, **_k: object) -> bool:
+            live = next(in_flight, False)
+            if not live:
+                (sd / "last-run.json").write_text(
+                    json.dumps(
+                        {
+                            "exit_class": "fail",
+                            "exit_code": 1,
+                            "ended_at": ended,
+                            "pid": runner_pid,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return live
+
+        monkeypatch.setattr(
+            crony_runtime, "run_in_progress", _finishes_notifying
+        )
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            crony_runner,
+            "_wait_for_pid_exit",
+            lambda *_a, **_kw: PidWait.EXITED,
+        )
+        rec = crony_runner.trigger_unit_sync(
+            full,
+            state_dir=sd,
+            job_timeout=math.inf,
+            trigger_timeout=30.0,
+        )
+        # The child's real outcome, not a fabricated crash.
+        assert rec["exit_class"] == "fail"
+
+    def test_crashed_runner_is_reported_apart_from_never_started(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A runner we actually attached to, whose pid then went away
+        # leaving no record, is a crash -- not "the platform never
+        # started anything". The two look identical from the outside (no
+        # result ever lands), so they are raised as different errors: a
+        # parent group needs that to tell its own fault (nothing ran)
+        # from its child's (the child ran and was killed).
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        # A run is in flight for the first look and gone once we have
+        # waited on its pid -- the runner died without recording.
+        in_flight = iter([True])
+        monkeypatch.setattr(
+            crony_runtime,
+            "run_in_progress",
+            lambda *_a, **_k: next(in_flight, False),
+        )
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            crony_runner,
+            "_wait_for_pid_exit",
+            lambda *_a, **_kw: PidWait.EXITED,
+        )
+        with pytest.raises(RunnerCrashed, match="without recording"):
+            crony_runner.trigger_unit_sync(
+                full,
+                state_dir=sd,
+                job_timeout=math.inf,
+                trigger_timeout=1.0,
+            )
+
+    def test_result_landing_on_the_deadline_is_returned_not_a_crash(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The runner writes its record and only then releases the lock,
+        # so a run completing right as the cap expires leaves a window
+        # where the lock is already free and the record is already there.
+        # Every verdict is taken from an observation made on the same
+        # pass, so the record wins: judging on a staler look would call a
+        # run that finished one that was killed without recording.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+        # Wait on the runner's pid, and have the cap expire while we do.
+        clock = {"now": 0.0}
+        real_monotonic = crony_commands.time.monotonic
+
+        def fake_monotonic() -> float:
+            return float(real_monotonic()) + clock["now"]
+
+        def _wait_and_overrun(*_a: object, **_k: object) -> PidWait:
+            clock["now"] += 10.0
+            return PidWait.EXITED
+
+        # In flight for the first look. By the next one it has finished,
+        # written its record, and dropped the lock -- and the cap is up,
+        # so the wait is about to give a verdict on this same pass.
+        in_flight = iter([True])
+
+        def _finished(*_a: object, **_k: object) -> bool:
+            live = next(in_flight, False)
+            if not live:
+                ended = datetime.datetime.now().astimezone().isoformat()
+                (sd / "last-run.json").write_text(
+                    json.dumps(
+                        {
+                            "exit_class": "ok",
+                            "exit_code": 0,
+                            "ended_at": ended,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return live
+
+        monkeypatch.setattr(crony_commands.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(crony_runtime, "run_in_progress", _finished)
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            crony_runner, "_wait_for_pid_exit", _wait_and_overrun
+        )
+        rec = crony_runner.trigger_unit_sync(
+            full,
+            state_dir=sd,
+            job_timeout=1.0,
+            trigger_timeout=30.0,
+        )
+        assert rec["exit_class"] == "ok"
+
+    def test_crashed_runner_is_reported_without_waiting_out_a_deadline(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The verdict is settled the moment the lock goes free with no
+        # record behind it: the runner writes its record before releasing
+        # the lock, so there will never be one. Nothing is learned by
+        # polling on to a deadline, and a long trigger_timeout must not
+        # keep a group waiting on a child that is already dead.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        full = h.full("foo")
+        sd = h.fabricate_orphan("foo")
+        (sd / "run.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        # In flight for the first look, gone once we have waited on it.
+        in_flight = iter([True])
+        monkeypatch.setattr(
+            crony_runtime,
+            "run_in_progress",
+            lambda *_a, **_k: next(in_flight, False),
+        )
+        monkeypatch.setattr(
+            crony_runner, "trigger_unit", lambda *_a, **_kw: None
+        )
+        monkeypatch.setattr(
+            crony_runner,
+            "_wait_for_pid_exit",
+            lambda *_a, **_kw: PidWait.EXITED,
+        )
+        with pytest.raises(RunnerCrashed, match="without recording"):
+            crony_runner.trigger_unit_sync(
+                full,
+                state_dir=sd,
+                job_timeout=math.inf,
+                trigger_timeout=600.0,
+            )
 
     def test_leftover_run_pid_without_held_lock_is_ignored(
         self, tmp_path: Path, monkeypatch: Any

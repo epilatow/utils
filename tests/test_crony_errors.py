@@ -24,6 +24,7 @@ from crony.errors import (  # noqa: E402
     JobTimeoutError,
     LockBusyError,
     PreconditionError,
+    RunnerCrashed,
     SubprocessError,
     TriggerStartTimeout,
     UnitNotInstalledError,
@@ -71,6 +72,7 @@ class TestExceptionRelationships:
             JobTimeoutError,
             UnitNotInstalledError,
             TriggerStartTimeout,
+            RunnerCrashed,
         ):
             assert issubclass(exc, CronyError)
 
@@ -83,6 +85,20 @@ class TestExceptionRelationships:
         assert issubclass(TriggerStartTimeout, JobTimeoutError)
         assert "exit_code" not in TriggerStartTimeout.__dict__
         assert TriggerStartTimeout.exit_code is ExitCode.TIMEOUT
+
+    def test_runner_crashed_is_not_a_job_timeout(self) -> None:
+        # A crashed runner is not a timeout of any kind: the job ran and
+        # was killed. Keeping it off the JobTimeoutError branch is what
+        # lets a group's dispatch tell "the child crashed" (the child's
+        # problem) from "the child never started" (the group's).
+        assert not issubclass(RunnerCrashed, JobTimeoutError)
+
+    def test_runner_crashed_takes_the_error_not_crashed_code(self) -> None:
+        # CRASHED is the code crony exits with when crony ITSELF dies on
+        # an unhandled exception, so a job that crashed must not surface
+        # it -- a `crony trigger --wait` caller could no longer tell the
+        # two apart. It takes the general error code instead.
+        assert RunnerCrashed.exit_code is ExitCode.ERROR
 
     def test_subprocess_error_is_also_called_process_error(self) -> None:
         # SubprocessError doubles as a subprocess.CalledProcessError so

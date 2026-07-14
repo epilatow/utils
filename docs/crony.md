@@ -321,11 +321,19 @@ Send a synthetic failure notification.
 ### STATUS values
 
 - **`ok`**\
-  The job's last run completed successfully.
+  The job's last run completed successfully. For a job group: the group got
+  every child it was asked to run running (a disabled child is skipped, not
+  run) -- whatever those children then did is reported on their own rows, and
+  a failing child does not fail its group.
 - **`fail`**\
-  The job's last run failed (exited with a non-zero status).
+  The job's last run failed (exited with a non-zero status). For a job group:
+  the group could not fire one of its children -- that child's unit or
+  snapshot is missing on this host, or the scheduler refused to fire it.
 - **`timeout`**\
-  The job was killed after exceeding its wallclock execution timeout.
+  The job was killed after exceeding its wallclock execution timeout. For a
+  job group: the group ran out of time on a child before it ever saw it
+  running -- its cumulative budget was spent, or the scheduler never started
+  the child.
 - **`gated`**\
   The job was skipped due to an execution gate. This is not considered as a
   job failure.

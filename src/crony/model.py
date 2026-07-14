@@ -1292,9 +1292,10 @@ class NotificationResult:
 
 class ExitClass(StrEnum):
     """The recorded outcome of a run: written to last-run.json as
-    `exit_class` and rolled up across a group's children. A StrEnum so
-    it serializes as its plain value and on-disk records round-trip
-    unchanged."""
+    `exit_class`, by a job for its own run and by a group for its own
+    (whether it managed to run its children -- see `GroupRunResult`).
+    A StrEnum so it serializes as its plain value and on-disk records
+    round-trip unchanged."""
 
     OK = "ok"
     FAIL = "fail"
@@ -1347,14 +1348,27 @@ class JobStatus(_DescribedStrEnum):
     omits `signal` (folded to `fail`) and `dispatched` (shown as
     `unknown`), which never surface in the cell."""
 
-    OK = ExitClass.OK, "The job's last run completed successfully."
+    OK = (
+        ExitClass.OK,
+        "The job's last run completed successfully. For a job group: the "
+        "group got every child it was asked to run running (a disabled "
+        "child is skipped, not run) -- whatever those children then did "
+        "is reported on their own rows, and a failing child does not fail "
+        "its group.",
+    )
     FAIL = (
         ExitClass.FAIL,
-        "The job's last run failed (exited with a non-zero status).",
+        "The job's last run failed (exited with a non-zero status). For "
+        "a job group: the group could not fire one of its children -- "
+        "that child's unit or snapshot is missing on this host, or the "
+        "scheduler refused to fire it.",
     )
     TIMEOUT = (
         ExitClass.TIMEOUT,
-        "The job was killed after exceeding its wallclock execution timeout.",
+        "The job was killed after exceeding its wallclock execution "
+        "timeout. For a job group: the group ran out of time on a child "
+        "before it ever saw it running -- its cumulative budget was spent, "
+        "or the scheduler never started the child.",
     )
     GATED = (
         ExitClass.GATED,
@@ -1485,7 +1499,7 @@ class _CommonRunResult:
     `snapshot.json` in the same dir carries the full namespaced name
     of the entity it was applied as. The two record kinds extend this
     with their own fields -- a job's exit detail / gate / notifications,
-    a group's child rollup.
+    a group's per-child outcomes.
     """
 
     host: str
@@ -1541,17 +1555,27 @@ class GroupChildResult:
 @dataclass
 class GroupRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed group run. Its
-    `process_exit` is always 0 -- a group's rollup lives in `exit_class`,
-    not its process exit -- but it is still reconciled against the
-    scheduler so a group whose parent launch was killed reads as
-    `crashed`.
+    `process_exit` is always 0 -- a group's outcome lives in
+    `exit_class`, not its process exit -- but it is still reconciled
+    against the scheduler so a group whose parent launch was killed
+    reads as `crashed`.
 
-    `exit_class` is a rollup from `jobs_run`: timeout outranks
-    fail / signal (which are equally severe), and ok / gated tie
-    at the bottom (gating is "intentionally not run", not a
-    group-level outcome). The status / list readers
-    consult this single field for the group's STATUS value instead
-    of re-deriving the rollup on every query.
+    `exit_class` is the group's OWN outcome, not a rollup of its
+    children's: `ok` when the group got every child running, else the
+    worst fault the group itself hit (a child it never got running --
+    could not fire, or ran out of time on before ever seeing it run).
+    A child that ran and then failed, was signaled, timed out against its
+    own cap, or crashed is the child's problem -- it surfaces on the
+    child's own row and does not fail the group, whose job is to run its
+    children rather than to succeed at their work. See
+    `runner._group_exit_class`.
+
+    `jobs_run` is the group's own log of what each child did from where
+    it sat, written for the record and read by nobody: `crony status`
+    takes each child's row from that child's own last-run.json, and the
+    group's from `exit_class` alone. It can therefore disagree with a
+    child's row -- a child the group stopped waiting on is recorded
+    `timeout` here while going on to finish and report `ok` on its own.
     """
 
     jobs_run: list[GroupChildResult]
@@ -1562,7 +1586,7 @@ class LastRun:
     """Display-side view of `last-run.json`. Captures the fields
     status consumes regardless of whether the underlying
     record was a `JobRunResult` (the per-job runner output) or a
-    `GroupRunResult` (the group-level rollup); the full records
+    `GroupRunResult` (the group's own outcome); the full records
     stay as the on-disk serialization shape. Fields are optional
     because last-run.json can be partial / corrupt and we'd rather
     surface "unknown" than have load_config abort.
