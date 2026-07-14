@@ -21,7 +21,6 @@ import os
 import re
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys as sys  # noqa: PLC0414  re-exported for tests
-import textwrap
 import time as time  # noqa: PLC0414  re-exported for tests
 import uuid
 from enum import StrEnum
@@ -40,6 +39,7 @@ import crony.platform
 import crony.runner
 import crony.runtime
 import crony.unit
+from common.helpref import ReferenceSection, reference_section_text
 
 logger = logging.getLogger(__name__)
 
@@ -1528,27 +1528,6 @@ _COL_VISIBILITY: dict[str, _ColVisibility] = {
 _STATUS_HELP_WIDTH = 76
 
 
-def _help_definition_list(
-    items: list[tuple[str, str]], label_width: int
-) -> str:
-    """Render `(label, description)` pairs as a `--help` definition list:
-    each label in a left column, its description wrapped and
-    hanging-indented beside it."""
-    out: list[str] = []
-    for label, description in items:
-        out.append(
-            textwrap.fill(
-                description,
-                width=_STATUS_HELP_WIDTH,
-                initial_indent=f"{label:<{label_width}}",
-                subsequent_indent=" " * label_width,
-                break_on_hyphens=False,
-                break_long_words=False,
-            )
-        )
-    return "\n".join(out)
-
-
 def _column_items(*, default: bool) -> list[tuple[str, str]]:
     """The `_STATUS_COLUMNS` reference items, split into the default set
     (shown when `--cols` is omitted, in display order) and the opt-in
@@ -1559,14 +1538,6 @@ def _column_items(*, default: bool) -> list[tuple[str, str]]:
     if not default:
         cols.sort(key=lambda c: c.name.strip("<>"))
     return [(c.name, c.description) for c in cols]
-
-
-def _value_reference(items: list[tuple[str, str]]) -> str:
-    """A `--help` value reference -- the same `<value>  <description>`
-    layout as the column / alias blocks, with the label column sized to
-    the widest value."""
-    width = max(len(label) for label, _ in items) + 2
-    return _help_definition_list(items, width)
 
 
 # The Colors lead-in, stored raw (unwrapped) so each consumer wraps to
@@ -1761,73 +1732,47 @@ _YELLOW_CELLS: dict[str, frozenset[str]] = {
 }
 
 
-class _ReferenceSection(NamedTuple):
-    """One `crony status` reference section: a heading, optional lead
-    paragraph, and `(label, description)` items. The single source for
-    both the `--help` epilog text and the man page's STATUS COLUMNS
-    section, so the two can't drift."""
-
-    title: str
-    items: list[tuple[str, str]]
-    lead: str = ""
-
-
-def status_reference_sections() -> list[_ReferenceSection]:
+def status_reference_sections() -> list[ReferenceSection]:
     """The `crony status` column / value / alias / color reference as
-    structured sections, sourced from the registries and enums."""
+    structured sections, sourced from the registries and enums. The
+    single source for both the `--help` epilog text and the man page's
+    STATUS COLUMNS section, so the two can't drift."""
     return [
-        _ReferenceSection("Default Columns", _column_items(default=True)),
-        _ReferenceSection("Optional Columns", _column_items(default=False)),
-        _ReferenceSection(
+        ReferenceSection("Default Columns", _column_items(default=True)),
+        ReferenceSection("Optional Columns", _column_items(default=False)),
+        ReferenceSection(
             "Column Aliases",
             [(a.name, a.description) for a in _STATUS_ALIASES],
         ),
-        _ReferenceSection(
+        ReferenceSection(
             "CONFIG values",
             [(m.value, m.description) for m in crony.model.ConfigStatus],
         ),
-        _ReferenceSection(
+        ReferenceSection(
             "SCHEDULE values",
             [(m.value, m.description) for m in crony.model.ScheduleValue],
         ),
-        _ReferenceSection(
+        ReferenceSection(
             "STATUS values",
             [(m.value, m.description) for m in crony.model.JobStatus],
         ),
-        _ReferenceSection(
+        ReferenceSection(
             "FLAG values",
             [(f.token, f.description) for f in crony.config.JobFlags.members()],
         ),
-        _ReferenceSection(
+        ReferenceSection(
             "MASKED values",
             [(r.value, r.description) for r in crony.config.MaskReason],
         ),
-        _ReferenceSection("Colors", _color_items(), lead=_COLOR_LEAD),
+        ReferenceSection("Colors", _color_items(), lead=_COLOR_LEAD),
     ]
 
 
-def _reference_section_text(section: _ReferenceSection) -> str:
-    """A reference section as `--help` text: a `Title:` header with the
-    body indented two spaces beneath it, matching the top-level `crony
-    --help` epilog. The body is an optional wrapped lead, then the value
-    reference."""
-    body: list[str] = []
-    if section.lead:
-        body.append(
-            textwrap.fill(
-                section.lead,
-                width=_STATUS_HELP_WIDTH,
-                break_on_hyphens=False,
-                break_long_words=False,
-            )
-        )
-        body.append("")
-    body.append(_value_reference(section.items))
-    return f"{section.title}:\n" + textwrap.indent("\n".join(body), "  ")
-
-
 STATUS_HELP_EPILOG: str = (
-    "\n\n".join(_reference_section_text(s) for s in status_reference_sections())
+    "\n\n".join(
+        reference_section_text(s, width=_STATUS_HELP_WIDTH)
+        for s in status_reference_sections()
+    )
     + "\n"
 )
 
