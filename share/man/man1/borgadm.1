@@ -50,7 +50,7 @@ To restore the latest full backup into a directory:
 To schedule unattended backups and checks via crony(1) run:
 .PP
 .EX
-    borgadm automate enable
+    borgadm automate apply
 .EE
 .SH COMMON ARGUMENTS
 .TP
@@ -92,11 +92,11 @@ Prefix each stdout/stderr message with a timestamp.\&
 Log informational messages, not just warnings.\&
 .SH SUBCOMMANDS
 .TP
-\f[B]automate enable\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]automate apply\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Write borgadm\(aqs crony(1) bundle and deploy the scheduled backup\-creation and check jobs (via launchd on macOS, systemd on Linux).\&
 On macOS the create job runs with Full Disk Access permissions.\&
 .TP
-\f[B]automate disable\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]automate destroy\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Tear down borgadm\(aqs scheduled backup and check jobs and remove its crony(1) bundle.\&
 .TP
 \f[B]automate status\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -212,7 +212,7 @@ skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]log\-files\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
-Print the borgadm log file paths, including those of any enabled automations.\&
+Print the borgadm log file paths, including those of any deployed automations.\&
 .TP
 \f[B]repair delete\-cache\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Delete the local borg cache for the repository, forcing it to be rebuilt on the next access.\&

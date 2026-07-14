@@ -386,7 +386,7 @@ class TestArgumentParser:
         cases = [
             ["check", "--verbose", "age"],
             ["check", "--config", "/tmp/c", "age"],
-            ["automate", "--verbose", "enable"],
+            ["automate", "--verbose", "apply"],
             ["repair", "--verbose", "delete-cache"],
         ]
         for argv in cases:
@@ -407,7 +407,7 @@ class TestArgumentParser:
                 "/tmp/c",
             ),
             (
-                ["automate", "enable", "--verbose"],
+                ["automate", "apply", "--verbose"],
                 "verbose",
                 True,
             ),
@@ -1369,9 +1369,11 @@ class TestAutomate:
         """The crony argv (after the crony path) of each run_cmd call."""
         return [list(call.args[0][1:]) for call in mock_run.call_args_list]
 
-    def test_enable_writes_bundle_and_applies(self, automate_env: Any) -> None:
+    def test_apply_writes_bundle_and_runs_crony(
+        self, automate_env: Any
+    ) -> None:
         dropin, mock_run = automate_env
-        ba.do_automate_enable()
+        ba.do_automate_apply()
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         text = bundle.read_text()
@@ -1379,28 +1381,26 @@ class TestAutomate:
             assert f"[job.{op}]" in text
         assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
 
-    def test_disable_destroys_and_removes_bundle(
-        self, automate_env: Any
-    ) -> None:
+    def test_destroy_removes_units_and_bundle(self, automate_env: Any) -> None:
         dropin, mock_run = automate_env
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
-        ba.do_automate_disable()
+        ba.do_automate_destroy()
         assert ["destroy", "-b", "borgadm"] in self._crony_calls(mock_run)
         assert not bundle.exists()
 
-    def test_disable_is_noop_when_not_enabled(self, automate_env: Any) -> None:
+    def test_destroy_is_noop_when_not_applied(self, automate_env: Any) -> None:
         # No bundle file: crony has nothing addressable and exits nonzero,
-        # but disable must treat that as a clean no-op, not an error.
+        # but destroy must treat that as a clean no-op, not an error.
         dropin, mock_run = automate_env
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=2, stdout="", stderr="unknown bundle"
         )
-        ba.do_automate_disable()
+        ba.do_automate_destroy()
         assert not (dropin / "borgadm.toml").exists()
 
-    def test_disable_surfaces_failure_when_bundle_present(
+    def test_destroy_surfaces_failure_when_bundle_present(
         self, automate_env: Any
     ) -> None:
         # The bundle is installed (file present) but destroy fails for a
@@ -1414,7 +1414,7 @@ class TestAutomate:
             args=[], returncode=7, stdout="", stderr="lock held"
         )
         with pytest.raises(ba.BorgadmError, match="crony destroy failed"):
-            ba.do_automate_disable()
+            ba.do_automate_destroy()
         assert bundle.exists()
 
     def test_status_shells_out_to_crony(self, automate_env: Any) -> None:
@@ -1436,15 +1436,15 @@ class TestAutomate:
         assert ["status", "-b", "borgadm"] not in self._crony_calls(mock_run)
         assert any("not enabled" in r.message for r in caplog.records)
 
-    def test_enable_on_linux_omits_full_disk_access(
+    def test_apply_on_linux_omits_full_disk_access(
         self, automate_env_linux: Any
     ) -> None:
-        # automate is cross-platform: on Linux enable still writes the
+        # automate is cross-platform: on Linux apply still writes the
         # bundle and applies it, but the create job carries no
         # full-disk-access flag (a user systemd job already has the
         # access, so no Crony.app grant is needed).
         dropin, mock_run = automate_env_linux
-        ba.do_automate_enable()
+        ba.do_automate_apply()
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
@@ -3310,7 +3310,7 @@ class TestCli:
     @pytest.mark.parametrize(
         "sub, sample_action",
         [
-            ("automate", "enable"),
+            ("automate", "apply"),
             ("check", "age"),
             ("repair", "delete-cache"),
         ],

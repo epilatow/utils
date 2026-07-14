@@ -66,7 +66,7 @@ To restore the latest full backup into a directory:
 To schedule unattended backups and checks via crony(1) run:
 
 ```text
-    borgadm automate enable
+    borgadm automate apply
 ```
 
 ## COMMON ARGUMENTS
@@ -105,13 +105,13 @@ To schedule unattended backups and checks via crony(1) run:
 
 ## SUBCOMMANDS
 
-### `automate enable [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `automate apply [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Write borgadm's crony(1) bundle and deploy the scheduled backup-creation and
 check jobs (via launchd on macOS, systemd on Linux). On macOS the create job
 runs with Full Disk Access permissions.
 
-### `automate disable [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `automate destroy [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Tear down borgadm's scheduled backup and check jobs and remove its crony(1)
 bundle.
@@ -228,7 +228,7 @@ showing prune keep tags.
 
 ### `log-files [--config CONFIG] [--verbose] [--timestamp-messages]`
 
-Print the borgadm log file paths, including those of any enabled automations.
+Print the borgadm log file paths, including those of any deployed automations.
 
 ### `repair delete-cache [--config CONFIG] [--verbose] [--timestamp-messages]`
 
