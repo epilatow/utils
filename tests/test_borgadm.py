@@ -2374,6 +2374,24 @@ class TestRsyncMountCleanup:
             ("/t/.borgadm_borg-rsync.tmp.aaa/merged", "overlay"),
         ]
 
+    @pytest.mark.parametrize(
+        "err",
+        [
+            FileNotFoundError("mount"),
+            subprocess.CalledProcessError(1, ["mount"]),
+        ],
+    )
+    def test_mounts_under_empty_when_mount_unusable(
+        self, err: Exception
+    ) -> None:
+        """An unusable `mount` binary yields no mounts instead of an
+        exception -- the helper runs as part of cleanup, where raising
+        would mask the run's real error."""
+        with patch.object(
+            ba.subprocess, "check_output", autospec=True, side_effect=err
+        ):
+            assert ba._mounts_under(Path("/t/.borgadm_x.tmp.aaa")) == []
+
     def test_umount_tree_unmounts_overlay_first(self) -> None:
         """The overlay 'merged' mount must be torn down before the fuse
         mounts it stacks on."""
@@ -2427,10 +2445,19 @@ class TestRsyncMountCleanup:
         self, tmp_path: Path
     ) -> None:
         """The live cleanup tears the overlay 'merged' mount down before
-        the per-archive fuse mounts it stacks on."""
+        the per-archive fuse mounts it stacks on, and sudo-removes the
+        root-owned overlay workdir."""
         target = tmp_path / "borg-rsync"
         target.mkdir()
         archives = ["repo::home-fuse-1of2", "repo::home-local-2of2"]
+
+        def fake_mounts(root: Path) -> list[tuple[Path, str]]:
+            return [
+                (root / "home-fuse-1of2", "fuse"),
+                (root / "home-local-2of2", "fuse"),
+                (root / "merged", "overlay"),
+            ]
+
         with (
             patch.object(ba.platform, "system", return_value="Linux"),
             patch.object(ba, "check_sudo", autospec=True, return_value=True),
@@ -2443,6 +2470,9 @@ class TestRsyncMountCleanup:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba.os, "listdir", return_value=["x"]),
             patch.object(ba, "run_borg", autospec=True),
+            patch.object(
+                ba, "_mounts_under", autospec=True, side_effect=fake_mounts
+            ),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
         ):
             ba.do_rsync(
@@ -2457,8 +2487,61 @@ class TestRsyncMountCleanup:
             for c in mock_run.call_args_list
             if c.args[0][0] == "umount"
         ]
-        assert umounts == ["merged", "home-local-2of2", "home-fuse-1of2"]
+        assert umounts == ["merged", "home-fuse-1of2", "home-local-2of2"]
+        rms = [
+            Path(c.args[0][2]).name
+            for c in mock_run.call_args_list
+            if c.args[0][:2] == ["rm", "-rf"]
+        ]
+        assert rms == ["workdir"]
         assert any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
+
+    def test_do_rsync_unmounts_mount_stranded_by_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A failure after a successful mount still tears the mount down:
+        the cleanup asks the mount table what is mounted rather than
+        relying on having reached any later step, so the tmpdir removal
+        never walks into a live mount."""
+        target = tmp_path / "borg-rsync"
+        target.mkdir()
+        archives = ["repo::home-fuse-1of2"]
+        err = ba.SubprocessError(2, ["borg"], output="", stderr="boom")
+
+        def fake_mounts(root: Path) -> list[tuple[Path, str]]:
+            return [(root / "home-fuse-1of2", "fuse")]
+
+        with (
+            patch.object(ba.platform, "system", return_value="Linux"),
+            patch.object(ba, "check_sudo", autospec=True, return_value=True),
+            patch.object(
+                ba,
+                "list_backups",
+                autospec=True,
+                return_value={"20260101_000000": archives},
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True, side_effect=err),
+            patch.object(
+                ba, "_mounts_under", autospec=True, side_effect=fake_mounts
+            ),
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            pytest.raises(ba.SubprocessError),
+        ):
+            ba.do_rsync(
+                target,
+                dry_run=False,
+                delete=True,
+                progress=False,
+                bypass_lock=True,
+            )
+        umounts = [
+            Path(c.args[0][2]).name
+            for c in mock_run.call_args_list
+            if c.args[0][0] == "umount"
+        ]
+        assert umounts == ["home-fuse-1of2"]
+        assert not any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
 
 
 class TestDoEnvironment:

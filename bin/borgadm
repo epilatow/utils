@@ -1188,10 +1188,12 @@ def _mounts_under(root: Path) -> list[tuple[Path, str]]:
 
     Parses `mount` output rather than /proc/mounts: the borgadm user
     inside the extract container may lack read permission on the latter.
+    Runs as part of cleanup, so an unusable `mount` (failed or absent)
+    yields an empty list rather than an exception.
     """
     try:
         output = subprocess.check_output(["mount"], text=True)
-    except subprocess.CalledProcessError:
+    except FileNotFoundError, subprocess.CalledProcessError:
         return []
     root_str = root.as_posix()
     found: list[tuple[Path, str]] = []
@@ -2336,13 +2338,14 @@ def do_rsync(
 
         # Create the workspace only once the flock is held: a concurrent
         # loser for this same target must not leave a tmp dir on disk for
-        # the lock holder's reclaim to glob and remove.
+        # the lock holder's reclaim to glob and remove. A cleanup failure
+        # (e.g. a busy mount that survived umount -f) degrades to a leaked
+        # dir the next run's reclaim sweeps, rather than an exception that
+        # would mask the run's real error.
         tmpdir_ctx = tempfile.TemporaryDirectory(
-            dir=tdir_dirname, prefix=tmpdir_prefix
+            dir=tdir_dirname, prefix=tmpdir_prefix, ignore_cleanup_errors=True
         )
         tmpdir = Path(tmpdir_ctx.name)
-        cleanup_mounts: list[Path] = []
-        cleanup_dirs: list[Path] = []
         try:
             # Reclaim tmp dirs orphaned by a previously SIGKILLed run of
             # this same target.
@@ -2368,7 +2371,6 @@ def do_rsync(
                     bypass_lock=bypass_lock,
                     sudo=True,
                 )
-                cleanup_mounts.append(mount_dir)
                 archive_mounts.append(mount_dir)
 
                 if not os.listdir(mount_dir):
@@ -2392,8 +2394,6 @@ def do_rsync(
             ]
             logger.info(f"Merging archives with overlayfs: {merged}")
             run_cmd(cmd, sudo=True)
-            cleanup_mounts.append(merged)
-            cleanup_dirs.append(workdir)
             if not os.listdir(merged):
                 raise BorgadmError(f"Empty overlayfs mount: {merged}")
 
@@ -2417,15 +2417,18 @@ def do_rsync(
 
             logger.info(f"Finished rsync to: {target_dir}")
         finally:
-            # Cleanup root owned resources. merged is appended last, so
-            # reversed() tears down the overlay before the fuse mounts it
-            # stacks on. The overlay workdir is root-owned and must be
-            # removed with sudo before the TemporaryDirectory context can
-            # clear the rest.
-            for m in reversed(cleanup_mounts):
-                run_cmd(["umount", "-f", m.as_posix()], sudo=True, errok=True)
-            for d in cleanup_dirs:
-                run_cmd(["rm", "-rf", d.as_posix()], sudo=True, errok=True)
+            # Cleanup root owned resources. The mount table, not
+            # bookkeeping, decides what comes down, so a mount stranded by
+            # a failure between mounting and any later step is still torn
+            # down before the TemporaryDirectory cleanup walks the tree.
+            # The overlay workdir is root-owned and must be removed with
+            # sudo before that cleanup can clear the rest.
+            _umount_tree(tmpdir)
+            run_cmd(
+                ["rm", "-rf", (tmpdir / "workdir").as_posix()],
+                sudo=True,
+                errok=True,
+            )
             tmpdir_ctx.cleanup()
 
 
