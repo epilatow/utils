@@ -155,6 +155,25 @@ def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
     return marker + tail, True
 
 
+def _head_truncate_to_lines(text: str, max_lines: int) -> tuple[str, bool]:
+    """Tail a string to at most max_lines lines, head-truncating.
+
+    When truncation occurs, a one-line `[... N lines truncated ...]`
+    marker replaces the dropped head (and counts toward max_lines, so
+    the result never exceeds it). Bounds a native dialog's height,
+    where a byte cap alone does not: a `display dialog` has no scroll
+    and grows vertically with its line count, so a large byte budget
+    still overflows the screen.
+    """
+    lines = text.splitlines(keepends=True)
+    if len(lines) <= max_lines:
+        return text, False
+    kept = lines[-(max_lines - 1) :] if max_lines > 1 else []
+    dropped = len(lines) - len(kept)
+    marker = f"[... {dropped} lines truncated ...]\n"
+    return marker + "".join(kept), True
+
+
 def _build_email_message(
     result: crony.model.JobRunResult,
     full_name: str,
@@ -372,9 +391,30 @@ def _send_ntfy_for(
 
 
 # Log content (latest run's tail) shown inside a dialog-popup body,
-# capped so the modal stays readable rather than an unwieldy wall of
-# text; the full log always remains on disk.
-_DIALOG_POPUP_LOG_KB: int = 8
+# capped so the modal stays a normal, clickable size rather than a
+# screen-filling wall of text (a `display dialog` has no scroll and
+# grows with its content, and an oversized one renders an unresponsive
+# OK button). Bounded by BOTH a line count -- the dominant driver of a
+# dialog's height -- and a small byte cap that guards very wide lines
+# that would wrap. The full log always remains on disk.
+_DIALOG_POPUP_LOG_LINES: int = 20
+_DIALOG_POPUP_LOG_KB: int = 2
+
+
+def _format_log_for_dialog(log_text: str, max_lines: int, max_kb: int) -> str:
+    """Latest run's log tail, bounded to fit a native dialog.
+
+    Applies the byte cap first (bounds a pathologically wide line that
+    would wrap into many display rows), then the line cap (the dominant
+    driver of a non-scrolling dialog's height). Line-last keeps the line
+    bound exact and leaves a single truncation marker -- the byte cap's
+    own head marker, if any, is dropped by the line cap. Keeps the tail
+    so the most recent failure output stays visible.
+    """
+    latest = extract_latest_log_entry(log_text)
+    trimmed, _ = _head_truncate_to_kb(latest, max_kb)
+    trimmed, _ = _head_truncate_to_lines(trimmed, max_lines)
+    return trimmed
 
 
 def _send_dialog_popup_for(
@@ -403,7 +443,9 @@ def _send_dialog_popup_for(
     title = f"crony: {full_name} {result.exit_class} (exit {result.exit_code})"
     body = _format_summary(result, full_name)
     if defaults.notify_attach_log and log_text:
-        tail = _format_log_for_notification(log_text, _DIALOG_POPUP_LOG_KB)
+        tail = _format_log_for_dialog(
+            log_text, _DIALOG_POPUP_LOG_LINES, _DIALOG_POPUP_LOG_KB
+        )
         if tail.strip():
             body = f"{body}{_LOG_SEPARATOR}{tail}"
     host.show_failure_dialog(title, body)

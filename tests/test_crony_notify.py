@@ -736,6 +736,27 @@ class TestDialogPopupNotify:
         # Detached so the modal can't stall the runner.
         assert captured["kwargs"].get("start_new_session") is True
 
+    def test_dispatch_line_bounds_large_log(self, monkeypatch: Any) -> None:
+        # A large multi-line log must reach the dialog body line-bounded
+        # (a `display dialog` grows with its line count and overflows),
+        # with a single truncation marker and the most recent output kept.
+        monkeypatch.setattr(
+            crony_platform, "current_platform", lambda: "darwin"
+        )
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(
+            crony_commands.subprocess,
+            "Popen",
+            lambda cmd, **_k: captured.setdefault("cmd", cmd),
+        )
+        big = "".join(f"logline{i}\n" for i in range(200))
+        result = self._make_failed_result(["dialog-popup"])
+        crony_notify.dispatch_notify(result, "default.j", big, Defaults())
+        script = captured["cmd"][2]
+        assert script.count("lines truncated") == 1
+        assert "logline199" in script  # tail kept
+        assert "logline0\n" not in script  # head dropped
+
     def test_dispatch_records_failure_off_darwin(
         self, monkeypatch: Any
     ) -> None:
@@ -1150,10 +1171,11 @@ class TestNotifyTestSubcommand:
 
 
 class TestLogHelpers:
-    """Direct unit tests for `extract_latest_log_entry` and
-    `_head_truncate_to_kb`. Exercised end-to-end via TestLogs and
-    TestNtfyNotify; this class isolates the boundary conditions
-    so a regression in either helper surfaces here first.
+    """Direct unit tests for `extract_latest_log_entry`, the
+    `_head_truncate_to_kb` / `_head_truncate_to_lines` caps, and the
+    `_format_log_for_dialog` combiner. Exercised end-to-end via TestLogs,
+    TestNtfyNotify, and TestDialogPopupNotify; this class isolates the
+    boundary conditions so a regression in a helper surfaces here first.
     """
 
     def test_extract_returns_from_last_header(self) -> None:
@@ -1192,6 +1214,40 @@ class TestLogHelpers:
         assert out.startswith("[... ")
         assert "bytes truncated" in out
         assert out.endswith("TAIL")
+
+    def test_head_truncate_lines_under_cap_passes_through(self) -> None:
+        text = "a\nb\nc\n"
+        out, truncated = crony_notify._head_truncate_to_lines(text, 20)
+        assert out == text
+        assert truncated is False
+
+    def test_head_truncate_lines_over_cap_keeps_tail_with_marker(
+        self,
+    ) -> None:
+        text = "".join(f"line{i}\n" for i in range(100))
+        out, truncated = crony_notify._head_truncate_to_lines(text, 20)
+        assert truncated is True
+        lines = out.splitlines()
+        assert len(lines) == 20  # 1 marker + 19 kept
+        assert lines[0].startswith("[... ") and "lines truncated" in lines[0]
+        assert lines[-1] == "line99"
+        assert "line0" not in out
+
+    def test_format_log_for_dialog_bounds_lines_and_bytes(self) -> None:
+        # A large latest-run entry is bounded to both the line and byte
+        # caps, keeping the most recent output.
+        big = "=== run j pid=1 ===\n" + "".join(
+            f"FAIL test_{i}\n" for i in range(200)
+        )
+        out = crony_notify._format_log_for_dialog(big, 20, 2)
+        assert len(out.splitlines()) <= 20
+        assert len(out.encode("utf-8")) <= 2 * 1024
+        assert "test_199" in out
+
+    def test_format_log_for_dialog_byte_cap_trims_wide_line(self) -> None:
+        wide = "=== run j pid=1 ===\n" + "x" * 10000 + "\n"
+        out = crony_notify._format_log_for_dialog(wide, 20, 2)
+        assert len(out.encode("utf-8")) <= 2 * 1024
 
 
 if __name__ == "__main__":
