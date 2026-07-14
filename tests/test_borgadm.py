@@ -24,7 +24,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2049,11 +2049,12 @@ class TestBorgLocksHeld:
 class TestRunBorg:
     """Test the lock-aware borg runner."""
 
-    def _assert_throwaway_cache_env(self, kwargs: dict[str, Any]) -> None:
+    def _assert_throwaway_cache_env(self, kwargs: Mapping[str, Any]) -> None:
         """The bypass path points borg's cache and security dirs at a
         shared throwaway location so the read contends on neither the
         repository nor the cache lock. The dirs sit under one
-        `borgadm-bypass-` parent and inherit the ambient environment."""
+        `borgadm-bypass-` parent and inherit the ambient environment.
+        The parent is removed once run_borg returns."""
         env = kwargs["env"]
         assert env["PATH"] == os.environ["PATH"]
         cache = Path(env["BORG_CACHE_DIR"])
@@ -2062,6 +2063,7 @@ class TestRunBorg:
         assert security.name == "security"
         assert cache.parent == security.parent
         assert cache.parent.name.startswith("borgadm-bypass-")
+        assert not cache.parent.exists()
 
     def test_bypass_inserts_bypass_lock_after_verb(self, mock_cfg: Any) -> None:
         with (
@@ -2105,6 +2107,56 @@ class TestRunBorg:
             mock_cfg.BORG_REPO,
         ]
         self._assert_throwaway_cache_env(kwargs)
+
+    def test_bypass_sudo_clears_root_owned_dirs(self, mock_cfg: Any) -> None:
+        """A sudo'd borg creates the throwaway cache/security dirs
+        root-owned, so the bypass path clears them with sudo before the
+        unprivileged tempdir cleanup runs."""
+        with (
+            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            ba.run_borg(
+                ["borg", "mount", mock_cfg.BORG_REPO, "/mnt"],
+                repo_write=False,
+                bypass_lock=True,
+                sudo=True,
+            )
+        assert mock_run.call_count == 2
+        borg_call, rm_call = mock_run.call_args_list
+        assert borg_call.kwargs["sudo"] is True
+        env = borg_call.kwargs["env"]
+        assert rm_call.args[0] == [
+            "rm",
+            "-rf",
+            env["BORG_CACHE_DIR"],
+            env["BORG_SECURITY_DIR"],
+        ]
+        assert rm_call.kwargs == {"sudo": True, "errok": True}
+        self._assert_throwaway_cache_env(borg_call.kwargs)
+
+    def test_bypass_sudo_clears_dirs_when_borg_fails(
+        self, mock_cfg: Any
+    ) -> None:
+        """The sudo cleanup runs even when the borg command raises."""
+        err = ba.SubprocessError(2, ["borg"], output="", stderr="boom")
+        with (
+            patch.object(
+                ba, "run_cmd", autospec=True, side_effect=[err, None]
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            pytest.raises(ba.SubprocessError),
+        ):
+            ba.run_borg(
+                ["borg", "mount", mock_cfg.BORG_REPO, "/mnt"],
+                repo_write=False,
+                bypass_lock=True,
+                sudo=True,
+            )
+        assert mock_run.call_count == 2
+        rm_call = mock_run.call_args_list[1]
+        assert rm_call.args[0][:2] == ["rm", "-rf"]
+        assert rm_call.kwargs == {"sudo": True, "errok": True}
 
     def test_blocking_free_lock_no_message(
         self, mock_cfg: Any, caplog: Any

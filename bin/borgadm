@@ -920,13 +920,31 @@ def run_borg(
         # a mid-write repo would otherwise trip. A read-only command needs
         # no persistent cache, so the fresh dirs add no meaningful cost.
         base_env = kwargs.pop("env", os.environ)
-        with tempfile.TemporaryDirectory(prefix="borgadm-bypass-") as td:
+        with tempfile.TemporaryDirectory(
+            prefix="borgadm-bypass-", ignore_cleanup_errors=True
+        ) as td:
+            cache_dir = os.path.join(td, "cache")
+            security_dir = os.path.join(td, "security")
             env = {
                 **base_env,
-                "BORG_CACHE_DIR": os.path.join(td, "cache"),
-                "BORG_SECURITY_DIR": os.path.join(td, "security"),
+                "BORG_CACHE_DIR": cache_dir,
+                "BORG_SECURITY_DIR": security_dir,
             }
-            return run_cmd(with_flags(["--bypass-lock"]), env=env, **kwargs)
+            try:
+                return run_cmd(with_flags(["--bypass-lock"]), env=env, **kwargs)
+            finally:
+                # A sudo'd borg creates the throwaway dirs root-owned,
+                # which the unprivileged TemporaryDirectory cleanup cannot
+                # remove -- clear them with sudo first. Cleanup failures
+                # (errok, ignore_cleanup_errors) degrade to a leaked tmp
+                # dir rather than an exception that would mask the borg
+                # result.
+                if kwargs.get("sudo"):
+                    run_cmd(
+                        ["rm", "-rf", cache_dir, security_dir],
+                        sudo=True,
+                        errok=True,
+                    )
     cfg = get_cfg()
     if borg_locks_held():
         logger.info(
