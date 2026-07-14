@@ -321,36 +321,38 @@ Send a synthetic failure notification.
 ### STATUS values
 
 - **`ok`**\
-  The job's last run completed successfully. For a job group: the group got
-  every child it was asked to run running (a disabled child is skipped, not
-  run) -- whatever those children then did is reported on their own rows, and
-  a failing child does not fail its group.
+  Jobs and groups. The job's last run completed successfully. For a job group:
+  the group got every child it was asked to run running (a disabled child is
+  skipped, not run) -- whatever those children then did is reported on their
+  own rows, and a failing child does not fail its group.
 - **`fail`**\
-  The job's last run failed (exited with a non-zero status). For a job group:
-  the group could not fire one of its children -- that child's unit or
-  snapshot is missing on this host, or the scheduler refused to fire it.
+  Jobs and groups. The job's last run failed (exited with a non-zero status).
+  For a job group: the group could not fire one of its children -- that
+  child's unit or snapshot is missing on this host, or the scheduler refused
+  to fire it.
 - **`timeout`**\
-  The job was killed after exceeding its wallclock execution timeout. For a
-  job group: the group ran out of time on a child before it ever saw it
-  running -- its cumulative budget was spent, or the scheduler never started
-  the child.
+  Jobs and groups. The job was killed after exceeding its wallclock execution
+  timeout. For a job group: the group ran out of time on a child before it
+  ever saw it running -- its cumulative budget was spent, or the scheduler
+  never started the child.
 - **`gated`**\
-  The job was skipped due to an execution gate. This is not considered as a
-  job failure.
+  Jobs only. The job was skipped due to an execution gate. This is not
+  considered as a job failure.
 - **`canceled`**\
-  An interactive job run that was canceled / skipped by the user.
+  Jobs and groups. A run canceled or skipped before its command ran -- for an
+  interactive job, one the user declined.
 - **`crashed`**\
-  The scheduler failed to launch a job, or the job was killed/crashed before
-  it could save its exit status to disk.
+  Jobs and groups. The scheduler failed to launch the job or group, or it was
+  killed/crashed before it could save its exit status to disk.
 - **`running`**\
-  The job is currently running.
+  Jobs and groups. The job or group is currently running.
 - **`pending`**\
-  An interactive job is either waiting for an active user, or waiting for that
-  user to confirm execution (via a pop-up dialog).
+  Jobs only. An interactive job is either waiting for an active user, or
+  waiting for that user to confirm execution (via a pop-up dialog).
 - **`never`**\
-  A newly deployed job that hasn't been run yet.
+  Jobs and groups. A newly deployed job or group that hasn't been run yet.
 - **`unknown`**\
-  We're unable to determine the job status.
+  Jobs and groups. We're unable to determine the status.
 
 ### FLAG values
 

@@ -324,38 +324,48 @@ It can be run manually via the \(gatrigger\(ga subcommand, and re\-enabled via t
 .SS STATUS values
 .TP
 \f[I]ok\f[R]
+Jobs and groups.\&
 The job\(aqs last run completed successfully.\&
 For a job group: the group got every child it was asked to run running (a disabled child is skipped, not run) \-\- whatever those children then did is reported on their own rows, and a failing child does not fail its group.\&
 .TP
 \f[I]fail\f[R]
+Jobs and groups.\&
 The job\(aqs last run failed (exited with a non\-zero status).\&
 For a job group: the group could not fire one of its children \-\- that child\(aqs unit or snapshot is missing on this host, or the scheduler refused to fire it.\&
 .TP
 \f[I]timeout\f[R]
+Jobs and groups.\&
 The job was killed after exceeding its wallclock execution timeout.\&
 For a job group: the group ran out of time on a child before it ever saw it running \-\- its cumulative budget was spent, or the scheduler never started the child.\&
 .TP
 \f[I]gated\f[R]
+Jobs only.\&
 The job was skipped due to an execution gate.\&
 This is not considered as a job failure.\&
 .TP
 \f[I]canceled\f[R]
-An interactive job run that was canceled / skipped by the user.\&
+Jobs and groups.\&
+A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined.\&
 .TP
 \f[I]crashed\f[R]
-The scheduler failed to launch a job, or the job was killed/crashed before it could save its exit status to disk.\&
+Jobs and groups.\&
+The scheduler failed to launch the job or group, or it was killed/crashed before it could save its exit status to disk.\&
 .TP
 \f[I]running\f[R]
-The job is currently running.\&
+Jobs and groups.\&
+The job or group is currently running.\&
 .TP
 \f[I]pending\f[R]
+Jobs only.\&
 An interactive job is either waiting for an active user, or waiting for that user to confirm execution (via a pop\-up dialog).\&
 .TP
 \f[I]never\f[R]
-A newly deployed job that hasn\(aqt been run yet.\&
+Jobs and groups.\&
+A newly deployed job or group that hasn\(aqt been run yet.\&
 .TP
 \f[I]unknown\f[R]
-We\(aqre unable to determine the job status.\&
+Jobs and groups.\&
+We\(aqre unable to determine the status.\&
 .SS FLAG values
 .TP
 \f[I]interactive\f[R]
