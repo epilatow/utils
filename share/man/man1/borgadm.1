@@ -92,15 +92,37 @@ Prefix each stdout/stderr message with a timestamp.\&
 Log informational messages, not just warnings.\&
 .SH SUBCOMMANDS
 .TP
-\f[B]automate apply\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]automate apply\f[R] [\-\-config\-only] [\-\-include JOB] [\-\-exclude JOB] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Write borgadm\(aqs crony(1) bundle and deploy the scheduled backup\-creation and check jobs (via launchd on macOS, systemd on Linux).\&
+Passing neither \-\-include nor \-\-exclude reuses the bundle\(aqs recorded job selection.\&
 On macOS the create job runs with Full Disk Access permissions.\&
+.RS
 .TP
-\f[B]automate destroy\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[CR]\-\-config\-only\f[R]
+only write the bundle file; skip running crony apply
+.TP
+\f[CR]\-\-include JOB\f[R]
+keep only these jobs in the bundle (repeatable); cannot be combined with \-\-exclude
+.TP
+\f[CR]\-\-exclude JOB\f[R]
+drop these jobs from the bundle (repeatable); cannot be combined with \-\-include
+.RE
+.TP
+\f[B]automate destroy\f[R] [\-\-config\-only] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Tear down borgadm\(aqs scheduled backup and check jobs and remove its crony(1) bundle.\&
+.RS
 .TP
-\f[B]automate status\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
-Report whether automated backups and checks are deployed, querying crony(1) for their status.\&
+\f[CR]\-\-config\-only\f[R]
+only remove the bundle file; skip running crony destroy
+.RE
+.TP
+\f[B]automate status\f[R] [\-\-config\-only] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+Report whether the crony(1) bundle on disk is current, then query crony(1) for the deployed jobs\(aq status.\&
+.RS
+.TP
+\f[CR]\-\-config\-only\f[R]
+only check the bundle file; skip running crony status
+.RE
 .TP
 \f[B]break\-lock\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Forcibly release a stale lock left on the repository by an interrupted borg run.\&
@@ -267,6 +289,19 @@ skip waiting for any locks (faster, but may race a concurrent backup) (default: 
 .TP
 \f[B]environment\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Print the shell commands needed to run the borg CLI directly against the configured repository.\&
+.SH AUTOMATION JOBS
+.TP
+\f[CR]create\f[R]
+Hourly \(gaborgadm create\(ga: back up every configured set (one archive per set), then prune old archives by the configured retention policy.\&
+.TP
+\f[CR]check\-age\f[R]
+Daily \(gaborgadm check age\(ga: verify the latest full backup is no older than the configured maximum age.\&
+.TP
+\f[CR]check\-prune\f[R]
+Daily \(gaborgadm check prune\(ga: report any partial or unpruned archives left in the repository.\&
+.TP
+\f[CR]check\-full\f[R]
+Weekly \(gaborgadm check full\(ga: verify repository and archive metadata with a full borg check.\&
 .SH CONFIGURATION
 .TP
 \f[CR]BORG_REPO\f[R]

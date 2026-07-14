@@ -105,21 +105,37 @@ To schedule unattended backups and checks via crony(1) run:
 
 ## SUBCOMMANDS
 
-### `automate apply [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `automate apply [--config-only] [--include JOB] [--exclude JOB] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Write borgadm's crony(1) bundle and deploy the scheduled backup-creation and
-check jobs (via launchd on macOS, systemd on Linux). On macOS the create job
-runs with Full Disk Access permissions.
+check jobs (via launchd on macOS, systemd on Linux). Passing neither --include
+nor --exclude reuses the bundle's recorded job selection. On macOS the create
+job runs with Full Disk Access permissions.
 
-### `automate destroy [--config CONFIG] [--verbose] [--timestamp-messages]`
+- **`--config-only`**\
+  only write the bundle file; skip running crony apply
+- **`--include JOB`**\
+  keep only these jobs in the bundle (repeatable); cannot be combined with
+  --exclude
+- **`--exclude JOB`**\
+  drop these jobs from the bundle (repeatable); cannot be combined with
+  --include
+
+### `automate destroy [--config-only] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Tear down borgadm's scheduled backup and check jobs and remove its crony(1)
 bundle.
 
-### `automate status [--config CONFIG] [--verbose] [--timestamp-messages]`
+- **`--config-only`**\
+  only remove the bundle file; skip running crony destroy
 
-Report whether automated backups and checks are deployed, querying crony(1)
-for their status.
+### `automate status [--config-only] [--config CONFIG] [--verbose] [--timestamp-messages]`
+
+Report whether the crony(1) bundle on disk is current, then query crony(1) for
+the deployed jobs' status.
+
+- **`--config-only`**\
+  only check the bundle file; skip running crony status
 
 ### `break-lock [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -287,6 +303,21 @@ Mirror the contents of the latest archive to a target directory with rsync
 
 Print the shell commands needed to run the borg CLI directly against the
 configured repository.
+
+## AUTOMATION JOBS
+
+- **`create`**\
+  Hourly `borgadm create`: back up every configured set (one archive per set),
+  then prune old archives by the configured retention policy.
+- **`check-age`**\
+  Daily `borgadm check age`: verify the latest full backup is no older than
+  the configured maximum age.
+- **`check-prune`**\
+  Daily `borgadm check prune`: report any partial or unpruned archives left in
+  the repository.
+- **`check-full`**\
+  Weekly `borgadm check full`: verify repository and archive metadata with a
+  full borg check.
 
 ## CONFIGURATION
 

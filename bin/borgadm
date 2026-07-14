@@ -48,7 +48,7 @@ if hasattr(signal, "SIGPIPE"):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
@@ -77,6 +77,10 @@ from common.docspec import (  # noqa: E402
     TextSection,
 )
 from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.helpref import (  # noqa: E402
+    ReferenceSection,
+    reference_section_text,
+)
 
 # -----------------------------------------------------------------------------
 # Constants and Globals
@@ -1383,14 +1387,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _automate_require_crony() -> None:
-    # Precondition for the automate subcommand: ensure the sibling crony
-    # tool is usable so apply / status / destroy fail clearly rather
-    # than mid-subprocess. automate drives crony, which owns the
-    # scheduler side (launchd on macOS, systemd on Linux).
-    _crony_path()
-
-
 # Name of the crony bundle borgadm owns: drop-in file `borgadm.toml`,
 # jobs namespaced `borgadm.<op>`.
 _CRONY_BUNDLE = "borgadm"
@@ -1462,37 +1458,127 @@ def _crony_job_uuid(op: str) -> str:
     return str(uuid.uuid5(_CRONY_UUID_NAMESPACE, f"{_CRONY_BUNDLE}-{op}"))
 
 
-def _crony_jobs() -> list[tuple[str, str, str]]:
-    """Return (job-name, command, interval) for each automated job.
+@dataclasses.dataclass(frozen=True)
+class _CronyJob:
+    """One automated job in the crony bundle.
 
-    Every job runs borgadm directly. `create` reads user files; on macOS
-    that needs Full Disk Access, so there its crony job carries the
-    `full-disk-access` flag (set in `_render_crony_bundle`) and crony
-    routes it through Crony.app for the grant. On Linux a user systemd
-    job already reads everything the user owns, so no such flag is added.
-    The `check` commands read only repo metadata and need none on any
-    platform. Each command is a single `/bin/sh -c` string (how crony
-    runs a job's `command`), with paths shell-quoted.
+    `command` is a template with a `{script}` placeholder for the
+    shell-quoted borgadm path, filled in at render time; the rendered
+    string is a single `/bin/sh -c` command (how crony runs a job).
+    `description` feeds the `automate apply --help` job reference and
+    the generated docs' AUTOMATION JOBS section.
     """
-    script = _borgadm_script_path()
 
-    def check(op: str) -> str:
-        return f"{shlex.quote(script)} check {op} --timestamp-messages"
+    name: str
+    command: str
+    interval: str
+    description: str
 
-    return [
-        (
-            "create",
-            f"{shlex.quote(script)} create --timestamp-messages",
-            "1h",
+
+# Every job runs borgadm directly. `create` reads user files; on macOS
+# that needs Full Disk Access, so there its crony job carries the
+# `full-disk-access` flag (set in `_render_crony_bundle`) and crony
+# routes it through Crony.app for the grant. On Linux a user systemd
+# job already reads everything the user owns, so no such flag is added.
+# The `check` commands read only repo metadata and need none on any
+# platform.
+_CRONY_JOBS: tuple[_CronyJob, ...] = (
+    _CronyJob(
+        "create",
+        "{script} create --timestamp-messages",
+        "1h",
+        "Hourly `borgadm create`: back up every configured set (one "
+        "archive per set), then prune old archives by the configured "
+        "retention policy.",
+    ),
+    _CronyJob(
+        "check-age",
+        "{script} check age --timestamp-messages",
+        "1d",
+        "Daily `borgadm check age`: verify the latest full backup is "
+        "no older than the configured maximum age.",
+    ),
+    _CronyJob(
+        "check-prune",
+        "{script} check prune --timestamp-messages",
+        "1d",
+        "Daily `borgadm check prune`: report any partial or unpruned "
+        "archives left in the repository.",
+    ),
+    _CronyJob(
+        "check-full",
+        "{script} check full --timestamp-messages",
+        "7d",
+        "Weekly `borgadm check full`: verify repository and archive "
+        "metadata with a full borg check.",
+    ),
+)
+
+# The valid targets for `automate apply --include` / `--exclude`.
+_CRONY_JOB_NAMES: frozenset[str] = frozenset(j.name for j in _CRONY_JOBS)
+
+# Wrap width for the `automate apply --help` job reference: the body is
+# indented two spaces under its title, so content wraps at 76 to stay
+# within a 78-column help layout. The generated docs render the same
+# reference from structured data (reflowed at display width), so this
+# only governs the terminal --help.
+_AUTOMATE_HELP_WIDTH = 76
+
+
+def _automate_jobs_reference() -> ReferenceSection:
+    """The automation-job reference -- the single source for both the
+    `automate apply --help` epilog and the generated docs' AUTOMATION
+    JOBS section, so the two can't drift."""
+    return ReferenceSection(
+        "Automation Jobs",
+        [(j.name, j.description) for j in _CRONY_JOBS],
+        lead=(
+            "The bundle schedules these jobs through crony(1); "
+            "--include and --exclude take the job names."
         ),
-        ("check-age", check("age"), "1d"),
-        ("check-prune", check("prune"), "1d"),
-        ("check-full", check("full"), "7d"),
-    ]
+    )
 
 
-def _render_crony_bundle() -> str:
+_AUTOMATE_APPLY_EPILOG: str = (
+    reference_section_text(
+        _automate_jobs_reference(), width=_AUTOMATE_HELP_WIDTH
+    )
+    + "\n"
+)
+
+# The generated bundle records which jobs `--include`/`--exclude`
+# picked, so a later bare `apply` and `status` reuse that selection
+# rather than regenerating the full set (and flagging false drift). The
+# two are mutually exclusive, so at most one marker is written.
+_INCLUDE_MARKER = "# include:"
+_EXCLUDE_MARKER = "# exclude:"
+
+
+def _selection_from(bundle_text: str) -> tuple[list[str] | None, list[str]]:
+    """The ``(include, exclude)`` a bundle's marker recorded.
+
+    ``include`` is a name list when an include marker is present, else
+    ``None``; ``exclude`` is the name list of an exclude marker, else
+    empty.
+    """
+    for line in bundle_text.splitlines():
+        if line.startswith(_INCLUDE_MARKER):
+            return line[len(_INCLUDE_MARKER) :].split(), []
+        if line.startswith(_EXCLUDE_MARKER):
+            return None, line[len(_EXCLUDE_MARKER) :].split()
+    return None, []
+
+
+def _render_crony_bundle(
+    include: Collection[str] | None = None,
+    exclude: Collection[str] = (),
+) -> str:
     """Render the crony bundle TOML borgadm installs.
+
+    ``include`` keeps only the named jobs, ``exclude`` drops them (at
+    most one is passed); the active selection is recorded as a marker
+    comment in the header so a later render can reproduce it (see
+    `_selection_from`).
 
     priority, the keep-awake flag, env, and the wallclock cap are
     identical for every job, so they live in `[defaults]` (no job
@@ -1524,12 +1610,21 @@ def _render_crony_bundle() -> str:
     repo and backup paths it runs against come from this machine's
     `~/.borgadm`.
     """
+    selected = list(_CRONY_JOBS)
+    if include is not None:
+        included = set(include)
+        selected = [j for j in selected if j.name in included]
+    elif exclude:
+        excluded = set(exclude)
+        selected = [j for j in selected if j.name not in excluded]
+    script = shlex.quote(_borgadm_script_path())
     jobs: dict[str, Any] = {}
-    for name, command, interval in _crony_jobs():
+    for cjob in selected:
+        name = cjob.name
         job: dict[str, Any] = {
             "uuid": _crony_job_uuid(name),
-            "command": command,
-            "interval": interval,
+            "command": cjob.command.format(script=script),
+            "interval": cjob.interval,
         }
         if name == "create":
             job["notify-channels"] = []
@@ -1557,16 +1652,22 @@ def _render_crony_bundle() -> str:
         },
         "job": jobs,
         "target": {
-            "host": {
-                _current_host(): {"jobs": [n for n, _, _ in _crony_jobs()]}
-            }
+            "host": {_current_host(): {"jobs": [j.name for j in selected]}}
         },
     }
-    header = (
-        "# Generated by `borgadm automate apply` -- edits are\n"
-        "# overwritten on the next apply.\n\n"
-    )
-    return header + tomlkit.dumps(doc)
+    header_lines = [
+        "# Generated by `borgadm automate apply` -- edits are",
+        "# overwritten on the next apply.",
+    ]
+    if include is not None:
+        header_lines.append(
+            f"{_INCLUDE_MARKER} {' '.join(sorted(set(include)))}"
+        )
+    elif exclude:
+        header_lines.append(
+            f"{_EXCLUDE_MARKER} {' '.join(sorted(set(exclude)))}"
+        )
+    return "\n".join(header_lines) + "\n\n" + tomlkit.dumps(doc)
 
 
 def do_log_files() -> None:
@@ -1591,9 +1692,9 @@ def _crony_log_paths() -> list[str]:
     except BorgadmError:
         return []
     paths: list[str] = []
-    for name, _command, _interval in _crony_jobs():
+    for cjob in _CRONY_JOBS:
         proc = run_cmd(
-            [crony, "logs", f"{_CRONY_BUNDLE}.{name}", "-p"], errok=True
+            [crony, "logs", f"{_CRONY_BUNDLE}.{cjob.name}", "-p"], errok=True
         )
         lp = proc.stdout.strip()
         if proc.returncode == 0 and lp:
@@ -1601,26 +1702,64 @@ def _crony_log_paths() -> list[str]:
     return paths
 
 
-def do_automate_status() -> None:
-    _automate_require_crony()
-    crony = _crony_path()
-    # Without the bundle file crony has no addressable borgadm bundle and
-    # would just error; report the cleaner not-enabled state directly.
-    if not _crony_bundle_path().exists():
-        logger.info("Automation is not enabled (run 'borgadm automate apply').")
+def do_automate_status(config_only: bool) -> None:
+    """Report whether the on-disk bundle is current, then show crony's
+    per-job status table.
+
+    The file check is borgadm's own -- has the bundle drifted from what
+    this borgadm would generate, honoring the file's recorded
+    include/exclude selection so a deliberately dropped job is not
+    mistaken for drift. A stale or missing bundle logs a warning, so
+    the process exits with the WARNING status. `config_only` stops
+    after the file check and never requires crony.
+    """
+    crony = None if config_only else _crony_path()
+    bundle = _crony_bundle_path()
+    if bundle.exists():
+        text = bundle.read_text()
+        include, exclude = _selection_from(text)
+        current = text == _render_crony_bundle(include=include, exclude=exclude)
+    else:
+        current = False
+    global _warning_occurred
+    if not bundle.exists():
+        logger.warning(
+            f"crony bundle not written yet: {bundle} "
+            "(run 'borgadm automate apply' to create it)"
+        )
+        _warning_occurred = True
+    elif not current:
+        logger.warning(
+            f"crony bundle is out of date: {bundle} "
+            "(run 'borgadm automate apply' to regenerate it)"
+        )
+        _warning_occurred = True
+    else:
+        logger.info(f"crony bundle is up to date: {bundle}")
+    if crony is None:
         return
     # crony owns the per-job state (on macOS that includes the Crony.app
     # wrapper health for the full-disk-access create job); show its
-    # table.
+    # table. errok tolerates crony's nonzero exit when the bundle was
+    # never applied -- the file check above already reported that state.
     run_cmd(
         [crony, "status", "-b", _CRONY_BUNDLE], allow_output=True, errok=True
     )
 
 
-def do_automate_destroy() -> None:
-    _automate_require_crony()
-    crony = _crony_path()
+def do_automate_destroy(config_only: bool) -> None:
+    """Remove the deployed jobs, then delete the bundle file.
+
+    `config_only` deletes just the bundle file, leaving any deployed
+    jobs in place, and never requires crony.
+    """
     bundle = _crony_bundle_path()
+    if config_only:
+        if bundle.exists():
+            logger.info(f"Removing crony bundle: {bundle}")
+            bundle.unlink()
+        return
+    crony = _crony_path()
     # `crony destroy` works off crony's on-disk state, so it removes the
     # units and logs even when the bundle file is already gone. Tolerate
     # its failure (errok) so destroying already-destroyed automation --
@@ -1644,14 +1783,34 @@ def do_automate_destroy() -> None:
         bundle.unlink()
 
 
-def do_automate_apply() -> None:
-    _automate_require_crony()
-    crony = _crony_path()
+def do_automate_apply(
+    config_only: bool, include: list[str], exclude: list[str]
+) -> None:
+    """Write the bundle and (unless `config_only`) run `crony apply`.
 
+    `config_only` writes the bundle file and stops, and never requires
+    crony. `include` keeps only the named jobs, `exclude` drops them
+    (the parser has already rejected unknown names and the two options
+    combined). Passing neither reuses the selection recorded in the
+    existing bundle file; passing either replaces it.
+    """
+    include_sel = include or None
     bundle = _crony_bundle_path()
+    if include_sel is None and not exclude:
+        # Bare apply: keep whatever selection the file already records.
+        include_sel, exclude = _selection_from(
+            bundle.read_text() if bundle.exists() else ""
+        )
+    # Resolve crony before writing so a missing crony fails cleanly
+    # instead of leaving an orphan bundle file behind.
+    crony = None if config_only else _crony_path()
     bundle.parent.mkdir(parents=True, exist_ok=True)
-    bundle.write_text(_render_crony_bundle())
+    bundle.write_text(
+        _render_crony_bundle(include=include_sel, exclude=exclude)
+    )
     logger.info(f"Wrote crony bundle: {bundle}")
+    if crony is None:
+        return
     # crony apply reconciles idempotently (deterministic UUIDs), so a
     # re-apply is a no-op update rather than a delete + re-add. On macOS
     # the create job's full-disk-access flag makes crony build Crony.app
@@ -2576,6 +2735,22 @@ def do_config_validate(config: str) -> None:
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
+def _validate_automate_apply(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject a bad `--include`/`--exclude` selection at parse time
+    (exit 2 with the usage line): the two options are mutually
+    exclusive, and every name must be a known automation job."""
+    if args.include and args.exclude:
+        parser.error("--include and --exclude cannot be combined")
+    unknown = (set(args.include) | set(args.exclude)) - _CRONY_JOB_NAMES
+    if unknown:
+        parser.error(
+            f"unknown job(s): {', '.join(sorted(unknown))} "
+            f"(valid: {', '.join(sorted(_CRONY_JOB_NAMES))})"
+        )
+
+
 def _validate_repair(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -2797,18 +2972,22 @@ def args_parser() -> StrictArgumentParser:
         help="Manage automated backups and checks (apply/status/destroy)",
     )
     automate_subparsers = automate.add_command_subparsers(metavar="<command>")
-    automate_subparsers.add_parser(
+    # The raw formatter renders the job-reference epilog verbatim, so
+    # the description is pre-wrapped to fit the 78-column help layout.
+    automate_apply = automate_subparsers.add_parser(
         "apply",
         help="Deploy automated backup creation and checks",
         description=(
-            "Write borgadm's crony(1) bundle and deploy the scheduled "
-            "backup-creation and check jobs (via launchd on macOS, "
-            "systemd on Linux). On macOS the create job runs with Full "
-            "Disk Access permissions."
+            "Write borgadm's crony(1) bundle and deploy the scheduled\n"
+            "backup-creation and check jobs (via launchd on macOS,\n"
+            "systemd on Linux). Passing neither --include nor --exclude\n"
+            "reuses the bundle's recorded job selection. On macOS the\n"
+            "create job runs with Full Disk Access permissions."
         ),
-        formatter_class=DefaultsHelpFormatter,
+        epilog=_AUTOMATE_APPLY_EPILOG,
+        formatter_class=RawDescriptionDefaultsHelpFormatter,
     )
-    automate_subparsers.add_parser(
+    automate_destroy = automate_subparsers.add_parser(
         "destroy",
         help="Tear down automated backup creation and checks",
         description=(
@@ -2817,14 +2996,57 @@ def args_parser() -> StrictArgumentParser:
         ),
         formatter_class=DefaultsHelpFormatter,
     )
-    automate_subparsers.add_parser(
+    automate_status = automate_subparsers.add_parser(
         "status",
         help="Show automation status (via crony(1))",
         description=(
-            "Report whether automated backups and checks are deployed, "
-            "querying crony(1) for their status."
+            "Report whether the crony(1) bundle on disk is current, then "
+            "query crony(1) for the deployed jobs' status."
         ),
         formatter_class=DefaultsHelpFormatter,
+    )
+    for automate_p, config_only_help in (
+        (
+            automate_apply,
+            "only write the bundle file; skip running crony apply",
+        ),
+        (
+            automate_status,
+            "only check the bundle file; skip running crony status",
+        ),
+        (
+            automate_destroy,
+            "only remove the bundle file; skip running crony destroy",
+        ),
+    ):
+        add_argument_ext(
+            automate_p,
+            "--config-only",
+            action="store_true",
+            help=config_only_help,
+        )
+    automate_apply.add_validate_callback(_validate_automate_apply)
+    add_argument_ext(
+        automate_apply,
+        "--include",
+        action="append",
+        default=[],
+        metavar="JOB",
+        help=(
+            "keep only these jobs in the bundle (repeatable); cannot be "
+            "combined with --exclude"
+        ),
+    )
+    add_argument_ext(
+        automate_apply,
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="JOB",
+        help=(
+            "drop these jobs from the bundle (repeatable); cannot be "
+            "combined with --include"
+        ),
     )
 
     add_parser(
@@ -3360,6 +3582,7 @@ MAN_SPEC = ManSpec(
     description=_DESCRIPTION,
     pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
     post_sections=[
+        ItemsSection("AUTOMATION JOBS", _automate_jobs_reference().items),
         ItemsSection("CONFIGURATION", _config_doc_items()),
         ItemsSection("FILES", _files_doc_items()),
     ],

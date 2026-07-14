@@ -1336,9 +1336,14 @@ class TestAutomate:
     ) -> Iterator[tuple[Path, Any]]:
         """A given platform + a temp crony drop-in dir + mocked run_cmd
         (so crony is never really invoked).
+
+        Resets the module warning flag (restored by monkeypatch at
+        teardown) because `do_automate_status` sets it on a stale or
+        missing bundle and it must not leak into later tests.
         """
         dropin = tmp_path / "crony-config"
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
+        monkeypatch.setattr(ba, "_warning_occurred", False)
         with (
             patch.object(ba.platform, "system", return_value=system),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
@@ -1373,7 +1378,7 @@ class TestAutomate:
         self, automate_env: Any
     ) -> None:
         dropin, mock_run = automate_env
-        ba.do_automate_apply()
+        ba.do_automate_apply(config_only=False, include=[], exclude=[])
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         text = bundle.read_text()
@@ -1386,7 +1391,7 @@ class TestAutomate:
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
-        ba.do_automate_destroy()
+        ba.do_automate_destroy(config_only=False)
         assert ["destroy", "-b", "borgadm"] in self._crony_calls(mock_run)
         assert not bundle.exists()
 
@@ -1397,7 +1402,7 @@ class TestAutomate:
         mock_run.return_value = subprocess.CompletedProcess(
             args=[], returncode=2, stdout="", stderr="unknown bundle"
         )
-        ba.do_automate_destroy()
+        ba.do_automate_destroy(config_only=False)
         assert not (dropin / "borgadm.toml").exists()
 
     def test_destroy_surfaces_failure_when_bundle_present(
@@ -1414,7 +1419,7 @@ class TestAutomate:
             args=[], returncode=7, stdout="", stderr="lock held"
         )
         with pytest.raises(ba.BorgadmError, match="crony destroy failed"):
-            ba.do_automate_destroy()
+            ba.do_automate_destroy(config_only=False)
         assert bundle.exists()
 
     def test_status_shells_out_to_crony(self, automate_env: Any) -> None:
@@ -1422,19 +1427,8 @@ class TestAutomate:
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
-        ba.do_automate_status()
+        ba.do_automate_status(config_only=False)
         assert ["status", "-b", "borgadm"] in self._crony_calls(mock_run)
-
-    def test_status_clean_when_not_enabled(
-        self, automate_env: Any, caplog: Any
-    ) -> None:
-        # No bundle file: report the not-enabled state directly instead
-        # of shelling out to crony (which would just error).
-        _dropin, mock_run = automate_env
-        with caplog.at_level(logging.INFO):
-            ba.do_automate_status()
-        assert ["status", "-b", "borgadm"] not in self._crony_calls(mock_run)
-        assert any("not enabled" in r.message for r in caplog.records)
 
     def test_apply_on_linux_omits_full_disk_access(
         self, automate_env_linux: Any
@@ -1444,7 +1438,7 @@ class TestAutomate:
         # full-disk-access flag (a user systemd job already has the
         # access, so no Crony.app grant is needed).
         dropin, mock_run = automate_env_linux
-        ba.do_automate_apply()
+        ba.do_automate_apply(config_only=False, include=[], exclude=[])
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
@@ -1535,14 +1529,250 @@ class TestAutomate:
         assert "darwin" not in doc["target"]
         assert doc["target"]["host"][host]["jobs"] == self.JOB_OPS
 
-    def test_generated_bundle_validates_against_crony(
-        self, tmp_path: Path
+    def test_include_keeps_only_named_jobs(self, automate_env: Any) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True, include=["create", "check-age"], exclude=[]
+        )
+        text = (dropin / "borgadm.toml").read_text()
+        doc = tomllib.loads(text)
+        assert set(doc["job"]) == {"create", "check-age"}
+        host = ba._current_host()
+        assert doc["target"]["host"][host]["jobs"] == ["create", "check-age"]
+        # The marker records the selection sorted, for stable re-renders.
+        assert "# include: check-age create" in text
+
+    def test_exclude_drops_jobs_and_records_sorted_marker(
+        self, automate_env: Any
     ) -> None:
-        # The bundle borgadm generates must be accepted by the real
-        # crony's validator, so a future crony schema change that breaks
-        # borgadm fails here rather than at install time.
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True,
+            include=[],
+            exclude=["check-full", "check-age"],
+        )
+        text = (dropin / "borgadm.toml").read_text()
+        doc = tomllib.loads(text)
+        assert set(doc["job"]) == {"create", "check-prune"}
+        assert "# exclude: check-age check-full" in text
+
+    def test_marker_round_trips_through_render(self, automate_env: Any) -> None:
+        # A rendered bundle's own marker must reproduce the identical
+        # bundle -- the invariant status relies on to detect real drift
+        # without flagging a deliberate selection.
+        del automate_env
+        for kwargs in (
+            {"exclude": ["check-full"]},
+            {"include": ["create", "check-prune"]},
+        ):
+            text = ba._render_crony_bundle(**kwargs)
+            include, exclude = ba._selection_from(text)
+            regenerated = ba._render_crony_bundle(
+                include=include, exclude=exclude
+            )
+            assert regenerated == text
+
+    def test_bare_apply_reuses_recorded_selection(
+        self, automate_env: Any
+    ) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True, include=[], exclude=["check-full"]
+        )
+        first = (dropin / "borgadm.toml").read_text()
+        ba.do_automate_apply(config_only=True, include=[], exclude=[])
+        assert (dropin / "borgadm.toml").read_text() == first
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["automate", "apply", "--include", "bogus"],
+            [
+                "automate",
+                "apply",
+                "--include",
+                "create",
+                "--exclude",
+                "check-age",
+            ],
+        ],
+    )
+    def test_apply_rejects_bad_selection_at_parse_time(
+        self, argv: list[str]
+    ) -> None:
+        # An unknown job name and a mixed --include/--exclude are both
+        # decidable from argv alone, so the parser rejects them (exit 2
+        # with the usage line) before any dispatch.
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(argv)
+        assert exc.value.code == 2
+
+    def test_unknown_job_error_lists_valid_names(self, capsys: Any) -> None:
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_command(["automate", "apply", "--include", "bogus"])
+        err = capsys.readouterr().err
+        assert "unknown job(s): bogus" in err
+        for name in sorted(ba._CRONY_JOB_NAMES):
+            assert name in err
+
+    def test_marker_dedupes_repeated_names(self, automate_env: Any) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True, include=["create", "create"], exclude=[]
+        )
+        assert "# include: create\n" in (dropin / "borgadm.toml").read_text()
+
+    def test_apply_config_only_skips_crony(self, automate_env: Any) -> None:
+        # config-only must neither require nor invoke crony -- it works
+        # even where crony is missing entirely.
+        dropin, mock_run = automate_env
+        with patch.object(
+            ba,
+            "_crony_path",
+            autospec=True,
+            side_effect=ba.BorgadmError("crony not found"),
+        ):
+            ba.do_automate_apply(config_only=True, include=[], exclude=[])
+        assert (dropin / "borgadm.toml").exists()
+        mock_run.assert_not_called()
+
+    def test_apply_leaves_no_bundle_when_crony_missing(
+        self, automate_env: Any
+    ) -> None:
+        # crony resolves before the bundle is written, so a missing crony
+        # fails cleanly instead of leaving an orphan bundle behind.
+        dropin, _mock_run = automate_env
+        with (
+            patch.object(
+                ba,
+                "_crony_path",
+                autospec=True,
+                side_effect=ba.BorgadmError("crony not found"),
+            ),
+            pytest.raises(ba.BorgadmError, match="crony not found"),
+        ):
+            ba.do_automate_apply(config_only=False, include=[], exclude=[])
+        assert not (dropin / "borgadm.toml").exists()
+
+    def test_status_up_to_date(self, automate_env: Any, caplog: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(ba._render_crony_bundle())
+        with caplog.at_level(logging.INFO):
+            ba.do_automate_status(config_only=False)
+        assert not ba._warning_occurred
+        assert any("up to date" in r.message for r in caplog.records)
+        assert ["status", "-b", "borgadm"] in self._crony_calls(mock_run)
+
+    def test_status_out_of_date_sets_warning(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        with caplog.at_level(logging.WARNING):
+            ba.do_automate_status(config_only=False)
+        assert ba._warning_occurred
+        assert any("out of date" in r.message for r in caplog.records)
+        # The drift report does not preempt crony's deployed-state table.
+        assert ["status", "-b", "borgadm"] in self._crony_calls(mock_run)
+
+    def test_status_not_written_sets_warning(
+        self, automate_env: Any, caplog: Any
+    ) -> None:
+        _dropin, _mock_run = automate_env
+        with caplog.at_level(logging.WARNING):
+            ba.do_automate_status(config_only=False)
+        assert ba._warning_occurred
+        assert any("not written yet" in r.message for r in caplog.records)
+
+    def test_status_honors_exclude_marker(self, automate_env: Any) -> None:
+        # A deliberately dropped job (recorded by the marker) is not
+        # mistaken for drift.
+        dropin, _mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(ba._render_crony_bundle(exclude=["check-full"]))
+        ba.do_automate_status(config_only=False)
+        assert not ba._warning_occurred
+
+    def test_status_config_only_skips_crony(self, automate_env: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(ba._render_crony_bundle())
+        with patch.object(
+            ba,
+            "_crony_path",
+            autospec=True,
+            side_effect=ba.BorgadmError("crony not found"),
+        ):
+            ba.do_automate_status(config_only=True)
+        mock_run.assert_not_called()
+
+    def test_destroy_config_only_unlinks_bundle_only(
+        self, automate_env: Any
+    ) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        with patch.object(
+            ba,
+            "_crony_path",
+            autospec=True,
+            side_effect=ba.BorgadmError("crony not found"),
+        ):
+            ba.do_automate_destroy(config_only=True)
+        assert not bundle.exists()
+        mock_run.assert_not_called()
+
+    def test_apply_help_documents_jobs(self) -> None:
+        # The apply --help epilog carries the job reference; every job
+        # name and description must appear so --include/--exclude values
+        # are discoverable from the help alone.
+        parser = ba.args_parser()
+        sub = next(
+            a
+            for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        )
+        automate = sub.choices["automate"]
+        asub = next(
+            a
+            for a in automate._actions
+            if isinstance(a, argparse._SubParsersAction)
+        )
+        help_text = asub.choices["apply"].format_help()
+        assert "Automation Jobs:" in help_text
+        for job in ba._CRONY_JOBS:
+            assert job.name in help_text
+
+    @pytest.mark.parametrize(
+        ("include", "exclude"),
+        [
+            (None, ()),
+            (None, ("check-full",)),
+            (("create",), ()),
+            (None, ("create", "check-age", "check-prune", "check-full")),
+        ],
+    )
+    def test_generated_bundle_validates_against_crony(
+        self,
+        tmp_path: Path,
+        include: tuple[str, ...] | None,
+        exclude: tuple[str, ...],
+    ) -> None:
+        # The bundle borgadm generates -- including one carrying a
+        # selection marker -- must be accepted by the real crony's
+        # validator, so a future crony schema change that breaks borgadm
+        # fails here rather than at install time.
         f = tmp_path / "borgadm.toml"
-        f.write_text(ba._render_crony_bundle())
+        f.write_text(ba._render_crony_bundle(include=include, exclude=exclude))
         crony = ba._crony_path()
         proc = subprocess.run(
             [crony, "config", "validate", "--file", str(f)],
@@ -2988,8 +3218,8 @@ class TestAutomateTimestampFlag:
     """Every automated job passes --timestamp-messages."""
 
     def test_bundle_commands_include_timestamp_messages(self) -> None:
-        for _name, command, _interval in ba._crony_jobs():
-            assert "--timestamp-messages" in command, command
+        for job in ba._CRONY_JOBS:
+            assert "--timestamp-messages" in job.command, job.command
 
 
 class TestTimestampPruning:
