@@ -2092,27 +2092,29 @@ class TestLogFiles:
         assert messages == [str(ba.LOGFILE)]
 
     @pytest.mark.parametrize("system", ["Darwin", "Linux"])
-    def test_shows_crony_log_paths_when_bundle_present(
+    def test_shows_existing_selected_job_logs(
         self, system: str, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
-        # Log paths resolve on any platform crony supports (the bundle is
-        # installed and crony is queried regardless of OS).
+        # A bare bundle deploys the default jobs; each job's run-log shows
+        # only when the file exists (a job that has not run is skipped).
         monkeypatch.setattr(ba.platform, "system", lambda: system)
         bundle = tmp_path / "borgadm.toml"
-        bundle.write_text("# stub\n")
-        log_paths = {
-            job.name: f"/state/crony/borgadm/u-{job.name}/run.log"
-            for job in ba._CRONY_JOBS
-        }
+        bundle.write_text(ba._render_crony_bundle())
+        never_ran = ba._DEFAULT_JOBS[0].name
+        log_of = {j.name: tmp_path / f"{j.name}.log" for j in ba._DEFAULT_JOBS}
+        for name, path in log_of.items():
+            if name != never_ran:
+                path.write_text("log\n")
+        queried: list[str] = []
 
         def fake_run(
             cmd: list[str], *_args: object, **_kwargs: object
         ) -> subprocess.CompletedProcess[str]:
-            # cmd == [crony, "logs", "borgadm.<job>", "-p"]
+            # cmd == [crony, "logs", "borgadm.<job>", "-p"]; crony prints a
+            # structural path whether or not the file exists yet.
             job = cmd[2].split(".", 1)[1]
-            return subprocess.CompletedProcess(
-                cmd, 0, log_paths[job] + "\n", ""
-            )
+            queried.append(job)
+            return subprocess.CompletedProcess(cmd, 0, f"{log_of[job]}\n", "")
 
         with (
             patch.object(
@@ -2124,8 +2126,74 @@ class TestLogFiles:
                 ba.do_log_files()
         messages = [r.message for r in caplog.records]
         assert messages[0] == str(ba.LOGFILE)
-        for lp in log_paths.values():
-            assert lp in messages
+        # Only the bundle's jobs are queried (rsync is not in a bare bundle).
+        assert set(queried) == {j.name for j in ba._DEFAULT_JOBS}
+        assert str(log_of[never_ran]) not in messages
+        for name, path in log_of.items():
+            if name != never_ran:
+                assert str(path) in messages
+
+    def test_queries_only_bundle_selected_jobs(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # A host may install a subset (here `--include rsync`). Jobs absent
+        # from the bundle must not be queried -- otherwise crony errors for
+        # each with "no applied state" and borgadm logs the noise.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        bundle = tmp_path / "borgadm.toml"
+        bundle.write_text(
+            ba._render_crony_bundle(
+                include=["rsync"], rsync_dir=Path("/backups/verify")
+            )
+        )
+        rsync_log = tmp_path / "rsync.log"
+        rsync_log.write_text("log\n")
+        queried: list[str] = []
+
+        def fake_run(
+            cmd: list[str], *_args: object, **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            queried.append(cmd[2].split(".", 1)[1])
+            return subprocess.CompletedProcess(cmd, 0, f"{rsync_log}\n", "")
+
+        with (
+            patch.object(
+                ba, "_crony_bundle_path", autospec=True, return_value=bundle
+            ),
+            patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
+        ):
+            with caplog.at_level(logging.INFO):
+                ba.do_log_files()
+        assert queried == ["rsync"]
+        assert str(rsync_log) in [r.message for r in caplog.records]
+
+    def test_unapplied_bundle_yields_no_crony_paths(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # Bundle written but never applied: crony resolves a structural
+        # path but no log file exists there, so only borgadm's own log
+        # shows -- no path to a missing file.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        bundle = tmp_path / "borgadm.toml"
+        bundle.write_text(ba._render_crony_bundle())
+
+        def fake_run(
+            cmd: list[str], *_args: object, **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            job = cmd[2].split(".", 1)[1]
+            return subprocess.CompletedProcess(
+                cmd, 0, f"{tmp_path}/unapplied/{job}.log\n", ""
+            )
+
+        with (
+            patch.object(
+                ba, "_crony_bundle_path", autospec=True, return_value=bundle
+            ),
+            patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
+        ):
+            with caplog.at_level(logging.INFO):
+                ba.do_log_files()
+        assert [r.message for r in caplog.records] == [str(ba.LOGFILE)]
 
 
 class TestCheck:

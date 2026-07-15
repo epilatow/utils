@@ -1626,6 +1626,28 @@ def _selection_from(bundle_text: str) -> _BundleSelection:
     )
 
 
+def _selected_jobs(
+    include: Collection[str] | None = None,
+    exclude: Collection[str] = (),
+) -> list[_CronyJob]:
+    """The jobs a selection deploys.
+
+    ``include`` keeps only the named jobs (the sole path by which the
+    non-default rsync job joins); ``exclude`` drops names from the
+    defaults; a bare selection is the default set. At most one of the
+    two is meaningful, and ``include`` wins if both are given -- the
+    same precedence `_render_crony_bundle` renders and `_selection_from`
+    records.
+    """
+    if include is not None:
+        included = set(include)
+        return [j for j in _CRONY_JOBS if j.name in included]
+    if exclude:
+        excluded = set(exclude)
+        return [j for j in _DEFAULT_JOBS if j.name not in excluded]
+    return list(_DEFAULT_JOBS)
+
+
 def _render_crony_bundle(
     include: Collection[str] | None = None,
     exclude: Collection[str] = (),
@@ -1673,14 +1695,7 @@ def _render_crony_bundle(
     the repo and backup paths it runs against come from that machine's
     `~/.borgadm`.
     """
-    if include is not None:
-        included = set(include)
-        selected = [j for j in _CRONY_JOBS if j.name in included]
-    elif exclude:
-        excluded = set(exclude)
-        selected = [j for j in _DEFAULT_JOBS if j.name not in excluded]
-    else:
-        selected = list(_DEFAULT_JOBS)
+    selected = _selected_jobs(include, exclude)
     if any(j.name == "rsync" for j in selected) and rsync_dir is None:
         raise ValueError("rsync job selected without a target directory")
     script = shlex.quote(_borgadm_script_path())
@@ -1760,24 +1775,33 @@ def do_log_files() -> None:
 
 
 def _crony_log_paths() -> list[str]:
-    """Return each automated job's crony run-log path when crony is
-    managing the bundle. Empty when crony is missing or when the bundle
-    isn't installed. Each path comes from `crony logs <job> -p`, which
-    resolves structurally from the bundle config (no run required yet).
+    """Return the run-log path of each bundle job whose log file exists.
+
+    Only the jobs the deployed bundle actually selects are queried (a
+    host may install a subset, e.g. `--include rsync`), so a job absent
+    from the bundle is never asked about. A path is returned only when
+    its log file is present: `crony logs <job> -p` resolves the path
+    structurally and prints it even for an entry that was never applied
+    or has not run yet, so the existence check keeps those phantom paths
+    out. Empty when crony is missing or the bundle isn't written.
     """
-    if not _crony_bundle_path().exists():
+    bundle = _crony_bundle_path()
+    if not bundle.exists():
         return []
     try:
         crony = _crony_path()
     except BorgadmError:
         return []
+    sel = _selection_from(bundle.read_text())
     paths: list[str] = []
-    for cjob in _CRONY_JOBS:
+    for cjob in _selected_jobs(sel.include, sel.exclude):
         proc = run_cmd(
-            [crony, "logs", f"{_CRONY_BUNDLE}.{cjob.name}", "-p"], errok=True
+            [crony, "logs", f"{_CRONY_BUNDLE}.{cjob.name}", "-p"],
+            errok=True,
+            log_error=False,
         )
         lp = proc.stdout.strip()
-        if proc.returncode == 0 and lp:
+        if proc.returncode == 0 and lp and Path(lp).exists():
             paths.append(lp)
     return paths
 
