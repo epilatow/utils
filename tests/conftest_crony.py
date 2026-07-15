@@ -242,7 +242,8 @@ def _assert_errored_job_group(
 def _assert_errored_platform_target(
     raw: dict[str, Any], platform: str, match: str
 ) -> None:
-    """As `_assert_errored_job` but for `[target.<platform>]` entries."""
+    """As `_assert_errored_job` but for platform target entries
+    (`[target.platform.<platform>]` or the legacy `[target.<platform>]`)."""
     cfg = _parse(raw)
     assert platform in cfg.errored_platform_targets, (
         f"expected {platform!r} in errored_platform_targets, got "
@@ -557,17 +558,21 @@ class _RunnerHarness:
         Persists the raw config to the on-disk file so subprocess
         re-invocations of `crony _run <child>` (group dispatch) load
         the same config we hand to _run_group. The target keys on the
-        simulated platform so the entries are actually selected when
-        a later `load_config()` resolves the host's target.
+        simulated platform (via the canonical
+        `[target.platform.<platform>]` section) so the entries are
+        actually selected when a later `load_config()` resolves the
+        host's target.
         """
         plat = crony_platform.current_platform()
         full = dict(raw)
         full.setdefault("target", {})
         target_section = full["target"]
         if isinstance(target_section, dict):
-            target_section.setdefault(plat, {})
-            assert isinstance(target_section[plat], dict)
-            target_section[plat].setdefault("jobs", default_target_jobs)
+            platform_section = target_section.setdefault("platform", {})
+            assert isinstance(platform_section, dict)
+            platform_section.setdefault(plat, {})
+            assert isinstance(platform_section[plat], dict)
+            platform_section[plat].setdefault("jobs", default_target_jobs)
         # Re-use uuids previously assigned to the same short name
         # so a successive `h.config(...)` call simulates an edit
         # to the same entity rather than a delete + replace.

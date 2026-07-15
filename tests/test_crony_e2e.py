@@ -174,10 +174,10 @@ class _CronyE2E:
 
     def write_bundle(self, jobs_toml: str, select: list[str]) -> None:
         """Write the reserved bundle: the given `[job.*]` TOML plus a
-        `[target.<platform>]` selecting `select` on this host, then stamp
-        UUIDs (crony rejects an unstamped job)."""
+        `[target.platform.<platform>]` selecting `select` on this host,
+        then stamp UUIDs (crony rejects an unstamped job)."""
         array = "[" + ", ".join(f'"{s}"' for s in select) + "]"
-        body = f"{jobs_toml}\n[target.{_PLATFORM}]\njobs = {array}\n"
+        body = f"{jobs_toml}\n[target.platform.{_PLATFORM}]\njobs = {array}\n"
         (self.dropin_dir / f"{E2E_BUNDLE}.toml").write_text(body)
         self.crony("config", "update", "-b", E2E_BUNDLE)
 

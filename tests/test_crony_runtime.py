@@ -710,7 +710,7 @@ class TestLoadConfig:
         cfg_file.write_text(
             f'[job.a]\nuuid = "{uuid_a}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["a"]\n',
+            '[target.platform.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
         config = crony_runtime.load_config()
@@ -773,7 +773,7 @@ class TestLoadConfig:
         cfg_file.write_text(
             f'[job.a]\nuuid = "{uuid_a}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["a"]\n',
+            '[target.platform.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
         # Build a snapshot that matches what apply would write.
@@ -840,7 +840,7 @@ class TestLoadConfig:
         cfg_file.write_text(
             f'[job.a]\nuuid = "{uuid_a}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["a"]\n',
+            '[target.platform.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
         bundles = TomlConfig.load_all()
@@ -875,7 +875,7 @@ class TestLoadConfig:
         cfg_file.write_text(
             f'[job.a]\nuuid = "{uuid_a}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["a"]\n',
+            '[target.platform.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
         config = crony_runtime.load_config()
@@ -1096,7 +1096,7 @@ class TestResolveMethods:
         cfg_file.write_text(
             f'[job.a]\nuuid = "{uuid_a}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["a"]\n',
+            '[target.platform.darwin]\njobs = ["a"]\n',
             encoding="utf-8",
         )
         config = crony_runtime.load_config()

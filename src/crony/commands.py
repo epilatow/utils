@@ -3139,8 +3139,9 @@ def _validate_file(path: Path) -> None:
     can't see. Lets a tool (or user) pre-flight a generated bundle
     before installing it. Raises ConfigError (exit CONFIG) on any
     error; prints `ok` and returns when clean. A clean file that still
-    uses the legacy underscore key spelling additionally prints one
-    deprecation warning and exits WARNING.
+    uses a deprecated-but-supported spelling (legacy underscore keys, or
+    the flat `[target.<platform>]` target section) additionally prints a
+    deprecation warning per affected spelling and exits WARNING.
     """
     if not path.exists():
         raise crony.errors.ConfigError(f"config not found: {path}")
@@ -3167,9 +3168,17 @@ def _validate_file(path: Path) -> None:
             f"{'entry' if errored == 1 else 'entries'}"
         )
     print(f"ok: {path} validates as bundle {name!r}")
+    deprecations: list[str] = []
     if cfg.legacy_underscore_keys:
+        deprecations.append(_legacy_keys_warning(cfg.legacy_underscore_keys))
+    if cfg.legacy_platform_targets:
+        deprecations.append(
+            _legacy_platform_target_warning(cfg.legacy_platform_targets)
+        )
+    if deprecations:
         print("warnings:")
-        print(f"  - {path}: {_legacy_keys_warning(cfg.legacy_underscore_keys)}")
+        for msg in deprecations:
+            print(f"  - {path}: {msg}")
         # WARNING is not raisable as a CronyError; SystemExit forwards
         # the code through cli() unchanged.
         raise SystemExit(int(crony.errors.ExitCode.WARNING))
@@ -3185,6 +3194,19 @@ def _legacy_keys_warning(keys: list[str]) -> str:
     )
 
 
+def _legacy_platform_target_warning(names: set[str]) -> str:
+    """One-line deprecation notice for a config file still using the
+    legacy flat `[target.<platform>]` spelling. The nested
+    `[target.platform.<platform>]` form is canonical; the flat form
+    still parses but is being phased out."""
+    joined = ", ".join(sorted(names))
+    return (
+        f"legacy flat platform target section(s) [target.{joined}]; "
+        f"[target.platform.<platform>] is the canonical spelling "
+        f"(e.g. [target.platform.{sorted(names)[0]}]) -- update to silence"
+    )
+
+
 def do_validate(bundle: str | None, file: str | None) -> None:
     """Lint configs; report linger status and broken secret files.
 
@@ -3192,8 +3214,10 @@ def do_validate(bundle: str | None, file: str | None) -> None:
     and isolates failed bundles. This subcommand surfaces linger /
     per-bundle warnings as informational output and exits WARNING
     (1) when any are present, CONFIG (3) when no bundles load. A bundle
-    still using the legacy underscore key spelling draws one
-    deprecation warning naming its underscore keys (the dash spelling is
+    still using a deprecated-but-supported spelling draws a deprecation
+    warning: one naming its legacy underscore keys (the dash spelling is
+    canonical), and one for the flat `[target.<platform>]` target
+    section (the nested `[target.platform.<platform>]` form is
     canonical).
     `validate` looks only at the parsed config -- it never inspects
     crony's applied / on-disk state. (Use `crony status` or
@@ -3255,6 +3279,11 @@ def do_validate(bundle: str | None, file: str | None) -> None:
                 f"{b.source}: "
                 f"{_legacy_keys_warning(config.legacy_underscore_keys)}"
             )
+        if config.legacy_platform_targets:
+            plat_warn = _legacy_platform_target_warning(
+                config.legacy_platform_targets
+            )
+            warnings.append(f"{b.source}: {plat_warn}")
 
     print(f"bundles loaded: {len(target_bundles)}")
     for b in target_bundles:

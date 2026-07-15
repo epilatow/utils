@@ -41,7 +41,7 @@ daily, darwin-only job:
     interval = "1d"
     uuid = "$(crony config generate-uuid)"
 
-    [target.darwin]
+    [target.platform.darwin]
     jobs = ["doit"]
     EOF
     crony apply -b darwin-tz-watchdog

@@ -603,21 +603,41 @@ def _parse_bundle_sections(
                         f"[target.host.{hostname}] must be a table"
                     )
                 config.host_targets[hostname] = _parse_target(
-                    hostname, "host", hostbody
+                    hostname, "host", hostbody, f"[target.host.{hostname}]"
+                )
+        elif name == "platform":
+            # [target.platform.<platform>] entries
+            if not isinstance(body, dict):
+                raise crony.errors.ConfigError(
+                    "[target.platform] must be a table"
+                )
+            for pname, pbody in body.items():
+                if not isinstance(pbody, dict):
+                    raise crony.errors.ConfigError(
+                        f"[target.platform.{pname}] must be a table"
+                    )
+                config.platform_targets[pname] = _parse_target(
+                    pname, "platform", pbody, f"[target.platform.{pname}]"
                 )
         elif name == "all":
             # [target.all] catch-all entry
             if not isinstance(body, dict):
                 raise crony.errors.ConfigError("[target.all] must be a table")
-            config.all_target = _parse_target("all", "all", body)
+            config.all_target = _parse_target(
+                "all", "all", body, "[target.all]"
+            )
         else:
-            # [target.<platform>] entry
+            # Legacy flat [target.<platform>] entry. The nested
+            # [target.platform.<platform>] form above is canonical; this
+            # spelling still parses but is recorded so `config validate`
+            # can warn.
             if not isinstance(body, dict):
                 raise crony.errors.ConfigError(
                     f"[target.{name}] must be a table"
                 )
+            config.legacy_platform_targets.add(name)
             config.platform_targets[name] = _parse_target(
-                name, "platform", body
+                name, "platform", body, f"[target.{name}]"
             )
 
 
@@ -664,6 +684,12 @@ class TomlBundleConfig:
     errored_platform_targets: dict[str, str] = field(default_factory=dict)
     errored_host_targets: dict[str, str] = field(default_factory=dict)
     errored_all_target: str | None = None
+    # Platform names declared via the legacy flat `[target.<platform>]`
+    # spelling rather than the canonical nested
+    # `[target.platform.<platform>]`. Both land in `platform_targets`;
+    # this set drives the source-accurate error label and the single
+    # deprecation warning `crony config validate` emits.
+    legacy_platform_targets: set[str] = field(default_factory=set)
     # Legacy underscore-spelled field keys this bundle still uses (the
     # dash spelling is canonical). Populated by `_from_raw`; surfaced as a
     # single deprecation warning per file by `crony config validate`.
@@ -1050,7 +1076,7 @@ class TomlBundle:
             raise crony.errors.ConfigError(f"{path}: {e}") from e
         _demote_duplicate_uuids(config, name)
         # Per-entity error messages are already prefixed with
-        # `[job.X]` / `[job-group.X]` / `[target.X]` /
+        # `[job.X]` / `[job-group.X]` / `[target.platform.X]` /
         # `[target.host.X]` / `[target.all]`; we only prepend the bundle
         # path so the user sees which file produced each error.
         for msg in sorted(config.errored_jobs.values()):
@@ -2136,14 +2162,12 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     )
 
 
-def _parse_target(name: str, kind: str, raw: dict[str, Any]) -> Target:
-    """Parse [target.<platform>], [target.host.<name>], or [target.all]."""
-    if kind == "host":
-        where = f"[target.host.{name}]"
-    elif kind == "all":
-        where = "[target.all]"
-    else:
-        where = f"[target.{name}]"
+def _parse_target(
+    name: str, kind: str, raw: dict[str, Any], where: str
+) -> Target:
+    """Parse a target section; `where` is its source header label
+    (e.g. `[target.platform.darwin]`, `[target.host.<name>]`,
+    `[target.all]`, or the legacy flat `[target.<platform>]`)."""
     if kind == "host":
         _validate_name(name, where)
     raw = _canonical_keys(raw, where)
@@ -2345,7 +2369,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
     errored_names = set(config.errored_jobs) | set(config.errored_job_groups)
 
     # Per-target validation: undefined refs in `jobs`, invalid
-    # platform name for a `[target.<platform>]`, undefined
+    # platform name for a `[target.platform.<platform>]`, undefined
     # notify_channels reference, chain cycle, chain with no
     # schedule, and multi-parent within the target's subtree all
     # demote just the offending target. `platforms` / `hosts`
@@ -2436,7 +2460,12 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
 
     bad_platform: dict[str, str] = {}
     for tname, target in config.platform_targets.items():
-        err = _validate_target(f"[target.{tname}]", tname, target)
+        label = (
+            f"[target.{tname}]"
+            if tname in config.legacy_platform_targets
+            else f"[target.platform.{tname}]"
+        )
+        err = _validate_target(label, tname, target)
         if err is not None:
             bad_platform[tname] = err
     for tname, msg in bad_platform.items():

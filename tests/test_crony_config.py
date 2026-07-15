@@ -807,6 +807,23 @@ class TestDuplicateUuidInBundle:
 
 class TestParseTarget:
     def test_platform_target(self) -> None:
+        # Canonical nested spelling: [target.platform.<platform>].
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "target": {"platform": {"darwin": {"jobs": ["a"]}}},
+            }
+        )
+        assert "darwin" in cfg.platform_targets
+        t = cfg.platform_targets["darwin"]
+        assert t.jobs == ["a"]
+        assert t.kind == "platform"
+        # The canonical spelling is not recorded as legacy.
+        assert cfg.legacy_platform_targets == set()
+
+    def test_legacy_flat_platform_target(self) -> None:
+        # Legacy flat spelling [target.<platform>] still parses to the
+        # same platform target, but is recorded so validate can warn.
         cfg = _parse(
             {
                 "job": {"a": _job()},
@@ -817,6 +834,27 @@ class TestParseTarget:
         t = cfg.platform_targets["darwin"]
         assert t.jobs == ["a"]
         assert t.kind == "platform"
+        assert cfg.legacy_platform_targets == {"darwin"}
+
+    def test_platform_not_a_table(self) -> None:
+        with pytest.raises(ConfigError, match=r"\[target\.platform\] must"):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "target": {"platform": "nope"},
+                }
+            )
+
+    def test_platform_entry_not_a_table(self) -> None:
+        with pytest.raises(
+            ConfigError, match=r"\[target\.platform\.darwin\] must"
+        ):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "target": {"platform": {"darwin": "nope"}},
+                }
+            )
 
     def test_host_target(self) -> None:
         cfg = _parse(
@@ -832,11 +870,24 @@ class TestParseTarget:
         _assert_errored_platform_target(
             {
                 "job": {"a": _job()},
-                "target": {"windows": {"jobs": ["a"]}},
+                "target": {"platform": {"windows": {"jobs": ["a"]}}},
             },
             "windows",
             "platform must be one of",
         )
+
+    def test_errored_platform_target_label_canonical(self) -> None:
+        # An errored canonical platform target names the nested header.
+        cfg = _parse({"target": {"platform": {"darwin": {"jobs": ["nope"]}}}})
+        assert (
+            "[target.platform.darwin]"
+            in (cfg.errored_platform_targets["darwin"])
+        )
+
+    def test_errored_platform_target_label_legacy(self) -> None:
+        # An errored legacy flat platform target names the flat header.
+        cfg = _parse({"target": {"darwin": {"jobs": ["nope"]}}})
+        assert "[target.darwin]" in cfg.errored_platform_targets["darwin"]
 
     def test_all_target(self) -> None:
         # `[target.all]` is the catch-all, not a platform, so it lands
@@ -2257,14 +2308,14 @@ class TestBundleLoading:
     def test_bundle_loads_despite_errored_target(
         self, tmp_path: Path, monkeypatch: Any, caplog: Any
     ) -> None:
-        # A `[target.<platform>]` with a bad ref demotes just
+        # A `[target.platform.<platform>]` with a bad ref demotes just
         # that target -- siblings (here, a host target) remain
         # live and the bundle keeps loading.
         cfg_file, _ = self._setup(tmp_path, monkeypatch)
         cfg_file.write_text(
             _uuid_toml(
                 '[job.a]\ncommand = "true"\nschedule = "daily"\n'
-                '[target.darwin]\njobs = ["nope"]\n'
+                '[target.platform.darwin]\njobs = ["nope"]\n'
                 '[target.host.squee]\njobs = ["a"]\n',
             ),
             encoding="utf-8",
@@ -2278,7 +2329,8 @@ class TestBundleLoading:
         assert "darwin" in config.errored_platform_targets
         assert "squee" in config.host_targets
         assert any(
-            "undefined name" in r.message and "[target.darwin]" in r.message
+            "undefined name" in r.message
+            and "[target.platform.darwin]" in r.message
             for r in caplog.records
         )
 

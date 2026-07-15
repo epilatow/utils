@@ -1102,7 +1102,7 @@ class TestApplyFullSync:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -1121,7 +1121,7 @@ class TestApplyFullSync:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -1584,7 +1584,7 @@ class TestDestroy:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -1621,7 +1621,7 @@ class TestDestroy:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -1655,7 +1655,7 @@ class TestDestroy:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -1717,7 +1717,7 @@ class TestDestroy:
             _uuid_toml(
                 '[job.old_b]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["old_b"]\n',
+                '[target.platform.darwin]\njobs = ["old_b"]\n',
             ),
             encoding="utf-8",
         )
@@ -1732,7 +1732,7 @@ class TestDestroy:
         # as orphan remnants on disk.
         h.config({}, default_target_jobs=[])
         (h.cfg_dropin / "borgadm.toml").write_text(
-            "[target.darwin]\njobs = []\n",
+            "[target.platform.darwin]\njobs = []\n",
             encoding="utf-8",
         )
         crony_commands.do_destroy(
@@ -2771,7 +2771,7 @@ class TestEnableDisable:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -4246,7 +4246,7 @@ class TestStatusReport:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -4438,7 +4438,7 @@ class TestStatusReport:
             _uuid_toml(
                 '[job.k]\ncommand = "true"\nschedule = "*-*-* 04:00"\n'
                 "\n"
-                '[target.darwin]\njobs = ["k"]\n',
+                '[target.platform.darwin]\njobs = ["k"]\n',
             ),
             encoding="utf-8",
         )
@@ -5423,7 +5423,7 @@ class TestValidate:
         h.cfg_file.write_text(
             _uuid_toml(
                 '[job.a]\ncommand = "true"\nschedule = "daily"\n'
-                '[target.darwin]\njobs = ["nope"]\n',
+                '[target.platform.darwin]\njobs = ["nope"]\n',
             ),
             encoding="utf-8",
         )
@@ -5431,8 +5431,28 @@ class TestValidate:
             crony_commands.do_validate(bundle=None, file=None)
         assert exc.value.code == int(ExitCode.WARNING)
         out = capsys.readouterr().out
-        assert "[target.darwin]" in out
+        assert "[target.platform.darwin]" in out
         assert "undefined name" in out
+
+    def test_warns_on_legacy_platform_target(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # An installed bundle using the flat [target.<platform>] spelling
+        # validates but draws the deprecation warning and exits WARNING.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[target.darwin]\njobs = ["a"]\n',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "legacy flat platform target" in out
+        assert "[target.platform.<platform>]" in out
 
     def test_warns_on_errored_all_target(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -5474,7 +5494,7 @@ class TestValidate:
             'interval = "1d"\n'
             'priority = "high"\n'
             "keep-awake = true\n"
-            "[target.darwin]\n"
+            "[target.platform.darwin]\n"
             'jobs = ["create", "check-age"]\n',
             encoding="utf-8",
         )
@@ -5496,7 +5516,7 @@ class TestValidate:
             'command = "wrapper create"\n'
             'interval = "1h"\n'
             "keep_awake = true\n"
-            "[target.darwin]\n"
+            "[target.platform.darwin]\n"
             'jobs = ["create"]\n',
             encoding="utf-8",
         )
@@ -5509,6 +5529,30 @@ class TestValidate:
         assert out.count("legacy underscore-spelled") == 1
         assert "keep_awake" in out
 
+    def test_file_mode_warns_on_legacy_platform_target(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        # The flat [target.<platform>] spelling still parses but draws a
+        # single deprecation warning pointing at the canonical nested
+        # form, and exits WARNING.
+        p = tmp_path / "borgadm.toml"
+        p.write_text(
+            "[job.create]\n"
+            'uuid = "11111111-1111-5111-8111-111111111111"\n'
+            'command = "wrapper create"\n'
+            'interval = "1h"\n'
+            "[target.darwin]\n"
+            'jobs = ["create"]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=str(p))
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "ok" in out
+        assert out.count("legacy flat platform target") == 1
+        assert "[target.platform.<platform>]" in out
+
     def test_file_mode_rejects_invalid_entry(self, tmp_path: Path) -> None:
         p = tmp_path / "borgadm.toml"
         p.write_text(
@@ -5517,7 +5561,7 @@ class TestValidate:
             'command = "true"\n'
             'interval = "1h"\n'
             'priority = "turbo"\n'
-            "[target.darwin]\n"
+            "[target.platform.darwin]\n"
             'jobs = ["create"]\n',
             encoding="utf-8",
         )
@@ -5544,7 +5588,7 @@ class TestValidate:
             'uuid = "11111111-1111-5111-8111-111111111111"\n'
             'command = "true"\n'
             'interval = "1h"\n'
-            "[target.darwin]\n"
+            "[target.platform.darwin]\n"
             'jobs = ["j"]\n',
             encoding="utf-8",
         )
@@ -6160,7 +6204,7 @@ class TestStatusBrokenSurface:
         cfg_file.write_text(
             f'[job.j]\nuuid = "{uuid_value}"\n'
             'command = "true"\nschedule = "daily"\n'
-            '[target.darwin]\njobs = ["j"]\n',
+            '[target.platform.darwin]\njobs = ["j"]\n',
             encoding="utf-8",
         )
         sd = crony_paths.STATE_DIR / "default" / uuid_value

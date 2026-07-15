@@ -252,11 +252,11 @@
 # from the same target -- or two groups that share a child -- is
 # rejected at parse time.
 
-#[target.darwin]
+#[target.platform.darwin]
 #jobs            = ["daily-updates"]
 #notify-channels = ["email"]
 
-#[target.linux]
+#[target.platform.linux]
 #jobs            = ["git-pull-utils"]
 #notify-channels = ["ntfy"]
 

@@ -30,7 +30,7 @@ a daily, darwin\-only job:
     interval = \(dq1d\(dq
     uuid = \(dq$(crony config generate\-uuid)\(dq
 
-    [target.darwin]
+    [target.platform.darwin]
     jobs = [\(dqdoit\(dq]
     EOF
     crony apply \-b darwin\-tz\-watchdog
