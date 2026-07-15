@@ -1547,10 +1547,9 @@ class TestAutomate:
             assert "env" not in doc["job"][op]
             if op != "create":
                 assert "flags" not in doc["job"][op]
-        # Target keys on this host.
-        host = ba._current_host()
-        assert "darwin" not in doc["target"]
-        assert doc["target"]["host"][host]["jobs"] == self.JOB_OPS
+        # The bundle deploys on any host that applies it.
+        assert set(doc["target"]) == {"all"}
+        assert doc["target"]["all"]["jobs"] == self.JOB_OPS
 
     def test_include_keeps_only_named_jobs(self, automate_env: Any) -> None:
         dropin, _mock_run = automate_env
@@ -1564,8 +1563,7 @@ class TestAutomate:
         text = (dropin / "borgadm.toml").read_text()
         doc = tomllib.loads(text)
         assert set(doc["job"]) == {"create", "check-age"}
-        host = ba._current_host()
-        assert doc["target"]["host"][host]["jobs"] == ["create", "check-age"]
+        assert doc["target"]["all"]["jobs"] == ["create", "check-age"]
         # The marker records the selection sorted, for stable re-renders.
         assert "# include: check-age create" in text
 
