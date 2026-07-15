@@ -1,7 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["pytest", "pytest-cov", "pytest-xdist", "tomlkit"]
+# dependencies = [
+#     "pytest",
+#     "pytest-cov",
+#     "pytest-xdist",
+#     "tomlkit",
+#     "pydantic>=2",
+# ]
 # ///
 # This is human generated code that's been AI modified
 
@@ -55,6 +61,7 @@ _REAL_UV_CACHE_DIR = os.environ.get(
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import borgadm as ba  # noqa: E402
+import crony.cli as crony_cli  # noqa: E402
 import crony.unit  # noqa: E402
 
 # The bin script under test, for run_tests' coverage module name and the
@@ -1400,7 +1407,9 @@ class TestAutomate:
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
         ba.do_automate_destroy(config_only=False)
-        assert ["destroy", "-b", "borgadm"] in self._crony_calls(mock_run)
+        assert ["destroy", "-b", "borgadm", "--all"] in self._crony_calls(
+            mock_run
+        )
         assert not bundle.exists()
 
     def test_destroy_is_noop_when_not_applied(self, automate_env: Any) -> None:
@@ -2026,6 +2035,43 @@ class TestAutomate:
             timeout=120,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_emitted_crony_argv_parses_against_crony(
+        self, automate_env: Any
+    ) -> None:
+        # Contract test: every crony invocation borgadm emits must be
+        # accepted by crony's own parser (including its validate
+        # callbacks, e.g. destroy's required target). borgadm shells out
+        # to crony, so a change to crony's CLI contract otherwise breaks
+        # automate silently at runtime with no failing test.
+        dropin, mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(ba._render_crony_bundle())
+        # Drive every handler that shells out to crony. do_log_files
+        # needs the bundle present, so destroy (which unlinks it) runs
+        # last. A new crony shell-out added to borgadm must be driven
+        # here (and its verb added below) or it goes unchecked.
+        ba.do_automate_apply(
+            config_only=False,
+            include=[],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
+        )
+        ba.do_automate_status(config_only=False)
+        ba.do_log_files()
+        ba.do_automate_destroy(config_only=False)
+        # _crony_calls drops the crony path, leaving the argv crony's
+        # own parser sees.
+        argvs = self._crony_calls(mock_run)
+        verbs = {argv[0] for argv in argvs}
+        assert verbs == {"apply", "status", "logs", "destroy"}
+        for argv in argvs:
+            # parse_command runs the verb's validate callback; a broken
+            # contract exits 2 (SystemExit), failing the test.
+            args = crony_cli._build_parser().parse_command(argv)
+            assert args.command == argv[0]
 
 
 class TestLogFiles:

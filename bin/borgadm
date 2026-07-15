@@ -1859,16 +1859,17 @@ def do_automate_destroy(config_only: bool) -> None:
             bundle.unlink()
         return
     crony = _crony_path()
-    # `crony destroy` works off crony's on-disk state, so it removes the
-    # units and logs even when the bundle file is already gone. Tolerate
-    # its failure (errok) so destroying already-destroyed automation --
-    # where crony has no addressable bundle and exits nonzero -- is a
-    # no-op rather than an error. But a present bundle file means the
-    # bundle is installed, so a nonzero exit is a real failure (e.g. a
-    # running job holds the lock) and gets surfaced rather than silently
-    # swallowed.
+    # `crony destroy` requires an explicit target, so `--all` scopes it
+    # to every job in the borgadm bundle. It works off crony's on-disk
+    # state, so it removes the units and logs even when the bundle file
+    # is already gone. Tolerate its failure (errok) so destroying
+    # already-destroyed automation -- where crony has no addressable
+    # bundle and exits nonzero -- is a no-op rather than an error. But a
+    # present bundle file means the bundle is installed, so a nonzero
+    # exit is a real failure (e.g. a running job holds the lock) and gets
+    # surfaced rather than silently swallowed.
     proc = run_cmd(
-        [crony, "destroy", "-b", _CRONY_BUNDLE],
+        [crony, "destroy", "-b", _CRONY_BUNDLE, "--all"],
         allow_output=True,
         errok=True,
     )
