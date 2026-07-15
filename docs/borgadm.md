@@ -248,7 +248,7 @@ showing prune keep tags.
 - **`--bypass-lock, --no-bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
-### `log-files [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `logs [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Print the borgadm log file paths, including those of any deployed automations.
 

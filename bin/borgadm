@@ -1765,7 +1765,7 @@ def _render_crony_bundle(
     return "\n".join(header_lines) + "\n\n" + tomlkit.dumps(doc)
 
 
-def do_log_files() -> None:
+def do_logs() -> None:
     log_paths: list[str] = [str(LOGFILE)]
     for lp in _crony_log_paths():
         if lp not in log_paths:
@@ -3433,7 +3433,8 @@ def args_parser() -> StrictArgumentParser:
     add_bypass_lock(list_cmd, default=False)
 
     add_parser(
-        "log-files",
+        "logs",
+        hidden_aliases=["log"],
         help="Show borgadm log file paths (default and deployed automations)",
         description=(
             "Print the borgadm log file paths, including those of any "
@@ -3566,6 +3567,16 @@ def args_parser() -> StrictArgumentParser:
             ),
         )
 
+    # A parser registered under a hidden alias appears in `choices` under
+    # both its canonical name and the alias, pointing at one object;
+    # dedupe by identity so its common args are added exactly once.
+    common_args_added: set[int] = set()
+
+    def add_common_args_once(p: argparse.ArgumentParser) -> None:
+        if id(p) not in common_args_added:
+            common_args_added.add(id(p))
+            add_common_args(p)
+
     for subparser in subparsers.choices.values():
         has_actions = any(
             isinstance(a, argparse._SubParsersAction)
@@ -3578,9 +3589,9 @@ def args_parser() -> StrictArgumentParser:
             for action in subparser._actions:
                 if isinstance(action, argparse._SubParsersAction):
                     for nested in action.choices.values():
-                        add_common_args(nested)
+                        add_common_args_once(nested)
         else:
-            add_common_args(subparser)
+            add_common_args_once(subparser)
 
     return parser
 
@@ -3610,7 +3621,7 @@ COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
     "environment": do_environment,
     "extract": do_extract,
     "list": do_list,
-    "log-files": do_log_files,
+    "logs": do_logs,
     "prune": do_prune,
     "repair archives": do_repair_archives,
     "repair delete-cache": do_repair_delete_cache,
@@ -3635,7 +3646,7 @@ def main(
         "config",
         "environment",
         "list",
-        "log-files",
+        "logs",
     }
     timed = top_command not in quick_commands
     cmd_start = time.perf_counter()

@@ -2046,7 +2046,7 @@ class TestAutomate:
         bundle = dropin / "borgadm.toml"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text(ba._render_crony_bundle())
-        # Drive every handler that shells out to crony. do_log_files
+        # Drive every handler that shells out to crony. do_logs
         # needs the bundle present, so destroy (which unlinks it) runs
         # last. A new crony shell-out added to borgadm must be driven
         # here (and its verb added below) or it goes unchecked.
@@ -2058,7 +2058,7 @@ class TestAutomate:
             rsync_interval=None,
         )
         ba.do_automate_status(config_only=False)
-        ba.do_log_files()
+        ba.do_logs()
         ba.do_automate_destroy(config_only=False)
         # _crony_calls drops the crony path, leaving the argv crony's
         # own parser sees.
@@ -2072,8 +2072,8 @@ class TestAutomate:
             assert args.command == argv[0]
 
 
-class TestLogFiles:
-    """Test the log-files subcommand (crony-backed)."""
+class TestLogs:
+    """Test the logs subcommand (crony-backed)."""
 
     @pytest.mark.parametrize("system", ["Darwin", "Linux"])
     def test_shows_default_logfile_only_without_bundle(
@@ -2087,7 +2087,7 @@ class TestLogFiles:
             return_value=Path("/nonexistent/borgadm.toml"),
         ):
             with caplog.at_level(logging.INFO):
-                ba.do_log_files()
+                ba.do_logs()
         messages = [r.message for r in caplog.records]
         assert messages == [str(ba.LOGFILE)]
 
@@ -2123,7 +2123,7 @@ class TestLogFiles:
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
         ):
             with caplog.at_level(logging.INFO):
-                ba.do_log_files()
+                ba.do_logs()
         messages = [r.message for r in caplog.records]
         assert messages[0] == str(ba.LOGFILE)
         # Only the bundle's jobs are queried (rsync is not in a bare bundle).
@@ -2163,7 +2163,7 @@ class TestLogFiles:
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
         ):
             with caplog.at_level(logging.INFO):
-                ba.do_log_files()
+                ba.do_logs()
         assert queried == ["rsync"]
         assert str(rsync_log) in [r.message for r in caplog.records]
 
@@ -2192,7 +2192,7 @@ class TestLogFiles:
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
         ):
             with caplog.at_level(logging.INFO):
-                ba.do_log_files()
+                ba.do_logs()
         assert [r.message for r in caplog.records] == [str(ba.LOGFILE)]
 
 
