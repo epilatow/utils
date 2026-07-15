@@ -141,6 +141,20 @@ class TestDarwinKeepAwake:
         assert argv == ["true"]
         assert note is not None and "caffeinate not found" in note
 
+    def test_available_when_caffeinate_present(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda n: "/x/caffeinate" if n == "caffeinate" else None,
+        )
+        assert DarwinHost().keep_awake_available() is True
+
+    def test_unavailable_when_caffeinate_missing(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        assert DarwinHost().keep_awake_available() is False
+
 
 class TestDarwinFullDiskAccess:
     """The FDA host methods route through crony.platform.fda; that module

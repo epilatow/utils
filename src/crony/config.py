@@ -141,7 +141,10 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
         "job via a pop-up."
     ),
     JobFlags.KEEP_AWAKE: (
-        "Prevent the system from sleeping while the job is executing."
+        "Prevent the system from sleeping while the job is executing, "
+        "where the platform allows it. A host that cannot take a sleep "
+        "inhibitor (e.g. an unprivileged Linux user denied the polkit "
+        "action) runs the job without it rather than failing."
     ),
     JobFlags.FULL_DISK_ACCESS: (
         "macOS/Darwin only. Execute the job with TCC Full Disk Access "

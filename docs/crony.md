@@ -64,6 +64,16 @@ it. While linger is disabled, a scheduled job whose time arrives while the
 user is logged out will not run then; instead it runs immediately the next
 time the user logs in.
 
+The keep-awake job flag holds the system awake for the job's duration. On
+systemd platforms this takes a sleep inhibitor, which is a privileged polkit
+action; the seatless user a `systemd --user` job runs as is denied it by
+default, so the job runs without keep-awake rather than failing. The
+`crony status` and `crony config validate` commands warn when a job requests
+keep-awake the host cannot grant. To grant it, install a polkit rule (a
+`.rules` file under `/etc/polkit-1/rules.d/`) that returns `polkit.Result.YES`
+for the `org.freedesktop.login1.inhibit-block-sleep` action when
+`subject.user` is the job's user.
+
 ## COMMON ARGUMENTS
 
 - **`job`**\
@@ -360,7 +370,10 @@ Send a synthetic failure notification.
   macOS/Darwin only. Delay job execution until an active user is detected, and
   then request the user to confirm execution of the job via a pop-up.
 - **`keep-awake`**\
-  Prevent the system from sleeping while the job is executing.
+  Prevent the system from sleeping while the job is executing, where the
+  platform allows it. A host that cannot take a sleep inhibitor (e.g. an
+  unprivileged Linux user denied the polkit action) runs the job without it
+  rather than failing.
 - **`full-disk-access`**\
   macOS/Darwin only. Execute the job with TCC Full Disk Access permissions.
 

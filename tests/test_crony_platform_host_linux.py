@@ -83,12 +83,41 @@ class TestLinuxKeepAwake:
     """LinuxHost.keep_awake_argv wraps the command in `systemd-inhibit`;
     shutil.which (which the backend uses) is stubbed."""
 
-    def test_wraps_with_systemd_inhibit(self, monkeypatch: Any) -> None:
+    @staticmethod
+    def _stub_inhibit(monkeypatch: Any, probe_rc: int, probe_err: str) -> None:
+        # Stub the tool lookup and the inhibitor probe, so no real
+        # systemd-inhibit runs.
         monkeypatch.setattr(
             shutil,
             "which",
             lambda n: "/x/systemd-inhibit" if n == "systemd-inhibit" else None,
         )
+        monkeypatch.setattr(
+            "crony.platform.linux.subprocess.run",
+            lambda *a, **_kwargs: subprocess.CompletedProcess(
+                a[0], probe_rc, "", probe_err
+            ),
+        )
+
+    def test_available_when_probe_succeeds(self, monkeypatch: Any) -> None:
+        self._stub_inhibit(monkeypatch, probe_rc=0, probe_err="")
+        assert LinuxHost().keep_awake_available() is True
+
+    def test_unavailable_when_probe_denied(self, monkeypatch: Any) -> None:
+        self._stub_inhibit(
+            monkeypatch,
+            probe_rc=1,
+            probe_err="Failed to inhibit: Access denied",
+        )
+        assert LinuxHost().keep_awake_available() is False
+
+    def test_unavailable_when_tool_missing(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(shutil, "which", lambda _n: None)
+        assert LinuxHost().keep_awake_available() is False
+
+    def test_wraps_with_systemd_inhibit(self, monkeypatch: Any) -> None:
+        # Inhibitor probe succeeds -> the job is wrapped.
+        self._stub_inhibit(monkeypatch, probe_rc=0, probe_err="")
         argv, note = LinuxHost().keep_awake_argv(
             ["/bin/sh", "-c", "true"], "default.a"
         )
@@ -98,6 +127,20 @@ class TestLinuxKeepAwake:
         assert "--" in argv
         assert argv[-3:] == ["/bin/sh", "-c", "true"]
         assert note is None
+
+    def test_denied_inhibit_runs_unwrapped(self, monkeypatch: Any) -> None:
+        # The probe is denied (the privileged sleep inhibitor): the job
+        # runs unwrapped rather than failing, and the note explains why.
+        self._stub_inhibit(
+            monkeypatch,
+            probe_rc=1,
+            probe_err="Failed to inhibit: Access denied",
+        )
+        argv, note = LinuxHost().keep_awake_argv(["true"], "default.a")
+        assert argv == ["true"]
+        assert note is not None
+        assert "cannot inhibit sleep" in note
+        assert "Access denied" in note
 
     def test_missing_systemd_inhibit_runs_unwrapped(
         self, monkeypatch: Any

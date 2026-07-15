@@ -111,7 +111,17 @@ $USER`. The `crony status` and `crony config validate` commands will check
 if systemd linger is enabled, and if not will emit a warning asking the user
 to enable it. While linger is disabled, a scheduled job whose time arrives
 while the user is logged out will not run then; instead it runs immediately
-the next time the user logs in.\
+the next time the user logs in.
+
+The keep-awake job flag holds the system awake for the job's duration. On
+systemd platforms this takes a sleep inhibitor, which is a privileged polkit
+action; the seatless user a `systemd --user` job runs as is denied it by
+default, so the job runs without keep-awake rather than failing. The `crony
+status` and `crony config validate` commands warn when a job requests
+keep-awake the host cannot grant. To grant it, install a polkit rule (a
+`.rules` file under `/etc/polkit-1/rules.d/`) that returns
+`polkit.Result.YES` for the `org.freedesktop.login1.inhibit-block-sleep`
+action when `subject.user` is the job's user.\
 """
 
 # The `crony status` overview. A module-level constant (rather than an inline

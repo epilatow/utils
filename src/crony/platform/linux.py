@@ -12,6 +12,7 @@ and dialogs raise.
 """
 
 import shutil
+import subprocess
 import time
 
 from crony.platform.fda import FDAWrapper
@@ -92,6 +93,26 @@ class LinuxHost(HostPlatform):
         # fallback owns the secret here.
         return None
 
+    @staticmethod
+    def _sleep_inhibit_probe(tool: str) -> subprocess.CompletedProcess[str]:
+        # Taking a sleep inhibitor is a privileged polkit action: a
+        # headless / seatless user (a scheduled job, an ssh login) is
+        # commonly denied it. Probe with a throwaway command so callers
+        # can tell whether a real wrap would succeed without failing a
+        # job on it.
+        return subprocess.run(
+            [tool, "--what=sleep:idle", "--mode=block", "--", "true"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def keep_awake_available(self) -> bool:
+        tool = shutil.which("systemd-inhibit")
+        if tool is None:
+            return False
+        return self._sleep_inhibit_probe(tool).returncode == 0
+
     def keep_awake_argv(
         self, argv: list[str], label: str
     ) -> tuple[list[str], str | None]:
@@ -100,6 +121,14 @@ class LinuxHost(HostPlatform):
             return (
                 argv,
                 "keep_awake: systemd-inhibit not found; running unwrapped",
+            )
+        probe = self._sleep_inhibit_probe(tool)
+        if probe.returncode != 0:
+            lines = probe.stderr.strip().splitlines()
+            why = lines[-1] if lines else f"exit {probe.returncode}"
+            return (
+                argv,
+                f"keep_awake: cannot inhibit sleep ({why}); running unwrapped",
             )
         return (
             [

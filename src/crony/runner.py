@@ -200,10 +200,11 @@ def _keep_awake_argv(
     Returns (argv, note). When `snap.keep_awake` is set, delegates to
     the HostPlatform to wrap the command in the host's sleep-inhibitor,
     which propagates the wrapped command's exit code and tears it down
-    when killed. A missing helper binary must never fail the job, so the
-    command runs unwrapped and `note` (logged by the caller) explains
-    why. Lid-close on battery still sleeps the machine -- no userspace
-    mechanism prevents that.
+    when killed. An unavailable inhibitor -- a missing helper binary, or
+    a host that denies the inhibitor to the running user -- must never
+    fail the job, so the command runs unwrapped and `note` (logged by
+    the caller) explains why. Lid-close on battery still sleeps the
+    machine -- no userspace mechanism prevents that.
     """
     if not snap.keep_awake:
         return argv, None

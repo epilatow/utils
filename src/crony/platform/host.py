@@ -81,17 +81,29 @@ class HostPlatform(abc.ABC):
         / file fallback, so None simply means "fall through"."""
 
     @abc.abstractmethod
+    def keep_awake_available(self) -> bool:
+        """Whether this host can actually honor keep-awake right now.
+
+        False when the inhibitor tool is missing or the host denies the
+        inhibitor to the running user (on Linux, taking a sleep
+        inhibitor is a privileged polkit action a seatless / headless
+        user is commonly denied). `keep_awake_argv` degrades to running
+        unwrapped in that case; `crony status` uses this to warn when a
+        job wants keep-awake the host cannot deliver."""
+
+    @abc.abstractmethod
     def keep_awake_argv(
         self, argv: list[str], label: str
     ) -> tuple[list[str], str | None]:
         """Wrap `argv` in the host's sleep-inhibitor so the machine
         stays awake while the command runs, returning (wrapped_argv,
         note). The wrapper propagates the command's exit code and tears
-        down when killed. When the inhibitor binary is unavailable,
-        return `argv` unwrapped with a `note` explaining why -- a
-        missing inhibitor must never fail the job. `label` names the job
-        for the inhibitor's bookkeeping. (Lid-close on battery still
-        sleeps the machine; no userspace mechanism prevents that.)"""
+        down when killed. When keep-awake is unavailable
+        (`keep_awake_available` is False), return `argv` unwrapped with a
+        `note` explaining why -- an unavailable inhibitor must never fail
+        the job. `label` names the job for the inhibitor's bookkeeping.
+        (Lid-close on battery still sleeps the machine; no userspace
+        mechanism prevents that.)"""
 
     @abc.abstractmethod
     def full_disk_access_argv(self, argv: list[str]) -> list[str]:

@@ -57,6 +57,11 @@ On systemd\-based platforms, for scheduled jobs to execute when a user is not lo
 Enabling linger requires sudo access and can be done via the following command: \(gasudo loginctl enable\-linger $USER\(ga.\&
 The \(gacrony status\(ga and \(gacrony config validate\(ga commands will check if systemd linger is enabled, and if not will emit a warning asking the user to enable it.\&
 While linger is disabled, a scheduled job whose time arrives while the user is logged out will not run then; instead it runs immediately the next time the user logs in.\&
+.PP
+The keep\-awake job flag holds the system awake for the job\(aqs duration.\&
+On systemd platforms this takes a sleep inhibitor, which is a privileged polkit action; the seatless user a \(gasystemd \-\-user\(ga job runs as is denied it by default, so the job runs without keep\-awake rather than failing.\&
+The \(gacrony status\(ga and \(gacrony config validate\(ga commands warn when a job requests keep\-awake the host cannot grant.\&
+To grant it, install a polkit rule (a \(ga.rules\(ga file under \(ga/etc/polkit\-1/rules.d/\(ga) that returns \(gapolkit.Result.YES\(ga for the \(gaorg.freedesktop.login1.inhibit\-block\-sleep\(ga action when \(gasubject.user\(ga is the job\(aqs user.\&
 .SH COMMON ARGUMENTS
 .TP
 \f[CR]job\f[R]
@@ -373,7 +378,9 @@ macOS/Darwin only.\&
 Delay job execution until an active user is detected, and then request the user to confirm execution of the job via a pop\-up.\&
 .TP
 \f[I]keep\-awake\f[R]
-Prevent the system from sleeping while the job is executing.\&
+Prevent the system from sleeping while the job is executing, where the platform allows it.\&
+A host that cannot take a sleep inhibitor (e.g.\&
+an unprivileged Linux user denied the polkit action) runs the job without it rather than failing.\&
 .TP
 \f[I]full\-disk\-access\f[R]
 macOS/Darwin only.\&

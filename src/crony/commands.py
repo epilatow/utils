@@ -2182,6 +2182,30 @@ def _select_name(
     return pending_name or current_name or ""
 
 
+def _keep_awake_warning(config: crony.model.Config) -> str | None:
+    """A warning for `crony status` / `crony config validate` when a
+    configured job requests keep-awake but this host cannot honor it,
+    else None.
+
+    keep-awake degrades to running the job unwrapped (see
+    `HostPlatform.keep_awake_argv`), so this is advisory, not a job
+    error. On Linux the sleep inhibitor is a privileged polkit action
+    that a seatless job's user is commonly denied.
+    """
+    ka_flag = crony.config.JobFlags.KEEP_AWAKE
+    wants_keep_awake = any(
+        ka_flag in job.flags for job in config.pending.jobs.values()
+    )
+    if not wants_keep_awake or crony.runtime.host().keep_awake_available():
+        return None
+    return (
+        "keep-awake is requested by a job but this host cannot acquire a "
+        "sleep inhibitor, so those jobs run without it. Grant the job's "
+        "user the org.freedesktop.login1.inhibit-block-sleep polkit "
+        "action to enable it."
+    )
+
+
 def do_status(
     jobs: list[str],
     cols: list[ColToken] | None,
@@ -2252,6 +2276,10 @@ def do_status(
         crony.runtime.scheduler().verify()
     except crony.platform.SchedulerWarning as warn:
         logger.warning("%s", warn)
+
+    keep_awake_warn = _keep_awake_warning(config)
+    if keep_awake_warn is not None:
+        logger.warning("%s", keep_awake_warn)
 
     # Surface bundle parse failures at the top of the report so
     # the operator sees them before scanning the table. The table
@@ -3193,6 +3221,9 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             crony.runtime.scheduler().verify()
         except crony.platform.SchedulerWarning as warn:
             warnings.append(str(warn))
+        keep_awake_warn = _keep_awake_warning(crony.runtime.load_config())
+        if keep_awake_warn is not None:
+            warnings.append(keep_awake_warn)
 
     target_bundles = (
         [b for b in bundles.bundles if b.name == bundle]

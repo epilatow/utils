@@ -100,6 +100,11 @@ class DarwinHost(HostPlatform):
             return r.stdout.rstrip("\n")
         return None
 
+    def keep_awake_available(self) -> bool:
+        # caffeinate needs no privilege, so keep-awake is available
+        # whenever the tool is present (it ships with macOS).
+        return shutil.which("caffeinate") is not None
+
     def keep_awake_argv(
         self, argv: list[str], _label: str
     ) -> tuple[list[str], str | None]:

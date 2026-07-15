@@ -1850,6 +1850,115 @@ class TestSchedulerVerifyEmission:
         assert "enable-linger" in caplog.text
 
 
+class TestKeepAwakeWarning:
+    """status warns -- host-level, not job state -- when a configured job
+    requests keep-awake but the host cannot take a sleep inhibitor. The
+    job still runs (unwrapped); the warning tells the operator so. The
+    linger probe is stubbed enabled so only the keep-awake path speaks."""
+
+    @staticmethod
+    def _run_status(caplog: Any) -> str:
+        with caplog.at_level(logging.WARNING):
+            crony_commands.do_status(
+                jobs=[],
+                cols=None,
+                show_masked=False,
+                bundle=None,
+                config_current=False,
+                config_pending=False,
+                exclude_healthy=False,
+            )
+        return str(caplog.text)
+
+    def test_warns_when_keep_awake_unavailable(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "keep-awake": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: True)
+        monkeypatch.setattr(
+            "crony.platform.linux.LinuxHost.keep_awake_available",
+            lambda _self: False,
+        )
+        assert "inhibit-block-sleep" in self._run_status(caplog)
+
+    def test_silent_when_keep_awake_available(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "keep-awake": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: True)
+        monkeypatch.setattr(
+            "crony.platform.linux.LinuxHost.keep_awake_available",
+            lambda _self: True,
+        )
+        assert "inhibit-block-sleep" not in self._run_status(caplog)
+
+    def test_silent_when_no_job_wants_keep_awake(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: True)
+        monkeypatch.setattr(
+            "crony.platform.linux.LinuxHost.keep_awake_available",
+            lambda _self: False,
+        )
+        assert "inhibit-block-sleep" not in self._run_status(caplog)
+
+    def test_validate_surfaces_warning(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # config validate carries the same host-level warning as status.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                        "keep-awake": True,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        monkeypatch.setattr(systemd, "_linger_enabled", lambda _u: True)
+        monkeypatch.setattr(
+            "crony.platform.linux.LinuxHost.keep_awake_available",
+            lambda _self: False,
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        assert "inhibit-block-sleep" in capsys.readouterr().out
+
+
 class TestUvExecutable:
     """`_uv_executable` locates the uv binary baked into platform units.
 
