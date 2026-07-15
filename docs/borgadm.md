@@ -105,12 +105,13 @@ To schedule unattended backups and checks via crony(1) run:
 
 ## SUBCOMMANDS
 
-### `automate apply [--config-only] [--include JOB] [--exclude JOB] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `automate apply [--config-only] [--include JOB] [--exclude JOB] [--rsync-dir DIR] [--rsync-interval INTERVAL] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Write borgadm's crony(1) bundle and deploy the scheduled backup-creation and
 check jobs (via launchd on macOS, systemd on Linux). Passing neither --include
-nor --exclude reuses the bundle's recorded job selection. On macOS the create
-job runs with Full Disk Access permissions.
+nor --exclude reuses the bundle's recorded job selection. The opt-in rsync
+verify job is selected with --include rsync. On macOS the create job runs with
+Full Disk Access permissions.
 
 - **`--config-only`**\
   only write the bundle file; skip running crony apply
@@ -120,6 +121,11 @@ job runs with Full Disk Access permissions.
 - **`--exclude JOB`**\
   drop these jobs from the bundle (repeatable); cannot be combined with
   --include
+- **`--rsync-dir DIR`**\
+  target directory for the rsync verify job (required with --include rsync)
+- **`--rsync-interval INTERVAL`**\
+  override the rsync verify job's interval (default: 1d; only valid with
+  --include rsync)
 
 ### `automate destroy [--config-only] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -318,6 +324,11 @@ configured repository.
 - **`check-full`**\
   Weekly `borgadm check full`: verify repository and archive metadata with a
   full borg check.
+- **`rsync`**\
+  Daily `borgadm rsync`: mirror the latest backup set into --rsync-dir (with
+  --delete) to verify restores work. Not deployed by default -- select with
+  `--include rsync`; the interval is customizable via `--rsync-interval`.
+  Linux only.
 
 ## CONFIGURATION
 

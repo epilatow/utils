@@ -92,9 +92,10 @@ Prefix each stdout/stderr message with a timestamp.\&
 Log informational messages, not just warnings.\&
 .SH SUBCOMMANDS
 .TP
-\f[B]automate apply\f[R] [\-\-config\-only] [\-\-include JOB] [\-\-exclude JOB] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]automate apply\f[R] [\-\-config\-only] [\-\-include JOB] [\-\-exclude JOB] [\-\-rsync\-dir DIR] [\-\-rsync\-interval INTERVAL] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Write borgadm\(aqs crony(1) bundle and deploy the scheduled backup\-creation and check jobs (via launchd on macOS, systemd on Linux).\&
 Passing neither \-\-include nor \-\-exclude reuses the bundle\(aqs recorded job selection.\&
+The opt\-in rsync verify job is selected with \-\-include rsync.\&
 On macOS the create job runs with Full Disk Access permissions.\&
 .RS
 .TP
@@ -106,6 +107,12 @@ keep only these jobs in the bundle (repeatable); cannot be combined with \-\-exc
 .TP
 \f[CR]\-\-exclude JOB\f[R]
 drop these jobs from the bundle (repeatable); cannot be combined with \-\-include
+.TP
+\f[CR]\-\-rsync\-dir DIR\f[R]
+target directory for the rsync verify job (required with \-\-include rsync)
+.TP
+\f[CR]\-\-rsync\-interval INTERVAL\f[R]
+override the rsync verify job\(aqs interval (default: 1d; only valid with \-\-include rsync)
 .RE
 .TP
 \f[B]automate destroy\f[R] [\-\-config\-only] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -302,6 +309,11 @@ Daily \(gaborgadm check prune\(ga: report any partial or unpruned archives left 
 .TP
 \f[CR]check\-full\f[R]
 Weekly \(gaborgadm check full\(ga: verify repository and archive metadata with a full borg check.\&
+.TP
+\f[CR]rsync\f[R]
+Daily \(gaborgadm rsync\(ga: mirror the latest backup set into \-\-rsync\-dir (with \-\-delete) to verify restores work.\&
+Not deployed by default \-\- select with \(ga\-\-include rsync\(ga; the interval is customizable via \(ga\-\-rsync\-interval\(ga.\&
+Linux only.\&
 .SH CONFIGURATION
 .TP
 \f[CR]BORG_REPO\f[R]

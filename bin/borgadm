@@ -64,6 +64,7 @@ from typing import (
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import crony.unit  # noqa: E402
 from common.argparse_ext import (  # noqa: E402
     DefaultsHelpFormatter,
     RawDescriptionDefaultsHelpFormatter,
@@ -1463,16 +1464,21 @@ class _CronyJob:
     """One automated job in the crony bundle.
 
     `command` is a template with a `{script}` placeholder for the
-    shell-quoted borgadm path, filled in at render time; the rendered
-    string is a single `/bin/sh -c` command (how crony runs a job).
-    `description` feeds the `automate apply --help` job reference and
-    the generated docs' AUTOMATION JOBS section.
+    shell-quoted borgadm path (and `{rsync_dir}` for the rsync job),
+    filled in at render time; the rendered string is a single
+    `/bin/sh -c` command (how crony runs a job). `interval` is the
+    default schedule (the rsync job's is overridable via
+    `--rsync-interval`). `default` marks whether a bare `apply` deploys
+    the job; a non-default job is deployed only when named in
+    `--include`. `description` feeds the `automate apply --help` job
+    reference and the generated docs' AUTOMATION JOBS section.
     """
 
     name: str
     command: str
     interval: str
     description: str
+    default: bool
 
 
 # Every job runs borgadm directly. `create` reads user files; on macOS
@@ -1481,7 +1487,9 @@ class _CronyJob:
 # routes it through Crony.app for the grant. On Linux a user systemd
 # job already reads everything the user owns, so no such flag is added.
 # The `check` commands read only repo metadata and need none on any
-# platform.
+# platform. `rsync` extracts the latest backup to verify restores; it
+# is opt-in (non-default), Linux-only, and takes its target directory
+# from `--rsync-dir` (the `{rsync_dir}` placeholder, filled at render).
 _CRONY_JOBS: tuple[_CronyJob, ...] = (
     _CronyJob(
         "create",
@@ -1490,6 +1498,7 @@ _CRONY_JOBS: tuple[_CronyJob, ...] = (
         "Hourly `borgadm create`: back up every configured set (one "
         "archive per set), then prune old archives by the configured "
         "retention policy.",
+        default=True,
     ),
     _CronyJob(
         "check-age",
@@ -1497,6 +1506,7 @@ _CRONY_JOBS: tuple[_CronyJob, ...] = (
         "1d",
         "Daily `borgadm check age`: verify the latest full backup is "
         "no older than the configured maximum age.",
+        default=True,
     ),
     _CronyJob(
         "check-prune",
@@ -1504,6 +1514,7 @@ _CRONY_JOBS: tuple[_CronyJob, ...] = (
         "1d",
         "Daily `borgadm check prune`: report any partial or unpruned "
         "archives left in the repository.",
+        default=True,
     ),
     _CronyJob(
         "check-full",
@@ -1511,11 +1522,28 @@ _CRONY_JOBS: tuple[_CronyJob, ...] = (
         "7d",
         "Weekly `borgadm check full`: verify repository and archive "
         "metadata with a full borg check.",
+        default=True,
+    ),
+    _CronyJob(
+        "rsync",
+        "{script} rsync --delete --timestamp-messages {rsync_dir}",
+        "1d",
+        "Daily `borgadm rsync`: mirror the latest backup set into "
+        "--rsync-dir (with --delete) to verify restores work. Not "
+        "deployed by default -- select with `--include rsync`; the "
+        "interval is customizable via `--rsync-interval`. Linux only.",
+        default=False,
     ),
 )
 
 # The valid targets for `automate apply --include` / `--exclude`.
 _CRONY_JOB_NAMES: frozenset[str] = frozenset(j.name for j in _CRONY_JOBS)
+
+# The jobs a bare `apply` (or `--exclude`, which filters from here)
+# deploys. A non-default job joins only when named in `--include`.
+_DEFAULT_JOBS: tuple[_CronyJob, ...] = tuple(
+    j for j in _CRONY_JOBS if j.default
+)
 
 # Wrap width for the `automate apply --help` job reference: the body is
 # indented two spaces under its title, so content wraps at 76 to stay
@@ -1547,37 +1575,83 @@ _AUTOMATE_APPLY_EPILOG: str = (
 )
 
 # The generated bundle records which jobs `--include`/`--exclude`
-# picked, so a later bare `apply` and `status` reuse that selection
-# rather than regenerating the full set (and flagging false drift). The
-# two are mutually exclusive, so at most one marker is written.
+# picked, plus the rsync job's `--rsync-dir`/`--rsync-interval`, so a
+# later bare `apply` and `status` reuse those settings rather than
+# regenerating a different set (and flagging false drift). include and
+# exclude are mutually exclusive, so at most one of them is written; the
+# rsync markers appear only when the rsync job is selected.
 _INCLUDE_MARKER = "# include:"
 _EXCLUDE_MARKER = "# exclude:"
+_RSYNC_DIR_MARKER = "# rsync-dir:"
+_RSYNC_INTERVAL_MARKER = "# rsync-interval:"
 
 
-def _selection_from(bundle_text: str) -> tuple[list[str] | None, list[str]]:
-    """The ``(include, exclude)`` a bundle's marker recorded.
+@dataclasses.dataclass(frozen=True)
+class _BundleSelection:
+    """The job selection and rsync settings a bundle's markers record.
 
-    ``include`` is a name list when an include marker is present, else
-    ``None``; ``exclude`` is the name list of an exclude marker, else
-    empty.
+    `include` is the recorded `--include` name list, or None when no
+    include marker is present; `exclude` is the `--exclude` name list, or
+    empty. `rsync_dir` / `rsync_interval` are the rsync job's recorded
+    settings, or None when their markers are absent. The fields line up
+    with `_render_crony_bundle`'s parameters, so a selection round-trips
+    through render -> `_selection_from` -> render unchanged.
     """
+
+    include: list[str] | None
+    exclude: list[str]
+    rsync_dir: Path | None
+    rsync_interval: crony.unit.Interval | None
+
+
+def _selection_from(bundle_text: str) -> _BundleSelection:
+    """The selection a bundle's marker comments record.
+
+    The rsync markers can coexist with an `# include: rsync` marker, so
+    every line is scanned rather than returning on the first match.
+    """
+    include: list[str] | None = None
+    exclude: list[str] = []
+    rsync_dir: Path | None = None
+    rsync_interval: crony.unit.Interval | None = None
     for line in bundle_text.splitlines():
-        if line.startswith(_INCLUDE_MARKER):
-            return line[len(_INCLUDE_MARKER) :].split(), []
-        if line.startswith(_EXCLUDE_MARKER):
-            return None, line[len(_EXCLUDE_MARKER) :].split()
-    return None, []
+        if line.startswith(_RSYNC_DIR_MARKER) and rsync_dir is None:
+            rsync_dir = Path(line[len(_RSYNC_DIR_MARKER) :].strip())
+        elif line.startswith(_RSYNC_INTERVAL_MARKER) and rsync_interval is None:
+            rsync_interval = crony.unit.Interval.from_str(
+                line[len(_RSYNC_INTERVAL_MARKER) :].strip()
+            )
+        elif (
+            line.startswith(_INCLUDE_MARKER) and include is None and not exclude
+        ):
+            include = line[len(_INCLUDE_MARKER) :].split()
+        elif (
+            line.startswith(_EXCLUDE_MARKER) and include is None and not exclude
+        ):
+            exclude = line[len(_EXCLUDE_MARKER) :].split()
+    return _BundleSelection(
+        include=include,
+        exclude=exclude,
+        rsync_dir=rsync_dir,
+        rsync_interval=rsync_interval,
+    )
 
 
 def _render_crony_bundle(
     include: Collection[str] | None = None,
     exclude: Collection[str] = (),
+    rsync_dir: Path | None = None,
+    rsync_interval: crony.unit.Interval | None = None,
 ) -> str:
     """Render the crony bundle TOML borgadm installs.
 
-    ``include`` keeps only the named jobs, ``exclude`` drops them (at
-    most one is passed); the active selection is recorded as a marker
-    comment in the header so a later render can reproduce it (see
+    A bare render deploys the default jobs; ``include`` keeps only the
+    named jobs (the only way the non-default rsync job joins), ``exclude``
+    drops names from the defaults (at most one of the two is passed). The
+    rsync job takes its target directory from ``rsync_dir`` and its
+    interval from ``rsync_interval`` (falling back to its `1d` default).
+    The active selection and rsync settings are recorded as marker
+    comments in the header so a later render can reproduce them (see
     `_selection_from`).
 
     priority, the keep-awake flag, env, and the wallclock cap are
@@ -1610,21 +1684,28 @@ def _render_crony_bundle(
     repo and backup paths it runs against come from this machine's
     `~/.borgadm`.
     """
-    selected = list(_CRONY_JOBS)
     if include is not None:
         included = set(include)
-        selected = [j for j in selected if j.name in included]
+        selected = [j for j in _CRONY_JOBS if j.name in included]
     elif exclude:
         excluded = set(exclude)
-        selected = [j for j in selected if j.name not in excluded]
+        selected = [j for j in _DEFAULT_JOBS if j.name not in excluded]
+    else:
+        selected = list(_DEFAULT_JOBS)
+    if any(j.name == "rsync" for j in selected) and rsync_dir is None:
+        raise ValueError("rsync job selected without a target directory")
     script = shlex.quote(_borgadm_script_path())
+    quoted_dir = shlex.quote(str(rsync_dir)) if rsync_dir is not None else ""
     jobs: dict[str, Any] = {}
     for cjob in selected:
         name = cjob.name
+        interval = cjob.interval
+        if name == "rsync" and rsync_interval is not None:
+            interval = str(rsync_interval)
         job: dict[str, Any] = {
             "uuid": _crony_job_uuid(name),
-            "command": cjob.command.format(script=script),
-            "interval": cjob.interval,
+            "command": cjob.command.format(script=script, rsync_dir=quoted_dir),
+            "interval": interval,
         }
         if name == "create":
             job["notify-channels"] = []
@@ -1667,6 +1748,18 @@ def _render_crony_bundle(
         header_lines.append(
             f"{_EXCLUDE_MARKER} {' '.join(sorted(set(exclude)))}"
         )
+    if any(j.name == "rsync" for j in selected):
+        # rsync_dir is guaranteed present here (guarded above); record
+        # the dir and the effective interval so a bare re-apply and the
+        # status currency check reproduce this exact bundle.
+        rsync_job = next(j for j in selected if j.name == "rsync")
+        interval = (
+            str(rsync_interval)
+            if rsync_interval is not None
+            else rsync_job.interval
+        )
+        header_lines.append(f"{_RSYNC_DIR_MARKER} {rsync_dir}")
+        header_lines.append(f"{_RSYNC_INTERVAL_MARKER} {interval}")
     return "\n".join(header_lines) + "\n\n" + tomlkit.dumps(doc)
 
 
@@ -1708,8 +1801,9 @@ def do_automate_status(config_only: bool) -> None:
 
     The file check is borgadm's own -- has the bundle drifted from what
     this borgadm would generate, honoring the file's recorded
-    include/exclude selection so a deliberately dropped job is not
-    mistaken for drift. A stale or missing bundle logs a warning, so
+    include/exclude selection and rsync settings so a deliberately
+    dropped job or a custom rsync dir/interval is not mistaken for
+    drift. A stale or missing bundle logs a warning, so
     the process exits with the WARNING status. `config_only` stops
     after the file check and never requires crony.
     """
@@ -1717,8 +1811,13 @@ def do_automate_status(config_only: bool) -> None:
     bundle = _crony_bundle_path()
     if bundle.exists():
         text = bundle.read_text()
-        include, exclude = _selection_from(text)
-        current = text == _render_crony_bundle(include=include, exclude=exclude)
+        sel = _selection_from(text)
+        current = text == _render_crony_bundle(
+            include=sel.include,
+            exclude=sel.exclude,
+            rsync_dir=sel.rsync_dir,
+            rsync_interval=sel.rsync_interval,
+        )
     else:
         current = False
     global _warning_occurred
@@ -1784,29 +1883,47 @@ def do_automate_destroy(config_only: bool) -> None:
 
 
 def do_automate_apply(
-    config_only: bool, include: list[str], exclude: list[str]
+    config_only: bool,
+    include: list[str],
+    exclude: list[str],
+    rsync_dir: Path | None,
+    rsync_interval: crony.unit.Interval | None,
 ) -> None:
     """Write the bundle and (unless `config_only`) run `crony apply`.
 
     `config_only` writes the bundle file and stops, and never requires
     crony. `include` keeps only the named jobs, `exclude` drops them
-    (the parser has already rejected unknown names and the two options
-    combined). Passing neither reuses the selection recorded in the
-    existing bundle file; passing either replaces it.
+    (the parser has already rejected unknown names, the two options
+    combined, and a bad rsync selection). `rsync_dir` / `rsync_interval`
+    configure the rsync job. Passing none of these reuses the selection
+    and rsync settings recorded in the existing bundle file; passing any
+    replaces them.
     """
     include_sel = include or None
     bundle = _crony_bundle_path()
-    if include_sel is None and not exclude:
-        # Bare apply: keep whatever selection the file already records.
-        include_sel, exclude = _selection_from(
-            bundle.read_text() if bundle.exists() else ""
-        )
+    if (
+        include_sel is None
+        and not exclude
+        and rsync_dir is None
+        and rsync_interval is None
+    ):
+        # Bare apply: keep whatever the file already records.
+        sel = _selection_from(bundle.read_text() if bundle.exists() else "")
+        include_sel = sel.include
+        exclude = sel.exclude
+        rsync_dir = sel.rsync_dir
+        rsync_interval = sel.rsync_interval
     # Resolve crony before writing so a missing crony fails cleanly
     # instead of leaving an orphan bundle file behind.
     crony = None if config_only else _crony_path()
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.write_text(
-        _render_crony_bundle(include=include_sel, exclude=exclude)
+        _render_crony_bundle(
+            include=include_sel,
+            exclude=exclude,
+            rsync_dir=rsync_dir,
+            rsync_interval=rsync_interval,
+        )
     )
     logger.info(f"Wrote crony bundle: {bundle}")
     if crony is None:
@@ -2735,12 +2852,27 @@ def do_config_validate(config: str) -> None:
 # -----------------------------------------------------------------------------
 # Argument Parsing
 # -----------------------------------------------------------------------------
+def _parse_rsync_interval(spec: str) -> crony.unit.Interval:
+    """`--rsync-interval` type: validate against crony's own Interval
+    grammar. Re-raise a bad spec as an argparse error so it surfaces as a
+    clean exit-2 usage message naming the option, rather than argparse's
+    generic 'invalid value' wording."""
+    try:
+        return crony.unit.Interval.from_str(spec)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
 def _validate_automate_apply(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject a bad `--include`/`--exclude` selection at parse time
-    (exit 2 with the usage line): the two options are mutually
-    exclusive, and every name must be a known automation job."""
+    """Reject a bad selection at parse time (exit 2 with the usage
+    line): include/exclude are mutually exclusive, every name must be a
+    known automation job, and the rsync job's options must line up with
+    it being selected. rsync is non-default and Linux-only, so it enters
+    the selection only via an explicit `--include rsync` on this command
+    line -- a truly bare apply (which reuses the recorded markers) trips
+    none of these checks."""
     if args.include and args.exclude:
         parser.error("--include and --exclude cannot be combined")
     unknown = (set(args.include) | set(args.exclude)) - _CRONY_JOB_NAMES
@@ -2749,6 +2881,18 @@ def _validate_automate_apply(
             f"unknown job(s): {', '.join(sorted(unknown))} "
             f"(valid: {', '.join(sorted(_CRONY_JOB_NAMES))})"
         )
+    rsync_selected = "rsync" in args.include
+    # The rsync job runs `borgadm rsync`, which is Linux only, so refuse
+    # to deploy it anywhere it could only ever fail. apply targets the
+    # host it runs on, so this host's platform is the job's platform.
+    if rsync_selected and platform.system() != "Linux":
+        parser.error("the rsync job is Linux only")
+    if rsync_selected and not args.rsync_dir:
+        parser.error("--include rsync requires --rsync-dir DIR")
+    if args.rsync_dir and not rsync_selected:
+        parser.error("--rsync-dir is only valid with --include rsync")
+    if args.rsync_interval and not rsync_selected:
+        parser.error("--rsync-interval is only valid with --include rsync")
 
 
 def _validate_repair(
@@ -2981,7 +3125,8 @@ def args_parser() -> StrictArgumentParser:
             "Write borgadm's crony(1) bundle and deploy the scheduled\n"
             "backup-creation and check jobs (via launchd on macOS,\n"
             "systemd on Linux). Passing neither --include nor --exclude\n"
-            "reuses the bundle's recorded job selection. On macOS the\n"
+            "reuses the bundle's recorded job selection. The opt-in rsync\n"
+            "verify job is selected with --include rsync. On macOS the\n"
             "create job runs with Full Disk Access permissions."
         ),
         epilog=_AUTOMATE_APPLY_EPILOG,
@@ -3046,6 +3191,28 @@ def args_parser() -> StrictArgumentParser:
         help=(
             "drop these jobs from the bundle (repeatable); cannot be "
             "combined with --include"
+        ),
+    )
+    add_argument_ext(
+        automate_apply,
+        "--rsync-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "target directory for the rsync verify job (required with "
+            "--include rsync)"
+        ),
+    )
+    add_argument_ext(
+        automate_apply,
+        "--rsync-interval",
+        type=_parse_rsync_interval,
+        default=None,
+        metavar="INTERVAL",
+        help=(
+            "override the rsync verify job's interval (default: 1d; only "
+            "valid with --include rsync)"
         ),
     )
 

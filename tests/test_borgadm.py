@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,7 @@ _REAL_UV_CACHE_DIR = os.environ.get(
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import borgadm as ba  # noqa: E402
+import crony.unit  # noqa: E402
 
 # The bin script under test, for run_tests' coverage module name and the
 # e2e subprocess fixtures.
@@ -1378,7 +1380,13 @@ class TestAutomate:
         self, automate_env: Any
     ) -> None:
         dropin, mock_run = automate_env
-        ba.do_automate_apply(config_only=False, include=[], exclude=[])
+        ba.do_automate_apply(
+            config_only=False,
+            include=[],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
+        )
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         text = bundle.read_text()
@@ -1438,7 +1446,13 @@ class TestAutomate:
         # full-disk-access flag (a user systemd job already has the
         # access, so no Crony.app grant is needed).
         dropin, mock_run = automate_env_linux
-        ba.do_automate_apply(config_only=False, include=[], exclude=[])
+        ba.do_automate_apply(
+            config_only=False,
+            include=[],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
+        )
         bundle = dropin / "borgadm.toml"
         assert bundle.exists()
         assert ["apply", "-b", "borgadm"] in self._crony_calls(mock_run)
@@ -1532,7 +1546,11 @@ class TestAutomate:
     def test_include_keeps_only_named_jobs(self, automate_env: Any) -> None:
         dropin, _mock_run = automate_env
         ba.do_automate_apply(
-            config_only=True, include=["create", "check-age"], exclude=[]
+            config_only=True,
+            include=["create", "check-age"],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
         )
         text = (dropin / "borgadm.toml").read_text()
         doc = tomllib.loads(text)
@@ -1550,6 +1568,8 @@ class TestAutomate:
             config_only=True,
             include=[],
             exclude=["check-full", "check-age"],
+            rsync_dir=None,
+            rsync_interval=None,
         )
         text = (dropin / "borgadm.toml").read_text()
         doc = tomllib.loads(text)
@@ -1561,14 +1581,19 @@ class TestAutomate:
         # bundle -- the invariant status relies on to detect real drift
         # without flagging a deliberate selection.
         del automate_env
-        for kwargs in (
-            {"exclude": ["check-full"]},
-            {"include": ["create", "check-prune"]},
+        for include_arg, exclude_arg in (
+            (None, ["check-full"]),
+            (["create", "check-prune"], []),
         ):
-            text = ba._render_crony_bundle(**kwargs)
-            include, exclude = ba._selection_from(text)
+            text = ba._render_crony_bundle(
+                include=include_arg, exclude=exclude_arg
+            )
+            sel = ba._selection_from(text)
             regenerated = ba._render_crony_bundle(
-                include=include, exclude=exclude
+                include=sel.include,
+                exclude=sel.exclude,
+                rsync_dir=sel.rsync_dir,
+                rsync_interval=sel.rsync_interval,
             )
             assert regenerated == text
 
@@ -1577,10 +1602,20 @@ class TestAutomate:
     ) -> None:
         dropin, _mock_run = automate_env
         ba.do_automate_apply(
-            config_only=True, include=[], exclude=["check-full"]
+            config_only=True,
+            include=[],
+            exclude=["check-full"],
+            rsync_dir=None,
+            rsync_interval=None,
         )
         first = (dropin / "borgadm.toml").read_text()
-        ba.do_automate_apply(config_only=True, include=[], exclude=[])
+        ba.do_automate_apply(
+            config_only=True,
+            include=[],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
+        )
         assert (dropin / "borgadm.toml").read_text() == first
 
     @pytest.mark.parametrize(
@@ -1620,7 +1655,11 @@ class TestAutomate:
     def test_marker_dedupes_repeated_names(self, automate_env: Any) -> None:
         dropin, _mock_run = automate_env
         ba.do_automate_apply(
-            config_only=True, include=["create", "create"], exclude=[]
+            config_only=True,
+            include=["create", "create"],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
         )
         assert "# include: create\n" in (dropin / "borgadm.toml").read_text()
 
@@ -1634,7 +1673,13 @@ class TestAutomate:
             autospec=True,
             side_effect=ba.BorgadmError("crony not found"),
         ):
-            ba.do_automate_apply(config_only=True, include=[], exclude=[])
+            ba.do_automate_apply(
+                config_only=True,
+                include=[],
+                exclude=[],
+                rsync_dir=None,
+                rsync_interval=None,
+            )
         assert (dropin / "borgadm.toml").exists()
         mock_run.assert_not_called()
 
@@ -1653,7 +1698,13 @@ class TestAutomate:
             ),
             pytest.raises(ba.BorgadmError, match="crony not found"),
         ):
-            ba.do_automate_apply(config_only=False, include=[], exclude=[])
+            ba.do_automate_apply(
+                config_only=False,
+                include=[],
+                exclude=[],
+                rsync_dir=None,
+                rsync_interval=None,
+            )
         assert not (dropin / "borgadm.toml").exists()
 
     def test_status_up_to_date(self, automate_env: Any, caplog: Any) -> None:
@@ -1731,6 +1782,176 @@ class TestAutomate:
         assert not bundle.exists()
         mock_run.assert_not_called()
 
+    def test_rsync_absent_from_default_and_exclude_renders(self) -> None:
+        # rsync is non-default, so a bare render and an --exclude render
+        # (which filters the defaults) never include it.
+        for text in (
+            ba._render_crony_bundle(),
+            ba._render_crony_bundle(exclude=["check-full"]),
+        ):
+            doc = tomllib.loads(text)
+            assert "rsync" not in doc["job"]
+
+    def test_include_rsync_renders_job_with_dir_and_markers(
+        self, automate_env: Any
+    ) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True,
+            include=["rsync"],
+            exclude=[],
+            rsync_dir=Path("/srv/my backups"),
+            rsync_interval=None,
+        )
+        text = (dropin / "borgadm.toml").read_text()
+        doc = tomllib.loads(text)
+        assert set(doc["job"]) == {"rsync"}
+        # Default interval is 1d; the space in the dir is shell-quoted.
+        assert doc["job"]["rsync"]["interval"] == "1d"
+        assert doc["job"]["rsync"]["command"] == (
+            f"{shlex.quote(ba._borgadm_script_path())} rsync --delete "
+            "--timestamp-messages '/srv/my backups'"
+        )
+        assert "# include: rsync" in text
+        assert "# rsync-dir: /srv/my backups" in text
+        assert "# rsync-interval: 1d" in text
+
+    def test_rsync_interval_override_recorded(self, automate_env: Any) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True,
+            include=["rsync"],
+            exclude=[],
+            rsync_dir=Path("/srv/verify"),
+            rsync_interval=crony.unit.Interval.from_str("12h"),
+        )
+        text = (dropin / "borgadm.toml").read_text()
+        doc = tomllib.loads(text)
+        assert doc["job"]["rsync"]["interval"] == "12h"
+        assert "# rsync-interval: 12h" in text
+
+    def test_rsync_markers_round_trip(self) -> None:
+        # A rendered rsync bundle's own markers must reproduce the
+        # identical bundle, so status does not flag a custom dir/interval
+        # as drift. The dir contains a space to exercise raw storage.
+        text = ba._render_crony_bundle(
+            include=["rsync"],
+            rsync_dir=Path("/srv/my backups"),
+            rsync_interval=crony.unit.Interval.from_str("12h"),
+        )
+        sel = ba._selection_from(text)
+        assert sel.include == ["rsync"]
+        assert sel.rsync_dir == Path("/srv/my backups")
+        assert sel.rsync_interval == crony.unit.Interval.from_str("12h")
+        regenerated = ba._render_crony_bundle(
+            include=sel.include,
+            exclude=sel.exclude,
+            rsync_dir=sel.rsync_dir,
+            rsync_interval=sel.rsync_interval,
+        )
+        assert regenerated == text
+
+    def test_bare_apply_reuses_rsync_settings(self, automate_env: Any) -> None:
+        dropin, _mock_run = automate_env
+        ba.do_automate_apply(
+            config_only=True,
+            include=["rsync"],
+            exclude=[],
+            rsync_dir=Path("/srv/verify"),
+            rsync_interval=crony.unit.Interval.from_str("12h"),
+        )
+        first = (dropin / "borgadm.toml").read_text()
+        ba.do_automate_apply(
+            config_only=True,
+            include=[],
+            exclude=[],
+            rsync_dir=None,
+            rsync_interval=None,
+        )
+        assert (dropin / "borgadm.toml").read_text() == first
+
+    def test_status_up_to_date_with_rsync_markers(
+        self, automate_env: Any
+    ) -> None:
+        dropin, _mock_run = automate_env
+        bundle = dropin / "borgadm.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(
+            ba._render_crony_bundle(
+                include=["rsync"],
+                rsync_dir=Path("/srv/verify"),
+                rsync_interval=crony.unit.Interval.from_str("12h"),
+            )
+        )
+        ba.do_automate_status(config_only=True)
+        assert not ba._warning_occurred
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["automate", "apply", "--include", "rsync"],
+            ["automate", "apply", "--rsync-dir", "/x"],
+            ["automate", "apply", "--rsync-interval", "12h"],
+        ],
+    )
+    def test_apply_rejects_bad_rsync_options_at_parse_time(
+        self, argv: list[str]
+    ) -> None:
+        # rsync is non-default and needs a dir, so selecting it without a
+        # dir, or passing a rsync option without selecting rsync, is a
+        # parse-time usage error (exit 2) before any dispatch.
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(argv)
+        assert exc.value.code == 2
+
+    def test_apply_rejects_rsync_on_non_linux(self, monkeypatch: Any) -> None:
+        # `borgadm rsync` is Linux only, so selecting the rsync job on
+        # any other platform is a parse-time usage error rather than a
+        # scheduled job that fails on every run.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Darwin")
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(
+                ["automate", "apply", "--include", "rsync", "--rsync-dir", "/x"]
+            )
+        assert exc.value.code == 2
+
+    def test_apply_accepts_rsync_on_linux(self, monkeypatch: Any) -> None:
+        # The Linux guard must not block the supported platform.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        parser = ba.args_parser()
+        args = parser.parse_command(
+            ["automate", "apply", "--include", "rsync", "--rsync-dir", "/x"]
+        )
+        assert args.command == "automate apply"
+        assert args.include == ["rsync"]
+        assert args.rsync_dir == Path("/x")
+        assert args.rsync_interval is None
+
+    def test_apply_rejects_malformed_rsync_interval(
+        self, monkeypatch: Any
+    ) -> None:
+        # --rsync-interval parses through crony's own Interval grammar, so
+        # a malformed value is a parse-time usage error (exit 2) rather
+        # than a bundle that only crony rejects at apply time.
+        monkeypatch.setattr(ba.platform, "system", lambda: "Linux")
+        parser = ba.args_parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(
+                [
+                    "automate",
+                    "apply",
+                    "--include",
+                    "rsync",
+                    "--rsync-dir",
+                    "/x",
+                    "--rsync-interval",
+                    "garbage",
+                ]
+            )
+        assert exc.value.code == 2
+
     def test_apply_help_documents_jobs(self) -> None:
         # The apply --help epilog carries the job reference; every job
         # name and description must appear so --include/--exclude values
@@ -1751,14 +1972,29 @@ class TestAutomate:
         assert "Automation Jobs:" in help_text
         for job in ba._CRONY_JOBS:
             assert job.name in help_text
+        # The rsync job's options are discoverable from the same help.
+        assert "--rsync-dir" in help_text
+        assert "--rsync-interval" in help_text
 
     @pytest.mark.parametrize(
-        ("include", "exclude"),
+        ("include", "exclude", "rsync_dir", "rsync_interval"),
         [
-            (None, ()),
-            (None, ("check-full",)),
-            (("create",), ()),
-            (None, ("create", "check-age", "check-prune", "check-full")),
+            (None, (), None, None),
+            (None, ("check-full",), None, None),
+            (("create",), (), None, None),
+            (
+                None,
+                ("create", "check-age", "check-prune", "check-full"),
+                None,
+                None,
+            ),
+            (
+                ("rsync",),
+                (),
+                Path("/srv/verify"),
+                crony.unit.Interval.from_str("12h"),
+            ),
+            (("create", "rsync"), (), Path("/srv/verify"), None),
         ],
     )
     def test_generated_bundle_validates_against_crony(
@@ -1766,13 +2002,22 @@ class TestAutomate:
         tmp_path: Path,
         include: tuple[str, ...] | None,
         exclude: tuple[str, ...],
+        rsync_dir: Path | None,
+        rsync_interval: crony.unit.Interval | None,
     ) -> None:
-        # The bundle borgadm generates -- including one carrying a
-        # selection marker -- must be accepted by the real crony's
-        # validator, so a future crony schema change that breaks borgadm
-        # fails here rather than at install time.
+        # The bundle borgadm generates -- including ones carrying a
+        # selection marker or the rsync job -- must be accepted by the
+        # real crony's validator, so a future crony schema change that
+        # breaks borgadm fails here rather than at install time.
         f = tmp_path / "borgadm.toml"
-        f.write_text(ba._render_crony_bundle(include=include, exclude=exclude))
+        f.write_text(
+            ba._render_crony_bundle(
+                include=include,
+                exclude=exclude,
+                rsync_dir=rsync_dir,
+                rsync_interval=rsync_interval,
+            )
+        )
         crony = ba._crony_path()
         proc = subprocess.run(
             [crony, "config", "validate", "--file", str(f)],
@@ -1812,8 +2057,8 @@ class TestLogFiles:
         bundle = tmp_path / "borgadm.toml"
         bundle.write_text("# stub\n")
         log_paths = {
-            op: f"/state/crony/borgadm/u-{op}/run.log"
-            for op in TestAutomate.JOB_OPS
+            job.name: f"/state/crony/borgadm/u-{job.name}/run.log"
+            for job in ba._CRONY_JOBS
         }
 
         def fake_run(
