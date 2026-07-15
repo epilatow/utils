@@ -134,46 +134,46 @@ only check the bundle file; skip running crony status
 \f[B]break\-lock\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Forcibly release a stale lock left on the repository by an interrupted borg run.\&
 .TP
-\f[B]check age\f[R] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [seconds]
+\f[B]check age\f[R] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [seconds]
 Verify that the latest full backup is no older than the configured (or given) maximum age.\&
 .RS
 .TP
 \f[CR]seconds\f[R]
 Maximum backup age, in seconds
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
-\f[B]check archives\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [\-\-latest | archive ...]\&
+\f[B]check archives\f[R] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] [\-\-latest | archive ...]\&
 Verify archive metadata with borg check \-\-archives\-only, over the given archives, the latest full set (\-\-latest), or every archive in the repository.\&
 .RS
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
-\f[B]check prune\f[R] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]check prune\f[R] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Report any partial or unpruned archives left in the repository.\&
 .RS
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
-\f[B]check repo\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]check repo\f[R] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Verify repository metadata with borg check \-\-repository\-only.\&
 .RS
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
-\f[B]check full\f[R] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]check full\f[R] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Verify both repository and archive metadata with a full borg check.\&
 .RS
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
@@ -203,7 +203,7 @@ Create a full backup, writing one archive per configured backup set, then prune 
 Skip backup pruning
 .RE
 .TP
-\f[B]extract\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir [patterns ...]\&
+\f[B]extract\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir [patterns ...]\&
 Extract the latest full backup into a target directory, optionally filtered by include/exclude patterns.\&
 .RS
 .TP
@@ -216,11 +216,11 @@ include/exclude paths matching PATTERN, see \(aqborg help patterns\(aq for detai
 \f[CR]\-\-delete\f[R]
 Delete files in destination not in backup
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip waiting for any locks (faster, but may race a concurrent backup) (default: True)
+\f[CR]\-\-bypass\-lock\f[R]
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
-\f[B]list\f[R] [\-\-latest] [\-\-full\-names] [\-\-keep\-tags | \-\-no\-keep\-tags] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-include\-partial | \-\-no\-include\-partial | \-\-only\-partial] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
+\f[B]list\f[R] [\-\-latest] [\-\-full\-names] [\-\-keep\-tags | \-\-no\-keep\-tags] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-include\-partial | \-\-no\-include\-partial | \-\-only\-partial] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 List backups grouped by timestamp, distinguishing full from partial sets and showing prune keep tags.\&
 .RS
 .TP
@@ -236,7 +236,7 @@ Include partial backups (default: True)
 \f[CR]\-\-only\-partial\f[R]
 Only list partial
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
+\f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
@@ -280,7 +280,7 @@ Default: warn but leave in place.\&
 Either way, an unknown archive in the repo causes list and prune to exit with the WARNING status.\&
 .RE
 .TP
-\f[B]rsync\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock | \-\-no\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir
+\f[B]rsync\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir
 Mirror the contents of the latest archive to a target directory with rsync (Linux only).\&
 .RS
 .TP
@@ -290,8 +290,8 @@ Target directory for extracted backup
 \f[CR]\-\-delete\f[R]
 Delete files in destination not in backup
 .TP
-\f[CR]\-\-bypass\-lock, \-\-no\-bypass\-lock\f[R]
-skip waiting for any locks (faster, but may race a concurrent backup) (default: True)
+\f[CR]\-\-bypass\-lock\f[R]
+skip waiting for any locks (faster, but may race a concurrent backup)
 .RE
 .TP
 \f[B]environment\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]

@@ -3035,16 +3035,14 @@ def args_parser() -> StrictArgumentParser:
             ),
         )
 
-    def add_bypass_lock(
-        parser: argparse.ArgumentParser, *, default: bool
-    ) -> None:
-        # Read-only commands only: a bypassing read skips waiting on any
-        # lock (fast, but may race a concurrent writer); the blocking form
-        # waits for the lock. Writers never bypass, so they omit this.
+    def add_bypass_lock(parser: argparse.ArgumentParser) -> None:
+        # Read-only commands only: every read waits for the lock by
+        # default; --bypass-lock opts in to skipping the wait (fast, but
+        # may race a concurrent writer). Writers never bypass, so they
+        # omit this.
         parser.add_argument(
             "--bypass-lock",
-            action=argparse.BooleanOptionalAction,
-            default=default,
+            action="store_true",
             help=(
                 "skip waiting for any locks (faster, but may race a "
                 "concurrent backup)"
@@ -3250,7 +3248,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=DefaultsHelpFormatter,
     )
     add_seconds(check_age)
-    add_bypass_lock(check_age, default=False)
+    add_bypass_lock(check_age)
 
     check_archives = check_subparsers.add_parser(
         "archives",
@@ -3266,7 +3264,7 @@ def args_parser() -> StrictArgumentParser:
     add_archive(check_archives_target, nargs="*", default=[])
     add_latest(check_archives_target)
     add_progress(check_archives)
-    add_bypass_lock(check_archives, default=False)
+    add_bypass_lock(check_archives)
 
     check_prune = check_subparsers.add_parser(
         "prune",
@@ -3276,7 +3274,7 @@ def args_parser() -> StrictArgumentParser:
         ),
         formatter_class=DefaultsHelpFormatter,
     )
-    add_bypass_lock(check_prune, default=False)
+    add_bypass_lock(check_prune)
 
     check_repo = check_subparsers.add_parser(
         "repo",
@@ -3287,7 +3285,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=DefaultsHelpFormatter,
     )
     add_progress(check_repo)
-    add_bypass_lock(check_repo, default=False)
+    add_bypass_lock(check_repo)
 
     check_full = check_subparsers.add_parser(
         "full",
@@ -3299,7 +3297,7 @@ def args_parser() -> StrictArgumentParser:
         formatter_class=DefaultsHelpFormatter,
     )
     add_progress(check_full)
-    add_bypass_lock(check_full, default=False)
+    add_bypass_lock(check_full)
 
     compact = add_parser(
         "compact",
@@ -3392,7 +3390,7 @@ def args_parser() -> StrictArgumentParser:
     add_delete(extract)
     add_dry_run(extract)
     add_progress(extract)
-    add_bypass_lock(extract, default=True)
+    add_bypass_lock(extract)
 
     list_cmd = add_parser(
         "list",
@@ -3430,7 +3428,7 @@ def args_parser() -> StrictArgumentParser:
         action="store_true",
         help="Only list partial",
     )
-    add_bypass_lock(list_cmd, default=False)
+    add_bypass_lock(list_cmd)
 
     add_parser(
         "logs",
@@ -3527,7 +3525,7 @@ def args_parser() -> StrictArgumentParser:
     add_delete(rsync)
     add_dry_run(rsync)
     add_progress(rsync)
-    add_bypass_lock(rsync, default=True)
+    add_bypass_lock(rsync)
 
     add_parser(
         "environment",

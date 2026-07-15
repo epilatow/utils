@@ -432,6 +432,26 @@ class TestArgumentParser:
                 f"Failed for {argv!r}: expected {attr}={expected!r}"
             )
 
+    def test_bypass_lock_defaults_off_and_opts_in(self) -> None:
+        # Every read-only command respects the lock by default; only an
+        # explicit --bypass-lock skips the wait. There is no negation
+        # flag (--no-bypass-lock is not a valid option).
+        parser = ba.args_parser()
+        cmds = (
+            ["extract", "/tmp/out"],
+            ["rsync", "/tmp/out"],
+            ["list"],
+            ["check", "age"],
+        )
+        for cmd in cmds:
+            assert parser.parse_args(cmd).bypass_lock is False, cmd
+            assert parser.parse_args([*cmd, "--bypass-lock"]).bypass_lock
+            # No negation flag on any read command, not just the two that
+            # used to bypass by default.
+            with pytest.raises(SystemExit) as exc:
+                parser.parse_args([*cmd, "--no-bypass-lock"])
+            assert exc.value.code == 2, cmd
+
     def test_common_args_on_subcommands_without_actions(
         self,
     ) -> None:

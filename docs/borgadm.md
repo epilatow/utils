@@ -148,43 +148,43 @@ the deployed jobs' status.
 Forcibly release a stale lock left on the repository by an interrupted borg
 run.
 
-### `check age [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] [seconds]`
+### `check age [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] [seconds]`
 
 Verify that the latest full backup is no older than the configured (or given)
 maximum age.
 
 - **`seconds`**\
   Maximum backup age, in seconds
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
-### `check archives [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] [--latest | archive ...]`
+### `check archives [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] [--latest | archive ...]`
 
 Verify archive metadata with borg check --archives-only, over the given
 archives, the latest full set (--latest), or every archive in the repository.
 
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
-### `check prune [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `check prune [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Report any partial or unpruned archives left in the repository.
 
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
-### `check repo [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `check repo [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Verify repository metadata with borg check --repository-only.
 
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
-### `check full [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `check full [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Verify both repository and archive metadata with a full borg check.
 
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `compact [--progress] [--config CONFIG] [--verbose] [--timestamp-messages]`
@@ -216,7 +216,7 @@ prune old archives unless --no-prune is given.
 - **`--no-prune`**\
   Skip backup pruning
 
-### `extract [--delete] [--dry-run] [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir [patterns ...]`
+### `extract [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir [patterns ...]`
 
 Extract the latest full backup into a target directory, optionally filtered by
 include/exclude patterns.
@@ -227,11 +227,10 @@ include/exclude patterns.
   include/exclude paths matching PATTERN, see 'borg help patterns' for details
 - **`--delete`**\
   Delete files in destination not in backup
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
-  (default: True)
 
-### `list [--latest] [--full-names] [--keep-tags | --no-keep-tags] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--include-partial | --no-include-partial | --only-partial] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `list [--latest] [--full-names] [--keep-tags | --no-keep-tags] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--include-partial | --no-include-partial | --only-partial] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 List backups grouped by timestamp, distinguishing full from partial sets and
 showing prune keep tags.
@@ -245,7 +244,7 @@ showing prune keep tags.
   Include partial backups (default: True)
 - **`--only-partial`**\
   Only list partial
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
 
 ### `logs [--config CONFIG] [--verbose] [--timestamp-messages]`
@@ -292,7 +291,7 @@ policy, optionally removing unknown archives.
   shape. Default: warn but leave in place. Either way, an unknown archive in
   the repo causes list and prune to exit with the WARNING status.
 
-### `rsync [--delete] [--dry-run] [--progress] [--bypass-lock | --no-bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir`
+### `rsync [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir`
 
 Mirror the contents of the latest archive to a target directory with rsync
 (Linux only).
@@ -301,9 +300,8 @@ Mirror the contents of the latest archive to a target directory with rsync
   Target directory for extracted backup
 - **`--delete`**\
   Delete files in destination not in backup
-- **`--bypass-lock, --no-bypass-lock`**\
+- **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
-  (default: True)
 
 ### `environment [--config CONFIG] [--verbose] [--timestamp-messages]`
 
