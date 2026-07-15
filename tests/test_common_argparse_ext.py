@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from common.argparse_ext import (  # noqa: E402
     DefaultsHelpFormatter,
     RawDescriptionDefaultsHelpFormatter,
+    SingleUseBooleanOptionalAction,
     StrictArgumentParser,
     StrictSubParsersAction,
     add_argument_ext,
@@ -74,6 +75,135 @@ class TestStrictArgumentParser:
         with pytest.raises(SystemExit):
             p.parse_args(["group", "do", "--bogus"])
         assert "tool group do:" in capsys.readouterr().err
+
+
+class TestSingleUseDefault:
+    """Every store-family optional is single-use by default; the
+    collectors (append/extend/count) stay multi-use."""
+
+    @staticmethod
+    def _parser() -> StrictArgumentParser:
+        p = StrictArgumentParser(prog="tool")
+        p.add_argument("-p", "--profile")
+        p.add_argument("--verbose", action="store_true")
+        p.add_argument("--cache", action="store_false")
+        p.add_argument("-d", "--domain", dest="domains", action="append")
+        p.add_argument("names", nargs="*")
+        return p
+
+    def test_value_option_repeated_errors(self, capsys: Any) -> None:
+        p = self._parser()
+        with pytest.raises(SystemExit) as exc:
+            p.parse_args(["--profile", "a", "--profile", "b"])
+        assert exc.value.code == 2
+        assert "--profile can only be specified once" in capsys.readouterr().err
+
+    def test_short_and_long_spelling_both_count(self, capsys: Any) -> None:
+        # The two spellings target one dest, so mixing them still repeats.
+        p = self._parser()
+        with pytest.raises(SystemExit):
+            p.parse_args(["-p", "a", "--profile", "b"])
+        assert "--profile can only be specified once" in capsys.readouterr().err
+
+    def test_store_true_repeated_errors(self, capsys: Any) -> None:
+        p = self._parser()
+        with pytest.raises(SystemExit):
+            p.parse_args(["--verbose", "--verbose"])
+        assert "--verbose can only be specified once" in capsys.readouterr().err
+
+    def test_store_false_repeated_errors(self, capsys: Any) -> None:
+        p = self._parser()
+        with pytest.raises(SystemExit):
+            p.parse_args(["--cache", "--cache"])
+        assert "--cache can only be specified once" in capsys.readouterr().err
+
+    def test_single_occurrence_passes(self) -> None:
+        p = self._parser()
+        args = p.parse_args(["--profile", "a", "--verbose"])
+        assert args.profile == "a"
+        assert args.verbose is True
+        assert args.cache is True
+
+    def test_append_stays_multi_use(self) -> None:
+        p = self._parser()
+        args = p.parse_args(["-d", "x", "-d", "y"])
+        assert args.domains == ["x", "y"]
+
+    def test_positional_not_guarded(self) -> None:
+        # A variadic positional takes many values in one shot; the guard
+        # (keyed on option strings) must leave it alone.
+        p = self._parser()
+        args = p.parse_args(["one", "two", "three"])
+        assert args.names == ["one", "two", "three"]
+
+    def test_bookkeeping_attr_stripped(self) -> None:
+        # The seen-set the guard stashes must not surface on the result.
+        p = self._parser()
+        args = p.parse_args(["--profile", "a"])
+        assert not hasattr(args, "_single_use_seen")
+
+    def test_bookkeeping_attr_stripped_through_subcommand(self) -> None:
+        # A subcommand's flag records the seen-set on the subnamespace,
+        # which the subparser strips before its vars are copied up; the
+        # collapsed result must carry no bookkeeping attr either.
+        p = StrictArgumentParser(prog="tool")
+        sub = p.add_command_subparsers(metavar="<command>")
+        cmd = sub.add_parser("go", help="Go.")
+        cmd.add_argument("--name")
+        args = p.parse_command(["go", "--name", "a"])
+        assert args.name == "a"
+        assert not hasattr(args, "_single_use_seen")
+
+    def test_repeat_error_routed_to_subcommand(self, capsys: Any) -> None:
+        # A repeat under a subcommand reports via that subcommand's usage
+        # line, not the root's.
+        p = StrictArgumentParser(prog="tool")
+        sub = p.add_command_subparsers(metavar="<command>")
+        cmd = sub.add_parser("go", help="Go.")
+        cmd.add_argument("--name")
+        with pytest.raises(SystemExit):
+            p.parse_command(["go", "--name", "a", "--name", "b"])
+        assert "tool go:" in capsys.readouterr().err
+
+    def test_group_argument_is_single_use(self, capsys: Any) -> None:
+        # Argument groups share the parser registry, so an option added
+        # through one inherits the single-use default.
+        p = StrictArgumentParser(prog="tool")
+        grp = p.add_argument_group("grp")
+        grp.add_argument("--opt")
+        with pytest.raises(SystemExit):
+            p.parse_args(["--opt", "a", "--opt", "b"])
+        assert "--opt can only be specified once" in capsys.readouterr().err
+
+
+class TestSingleUseBooleanOptional:
+    """`SingleUseBooleanOptionalAction` guards the `--flag`/`--no-flag`
+    pair a plain `BooleanOptionalAction` would let repeat."""
+
+    @staticmethod
+    def _parser() -> StrictArgumentParser:
+        p = StrictArgumentParser(prog="tool")
+        p.add_argument(
+            "--keep", action=SingleUseBooleanOptionalAction, default=True
+        )
+        return p
+
+    def test_single_use_passes(self) -> None:
+        assert self._parser().parse_args(["--no-keep"]).keep is False
+        assert self._parser().parse_args(["--keep"]).keep is True
+        assert self._parser().parse_args([]).keep is True
+
+    def test_same_spelling_repeated_errors(self, capsys: Any) -> None:
+        with pytest.raises(SystemExit):
+            self._parser().parse_args(["--keep", "--keep"])
+        assert "--keep can only be specified once" in capsys.readouterr().err
+
+    def test_contradictory_spellings_error(self, capsys: Any) -> None:
+        # Both spellings target one dest, so --keep --no-keep is a repeat.
+        with pytest.raises(SystemExit):
+            self._parser().parse_args(["--keep", "--no-keep"])
+        err = capsys.readouterr().err
+        assert "--no-keep can only be specified once" in err
 
 
 class TestCommandSubparsers:

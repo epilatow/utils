@@ -67,6 +67,7 @@ import crony.unit  # noqa: E402
 from common.argparse_ext import (  # noqa: E402
     DefaultsHelpFormatter,
     RawDescriptionDefaultsHelpFormatter,
+    SingleUseBooleanOptionalAction,
     StrictArgumentParser,
     add_argument_ext,
 )
@@ -3408,7 +3409,7 @@ def args_parser() -> StrictArgumentParser:
     )
     list_cmd.add_argument(
         "--keep-tags",
-        action=argparse.BooleanOptionalAction,
+        action=SingleUseBooleanOptionalAction,
         default=True,
         help=(
             "Include keep tags (indicating what would be kept and "
@@ -3419,7 +3420,7 @@ def args_parser() -> StrictArgumentParser:
     group = list_cmd.add_mutually_exclusive_group()
     group.add_argument(
         "--include-partial",
-        action=argparse.BooleanOptionalAction,
+        action=SingleUseBooleanOptionalAction,
         default=True,
         help="Include partial backups",
     )

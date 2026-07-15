@@ -13,7 +13,7 @@ import argparse
 import difflib
 import functools
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 ValidateCallback = Callable[[argparse.ArgumentParser, argparse.Namespace], None]
@@ -21,6 +21,11 @@ ValidateCallback = Callable[[argparse.ArgumentParser, argparse.Namespace], None]
 # Attributes stashed on an Action for the doc renderer to read.
 _EXTENDED_HELP_ATTR = "_extended_help"
 _COMMON_ATTR = "_doc_common"
+
+# Namespace attribute where the single-use guard records which optionals
+# have already been seen during a parse. Stripped from the parsed result by
+# StrictArgumentParser.parse_known_args, so it never reaches a caller.
+_SINGLE_USE_SEEN_ATTR = "_single_use_seen"
 
 
 def add_argument_ext(
@@ -145,6 +150,66 @@ class RawDescriptionDefaultsHelpFormatter(
     """RawDescriptionHelpFormatter that also shows defaults."""
 
 
+class _SingleUseMixin(argparse.Action):
+    """Repeat-guard layered over a concrete store action.
+
+    Errors with ``<flag> can only be specified once`` when an optional is
+    given more than once, then delegates to the base action to do the
+    actual storing -- so the store / store_true / store_false / store_const
+    (and BooleanOptionalAction) value semantics are unchanged. A positional
+    carries no option string and is consumed in a single call, so the guard
+    is skipped for it.
+
+    ``StrictArgumentParser`` registers the store-family variants below as
+    its default action handlers, making single-use the repo-wide default;
+    ``action="append"`` (and the other collectors) opt back into multi-use.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        if self.option_strings:
+            seen: set[str] = getattr(namespace, _SINGLE_USE_SEEN_ATTR, set())
+            if self.dest in seen:
+                parser.error(f"{option_string} can only be specified once")
+            seen.add(self.dest)
+            setattr(namespace, _SINGLE_USE_SEEN_ATTR, seen)
+        super().__call__(parser, namespace, values, option_string)
+
+
+class _SingleUseStore(_SingleUseMixin, argparse._StoreAction):
+    """Single-use ``store`` (the default action for a value option)."""
+
+
+class _SingleUseStoreConst(_SingleUseMixin, argparse._StoreConstAction):
+    """Single-use ``store_const``."""
+
+
+class _SingleUseStoreTrue(_SingleUseMixin, argparse._StoreTrueAction):
+    """Single-use ``store_true``."""
+
+
+class _SingleUseStoreFalse(_SingleUseMixin, argparse._StoreFalseAction):
+    """Single-use ``store_false``."""
+
+
+class SingleUseBooleanOptionalAction(
+    _SingleUseMixin, argparse.BooleanOptionalAction
+):
+    """``--flag`` / ``--no-flag`` pair that may be given only once.
+
+    ``argparse.BooleanOptionalAction`` is passed as an explicit action
+    class, so it bypasses ``StrictArgumentParser``'s single-use default;
+    callers that want the pair guarded use this instead. Both spellings
+    target one dest, so any repeat -- ``--flag --flag``, ``--flag
+    --no-flag``, ... -- is a redundant or contradictory request and errors.
+    """
+
+
 if TYPE_CHECKING:
     SubParsersActionBase = argparse._SubParsersAction[argparse.ArgumentParser]
 else:
@@ -257,6 +322,36 @@ class StrictArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.register("action", "parsers", StrictSubParsersAction)
+        # Make every store-family optional single-use by default; the
+        # collectors (append / extend / count) keep argparse's own
+        # multi-use actions. Subparsers are StrictArgumentParsers too, and
+        # argument groups share this registry, so the default reaches the
+        # whole parser tree.
+        for name, action_cls in (
+            (None, _SingleUseStore),
+            ("store", _SingleUseStore),
+            ("store_const", _SingleUseStoreConst),
+            ("store_true", _SingleUseStoreTrue),
+            ("store_false", _SingleUseStoreFalse),
+        ):
+            self.register("action", name, action_cls)
+
+    def parse_known_args(  # type: ignore[override]
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        """Parse as usual, then drop the single-use bookkeeping attr.
+
+        The single-use guard records seen optionals on the namespace under
+        ``_SINGLE_USE_SEEN_ATTR``; strip it here so it never surfaces on the
+        result a caller inspects (or that a subparser copies up to its
+        parent namespace).
+        """
+        parsed, remaining = super().parse_known_args(args, namespace)
+        if hasattr(parsed, _SINGLE_USE_SEEN_ATTR):
+            delattr(parsed, _SINGLE_USE_SEEN_ATTR)
+        return parsed, remaining
 
     def add_command_subparsers(self, **kwargs: Any) -> StrictSubParsersAction:
         """Add a command-tree subparsers group to this parser.

@@ -1002,47 +1002,6 @@ def do_list_containers(
 # =============================================================================
 
 
-class _SingleUseAction(argparse.Action):
-    """Argparse action that errors if its flag is repeated.
-
-    Works for value options and for store-true flags: pass `nargs=0` to
-    make it a boolean flag, which then stores `const` (defaulting to True,
-    with a False default) like argparse's own store_true -- so a caller
-    need only add `nargs=0` to get a single-use boolean.
-    """
-
-    def __init__(
-        self,
-        option_strings: list[str],
-        dest: str,
-        nargs: int | str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if nargs == 0:
-            kwargs.setdefault("const", True)
-            kwargs.setdefault("default", False)
-        super().__init__(option_strings, dest, nargs=nargs, **kwargs)
-
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,
-        namespace: argparse.Namespace,
-        values: Any,
-        option_string: str | None = None,
-    ) -> None:
-        seen: set[str] = getattr(namespace, "_seen_flags", set())
-        if self.dest in seen:
-            parser.error(f"{option_string} can only be specified once")
-        seen.add(self.dest)
-        namespace._seen_flags = seen
-        # A boolean flag (nargs=0) carries no value, so store its const.
-        setattr(
-            namespace,
-            self.dest,
-            self.const if self.nargs == 0 else values,
-        )
-
-
 # The Description and Getting Started text appended to the `--help`
 # epilog. _DESCRIPTION's first paragraph is written to stand alone so it
 # can serve as the tool's summary blurb (the README entry) on its own.
@@ -1124,7 +1083,6 @@ def build_parser() -> StrictArgumentParser:
             p,
             "-p",
             "--profile",
-            action=_SingleUseAction,
             common=True,
             help=(
                 "Profile name (case-insensitive) or path to a profile"
@@ -1139,7 +1097,6 @@ def build_parser() -> StrictArgumentParser:
             p,
             "-c",
             "--container",
-            action=_SingleUseAction,
             common=True,
             help=(
                 "Container ID, or name (case-insensitive; an exact name"
@@ -1170,8 +1127,7 @@ def build_parser() -> StrictArgumentParser:
             p,
             "--no-header",
             dest="no_header",
-            action=_SingleUseAction,
-            nargs=0,
+            action="store_true",
             common=True,
             help="Omit the column header row.",
         )
@@ -1227,7 +1183,6 @@ def build_parser() -> StrictArgumentParser:
         dest="fmt",
         choices=["netscape", "json"],
         default="netscape",
-        action=_SingleUseAction,
         help="Output format.",
     )
     list_cmd.add_argument(

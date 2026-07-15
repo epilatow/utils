@@ -248,3 +248,15 @@ tree, so it is safe to run on a dirty checkout.
   empty collections), and `render-docs` uses the same helper, so `--help` and
   the generated docs surface the same defaults. A help string that already
   states its own default is left untouched.
+
+- Options are single-use by default. On a `StrictArgumentParser` every
+  store-family optional (`store`, `store_true`, `store_false`, `store_const`,
+  and the default value store) errors with a uniform
+  `<flag> can only be specified once` if given more than once -- so
+  `--profile a --profile b` is a usage error rather than a silent last-wins. A
+  caller opts an argument back into multi-use by choosing a collector action:
+  `action="append"` (or `extend` / `count`). Positionals are unaffected (they
+  are consumed in one shot). `argparse.BooleanOptionalAction` is passed as an
+  explicit action class and so bypasses the default; use
+  `common.argparse_ext`'s `SingleUseBooleanOptionalAction` for a guarded
+  `--flag` / `--no-flag` pair.
