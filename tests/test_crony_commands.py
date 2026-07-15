@@ -2191,10 +2191,13 @@ class TestEnableDisable:
         cmd = next(
             c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
         )
+        # --no-block keeps the async trigger from blocking on the
+        # Type=oneshot service's ExecStart.
         assert cmd == [
             "systemctl",
             "--user",
             "start",
+            "--no-block",
             f"crony-{h.full('j')}.service",
         ]
 

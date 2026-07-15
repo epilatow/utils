@@ -249,6 +249,25 @@ class TestSystemdActivate:
                 "default.brew", scheduled=True
             )
 
+    def test_trigger_uses_no_block(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The .service is Type=oneshot, for which a plain `systemctl
+        # start` blocks until ExecStart exits. --no-block keeps trigger
+        # async (it must return once the fire is accepted, not once the
+        # job finishes).
+        calls = self._record(monkeypatch)
+        get_scheduler("linux", tmp_path).trigger("default.brew")
+        assert calls == [
+            [
+                "systemctl",
+                "--user",
+                "start",
+                "--no-block",
+                "crony-default.brew.service",
+            ]
+        ]
+
     def test_trigger_failure_raises_subprocess_error(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
