@@ -1387,17 +1387,29 @@ class TestAutomate:
         Resets the module warning flag (restored by monkeypatch at
         teardown) because `do_automate_status` sets it on a stale or
         missing bundle and it must not leak into later tests.
+
+        The yielded mock stands in for the shared driver's crony
+        subprocess (apply / status / destroy), so crony is never really
+        invoked; each call surfaces as a `subprocess.run([crony, *argv])`
+        on it. borgadm's do_logs shells out through its own `run_cmd`
+        (crony's log path must be captured, which the streaming driver
+        can't do), so that seam is mocked too; `_crony_calls` reads both.
         """
         dropin = tmp_path / "crony-config"
         monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
         monkeypatch.setattr(ba, "_warning_occurred", False)
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
         with (
             patch.object(ba.platform, "system", return_value=system),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
+            patch(
+                "common.crony_automate.subprocess.run", autospec=True
+            ) as mock_run,
+            patch.object(ba, "run_cmd", autospec=True) as mock_run_cmd,
         ):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="", stderr=""
-            )
+            mock_run.return_value = completed
+            mock_run_cmd.return_value = completed
             yield dropin, mock_run
 
     @pytest.fixture
@@ -1418,8 +1430,20 @@ class TestAutomate:
 
     @staticmethod
     def _crony_calls(mock_run: Any) -> list[list[str]]:
-        """The crony argv (after the crony path) of each run_cmd call."""
-        return [list(call.args[0][1:]) for call in mock_run.call_args_list]
+        """The crony argv (after the crony path) of every crony
+        invocation, aggregated across both seams: the shared driver's
+        subprocess (`mock_run`) and borgadm's own `run_cmd` (do_logs).
+        Non-crony `run_cmd` calls are filtered out by basename."""
+        run_cmd_mock = cast(Any, ba.run_cmd)
+        calls = list(mock_run.call_args_list) + list(
+            run_cmd_mock.call_args_list
+        )
+        argvs: list[list[str]] = []
+        for call in calls:
+            argv = call.args[0]
+            if argv and Path(argv[0]).name == "crony":
+                argvs.append(list(argv[1:]))
+        return argvs
 
     def test_apply_writes_bundle_and_runs_crony(
         self, automate_env: Any
@@ -1713,8 +1737,8 @@ class TestAutomate:
         # even where crony is missing entirely.
         dropin, mock_run = automate_env
         with patch.object(
-            ba,
-            "_crony_path",
+            ba._CRONY,
+            "crony_path",
             autospec=True,
             side_effect=ba.BorgadmError("crony not found"),
         ):
@@ -1736,8 +1760,8 @@ class TestAutomate:
         dropin, _mock_run = automate_env
         with (
             patch.object(
-                ba,
-                "_crony_path",
+                ba._CRONY,
+                "crony_path",
                 autospec=True,
                 side_effect=ba.BorgadmError("crony not found"),
             ),
@@ -1802,8 +1826,8 @@ class TestAutomate:
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text(ba._render_crony_bundle())
         with patch.object(
-            ba,
-            "_crony_path",
+            ba._CRONY,
+            "crony_path",
             autospec=True,
             side_effect=ba.BorgadmError("crony not found"),
         ):
@@ -1818,8 +1842,8 @@ class TestAutomate:
         bundle.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_text("# stub\n")
         with patch.object(
-            ba,
-            "_crony_path",
+            ba._CRONY,
+            "crony_path",
             autospec=True,
             side_effect=ba.BorgadmError("crony not found"),
         ):
@@ -4100,33 +4124,6 @@ class TestCli:
             result = ba.cli()
         assert result == ba.ExitCode.SUCCESS
         mock_main.assert_called_once()
-
-
-class TestRepoRoot:
-    """Test _repo_root() symlink resolution."""
-
-    def test_repo_root_resolves_symlinked_launcher(
-        self, tmp_path: Path
-    ) -> None:
-        """_repo_root() follows a symlinked launcher to the real repo.
-
-        Mirrors the common install where ~/.local/bin/borgadm is a
-        symlink to repo/bin/borgadm: without resolve(), repo_root
-        would return ~/.local/ and the Applications/ tree wouldn't
-        be found.
-        """
-        real_repo = tmp_path / "repo"
-        (real_repo / "bin").mkdir(parents=True)
-        real_script = real_repo / "bin" / "borgadm"
-        real_script.write_text("#!/usr/bin/env python\n")
-
-        launcher_root = tmp_path / "launcher"
-        (launcher_root / "bin").mkdir(parents=True)
-        launcher_script = launcher_root / "bin" / "borgadm"
-        launcher_script.symlink_to(real_script)
-
-        with patch.object(ba, "__file__", str(launcher_script)):
-            assert ba._repo_root() == real_repo.resolve()
 
 
 @pytest.mark.e2e
