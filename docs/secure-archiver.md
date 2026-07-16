@@ -18,7 +18,8 @@ example config written by `config init`). On every run it stages an archive's
 files into a temporary directory, computes a SHA256 manifest of the contents,
 and publishes a new revision only when the contents changed since the latest
 existing archive -- unless --force-update forces a write. All archives
-produced by a single run share one timestamp.
+produced by a single run share one timestamp. The `automate` subcommand
+schedules a weekly run through crony(1) (launchd on macOS, systemd on Linux).
 
 ## GETTING STARTED
 
@@ -31,28 +32,18 @@ To get started, write a sample config, edit it to point at your files and
     secure-archiver create
 ```
 
-Schedule secure-archiver(1) to run weekly as an interactive crony(1) job. We
-run it interactively so you can confirm when runs start, so the 1Password
-vault-access authorization prompts don't surprise you.
+To schedule a weekly run through crony(1), deploy the automation bundle:
 
 ```text
-    mkdir -p ~/.config/crony/config/
-    cat > ~/.config/crony/config/secure-archiver.toml <<-EOF
-    [defaults]
-    notify-channels = ["default"]
-
-    [job.create]
-    command   = "secure-archiver create"
-    env.PATH  = "\$PATH:\$HOME/.local/bin"
-    interval = "1w"
-    flags = ["interactive"]
-    uuid = "$(crony config generate-uuid)"
-
-    [target.all]
-    jobs = ["create"]
-    EOF
-    crony apply -b secure-archiver
+    secure-archiver automate apply
 ```
+
+On macOS the scheduled job runs interactively -- crony holds each run until
+you are present and confirm it, so the 1Password vault-access prompts never
+fire unattended. On Linux crony has no interactive support, so the job runs
+unattended: your `op` must be usable without an interactive unlock (e.g. a
+service-account token). The automate status and automate destroy subcommands
+inspect and tear down the schedule.
 
 ## COMMON ARGUMENTS
 
@@ -84,6 +75,31 @@ Write a commented example config to output_file, which must not already exist.
 
 Load and validate the config file, reporting the resolved path on success and
 the validation errors on failure.
+
+### `automate apply [--config-only]`
+
+Write secure-archiver's crony(1) bundle and deploy the scheduled create job
+(via launchd on macOS, systemd on Linux). On macOS the job runs interactively
+so the 1Password prompts reach you when a run starts.
+
+- **`--config-only`**\
+  only write the bundle file; skip crony apply
+
+### `automate status [--config-only]`
+
+Report whether the crony(1) bundle on disk is current, then query crony(1) for
+the deployed job's status.
+
+- **`--config-only`**\
+  only check the bundle file; skip crony status
+
+### `automate destroy [--config-only]`
+
+Tear down secure-archiver's scheduled create job and remove its crony(1)
+bundle.
+
+- **`--config-only`**\
+  only remove the bundle file; skip crony destroy
 
 ## FILES
 

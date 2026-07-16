@@ -12,6 +12,7 @@ The 1Password CLI (\(gaop\(ga) and the 7\-Zip CLI (\(ga7zz\(ga) must be on PATH.
 Each archive is defined by an [archive.NAME] section in the config (see the example config written by \(gaconfig init\(ga).\&
 On every run it stages an archive\(aqs files into a temporary directory, computes a SHA256 manifest of the contents, and publishes a new revision only when the contents changed since the latest existing archive \-\- unless \-\-force\-update forces a write.\&
 All archives produced by a single run share one timestamp.\&
+The \(gaautomate\(ga subcommand schedules a weekly run through crony(1) (launchd on macOS, systemd on Linux).\&
 .SH GETTING STARTED
 To get started, write a sample config, edit it to point at your files and 1Password references, then create archives from it:
 .PP
@@ -21,27 +22,16 @@ To get started, write a sample config, edit it to point at your files and 1Passw
     secure\-archiver create
 .EE
 .PP
-Schedule secure\-archiver(1) to run weekly as an interactive crony(1) job.\&
-We run it interactively so you can confirm when runs start, so the 1Password vault\-access authorization prompts don\(aqt surprise you.\&
+To schedule a weekly run through crony(1), deploy the automation bundle:
 .PP
 .EX
-    mkdir \-p \(ti/.config/crony/config/
-    cat > \(ti/.config/crony/config/secure\-archiver.toml <<\-EOF
-    [defaults]
-    notify\-channels = [\(dqdefault\(dq]
-
-    [job.create]
-    command   = \(dqsecure\-archiver create\(dq
-    env.PATH  = \(dq\(rs$PATH:\(rs$HOME/.local/bin\(dq
-    interval = \(dq1w\(dq
-    flags = [\(dqinteractive\(dq]
-    uuid = \(dq$(crony config generate\-uuid)\(dq
-
-    [target.all]
-    jobs = [\(dqcreate\(dq]
-    EOF
-    crony apply \-b secure\-archiver
+    secure\-archiver automate apply
 .EE
+.PP
+On macOS the scheduled job runs interactively \-\- crony holds each run until you are present and confirm it, so the 1Password vault\-access prompts never fire unattended.\&
+On Linux crony has no interactive support, so the job runs unattended: your \(gaop\(ga must be usable without an interactive unlock (e.g.\&
+a service\-account token).\&
+The automate status and automate destroy subcommands inspect and tear down the schedule.\&
 .SH COMMON ARGUMENTS
 .TP
 \f[CR]\-\-config CONFIG\f[R]
@@ -70,6 +60,31 @@ Path to write the example config
 .TP
 \f[B]config validate\f[R] [\-\-config CONFIG]
 Load and validate the config file, reporting the resolved path on success and the validation errors on failure.\&
+.TP
+\f[B]automate apply\f[R] [\-\-config\-only]
+Write secure\-archiver\(aqs crony(1) bundle and deploy the scheduled create job (via launchd on macOS, systemd on Linux).\&
+On macOS the job runs interactively so the 1Password prompts reach you when a run starts.\&
+.RS
+.TP
+\f[CR]\-\-config\-only\f[R]
+only write the bundle file; skip crony apply
+.RE
+.TP
+\f[B]automate status\f[R] [\-\-config\-only]
+Report whether the crony(1) bundle on disk is current, then query crony(1) for the deployed job\(aqs status.\&
+.RS
+.TP
+\f[CR]\-\-config\-only\f[R]
+only check the bundle file; skip crony status
+.RE
+.TP
+\f[B]automate destroy\f[R] [\-\-config\-only]
+Tear down secure\-archiver\(aqs scheduled create job and remove its crony(1) bundle.\&
+.RS
+.TP
+\f[CR]\-\-config\-only\f[R]
+only remove the bundle file; skip crony destroy
+.RE
 .SH FILES
 .TP
 \f[CR]./secure\-archiver.toml\f[R]

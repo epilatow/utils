@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
+# dependencies = ["tomlkit"]
 # ///
 # This is AI generated code
 #
@@ -13,17 +14,22 @@ import hashlib
 import json
 import locale
 import os
+import platform as platform  # noqa: PLC0414  re-exported for tests
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import tomllib
+import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import tomlkit
 
 # First-party shared helpers live under <repo>/src. The entry script's
 # own directory (bin/) is on sys.path, but the package dir is not, so
@@ -38,6 +44,7 @@ from common.argparse_ext import (  # noqa: E402
     add_argument_ext,
 )
 from common.cli import cli_entrypoint  # noqa: E402
+from common.crony_automate import CronyAutomation  # noqa: E402
 from common.docspec import (  # noqa: E402
     ItemsSection,
     ManSpec,
@@ -1101,6 +1108,104 @@ def publish(
     return True
 
 
+# =============================================================================
+# CRONY AUTOMATION
+# =============================================================================
+#
+# secure-archiver schedules itself as a single weekly crony(1) job. The
+# shared driver owns the crony bundle's lifecycle (apply / status /
+# destroy); only the bundle's content lives here.
+
+# Name of the crony bundle secure-archiver owns: drop-in file
+# `secure-archiver.toml`, job namespaced `secure-archiver.create`.
+_CRONY_BUNDLE = "secure-archiver"
+
+# Fixed namespace so the create job's crony UUID is stable across apply /
+# destroy / apply cycles.
+_CRONY_UUID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "https://github.com/epilatow/utils#secure-archiver-crony",
+)
+
+# Set when `automate status` finds a missing or stale bundle, so cli()
+# exits WARNING even though nothing raised.
+_warning_occurred = False
+
+
+def _secure_archiver_script_path() -> str:
+    """Path to secure-archiver itself, for the crony job's command.
+
+    Resolves symlinks so the command points at the real script in the
+    repo rather than an install symlink that could later move.
+    """
+    return str(Path(__file__).resolve())
+
+
+_CRONY = CronyAutomation(
+    _CRONY_BUNDLE,
+    _CRONY_UUID_NAMESPACE,
+    "secure-archiver automate apply",
+    eprint,
+    eprint,
+    SecureArchiverError,
+)
+
+
+def _render_crony_bundle() -> str:
+    """Render the crony(1) bundle secure-archiver installs.
+
+    A single weekly `create` job. On macOS it carries the `interactive`
+    flag so crony holds the run until an active user is present and
+    confirms it -- the 1Password vault-access prompts need a human at the
+    keyboard. That flag is macOS-only (crony has no interactive support
+    on Linux), so on Linux the job runs unattended and the host's `op`
+    must be usable without an interactive unlock. The command is the
+    resolved secure-archiver path (stable across install symlinks) and
+    ~/.local/bin is prepended to PATH so the `uv` shebang, `op`, and
+    `7zz` resolve under the scheduler's minimal PATH.
+    """
+    create_job: dict[str, Any] = {
+        "uuid": _CRONY.job_uuid("create"),
+        "command": f"{shlex.quote(_secure_archiver_script_path())} create",
+        "interval": "1w",
+    }
+    if platform.system() == "Darwin":
+        create_job["flags"] = ["interactive"]
+    doc: dict[str, Any] = {
+        "defaults": {
+            "notify-channels": ["default"],
+            "env": {"PATH": "$HOME/.local/bin:$PATH"},
+        },
+        "job": {"create": create_job},
+        "target": {"all": {"jobs": ["create"]}},
+    }
+    return "\n".join(_CRONY.header_lines()) + "\n\n" + tomlkit.dumps(doc)
+
+
+def do_automate_apply(config_only: bool) -> None:
+    """Write secure-archiver's crony(1) bundle and (unless `config_only`)
+    deploy the scheduled create job via `crony apply`."""
+    _CRONY.apply_bundle(_render_crony_bundle(), config_only=config_only)
+
+
+def do_automate_status(config_only: bool) -> None:
+    """Report whether the on-disk crony(1) bundle is current, then
+    (unless `config_only`) show crony's per-job status table. A stale or
+    missing bundle warns, so the process exits with the WARNING status."""
+    global _warning_occurred
+    _warning_occurred |= _CRONY.report_status(
+        lambda text: text == _render_crony_bundle(),
+        config_only=config_only,
+    )
+
+
+def do_automate_destroy(config_only: bool) -> None:
+    """Tear down the scheduled create job and remove the crony(1) bundle.
+    `config_only` removes just the bundle file, leaving the deployed job
+    in place."""
+    _CRONY.destroy(config_only=config_only)
+
+
 # The DESCRIPTION and GETTING STARTED text, shown in `--help` (appended to
 # the exit-code epilog) and rendered into the man page / GFM doc via
 # MAN_SPEC. _DESCRIPTION's first paragraph is written to stand alone so it
@@ -1119,7 +1224,8 @@ an archive's files into a temporary directory, computes a SHA256 manifest
 of the contents, and publishes a new revision only when the
 contents changed since the latest existing archive -- unless --force-update
 forces a write. All archives produced by a single run share one
-timestamp."""
+timestamp. The `automate` subcommand schedules a weekly run through
+crony(1) (launchd on macOS, systemd on Linux)."""
 
 _GETTING_STARTED = """\
 To get started, write a sample config, edit it to point at your files and
@@ -1129,26 +1235,18 @@ To get started, write a sample config, edit it to point at your files and
     secure-archiver config validate
     secure-archiver create
 
-Schedule secure-archiver(1) to run weekly as an interactive crony(1) job.
-We run it interactively so you can confirm when runs start, so the
-1Password vault-access authorization prompts don't surprise you.
+To schedule a weekly run through crony(1), deploy the automation
+bundle:
 
-    mkdir -p ~/.config/crony/config/
-    cat > ~/.config/crony/config/secure-archiver.toml <<-EOF
-    [defaults]
-    notify-channels = ["default"]
+    secure-archiver automate apply
 
-    [job.create]
-    command   = "secure-archiver create"
-    env.PATH  = "\\$PATH:\\$HOME/.local/bin"
-    interval = "1w"
-    flags = ["interactive"]
-    uuid = "$(crony config generate-uuid)"
-
-    [target.all]
-    jobs = ["create"]
-    EOF
-    crony apply -b secure-archiver"""
+On macOS the scheduled job runs interactively -- crony holds each run
+until you are present and confirm it, so the 1Password vault-access
+prompts never fire unattended. On Linux crony has no interactive
+support, so the job runs unattended: your `op` must be usable without
+an interactive unlock (e.g. a service-account token). The automate
+status and automate destroy subcommands inspect and tear down the
+schedule."""
 
 
 def build_parser() -> StrictArgumentParser:
@@ -1244,6 +1342,57 @@ def build_parser() -> StrictArgumentParser:
         ),
     )
     add_config(config_validate_parser)
+
+    # Automate subcommand group (apply / status / destroy)
+    automate_parser = subparsers.add_parser(
+        "automate",
+        help="Manage the scheduled archive job (via crony(1)).",
+    )
+    automate_subparsers = automate_parser.add_command_subparsers(
+        metavar="<command>"
+    )
+    automate_apply_parser = automate_subparsers.add_parser(
+        "apply",
+        help="Deploy the scheduled archive job",
+        description=(
+            "Write secure-archiver's crony(1) bundle and deploy the "
+            "scheduled create job (via launchd on macOS, systemd on "
+            "Linux). On macOS the job runs interactively so the 1Password "
+            "prompts reach you when a run starts."
+        ),
+    )
+    automate_status_parser = automate_subparsers.add_parser(
+        "status",
+        help="Show automation status (via crony(1))",
+        description=(
+            "Report whether the crony(1) bundle on disk is current, then "
+            "query crony(1) for the deployed job's status."
+        ),
+    )
+    automate_destroy_parser = automate_subparsers.add_parser(
+        "destroy",
+        help="Tear down the scheduled archive job",
+        description=(
+            "Tear down secure-archiver's scheduled create job and remove "
+            "its crony(1) bundle."
+        ),
+    )
+    for automate_p, config_only_help in (
+        (automate_apply_parser, "only write the bundle file; skip crony apply"),
+        (
+            automate_status_parser,
+            "only check the bundle file; skip crony status",
+        ),
+        (
+            automate_destroy_parser,
+            "only remove the bundle file; skip crony destroy",
+        ),
+    ):
+        automate_p.add_argument(
+            "--config-only",
+            action="store_true",
+            help=config_only_help,
+        )
 
     return parser
 
@@ -1341,6 +1490,9 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "create": do_update,
     "config init": do_config_init,
     "config validate": do_config_validate,
+    "automate apply": do_automate_apply,
+    "automate status": do_automate_status,
+    "automate destroy": do_automate_destroy,
 }
 
 
@@ -1356,6 +1508,8 @@ def cli() -> int:
     except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
         return e.exit_code
+    if _warning_occurred:
+        return ExitCode.WARNING
     return ExitCode.SUCCESS
 
 

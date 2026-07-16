@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["pytest", "pytest-cov"]
+# dependencies = ["pytest", "pytest-cov", "tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
 
@@ -9,9 +9,13 @@
 Comprehensive unit tests for secure_archiver
 """
 
+import contextlib
 import json
+import subprocess
 import sys
 import tomllib
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -28,6 +32,7 @@ from conftest import (
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+import crony.cli as crony_cli  # noqa: E402
 import secure_archiver as sa  # noqa: E402
 
 # The bin script under test, for run_tests' coverage module name.
@@ -1498,6 +1503,9 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
         (["create", "--bogus"], "create"),
         (["config", "validate", "--bogus"], "config validate"),
         (["config", "init", "--bogus"], "config init"),
+        (["automate", "apply", "--bogus"], "automate apply"),
+        (["automate", "status", "--bogus"], "automate status"),
+        (["automate", "destroy", "--bogus"], "automate destroy"),
     ]
 
 
@@ -2194,6 +2202,279 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         sa.ExitCode.WARNING,
         sa.ExitCode.CRASHED,
     }
+
+
+class TestAutomate:
+    """Test the automate subcommand (crony-backed)."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _automate_ctx(
+        system: str, tmp_path: Path, monkeypatch: Any
+    ) -> Iterator[tuple[Path, Any]]:
+        """A given platform + a temp crony drop-in dir + a mocked crony
+        subprocess (so crony is never really invoked); each crony call
+        surfaces as a `subprocess.run([crony, *argv])` on the mock.
+
+        Resets the module warning flag because `do_automate_status` sets
+        it on a stale or missing bundle and it must not leak into later
+        tests.
+        """
+        dropin = tmp_path / "crony-config"
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
+        monkeypatch.setattr(sa, "_warning_occurred", False)
+        with (
+            patch.object(sa.platform, "system", return_value=system),
+            patch(
+                "common.crony_automate.subprocess.run", autospec=True
+            ) as mock_run,
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            yield dropin, mock_run
+
+    @pytest.fixture
+    def automate_env(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> Iterator[tuple[Path, Any]]:
+        """Darwin automate environment (see _automate_ctx)."""
+        with self._automate_ctx("Darwin", tmp_path, monkeypatch) as env:
+            yield env
+
+    @staticmethod
+    def _crony_calls(mock_run: Any) -> list[list[str]]:
+        """The crony argv (after the crony path) of each crony call."""
+        argvs: list[list[str]] = []
+        for call in mock_run.call_args_list:
+            argv = call.args[0]
+            if argv and Path(argv[0]).name == "crony":
+                argvs.append(list(argv[1:]))
+        return argvs
+
+    def test_apply_writes_bundle_and_runs_crony(
+        self, automate_env: Any
+    ) -> None:
+        dropin, mock_run = automate_env
+        sa.do_automate_apply(config_only=False)
+        bundle = dropin / "secure-archiver.toml"
+        assert bundle.exists()
+        assert "[job.create]" in bundle.read_text()
+        assert ["apply", "-b", "secure-archiver"] in self._crony_calls(mock_run)
+
+    def test_apply_config_only_skips_crony(self, automate_env: Any) -> None:
+        # config-only must neither require nor invoke crony -- it works
+        # even where crony is missing entirely.
+        dropin, mock_run = automate_env
+        with patch.object(
+            sa._CRONY,
+            "crony_path",
+            autospec=True,
+            side_effect=sa.SecureArchiverError("crony not found"),
+        ):
+            sa.do_automate_apply(config_only=True)
+        assert (dropin / "secure-archiver.toml").exists()
+        mock_run.assert_not_called()
+
+    def test_apply_leaves_no_bundle_when_crony_missing(
+        self, automate_env: Any
+    ) -> None:
+        # crony resolves before the bundle is written, so a missing crony
+        # fails cleanly instead of leaving an orphan bundle behind.
+        dropin, _mock_run = automate_env
+        with (
+            patch.object(
+                sa._CRONY,
+                "crony_path",
+                autospec=True,
+                side_effect=sa.SecureArchiverError("crony not found"),
+            ),
+            pytest.raises(sa.SecureArchiverError, match="crony not found"),
+        ):
+            sa.do_automate_apply(config_only=False)
+        assert not (dropin / "secure-archiver.toml").exists()
+
+    def test_destroy_removes_units_and_bundle(self, automate_env: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        sa.do_automate_destroy(config_only=False)
+        assert [
+            "destroy",
+            "-b",
+            "secure-archiver",
+            "--all",
+        ] in self._crony_calls(mock_run)
+        assert not bundle.exists()
+
+    def test_destroy_is_noop_when_not_applied(self, automate_env: Any) -> None:
+        # No bundle file: crony has nothing addressable and exits nonzero,
+        # but destroy must treat that as a clean no-op, not an error.
+        dropin, mock_run = automate_env
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="unknown bundle"
+        )
+        sa.do_automate_destroy(config_only=False)
+        assert not (dropin / "secure-archiver.toml").exists()
+
+    def test_destroy_surfaces_failure_when_bundle_present(
+        self, automate_env: Any
+    ) -> None:
+        # The bundle is installed (file present) but destroy fails for a
+        # real reason (a running job holds the lock); that must surface
+        # rather than silently leaving the file in place.
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=7, stdout="", stderr="lock held"
+        )
+        with pytest.raises(
+            sa.SecureArchiverError, match="crony destroy failed"
+        ):
+            sa.do_automate_destroy(config_only=False)
+        assert bundle.exists()
+
+    def test_destroy_config_only_unlinks_bundle_only(
+        self, automate_env: Any
+    ) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        with patch.object(
+            sa._CRONY,
+            "crony_path",
+            autospec=True,
+            side_effect=sa.SecureArchiverError("crony not found"),
+        ):
+            sa.do_automate_destroy(config_only=True)
+        assert not bundle.exists()
+        mock_run.assert_not_called()
+
+    def test_status_up_to_date(self, automate_env: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(sa._render_crony_bundle())
+        sa.do_automate_status(config_only=False)
+        assert not sa._warning_occurred
+        assert ["status", "-b", "secure-archiver"] in self._crony_calls(
+            mock_run
+        )
+
+    def test_status_out_of_date_sets_warning(self, automate_env: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text("# stub\n")
+        sa.do_automate_status(config_only=False)
+        assert sa._warning_occurred
+        # The drift report does not preempt crony's deployed-state table.
+        assert ["status", "-b", "secure-archiver"] in self._crony_calls(
+            mock_run
+        )
+
+    @pytest.mark.usefixtures("automate_env")
+    def test_status_not_written_sets_warning(self) -> None:
+        sa.do_automate_status(config_only=False)
+        assert sa._warning_occurred
+
+    def test_status_config_only_skips_crony(self, automate_env: Any) -> None:
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(sa._render_crony_bundle())
+        with patch.object(
+            sa._CRONY,
+            "crony_path",
+            autospec=True,
+            side_effect=sa.SecureArchiverError("crony not found"),
+        ):
+            sa.do_automate_status(config_only=True)
+        assert not sa._warning_occurred
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("system", "expect_flag"),
+        [("Darwin", True), ("Linux", False)],
+    )
+    def test_interactive_flag_gated_on_macos(
+        self, system: str, expect_flag: bool, monkeypatch: Any
+    ) -> None:
+        # crony's interactive flag (wait-for-user + confirm) is macOS
+        # only -- it would crash the runner on Linux -- so the create job
+        # carries it on Darwin and omits it everywhere else, where the
+        # job runs unattended.
+        monkeypatch.setattr(sa.platform, "system", lambda: system)
+        doc = tomllib.loads(sa._render_crony_bundle())
+        if expect_flag:
+            assert doc["job"]["create"]["flags"] == ["interactive"]
+        else:
+            assert "flags" not in doc["job"]["create"]
+
+    def test_render_is_single_weekly_create_job(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(sa.platform, "system", lambda: "Darwin")
+        doc = tomllib.loads(sa._render_crony_bundle())
+        assert set(doc["job"]) == {"create"}
+        assert doc["job"]["create"]["interval"] == "1w"
+        assert doc["job"]["create"]["command"].endswith(" create")
+        assert doc["defaults"]["notify-channels"] == ["default"]
+        assert doc["defaults"]["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
+        assert set(doc["target"]) == {"all"}
+        assert doc["target"]["all"]["jobs"] == ["create"]
+
+    def test_deterministic_uuids(self) -> None:
+        assert sa._CRONY.job_uuid("create") == sa._CRONY.job_uuid("create")
+        # canonical lowercase UUID form (crony requires it)
+        parsed = uuid.UUID(sa._CRONY.job_uuid("create"))
+        assert str(parsed) == sa._CRONY.job_uuid("create")
+
+    @pytest.mark.parametrize("system", ["Darwin", "Linux"])
+    def test_generated_bundle_validates_against_crony(
+        self, system: str, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The bundle secure-archiver generates on each platform must be
+        # accepted by the real crony's validator, so a future crony
+        # schema change that breaks it fails here rather than at install
+        # time.
+        monkeypatch.setattr(sa.platform, "system", lambda: system)
+        f = tmp_path / "secure-archiver.toml"
+        f.write_text(sa._render_crony_bundle())
+        crony = sa._CRONY.crony_path()
+        proc = subprocess.run(
+            [crony, "config", "validate", "--file", str(f)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_emitted_crony_argv_parses_against_crony(
+        self, automate_env: Any
+    ) -> None:
+        # Contract test: every crony invocation secure-archiver emits must
+        # be accepted by crony's own parser (including validate callbacks,
+        # e.g. destroy's required target). secure-archiver shells out to
+        # crony, so a change to crony's CLI contract otherwise breaks
+        # automate silently at runtime with no failing test.
+        dropin, mock_run = automate_env
+        bundle = dropin / "secure-archiver.toml"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        bundle.write_text(sa._render_crony_bundle())
+        sa.do_automate_apply(config_only=False)
+        sa.do_automate_status(config_only=False)
+        sa.do_automate_destroy(config_only=False)
+        argvs = self._crony_calls(mock_run)
+        assert {argv[0] for argv in argvs} == {"apply", "status", "destroy"}
+        for argv in argvs:
+            # parse_command runs the verb's validate callback; a broken
+            # contract exits 2 (SystemExit), failing the test.
+            args = crony_cli._build_parser().parse_command(argv)
+            assert args.command == argv[0]
 
 
 class TestHelpWidth(HelpWidthBase):
