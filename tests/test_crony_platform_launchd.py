@@ -31,8 +31,10 @@ from crony.unit import (  # noqa: E402
     EntityRef,
     Interval,
     JitterSpec,
+    OnDemand,
     PriorityClass,
     Schedule,
+    Timing,
     UnitSpec,
 )
 
@@ -103,6 +105,14 @@ class TestPlistRendering:
         assert "<key>StartInterval</key>" in plist
         assert "<integer>1800</integer>" in plist
 
+    def test_on_demand_renders_dormant_plist(self) -> None:
+        # A trigger-only OnDemand entry arms no timer -- the plist carries
+        # neither StartInterval nor StartCalendarInterval, a dormant unit
+        # loaded but fired only via kickstart.
+        plist = launchd._render_plist("j", _CMD, OnDemand())
+        assert "StartInterval" not in plist
+        assert "StartCalendarInterval" not in plist
+
     def test_program_args_wrap_uv_in_sh_with_absolute_path(self) -> None:
         plist = launchd._render_plist(
             "j",
@@ -122,12 +132,13 @@ class TestPlistRendering:
         # Each rendered plist must parse back as a well-formed plist
         # (plutil only runs at apply on macOS; this catches structural
         # breakage in CI on any platform).
-        shapes: list[tuple[Schedule | Interval | None, PriorityClass]] = [
+        shapes: list[tuple[Timing | None, PriorityClass]] = [
             (Schedule.from_str("daily"), PriorityClass.NORMAL),
             (Interval.from_str("30min"), PriorityClass.NORMAL),
             (Schedule.from_str("Mon *-*-* 09:00"), PriorityClass.HIGH),
             (Schedule.from_str("*-*-* 03:00"), PriorityClass.LOW),
-            (None, PriorityClass.NORMAL),  # on-demand, normal priority
+            (OnDemand(), PriorityClass.NORMAL),  # trigger-only
+            (None, PriorityClass.NORMAL),  # transit / group-only
         ]
         for timing, priority in shapes:
             plist = launchd._render_plist("j", _CMD, timing, priority)

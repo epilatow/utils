@@ -72,6 +72,13 @@ class _SnapshotCommon(_SnapshotModel):
     timeout: Annotated[int, _Since(5)]
     schedule: Annotated[str | None, _Since(4)] = None
     interval: Annotated[str | None, _Since(4)] = None
+    # The trigger-only firing mode (`schedule = "on-demand"`); mutually
+    # exclusive with `schedule` / `interval` above, so at most one of the
+    # three timing keys is set. Persisted so the applied side shows
+    # `on-demand` and a switch to / from a real schedule reads as drift.
+    on_demand: Annotated[bool, _Since(7)] = _disk_key(
+        "on-demand", default=False
+    )
     unit_disabled: Annotated[bool, _Since(6)] = False
     # One boolean per JobFlags member, keyed on disk by the flag's dash
     # token. A drift test asserts these stay in lockstep with
@@ -95,8 +102,11 @@ class _SnapshotCommon(_SnapshotModel):
         return crony.unit.EntityRef(self.entity_name().bundle, self.uuid)
 
     def timing(self) -> crony.unit.Timing | None:
-        """The Timing value object for this snapshot's schedule /
-        interval strings (None for an on-demand entry)."""
+        """The Timing value object for this snapshot's timing keys:
+        OnDemand for the trigger-only mode, else the schedule / interval
+        string, else None (a transit group or group-only job)."""
+        if self.on_demand:
+            return crony.unit.OnDemand()
         if self.schedule is not None:
             return crony.unit.Schedule.from_str(self.schedule)
         if self.interval is not None:

@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import crony.errors
-from crony.unit import UnitSpec
+from crony.unit import UnitSpec, is_scheduled
 
 # On-disk unit-naming prefix. Existing units are named
 # `org.crony.<name>.plist` (launchd) / `crony-<name>.{service,timer}`
@@ -202,8 +202,8 @@ class Scheduler(abc.ABC):
         stale anchor. All files are written before any reload. `activate`
         is False only for a self-reload that fell through because the unit
         did not change (reloading would kill the running job for nothing).
-        Whether the entry arms a schedule is `spec.timing is not None` --
-        `unit_spec` already drops the timing for a disabled entry."""
+        Whether the entry arms a schedule is `is_scheduled(spec.timing)`
+        -- a disabled, on-demand, or transit entry renders dormant."""
         rendered = self.render_units(spec)
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         keep = {str(u.filename) for u in rendered.units}
@@ -211,7 +211,7 @@ class Scheduler(abc.ABC):
         for u in rendered.units:
             (self.unit_dir / u.filename).write_text(u.content, encoding="utf-8")
         if activate:
-            self.activate(str(spec.name), scheduled=spec.timing is not None)
+            self.activate(str(spec.name), scheduled=is_scheduled(spec.timing))
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:

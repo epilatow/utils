@@ -54,6 +54,7 @@ from crony.errors import (  # noqa: E402
 )
 from crony.unit import (  # noqa: E402
     Interval,
+    OnDemand,
     PriorityClass,
     Schedule,
 )
@@ -1061,7 +1062,7 @@ class TestValidateConfig:
                 "target": {"darwin": {"jobs": ["root"]}},
             },
             "darwin",
-            "no schedule anywhere",
+            "no firing point anywhere",
         )
 
     def test_chain_cycle_rejected(self) -> None:
@@ -1219,7 +1220,55 @@ class TestValidateConfig:
                 "target": {"darwin": {"jobs": ["a"]}},
             },
             "darwin",
-            "no schedule anywhere",
+            "no firing point anywhere",
+        )
+
+    def test_on_demand_job_directly_reachable_ok(self) -> None:
+        # `schedule = "on-demand"` is its own firing point, so a target
+        # reaching a schedule-less on-demand job directly is valid -- it
+        # runs only via `crony trigger`.
+        cfg = _parse(
+            {
+                "job": {
+                    "a": {"command": "true", "schedule": "on-demand"},
+                },
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        assert "darwin" not in cfg.errored_platform_targets
+        assert isinstance(cfg.jobs["a"].timing, OnDemand)
+
+    def test_on_demand_group_makes_subtree_reachable(self) -> None:
+        # An on-demand group is a firing point for its whole subtree: a
+        # schedule-less child under it is reachable (dispatched when the
+        # group is triggered), so the chain is valid.
+        cfg = _parse(
+            {
+                "job": {"a": {"command": "true"}},
+                "job-group": {
+                    "g": {"jobs": ["a"], "schedule": "on-demand"},
+                },
+                "target": {"darwin": {"jobs": ["g"]}},
+            }
+        )
+        assert "darwin" not in cfg.errored_platform_targets
+        assert isinstance(cfg.job_groups["g"].timing, OnDemand)
+
+    def test_on_demand_and_interval_mutually_exclusive(self) -> None:
+        # on-demand rides the `schedule` key, so pairing it with
+        # `interval` trips the existing schedule/interval exclusion.
+        _assert_errored_job(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "on-demand",
+                        "interval": "1h",
+                    },
+                },
+            },
+            "a",
+            "mutually exclusive",
         )
 
     def test_referenced_group_only_job_ok(self) -> None:

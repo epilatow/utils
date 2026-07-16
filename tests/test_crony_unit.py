@@ -15,10 +15,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.unit import (  # noqa: E402
+    ON_DEMAND_SPEC,
     EntityName,
     EntityRef,
     Interval,
     JitterSpec,
+    OnDemand,
     PriorityClass,
     Schedule,
     UnitSpec,
@@ -208,6 +210,19 @@ class TestSchedule:
     def test_rejects(self, spec: str) -> None:
         with pytest.raises(ValueError):
             Schedule.from_str(spec)
+
+
+class TestOnDemand:
+    def test_str_is_the_spec_token(self) -> None:
+        assert str(OnDemand()) == ON_DEMAND_SPEC == "on-demand"
+
+    def test_instances_are_equal(self) -> None:
+        # No fields, so every instance compares equal -- it behaves as a
+        # singleton firing-mode marker.
+        assert OnDemand() == OnDemand()
+
+    def test_not_confused_with_a_schedule(self) -> None:
+        assert not isinstance(OnDemand(), (Schedule, Interval))
 
 
 class TestUnitSpec:

@@ -2155,6 +2155,58 @@ class TestEnableDisable:
         assert node is not None and node.unit_disabled is False
         assert self._schedule_cell(h.full("a"), capsys) == "grouped"
 
+    def test_on_demand_and_grouped_schedule_cells(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A standalone on-demand job (schedule = "on-demand") shows
+        # `on-demand`; a schedule-less child under a scheduled group shows
+        # `grouped`. The distinction is each entry's own timing.
+        monkeypatch.setenv("NO_COLOR", "1")
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {
+                "job": {
+                    "od": {"command": "true", "schedule": "on-demand"},
+                    "child": {"command": "true"},
+                },
+                "job-group": {
+                    "g": {"jobs": ["child"], "schedule": "*-*-* 03:00"},
+                },
+            },
+            default_target_jobs=["od", "g"],
+        )
+        h.apply("od")
+        h.apply("child")
+        assert self._schedule_cell(h.full("od"), capsys) == "on-demand"
+        assert self._schedule_cell(h.full("child"), capsys) == "grouped"
+
+    def test_trigger_fires_on_demand_job_on_linux(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An on-demand job has no schedule and sits directly under a
+        # target, yet applies and is triggerable -- trigger starts its
+        # dormant `.service` (no `.timer` is installed for it).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "on-demand"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.calls.clear()
+        crony_commands.do_trigger(
+            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        )
+        cmd = next(
+            c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
+        )
+        assert cmd == [
+            "systemctl",
+            "--user",
+            "start",
+            "--no-block",
+            f"crony-{h.full('j')}.service",
+        ]
+
     def test_trigger_invokes_launchctl_kickstart_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:

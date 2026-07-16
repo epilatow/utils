@@ -1255,15 +1255,19 @@ def _parse_timing(
     schedule_str: str | None, interval_str: str | None, where: str
 ) -> crony.unit.Timing | None:
     """Build a unit's timing from the config's mutually-exclusive
-    `schedule` / `interval` keys, or None for an on-demand entry.
-    Surfaces the value objects' validation as a config error tied to
-    `where`. Intervals below `_min_interval_seconds` are rejected."""
+    `schedule` / `interval` keys, or None when neither is set (a transit
+    group or group-only job). The reserved `schedule = "on-demand"` value
+    selects the trigger-only firing mode (`crony.unit.OnDemand`). Surfaces
+    the value objects' validation as a config error tied to `where`.
+    Intervals below `_min_interval_seconds` are rejected."""
     if schedule_str is not None and interval_str is not None:
         raise crony.errors.ConfigError(
             f"{where}: 'schedule' and 'interval' are mutually exclusive"
         )
     try:
         if schedule_str is not None:
+            if schedule_str == crony.unit.ON_DEMAND_SPEC:
+                return crony.unit.OnDemand()
             return crony.unit.Schedule.from_str(schedule_str)
         if interval_str is None:
             return None
@@ -2393,16 +2397,17 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             )
             if notify_msg is not None:
                 return notify_msg
-        # Chain walk: every path from the target through groups to
-        # a leaf job must contain a schedule somewhere; cycles in
-        # the group graph are caught on the way down. A walk into
-        # an errored entry stops without complaint -- the per-entity
-        # error is already attributed and piling on a derived "would
-        # never fire" would just hide it.
+        # Chain walk: every path from the target through groups to a
+        # leaf job must reach a firing point somewhere -- a schedule, an
+        # interval, or a trigger-only `schedule = "on-demand"` entry (any
+        # non-None timing). Cycles in the group graph are caught on the
+        # way down. A walk into an errored entry stops without complaint
+        # -- the per-entity error is already attributed and piling on a
+        # derived "would never fire" would just hide it.
         chain_error: list[str] = []
 
         def _walk_chain(
-            ref: str, path: tuple[str, ...], seen_schedule: bool
+            ref: str, path: tuple[str, ...], seen_firing: bool
         ) -> None:
             if chain_error:
                 return
@@ -2423,17 +2428,18 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 return
             if ref in config.jobs:
                 job = config.jobs[ref]
-                scheduled = job.timing is not None
-                if not seen_schedule and not scheduled:
+                if not seen_firing and job.timing is None:
                     chain_error.append(
                         f"{label}: chain {' -> '.join(path)} has "
-                        f"no schedule anywhere -- {ref!r} would "
-                        f"never fire"
+                        f"no firing point anywhere -- {ref!r} would "
+                        f"never fire (give it a schedule / interval, "
+                        f"place it under a scheduled group, or mark it "
+                        f'schedule = "on-demand" to run it only via '
+                        f"`crony trigger`)"
                     )
                 return
             group = config.job_groups[ref]
-            scheduled = group.timing is not None
-            new_seen = seen_schedule or scheduled
+            new_seen = seen_firing or group.timing is not None
             for child in group.jobs:
                 _walk_chain(child, path, new_seen)
 

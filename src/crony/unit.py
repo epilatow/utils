@@ -26,6 +26,7 @@ import enum
 import re
 import uuid
 from dataclasses import dataclass, field
+from typing import TypeIs
 
 # Bundle names come from filenames and are the namespace prefix, so the
 # "." (name separator) and ":" (ref separator) are both excluded.
@@ -330,6 +331,31 @@ class Schedule:
         return dict(self._calendar)
 
 
+# The literal `schedule` value that selects the trigger-only firing mode
+# (see OnDemand). Parsed by config, and what `str(OnDemand())` renders.
+ON_DEMAND_SPEC = "on-demand"
+
+
+@dataclass(frozen=True)
+class OnDemand:
+    """The trigger-only firing mode: an entry that declares
+    ``schedule = "on-demand"`` and fires only via ``crony trigger`` (or a
+    parent group's dispatch), never on its own timer.
+
+    A firing mode in its own right, distinct from an entry that declares
+    no timing at all (``timing`` is None) -- which is a transit group or a
+    group-only job, valid only when a scheduled ancestor reaches it.
+    OnDemand needs no such ancestor: it is a valid firing point for itself
+    and its subtree. It reaches a backend as its own ``UnitSpec.timing``,
+    which the backend -- seeing `is_scheduled` is False -- renders as a
+    dormant unit (loaded and triggerable, no timer), exactly as a transit
+    group does.
+    """
+
+    def __str__(self) -> str:
+        return ON_DEMAND_SPEC
+
+
 def _check_range(name: str, value: int, low: int, high: int) -> None:
     if not low <= value <= high:
         raise ValueError(f"{name} {value} out of range {low}-{high}")
@@ -393,11 +419,23 @@ def _unsupported_schedule(text: str) -> ValueError:
     )
 
 
-# How a unit fires: a calendar Schedule or a repeat Interval. The two
-# are mutually exclusive, so a single value (or None, for an on-demand
-# unit) models it without an "at most one set" invariant. isinstance
-# discriminates the variant.
-Timing = Schedule | Interval
+# How an entry fires: a calendar Schedule, a repeat Interval, or
+# OnDemand (trigger-only). The three are mutually exclusive, so a single
+# value (or None, for an entry that declares no firing mode -- a transit
+# group or a group-only job) models it without an "at most one set"
+# invariant. isinstance discriminates the variant.
+Timing = Schedule | Interval | OnDemand
+
+
+def is_scheduled(timing: Timing | None) -> TypeIs[Schedule | Interval]:
+    """Whether `timing` arms a scheduler timer. A Schedule or Interval
+    does; OnDemand (trigger-only) and None (a transit group or group-only
+    job) render a dormant unit -- loaded but with no timer, run only on
+    `crony trigger` or a parent group's dispatch. The single predicate
+    the model, status, and the backends share, so "has a timer" is
+    decided identically everywhere; a TypeIs so a backend guarded by it
+    narrows to the real-timer type."""
+    return isinstance(timing, (Schedule, Interval))
 
 
 @dataclass(frozen=True)
@@ -428,9 +466,11 @@ class UnitSpec:
 
     name        The unit's full name; basis for its platform label.
     cmd         The argv the unit runs.
-    timing      A Schedule, an Interval, or None for an on-demand unit
-                (a transit group, or a job fired only by explicit
-                trigger).
+    timing      The entry's firing mode: a Schedule or Interval (which
+                arm a timer -- `is_scheduled`), OnDemand (trigger-only),
+                or None (a transit group or group-only job). A backend
+                renders OnDemand and None the same way -- a dormant unit
+                with no timer. A disabled entry is rendered with None.
     priority    The unit's priority class. NORMAL when no special
                 scheduling is requested (groups always render NORMAL);
                 only HIGH / LOW emit platform directives.

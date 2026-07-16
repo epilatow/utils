@@ -68,7 +68,8 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     """Render a unit's timing into one status cell value.
 
     A Schedule shows its OnCalendar source; an Interval shows
-    `interval=<spec>`. An entry with no timing -- a transit group or a
+    `interval=<spec>`. A trigger-only OnDemand entry displays as
+    `on-demand`. An entry with no timing -- a transit group or a
     group-only job -- displays as `grouped`. This renders only the
     schedule shape; the caller overrides the cell with `disabled` for an
     operator-disabled entry (it has the snapshot's disable flag).
@@ -79,6 +80,8 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
         return crony.model.ScheduleValue.INTERVAL.value.replace(
             "<x>", str(timing)
         )
+    if isinstance(timing, crony.unit.OnDemand):
+        return crony.model.ScheduleValue.ON_DEMAND.value
     return crony.model.ScheduleValue.GROUPED.value
 
 
@@ -1934,17 +1937,24 @@ def _resolve_states(
 def _entry_is_scheduled(
     entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
 ) -> bool:
+    # "Scheduled" selects the `.timer` unit name over the bare
+    # `.service`. A dormant entry (transit group, trigger-only OnDemand,
+    # or no timing) is not scheduled -- `is_scheduled` is the shared
+    # "arms a real timer" test.
     if entry is None:
         return False
-    return entry.timing is not None
+    return crony.unit.is_scheduled(entry.timing)
 
 
 def _snapshot_says_scheduled(
     config: crony.model.Config, full: str
 ) -> bool | None:
     """`True` / `False` if the current-graph entry for `full`
-    records schedule fields; `None` otherwise. Used to guess UNIT
-    NAME for entries whose live config no longer exists.
+    arms a real timer (a Schedule / Interval, so the scheduler names
+    its `.timer`); `None` otherwise. A dormant entry -- a transit group
+    or a trigger-only OnDemand job -- reads `False` (the bare
+    `.service`). Used to guess UNIT NAME for entries whose live config no
+    longer exists.
 
     The lookup goes through `resolve_runnable` (current only).
     A broken or unit-only or pending-only entry returns `None`
@@ -1958,7 +1968,7 @@ def _snapshot_says_scheduled(
         return None
     snap = config.current.job_from_ref(ref)
     if snap is not None:
-        return snap.timing is not None
+        return crony.unit.is_scheduled(snap.timing)
     return None
 
 

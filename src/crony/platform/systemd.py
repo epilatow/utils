@@ -24,8 +24,9 @@ from crony.platform.scheduler import (
 from crony.unit import (
     Interval,
     PriorityClass,
-    Timing,
+    Schedule,
     UnitSpec,
+    is_scheduled,
 )
 
 # --quiet drops the success-path symlink chatter. Enable (create the
@@ -86,7 +87,9 @@ def _render_service(
     )
 
 
-def _render_timer(name: str, timing: Timing, jitter: Interval | None) -> str:
+def _render_timer(
+    name: str, timing: Schedule | Interval, jitter: Interval | None
+) -> str:
     """Render the systemd `.timer` unit.
 
     `jitter` is the fixed per-job start-time offset for a jittered interval
@@ -302,7 +305,7 @@ class SystemdScheduler(Scheduler):
                 _render_service(name, spec.cmd, spec.priority),
             )
         ]
-        if spec.timing is not None:
+        if is_scheduled(spec.timing):
             jitter = spec.jitter.offset if spec.jitter is not None else None
             units.append(
                 RenderedUnit(

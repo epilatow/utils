@@ -307,13 +307,13 @@ class _JobCommon:
     state_dir_symlink: tuple[Path, str] | None = field(
         default=None, kw_only=True
     )
-    # The per-entry schedule / interval that drove the rendered platform
-    # unit, pinned so `crony status` shows the applied schedule
-    # independently of any later live-config edit. Default-None
-    # (on-demand) for back-compat with snapshots written before a timing
-    # was pinned; loaders rely on the dataclass default rather than a
-    # schema bump. Keyword-only so the subclasses can append their own
-    # non-default fields after it.
+    # The per-entry firing mode (Schedule / Interval / OnDemand) that
+    # drove the rendered platform unit, pinned so `crony status` shows the
+    # applied schedule independently of any later live-config edit.
+    # Default-None (a transit group or group-only job) for back-compat
+    # with snapshots written before a timing was pinned; loaders rely on
+    # the dataclass default rather than a schema bump. Keyword-only so the
+    # subclasses can append their own non-default fields after it.
     timing: crony.unit.Timing | None = field(default=None, kw_only=True)
     # The entry's resolved capability flags as a single bitmask. `Job`
     # exposes the per-flag booleans (`interactive`, `keep_awake`) as
@@ -489,7 +489,10 @@ class _JobCommon:
         ones, a re-render's stamped ones). A disabled entry renders
         schedule-less (`timing` dropped) -- loaded and triggerable, but
         not firing on its own -- while keeping its schedule pinned in the
-        `timing` field so `enable` restores it.
+        `timing` field so `enable` restores it. A trigger-only OnDemand
+        entry keeps its OnDemand timing here (so status shows `on-demand`)
+        and the backend renders it dormant like any non-`is_scheduled`
+        entry.
 
         Requires those paths; a node only ever compared, never installed
         (a bare snapshot load), has no unit to render and raises. The
@@ -552,6 +555,12 @@ class _JobCommon:
             if isinstance(self.timing, crony.unit.Interval)
             else None
         )
+
+    def _on_demand(self) -> bool:
+        """Whether this entry's timing is the trigger-only OnDemand mode
+        (persisted so the applied side shows `on-demand` and a switch to
+        or from a schedule reads as drift)."""
+        return isinstance(self.timing, crony.unit.OnDemand)
 
     def _to_snapshot(
         self,
@@ -761,6 +770,7 @@ class Job(_JobCommon):
             timeout=self.timeout,
             schedule=self._schedule_str(),
             interval=self._interval_str(),
+            on_demand=self._on_demand(),
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -964,6 +974,7 @@ class JobGroup(_JobCommon):
             timeout=self.timeout,
             schedule=self._schedule_str(),
             interval=self._interval_str(),
+            on_demand=self._on_demand(),
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -1462,12 +1473,12 @@ class ConfigStatus(_DescribedStrEnum):
 
 class ScheduleValue(_DescribedStrEnum):
     """The kinds of value the `crony status` SCHEDULE column shows. Each
-    member's value is its `--help` display label. GROUPED and DISABLED's
-    values are also the literal cell strings the renderer emits;
-    INTERVAL's value is the cell template, whose `<x>` the renderer
-    replaces with the actual time span. All three thus have a single home
-    here. SCHEDULE is a pure category label -- a scheduled entry renders
-    its raw OnCalendar string."""
+    member's value is its `--help` display label. GROUPED, ON_DEMAND, and
+    DISABLED's values are also the literal cell strings the renderer
+    emits; INTERVAL's value is the cell template, whose `<x>` the renderer
+    replaces with the actual time span. All thus have a single home here.
+    SCHEDULE is a pure category label -- a scheduled entry renders its raw
+    OnCalendar string."""
 
     SCHEDULE = (
         "OnCalendar schedule",
@@ -1481,6 +1492,12 @@ class ScheduleValue(_DescribedStrEnum):
         "grouped",
         "A job/group with no schedule of its own, it runs when triggered "
         "by a parent job group.",
+    )
+    ON_DEMAND = (
+        "on-demand",
+        'A trigger-only job/group (schedule = "on-demand") with no '
+        "schedule of its own and no scheduled parent. It runs only when "
+        "run manually via the `trigger` subcommand.",
     )
     DISABLED = (
         "disabled",

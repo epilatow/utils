@@ -28,8 +28,10 @@ from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
     Interval,
+    OnDemand,
     PriorityClass,
     Schedule,
+    Timing,
     UnitSpec,
 )
 
@@ -118,7 +120,7 @@ class TestSystemdPriority:
 class TestSystemdScheduler:
     """render() returns the right unit files for each schedule shape."""
 
-    def _spec(self, timing: Schedule | Interval | None) -> UnitSpec:
+    def _spec(self, timing: Timing | None) -> UnitSpec:
         return UnitSpec(
             name=EntityName.from_str("default.brew"),
             cmd=_CMD,
@@ -144,6 +146,17 @@ class TestSystemdScheduler:
             Path("crony-default.brew.service")
         ]
         assert all(u.content for u in units.units)
+
+    def test_service_only_when_on_demand(self) -> None:
+        # A trigger-only OnDemand entry arms no timer -- the backend
+        # renders the dormant `.service` alone, same as a schedule-less
+        # entry (the model no longer collapses OnDemand to None).
+        units = get_scheduler("linux", _DIR).render_units(
+            self._spec(OnDemand())
+        )
+        assert [u.filename for u in units.units] == [
+            Path("crony-default.brew.service")
+        ]
 
     def test_remove_files_unlinks_service_and_timer(
         self, tmp_path: Path, monkeypatch: Any

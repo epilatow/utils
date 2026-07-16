@@ -323,6 +323,10 @@ A systemd time\-span interval for job execution.\&
 \f[I]grouped\f[R]
 A job/group with no schedule of its own, it runs when triggered by a parent job group.\&
 .TP
+\f[I]on\-demand\f[R]
+A trigger\-only job/group (schedule = \(dqon\-demand\(dq) with no schedule of its own and no scheduled parent.\&
+It runs only when run manually via the \(gatrigger\(ga subcommand.\&
+.TP
 \f[I]disabled\f[R]
 A job that has been disabled via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
 It can be run manually via the \(gatrigger\(ga subcommand, and re\-enabled via the \(gaenable\(ga subcommand.\&

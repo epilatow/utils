@@ -323,6 +323,10 @@ Send a synthetic failure notification.
 - **`grouped`**\
   A job/group with no schedule of its own, it runs when triggered by a parent
   job group.
+- **`on-demand`**\
+  A trigger-only job/group (schedule = "on-demand") with no schedule of its
+  own and no scheduled parent. It runs only when run manually via the
+  `trigger` subcommand.
 - **`disabled`**\
   A job that has been disabled via the `disable` subcommand; it will not be
   run via any schedule. It can be run manually via the `trigger` subcommand,

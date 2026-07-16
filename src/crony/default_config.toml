@@ -133,7 +133,10 @@
 # `script` (path under the dotfiles repo) is required. Schedule and
 # interval are optional; a job with neither fires only when a
 # scheduled group dispatches it. Validation rejects a target chain
-# that reaches a job through a path with no schedule anywhere.
+# that reaches a job through a path with no firing point anywhere --
+# give the job a schedule / interval, place it under a scheduled group,
+# or set `schedule = "on-demand"` (see reindex below) to make it a
+# trigger-only job run solely via `crony trigger`.
 #
 # `uuid` is the stable per-bundle identity of the entry, decoupled
 # from `name` so that renaming a job in this file is recognized as
@@ -197,6 +200,16 @@
 #command = "uv self update && uv tool upgrade --all"
 #gate    = "command -v uv"
 
+# Trigger-only (on-demand) job: no schedule and no scheduled parent, so
+# it never fires on its own -- it runs only when invoked with
+# `crony trigger reindex`. `schedule = "on-demand"` opts it out of the
+# "would never fire" check and shows `on-demand` in `crony status`.
+# Mutually exclusive with a real schedule / interval (it rides the same
+# `schedule` key).
+#[job.reindex]
+#command  = "reindex --full"
+#schedule = "on-demand"
+
 # Interactive job: sits pending after its fire and pops a
 # desktop dialog (Run / Delay / Cancel) once the user has been
 # active continuously for `interactive-active` (default 10min).
@@ -220,8 +233,11 @@
 # A sequencer that fires named jobs (or other groups) in order.
 # Schedule / interval are optional: a group with no schedule is a
 # "transit" group that fires only when a parent group dispatches it.
-# Every chain from a target down through groups to a leaf job must
-# contain a schedule somewhere, or validation rejects it.
+# Every chain from a target down through groups to a leaf job must reach
+# a firing point somewhere -- a schedule, an interval, or an on-demand
+# entry (`schedule = "on-demand"`, valid on a group too) -- or validation
+# rejects it. An on-demand group is triggered as a unit via
+# `crony trigger <group>`, dispatching its children on demand.
 
 #[job-group.daily-updates]
 #uuid      = "11223344-5566-7788-99aa-bbccddeeff00"

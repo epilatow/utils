@@ -68,8 +68,10 @@ from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
     Interval,
+    OnDemand,
     PriorityClass,
     Schedule,
+    is_scheduled,
 )
 
 _script_path = REPO_ROOT / "src" / "crony" / "model.py"
@@ -569,6 +571,46 @@ class TestUnitDisabled:
         d = self._snap().to_dict()
         d.pop("unit_disabled", None)  # a snapshot written before the field
         assert snapshot_from_dict(d).unit_disabled is False
+
+
+class TestOnDemand:
+    """`schedule = "on-demand"` is the trigger-only firing mode: the node
+    carries an `OnDemand` timing (so status shows `on-demand` and a switch
+    to / from a real schedule reads as drift), but `unit_spec` renders it
+    dormant like a transit group, and it round-trips through
+    snapshot.json."""
+
+    def _snap(self) -> Any:
+        cfg = _parse({"job": {"j": _job(schedule="on-demand")}})
+        return dataclasses.replace(
+            _resolve_snapshot_for(cfg, "j"),
+            uv_path=Path("/uv"),
+            crony_path=Path("/crony"),
+        )
+
+    def test_timing_is_on_demand(self) -> None:
+        assert isinstance(self._snap().timing, OnDemand)
+
+    def test_unit_spec_pins_on_demand_and_is_not_scheduled(self) -> None:
+        # The model pins OnDemand on the spec (so status shows
+        # `on-demand`) and it reads as not-scheduled -- the backend
+        # renders it dormant, no collapse to None in the model.
+        spec_timing = self._snap().unit_spec().timing
+        assert isinstance(spec_timing, OnDemand)
+        assert not is_scheduled(spec_timing)
+
+    def test_round_trips_through_snapshot(self) -> None:
+        snap = self._snap()
+        d = snap.to_dict()
+        assert d["on-demand"] is True
+        assert isinstance(snapshot_from_dict(d).timing, OnDemand)
+
+    def test_absent_in_old_snapshot_loads_not_on_demand(self) -> None:
+        d = _resolve_snapshot_for(
+            _parse({"job": {"j": _job(schedule="daily")}}), "j"
+        ).to_dict()
+        d.pop("on-demand", None)  # a snapshot written before the field
+        assert not isinstance(snapshot_from_dict(d).timing, OnDemand)
 
 
 class TestJobFromRefAndFullName:
