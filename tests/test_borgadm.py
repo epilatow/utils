@@ -389,6 +389,24 @@ class TestArgumentParser:
             parser.parse_command(["repair", mode])
         assert exc.value.code == 2
 
+    @pytest.mark.parametrize("cmd", ["extract", "rsync"])
+    def test_archive_option_defaults_to_none(self, cmd: str) -> None:
+        """Without --archive, extract/rsync leave `archive` None so the
+        handler falls back to the latest full backup set."""
+        parser = ba.args_parser()
+        args = parser.parse_command([cmd, "/target"])
+        assert args.command == cmd
+        assert args.archive is None
+
+    @pytest.mark.parametrize("cmd", ["extract", "rsync"])
+    def test_archive_option_captures_selector(self, cmd: str) -> None:
+        """--archive carries its selector through to the handler."""
+        parser = ba.args_parser()
+        args = parser.parse_command(
+            [cmd, "/target", "--archive", "20250101_120000"]
+        )
+        assert args.archive == "20250101_120000"
+
     def test_common_args_rejected_before_action(self) -> None:
         """Common args between subcommand and action should fail."""
         parser = ba.args_parser()
@@ -2584,6 +2602,98 @@ class TestCheck:
             ba.do_check_prune(bypass_lock=False)  # Should not raise
 
 
+@pytest.mark.usefixtures("mock_cfg")
+class TestSelectedBackup:
+    """_selected_backup resolves which backup extract/rsync operate on:
+    the latest full set by default, else a name or a YYYYMMDD_HHMMSS
+    timestamp (via the shared _resolve_archives)."""
+
+    def test_none_resolves_latest_full_set(self) -> None:
+        """No selector returns the latest full backup set and its
+        timestamp."""
+        latest = {
+            "20250102_120000": [
+                "foobar::home-set1-20250102_120000_1of1",
+            ]
+        }
+        with patch.object(
+            ba, "list_backups", autospec=True, return_value=latest
+        ) as mock_list:
+            ts, archives = ba._selected_backup(None, bypass_lock=False)
+        assert ts == "20250102_120000"
+        assert archives == latest["20250102_120000"]
+        mock_list.assert_called_once_with(latest=True, bypass_lock=False)
+
+    def test_none_on_empty_repo_errors(self) -> None:
+        """No selector against a repo with no full backups fails."""
+        with (
+            patch.object(ba, "list_backups", autospec=True, return_value={}),
+            pytest.raises(ba.BorgadmError, match="No full backups"),
+        ):
+            ba._selected_backup(None, bypass_lock=False)
+
+    def test_timestamp_selects_that_set(self) -> None:
+        """A timestamp selector resolves to every archive at that time,
+        returning that shared timestamp."""
+
+        def list_backups_side_effect(
+            partial: bool = False, **_kwargs: object
+        ) -> dict[str, list[str]]:
+            if partial:
+                return {}
+            return {
+                "20250101_120000": [
+                    "foobar::home-set1-20250101_120000_1of2",
+                    "foobar::home-set2-20250101_120000_2of2",
+                ]
+            }
+
+        with patch.object(
+            ba,
+            "list_backups",
+            autospec=True,
+            side_effect=list_backups_side_effect,
+        ):
+            ts, archives = ba._selected_backup(
+                "20250101_120000", bypass_lock=False
+            )
+        assert ts == "20250101_120000"
+        assert archives == [
+            "foobar::home-set1-20250101_120000_1of2",
+            "foobar::home-set2-20250101_120000_2of2",
+        ]
+
+    def test_archive_name_selects_single_archive(self) -> None:
+        """A full archive name resolves to just that archive, with the
+        timestamp parsed from its name."""
+        raw = Mock()
+        raw.stdout = (
+            "home-set1-20250101_120000_1of2\nhome-set2-20250101_120000_2of2\n"
+        )
+        with patch.object(
+            ba, "list_backups_raw", autospec=True, return_value=raw
+        ):
+            ts, archives = ba._selected_backup(
+                "home-set1-20250101_120000_1of2", bypass_lock=False
+            )
+        assert ts == "20250101_120000"
+        assert archives == ["foobar::home-set1-20250101_120000_1of2"]
+
+    def test_foreign_name_is_rejected(self) -> None:
+        """A name that exists but is not a borgadm archive (no derivable
+        timestamp) is rejected -- extract/rsync reconstruct a
+        borgadm-managed backup."""
+        raw = Mock()
+        raw.stdout = "someone-elses-archive\n"
+        with (
+            patch.object(
+                ba, "list_backups_raw", autospec=True, return_value=raw
+            ),
+            pytest.raises(ba.BorgadmError, match="borgadm-managed"),
+        ):
+            ba._selected_backup("someone-elses-archive", bypass_lock=False)
+
+
 # borg 1.4's LockTimeout stderr, verified against a real held lock.
 _LOCK_TIMEOUT_STDERR = (
     "Failed to create/acquire the lock /repo/lock.exclusive (timeout).\n"
@@ -3088,6 +3198,7 @@ class TestRsyncMountCleanup:
                 delete=True,
                 progress=False,
                 bypass_lock=True,
+                archive=None,
             )
         umounts = [
             Path(c.args[0][2]).name
@@ -3102,6 +3213,46 @@ class TestRsyncMountCleanup:
         ]
         assert rms == ["workdir"]
         assert any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
+
+    def test_do_rsync_archive_records_selected_timestamp(
+        self, mock_cfg: Any, tmp_path: Path
+    ) -> None:
+        """`rsync --archive NAME` mirrors the selected archive and records
+        its parsed timestamp in the .ts sidecar rather than the latest."""
+        target = tmp_path / "borg-rsync"
+        target.mkdir()
+        raw = Mock()
+        raw.stdout = "home-set1-20260101_000000_1of1\n"
+        with (
+            patch.object(ba.platform, "system", return_value="Linux"),
+            patch.object(ba, "check_sudo", autospec=True, return_value=True),
+            patch.object(
+                ba, "list_backups_raw", autospec=True, return_value=raw
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba.os, "listdir", return_value=["x"]),
+            patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
+            patch.object(ba, "_mounts_under", autospec=True, return_value=[]),
+            patch.object(ba, "run_cmd", autospec=True),
+        ):
+            ba.do_rsync(
+                target,
+                dry_run=False,
+                delete=False,
+                progress=False,
+                bypass_lock=True,
+                archive="home-set1-20260101_000000_1of1",
+            )
+        sidecar = tmp_path / f".{ba.BASENAME}_borg-rsync.ts"
+        assert sidecar.read_text() == "20260101_000000"
+        mounted = [
+            c.args[0][-2]
+            for c in mock_run_borg.call_args_list
+            if "mount" in c.args[0]
+        ]
+        assert mounted == [
+            f"{mock_cfg.BORG_REPO}::home-set1-20260101_000000_1of1"
+        ]
 
     def test_do_rsync_unmounts_mount_stranded_by_failure(
         self, tmp_path: Path
@@ -3141,6 +3292,7 @@ class TestRsyncMountCleanup:
                 delete=True,
                 progress=False,
                 bypass_lock=True,
+                archive=None,
             )
         umounts = [
             Path(c.args[0][2]).name
@@ -5047,6 +5199,86 @@ class TestE2EExtract:
         result = borg_e2e.run("extract", str(target), check=False)
         assert result.returncode != 0
         assert "no full backups found" in result.stderr.lower()
+
+    def test_extract_archive_timestamp_restores_that_backup(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """`extract --archive TIMESTAMP` restores the set at that time
+        rather than the latest; the bare form still restores the latest."""
+        old_ts = "20260101_120000"
+        new_ts = "20260202_120000"
+        old_src = tmp_path / "old-src"
+        old_src.mkdir()
+        (old_src / "data.txt").write_text("old-version")
+        new_src = tmp_path / "new-src"
+        new_src.mkdir()
+        (new_src / "data.txt").write_text("new-version")
+        borg_e2e.make_archive(
+            _archive_name("set-a", old_ts, 1, 1), content_path=old_src
+        )
+        borg_e2e.make_archive(
+            _archive_name("set-a", new_ts, 1, 1), content_path=new_src
+        )
+
+        picked = tmp_path / "picked"
+        picked.mkdir()
+        result = borg_e2e.run("extract", str(picked), "--archive", old_ts)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        restored = list(picked.rglob("data.txt"))
+        assert len(restored) == 1
+        assert restored[0].read_text() == "old-version"
+
+        latest = tmp_path / "latest"
+        latest.mkdir()
+        result = borg_e2e.run("extract", str(latest))
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        restored = list(latest.rglob("data.txt"))
+        assert len(restored) == 1
+        assert restored[0].read_text() == "new-version"
+
+    def test_extract_archive_name_restores_only_that_archive(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """`extract --archive NAME` restores just the named archive, not
+        the sibling archives sharing its timestamp."""
+        ts = "20260101_120000"
+        src_a = tmp_path / "src-a"
+        src_a.mkdir()
+        (src_a / "a.txt").write_text("A")
+        src_b = tmp_path / "src-b"
+        src_b.mkdir()
+        (src_b / "b.txt").write_text("B")
+        name_a = _archive_name("set-a", ts, 1, 2)
+        borg_e2e.make_archive(name_a, content_path=src_a)
+        borg_e2e.make_archive(
+            _archive_name("set-b", ts, 2, 2), content_path=src_b
+        )
+
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        result = borg_e2e.run("extract", str(target), "--archive", name_a)
+        assert result.returncode == 0, (
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert len(list(target.rglob("a.txt"))) == 1
+        assert list(target.rglob("b.txt")) == []
+
+    def test_extract_archive_unknown_timestamp_fails(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path
+    ) -> None:
+        """An unknown --archive selector fails rather than falling back
+        to the latest backup."""
+        borg_e2e.make_archive(_archive_name("set-a", "20260101_120000", 1, 1))
+        target = tmp_path / "extract-target"
+        target.mkdir()
+        result = borg_e2e.run(
+            "extract", str(target), "--archive", "20990101_000000", check=False
+        )
+        assert result.returncode != 0
 
 
 @pytest.mark.e2e

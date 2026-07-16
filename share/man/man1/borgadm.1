@@ -57,6 +57,9 @@ To schedule unattended backups and checks via crony(1) run:
 \f[CR]archive\f[R]
 A full archive name as shown by \f[CR]borgadm list\f[R], or a YYYYMMDD_HHMMSS timestamp standing for every archive at that time.\&
 .TP
+\f[CR]\-\-archive SELECTOR\f[R]
+Operate on the given archive instead of the latest full backup set: a full archive name as shown by \f[CR]borgadm list\f[R], or a YYYYMMDD_HHMMSS timestamp standing for every archive at that time.\&
+.TP
 \f[CR]\-\-config CONFIG\f[R]
 Path to the borgadm config file to read.\&
 (default: \(ti/.borgadm)
@@ -203,8 +206,9 @@ Create a full backup, writing one archive per configured backup set, then prune 
 Skip backup pruning
 .RE
 .TP
-\f[B]extract\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir [patterns ...]\&
-Extract the latest full backup into a target directory, optionally filtered by include/exclude patterns.\&
+\f[B]extract\f[R] [\-\-archive SELECTOR] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir [patterns ...]\&
+Extract a backup into a target directory, optionally filtered by include/exclude patterns.\&
+Defaults to the latest full backup set; \-\-archive selects a different one.\&
 .RS
 .TP
 \f[CR]target_dir\f[R]
@@ -280,8 +284,9 @@ Default: warn but leave in place.\&
 Either way, an unknown archive in the repo causes list and prune to exit with the WARNING status.\&
 .RE
 .TP
-\f[B]rsync\f[R] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir
-Mirror the contents of the latest archive to a target directory with rsync (Linux only).\&
+\f[B]rsync\f[R] [\-\-archive SELECTOR] [\-\-delete] [\-\-dry\-run] [\-\-progress] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] target_dir
+Mirror the contents of a backup to a target directory with rsync (Linux only).\&
+Defaults to the latest full backup set; \-\-archive selects a different one.\&
 .RS
 .TP
 \f[CR]target_dir\f[R]

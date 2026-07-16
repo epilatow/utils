@@ -74,6 +74,10 @@ To schedule unattended backups and checks via crony(1) run:
 - **`archive`**\
   A full archive name as shown by `borgadm list`, or a YYYYMMDD_HHMMSS
   timestamp standing for every archive at that time.
+- **`--archive SELECTOR`**\
+  Operate on the given archive instead of the latest full backup set: a full
+  archive name as shown by `borgadm list`, or a YYYYMMDD_HHMMSS timestamp
+  standing for every archive at that time.
 - **`--config CONFIG`**\
   Path to the borgadm config file to read. (default: ~/.borgadm)
 - **`--dry-run`**\
@@ -216,10 +220,11 @@ prune old archives unless --no-prune is given.
 - **`--no-prune`**\
   Skip backup pruning
 
-### `extract [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir [patterns ...]`
+### `extract [--archive SELECTOR] [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir [patterns ...]`
 
-Extract the latest full backup into a target directory, optionally filtered by
-include/exclude patterns.
+Extract a backup into a target directory, optionally filtered by
+include/exclude patterns. Defaults to the latest full backup set; --archive
+selects a different one.
 
 - **`target_dir`**\
   Target directory for extracted backup
@@ -291,10 +296,10 @@ policy, optionally removing unknown archives.
   shape. Default: warn but leave in place. Either way, an unknown archive in
   the repo causes list and prune to exit with the WARNING status.
 
-### `rsync [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir`
+### `rsync [--archive SELECTOR] [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir`
 
-Mirror the contents of the latest archive to a target directory with rsync
-(Linux only).
+Mirror the contents of a backup to a target directory with rsync (Linux only).
+Defaults to the latest full backup set; --archive selects a different one.
 
 - **`target_dir`**\
   Target directory for extracted backup

@@ -2081,6 +2081,41 @@ def _resolve_archives(
     return resolved
 
 
+def _selected_backup(
+    archive: str | None, bypass_lock: bool
+) -> tuple[str, list[str]]:
+    """Resolve which backup an extract/rsync run operates on, returning
+    its (timestamp, full-archive-names).
+
+    With no selector, the latest full backup set. With a selector, the
+    archives named by `_resolve_archives` -- a full archive name, or a
+    YYYYMMDD_HHMMSS timestamp standing for every archive at that time.
+    Extract/rsync reconstruct a borgadm-managed backup, so the selected
+    archives must parse as borgadm names sharing one timestamp; a
+    selector that resolves only to foreign names is rejected. The shared
+    timestamp is returned for rsync's recorded-version sidecar."""
+    if archive is None:
+        backups = list_backups(latest=True, bypass_lock=bypass_lock)
+        if not backups:
+            raise BorgadmError("No full backups found.")
+        assert len(backups.keys()) == 1
+        ts = next(iter(backups))
+        return ts, backups[ts]
+    cfg = get_cfg()
+    names = _resolve_archives([archive], bypass_lock=bypass_lock)
+    timestamps = {
+        parsed.timestamp
+        for name in names
+        if (parsed := _ArchiveName.from_str(cfg.BACKUP_NAME, name)) is not None
+    }
+    if len(timestamps) != 1:
+        raise BorgadmError(
+            f"Not a borgadm-managed archive or timestamp: {archive}"
+        )
+    ts = next(iter(timestamps))
+    return ts, [f"{cfg.BORG_REPO}::{name}" for name in names]
+
+
 def do_check_archives(
     progress: bool, latest: bool, archive: list[str], bypass_lock: bool
 ) -> None:
@@ -2339,12 +2374,9 @@ def do_extract(
     delete: bool,
     progress: bool,
     bypass_lock: bool,
+    archive: str | None,
 ) -> None:
-    backups = list_backups(latest=True, bypass_lock=bypass_lock)
-    if not backups:
-        raise BorgadmError("No full backups found.")
-    assert len(backups.keys()) == 1
-    archives = list(backups.values())[0]
+    _ts, archives = _selected_backup(archive, bypass_lock)
 
     target_dir = target_dir.resolve()
     if not os.path.isdir(target_dir):
@@ -2361,12 +2393,12 @@ def do_extract(
         # contain spaces.
         archive_paths: set[Path] = set()
         archive_dirs: set[Path] = set()
-        for archive in archives:
-            logger.info(f"Getting archive contents: {archive}")
+        for archive_ref in archives:
+            logger.info(f"Getting archive contents: {archive_ref}")
             cmd = borg_cmd() + ["list", "--format", "{type} {path}{NL}"]
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
-            cmd.append(archive)
+            cmd.append(archive_ref)
             proc = run_borg(cmd, repo_write=False, bypass_lock=bypass_lock)
             for line in proc.stdout.splitlines():
                 if not line:
@@ -2452,8 +2484,8 @@ def do_extract(
                 "Another extract process is already running for this path."
             ) from None
 
-        for archive in archives:
-            logger.info(f"Extracting: {archive} to {target_dir}")
+        for archive_ref in archives:
+            logger.info(f"Extracting: {archive_ref} to {target_dir}")
 
             cmd = borg_cmd() + ["extract"]
             cmd += ["--progress"] if progress else []
@@ -2461,7 +2493,7 @@ def do_extract(
                 cmd.append("--dry-run")
             for pattern in patterns:
                 cmd += ["--pattern", pattern]
-            cmd.append(archive)
+            cmd.append(archive_ref)
             run_borg(
                 cmd,
                 repo_write=False,
@@ -2589,6 +2621,7 @@ def do_rsync(
     delete: bool,
     progress: bool,
     bypass_lock: bool,
+    archive: str | None,
 ) -> None:
     if platform.system() != "Linux":
         raise BorgadmError("Rsync subcommand is only supported on linux")
@@ -2600,12 +2633,7 @@ def do_rsync(
             " variables."
         )
 
-    backups = list_backups(latest=True, bypass_lock=bypass_lock)
-    if not backups:
-        raise BorgadmError("No full backups found.")
-    assert len(backups.keys()) == 1
-    ts = list(backups.keys())[0]
-    archives = list(backups.values())[0]
+    ts, archives = _selected_backup(archive, bypass_lock)
 
     target_dir = target_dir.resolve()
     if not os.path.isdir(target_dir):
@@ -2640,8 +2668,8 @@ def do_rsync(
             _reclaim_stale_run_dirs(tdir_dirname, tmpdir_prefix, tmpdir)
 
             archive_mounts: list[Path] = []
-            for archive in archives:
-                archive_name = archive.split("::", 1)[1]
+            for archive_ref in archives:
+                archive_name = archive_ref.split("::", 1)[1]
                 mount_dir = tmpdir / archive_name
 
                 os.makedirs(mount_dir)
@@ -2649,10 +2677,10 @@ def do_rsync(
                     "mount",
                     "-o",
                     "allow_other",
-                    archive,
+                    archive_ref,
                     mount_dir.as_posix(),
                 ]
-                logger.info(f"Mounting {archive} to: {mount_dir}")
+                logger.info(f"Mounting {archive_ref} to: {mount_dir}")
                 run_borg(
                     cmd,
                     repo_write=False,
@@ -2662,7 +2690,7 @@ def do_rsync(
                 archive_mounts.append(mount_dir)
 
                 if not os.listdir(mount_dir):
-                    raise BorgadmError(f"Empty archive mount: {archive}")
+                    raise BorgadmError(f"Empty archive mount: {archive_ref}")
 
             lowerdir = ":".join([i.as_posix() for i in archive_mounts])
             upperdir = tmpdir / "upperdir"
@@ -3122,6 +3150,26 @@ def args_parser() -> StrictArgumentParser:
             ),
         )
 
+    def add_archive_option(parser: argparse.ArgumentParser) -> None:
+        # Shared by extract and rsync, which default to the latest full
+        # set and read this override the same way (a name or an expanded
+        # timestamp, via _selected_backup), so COMMON ARGUMENTS documents
+        # it once.
+        add_argument_ext(
+            parser,
+            "--archive",
+            default=None,
+            metavar="SELECTOR",
+            help="archive to operate on (default: latest full backup set)",
+            common=True,
+            extended_help=(
+                "Operate on the given archive instead of the latest full "
+                "backup set: a full archive name as shown by `borgadm "
+                "list`, or a YYYYMMDD_HHMMSS timestamp standing for every "
+                "archive at that time."
+            ),
+        )
+
     automate = add_parser(
         "automate",
         help="Manage automated backups and checks (apply/status/destroy)",
@@ -3373,10 +3421,11 @@ def args_parser() -> StrictArgumentParser:
 
     extract = add_parser(
         "extract",
-        help="Extract latest full backup",
+        help="Extract a backup",
         description=(
-            "Extract the latest full backup into a target directory, "
-            "optionally filtered by include/exclude patterns."
+            "Extract a backup into a target directory, optionally filtered "
+            "by include/exclude patterns. Defaults to the latest full "
+            "backup set; --archive selects a different one."
         ),
     )
     add_target_dir(extract)
@@ -3388,6 +3437,7 @@ def args_parser() -> StrictArgumentParser:
             "see 'borg help patterns' for details"
         ),
     )
+    add_archive_option(extract)
     add_delete(extract)
     add_dry_run(extract)
     add_progress(extract)
@@ -3516,13 +3566,15 @@ def args_parser() -> StrictArgumentParser:
 
     rsync = add_parser(
         "rsync",
-        help="Rsync latest archive",
+        help="Rsync a backup",
         description=(
-            "Mirror the contents of the latest archive to a target directory "
-            "with rsync (Linux only)."
+            "Mirror the contents of a backup to a target directory with "
+            "rsync (Linux only). Defaults to the latest full backup set; "
+            "--archive selects a different one."
         ),
     )
     add_target_dir(rsync)
+    add_archive_option(rsync)
     add_delete(rsync)
     add_dry_run(rsync)
     add_progress(rsync)
