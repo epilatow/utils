@@ -1224,13 +1224,13 @@ class TestValidateConfig:
         )
 
     def test_on_demand_job_directly_reachable_ok(self) -> None:
-        # `schedule = "on-demand"` is its own firing point, so a target
+        # `on-demand = true` is its own firing point, so a target
         # reaching a schedule-less on-demand job directly is valid -- it
         # runs only via `crony trigger`.
         cfg = _parse(
             {
                 "job": {
-                    "a": {"command": "true", "schedule": "on-demand"},
+                    "a": {"command": "true", "on-demand": True},
                 },
                 "target": {"darwin": {"jobs": ["a"]}},
             }
@@ -1246,7 +1246,7 @@ class TestValidateConfig:
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
-                    "g": {"jobs": ["a"], "schedule": "on-demand"},
+                    "g": {"jobs": ["a"], "on-demand": True},
                 },
                 "target": {"darwin": {"jobs": ["g"]}},
             }
@@ -1255,20 +1255,38 @@ class TestValidateConfig:
         assert isinstance(cfg.job_groups["g"].timing, OnDemand)
 
     def test_on_demand_and_interval_mutually_exclusive(self) -> None:
-        # on-demand rides the `schedule` key, so pairing it with
-        # `interval` trips the existing schedule/interval exclusion.
+        # on-demand is mutually exclusive with schedule / interval.
         _assert_errored_job(
             {
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "on-demand",
+                        "on-demand": True,
                         "interval": "1h",
                     },
                 },
             },
             "a",
             "mutually exclusive",
+        )
+
+    def test_all_three_timing_keys_mutually_exclusive(self) -> None:
+        # All three firing-mode keys at once lists them (Oxford comma)
+        # in the exclusion message.
+        _assert_errored_job(
+            {
+                "job": {
+                    "a": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "interval": "1h",
+                        "on-demand": True,
+                    },
+                },
+            },
+            "a",
+            r"'schedule', 'interval', and 'on-demand' are mutually "
+            r"exclusive",
         )
 
     def test_referenced_group_only_job_ok(self) -> None:

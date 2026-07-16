@@ -331,15 +331,17 @@ class Schedule:
         return dict(self._calendar)
 
 
-# The literal `schedule` value that selects the trigger-only firing mode
-# (see OnDemand). Parsed by config, and what `str(OnDemand())` renders.
+# The canonical display token for the trigger-only firing mode (see
+# OnDemand) -- what `str(OnDemand())` and the status SCHEDULE cell show.
+# The config spells the mode as the `on-demand = true` key, not this
+# string.
 ON_DEMAND_SPEC = "on-demand"
 
 
 @dataclass(frozen=True)
 class OnDemand:
     """The trigger-only firing mode: an entry that declares
-    ``schedule = "on-demand"`` and fires only via ``crony trigger`` (or a
+    ``on-demand = true`` and fires only via ``crony trigger`` (or a
     parent group's dispatch), never on its own timer.
 
     A firing mode in its own right, distinct from an entry that declares

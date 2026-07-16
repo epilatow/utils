@@ -72,10 +72,11 @@ class _SnapshotCommon(_SnapshotModel):
     timeout: Annotated[int, _Since(5)]
     schedule: Annotated[str | None, _Since(4)] = None
     interval: Annotated[str | None, _Since(4)] = None
-    # The trigger-only firing mode (`schedule = "on-demand"`); mutually
-    # exclusive with `schedule` / `interval` above, so at most one of the
-    # three timing keys is set. Persisted so the applied side shows
-    # `on-demand` and a switch to / from a real schedule reads as drift.
+    # The trigger-only firing mode (`on-demand = true` in config);
+    # mutually exclusive with `schedule` / `interval` above, so at most
+    # one of the three timing keys is set. Persisted so the applied side
+    # shows `on-demand` and a switch to / from a real schedule reads as
+    # drift.
     on_demand: Annotated[bool, _Since(7)] = _disk_key(
         "on-demand", default=False
     )

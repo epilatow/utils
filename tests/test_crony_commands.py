@@ -2158,15 +2158,15 @@ class TestEnableDisable:
     def test_on_demand_and_grouped_schedule_cells(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # A standalone on-demand job (schedule = "on-demand") shows
-        # `on-demand`; a schedule-less child under a scheduled group shows
-        # `grouped`. The distinction is each entry's own timing.
+        # A standalone on-demand job (on-demand = true) shows `on-demand`;
+        # a schedule-less child under a scheduled group shows `grouped`.
+        # The distinction is each entry's own timing.
         monkeypatch.setenv("NO_COLOR", "1")
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
                 "job": {
-                    "od": {"command": "true", "schedule": "on-demand"},
+                    "od": {"command": "true", "on-demand": True},
                     "child": {"command": "true"},
                 },
                 "job-group": {
@@ -2188,7 +2188,7 @@ class TestEnableDisable:
         # dormant `.service` (no `.timer` is installed for it).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
-            {"job": {"j": {"command": "true", "schedule": "on-demand"}}},
+            {"job": {"j": {"command": "true", "on-demand": True}}},
             default_target_jobs=["j"],
         )
         h.apply("j")

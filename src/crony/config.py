@@ -1205,12 +1205,14 @@ class TomlConfig:
 
 
 # =============================================================================
-# SCHEDULE / INTERVAL PARSING
+# TIMING PARSING
 # =============================================================================
-# Schedules use systemd OnCalendar syntax; intervals use systemd
-# time-span syntax. Both are parsed and validated by the crony.unit
-# value objects (Schedule / Interval); `_parse_timing` wraps them for
-# the config loader and adds the loader's own interval floor
+# The three mutually-exclusive firing modes: schedules use systemd
+# OnCalendar syntax, intervals use systemd time-span syntax, and
+# `on-demand = true` is trigger-only. Schedule / Interval are parsed and
+# validated by the crony.unit value objects; `_parse_timing` wraps them
+# for the config loader, resolves the on-demand mode, enforces the
+# one-mode-at-a-time rule, and adds the loader's own interval floor
 # (`_min_interval_seconds`), a constraint the value objects do not impose.
 
 
@@ -1252,22 +1254,40 @@ def _min_interval_seconds() -> int:
 
 
 def _parse_timing(
-    schedule_str: str | None, interval_str: str | None, where: str
+    schedule_str: str | None,
+    interval_str: str | None,
+    on_demand: bool,
+    where: str,
 ) -> crony.unit.Timing | None:
-    """Build a unit's timing from the config's mutually-exclusive
-    `schedule` / `interval` keys, or None when neither is set (a transit
-    group or group-only job). The reserved `schedule = "on-demand"` value
-    selects the trigger-only firing mode (`crony.unit.OnDemand`). Surfaces
-    the value objects' validation as a config error tied to `where`.
-    Intervals below `_min_interval_seconds` are rejected."""
-    if schedule_str is not None and interval_str is not None:
-        raise crony.errors.ConfigError(
-            f"{where}: 'schedule' and 'interval' are mutually exclusive"
+    """Build a unit's firing mode from the config's mutually-exclusive
+    `schedule` / `interval` / `on-demand` keys, or None when none is set
+    (a transit group or group-only job). `on-demand = true` selects the
+    trigger-only firing mode (`crony.unit.OnDemand`). Surfaces the value
+    objects' validation as a config error tied to `where`. Intervals
+    below `_min_interval_seconds` are rejected."""
+    present = [
+        name
+        for name, given in (
+            ("schedule", schedule_str is not None),
+            ("interval", interval_str is not None),
+            ("on-demand", on_demand),
         )
+        if given
+    ]
+    if len(present) > 1:
+        quoted = [f"'{name}'" for name in present]
+        joined = (
+            " and ".join(quoted)
+            if len(quoted) == 2
+            else ", ".join(quoted[:-1]) + f", and {quoted[-1]}"
+        )
+        raise crony.errors.ConfigError(
+            f"{where}: {joined} are mutually exclusive"
+        )
+    if on_demand:
+        return crony.unit.OnDemand()
     try:
         if schedule_str is not None:
-            if schedule_str == crony.unit.ON_DEMAND_SPEC:
-                return crony.unit.OnDemand()
             return crony.unit.Schedule.from_str(schedule_str)
         if interval_str is None:
             return None
@@ -1343,6 +1363,7 @@ _KNOWN_JOB: frozenset[str] = (
             "gate-args",
             "schedule",
             "interval",
+            "on-demand",
             "priority",
             "platforms",
             "hosts",
@@ -1365,6 +1386,7 @@ _KNOWN_JOB_GROUP: frozenset[str] = (
             "jobs",
             "schedule",
             "interval",
+            "on-demand",
             "platforms",
             "hosts",
             "flags",
@@ -2084,7 +2106,8 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         )
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
-    timing = _parse_timing(schedule_str, interval_str, where)
+    on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
+    timing = _parse_timing(schedule_str, interval_str, on_demand, where)
     priority = _parse_priority_field(raw, where)
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     keep_awake = flags.get(JobFlags.KEEP_AWAKE)
@@ -2151,7 +2174,8 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
         )
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
-    timing = _parse_timing(schedule_str, interval_str, where)
+    on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
+    timing = _parse_timing(schedule_str, interval_str, on_demand, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
@@ -2399,7 +2423,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 return notify_msg
         # Chain walk: every path from the target through groups to a
         # leaf job must reach a firing point somewhere -- a schedule, an
-        # interval, or a trigger-only `schedule = "on-demand"` entry (any
+        # interval, or a trigger-only `on-demand = true` entry (any
         # non-None timing). Cycles in the group graph are caught on the
         # way down. A walk into an errored entry stops without complaint
         # -- the per-entity error is already attributed and piling on a
@@ -2433,8 +2457,8 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                         f"{label}: chain {' -> '.join(path)} has "
                         f"no firing point anywhere -- {ref!r} would "
                         f"never fire (give it a schedule / interval, "
-                        f"place it under a scheduled group, or mark it "
-                        f'schedule = "on-demand" to run it only via '
+                        f"place it under a scheduled group, or set "
+                        f"on-demand = true to run it only via "
                         f"`crony trigger`)"
                     )
                 return

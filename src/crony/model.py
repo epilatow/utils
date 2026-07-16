@@ -1495,9 +1495,9 @@ class ScheduleValue(_DescribedStrEnum):
     )
     ON_DEMAND = (
         "on-demand",
-        'A trigger-only job/group (schedule = "on-demand") with no '
-        "schedule of its own and no scheduled parent. It runs only when "
-        "run manually via the `trigger` subcommand.",
+        "A trigger-only job/group (on-demand = true) with no schedule of "
+        "its own and no scheduled parent. It runs only when run manually "
+        "via the `trigger` subcommand.",
     )
     DISABLED = (
         "disabled",

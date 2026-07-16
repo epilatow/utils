@@ -574,14 +574,14 @@ class TestUnitDisabled:
 
 
 class TestOnDemand:
-    """`schedule = "on-demand"` is the trigger-only firing mode: the node
+    """`on-demand = true` is the trigger-only firing mode: the node
     carries an `OnDemand` timing (so status shows `on-demand` and a switch
     to / from a real schedule reads as drift), but `unit_spec` renders it
     dormant like a transit group, and it round-trips through
     snapshot.json."""
 
     def _snap(self) -> Any:
-        cfg = _parse({"job": {"j": _job(schedule="on-demand")}})
+        cfg = _parse({"job": {"j": {"command": "true", "on-demand": True}}})
         return dataclasses.replace(
             _resolve_snapshot_for(cfg, "j"),
             uv_path=Path("/uv"),
