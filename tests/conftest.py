@@ -15,6 +15,12 @@ from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
+# The crony automate contract/mechanics base is a plain helper module
+# (not a test file and not this conftest, so the utilities that don't
+# touch crony never load it). Register it for assertion rewriting so its
+# shared asserts report as richly as a test module's.
+pytest.register_assert_rewrite("crony_automate_base")
+
 # Repository root
 _REPO_ROOT = Path(__file__).parent.parent
 
