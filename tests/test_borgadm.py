@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, cast
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 from conftest import (
@@ -2467,54 +2468,6 @@ class TestIsLockTimeout:
         assert ba._is_lock_timeout("") is False
 
 
-class TestBorgLocksHeld:
-    """Test the lock-held probe."""
-
-    def _probe(self, returncode: int, stderr: str) -> tuple[bool, Any]:
-        proc = subprocess.CompletedProcess(
-            args=[], returncode=returncode, stdout="", stderr=stderr
-        )
-        with (
-            patch.object(
-                ba, "run_cmd", autospec=True, return_value=proc
-            ) as mock_run,
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-        ):
-            result = ba.borg_locks_held()
-        return result, mock_run
-
-    def test_free_lock_returns_false(self, mock_cfg: Any) -> None:
-        result, mock_run = self._probe(0, "")
-        assert result is False
-        # The probe waits only LOCK_CHECK_TIMEOUT and never logs its own
-        # (expected) failure as an error.
-        mock_run.assert_called_once_with(
-            [
-                "borg",
-                "list",
-                "--short",
-                "--lock-wait",
-                str(mock_cfg.LOCK_CHECK_TIMEOUT),
-                mock_cfg.BORG_REPO,
-            ],
-            errok=True,
-            log_error=False,
-            track_warning=False,
-        )
-
-    @pytest.mark.usefixtures("mock_cfg")
-    def test_held_lock_returns_true(self) -> None:
-        result, _ = self._probe(2, _LOCK_TIMEOUT_STDERR)
-        assert result is True
-
-    @pytest.mark.usefixtures("mock_cfg")
-    def test_non_lock_failure_returns_false(self) -> None:
-        # A real failure (network, etc.) is reported as not-held so the
-        # blocking operation surfaces it rather than the probe masking it.
-        result, _ = self._probe(2, "Connection closed by remote host")
-        assert result is False
-
-
 class TestRunBorg:
     """Test the lock-aware borg runner."""
 
@@ -2538,14 +2491,12 @@ class TestRunBorg:
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(ba, "borg_locks_held", autospec=True) as mock_probe,
         ):
             ba.run_borg(
                 ["borg", "list", mock_cfg.BORG_REPO],
                 repo_write=False,
                 bypass_lock=True,
             )
-        mock_probe.assert_not_called()
         mock_run.assert_called_once()
         args, kwargs = mock_run.call_args
         assert args[0] == ["borg", "list", "--bypass-lock", mock_cfg.BORG_REPO]
@@ -2558,9 +2509,6 @@ class TestRunBorg:
         with (
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=launcher),
-            patch.object(
-                ba, "borg_locks_held", autospec=True, return_value=False
-            ),
         ):
             ba.run_borg(
                 [*launcher, "list", mock_cfg.BORG_REPO],
@@ -2631,47 +2579,128 @@ class TestRunBorg:
         self, mock_cfg: Any, caplog: Any
     ) -> None:
         caplog.set_level(logging.INFO)
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "borg_locks_held", autospec=True, return_value=False
-            ),
+                ba, "run_cmd", autospec=True, return_value=result
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
-            ba.run_borg(["borg", "list", mock_cfg.BORG_REPO], repo_write=False)
+            actual = ba.run_borg(
+                ["borg", "list", mock_cfg.BORG_REPO], repo_write=False
+            )
+        assert actual is result
         mock_run.assert_called_once_with(
             [
                 "borg",
                 "list",
                 "--lock-wait",
-                str(mock_cfg.BORG_CMD_TIMEOUT),
+                str(mock_cfg.LOCK_CHECK_TIMEOUT),
                 mock_cfg.BORG_REPO,
-            ]
+            ],
+            errok=True,
+            log_error=False,
         )
         assert "lock is held" not in caplog.text.lower()
 
-    def test_blocking_held_lock_logs_waiting_message(
+    def test_writer_lock_timeout_logs_and_retries_same_command(
         self, mock_cfg: Any, caplog: Any
     ) -> None:
         caplog.set_level(logging.INFO)
+        lock_timeout = subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr=_LOCK_TIMEOUT_STDERR
+        )
+        success = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "borg_locks_held", autospec=True, return_value=True
+                ba,
+                "run_cmd",
+                autospec=True,
+                side_effect=[lock_timeout, success],
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            actual = ba.run_borg(
+                ["borg", "create", mock_cfg.BORG_REPO], repo_write=True
+            )
+        assert actual is success
+        assert "A borg lock is held" in caplog.text
+        assert mock_run.call_args_list == [
+            call(
+                [
+                    "borg",
+                    "create",
+                    "--lock-wait",
+                    str(mock_cfg.LOCK_CHECK_TIMEOUT),
+                    mock_cfg.BORG_REPO,
+                ],
+                errok=True,
+                log_error=False,
             ),
+            call(
+                [
+                    "borg",
+                    "create",
+                    "--lock-wait",
+                    str(mock_cfg.BORG_CMD_TIMEOUT),
+                    mock_cfg.BORG_REPO,
+                ]
+            ),
+        ]
+
+    def test_warning_is_completed_operation_without_retry(
+        self, mock_cfg: Any
+    ) -> None:
+        warning = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="warning"
+        )
+        with (
+            patch.object(
+                ba, "run_cmd", autospec=True, return_value=warning
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+        ):
+            actual = ba.run_borg(
+                ["borg", "create", mock_cfg.BORG_REPO], repo_write=True
+            )
+        assert actual is warning
+        mock_run.assert_called_once()
+
+    def test_non_lock_failure_logs_and_raises_without_retry(
+        self, mock_cfg: Any, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.ERROR)
+        cmd = [
+            "borg",
+            "create",
+            "--lock-wait",
+            str(mock_cfg.LOCK_CHECK_TIMEOUT),
+            mock_cfg.BORG_REPO,
+        ]
+        failure = subprocess.CompletedProcess(
+            args=cmd,
+            returncode=2,
+            stdout="partial output",
+            stderr="Connection closed by remote host",
+        )
+        with (
+            patch.object(
+                ba, "run_cmd", autospec=True, return_value=failure
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            pytest.raises(ba.SubprocessError) as exc,
         ):
             ba.run_borg(["borg", "create", mock_cfg.BORG_REPO], repo_write=True)
-        assert "A borg lock is held" in caplog.text
-        mock_run.assert_called_once_with(
-            [
-                "borg",
-                "create",
-                "--lock-wait",
-                str(mock_cfg.BORG_CMD_TIMEOUT),
-                mock_cfg.BORG_REPO,
-            ]
-        )
+        assert exc.value.returncode == 2
+        assert exc.value.stdout == "partial output"
+        assert exc.value.stderr == "Connection closed by remote host"
+        assert "failed with exit code 2" in caplog.text
+        assert "lock is held" not in caplog.text.lower()
+        mock_run.assert_called_once()
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_repo_write_cannot_bypass_lock(self) -> None:
@@ -2683,12 +2712,14 @@ class TestRunBorg:
             )
 
     def test_kwargs_pass_through(self, mock_cfg: Any) -> None:
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
         with (
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(
-                ba, "borg_locks_held", autospec=True, return_value=False
-            ),
+                ba, "run_cmd", autospec=True, return_value=result
+            ) as mock_run,
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
         ):
             ba.run_borg(
                 ["borg", "extract", "repo::a"],
@@ -2699,11 +2730,12 @@ class TestRunBorg:
         _, kwargs = mock_run.call_args
         assert kwargs["cwd"] == mock_cfg.BACKUP_ROOT
         assert kwargs["allow_output"] is True
+        assert kwargs["errok"] is True
+        assert kwargs["log_error"] is False
 
 
-class TestRunCmdLogError:
-    """run_cmd's log_error / track_warning flags keep an advisory call
-    (the lock probe) from logging or affecting borgadm's exit status."""
+class TestRunCmdStatusHandling:
+    """Test deferred error logging and Borg warning promotion."""
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_log_error_false_suppresses_error_log(self, caplog: Any) -> None:
@@ -2718,16 +2750,7 @@ class TestRunCmdLogError:
         assert "failed with exit code" in caplog.text
 
     @pytest.mark.usefixtures("mock_cfg")
-    def test_track_warning_false_does_not_flip_global_warning(self) -> None:
-        # `false borg` exits 1 and is classified as a borg command (the
-        # is_borg heuristic keys off "borg" anywhere in argv), so it
-        # exercises the WARNING branch without a real borg repo.
-        with patch.object(ba, "_warning_occurred", False):
-            ba.run_cmd(["false", "borg"], errok=True, track_warning=False)
-            assert ba._warning_occurred is False
-
-    @pytest.mark.usefixtures("mock_cfg")
-    def test_track_warning_default_flips_global_warning(self) -> None:
+    def test_borg_warning_flips_global_warning(self) -> None:
         with patch.object(ba, "_warning_occurred", False):
             ba.run_cmd(["false", "borg"], errok=True)
             assert ba._warning_occurred is True
@@ -5407,6 +5430,25 @@ class TestLockAwareE2E:
             stderr=subprocess.DEVNULL,
         )
 
+    def _hold_shared_lock(
+        self, borg_e2e: BorgE2EFixture
+    ) -> subprocess.Popen[bytes]:
+        """Hold a shared repo lock in an extract blocked on stdout."""
+        large_file = borg_e2e.backup_root / "shared-lock-data"
+        large_file.write_bytes(b"x" * (2 * 1024 * 1024))
+        borg_e2e.make_archive("shared-lock-holder")
+        return subprocess.Popen(
+            [
+                "borg",
+                "extract",
+                "--stdout",
+                f"{borg_e2e.repo_path}::shared-lock-holder",
+            ],
+            env=borg_e2e._subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
     def _await_lock_held(self, borg_e2e: BorgE2EFixture) -> None:
         """Block until the holder has actually taken the lock."""
         deadline = time.monotonic() + 15
@@ -5428,6 +5470,73 @@ class TestLockAwareE2E:
                 return
             time.sleep(0.1)
         pytest.fail("background holder never acquired the lock")
+
+    def _await_writer_blocked(self, borg_e2e: BorgE2EFixture) -> None:
+        """Block until an exclusive operation sees a held shared lock."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                [
+                    "borg",
+                    "compact",
+                    "--dry-run",
+                    "--lock-wait",
+                    "0",
+                    str(borg_e2e.repo_path),
+                ],
+                env=borg_e2e._subprocess_env(),
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode != 0 and "lock" in probe.stderr.lower():
+                return
+            time.sleep(0.1)
+        pytest.fail("shared-lock holder never blocked an exclusive operation")
+
+    def test_writer_reports_shared_lock_before_waiting(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        """A writer's initial attempt sees a restore's shared lock."""
+        borg_e2e.config_path.write_text(
+            borg_e2e.config_path.read_text()
+            + "LOCK_CHECK_TIMEOUT = 2\n"
+            + "BORG_CMD_TIMEOUT = 20\n"
+        )
+        holder = self._hold_shared_lock(borg_e2e)
+        output: list[str] = []
+        saw_wait = False
+        try:
+            self._await_writer_blocked(borg_e2e)
+            proc = subprocess.Popen(
+                [str(borg_e2e.borgadm_bin), "compact"],
+                env=borg_e2e._subprocess_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            assert proc.stdout is not None
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if readable:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    output.append(line)
+                    if "A borg lock is held" in line:
+                        saw_wait = True
+                        break
+                if proc.poll() is not None:
+                    break
+        finally:
+            holder.terminate()
+            holder.wait()
+            if holder.stdout is not None:
+                holder.stdout.close()
+        remaining, _ = proc.communicate(timeout=60)
+        out = "".join(output) + remaining
+        assert proc.returncode == 0, f"output:\n{out}"
+        assert saw_wait, f"writer did not report shared lock:\n{out}"
 
     def test_bypass_lock_does_not_wait_for_held_lock(
         self, borg_e2e: BorgE2EFixture
@@ -5494,9 +5603,9 @@ class TestLockAwareE2E:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            # Long enough for borgadm to start, probe (LOCK_CHECK_TIMEOUT),
-            # log the waiting message, and begin blocking -- all while the
-            # lock is still held.
+            # Long enough for the initial attempt (LOCK_CHECK_TIMEOUT) to
+            # report the held lock and for the retry to begin blocking --
+            # all while the lock is still held.
             time.sleep(8)
         finally:
             holder.terminate()

@@ -284,7 +284,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "LOCK_CHECK_TIMEOUT",
         5,
-        "Seconds to wait probing whether a borg lock is held",
+        "Seconds to wait for a borg lock before announcing the wait",
     ),
     ConfigField(
         "BACKUP_NAME",
@@ -746,7 +746,6 @@ def run_cmd(
     errok: bool = False,
     allow_output: bool = False,
     log_error: bool = True,
-    track_warning: bool = True,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
     slow = cmd[0] in borg_cmd() + ["rsync"]
@@ -806,18 +805,14 @@ def run_cmd(
     if is_borg and proc.returncode == ExitCode.WARNING:
         # Borg exit code 1 means the operation completed with
         # non-fatal warnings (e.g., files changed during backup).
-        # track_warning lets an advisory call (the lock probe) opt out
-        # so its incidental warning neither logs nor promotes borgadm's
-        # own exit code.
-        if track_warning:
-            logger.warning(
-                "Command %s completed with warnings (exit code %s):\n%s",
-                cmd_str,
-                proc.returncode,
-                stderr_str.strip(),
-            )
-            global _warning_occurred
-            _warning_occurred = True
+        logger.warning(
+            "Command %s completed with warnings (exit code %s):\n%s",
+            cmd_str,
+            proc.returncode,
+            stderr_str.strip(),
+        )
+        global _warning_occurred
+        _warning_occurred = True
     elif proc.returncode != 0:
         if log_error:
             logger.error(
@@ -851,35 +846,6 @@ def _is_lock_timeout(stderr: str) -> bool:
     return "failed to create/acquire the lock" in s and "timeout" in s
 
 
-def borg_locks_held() -> bool:
-    """Probe whether a borg lock that would block a normal read is
-    currently held, waiting at most `LOCK_CHECK_TIMEOUT` seconds. borg
-    takes both a repository lock and a local cache lock, and a blocking
-    read waits on whichever is held; this probe runs the same kind of
-    non-bypassing read, so it contends on the same locks and predicts
-    that wait. Advisory only: it lets a blocking operation warn the user
-    before it waits for what could be a full backup's duration. A
-    non-lock failure (network, etc.) is reported as not-held so the real
-    operation surfaces it."""
-    cfg = get_cfg()
-    proc = run_cmd(
-        borg_cmd()
-        + [
-            "list",
-            "--short",
-            "--lock-wait",
-            str(cfg.LOCK_CHECK_TIMEOUT),
-            cfg.BORG_REPO,
-        ],
-        errok=True,
-        log_error=False,
-        track_warning=False,
-    )
-    if proc.returncode == 0:
-        return False
-    return _is_lock_timeout(proc.stderr)
-
-
 def run_borg(
     cmd: list[str],
     *,
@@ -890,14 +856,16 @@ def run_borg(
     """Run a borg `cmd` (a full argv built from `borg_cmd()`) with
     locking handled.
 
-    By default the operation blocks on the lock: if the lock is already
-    held it logs that it is waiting (probing via `borg_locks_held`), then
-    runs with a `BORG_CMD_TIMEOUT` lock-wait so it proceeds once the
-    holder releases. With `bypass_lock` it skips the wait entirely
-    (`--bypass-lock` plus throwaway cache and security dirs so it
-    contends on neither the repository nor the cache lock), trading the
-    wait for the risk of racing a concurrent writer -- only read-only
-    commands expose that choice.
+    By default the operation first runs with a `LOCK_CHECK_TIMEOUT`
+    lock-wait. If that actual operation reports Borg's LockTimeout, it
+    logs that it is waiting and retries with a `BORG_CMD_TIMEOUT`
+    lock-wait so it proceeds once the holder releases. Using the actual
+    operation means a writer tests for an exclusive lock and sees shared
+    readers that would not block a read-only probe. With `bypass_lock`
+    it skips the wait entirely (`--bypass-lock` plus throwaway cache and
+    security dirs so it contends on neither the repository nor the cache
+    lock), trading the wait for the risk of racing a concurrent writer --
+    only read-only commands expose that choice.
 
     `repo_write` must be True for any operation that mutates the repo;
     such an operation may never bypass the lock, and the assert makes
@@ -952,11 +920,32 @@ def run_borg(
                         errok=True,
                     )
     cfg = get_cfg()
-    if borg_locks_held():
-        logger.info(
-            "A borg lock is held, waiting up to %ss for it to release.",
-            cfg.BORG_CMD_TIMEOUT,
+    initial = run_cmd(
+        with_flags(["--lock-wait", str(cfg.LOCK_CHECK_TIMEOUT)]),
+        errok=True,
+        log_error=False,
+        **kwargs,
+    )
+    if initial.returncode in (ExitCode.SUCCESS, ExitCode.WARNING):
+        return initial
+    if not _is_lock_timeout(initial.stderr):
+        cmd_str = shlex.join(cast(list[str], initial.args))
+        logger.error(
+            "Command %s failed with exit code %s and stderr:\n%s",
+            cmd_str,
+            initial.returncode,
+            initial.stderr.strip(),
         )
+        raise SubprocessError(
+            initial.returncode,
+            initial.args,
+            output=initial.stdout,
+            stderr=initial.stderr,
+        )
+    logger.info(
+        "A borg lock is held, waiting up to %ss for it to release.",
+        cfg.BORG_CMD_TIMEOUT,
+    )
     return run_cmd(
         with_flags(["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)]), **kwargs
     )
