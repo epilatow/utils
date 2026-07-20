@@ -223,39 +223,90 @@ class _ExitOutcome(NamedTuple):
     signal: int | None
 
 
-def _exec_with_timeout(
+# The scheduler-stop signals the guard relays into a run's session. A
+# runner ignores these so it survives to record its own outcome; the
+# command, which keeps the default dispositions, still dies on them.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def _ignore_signals(sigs: tuple[int, ...]) -> None:
+    """SIG_IGN each of `sigs`, making a runner passive to the guard's
+    stop / timeout signals: it survives to record (or, if it hangs, until
+    the guard's SIGKILL and the killed-flag) instead of dying on them.
+    There is no teardown -- the runner installs these once and exits after
+    its run, so it never restores them; tests isolate signal state through
+    a conftest fixture."""
+    for s in sigs:
+        signal.signal(s, signal.SIG_IGN)
+
+
+def _exec_command(
     argv: list[str],
     *,
     env: dict[str, str],
-    timeout: int | None,
     log_file: IO[bytes],
-) -> _ExitOutcome:
-    """Exec argv, piping stdout+stderr into log_file.
+) -> tuple[_ExitOutcome, bool]:
+    """Run the command to completion, piping stdout+stderr into log_file.
 
-    On timeout, sends SIGTERM, then SIGKILL after a grace window, and
-    re-raises subprocess.TimeoutExpired. `timeout=None` runs the command
-    with no wallclock cap (the caller passes None when the entry's
-    resolved timeout is 0).
+    The timeout and all killing belong to the guard (`do_run_guard`);
+    this stays passive. After spawning the command it installs its own
+    dispositions -- installed after the fork/exec so the command keeps the
+    default dispositions (and still dies on the guard's signals) with
+    nothing to inherit:
+
+    - SIGTERM / SIGINT / SIGHUP are ignored, so the stop signal the guard
+      relays into the session does not take the runner down before it
+      records; the command, unaffected, still dies on it.
+    - SIGUSR1 sets a flag. The guard sends it to the runner just before
+      the SIGTERM that kills a timed-out run, so a returned ``True`` means
+      "killed for exceeding the timeout" -- the caller records TIMEOUT
+      rather than a plain signal death.
+
+    With the command running and those handlers in place, it signals the
+    guard to arm the cap from this moment (`_arm_guard`), so the runner's
+    pre-command setup and an interactive job's approval wait do not count
+    against it. An uncapped run has no guard to arm.
+
+    Returns the command's outcome and that timed-out flag.
     """
+    timed_out = False
+
+    def _note_timeout(_signum: int, _frame: object) -> None:
+        nonlocal timed_out
+        timed_out = True
+
     proc = subprocess.Popen(
         argv,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         env=env,
     )
-    try:
-        rc = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        raise
+    _ignore_signals(_STOP_SIGNALS)
+    signal.signal(signal.SIGUSR1, _note_timeout)
+    _arm_guard()
+    rc = proc.wait()
     if rc < 0:
-        return _ExitOutcome(rc=0, signal=-rc)
-    return _ExitOutcome(rc=rc, signal=None)
+        return _ExitOutcome(rc=0, signal=-rc), timed_out
+    return _ExitOutcome(rc=rc, signal=None), timed_out
+
+
+def _arm_guard() -> None:
+    """Signal the guard that the command has started, so it clocks its cap
+    from now rather than from the runner's launch. The guard published its
+    pid in GUARD_PID_ENV; an uncapped run has no guard and leaves it unset,
+    so this is a no-op. Best-effort: a guard that has already exited
+    (ProcessLookupError) or is not ours (PermissionError) is ignored -- a
+    non-interactive guard's own initial cap still bounds a run whose arm
+    never lands."""
+    guard_pid = os.environ.get(crony.runtime.GUARD_PID_ENV)
+    if not guard_pid:
+        return
+    try:
+        pid = int(guard_pid)
+    except ValueError:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGUSR1)
 
 
 def _wait_for_pid_exit(
@@ -488,6 +539,12 @@ def _run_job(snap: crony.model.Job) -> int:
             # last launch, read afterward by the dispatch waiter and when
             # status is built.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            # Clear any stale killed-flag from a prior run: the guard
+            # writes it only when it has to SIGKILL a timed-out run whose
+            # runner could not record, and status reads a present flag
+            # (with no fresh record) as a timeout. Clearing it here scopes
+            # a later write to this run.
+            (sd / "killed.flag").unlink(missing_ok=True)
 
             log_file = open(log_path, "ab", buffering=0)
             try:
@@ -595,34 +652,34 @@ def _run_job(snap: crony.model.Job) -> int:
                 if keep_awake_note is not None:
                     log_file.write(f"{keep_awake_note}\n".encode())
                 log_file.write(f"exec: {shlex.join(argv)}\n".encode())
-                try:
-                    rc, sig = _exec_with_timeout(
-                        argv,
-                        env=env,
-                        timeout=snap.timeout or None,
-                        log_file=log_file,
-                    )
-                    if sig is not None:
-                        exit_class = crony.model.ExitClass.SIGNAL
-                        exit_code: int | None = None
-                        surfaced_rc = 128 + sig
-                    elif rc == 0 or rc in snap.success_exit_codes:
-                        # A code the job declares as success (exit 0, or
-                        # a configured non-zero like borg's warning exit
-                        # 1): classify "ok" and surface 0 so the platform
-                        # scheduler doesn't record the unit as failed.
-                        exit_class = crony.model.ExitClass.OK
-                        exit_code = rc
-                        surfaced_rc = 0
-                    else:
-                        exit_class = crony.model.ExitClass.FAIL
-                        exit_code = rc
-                        surfaced_rc = rc
-                except subprocess.TimeoutExpired:
+                outcome, timed_out = _exec_command(
+                    argv, env=env, log_file=log_file
+                )
+                rc, sig = outcome
+                if timed_out:
+                    # The guard sent SIGUSR1 before the SIGTERM that
+                    # stopped it: the run was killed for exceeding its
+                    # timeout, recorded as such rather than a signal death.
                     exit_class = crony.model.ExitClass.TIMEOUT
-                    exit_code = None
+                    exit_code: int | None = None
                     sig = None
                     surfaced_rc = int(crony.errors.ExitCode.TIMEOUT)
+                elif sig is not None:
+                    exit_class = crony.model.ExitClass.SIGNAL
+                    exit_code = None
+                    surfaced_rc = 128 + sig
+                elif rc == 0 or rc in snap.success_exit_codes:
+                    # A code the job declares as success (exit 0, or
+                    # a configured non-zero like borg's warning exit
+                    # 1): classify "ok" and surface 0 so the platform
+                    # scheduler doesn't record the unit as failed.
+                    exit_class = crony.model.ExitClass.OK
+                    exit_code = rc
+                    surfaced_rc = 0
+                else:
+                    exit_class = crony.model.ExitClass.FAIL
+                    exit_code = rc
+                    surfaced_rc = rc
 
                 # Pre-populate per-channel slots with sent=False so
                 # the dispatcher can update each entry in place. Order
@@ -788,6 +845,9 @@ def _run_group(snap: crony.model.JobGroup) -> int:
             # Left in place on exit; see `_run_job` for the run.pid
             # lifecycle.
             pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+            # Scope any killed-flag to this run: clear a stale one so it
+            # cannot mislabel a later crash as a timeout (see `_run_job`).
+            (sd / "killed.flag").unlink(missing_ok=True)
 
             log_file = open(log_path, "ab", buffering=0)
             children: list[crony.model.GroupChildResult] = []
@@ -795,6 +855,13 @@ def _run_group(snap: crony.model.JobGroup) -> int:
             # A child that ran and failed is the child's problem and is
             # deliberately not recorded here (see `_group_exit_class`).
             faults: list[_GroupFault] = []
+            # The group runner enforces its own cumulative budget and
+            # records the timeout itself; its guard is only a backstop for
+            # the group runner wedging. So it ignores the guard's signals
+            # (the SIGUSR1 hint too, or a default disposition would kill
+            # it) -- a normal timeout self-records, a wedged one rides to
+            # the guard's SIGKILL and reads as a timeout via the flag.
+            _ignore_signals((*_STOP_SIGNALS, signal.SIGUSR1))
             try:
                 # Resolve each child ref to its current full name via
                 # the child's own snapshot. A None resolution means the
@@ -1412,65 +1479,243 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
     return 0
 
 
-# Grace between the guard's SIGTERM and its escalation to SIGKILL,
-# matching `_exec_with_timeout`'s own command-kill grace.
-_GUARD_KILL_GRACE_SEC = 10
+# The grace the guard waits after signalling a session before it SIGKILLs
+# whatever survives -- the SIGTERM of a timeout kill, or the stop signal
+# relayed on a scheduler stop of a running unit (a system shutdown, a manual
+# stop, or crony's own `launchctl bootout` from apply-reload / disable /
+# destroy). The guard has to do this SIGKILL itself: the run lives in the
+# guard's own session (start_new_session), which the scheduler does not
+# track -- it tracks the guard -- so nothing else reaps a session whose
+# command ignores the signal (and the runner ignores stop signals by
+# design). So this grace MUST stay below the lowest scheduler stop-to-kill
+# timeout, so the guard reaps the session before the scheduler SIGKILLs the
+# guard out from under it -- on launchd (process-group based) that kill hits
+# the guard's group, not the child's separate session, which would then
+# orphan. launchd's ExitTimeOut (20s default, which we do not override) is
+# the binding bound; systemd's TimeoutStopSec (90s) is looser.
+_KILL_GRACE_SEC = 10
+# Pause after the SIGUSR1 timeout hint so the runner records it before the
+# SIGTERM that follows lands. Standard signals carry no delivery-ordering
+# guarantee (Linux signal(7): unspecified; macOS sigaction(2): only trap
+# signals ordered), and the runner-vs-job race is cross-process anyway, so
+# this separates the hint from the kill.
+_TIMEOUT_HINT_SETTLE_SEC = 1.0
+# Poll granularity while the guard waits on the runner, so it can act on a
+# relayed stop between waits.
+_GUARD_POLL_SEC = 1.0
+# Poll granularity while the guard waits for the killed session to drain,
+# small so a clean teardown returns promptly (the common case).
+_REAP_POLL_SEC = 0.1
+
+
+def _guard_state_dir(argv: list[str]) -> Path | None:
+    """The guarded run's state dir, from the ref at the tail of `argv`.
+
+    Used only to drop a killed-flag on a timeout SIGKILL; None when the
+    ref does not parse, so the guard skips the flag rather than failing
+    the kill.
+    """
+    if not argv:
+        return None
+    ref = crony.unit.EntityRef.from_str(argv[-1])
+    if ref is None:
+        return None
+    return crony.model.Job.state_dir_from_ref(ref)
+
+
+def _read_runner_pid(sd: Path | None) -> int | None:
+    """The runner's own pid from `sd/run.pid`, the target for the timeout
+    hint. The session leader (`proc.pid`) is the intervening `uv run`
+    process, not the runner, so a single-process signal has to go here
+    instead. None when the state dir or file is absent or unparsable. The
+    file persists across runs, so a runner that timed out before writing
+    its own pid would yield a prior run's -- the caller confirms the pid
+    is a live member of this run's group (`_in_process_group`) before
+    signalling it."""
+    if sd is None:
+        return None
+    try:
+        text = (sd / "run.pid").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return int(text.strip())
+    except ValueError:
+        return None
+
+
+def _in_process_group(pid: int, pgid: int) -> bool:
+    """Whether `pid` is a live member of process group `pgid` -- the
+    guard's own run session. Guards the run.pid hint against a pid that is
+    stale (a prior run's, if this runner wedged before writing its own) or
+    reused: a dead pid raises ProcessLookupError, and a pid reused by an
+    unrelated process reports a different group. Only a pid in this run's
+    group is signalled."""
+    try:
+        return os.getpgid(pid) == pgid
+    except ProcessLookupError:
+        return False
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether process group `pgid` still has a live member. Signal 0
+    probes existence without delivering anything; ProcessLookupError means
+    the group has drained. A member owned by another user (PermissionError)
+    still counts as alive."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_session(
+    proc: subprocess.Popen[bytes],
+    pgid: int,
+    sd: Path | None,
+    *,
+    timed_out: bool,
+) -> None:
+    """Wait the grace for the whole session to drain on the signal it was
+    just sent, then SIGKILL anything still in it -- a runner that will not
+    exit, or a descendant that ignored the signal -- so nothing outlives
+    the kill (the runner's exit alone is not proof the session is gone: a
+    descendant that traps the signal outlives the runner that records and
+    exits). `proc.poll()` reaps the runner's `uv` as it exits so a zombie
+    leader does not keep the group looking alive. On a timeout kill where
+    the runner itself had to be SIGKILLed before it could record, drop the
+    killed-flag so status still reads the run as a timeout.
+    """
+    deadline = time.monotonic() + _KILL_GRACE_SEC
+    while time.monotonic() < deadline:
+        proc.poll()
+        if not _group_alive(pgid):
+            break
+        time.sleep(_REAP_POLL_SEC)
+    if _group_alive(pgid):
+        runner_recorded = proc.poll() is not None
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+        if timed_out and not runner_recorded and sd is not None:
+            with contextlib.suppress(OSError):
+                (sd / "killed.flag").write_text("timeout\n", encoding="utf-8")
+    proc.wait()
 
 
 def do_run_guard(cap: int, argv: list[str]) -> None:
-    """Hard wallclock backstop wrapping the runner. Platform schedulers
-    invoke this; not user-facing.
+    """Enforce a run's wallclock timeout and own all its killing.
+    Platform schedulers invoke this; not user-facing.
 
-    Runs `argv` (a `crony _run <ref>` invocation) under a `cap`-second
-    deadline and, if it overruns, kills its whole process group. It is
-    the last resort behind the runner's own soft timeout: a runner that
-    wedges before honoring its deadline (a stuck syscall, a lock it can't
-    take) is killed here instead of holding a unit forever. The cap is
-    `entry timeout + padding`, so on a healthy run the soft timeout fires
-    first and records a clean result; the guard only acts when that
-    didn't happen.
+    Runs `argv` (a `crony _run <ref>` invocation, optionally led by an
+    `--interactive` marker) in its own session and caps it at `cap`
+    seconds. `cap` is always positive: an uncapped entry is rendered
+    without the guard (`_guarded_argv`), so the guard never runs for one.
+    A non-interactive run is armed at launch: its setup is
+    bounded, so a runner wedged before the command is still killed at the
+    cap. An interactive run is armed only when the runner signals that it
+    has started the command (SIGUSR1 to the guard), leaving its unbounded
+    approval wait unclocked. A job runner sends that signal in either
+    case; arming is idempotent, so for a non-interactive job it is a
+    harmless no-op. A group runner is always non-interactive (armed at
+    launch) and sends none. The runner is otherwise passive -- it records
+    and exits, emitting no signals of its own.
 
-    The child runs in its own session so the kill targets only its
-    process group, never the guard. SIGTERM / SIGINT / SIGHUP are
-    forwarded to that group: the guard is the process the scheduler
-    tracks (launchd's process group, systemd's main pid), so a scheduler
-    stopping the unit signals the guard, which must pass it on to the run
-    that escaped into its own session. The child's exit status propagates
-    unchanged (a signal death as 128 + signum); an overrun exits TIMEOUT.
+    The killing is the guard's, for the whole session:
+
+    - on timeout: SIGUSR1 the runner (so it records a timeout), then
+      SIGTERM the session (a graceful kill of the job), then SIGKILL
+      after a grace if anything survives. A SIGKILL that had to be used
+      leaves a killed-flag so status reads the run as a timeout.
+    - on a scheduler stop (a received SIGTERM/SIGINT/SIGHUP): relay the
+      same signal to the session, then the same grace -> SIGKILL. No
+      hint, so the runner records a plain signal death; no flag.
+
+    Because the runner survives the SIGTERM to record and then exits, its
+    exit is the signal that the session is dead; the guard waits on the
+    runner throughout -- no process-group polling.
     """
-    # start_new_session makes the child a session/group leader, so its
-    # pgid equals its pid -- the target for group signals. Set after the
-    # spawn; the forwarder reads it lazily so it is a no-op for a signal
-    # arriving during the spawn itself (handlers are installed first so
-    # such a signal can't fall through to the default-terminate
-    # disposition and leave the guard dead with a child still starting).
+    if cap <= 0:
+        raise crony.errors.UsageError(
+            f"crony _run-guard requires a positive cap, got {cap}; an "
+            f"uncapped entry is rendered without the guard"
+        )
+    interactive = bool(argv) and argv[0] == "--interactive"
+    if interactive:
+        argv = argv[1:]
+    sd = _guard_state_dir(argv)
     pgid: int | None = None
+    stop_signum: int | None = None
+    deadline: float | None = None
 
-    def _forward(signum: int, _frame: object) -> None:
-        if pgid is None:
-            return
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signum)
+    def _on_stop(signum: int, _frame: object) -> None:
+        nonlocal stop_signum
+        stop_signum = signum
+        if pgid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signum)
 
+    def _on_arm(_signum: int, _frame: object) -> None:
+        # The runner signals this when it starts the command. Arm the cap
+        # from here only if it is not already running: a non-interactive
+        # run is armed at launch (below), so this is its no-op; an
+        # interactive run is armed only here, once its unbounded approval
+        # wait is over. First arm wins.
+        nonlocal deadline
+        if deadline is None:
+            deadline = time.monotonic() + cap
+
+    # Install before the spawn so a stop or an arm racing it runs the
+    # handler rather than the default-terminate disposition -- which for
+    # SIGUSR1 too would leave the guard dead with a new session starting.
+    # The runner resets these to SIG_DFL at its own exec, so nothing is
+    # inherited.
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, _forward)
-
-    proc = subprocess.Popen(argv, start_new_session=True)
+        signal.signal(sig, _on_stop)
+    signal.signal(signal.SIGUSR1, _on_arm)
+    env = {**os.environ, crony.runtime.GUARD_PID_ENV: str(os.getpid())}
+    proc = subprocess.Popen(argv, start_new_session=True, env=env)
     pgid = proc.pid
 
-    try:
-        rc = proc.wait(timeout=cap)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signal.SIGTERM)
+    # A non-interactive run is armed at launch, so a runner wedged before
+    # it can start the command is still killed at the cap. An interactive
+    # run waits unbounded until the arm signal.
+    if not interactive:
+        deadline = time.monotonic() + cap
+    while True:
+        if stop_signum is not None:
+            # The stop was already relayed into the session; escalate to
+            # SIGKILL if it does not die. Not a timeout: no hint, no flag.
+            _reap_session(proc, pgid, sd, timed_out=False)
+            raise SystemExit(128 + stop_signum)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            runner_pid = _read_runner_pid(sd)
+            if runner_pid is not None and _in_process_group(runner_pid, pgid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(runner_pid, signal.SIGUSR1)
+            time.sleep(_TIMEOUT_HINT_SETTLE_SEC)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGTERM)
+            _reap_session(proc, pgid, sd, timed_out=True)
+            raise SystemExit(int(crony.errors.ExitCode.TIMEOUT))
+        wait_for = (
+            _GUARD_POLL_SEC
+            if remaining is None
+            else min(_GUARD_POLL_SEC, remaining)
+        )
         try:
-            proc.wait(timeout=_GUARD_KILL_GRACE_SEC)
+            rc = proc.wait(timeout=wait_for)
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
-        raise SystemExit(int(crony.errors.ExitCode.TIMEOUT)) from None
-    raise SystemExit(rc if rc >= 0 else 128 - rc)
+            continue
+        if stop_signum is not None:
+            # A stop landed while we were waiting and its relay already let
+            # the runner exit; still reap the session so a descendant that
+            # ignored the relayed signal does not outlive the guard.
+            _reap_session(proc, pgid, sd, timed_out=False)
+            raise SystemExit(128 + stop_signum)
+        raise SystemExit(rc if rc >= 0 else 128 - rc)
 
 
 def do_run(ref: str) -> None:

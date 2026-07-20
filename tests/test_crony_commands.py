@@ -439,14 +439,13 @@ class TestApplyLinux:
         assert "systemctl" in commands
 
 
-class TestApplyHardTimeout:
-    """Apply renders the hard-timeout guard into the unit's run command
-    for a capped entry, with cap = entry timeout + padding, and renders a
-    bare run for an uncapped one. Same backstop on both platforms.
+class TestApplyTimeoutGuard:
+    """Apply renders the timeout guard into the unit's run command for a
+    capped entry, with cap = the entry timeout, and renders a bare run
+    for an uncapped one. Same on both platforms.
     """
 
     _GUARD = crony_model.GUARD_SUBCOMMAND
-    _PAD = crony_model._HARD_TIMEOUT_PADDING_SEC
 
     def test_darwin_capped_job_renders_guard(
         self, tmp_path: Path, monkeypatch: Any
@@ -466,7 +465,7 @@ class TestApplyHardTimeout:
         )
         h.apply("j")
         plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
-        assert f"{self._GUARD} {300 + self._PAD} " in plist
+        assert f"{self._GUARD} {300} " in plist
 
     def test_darwin_uncapped_job_renders_bare_run(
         self, tmp_path: Path, monkeypatch: Any
@@ -506,14 +505,14 @@ class TestApplyHardTimeout:
         )
         h.apply("j")
         svc = (h.sysd / f"crony-{h.full('j')}.service").read_text()
-        assert f"{self._GUARD} {300 + self._PAD} " in svc
+        assert f"{self._GUARD} {300} " in svc
 
-    def test_interactive_job_renders_no_guard(
+    def test_interactive_job_renders_guard_with_marker(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # An interactive job's pending wait / prompt / re-promptable delay
-        # has no wallclock bound, so the hard guard would kill a healthy
-        # waiting job. It renders unguarded even with a nonzero timeout.
+        # An interactive job is guarded like any capped job, but carries
+        # the `--interactive` marker so the guard leaves its unbounded
+        # approval wait unclocked and caps only the command once it runs.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
             {
@@ -530,7 +529,7 @@ class TestApplyHardTimeout:
         )
         h.apply("j")
         plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
-        assert self._GUARD not in plist
+        assert f"{self._GUARD} {300} --interactive " in plist
 
     def test_capped_job_apply_is_idempotent(
         self, tmp_path: Path, monkeypatch: Any

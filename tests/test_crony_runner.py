@@ -29,6 +29,7 @@ from conftest_crony import (  # noqa: E402
     _assert_errored_job,
     _email_block,
     _isolate_home,  # noqa: E402, F401
+    _isolate_signal_state,  # noqa: E402, F401
     _job,
     _ntfy_block,
     _parse,
@@ -945,6 +946,42 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_class"] == "timeout"
         assert rec["exit_class"] == "ok"
 
+    def test_run_group_ignores_guard_signals_while_running(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The group runner enforces its own budget and records the timeout
+        # itself, so while running it ignores the guard's stop/hint signals
+        # (a default SIGUSR1 would kill it): a backstop fire then rides to
+        # SIGKILL and reads as a timeout via the flag, never a crash. Probe
+        # the live dispositions from inside dispatch. (It does not restore
+        # them -- the runner exits after its run; the autouse fixture
+        # isolates the test process.)
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"c": {"command": "true", "job_timeout_sec": 100}},
+                "job-group": {"g": {"jobs": ["c"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "c")
+        guarded = (
+            signal.SIGTERM,
+            signal.SIGINT,
+            signal.SIGHUP,
+            signal.SIGUSR1,
+        )
+        observed: dict[int, Any] = {}
+
+        def _probe(*_a: object, **_k: object) -> dict[str, Any]:
+            for s in guarded:
+                observed[s] = signal.getsignal(s)
+            return {"exit_class": "ok", "exit_code": 0}
+
+        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _probe)
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        assert observed == {s: signal.SIG_IGN for s in guarded}
+
     def test_subgroup_fault_does_not_fail_parent_group(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -1558,6 +1595,33 @@ class TestRunGroupInteractive:
         # An uncapped child makes the whole group uncapped (0 = no cap).
         assert cfg.resolved_group_timeout_sec(target, "g") == 0
 
+    def test_guard_cap_is_the_entry_timeout_for_group_and_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The guard is a uniform backstop: its cap is the entry's own
+        # timeout for a group (its 1.05 budget) exactly as for a job -- no
+        # special margin. A group's own budget slack is the headroom that
+        # keeps the backstop from firing on a healthy run.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "job_timeout_sec": 100,
+                    },
+                },
+                "job-group": {"g": {"jobs": ["j"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        group = h.snap(cfg, "g")
+        job = h.snap(cfg, "j")
+        assert group.timeout > 0
+        assert group._guard_timeout == group.timeout
+        assert job._guard_timeout == job.timeout == 100
+
     def test_group_budget_zero_propagates_through_subgroup(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -1925,9 +1989,9 @@ class TestKeepAwake:
 
         def fake_exec(argv: list[str], **_kwargs: object) -> Any:
             captured["argv"] = argv
-            return crony_runner._ExitOutcome(rc=0, signal=None)
+            return crony_runner._ExitOutcome(rc=0, signal=None), False
 
-        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -1950,32 +2014,80 @@ class TestKeepAwake:
             "true",
         ]
 
-    def test_run_job_uncapped_passes_none_timeout(
+    def test_run_job_records_timeout_when_guard_signals(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
+        # _exec_command reporting timed_out=True (the guard's SIGUSR1
+        # hint) is recorded as a timeout, not as the signal death that
+        # actually stopped the command.
         h = _RunnerHarness(tmp_path, monkeypatch)
-        captured: dict[str, Any] = {}
 
-        def fake_exec(*_args: object, timeout: Any, **_kwargs: object) -> Any:
-            captured["timeout"] = timeout
-            return crony_runner._ExitOutcome(rc=0, signal=None)
+        def fake_exec(*_args: object, **_kwargs: object) -> Any:
+            return crony_runner._ExitOutcome(rc=0, signal=15), True
 
-        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
         cfg = h.config(
-            {
-                "job": {
-                    "j": {
-                        "command": "true",
-                        "schedule": "daily",
-                        "job_timeout_sec": 0,
-                    }
-                }
-            },
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
             default_target_jobs=["j"],
         )
-        assert crony_runner._run_job(h.snap(cfg, "j")) == 0
-        # 0 (no cap) reaches the runner as None so proc.wait never caps.
-        assert captured["timeout"] is None
+        snap = h.snap(cfg, "j")
+        assert crony_runner._run_job(snap) == int(ExitCode.TIMEOUT)
+        rec = json.loads(
+            (snap.state_dir / "last-run.json").read_text(encoding="utf-8")
+        )
+        assert rec["exit_class"] == "timeout"
+
+    def test_arm_guard_signals_the_guard_pid(self, monkeypatch: Any) -> None:
+        # With a guard present (its pid in the env), arming signals exactly
+        # that pid SIGUSR1 -- the runner telling the guard the command has
+        # started so the cap clocks from now.
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            "crony.runner.os.kill",
+            lambda pid, sig: calls.append((pid, sig)),
+        )
+        monkeypatch.setenv(crony_runtime.GUARD_PID_ENV, "4321")
+        crony_runner._arm_guard()
+        assert calls == [(4321, signal.SIGUSR1)]
+
+    def test_arm_guard_is_a_noop_without_a_guard(
+        self, monkeypatch: Any
+    ) -> None:
+        # An uncapped run has no guard: nothing in the env, nothing signal.
+        calls: list[object] = []
+        monkeypatch.setattr("crony.runner.os.kill", lambda *a: calls.append(a))
+        monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)
+        crony_runner._arm_guard()
+        assert calls == []
+
+    def test_read_runner_pid_reads_run_pid(self, tmp_path: Path) -> None:
+        (tmp_path / "run.pid").write_text("4242\n", encoding="utf-8")
+        assert crony_runner._read_runner_pid(tmp_path) == 4242
+
+    def test_read_runner_pid_none_when_missing_or_garbage(
+        self, tmp_path: Path
+    ) -> None:
+        assert crony_runner._read_runner_pid(None) is None
+        assert crony_runner._read_runner_pid(tmp_path) is None
+        (tmp_path / "run.pid").write_text("not-a-pid", encoding="utf-8")
+        assert crony_runner._read_runner_pid(tmp_path) is None
+
+    def test_in_process_group_true_for_a_group_member(self) -> None:
+        assert crony_runner._in_process_group(os.getpid(), os.getpgid(0))
+
+    def test_in_process_group_false_for_dead_or_foreign_pid(self) -> None:
+        # A pid with no live process reports no group (ProcessLookupError);
+        # a live pid in another group does not match ours.
+        assert not crony_runner._in_process_group(2**31 - 1, os.getpgid(0))
+        assert not crony_runner._in_process_group(
+            os.getpid(), os.getpgid(0) + 1
+        )
+
+    def test_ignore_signals_installs_sig_ign(self) -> None:
+        # Installs SIG_IGN and does not restore -- the runner exits after
+        # its run; the autouse signal-isolation fixture puts SIGUSR2 back.
+        crony_runner._ignore_signals((signal.SIGUSR2,))
+        assert signal.getsignal(signal.SIGUSR2) == signal.SIG_IGN
 
     def test_run_job_logs_note_when_tool_missing(
         self, tmp_path: Path, monkeypatch: Any
@@ -2051,9 +2163,9 @@ class TestFullDiskAccess:
 
         def fake_exec(argv: list[str], **_kwargs: object) -> Any:
             captured["argv"] = argv
-            return crony_runner._ExitOutcome(rc=0, signal=None)
+            return crony_runner._ExitOutcome(rc=0, signal=None), False
 
-        monkeypatch.setattr(crony_runner, "_exec_with_timeout", fake_exec)
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
         cfg = h.config(
             {
                 "job": {
@@ -3107,11 +3219,19 @@ def _run_guard_in_child(cap: int, argv: list[str]) -> int:
 
 
 class TestDoRunGuard:
-    """The hard-timeout backstop: propagate a normal exit, and kill the
-    whole run group (not just the direct child) on overrun."""
+    """The timeout guard: propagate a normal exit, and kill the whole run
+    group (not just the direct child) on overrun."""
 
     def test_propagates_success(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 0"]) == 0
+
+    def test_rejects_a_nonpositive_cap(self) -> None:
+        # The guard is only rendered for a capped entry; an uncapped one
+        # runs without it, so a cap <= 0 reaching the guard is a rendering
+        # bug, not a "no cap" request -- it fails loudly.
+        for bad in (0, -5):
+            with pytest.raises(UsageError):
+                crony_runner.do_run_guard(bad, ["/bin/sh", "-c", "true"])
 
     def test_propagates_nonzero_exit(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 7"]) == 7
@@ -3147,6 +3267,35 @@ class TestDoRunGuard:
         else:
             pytest.fail(f"grandchild {gc_pid} survived the group kill")
 
+    def test_overrun_sigkills_a_signal_ignoring_descendant(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The command dies on the timeout SIGTERM but leaves a descendant
+        # that ignores it. The runner exiting is not proof the session is
+        # dead, so the guard must escalate to SIGKILL the survivor rather
+        # than orphan it.
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 1.0)
+        pidfile = tmp_path / "stubborn.pid"
+        argv = [
+            "/bin/sh",
+            "-c",
+            # Background a SIGTERM-ignoring looper, record its pid, then
+            # wait -- the foreground sh dies on the SIGTERM while the looper
+            # survives it, so only the SIGKILL escalation reaps it.
+            f"sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
+            f"echo $! > {pidfile}; wait",
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        gc_pid = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(gc_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"stubborn descendant {gc_pid} survived the sweep")
+
     def test_forwards_sigterm_to_the_run(self, tmp_path: Path) -> None:
         # The guard is the scheduler-tracked process; a stop signal it
         # receives must reach the run that escaped into its own session.
@@ -3179,6 +3328,87 @@ class TestDoRunGuard:
             time.sleep(0.1)
         else:
             pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
+
+    def test_timeout_delivers_sigusr1_hint(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # On timeout the guard signals the runner SIGUSR1 (the "this was a
+        # timeout" hint) before the SIGTERM. It targets the runner's real
+        # pid from run.pid -- the session leader is an intervening `uv run`,
+        # not the runner -- so the child publishes its pid there and traps
+        # the signal.
+        # A short-sleep loop so /bin/sh runs the trap promptly (a long
+        # foreground sleep would defer it); the settle gives the trap time
+        # to fire before the SIGTERM. The real Python runner handles the
+        # signal immediately, so this deferral is the shell's alone.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 1.0)
+        monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
+        uid = "11111111-2222-3333-4444-555555555555"
+        sd = tmp_path / "default" / uid
+        sd.mkdir(parents=True)
+        marker = tmp_path / "got-usr1"
+        argv = [
+            "/bin/sh",
+            "-c",
+            f"echo $$ > {sd / 'run.pid'}; "
+            f'trap "touch {marker}; exit 7" USR1; '
+            "while :; do sleep 0.1; done",
+            "_",
+            f"default:{uid}",
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        assert marker.is_file()
+
+    def test_timeout_sigkill_writes_killed_flag(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A run that ignores the SIGUSR1 hint and SIGTERM is SIGKILLed on
+        # timeout; the guard leaves a killed-flag (keyed on the run's ref)
+        # so status can read the SIGKILLed, never-recorded run as a timeout.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
+        uid = "12345678-9abc-def0-1234-56789abcdef0"
+        sd = tmp_path / "default" / uid
+        sd.mkdir(parents=True)
+        argv = [
+            "/bin/sh",
+            "-c",
+            f"echo $$ > {sd / 'run.pid'}; "
+            'trap "" TERM USR1; while true; do sleep 1; done',
+            "_",
+            f"default:{uid}",
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        assert (sd / "killed.flag").is_file()
+
+    def test_interactive_does_not_time_out_before_arm(self) -> None:
+        # An interactive guard leaves the pre-command wait unbounded: with
+        # no arm, a child outliving the cap is not killed -- its own exit
+        # propagates.
+        start = time.monotonic()
+        code = _run_guard_in_child(
+            1, ["--interactive", "/bin/sh", "-c", "sleep 2; exit 5"]
+        )
+        elapsed = time.monotonic() - start
+        assert code == 5
+        assert elapsed >= 2
+
+    def test_interactive_arm_starts_the_cap(self) -> None:
+        # Once the runner arms an interactive guard (SIGUSR1 to the guard's
+        # own pid, here the child's parent), the cap runs from that arm and
+        # an overrun is killed.
+        start = time.monotonic()
+        argv = [
+            "--interactive",
+            "/bin/sh",
+            "-c",
+            'kill -USR1 "$PPID"; sleep 30',
+        ]
+        code = _run_guard_in_child(1, argv)
+        elapsed = time.monotonic() - start
+        assert code == int(ExitCode.TIMEOUT)
+        assert elapsed < 20
 
 
 class _FakeScheduler:

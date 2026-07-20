@@ -14,6 +14,7 @@ plugin; it carries no test classes and is never run as a test.
 import json
 import math
 import re
+import signal
 import subprocess
 import sys
 import uuid
@@ -157,6 +158,26 @@ def isolate_crony_home(
 @pytest.fixture(autouse=True)
 def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
     isolate_crony_home(tmp_path, monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_signal_state() -> Any:
+    """Restore the signal dispositions the runner touches around each
+    test. The runner installs its SIG_IGN passivity once and never
+    restores it (it exits after a run, so production has no teardown); an
+    in-process `_run_job` / `_run_group` / `_ignore_signals` call would
+    otherwise leak SIG_IGN into later tests. Snapshot and put them back."""
+    sigs = (
+        signal.SIGTERM,
+        signal.SIGINT,
+        signal.SIGHUP,
+        signal.SIGUSR1,
+        signal.SIGUSR2,
+    )
+    saved = {s: signal.getsignal(s) for s in sigs}
+    yield
+    for s, handler in saved.items():
+        signal.signal(s, handler)
 
 
 def _job(**overrides: Any) -> dict[str, Any]:

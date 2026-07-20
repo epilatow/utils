@@ -648,7 +648,7 @@ def _build_parser() -> StrictArgumentParser:
             help="Entity address `<bundle>:<uuid>` (internal-only form).",
         )
 
-    # _run-guard -- internal hard-timeout backstop wrapping `_run`;
+    # _run-guard -- internal wallclock-timeout enforcer wrapping `_run`;
     # rendered into the platform unit by apply, never invoked by hand.
     # Hidden from `crony --help` for the same reason as `_run` (no
     # `help=`). Takes the cap then the full inner command via REMAINDER
@@ -657,7 +657,7 @@ def _build_parser() -> StrictArgumentParser:
     p_guard.add_argument(
         "cap",
         type=int,
-        help="Hard wallclock cap in seconds (internal-only form).",
+        help="Wallclock cap in seconds (internal-only form).",
     )
     p_guard.add_argument(
         "argv",

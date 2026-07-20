@@ -1214,9 +1214,10 @@ class TestExecPathStrings:
 
 
 class TestGuardedArgv:
-    """`model._guarded_argv` wraps the base run in the hard-timeout
-    guard for a capped entry; the path scan recovers uv / crony from the
-    guarded shape just as it does from the bare one."""
+    """`model._guarded_argv` wraps the base run in the timeout guard for a
+    capped entry; an interactive entry carries a leading `--interactive`
+    marker, a non-interactive one does not. The path scan recovers uv /
+    crony from any guarded shape just as it does from the bare one."""
 
     _UV = Path("/abs/uv")
     _CRONY = Path("/abs/crony")
@@ -1224,24 +1225,48 @@ class TestGuardedArgv:
 
     def test_uncapped_is_bare_run(self) -> None:
         assert crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 0
+            self._UV, self._CRONY, self._REF, 0, False
         ) == crony_model._run_argv(self._UV, self._CRONY, self._REF)
 
-    def test_capped_wraps_with_padded_cap(self) -> None:
-        argv = crony_model._guarded_argv(self._UV, self._CRONY, self._REF, 120)
-        cap = 120 + crony_model._HARD_TIMEOUT_PADDING_SEC
+    def test_capped_wraps_with_timeout_as_cap(self) -> None:
+        argv = crony_model._guarded_argv(
+            self._UV, self._CRONY, self._REF, 120, False
+        )
         assert argv == (
             "/abs/uv",
             "run",
             "--script",
             "/abs/crony",
             crony_model.GUARD_SUBCOMMAND,
-            str(cap),
+            str(120),
             *crony_model._run_argv(self._UV, self._CRONY, self._REF),
         )
 
+    def test_interactive_capped_carries_marker(self) -> None:
+        argv = crony_model._guarded_argv(
+            self._UV, self._CRONY, self._REF, 120, True
+        )
+        assert argv == (
+            "/abs/uv",
+            "run",
+            "--script",
+            "/abs/crony",
+            crony_model.GUARD_SUBCOMMAND,
+            str(120),
+            "--interactive",
+            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+        )
+
+    def test_uncapped_interactive_is_still_bare_run(self) -> None:
+        # No cap means no guard at all, so the marker never appears.
+        assert crony_model._guarded_argv(
+            self._UV, self._CRONY, self._REF, 0, True
+        ) == crony_model._run_argv(self._UV, self._CRONY, self._REF)
+
     def test_paths_recover_from_guarded_shape(self) -> None:
-        argv = crony_model._guarded_argv(self._UV, self._CRONY, self._REF, 600)
+        argv = crony_model._guarded_argv(
+            self._UV, self._CRONY, self._REF, 600, True
+        )
         assert crony_model.exec_path_strings(list(argv)) == (
             "/abs/uv",
             "/abs/crony",
@@ -2042,6 +2067,24 @@ class TestCrashedSignal:
     def test_run_pid_without_any_record_is_crashed(self) -> None:
         # First-ever launch died before writing any record.
         assert self._crashed(run_pid=7397) is True
+
+    def test_killed_flag_reads_crash_as_timeout(self) -> None:
+        # A crashed launch (run.pid, no matching record) that the guard
+        # SIGKILLed on its timeout carries the killed-flag, so status
+        # reads it as a timeout rather than a generic crash.
+        js = crony_model.JobStatus
+        assert (
+            crony_runtime._derive_job_status(
+                False, False, 7397, None, None, killed_on_timeout=False
+            )
+            == js.CRASHED
+        )
+        assert (
+            crony_runtime._derive_job_status(
+                False, False, 7397, None, None, killed_on_timeout=True
+            )
+            == js.TIMEOUT
+        )
 
     def test_run_pid_matching_record_is_not_crashed(self) -> None:
         # The record carries the same pid as the surviving run.pid, so

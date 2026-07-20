@@ -80,17 +80,12 @@ RUN_SUBCOMMAND = "_run"
 # re-renders them. Remove once no `run`-baked units remain on any host.
 RUN_SUBCOMMAND_LEGACY = "run"
 
-# Seconds added to a capped entry's timeout to form the hard guard's
-# wallclock cap. The cap is looser than the entry timeout so the runner's
-# own soft timeout fires first (keeping the clean last-run.json
-# reporting); the guard is the last-resort backstop for a runner that
-# wedges before honoring its deadline. The padding covers crony startup
-# plus the soft timeout's SIGTERM->SIGKILL grace.
-_HARD_TIMEOUT_PADDING_SEC = 60
-
-# Hidden crony subcommand that wraps a run in a hard wallclock cap: it
-# launches the inner `crony _run` in its own session and kills that
-# process group if the cap elapses.
+# Hidden crony subcommand that wraps a run in its wallclock timeout: it
+# launches the inner `crony _run` in its own session, arms the cap when the
+# runner signals the command has started, and on overrun kills that session
+# (a SIGUSR1 hint to the runner, then a SIGTERM -> grace -> SIGKILL
+# escalation). A leading `--interactive` in the wrapped argv tells it not to
+# clock the pre-command wait, which for an interactive job is unbounded.
 GUARD_SUBCOMMAND = "_run-guard"
 
 # Hidden crony subcommand the platform unit layer can use to implement jitter
@@ -211,21 +206,29 @@ def _guarded_argv(
     crony_path: Path,
     ref: crony.unit.EntityRef,
     timeout: int,
+    interactive: bool,
 ) -> tuple[str, ...]:
     """The unit's full run command. A positive `timeout` wraps the base
-    run in the hard-timeout guard (cap = timeout + padding); an uncapped
-    entry (`timeout <= 0`) runs the base argv directly, no guard."""
+    run in the timeout guard, which enforces the timeout and kills the
+    session on overrun; an uncapped entry (`timeout <= 0`) runs the base
+    argv directly, no guard.
+
+    An `interactive` guarded entry carries a leading `--interactive` marker
+    so the guard leaves the pre-command wait unbounded and clocks the cap
+    only once the command starts. A non-interactive entry omits it, so its
+    argv is unchanged from an unmarked guard wrap."""
     base = _run_argv(uv_path, crony_path, ref)
     if timeout <= 0:
         return base
-    cap = timeout + _HARD_TIMEOUT_PADDING_SEC
+    marker = ("--interactive",) if interactive else ()
     return (
         str(uv_path),
         "run",
         "--script",
         str(crony_path),
         GUARD_SUBCOMMAND,
-        str(cap),
+        str(timeout),
+        *marker,
         *base,
     )
 
@@ -248,6 +251,7 @@ def _normalized_spec(
     timing: crony.unit.Timing | None,
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
+    guard_interactive: bool,
 ) -> crony.unit.UnitSpec:
     """A UnitSpec with blank (`Path("")`) executable paths -- the
     path-independent form both graphs normalize to for the drift compare.
@@ -255,7 +259,9 @@ def _normalized_spec(
     live, so a moved-but-present binary collapses to the same content as
     the live one and does not read as drift. Buildable even for a node
     with no resolved executables."""
-    cmd = _guarded_argv(Path(""), Path(""), ref, guard_timeout)
+    cmd = _guarded_argv(
+        Path(""), Path(""), ref, guard_timeout, guard_interactive
+    )
     return crony.unit.UnitSpec(
         name=name,
         cmd=cmd,
@@ -475,12 +481,19 @@ class _JobCommon:
 
     @property
     def _guard_timeout(self) -> int:
-        """The wallclock cap the hard-timeout guard wraps the unit's run
-        in (0 = no guard). The entry's `timeout` here; `Job` overrides to
-        drop the guard for an interactive job, whose pending wait /
-        prompt / delay phase has no wallclock bound for the guard to
-        respect."""
+        """The wallclock cap the timeout guard wraps the unit's run in
+        (0 = no guard). The entry's `timeout`; an uncapped entry (0) runs
+        unguarded."""
         return self.timeout
+
+    @property
+    def _guard_interactive(self) -> bool:
+        """Whether the guard leaves the pre-command wait unbounded and
+        clocks its cap only from the command's start. False here (a group
+        has no interactive wait); `Job` overrides to its `interactive`
+        flag, so an interactive job's approval wait does not count against
+        the cap."""
+        return False
 
     def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders for this node's
@@ -505,7 +518,11 @@ class _JobCommon:
             )
         uv_path, crony_path = self.uv_path, self.crony_path
         cmd = _guarded_argv(
-            uv_path, crony_path, self.entity_ref, self._guard_timeout
+            uv_path,
+            crony_path,
+            self.entity_ref,
+            self._guard_timeout,
+            self._guard_interactive,
         )
         timing = None if self.unit_disabled else self.timing
         return crony.unit.UnitSpec(
@@ -535,6 +552,7 @@ class _JobCommon:
                 None if disabled else self.timing,
                 self._unit_priority,
                 self._guard_timeout,
+                self._guard_interactive,
             ),
         )
 
@@ -668,14 +686,12 @@ class Job(_JobCommon):
         return self.priority
 
     @property
-    def _guard_timeout(self) -> int:
-        """An interactive job has no wallclock-bounded run: its pending
-        wait, prompt, and re-promptable delay can outlast any cap, so the
-        hard guard would kill a healthy waiting job. The guard is dropped
-        (0); the runner's own soft timeout still bounds the command once
-        the user runs it. A non-interactive job is guarded by its
-        timeout."""
-        return 0 if self.interactive else self.timeout
+    def _guard_interactive(self) -> bool:
+        """An interactive job's approval wait -- pending, prompt, and
+        re-promptable delay -- can outlast any cap, so the guard must not
+        clock it. It arms the cap only once the runner starts the command,
+        bounding the command alone; the wait stays unbounded."""
+        return self.interactive
 
     @classmethod
     def _from_config(
@@ -724,7 +740,8 @@ class Job(_JobCommon):
             crony.unit.EntityRef(name.bundle, job.uuid),
             job.timing,
             priority,
-            0 if interactive else timeout,
+            timeout,
+            interactive,
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -825,7 +842,8 @@ class Job(_JobCommon):
             snap.entity_ref(),
             eff_timing,
             priority,
-            0 if interactive else snap.timeout,
+            snap.timeout,
+            interactive,
             ondisk_units,
             installed_uv,
             installed_crony,
@@ -872,9 +890,11 @@ class JobGroup(_JobCommon):
     current full name via the child's own snapshot at dispatch
     time so a rename in config doesn't flip the parent's snapshot
     (the snapshot persists only the uuids -- the bundle is the
-    parent's). The inherited `timeout` holds the pre-padded cumulative
-    deadline computed once at apply time. 0 means no cap (some child is
-    uncapped); the group runner treats it as an infinite deadline.
+    parent's). The inherited `timeout` holds the cumulative deadline
+    (`1.05 x` the sum of the children's own caps) computed once at apply
+    time; the group runner enforces it and the guard backstops it. 0 means
+    no cap (some child is uncapped); the group runner treats it as an
+    infinite deadline.
     """
 
     children: list[crony.unit.EntityRef]
@@ -947,6 +967,7 @@ class JobGroup(_JobCommon):
             group.timing,
             crony.unit.PriorityClass.NORMAL,
             timeout,
+            False,
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -1015,6 +1036,7 @@ class JobGroup(_JobCommon):
             eff_timing,
             crony.unit.PriorityClass.NORMAL,
             snap.timeout,
+            False,
             ondisk_units,
             installed_uv,
             installed_crony,
@@ -1049,6 +1071,7 @@ def _pending_rendered_units(
     timing: crony.unit.Timing | None,
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
+    guard_interactive: bool,
 ) -> crony.platform.RenderedUnits:
     """The normalized `RenderedUnits` for a config-built (pending) node:
     the platform render of the entry's blank-path unit spec, so the form
@@ -1061,7 +1084,9 @@ def _pending_rendered_units(
         platform or crony.platform.current_platform()
     )
     return sched.render_units(
-        _normalized_spec(name, ref, timing, priority, guard_timeout)
+        _normalized_spec(
+            name, ref, timing, priority, guard_timeout, guard_interactive
+        )
     )
 
 
@@ -1072,6 +1097,7 @@ def _current_rendered_units(
     timing: crony.unit.Timing | None,
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
+    guard_interactive: bool,
     ondisk_units: crony.platform.RenderedUnits,
     installed_uv: Path | None,
     installed_crony: Path | None,
@@ -1103,7 +1129,9 @@ def _current_rendered_units(
     normalized_units = {
         u.filename: u.content
         for u in sched.render_units(
-            _normalized_spec(name, ref, timing, priority, guard_timeout)
+            _normalized_spec(
+                name, ref, timing, priority, guard_timeout, guard_interactive
+            )
         ).units
     }
     # `comparison_units` renders with the installed (on-disk) uv / crony
@@ -1114,7 +1142,13 @@ def _current_rendered_units(
     # faithful install of this entry.
     comparison_units: dict[Path, str] = {}
     if installed_uv is not None and installed_crony is not None:
-        cmd = _guarded_argv(installed_uv, installed_crony, ref, guard_timeout)
+        cmd = _guarded_argv(
+            installed_uv,
+            installed_crony,
+            ref,
+            guard_timeout,
+            guard_interactive,
+        )
         comparison_units = {
             u.filename: u.content
             for u in sched.render_units(

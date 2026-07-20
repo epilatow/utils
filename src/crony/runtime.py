@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # it out from under itself (see `apply_one`).
 RUNNING_REF_ENV = "CRONY_RUNNING_REF"
 
+# The guard publishes its own pid here for the runner it spawns, so the
+# runner can signal the guard SIGUSR1 the instant it starts the command
+# (the guard arms its wallclock cap on that signal, excluding the runner's
+# pre-command setup / interactive wait from the cap). Absent when a run has
+# no guard (an uncapped entry), in which case the runner arms nothing.
+GUARD_PID_ENV = "CRONY_GUARD_PID"
+
 
 def load_snapshot(
     ref: crony.unit.EntityRef,
@@ -197,6 +204,7 @@ def _derive_job_status(
     run_pid: int | None,
     last_run: crony.model.LastRun | None,
     unit_last_exit: crony.platform.UnitLastExit | None,
+    killed_on_timeout: bool = False,
 ) -> crony.model.JobStatus:
     """The entity's current run status from its runtime facts.
 
@@ -207,12 +215,16 @@ def _derive_job_status(
     file), `running` otherwise. Otherwise `crashed` when a launch ended
     without recording (see `_crashed`), then the recorded exit_class, and
     `never` / `unknown` when no usable record exists.
+
+    `killed_on_timeout` is the guard's killed-flag: when a run crashed
+    (never recorded) because the guard had to SIGKILL it on its timeout,
+    the flag names the crash a `timeout` instead.
     """
     js = crony.model.JobStatus
     if is_running:
         return js.PENDING if is_pending else js.RUNNING
     if _crashed(is_running, run_pid, last_run, unit_last_exit):
-        return js.CRASHED
+        return js.TIMEOUT if killed_on_timeout else js.CRASHED
     if last_run is None or last_run.exit_class is None:
         return js.NEVER if last_run is None else js.UNKNOWN
     return _EXIT_TO_JOBSTATUS.get(last_run.exit_class, js.UNKNOWN)
@@ -267,12 +279,14 @@ def _read_runtime_state(
     )
     pid_path = state_dir / "run.pid"
     is_pending = (state_dir / "pending.flag").is_file()
+    killed_on_timeout = (state_dir / "killed.flag").is_file()
     job_status = _derive_job_status(
         is_running,
         is_pending,
         read_pid_file(pid_path),
         last_run,
         unit_last_exit,
+        killed_on_timeout,
     )
     return crony.model.RuntimeState(
         state_dir=state_dir,
