@@ -1605,6 +1605,11 @@ class JobRunResult(_CommonRunResult):
     # records. Empty dict means no external dispatch was attempted
     # (notify_channels resolved to []).
     notifications: dict[str, NotificationResult] = field(default_factory=dict)
+    # True when a failing run's notification was withheld by the
+    # notify-success-ratio floor (enough of the last N runs succeeded).
+    # Recorded for forensics ("why wasn't I paged?"); deliberately not
+    # surfaced by status, trigger, or any other crony command output.
+    notify_suppressed: bool = False
 
 
 @dataclass
@@ -1689,6 +1694,93 @@ class LastRun:
             ),
             pid=pid if isinstance(pid, int) else None,
         )
+
+
+EXIT_HISTORY_SCHEMA: int = 1
+
+
+@dataclass
+class ExitHistoryEntry:
+    """One completed run in `exit-history.json`. `exit_class` drives the
+    notify-success-ratio count (a success is `ExitClass.OK`); `ended_at`
+    is retained for forensics -- inspecting why a failure was or was not
+    notified -- and is not read by the ratio itself."""
+
+    exit_class: ExitClass
+    ended_at: str
+
+
+@dataclass
+class ExitHistory:
+    """`exit-history.json`: a job's bounded, append-ordered log of recent
+    run outcomes, kept beside `last-run.json` so the notify-success-ratio
+    floor can look back over the last N runs. Only jobs whose resolved
+    ratio has N > 1 maintain it. Distinct from `last-run.json`, which is
+    a single most-recent record; this is the outcome history, holding no
+    notification state.
+
+    A versioned container (unlike the unversioned `last-run.json`) so the
+    entry shape can evolve behind the `schema` field; a record whose
+    schema this build does not recognize reads as an empty history rather
+    than aborting.
+    """
+
+    schema: int
+    runs: list[ExitHistoryEntry]
+
+    @classmethod
+    def empty(cls) -> ExitHistory:
+        """A fresh, current-schema history with no runs."""
+        return cls(schema=EXIT_HISTORY_SCHEMA, runs=[])
+
+    @classmethod
+    def from_raw(cls, raw: object) -> ExitHistory:
+        """Parse a decoded `exit-history.json` document tolerantly.
+
+        A non-dict, a missing / mismatched `schema`, a non-list `runs`,
+        or any entry missing a parseable `exit_class` yields an empty
+        history (the malformed entry is dropped, not fatal), matching the
+        `LastRun.from_raw` posture -- a corrupt outcome log degrades to
+        "no history", it never aborts a run.
+        """
+        if not isinstance(raw, dict):
+            return cls.empty()
+        if raw.get("schema") != EXIT_HISTORY_SCHEMA:
+            return cls.empty()
+        raw_runs = raw.get("runs")
+        if not isinstance(raw_runs, list):
+            return cls.empty()
+        runs: list[ExitHistoryEntry] = []
+        for item in raw_runs:
+            if not isinstance(item, dict):
+                continue
+            exit_class = ExitClass.parse(item.get("exit_class"))
+            ended_at = item.get("ended_at")
+            if exit_class is None or not isinstance(ended_at, str):
+                continue
+            runs.append(ExitHistoryEntry(exit_class, ended_at))
+        return cls(schema=EXIT_HISTORY_SCHEMA, runs=runs)
+
+    def to_payload(self) -> dict[str, Any]:
+        """The JSON-serializable form written to `exit-history.json`."""
+        return {
+            "schema": self.schema,
+            "runs": [
+                {"exit_class": str(e.exit_class), "ended_at": e.ended_at}
+                for e in self.runs
+            ],
+        }
+
+    def successes_in_window(self, n: int) -> int:
+        """Successes among the last `n` runs, counting absent early runs
+        as successes (warm-up padding). So a job with fewer than `n`
+        recorded runs is only ever notified once it has accumulated
+        enough real failures, not on its first failure.
+        """
+        recent = self.runs[-n:]
+        real_successes = sum(1 for e in recent if e.exit_class == ExitClass.OK)
+        padding = n - len(recent)
+        return real_successes + padding
 
 
 @dataclass

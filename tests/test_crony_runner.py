@@ -812,6 +812,195 @@ class TestRunJobNotify:
             )
 
 
+class TestRunJobSuccessRatio:
+    """The notify-success-ratio floor: suppress a failed run's
+    notification while enough of the last N runs succeeded."""
+
+    @staticmethod
+    def _dispatch_spy(monkeypatch: Any) -> list[Any]:
+        calls: list[Any] = []
+        monkeypatch.setattr(
+            crony_notify,
+            "dispatch_notify",
+            lambda result, *_a, **_k: calls.append(result),
+        )
+        return calls
+
+    @staticmethod
+    def _history(sd: Path) -> list[str]:
+        raw = json.loads((sd / "exit-history.json").read_text())
+        return [e["exit_class"] for e in raw["runs"]]
+
+    def test_default_ratio_notifies_each_failure_no_history(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # 1/1 (the default) is stateless-equivalent to today: notify on
+        # every failure and never touch exit-history.json.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                        "notify_channels": ["dialog-popup"],
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        calls = self._dispatch_spy(monkeypatch)
+        crony_runner._run_job(h.snap(cfg, "f"))
+        crony_runner._run_job(h.snap(cfg, "f"))
+        assert len(calls) == 2
+        sd = h.state_dir("f")
+        assert not (sd / "exit-history.json").exists()
+        assert h.last_run("f")["notify_suppressed"] is False
+
+    def test_suppresses_until_window_all_failed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                        "notify_channels": ["dialog-popup"],
+                        "notify_success_ratio": "1/3",
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        calls = self._dispatch_spy(monkeypatch)
+        suppressed: list[bool] = []
+        for _ in range(3):
+            crony_runner._run_job(h.snap(cfg, "f"))
+            suppressed.append(h.last_run("f")["notify_suppressed"])
+        # Warm-up padding + one real failure keep the first two quiet;
+        # the third (three real failures in the window) fires.
+        assert suppressed == [True, True, False]
+        assert len(calls) == 1
+        # A fourth failing run fires again -- no re-notify throttle.
+        crony_runner._run_job(h.snap(cfg, "f"))
+        assert len(calls) == 2
+        sd = h.state_dir("f")
+        assert self._history(sd) == ["fail", "fail", "fail", "fail"]
+        # Withheld runs are noted in the per-job log for forensics.
+        assert (
+            "suppressed by notify-success-ratio" in (sd / "run.log").read_text()
+        )
+
+    def test_success_slides_window_not_reset(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A single success does not permanently re-arm silence: it must
+        # slide out of the window (three more failures) before the next
+        # notification fires.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        ok_marker = tmp_path / "ok_marker"
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": f"test -f {ok_marker}",
+                        "schedule": "daily",
+                        "notify_channels": ["dialog-popup"],
+                        "notify_success_ratio": "1/3",
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        calls = self._dispatch_spy(monkeypatch)
+
+        def run() -> None:
+            crony_runner._run_job(h.snap(cfg, "f"))
+
+        for _ in range(3):  # three failures -> fires on the third
+            run()
+        assert len(calls) == 1
+        ok_marker.write_text("")  # one success, no dispatch
+        run()
+        assert len(calls) == 1
+        ok_marker.unlink()
+        run()  # ok still in window -> suppressed
+        run()  # ok still in window -> suppressed
+        assert len(calls) == 1
+        run()  # ok has slid out; three failures again -> fires
+        assert len(calls) == 2
+
+    def test_gated_run_not_recorded(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": "exit 1",
+                        "gate": "false",
+                        "schedule": "daily",
+                        "notify_channels": ["dialog-popup"],
+                        "notify_success_ratio": "1/2",
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        crony_runner._run_job(h.snap(cfg, "f"))
+        sd = h.state_dir("f")
+        assert h.last_run("f")["exit_class"] == "gated"
+        # A gated run never executed the command, so it stays out of the
+        # window entirely.
+        assert not (sd / "exit-history.json").exists()
+
+    def test_ok_run_appends_to_window(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "notify_success_ratio": "1/2",
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        crony_runner._run_job(h.snap(cfg, "f"))
+        assert self._history(h.state_dir("f")) == ["ok"]
+
+    def test_channelless_failure_appends_but_not_suppressed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # No channels -> nothing to suppress, but the outcome still
+        # feeds the window so channels can be toggled on without a gap.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "f": {
+                        "command": "exit 1",
+                        "schedule": "daily",
+                        "notify_success_ratio": "1/2",
+                    }
+                }
+            },
+            default_target_jobs=["f"],
+        )
+        calls = self._dispatch_spy(monkeypatch)
+        crony_runner._run_job(h.snap(cfg, "f"))
+        assert not calls
+        assert self._history(h.state_dir("f")) == ["fail"]
+        assert h.last_run("f")["notify_suppressed"] is False
+
+
 class TestRunGroup:
     def test_group_dispatches_each_child_via_platform(
         self, tmp_path: Path, monkeypatch: Any

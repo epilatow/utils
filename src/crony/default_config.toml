@@ -39,6 +39,7 @@
 #notify-channels      = []           # names defined below, or "dialog-popup"
 #notify-attach-log    = true         # include log content in notifications
 #notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
+#notify-success-ratio = "1/1"        # failure-notification floor (see below)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
 #trigger-timeout-sec  = 15           # `crony trigger --wait` deadline
 #priority             = "high"       # priority class; jobs may override
@@ -50,6 +51,17 @@
 #
 #[defaults.env]
 #PATH = "$HOME/.local/bin:$PATH"      # merged under every job; a job key wins
+
+# Failure-notification floor (notify-success-ratio). A "K/N" string:
+# notify a failed run only when fewer than K of the last N runs
+# succeeded. The window includes the run that just finished, and a job
+# with fewer than N runs on record counts the missing early runs as
+# successes -- so a fresh job is not paged on its first failure. The
+# default "1/1" notifies on every failure. "1/5" stays quiet unless the
+# last 5 runs all failed -- good for automation that occasionally fails
+# for transient reasons (a dropped connection, a sleeping laptop). N is
+# capped at 100. Cascades target > job > defaults like notify-channels,
+# but has no cross-bundle `default` inherit -- each bundle sets its own.
 
 # Notification inheritance. The reserved channel name `default` in a
 # NON-default bundle's `notify-channels` pulls in the default bundle's
@@ -157,6 +169,7 @@
 #            entries must use `!`, or none).
 # Optional per-job overrides of [defaults]:
 #notify-channels = ["email"]   # or [] to silence just this job
+#notify-success-ratio = "1/5"  # only page after 5 straight failures
 #job-timeout-sec = 7200        # 0 = no cap (job manages its own timeout)
 #priority = "high"             # process-priority class for the unit:
 #   "high"   un-throttle: macOS ProcessType=Interactive + normal CPU/IO
@@ -274,6 +287,7 @@
 #[target.platform.linux]
 #jobs            = ["git-pull-utils"]
 #notify-channels = ["ntfy"]
+#notify-success-ratio = "2/10"  # page unless >=2 of the last 10 passed
 
 #[target.host.work-laptop]
 #jobs            = ["brew-update", "git-pull-utils"]

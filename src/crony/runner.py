@@ -516,8 +516,8 @@ def _run_job(snap: crony.model.Job) -> int:
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
-    notify_channels, notify_defaults = crony.notify.resolve_notify_at_runtime(
-        full_name
+    notify_channels, notify_defaults, success_ratio = (
+        crony.notify.resolve_notify_at_runtime(full_name)
     )
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see _runtime_env).
@@ -704,7 +704,38 @@ def _run_job(snap: crony.model.Job) -> int:
                     notifications=notifications,
                 )
 
-                if exit_class != crony.model.ExitClass.OK and notify_channels:
+                # Maintain the exit-history window only when the ratio
+                # can actually suppress (N > 1); a 1/1 job keeps the
+                # original notify-on-every-failure path with no new
+                # on-disk state. The append is unconditional on
+                # completion -- OK runs are the successes the window
+                # needs, and it must not depend on notify_channels, or
+                # toggling channels would punch gaps in the window.
+                if success_ratio.n > 1:
+                    history = crony.runtime.append_exit_history(
+                        sd, exit_class, result.ended_at
+                    )
+                    successes = history.successes_in_window(success_ratio.n)
+                else:
+                    successes = None
+
+                should_dispatch = (
+                    exit_class != crony.model.ExitClass.OK
+                    and bool(notify_channels)
+                )
+                if (
+                    should_dispatch
+                    and successes is not None
+                    and successes >= success_ratio.k
+                ):
+                    should_dispatch = False
+                    result.notify_suppressed = True
+                    log_file.write(
+                        f"notify: suppressed by notify-success-ratio "
+                        f"{success_ratio}\n".encode()
+                    )
+
+                if should_dispatch:
                     log_text = ""
                     try:
                         log_text = log_path.read_text(

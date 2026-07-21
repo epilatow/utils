@@ -2309,6 +2309,39 @@ class TestLastStartedAt:
         assert got is None
 
 
+class TestExitHistoryPersistence:
+    def test_missing_reads_empty(self, tmp_path: Path) -> None:
+        assert crony_runtime.read_exit_history(tmp_path).runs == []
+
+    def test_corrupt_reads_empty(self, tmp_path: Path) -> None:
+        crony_runtime.exit_history_path(tmp_path).write_text("{not json")
+        assert crony_runtime.read_exit_history(tmp_path).runs == []
+
+    def test_append_creates_and_orders(self, tmp_path: Path) -> None:
+        crony_runtime.append_exit_history(
+            tmp_path, crony_model.ExitClass.OK, "t0"
+        )
+        crony_runtime.append_exit_history(
+            tmp_path, crony_model.ExitClass.FAIL, "t1"
+        )
+        hist = crony_runtime.read_exit_history(tmp_path)
+        assert [(e.exit_class, e.ended_at) for e in hist.runs] == [
+            (crony_model.ExitClass.OK, "t0"),
+            (crony_model.ExitClass.FAIL, "t1"),
+        ]
+
+    def test_append_truncates_to_cap(self, tmp_path: Path) -> None:
+        for i in range(5):
+            hist = crony_runtime.append_exit_history(
+                tmp_path, crony_model.ExitClass.FAIL, f"t{i}", cap=3
+            )
+        # Only the 3 most-recent survive, oldest-first.
+        assert [e.ended_at for e in hist.runs] == ["t2", "t3", "t4"]
+        assert [
+            e.ended_at for e in crony_runtime.read_exit_history(tmp_path).runs
+        ] == ["t2", "t3", "t4"]
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

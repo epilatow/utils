@@ -664,17 +664,64 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
         fd.close()
 
 
-def write_last_run(path: Path, payload: dict[str, Any]) -> None:
-    """Atomically write last-run.json so partial writes can't corrupt it.
-
-    Insertion order is preserved (no `sort_keys=True`): top-level keys
-    follow dataclass field order, and `notifications` keeps the
-    configured channel order so the on-disk record matches what the
-    user wrote in the toml.
-    """
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write `payload` as JSON to `path` via a tmp file + atomic rename,
+    so a reader never observes a partial write. Insertion order is
+    preserved (no `sort_keys=True`)."""
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(path)
+
+
+def write_last_run(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write last-run.json so partial writes can't corrupt it.
+
+    Insertion order is preserved: top-level keys follow dataclass field
+    order, and `notifications` keeps the configured channel order so the
+    on-disk record matches what the user wrote in the toml.
+    """
+    _atomic_write_json(path, payload)
+
+
+def exit_history_path(state_dir: Path) -> Path:
+    """Path to a job's `exit-history.json` (may not exist)."""
+    return state_dir / "exit-history.json"
+
+
+def read_exit_history(state_dir: Path) -> crony.model.ExitHistory:
+    """Load a job's `exit-history.json`, tolerating a missing or corrupt
+    file as an empty history (see `ExitHistory.from_raw`)."""
+    path = exit_history_path(state_dir)
+    if not path.is_file():
+        return crony.model.ExitHistory.empty()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return crony.model.ExitHistory.empty()
+    return crony.model.ExitHistory.from_raw(raw)
+
+
+def append_exit_history(
+    state_dir: Path,
+    exit_class: crony.model.ExitClass,
+    ended_at: str,
+    *,
+    cap: int = crony.config.MAX_SUCCESS_RATIO_WINDOW,
+) -> crony.model.ExitHistory:
+    """Append one completed run's outcome to `exit-history.json`,
+    truncate to the `cap` most-recent runs, write it atomically, and
+    return the updated history.
+
+    Callers invoke this only while holding the job's `run.lock`, so the
+    read-modify-write is single-flight and the atomic replace keeps any
+    concurrent lock-free reader safe.
+    """
+    history = read_exit_history(state_dir)
+    history.runs.append(crony.model.ExitHistoryEntry(exit_class, ended_at))
+    if len(history.runs) > cap:
+        del history.runs[:-cap]
+    _atomic_write_json(exit_history_path(state_dir), history.to_payload())
+    return history
 
 
 def dispatch_unit_path(name: str, platform: str | None = None) -> Path:

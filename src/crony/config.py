@@ -330,6 +330,37 @@ class NotifyChannel:
         )
 
 
+# Upper bound on N (the denominator of notify-success-ratio) and, by
+# construction, on how many outcomes exit-history.json retains: N is
+# validated <= this, so the tail the ratio reads never exceeds what is
+# stored. 100 recent runs is far more window than any real failure
+# floor needs.
+MAX_SUCCESS_RATIO_WINDOW: int = 100
+
+
+@dataclass(frozen=True)
+class SuccessRatio:
+    """A resolved `notify-success-ratio`: notify a failed run only when
+    fewer than `k` of the last `n` runs succeeded (the window includes
+    the run just completed, and missing early runs count as successes).
+
+    `SuccessRatio(1, 1)` is the default and reproduces
+    notify-on-every-failure: a failed run is 0 successes in a window of
+    1, which is `< 1`, so it always notifies. `n == 1` is the only value
+    that never suppresses, which the runner uses to skip the
+    exit-history machinery entirely.
+    """
+
+    k: int
+    n: int
+
+    def __str__(self) -> str:
+        return f"{self.k}/{self.n}"
+
+
+DEFAULT_SUCCESS_RATIO: SuccessRatio = SuccessRatio(1, 1)
+
+
 @dataclass
 class Defaults:
     """Tool-wide default settings cascaded to jobs."""
@@ -353,6 +384,12 @@ class Defaults:
     # is 4 KB) and ignore this setting -- adjusting it here will
     # not affect ntfy.
     notify_attach_max_kb: int = 256
+    # Failure-notification floor: notify a failed run only when fewer
+    # than K of the last N runs succeeded (K/N). The default 1/1
+    # notifies on every failure. Unlike notify_channels this has no
+    # cross-bundle inherit sentinel; it cascades target > job > defaults
+    # within a bundle only.
+    notify_success_ratio: SuccessRatio = DEFAULT_SUCCESS_RATIO
     # Default per-job wallclock cap. 0 = no cap (for jobs that manage
     # their own timeout); see TomlJob.job_timeout_sec.
     job_timeout_sec: int = 1800
@@ -446,6 +483,9 @@ class TomlJob:
     # None = inherit from target/defaults; [] = explicit empty (this
     # job sends no external notifications even if defaults / target
     # would).
+    # None = inherit from target/defaults; a SuccessRatio overrides the
+    # failure-notification floor for this job.
+    notify_success_ratio: SuccessRatio | None = None
     # Non-zero exit codes to classify as success (exit 0 is always
     # success). A run whose code lands here is "ok" -- not failed, no
     # notification -- and `crony _run` surfaces 0 to the scheduler. For
@@ -535,6 +575,9 @@ class Target:
     jobs: list[str] = field(default_factory=list)
     # None = inherit from job/defaults; [] = explicit empty.
     notify_channels: list[str] | None = None
+    # None = inherit from job/defaults; a SuccessRatio overrides the
+    # failure-notification floor for jobs selected through this target.
+    notify_success_ratio: SuccessRatio | None = None
 
 
 def _parse_bundle_sections(
@@ -898,6 +941,22 @@ class TomlBundleConfig:
         if job.notify_channels is not None:
             return list(job.notify_channels)
         return list(self.defaults.notify_channels)
+
+    def resolved_notify_success_ratio(
+        self, target: Target | None, job: TomlJob
+    ) -> SuccessRatio:
+        """Cascade notify_success_ratio: target > job > defaults.
+
+        Each of target / job is either None ("inherit from below") or a
+        SuccessRatio override. The bottom-most fallback is the defaults'
+        ratio, which is DEFAULT_SUCCESS_RATIO (1/1) unless the bundle set
+        its own.
+        """
+        if target is not None and target.notify_success_ratio is not None:
+            return target.notify_success_ratio
+        if job.notify_success_ratio is not None:
+            return job.notify_success_ratio
+        return self.defaults.notify_success_ratio
 
     def resolved_job_timeout_sec(self, job: TomlJob) -> int:
         """Cascade job_timeout_sec: job > defaults. 0 means no cap.
@@ -1340,6 +1399,7 @@ _KNOWN_DEFAULTS: frozenset[str] = (
             "notify-channels",
             "notify-attach-log",
             "notify-attach-max-kb",
+            "notify-success-ratio",
             "job-timeout-sec",
             "trigger-timeout-sec",
             "priority",
@@ -1369,6 +1429,7 @@ _KNOWN_JOB: frozenset[str] = (
             "hosts",
             "job-timeout-sec",
             "notify-channels",
+            "notify-success-ratio",
             "success-exit-codes",
             "env",
             "flags",
@@ -1399,6 +1460,7 @@ _KNOWN_TARGET: frozenset[str] = frozenset(
     {
         "jobs",
         "notify-channels",
+        "notify-success-ratio",
     }
 )
 
@@ -1988,6 +2050,61 @@ def _parse_notify_channels(
     return out
 
 
+def _parse_success_ratio_value(val: str, where: str) -> SuccessRatio:
+    """Parse a `"K/N"` notify-success-ratio value into a SuccessRatio.
+
+    K and N are positive integers with `1 <= K <= N <=
+    MAX_SUCCESS_RATIO_WINDOW`. Anything else -- a missing or extra `/`,
+    a non-integer side, a percentage, an out-of-range bound -- raises
+    ConfigError naming the offending value.
+    """
+    parts = val.split("/")
+    if len(parts) != 2:
+        raise crony.errors.ConfigError(
+            f"{where}: 'notify-success-ratio' must be \"K/N\" (e.g. "
+            f'"1/5"), got {val!r}'
+        )
+    try:
+        k = int(parts[0])
+        n = int(parts[1])
+    except ValueError:
+        raise crony.errors.ConfigError(
+            f"{where}: 'notify-success-ratio' must be \"K/N\" with integer "
+            f"K and N, got {val!r}"
+        ) from None
+    if not 1 <= n <= MAX_SUCCESS_RATIO_WINDOW:
+        raise crony.errors.ConfigError(
+            f"{where}: 'notify-success-ratio' N (window) must be between 1 "
+            f"and {MAX_SUCCESS_RATIO_WINDOW}, got {n}"
+        )
+    if not 1 <= k <= n:
+        raise crony.errors.ConfigError(
+            f"{where}: 'notify-success-ratio' K (successes) must be between "
+            f"1 and N={n}, got {k}"
+        )
+    return SuccessRatio(k, n)
+
+
+def _parse_notify_success_ratio(
+    raw: dict[str, Any], where: str, *, required: bool
+) -> SuccessRatio | None:
+    """Parse a `notify-success-ratio` field.
+
+    `required=True` (Defaults) returns DEFAULT_SUCCESS_RATIO when the
+    key is absent; `required=False` (TomlJob/Target) returns None so the
+    cascade can inherit from a layer below.
+    """
+    if "notify-success-ratio" not in raw:
+        return DEFAULT_SUCCESS_RATIO if required else None
+    val = raw["notify-success-ratio"]
+    if not isinstance(val, str):
+        raise crony.errors.ConfigError(
+            f"{where}: 'notify-success-ratio' must be a string like "
+            f'"1/5", got {type(val).__name__}'
+        )
+    return _parse_success_ratio_value(val, where)
+
+
 def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
     """Parse [defaults].
 
@@ -2027,6 +2144,10 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         ),
         notify_attach_max_kb=_positive_int(
             raw, "notify-attach-max-kb", where, default=256
+        ),
+        notify_success_ratio=(
+            _parse_notify_success_ratio(raw, where, required=True)
+            or DEFAULT_SUCCESS_RATIO
         ),
         job_timeout_sec=_nonneg_int(
             raw, "job-timeout-sec", where, default=1800
@@ -2114,6 +2235,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     channels = _parse_notify_channels(raw, where, required=False)
+    success_ratio = _parse_notify_success_ratio(raw, where, required=False)
     success_exit_codes = _parse_success_exit_codes(raw, where)
     job_timeout_sec = _typed_field(raw, "job-timeout-sec", int, where)
     if job_timeout_sec is not None and job_timeout_sec < 0:
@@ -2140,6 +2262,7 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
         hosts=hosts,
         job_timeout_sec=job_timeout_sec,
         notify_channels=channels,
+        notify_success_ratio=success_ratio,
         success_exit_codes=success_exit_codes,
         env=_string_dict(raw, "env", where),
         interactive=interactive,
@@ -2202,11 +2325,13 @@ def _parse_target(
     _reject_unknown_keys(raw, _KNOWN_TARGET, where)
     jobs = _string_list(raw, "jobs", where)
     channels = _parse_notify_channels(raw, where, required=False)
+    success_ratio = _parse_notify_success_ratio(raw, where, required=False)
     return Target(
         name=name,
         kind=kind,
         jobs=jobs,
         notify_channels=channels,
+        notify_success_ratio=success_ratio,
     )
 
 

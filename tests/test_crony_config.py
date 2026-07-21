@@ -1590,6 +1590,120 @@ class TestResolution:
         assert cfg.resolved_job_timeout_sec(cfg.jobs["a"]) == 100
 
 
+class TestNotifySuccessRatio:
+    """Parsing, validation, and cascade of notify-success-ratio."""
+
+    def test_default_is_one_over_one(self) -> None:
+        cfg = _parse({"job": {"a": _job()}})
+        assert cfg.defaults.notify_success_ratio == crony_config.SuccessRatio(
+            1, 1
+        )
+        assert cfg.jobs["a"].notify_success_ratio is None
+
+    def test_defaults_parse(self) -> None:
+        cfg = _parse({"defaults": {"notify_success_ratio": "2/5"}})
+        assert cfg.defaults.notify_success_ratio == crony_config.SuccessRatio(
+            2, 5
+        )
+
+    def test_ratio_str_roundtrips(self) -> None:
+        assert str(crony_config.SuccessRatio(1, 5)) == "1/5"
+
+    def test_cascade_target_wins(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"notify_success_ratio": "1/9"},
+                "job": {"a": _job(notify_success_ratio="1/3")},
+                "target": {
+                    "darwin": {
+                        "jobs": ["a"],
+                        "notify_success_ratio": "2/7",
+                    }
+                },
+            }
+        )
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_success_ratio(
+            target, cfg.jobs["a"]
+        ) == crony_config.SuccessRatio(2, 7)
+
+    def test_cascade_job_overrides_defaults(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"notify_success_ratio": "1/9"},
+                "job": {"a": _job(notify_success_ratio="1/3")},
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_success_ratio(
+            target, cfg.jobs["a"]
+        ) == crony_config.SuccessRatio(1, 3)
+
+    def test_cascade_default_fallback(self) -> None:
+        cfg = _parse(
+            {
+                "defaults": {"notify_success_ratio": "1/4"},
+                "job": {"a": _job()},
+                "target": {"darwin": {"jobs": ["a"]}},
+            }
+        )
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_success_ratio(
+            target, cfg.jobs["a"]
+        ) == crony_config.SuccessRatio(1, 4)
+
+    def test_cascade_unset_everywhere_is_one_over_one(self) -> None:
+        cfg = _parse(
+            {"job": {"a": _job()}, "target": {"darwin": {"jobs": ["a"]}}}
+        )
+        target = cfg.resolve_target("h", "darwin")
+        assert cfg.resolved_notify_success_ratio(
+            target, cfg.jobs["a"]
+        ) == crony_config.SuccessRatio(1, 1)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "1",  # no denominator
+            "1/2/3",  # extra field
+            "a/5",  # non-integer K
+            "1/b",  # non-integer N
+            "0/5",  # K below 1
+            "3/2",  # K above N
+            "1/0",  # N below 1
+            "80%",  # percentage, not a fraction
+            "1.0/5",  # float side
+        ],
+    )
+    def test_bad_values_rejected(self, value: str) -> None:
+        with pytest.raises(ConfigError, match="notify-success-ratio"):
+            _parse({"defaults": {"notify_success_ratio": value}})
+
+    def test_window_over_max_rejected(self) -> None:
+        over = crony_config.MAX_SUCCESS_RATIO_WINDOW + 1
+        with pytest.raises(ConfigError, match="notify-success-ratio"):
+            _parse({"defaults": {"notify_success_ratio": f"1/{over}"}})
+
+    def test_window_at_max_accepted(self) -> None:
+        cap = crony_config.MAX_SUCCESS_RATIO_WINDOW
+        cfg = _parse({"defaults": {"notify_success_ratio": f"1/{cap}"}})
+        assert cfg.defaults.notify_success_ratio == crony_config.SuccessRatio(
+            1, cap
+        )
+
+    def test_non_string_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="notify-success-ratio"):
+            _parse({"defaults": {"notify_success_ratio": 5}})
+
+    def test_bad_value_on_job_errors_that_job(self) -> None:
+        _assert_errored_job(
+            {"job": {"a": _job(notify_success_ratio="3/2")}},
+            "a",
+            "notify-success-ratio",
+        )
+
+
 class TestNotifyInherit:
     """`notify_channels = ["default"]` inherit sentinel: a non-default
     bundle notifies as the default bundle would, and inherits it
@@ -1890,7 +2004,7 @@ class TestNotifyInherit:
             ),
             encoding="utf-8",
         )
-        channels, defaults = crony_notify.resolve_notify_at_runtime(
+        channels, defaults, _ = crony_notify.resolve_notify_at_runtime(
             "borgadm.check"
         )
         assert channels == ["ntfy", "dialog-popup"]
@@ -1919,12 +2033,14 @@ class TestNotifyInherit:
             ),
             encoding="utf-8",
         )
-        channels, defaults = crony_notify.resolve_notify_at_runtime(
+        channels, defaults, _ = crony_notify.resolve_notify_at_runtime(
             "borgadm.check"
         )
         assert channels == ["ntfy"]
         assert "ntfy" in defaults.notify_channel_defs
-        disabled, _ = crony_notify.resolve_notify_at_runtime("borgadm.create")
+        disabled, _, _ = crony_notify.resolve_notify_at_runtime(
+            "borgadm.create"
+        )
         assert disabled == []
 
 

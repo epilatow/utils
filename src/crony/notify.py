@@ -626,29 +626,36 @@ def expand_notify_inherit(
 
 def resolve_notify_at_runtime(
     full_name: str,
-) -> tuple[list[str], crony.config.Defaults]:
-    """Look up notify channels + bundle defaults from the live config.
+) -> tuple[list[str], crony.config.Defaults, crony.config.SuccessRatio]:
+    """Look up notify channels, bundle defaults, and the resolved
+    notify-success-ratio from the live config.
 
     Notify routing is intentionally NOT pinned in the snapshot:
-    edits to notify channels / defaults take effect on the next
-    fire without requiring a re-apply. Falls back gracefully when
-    the toml entry has been removed -- `crony status` will
+    edits to notify channels / defaults / the ratio take effect on
+    the next fire without requiring a re-apply. Falls back gracefully
+    when the toml entry has been removed -- `crony status` will
     already be surfacing the orphan, so log-only here is a
-    coherent degraded behavior.
+    coherent degraded behavior, and an orphan defaults to
+    notify-on-every-failure (SuccessRatio(1, 1)).
     """
     bn, short = crony.config.parse_full_name(full_name)
     try:
         bundles = crony.config.TomlConfig.load_all()
     except OSError, crony.errors.ConfigError, crony.errors.UsageError:
-        return [], crony.config.Defaults()
+        return [], crony.config.Defaults(), crony.config.DEFAULT_SUCCESS_RATIO
     bundle = bundles.by_name(bn)
     if bundle is None:
-        return [], crony.config.Defaults()
+        return [], crony.config.Defaults(), crony.config.DEFAULT_SUCCESS_RATIO
     config = bundle.config
     target = config.resolve_target()
     job = config.jobs.get(short)
     if job is None:
         channels = list(config.defaults.notify_channels)
+        ratio = config.defaults.notify_success_ratio
     else:
         channels = config.resolved_notify_channels(target, job)
-    return expand_notify_inherit(channels, bn, bundles, config.defaults)
+        ratio = config.resolved_notify_success_ratio(target, job)
+    expanded, defaults = expand_notify_inherit(
+        channels, bn, bundles, config.defaults
+    )
+    return expanded, defaults, ratio

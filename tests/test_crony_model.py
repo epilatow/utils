@@ -38,9 +38,12 @@ from crony.errors import (  # noqa: E402
     UsageError,
 )
 from crony.model import (  # noqa: E402
+    EXIT_HISTORY_SCHEMA,
     RUN_LOG_NAME,
     ConfigStatus,
     ExitClass,
+    ExitHistory,
+    ExitHistoryEntry,
     Graph,
     Job,
     JobGroup,
@@ -978,6 +981,95 @@ class TestJitterOffsetSeconds:
         assert _jitter_offset_seconds(
             EntityName("default", "a"), iv, "m1"
         ) != _jitter_offset_seconds(EntityName("default", "b"), iv, "m1")
+
+
+def _hist(*classes: ExitClass) -> ExitHistory:
+    """An ExitHistory from a sequence of outcome classes (oldest first)."""
+    return ExitHistory(
+        schema=EXIT_HISTORY_SCHEMA,
+        runs=[
+            ExitHistoryEntry(c, f"2026-01-01T00:0{i}")
+            for i, c in enumerate(classes)
+        ],
+    )
+
+
+class TestExitHistory:
+    def test_empty(self) -> None:
+        h = ExitHistory.empty()
+        assert h.schema == EXIT_HISTORY_SCHEMA
+        assert h.runs == []
+
+    def test_payload_roundtrips(self) -> None:
+        h = _hist(ExitClass.OK, ExitClass.FAIL, ExitClass.TIMEOUT)
+        reparsed = ExitHistory.from_raw(h.to_payload())
+        assert reparsed.runs == h.runs
+        # And survives a JSON encode/decode cycle unchanged.
+        again = ExitHistory.from_raw(json.loads(json.dumps(h.to_payload())))
+        assert again.runs == h.runs
+
+    def test_from_raw_non_dict_is_empty(self) -> None:
+        assert ExitHistory.from_raw([1, 2, 3]).runs == []
+        assert ExitHistory.from_raw("nope").runs == []
+
+    def test_from_raw_wrong_schema_is_empty(self) -> None:
+        payload = _hist(ExitClass.OK).to_payload()
+        payload["schema"] = EXIT_HISTORY_SCHEMA + 1
+        assert ExitHistory.from_raw(payload).runs == []
+
+    def test_from_raw_runs_not_list_is_empty(self) -> None:
+        assert (
+            ExitHistory.from_raw(
+                {"schema": EXIT_HISTORY_SCHEMA, "runs": "x"}
+            ).runs
+            == []
+        )
+
+    def test_from_raw_drops_bad_entries(self) -> None:
+        payload = {
+            "schema": EXIT_HISTORY_SCHEMA,
+            "runs": [
+                {"exit_class": "ok", "ended_at": "t0"},
+                {"exit_class": "bogus", "ended_at": "t1"},  # unknown class
+                {"exit_class": "fail"},  # missing ended_at
+                "not-a-dict",
+                {"exit_class": "timeout", "ended_at": "t2"},
+            ],
+        }
+        h = ExitHistory.from_raw(payload)
+        assert [e.exit_class for e in h.runs] == [
+            ExitClass.OK,
+            ExitClass.TIMEOUT,
+        ]
+
+    def test_successes_all_padding_when_empty(self) -> None:
+        assert ExitHistory.empty().successes_in_window(5) == 5
+
+    def test_successes_partial_window_pads(self) -> None:
+        # One failure on record, window 5: 0 real successes + 4 padding.
+        assert _hist(ExitClass.FAIL).successes_in_window(5) == 4
+        # ok, fail, fail: 1 real success + 2 padding.
+        assert (
+            _hist(
+                ExitClass.OK, ExitClass.FAIL, ExitClass.FAIL
+            ).successes_in_window(5)
+            == 3
+        )
+
+    def test_successes_full_window_all_fail(self) -> None:
+        h = _hist(*([ExitClass.FAIL] * 5))
+        assert h.successes_in_window(5) == 0
+
+    def test_successes_slides_past_window(self) -> None:
+        # An old success followed by five failures: the success has
+        # slid out of the 5-run window, so it counts 0.
+        h = _hist(ExitClass.OK, *([ExitClass.FAIL] * 5))
+        assert h.successes_in_window(5) == 0
+
+    def test_successes_counts_only_ok(self) -> None:
+        # timeout / signal are failures for the ratio, like fail.
+        h = _hist(ExitClass.TIMEOUT, ExitClass.SIGNAL)
+        assert h.successes_in_window(2) == 0
 
 
 if __name__ == "__main__":
