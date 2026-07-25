@@ -33,7 +33,7 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import pandoc  # noqa: E402  (import after the src/ path insert above)
+import pandoc  # noqa: E402
 
 _script_path = REPO_ROOT / "src" / "pandoc.py"
 

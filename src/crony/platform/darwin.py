@@ -93,7 +93,9 @@ class DarwinHost(HostPlatform):
             argv.extend(["-a", account])
         argv.append("-w")
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                argv, capture_output=True, text=True, timeout=5, check=False
+            )
         except FileNotFoundError, subprocess.TimeoutExpired:
             return None
         if r.returncode == 0:

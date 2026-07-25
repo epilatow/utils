@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from common.crony_automate import CronyAutomation  # noqa: E402
+from common.crony_automate import CronyAutomation
 
 _NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "test-crony-automate")
 
@@ -205,7 +205,10 @@ class TestApply:
         d, dropin, _ = driver
         with (
             patch.object(
-                d, "crony_path", autospec=True, side_effect=StubError("missing")
+                d,
+                "crony_path",
+                autospec=True,
+                side_effect=StubError("missing"),
             ),
             pytest.raises(StubError, match="missing"),
         ):

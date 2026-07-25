@@ -1497,7 +1497,7 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
 
     PARSER_FUNC = staticmethod(sa.build_parser)
-    CASES = [
+    CASES: ClassVar = [
         (["create", "--bogus"], "create"),
         (["config", "validate", "--bogus"], "config validate"),
         (["config", "init", "--bogus"], "config init"),
@@ -1515,7 +1515,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(sa.cli)
     EXIT_CODE_USAGE = sa.ExitCode.USAGE
     TEST_SUBCOMMAND = "create"
-    EXCEPTION_EXIT_CODE_MAP = [
+    EXCEPTION_EXIT_CODE_MAP: ClassVar = [
         (sa.UsageError("t"), sa.ExitCode.USAGE),
         (sa.ConfigError("t"), sa.ExitCode.CONFIG),
         (sa.NotFoundError("t"), sa.ExitCode.NOT_FOUND),
@@ -2195,7 +2195,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
 
     BASE_ERROR = sa.SecureArchiverError
     EXIT_CODE = sa.ExitCode
-    EXCLUDED_CODES = {
+    EXCLUDED_CODES: ClassVar = {
         sa.ExitCode.SUCCESS,
         sa.ExitCode.WARNING,
         sa.ExitCode.CRASHED,
@@ -2216,7 +2216,7 @@ class TestAutomate(CronyAutomateBase):
     BUNDLE = "secure-archiver"
     ERROR = sa.SecureArchiverError
     CRONY_PARSER = staticmethod(crony_cli._build_parser)
-    EXPECTED_VERBS = {"apply", "status", "destroy"}
+    EXPECTED_VERBS: ClassVar = {"apply", "status", "destroy"}
 
     def apply(self, *, config_only: bool) -> None:
         sa.do_automate_apply(config_only=config_only)

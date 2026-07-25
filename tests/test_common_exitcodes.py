@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "common" / "exitcodes.py"

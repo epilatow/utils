@@ -48,7 +48,7 @@ if hasattr(signal, "SIGPIPE"):
 
 from collections import OrderedDict
 from collections.abc import Callable, Collection
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -63,23 +63,23 @@ from typing import (
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import crony.unit  # noqa: E402
-from common.argparse_ext import (  # noqa: E402
+import crony.unit
+from common.argparse_ext import (
     DefaultsHelpFormatter,
     RawDescriptionDefaultsHelpFormatter,
     SingleUseBooleanOptionalAction,
     StrictArgumentParser,
     add_argument_ext,
 )
-from common.cli import cli_entrypoint  # noqa: E402
-from common.crony_automate import CronyAutomation  # noqa: E402
-from common.docspec import (  # noqa: E402
+from common.cli import cli_entrypoint
+from common.crony_automate import CronyAutomation
+from common.docspec import (
     ItemsSection,
     ManSpec,
     TextSection,
 )
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
-from common.helpref import (  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase
+from common.helpref import (
     ReferenceSection,
     reference_section_text,
 )
@@ -164,7 +164,9 @@ class CheckPruneError(BorgadmError):
 
 _borg_env_initialized: bool = False  # Ensures env is only initialized once
 _warning_occurred: bool = False
-_hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(mode="w+")
+_hostkey_file: typing.IO[str] = tempfile.NamedTemporaryFile(  # noqa: SIM115
+    mode="w+"
+)
 _ssh_agent_pid: str | None = None
 _start_time: float = time.perf_counter()
 
@@ -558,7 +560,8 @@ class BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
                 self.stream.close()
             except BrokenPipeError, OSError:
                 pass
-            self.stream = open(os.devnull, "w")
+            # The logging handler owns this replacement stream.
+            self.stream = open(os.devnull, "w")  # noqa: SIM115
             return
         super().handleError(record)
 
@@ -975,7 +978,7 @@ def stop_ssh_agent() -> None:
         logger.debug("Stopping SSH agent.")
         try:
             run_cmd(["kill", _ssh_agent_pid])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - atexit cleanup is best-effort
             logger.warning(f"Failed to kill SSH agent: {e}")
         _ssh_agent_pid = None
 
@@ -1315,16 +1318,16 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
         ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
         for ts in sorted(timestamps - set(ts_keep.keys())):
             assert ts not in ts_keep
-            dt: datetime = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+            dt: datetime = datetime.strptime(  # noqa: DTZ007
+                ts, "%Y%m%d_%H%M%S"
+            )
             if last is None or (dt - last) >= interval.timedelta():
                 last = dt
                 ts_keep_new[ts] = str(interval)
         ts_latest = ts
 
-        i: int = 0
-        for ts in sorted(ts_keep_new.keys(), reverse=True):
+        for i, ts in enumerate(sorted(ts_keep_new.keys(), reverse=True)):
             ts_keep_new[ts] = ts_keep_new[ts] + f"-{i}"
-            i += 1
 
         logger.debug(
             "interval=%s, keep=%s, len=%s, ts=%s",
@@ -1871,10 +1874,11 @@ def do_check_age(bypass_lock: bool) -> None:
     if not backups:
         raise CheckNoBackupsError("No full backups found.")
     assert len(backups.keys()) == 1, backups
-    latest = list(backups.keys())[0]
+    latest = next(iter(backups.keys()))
 
-    ts = datetime.strptime(latest, "%Y%m%d_%H%M%S")
-    age = int((datetime.now() - ts).total_seconds())
+    # Archive names are local wall-clock keys, not timezone-aware instants.
+    ts = datetime.strptime(latest, "%Y%m%d_%H%M%S")  # noqa: DTZ007
+    age = int((datetime.now() - ts).total_seconds())  # noqa: DTZ005
     if age > seconds:
         raise CheckAgeError(
             f"Latest full backup ({latest}) is too old:"
@@ -2031,7 +2035,9 @@ def do_check_archives(
         if not backups:
             raise CheckNoBackupsError("No full backups found.")
         assert len(backups.keys()) == 1
-        _check_archive_targets(list(backups.values())[0], progress, bypass_lock)
+        _check_archive_targets(
+            next(iter(backups.values())), progress, bypass_lock
+        )
     else:
         logger.info("Checking archive metadata.")
         cmd = _borg_check_cmd(
@@ -2054,7 +2060,7 @@ def do_check_prune(bypass_lock: bool) -> None:
 
     partial_backups = list_backups(partial=True, bypass_lock=bypass_lock)
     if partial_backups:
-        for _ts, archives in partial_backups.items():
+        for archives in partial_backups.values():
             names = [a.removeprefix(f"{cfg.BORG_REPO}::") for a in archives]
             problems.append(f"Partial archive(s): {', '.join(names)}")
 
@@ -2158,7 +2164,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
     for set_name in cfg.BACKUP_SETS:
         backup_set_tests(set_name)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(tz=UTC).astimezone().strftime("%Y%m%d_%H%M%S")
     # NofM suffix: M is the count of configured sets; N is the 1-based
     # position of the current set among the sorted dict keys. Sorting
     # the keys means two configs with the same set names produce
@@ -2244,7 +2250,7 @@ def do_delete(
         backups = list_backups(latest=True)
         if not backups:
             raise BorgadmError("No full backups found.")
-        ts = list(backups.keys())[0]
+        ts = next(iter(backups.keys()))
         archives_to_delete = [
             a.removeprefix(f"{cfg.BORG_REPO}::") for a in backups[ts]
         ]

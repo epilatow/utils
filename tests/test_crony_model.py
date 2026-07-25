@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from conftest_crony import (  # noqa: E402
     _assert_errored_job,
     _assert_errored_job_group,
-    _isolate_home,  # noqa: E402, F401
+    _isolate_home,  # noqa: F401
     _job,
     _parse,
     _resolve_snapshot_for,

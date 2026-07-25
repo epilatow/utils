@@ -48,12 +48,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
+from common.argparse_ext import (
     RawDescriptionDefaultsHelpFormatter,
 )
-from common.cli import cli_entrypoint  # noqa: E402
-from common.docspec import ManSpec, TextSection  # noqa: E402
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.cli import cli_entrypoint
+from common.docspec import ManSpec, TextSection
+from common.exitcodes import CommonExitCode, ExitCodeBase
 
 # Configure logging to stderr so notification output (decision /
 # action) stays in stdout when piped.
@@ -130,6 +130,7 @@ def _uea_aqua_pid() -> int | None:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         return None
@@ -146,15 +147,16 @@ def _uea_aqua_pid() -> int | None:
 def _process_start_epoch(pid: int) -> float:
     """Return start time (epoch seconds) of `pid` via `ps -o lstart=`.
 
-    `ps` prints lstart in the *current* local timezone. The
-    returned naive datetime is then converted with `.timestamp()`,
-    which interprets it in the current local zone -- so the
-    round-trip gives an epoch consistent with `_tz_mtime`.
+    `ps` prints lstart in the *current* local timezone. Attach that
+    local zone to the returned naive datetime before converting it
+    with `.timestamp()`, so the round-trip gives an epoch consistent
+    with `_tz_mtime`.
     """
     proc = subprocess.run(
         ["ps", "-p", str(pid), "-o", "lstart="],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         raise WatchdogError(f"ps failed for pid {pid}: {proc.stderr.strip()!r}")
@@ -162,12 +164,12 @@ def _process_start_epoch(pid: int) -> float:
     if not line:
         raise WatchdogError(f"ps returned no lstart for pid {pid}")
     try:
-        naive = datetime.datetime.strptime(line, PS_LSTART_FORMAT)
+        local = datetime.datetime.strptime(line, PS_LSTART_FORMAT).astimezone()
     except ValueError as exc:
         raise WatchdogError(
             f"unrecognised lstart format {line!r}: {exc}"
         ) from exc
-    return naive.timestamp()
+    return local.timestamp()
 
 
 def _restart_uea_aqua(pid: int) -> None:
@@ -200,7 +202,8 @@ def _restart_uea_aqua(pid: int) -> None:
 def _format_epoch(epoch: float) -> str:
     """Format an epoch as local time for human-readable diagnostics."""
     return (
-        datetime.datetime.fromtimestamp(epoch)
+        datetime.datetime.fromtimestamp(epoch, tz=datetime.UTC)
+        .astimezone()
         .strftime("%Y-%m-%d %H:%M:%S %Z")
         .rstrip()
     )

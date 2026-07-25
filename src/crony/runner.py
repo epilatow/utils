@@ -546,7 +546,8 @@ def _run_job(snap: crony.model.Job) -> int:
             # a later write to this run.
             (sd / "killed.flag").unlink(missing_ok=True)
 
-            log_file = open(log_path, "ab", buffering=0)
+            # The surrounding result-recording block closes this in finally.
+            log_file = open(log_path, "ab", buffering=0)  # noqa: SIM115
             try:
                 timeout_label = (
                     "none" if snap.timeout == 0 else f"{snap.timeout}s"
@@ -569,6 +570,7 @@ def _run_job(snap: crony.model.Job) -> int:
                             stderr=subprocess.STDOUT,
                             env=env,
                             timeout=30,
+                            check=False,
                         )
                         gate_rc = gate_proc.returncode
                     except subprocess.TimeoutExpired:
@@ -880,7 +882,8 @@ def _run_group(snap: crony.model.JobGroup) -> int:
             # cannot mislabel a later crash as a timeout (see `_run_job`).
             (sd / "killed.flag").unlink(missing_ok=True)
 
-            log_file = open(log_path, "ab", buffering=0)
+            # The surrounding group-recording block closes this in finally.
+            log_file = open(log_path, "ab", buffering=0)  # noqa: SIM115
             children: list[crony.model.GroupChildResult] = []
             # The group's OWN faults -- the children it could not run.
             # A child that ran and failed is the child's problem and is

@@ -54,7 +54,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.platform import current_platform  # noqa: E402
+from crony.platform import current_platform
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "bin" / "crony"
@@ -83,6 +83,7 @@ def _user_systemd_up() -> bool:
                 ["systemctl", "--user", "show-environment"],
                 capture_output=True,
                 timeout=10,
+                check=False,
             ).returncode
             == 0
         )
@@ -103,6 +104,7 @@ def _launchd_usable() -> bool:
                 ["launchctl", "print", f"gui/{os.getuid()}"],
                 capture_output=True,
                 timeout=10,
+                check=False,
             ).returncode
             == 0
         )
@@ -223,6 +225,7 @@ class _CronyE2E:
                 ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
                 capture_output=True,
                 text=True,
+                check=False,
             ).returncode
             == 0
         )

@@ -23,8 +23,8 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import crony.platform.fda as fda  # noqa: E402
 from crony.errors import PreconditionError  # noqa: E402
+from crony.platform import fda  # noqa: E402
 
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "fda.py"
 
@@ -240,7 +240,7 @@ class TestBuildWrapper:
     ) -> None:
         _src, _binary, hash_file = env
 
-        def fail(*_a: object, **_k: object) -> Any:  # noqa: ANN401
+        def fail(*_a: object, **_k: object) -> Any:
             return subprocess.CompletedProcess(
                 args=[], returncode=1, stderr="boom"
             )
@@ -313,6 +313,7 @@ class TestWrapperBinary:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0, f"compile failed: {result.stderr}"
 
@@ -350,13 +351,14 @@ class TestWrapperBinary:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
 
     def test_compiles_to_macho(self, tree: tuple[Path, Path, Path]) -> None:
         binary, _, _ = tree
         out = subprocess.run(
-            ["file", str(binary)], capture_output=True, text=True
+            ["file", str(binary)], capture_output=True, text=True, check=False
         ).stdout
         assert "Mach-O" in out
 
@@ -369,6 +371,7 @@ class TestWrapperBinary:
             capture_output=True,
             text=True,
             env={**os.environ, "HOME": str(fake_home)},
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         assert (mock_cmd.parent / "args.txt").read_text().strip() == (
@@ -384,6 +387,7 @@ class TestWrapperBinary:
             capture_output=True,
             text=True,
             env={**os.environ, "HOME": str(fake_home)},
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         # The single command invocation runs inside the disclaimed
@@ -404,6 +408,7 @@ class TestWrapperBinary:
                 "HOME": str(fake_home),
                 "CRONY_FDA_DISCLAIMED": "1",
             },
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         calls = (mock_cmd.parent / "calls.txt").read_text().splitlines()
@@ -418,6 +423,7 @@ class TestWrapperBinary:
             capture_output=True,
             text=True,
             env={**os.environ, "HOME": str(fake_home)},
+            check=False,
         )
         # Granted (no TCC dir -> indeterminate -> proceed) exits 0 and
         # runs no command.
@@ -437,6 +443,7 @@ class TestWrapperBinary:
                 capture_output=True,
                 text=True,
                 env={**os.environ, "HOME": str(fake_home)},
+                check=False,
             )
         finally:
             tcc.chmod(0o700)
@@ -456,6 +463,7 @@ class TestWrapperBinary:
                 capture_output=True,
                 text=True,
                 env={**os.environ, "HOME": str(fake_home)},
+                check=False,
             )
         finally:
             tcc.chmod(0o700)
@@ -508,6 +516,7 @@ class TestWrapperBinary:
             capture_output=True,
             text=True,
             env={**os.environ, "HOME": str(fake_home)},
+            check=False,
         )
         assert result.returncode != 0
 
@@ -520,6 +529,7 @@ class TestWrapperBinary:
             capture_output=True,
             text=True,
             env={**os.environ, "HOME": str(fake_home)},
+            check=False,
         )
         assert result.returncode != 0
         assert "no command" in result.stderr
@@ -556,7 +566,7 @@ class TestBuildWrapperDarwin:
         binary = bundle / "Contents" / "MacOS" / "Crony"
         assert binary.exists()
         out = subprocess.run(
-            ["file", str(binary)], capture_output=True, text=True
+            ["file", str(binary)], capture_output=True, text=True, check=False
         ).stdout
         assert "Mach-O" in out
         # The build leaves a current binary: _needs_rebuild is satisfied

@@ -87,7 +87,7 @@ class CronyAutomateBase:
         """Drive any additional handler that shells out to crony (beyond
         apply / status / destroy) so the argv gate covers it. Default
         none; the bundle is present when this runs (destroy comes last)."""
-        return None
+        return
 
     @contextlib.contextmanager
     def _automate_ctx(

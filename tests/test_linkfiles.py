@@ -18,7 +18,7 @@ discovery rules (ignore files, dotfile-skipping), and per-record install
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from conftest import (
@@ -1205,7 +1205,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(lf.cli)
     EXIT_CODE_USAGE = lf.ExitCode.USAGE
     TEST_SUBCOMMAND = "audit"
-    EXCEPTION_EXIT_CODE_MAP = [
+    EXCEPTION_EXIT_CODE_MAP: ClassVar = [
         (lf.ConflictsFound("t"), lf.ExitCode.CONFLICTS),
         (lf.UsageError("t"), lf.ExitCode.USAGE),
         (lf.LinkfilesError("t"), lf.ExitCode.ERROR),
@@ -1216,7 +1216,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
 class TestExceptionHierarchy(ExceptionHierarchyBase):
     BASE_ERROR = lf.LinkfilesError
     EXIT_CODE = lf.ExitCode
-    EXCLUDED_CODES = {
+    EXCLUDED_CODES: ClassVar = {
         lf.ExitCode.SUCCESS,
         lf.ExitCode.WARNING,
         lf.ExitCode.CONFIG,

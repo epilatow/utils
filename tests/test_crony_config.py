@@ -26,7 +26,7 @@ from conftest_crony import (  # noqa: E402
     _bundle_set,
     _email_block,
     _inject_uuids,
-    _isolate_home,  # noqa: E402, F401
+    _isolate_home,  # noqa: F401
     _job,
     _ntfy_block,
     _parse,

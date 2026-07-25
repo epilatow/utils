@@ -23,10 +23,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import crony.platform.fda as fda  # noqa: E402
-from crony.errors import PreconditionError  # noqa: E402
-from crony.platform import DarwinHost, PidWait  # noqa: E402
-from crony.platform.fda import FDAWrapper  # noqa: E402
+from crony.errors import PreconditionError
+from crony.platform import (
+    DarwinHost,
+    PidWait,
+    fda,
+)
+from crony.platform.fda import FDAWrapper
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "darwin.py"

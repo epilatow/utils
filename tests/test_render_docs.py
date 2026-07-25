@@ -40,7 +40,7 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import render_docs  # noqa: E402  (import after the src/ path insert above)
+import render_docs  # noqa: E402
 from common.argparse_ext import add_argument_ext  # noqa: E402
 from common.docspec import (  # noqa: E402
     ItemListsSection,

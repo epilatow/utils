@@ -1395,42 +1395,54 @@ class JobStatus(_DescribedStrEnum):
 
     OK = (
         ExitClass.OK,
-        "Jobs and groups. The job's last run completed successfully. For "
-        "a job group: the group got every child it was asked to run "
-        "running (a disabled child is skipped, not run) -- whatever those "
-        "children then did is reported on their own rows, and a failing "
-        "child does not fail its group.",
+        (
+            "Jobs and groups. The job's last run completed successfully. For "
+            "a job group: the group got every child it was asked to run "
+            "running (a disabled child is skipped, not run) -- whatever those "
+            "children then did is reported on their own rows, and a failing "
+            "child does not fail its group."
+        ),
     )
     FAIL = (
         ExitClass.FAIL,
-        "Jobs and groups. The job's last run failed (exited with a "
-        "non-zero status). For a job group: the group could not fire one "
-        "of its children -- that child's unit or snapshot is missing on "
-        "this host, or the scheduler refused to fire it.",
+        (
+            "Jobs and groups. The job's last run failed (exited with a "
+            "non-zero status). For a job group: the group could not fire one "
+            "of its children -- that child's unit or snapshot is missing on "
+            "this host, or the scheduler refused to fire it."
+        ),
     )
     TIMEOUT = (
         ExitClass.TIMEOUT,
-        "Jobs and groups. The job was killed after exceeding its "
-        "wallclock execution timeout. For a job group: the group ran out "
-        "of time on a child before it ever saw it running -- its "
-        "cumulative budget was spent, or the scheduler never started the "
-        "child.",
+        (
+            "Jobs and groups. The job was killed after exceeding its "
+            "wallclock execution timeout. For a job group: the group ran out "
+            "of time on a child before it ever saw it running -- its "
+            "cumulative budget was spent, or the scheduler never started the "
+            "child."
+        ),
     )
     GATED = (
         ExitClass.GATED,
-        "Jobs only. The job was skipped due to an execution gate. This is "
-        "not considered as a job failure.",
+        (
+            "Jobs only. The job was skipped due to an execution gate. This is "
+            "not considered as a job failure."
+        ),
     )
     CANCELED = (
         ExitClass.CANCELED,
-        "Jobs and groups. A run canceled or skipped before its command "
-        "ran -- for an interactive job, one the user declined.",
+        (
+            "Jobs and groups. A run canceled or skipped before its command "
+            "ran -- for an interactive job, one the user declined."
+        ),
     )
     CRASHED = (
         "crashed",
-        "Jobs and groups. The scheduler failed to launch the job or "
-        "group, or it was killed/crashed before it could save its exit "
-        "status to disk.",
+        (
+            "Jobs and groups. The scheduler failed to launch the job or "
+            "group, or it was killed/crashed before it could save its exit "
+            "status to disk."
+        ),
     )
     RUNNING = (
         "running",
@@ -1438,14 +1450,18 @@ class JobStatus(_DescribedStrEnum):
     )
     PENDING = (
         "pending",
-        "Jobs only. An interactive job is either waiting for an active "
-        "user, or waiting for that user to confirm execution (via a "
-        "pop-up dialog).",
+        (
+            "Jobs only. An interactive job is either waiting for an active "
+            "user, or waiting for that user to confirm execution (via a "
+            "pop-up dialog)."
+        ),
     )
     NEVER = (
         "never",
-        "Jobs and groups. A newly deployed job or group that hasn't been "
-        "run yet.",
+        (
+            "Jobs and groups. A newly deployed job or group that hasn't been "
+            "run yet."
+        ),
     )
     UNKNOWN = (
         "unknown",
@@ -1467,14 +1483,18 @@ class ConfigStatus(_DescribedStrEnum):
     SYNCED = "synced", "A deployed job's configuration is up-to-date."
     STALE = (
         "stale",
-        "A deployed job's configuration has diverged from its "
-        "configuration file definition, but the job is still runnable. "
-        "Run `apply` to update the deployed configuration.",
+        (
+            "A deployed job's configuration has diverged from its "
+            "configuration file definition, but the job is still runnable. "
+            "Run `apply` to update the deployed configuration."
+        ),
     )
     BROKEN = (
         "broken",
-        "A deployed job's configuration is broken and un-runnable. Run "
-        "`apply` to fix the deployed configuration.",
+        (
+            "A deployed job's configuration is broken and un-runnable. Run "
+            "`apply` to fix the deployed configuration."
+        ),
     )
     MISSING = (
         "missing",
@@ -1482,26 +1502,32 @@ class ConfigStatus(_DescribedStrEnum):
     )
     ORPHAN = (
         "orphan",
-        "A deployed job (or some job-related resource) is not defined in "
-        "any configuration file. Run `destroy --orphans` to clean up the "
-        "deployed configuration.",
+        (
+            "A deployed job (or some job-related resource) is not defined in "
+            "any configuration file. Run `destroy --orphans` to clean up the "
+            "deployed configuration."
+        ),
     )
     MASKED = (
         "masked",
-        "A job can't be deployed on the current host due to "
-        "configuration filters (usually a mismatched `platform` or "
-        "`host` directive).",
+        (
+            "A job can't be deployed on the current host due to "
+            "configuration filters (usually a mismatched `platform` or "
+            "`host` directive)."
+        ),
     )
     ERROR = (
         "error",
-        "The job configuration file definition (i.e. the pending or "
-        "requested configuration) is broken, or its dependencies can't "
-        "be met (e.g. full-disk-access has been requested on "
-        "macOS/darwin, but the Crony.app wrapper doesn't have "
-        "full-disk-access). If the job was previously deployed, it will "
-        "continue to run and can be managed, but the deployed "
-        "configuration can't be updated with `apply` until the pending "
-        "configuration issue is fixed.",
+        (
+            "The job configuration file definition (i.e. the pending or "
+            "requested configuration) is broken, or its dependencies can't "
+            "be met (e.g. full-disk-access has been requested on "
+            "macOS/darwin, but the Crony.app wrapper doesn't have "
+            "full-disk-access). If the job was previously deployed, it will "
+            "continue to run and can be managed, but the deployed "
+            "configuration can't be updated with `apply` until the pending "
+            "configuration issue is fixed."
+        ),
     )
 
 
@@ -1524,21 +1550,27 @@ class ScheduleValue(_DescribedStrEnum):
     )
     GROUPED = (
         "grouped",
-        "A job/group with no schedule of its own, it runs when triggered "
-        "by a parent job group.",
+        (
+            "A job/group with no schedule of its own, it runs when triggered "
+            "by a parent job group."
+        ),
     )
     ON_DEMAND = (
         "on-demand",
-        "A trigger-only job/group (on-demand = true) with no schedule of "
-        "its own and no scheduled parent. It runs only when run manually "
-        "via the `trigger` subcommand.",
+        (
+            "A trigger-only job/group (on-demand = true) with no schedule of "
+            "its own and no scheduled parent. It runs only when run manually "
+            "via the `trigger` subcommand."
+        ),
     )
     DISABLED = (
         "disabled",
-        "A job that has been disabled via the `disable` subcommand; it "
-        "will not be run via any schedule. It can be run manually via the "
-        "`trigger` subcommand, and re-enabled via the `enable` "
-        "subcommand.",
+        (
+            "A job that has been disabled via the `disable` subcommand; it "
+            "will not be run via any schedule. It can be run manually via the "
+            "`trigger` subcommand, and re-enabled via the `enable` "
+            "subcommand."
+        ),
     )
 
 

@@ -194,6 +194,7 @@ def _probe_fda() -> bool:
         [str(wrapper_binary()), _CHECK_FDA_FLAG],
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0
 
@@ -213,7 +214,7 @@ def grant_instructions() -> str:
 def _run_build_step(cmd: list[str], what: str) -> None:
     """Run a build subprocess, surfacing failures as a crony error with
     the tool's stderr rather than an uncaught CalledProcessError."""
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise crony.errors.PreconditionError(
             f"failed to {what} (exit {result.returncode}):\n"

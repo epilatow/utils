@@ -35,7 +35,7 @@ from conftest_crony import (  # noqa: E402
     _cast_dict,
     _email_block,
     _idle_lock_host,
-    _isolate_home,  # noqa: E402, F401
+    _isolate_home,  # noqa: F401
     _ntfy_block,
     _parse,
     _RunnerHarness,
@@ -856,14 +856,13 @@ class TestApplyFullSync:
         h = _ApplyHarness(tmp_path, monkeypatch)
         orphan_dir = h.fabricate_orphan("busy")
         h.config({}, default_target_jobs=[])
-        held = open(orphan_dir / "run.lock", "w")
-        try:
-            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
-            assert orphan_dir.exists()
-        finally:
-            _fcntl.flock(held, _fcntl.LOCK_UN)
-            held.close()
+        with open(orphan_dir / "run.lock", "w") as held:
+            try:
+                _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+                assert orphan_dir.exists()
+            finally:
+                _fcntl.flock(held, _fcntl.LOCK_UN)
 
     def test_uuid_edit_surgical_apply_removes_old_residue(
         self, tmp_path: Path, monkeypatch: Any
@@ -1504,20 +1503,19 @@ class TestDestroy:
         sd = h.state_dir("j")
         sd.mkdir(parents=True, exist_ok=True)
         lock_path = sd / "run.lock"
-        held = open(lock_path, "w")
-        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        try:
-            with pytest.raises(LockBusyError) as exc:
-                crony_commands.do_destroy(
-                    jobs=["j"],
-                    bundle=None,
-                    orphans=False,
-                )
-            assert "run in progress; will not destroy" in str(exc.value)
-            assert exc.value.exit_code == ExitCode.LOCK_BUSY
-        finally:
-            _fcntl.flock(held, _fcntl.LOCK_UN)
-            held.close()
+        with open(lock_path, "w") as held:
+            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            try:
+                with pytest.raises(LockBusyError) as exc:
+                    crony_commands.do_destroy(
+                        jobs=["j"],
+                        bundle=None,
+                        orphans=False,
+                    )
+                assert "run in progress; will not destroy" in str(exc.value)
+                assert exc.value.exit_code == ExitCode.LOCK_BUSY
+            finally:
+                _fcntl.flock(held, _fcntl.LOCK_UN)
 
     def test_destroy_finds_units_with_no_state(
         self, tmp_path: Path, monkeypatch: Any
@@ -6098,18 +6096,17 @@ class TestDestroyByEntityRef:
         sd = h.state / DEFAULT_BUNDLE_NAME / ghost_uuid
         sd.mkdir(parents=True)
         lock = sd / "run.lock"
-        held = open(lock, "w")
-        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        try:
-            h.config({}, default_target_jobs=[])
-            ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
-            with pytest.raises(LockBusyError, match="run in progress"):
-                crony_commands.do_destroy(
-                    jobs=[ref_input], bundle=None, orphans=False
-                )
-        finally:
-            _fcntl.flock(held, _fcntl.LOCK_UN)
-            held.close()
+        with open(lock, "w") as held:
+            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            try:
+                h.config({}, default_target_jobs=[])
+                ref_input = f"{DEFAULT_BUNDLE_NAME}:{ghost_uuid}"
+                with pytest.raises(LockBusyError, match="run in progress"):
+                    crony_commands.do_destroy(
+                        jobs=[ref_input], bundle=None, orphans=False
+                    )
+            finally:
+                _fcntl.flock(held, _fcntl.LOCK_UN)
         # State dir survived because the destroy refused.
         assert sd.exists()
 

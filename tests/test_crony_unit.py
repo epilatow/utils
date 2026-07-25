@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.unit import (  # noqa: E402
+from crony.unit import (
     ON_DEMAND_SPEC,
     EntityName,
     EntityRef,

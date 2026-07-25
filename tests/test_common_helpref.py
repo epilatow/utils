@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from common.helpref import (  # noqa: E402
+from common.helpref import (
     ReferenceSection,
     definition_list,
     reference_section_text,
@@ -25,8 +25,10 @@ _ITEMS = [
     ("alpha", "Short description."),
     (
         "beta-longer",
-        "A description long enough that it must wrap onto a "
-        "second line when rendered at a narrow width.",
+        (
+            "A description long enough that it must wrap onto a "
+            "second line when rendered at a narrow width."
+        ),
     ),
 ]
 

@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from conftest_crony import (  # noqa: E402
     _email_block,
-    _isolate_home,  # noqa: E402, F401
+    _isolate_home,  # noqa: F401
     _job,
     _parse,
     _RunnerHarness,
@@ -390,7 +390,7 @@ class TestNtfyNotify:
             def __enter__(self_inner: Any) -> Any:
                 return self_inner
 
-            def __exit__(self_inner: Any, *a: Any) -> None:
+            def __exit__(self_inner: Any, *a: object) -> None:
                 return None
 
         def _fake_urlopen(req: Any, **_kwargs: object) -> Any:
@@ -451,7 +451,7 @@ class TestNtfyNotify:
             def __enter__(self_inner: Any) -> Any:
                 return self_inner
 
-            def __exit__(self_inner: Any, *a: Any) -> None:
+            def __exit__(self_inner: Any, *a: object) -> None:
                 return None
 
         def _fake(req: Any, **_kwargs: object) -> Any:
@@ -488,7 +488,7 @@ class TestNtfyNotify:
             def __enter__(self_inner: Any) -> Any:
                 return self_inner
 
-            def __exit__(self_inner: Any, *a: Any) -> None:
+            def __exit__(self_inner: Any, *a: object) -> None:
                 return None
 
         def _fake(req: Any, **_kwargs: object) -> Any:
@@ -547,7 +547,7 @@ class TestNtfyNotify:
             def __enter__(self_inner: Any) -> Any:
                 return self_inner
 
-            def __exit__(self_inner: Any, *a: Any) -> None:
+            def __exit__(self_inner: Any, *a: object) -> None:
                 return None
 
         def _fake(req: Any, **_kwargs: object) -> Any:
@@ -617,7 +617,7 @@ class TestNtfyNotify:
             def __enter__(self_inner: Any) -> Any:
                 return self_inner
 
-            def __exit__(self_inner: Any, *a: Any) -> None:
+            def __exit__(self_inner: Any, *a: object) -> None:
                 return None
 
         def _fake_urlopen(req: Any, **_kwargs: object) -> Any:

@@ -38,19 +38,19 @@ import tomlkit
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
+from common.argparse_ext import (
     RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
     add_argument_ext,
 )
-from common.cli import cli_entrypoint  # noqa: E402
-from common.crony_automate import CronyAutomation  # noqa: E402
-from common.docspec import (  # noqa: E402
+from common.cli import cli_entrypoint
+from common.crony_automate import CronyAutomation
+from common.docspec import (
     ItemsSection,
     ManSpec,
     TextSection,
 )
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase
 
 # =============================================================================
 # ARCHIVE DESIGN
@@ -194,10 +194,9 @@ class GeneralConfig:
             keep_revisions = 3
 
         readme = d.get("readme")
-        if readme is not None:
-            if not isinstance(readme, str):
-                errors.append("general.readme must be a string")
-                readme = None
+        if readme is not None and not isinstance(readme, str):
+            errors.append("general.readme must be a string")
+            readme = None
 
         if errors:
             return None
@@ -712,7 +711,7 @@ TS_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
 def timestamp_now() -> str:
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return dt.datetime.now(tz=dt.UTC).astimezone().strftime("%Y%m%d_%H%M%S")
 
 
 def list_archives(out_dir: Path, archive_name: str) -> list[Path]:
@@ -1378,7 +1377,10 @@ def build_parser() -> StrictArgumentParser:
         ),
     )
     for automate_p, config_only_help in (
-        (automate_apply_parser, "only write the bundle file; skip crony apply"),
+        (
+            automate_apply_parser,
+            "only write the bundle file; skip crony apply",
+        ),
         (
             automate_status_parser,
             "only check the bundle file; skip crony status",
@@ -1527,13 +1529,17 @@ MAN_SPEC = ManSpec(
             [
                 (
                     "./secure-archiver.toml",
-                    "Config file used when --config is omitted and present "
-                    "in the current directory.",
+                    (
+                        "Config file used when --config is omitted and present "
+                        "in the current directory."
+                    ),
                 ),
                 (
                     "~/.secure-archiver.toml",
-                    "Config file used when --config is omitted and no "
-                    "secure-archiver.toml exists in the current directory.",
+                    (
+                        "Config file used when --config is omitted and no "
+                        "secure-archiver.toml exists in the current directory."
+                    ),
                 ),
             ],
         ),

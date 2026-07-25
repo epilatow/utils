@@ -141,7 +141,11 @@ def test_process_start_epoch_parses_ps_lstart() -> None:
     # the same wall-clock instant ps reported.
     import datetime as dt
 
-    rebuilt = dt.datetime.fromtimestamp(epoch).strftime(dtw.PS_LSTART_FORMAT)
+    rebuilt = (
+        dt.datetime.fromtimestamp(epoch, tz=dt.UTC)
+        .astimezone()
+        .strftime(dtw.PS_LSTART_FORMAT)
+    )
     assert rebuilt == "Fri Apr 10 08:07:23 2026"
 
 

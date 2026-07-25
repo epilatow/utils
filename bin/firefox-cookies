@@ -38,18 +38,18 @@ from typing import Any
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
+from common.argparse_ext import (
     RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
     add_argument_ext,
 )
-from common.cli import cli_entrypoint  # noqa: E402
-from common.docspec import (  # noqa: E402
+from common.cli import cli_entrypoint
+from common.docspec import (
     ItemsSection,
     ManSpec,
     TextSection,
 )
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase
 
 # Configure logging to stderr
 logging.basicConfig(
@@ -172,10 +172,11 @@ def parse_profiles(firefox_dir: Path) -> list[Profile]:
     # Find the default profile path from [Install*] sections
     install_default: str | None = None
     for section in config.sections():
-        if section.startswith("Install"):
-            if config.has_option(section, "Default"):
-                install_default = config.get(section, "Default")
-                break
+        if section.startswith("Install") and config.has_option(
+            section, "Default"
+        ):
+            install_default = config.get(section, "Default")
+            break
 
     profiles: list[Profile] = []
     for section in config.sections():
@@ -1282,26 +1283,36 @@ MAN_SPEC = ManSpec(
             [
                 (
                     "<profile>/cookies.sqlite",
-                    "The profile's persistent cookie database (the `db` "
-                    "source). Copied to a temporary location before reading, "
-                    "so it can be queried while Firefox is running.",
+                    (
+                        "The profile's persistent cookie database (the `db` "
+                        "source). Copied to a temporary location before "
+                        "reading, so it can be queried while Firefox is "
+                        "running."
+                    ),
                 ),
                 (
                     "<profile>/sessionstore-backups/recovery.jsonlz4",
-                    "The Session Restore backup (mozlz4-compressed). Holds "
-                    "the session cookies Firefox keeps only in memory (the "
-                    "`recovery` source).",
+                    (
+                        "The Session Restore backup (mozlz4-compressed). Holds "
+                        "the session cookies Firefox keeps only in memory (the "
+                        "`recovery` source)."
+                    ),
                 ),
                 (
                     "<profile>/containers.json",
-                    "The profile's container definitions, used to resolve "
-                    "container names and IDs.",
+                    (
+                        "The profile's container definitions, used to resolve "
+                        "container names and IDs."
+                    ),
                 ),
                 (
                     "<firefox-dir>/profiles.ini",
-                    "The profile index, read to locate and resolve profiles. "
-                    "<firefox-dir> is ~/Library/Application Support/Firefox on "
-                    "macOS and ~/.mozilla/firefox on Linux.",
+                    (
+                        "The profile index, read to locate and resolve "
+                        "profiles. <firefox-dir> is ~/Library/Application "
+                        "Support/Firefox on macOS and ~/.mozilla/firefox on "
+                        "Linux."
+                    ),
                 ),
             ],
         ),

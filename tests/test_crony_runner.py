@@ -28,8 +28,8 @@ from conftest_crony import (  # noqa: E402
     _ApplyHarness,
     _assert_errored_job,
     _email_block,
-    _isolate_home,  # noqa: E402, F401
-    _isolate_signal_state,  # noqa: E402, F401
+    _isolate_home,  # noqa: F401
+    _isolate_signal_state,  # noqa: F401
     _job,
     _ntfy_block,
     _parse,
@@ -759,13 +759,12 @@ class TestRunJobLockContention:
         lock = sd / "run.lock"
         import fcntl as _fcntl
 
-        held = open(lock, "w")
-        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        try:
-            rc = crony_runner._run_job(h.snap(cfg, "j"))
-        finally:
-            _fcntl.flock(held, _fcntl.LOCK_UN)
-            held.close()
+        with open(lock, "w") as held:
+            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            try:
+                rc = crony_runner._run_job(h.snap(cfg, "j"))
+            finally:
+                _fcntl.flock(held, _fcntl.LOCK_UN)
         assert rc == int(ExitCode.LOCK_BUSY)
         # No last-run.json on contention; the previous holder owns
         # that record.
@@ -2729,7 +2728,7 @@ class TestTriggerUnitSync:
 
         def _no_wait(
             pid: int,
-            timeout: float | None,  # noqa: ARG001
+            timeout: float | None,  # noqa: ARG001 - callback signature
         ) -> PidWait:
             waited.append(pid)
             return PidWait.EXITED
@@ -3118,7 +3117,7 @@ class TestTriggerUnitSync:
 
         def _record_wait(
             pid: int,
-            timeout: float | None,  # noqa: ARG001
+            timeout: float | None,  # noqa: ARG001 - callback signature
         ) -> PidWait:
             waited.append(pid)
             return PidWait.EXITED
@@ -3151,7 +3150,7 @@ class TestTriggerUnitSync:
 
         def _wait_then_complete(
             pid: int,
-            timeout: float | None,  # noqa: ARG001
+            timeout: float | None,  # noqa: ARG001 - callback signature
         ) -> PidWait:
             waited.append(pid)
             # The running child finishes: write a fresh record.
@@ -3191,7 +3190,7 @@ class TestTriggerUnitSync:
 
         def _timeout_wait(
             _pid: int,
-            timeout: float | None,  # noqa: ARG001
+            timeout: float | None,  # noqa: ARG001 - callback signature
         ) -> PidWait:
             time.sleep(0.2)
             return PidWait.TIMED_OUT
@@ -3471,8 +3470,10 @@ class TestDoRunGuard:
             # Background a SIGTERM-ignoring looper, record its pid, then
             # wait -- the foreground sh dies on the SIGTERM while the looper
             # survives it, so only the SIGKILL escalation reaps it.
-            f"sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
-            f"echo $! > {pidfile}; wait",
+            (
+                f"sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
+                f"echo $! > {pidfile}; wait"
+            ),
         ]
         assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
         gc_pid = int(pidfile.read_text().strip())
@@ -3539,9 +3540,11 @@ class TestDoRunGuard:
         argv = [
             "/bin/sh",
             "-c",
-            f"echo $$ > {sd / 'run.pid'}; "
-            f'trap "touch {marker}; exit 7" USR1; '
-            "while :; do sleep 0.1; done",
+            (
+                f"echo $$ > {sd / 'run.pid'}; "
+                f'trap "touch {marker}; exit 7" USR1; '
+                "while :; do sleep 0.1; done"
+            ),
             "_",
             f"default:{uid}",
         ]
@@ -3563,8 +3566,10 @@ class TestDoRunGuard:
         argv = [
             "/bin/sh",
             "-c",
-            f"echo $$ > {sd / 'run.pid'}; "
-            'trap "" TERM USR1; while true; do sleep 1; done',
+            (
+                f"echo $$ > {sd / 'run.pid'}; "
+                'trap "" TERM USR1; while true; do sleep 1; done'
+            ),
             "_",
             f"default:{uid}",
         ]
@@ -3663,13 +3668,12 @@ class TestDoJitter:
         sd.mkdir(parents=True)
         import fcntl as _fcntl
 
-        held = open(sd / "run.lock", "w")
-        _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        try:
-            crony_runner.do_jitter(ref, self._NAME)
-        finally:
-            _fcntl.flock(held, _fcntl.LOCK_UN)
-            held.close()
+        with open(sd / "run.lock", "w") as held:
+            _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            try:
+                crony_runner.do_jitter(ref, self._NAME)
+            finally:
+                _fcntl.flock(held, _fcntl.LOCK_UN)
         assert sched.calls == [("deactivate_jitter", self._NAME)]
         assert not (sd / RUN_LOG_NAME).exists()
 

@@ -17,14 +17,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.errors import SubprocessError  # noqa: E402
-from crony.platform import (  # noqa: E402
+from crony.errors import SubprocessError
+from crony.platform import (
     SchedulerWarning,
     UnitLastExit,
     get_scheduler,
     systemd,
 )
-from crony.unit import (  # noqa: E402
+from crony.unit import (
     EntityName,
     EntityRef,
     Interval,
@@ -515,6 +515,7 @@ class TestSystemdAnalyzeVerify:
                 ["systemd-analyze", "verify", str(path)],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             output = proc.stdout + proc.stderr
             complaints = [

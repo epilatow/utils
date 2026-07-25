@@ -115,7 +115,7 @@ def _md(text: str) -> str:
 _GFM_SPECIAL = _MD_SPECIAL - {"`"}
 # A code span: a run of N backticks closed by a run of N (the `(?<!`)` /
 # `(?!`)` guards make each run maximal), with the inner text in between.
-_GFM_CODE_SPAN = re.compile(r"(?<!`)(`+)(?:.+?)\1(?!`)", re.S)
+_GFM_CODE_SPAN = re.compile(r"(?<!`)(`+)(?:.+?)\1(?!`)", re.DOTALL)
 
 
 def _gfm_escape(text: str) -> str:
@@ -209,7 +209,7 @@ def _signature(parser: argparse.ArgumentParser) -> str:
     so repeating it in each signature is noise."""
     usage = " ".join(parser.format_usage().split())
     prefix = f"usage: {parser.prog} "
-    sig = usage[len(prefix) :] if usage.startswith(prefix) else usage
+    sig = usage.removeprefix(prefix)
     return sig.removeprefix("[-h] ").removeprefix("[-h]").strip()
 
 

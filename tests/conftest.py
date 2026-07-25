@@ -229,7 +229,7 @@ class CmdCallbacksBase:
         self,
     ) -> None:
         """Dispatch handlers don't define default values."""
-        for _cmd, fn in self.CALLBACKS.items():
+        for fn in self.CALLBACKS.values():
             sig = inspect.signature(fn)
             for name, param in sig.parameters.items():
                 assert param.default is inspect.Parameter.empty, (
@@ -551,11 +551,11 @@ class HelpWidthBase:
         offenders: list[str] = []
         for sub in self._all_parsers(type(self).PARSER_FUNC()):
             for action in sub._actions:
-                if isinstance(action, argparse._SubParsersAction):
-                    if action.metavar != "<command>":
-                        offenders.append(
-                            f"{sub.prog}: metavar={action.metavar!r}"
-                        )
+                if (
+                    isinstance(action, argparse._SubParsersAction)
+                    and action.metavar != "<command>"
+                ):
+                    offenders.append(f"{sub.prog}: metavar={action.metavar!r}")
         assert not offenders, (
             'subcommand groups must set metavar="<command>":\n'
             + "\n".join(offenders)

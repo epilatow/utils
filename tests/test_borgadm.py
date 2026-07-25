@@ -34,7 +34,7 @@ import tomllib
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from unittest.mock import Mock, call, patch
@@ -128,7 +128,7 @@ def mock_config_constructor(cfg: Any) -> Any:
     def constructor(
         _config_path: str,
         args: dict[str, Any],
-        require_backup_sets: bool = False,  # noqa: ARG001
+        require_backup_sets: bool = False,  # noqa: ARG001 - keyword contract
     ) -> Any:
         # require_backup_sets mirrors the real Config signature so the
         # `config validate` path's keyword call binds; the mock ignores it.
@@ -142,14 +142,15 @@ def mock_config_constructor(cfg: Any) -> Any:
 @pytest.fixture
 def mock_cfg() -> Any:
     """Create a mock config for testing."""
-    config_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
-    config_file.write("""
-    BORG_REPO = foobar
-    BACKUP_SETS = { "set1": {"paths": ["foo"]} }
-    """)
-    config_file.flush()
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as config_file:
+        config_file.write("""
+        BORG_REPO = foobar
+        BACKUP_SETS = { "set1": {"paths": ["foo"]} }
+        """)
+        config_file.flush()
+        config_name = config_file.name
 
-    cfg = ba.Config(config_file.name, {"command": "test"})
+    cfg = ba.Config(config_name, {"command": "test"})
     original_cfg = ba.CFG
     # ba is a dynamically loaded module typed as ModuleType; a direct
     # attribute write fails mypy --strict (attr-defined), so setattr
@@ -516,7 +517,7 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage, including nested."""
 
     PARSER_FUNC = staticmethod(ba.args_parser)
-    CASES = [
+    CASES: ClassVar = [
         (["list", "--bogus"], "list"),
         (["check", "age", "--bogus"], "check age"),
         (["repair", "repo", "--bogus"], "repair repo"),
@@ -533,7 +534,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(ba.cli)
     EXIT_CODE_USAGE = ba.ExitCode.USAGE
     TEST_SUBCOMMAND = "environment"
-    EXCEPTION_EXIT_CODE_MAP = [
+    EXCEPTION_EXIT_CODE_MAP: ClassVar = [
         (ba.ConfigError("t"), ba.ExitCode.CONFIG),
         (
             ba.SubprocessError(1, "cmd"),
@@ -559,7 +560,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
         (ba.BorgadmError("t"), ba.ExitCode.ERROR),
         (RuntimeError("t"), ba.ExitCode.CRASHED),
     ]
-    POPPED_ARGS = {
+    POPPED_ARGS: ClassVar = {
         "config",
         "verbose",
         "timestamp_messages",
@@ -576,7 +577,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     # main() re-injects the --config path for the config subcommands (they
     # operate on the file itself); keep in sync with the dispatcher's
     # `if top_command == "config"` branch.
-    INJECTED_GLOBALS = {
+    INJECTED_GLOBALS: ClassVar = {
         "config init": {"config"},
         "config validate": {"config"},
     }
@@ -1118,12 +1119,12 @@ class TestDelete:
 class TestList:
     """Test list subcommand."""
 
-    FULL_BACKUPS: dict[str, list[str]] = {
+    FULL_BACKUPS: ClassVar[dict[str, list[str]]] = {
         "20250103_120000": ["foobar::home-set1-20250103_120000"],
         "20250102_120000": ["foobar::home-set1-20250102_120000"],
         "20250101_120000": ["foobar::home-set1-20250101_120000"],
     }
-    PARTIAL_BACKUPS: dict[str, list[str]] = {
+    PARTIAL_BACKUPS: ClassVar[dict[str, list[str]]] = {
         "20250104_060000": ["foobar::home-set1-20250104_060000"],
     }
 
@@ -1381,9 +1382,9 @@ class TestAutomate(CronyAutomateBase):
     BUNDLE = "borgadm"
     ERROR = ba.BorgadmError
     CRONY_PARSER = staticmethod(crony_cli._build_parser)
-    EXPECTED_VERBS = {"apply", "status", "logs", "destroy"}
+    EXPECTED_VERBS: ClassVar = {"apply", "status", "logs", "destroy"}
 
-    JOB_OPS = [
+    JOB_OPS: ClassVar = [
         "create",
         "check-age",
         "check-prune",
@@ -1799,7 +1800,14 @@ class TestAutomate(CronyAutomateBase):
         parser = ba.args_parser()
         with pytest.raises(SystemExit) as exc:
             parser.parse_command(
-                ["automate", "apply", "--include", "rsync", "--rsync-dir", "/x"]
+                [
+                    "automate",
+                    "apply",
+                    "--include",
+                    "rsync",
+                    "--rsync-dir",
+                    "/x",
+                ]
             )
         assert exc.value.code == 2
 
@@ -1871,14 +1879,16 @@ class TestLogs:
         self, system: str, monkeypatch: Any, caplog: Any
     ) -> None:
         monkeypatch.setattr(ba.platform, "system", lambda: system)
-        with patch.object(
-            ba,
-            "_crony_bundle_path",
-            autospec=True,
-            return_value=Path("/nonexistent/borgadm.toml"),
+        with (
+            patch.object(
+                ba,
+                "_crony_bundle_path",
+                autospec=True,
+                return_value=Path("/nonexistent/borgadm.toml"),
+            ),
+            caplog.at_level(logging.INFO),
         ):
-            with caplog.at_level(logging.INFO):
-                ba.do_logs()
+            ba.do_logs()
         messages = [r.message for r in caplog.records]
         assert messages == [str(ba.LOGFILE)]
 
@@ -1912,9 +1922,9 @@ class TestLogs:
                 ba, "_crony_bundle_path", autospec=True, return_value=bundle
             ),
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
+            caplog.at_level(logging.INFO),
         ):
-            with caplog.at_level(logging.INFO):
-                ba.do_logs()
+            ba.do_logs()
         messages = [r.message for r in caplog.records]
         assert messages[0] == str(ba.LOGFILE)
         # Only the bundle's jobs are queried (rsync is not in a bare bundle).
@@ -1952,9 +1962,9 @@ class TestLogs:
                 ba, "_crony_bundle_path", autospec=True, return_value=bundle
             ),
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
+            caplog.at_level(logging.INFO),
         ):
-            with caplog.at_level(logging.INFO):
-                ba.do_logs()
+            ba.do_logs()
         assert queried == ["rsync"]
         assert str(rsync_log) in [r.message for r in caplog.records]
 
@@ -1981,9 +1991,9 @@ class TestLogs:
                 ba, "_crony_bundle_path", autospec=True, return_value=bundle
             ),
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
+            caplog.at_level(logging.INFO),
         ):
-            with caplog.at_level(logging.INFO):
-                ba.do_logs()
+            ba.do_logs()
         assert [r.message for r in caplog.records] == [str(ba.LOGFILE)]
 
 
@@ -2025,9 +2035,9 @@ class TestCheck:
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_age_too_old(self) -> None:
         """Test check age raises CheckAgeError."""
-        old_ts = (datetime.now() - timedelta(hours=48)).strftime(
-            "%Y%m%d_%H%M%S"
-        )
+        old_ts = (
+            datetime.now(tz=UTC).astimezone() - timedelta(hours=48)
+        ).strftime("%Y%m%d_%H%M%S")
         with (
             patch.object(
                 ba,
@@ -2042,9 +2052,9 @@ class TestCheck:
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_age_ok(self) -> None:
         """Test check age succeeds when backup is recent."""
-        recent_ts = (datetime.now() - timedelta(hours=1)).strftime(
-            "%Y%m%d_%H%M%S"
-        )
+        recent_ts = (
+            datetime.now(tz=UTC).astimezone() - timedelta(hours=1)
+        ).strftime("%Y%m%d_%H%M%S")
         with patch.object(
             ba,
             "list_backups",
@@ -3083,9 +3093,11 @@ class TestDoEnvironment:
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_local_repo_omits_ssh_add(self, caplog: Any) -> None:
-        with patch.object(ba.CFG, "BORG_REPO", "/var/backups/borg"):
-            with caplog.at_level(logging.INFO):
-                ba.do_environment()
+        with (
+            patch.object(ba.CFG, "BORG_REPO", "/var/backups/borg"),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_environment()
         messages = [r.message for r in caplog.records]
         assert not any("ssh-add" in m for m in messages)
         assert any("export BORG_PASSPHRASE=" in m for m in messages)
@@ -3093,9 +3105,11 @@ class TestDoEnvironment:
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_remote_repo_emits_ssh_add(self, caplog: Any) -> None:
-        with patch.object(ba.CFG, "BORG_REPO", "user@host:/srv/borg"):
-            with caplog.at_level(logging.INFO):
-                ba.do_environment()
+        with (
+            patch.object(ba.CFG, "BORG_REPO", "user@host:/srv/borg"),
+            caplog.at_level(logging.INFO),
+        ):
+            ba.do_environment()
         messages = [r.message for r in caplog.records]
         assert any("ssh-add -q" in m for m in messages)
 
@@ -3306,15 +3320,15 @@ class TestMain:
             ),
             patch.object(ba, "initialize_logger", autospec=True),
             caplog.at_level(logging.ERROR),
+            pytest.raises(ba.ConfigError),
         ):
-            with pytest.raises(ba.ConfigError):
-                ba.main(
-                    command="environment",
-                    config=str(ba.CONFIG),
-                    verbose=False,
-                    timestamp_messages=False,
-                    args_dict={},
-                )
+            ba.main(
+                command="environment",
+                config=str(ba.CONFIG),
+                verbose=False,
+                timestamp_messages=False,
+                args_dict={},
+            )
         assert "setup-boom" in caplog.text
 
 
@@ -3332,11 +3346,10 @@ class TestTimestampMessages:
             for h in root.handlers:
                 if not isinstance(h, logging.StreamHandler):
                     continue
-                if getattr(h, "stream", None) is sys.stdout:
-                    assert h.formatter is not None
-                    fmt = h.formatter._fmt or ""
-                    assert "asctime" in fmt
-                elif getattr(h, "stream", None) is sys.stderr:
+                if (
+                    getattr(h, "stream", None) is sys.stdout
+                    or getattr(h, "stream", None) is sys.stderr
+                ):
                     assert h.formatter is not None
                     fmt = h.formatter._fmt or ""
                     assert "asctime" in fmt
@@ -3544,7 +3557,8 @@ class TestTimestampPruning:
 
     def test_incremental_prune(self) -> None:
         """Test incremental pruning simulation."""
-        start = datetime(2000, 1, 1, 0, 0, 0)
+        # Archive names intentionally model naive local wall-clock keys.
+        start = datetime(2000, 1, 1, 0, 0, 0)  # noqa: DTZ001
         ts_all: set[str] = set()
         for i in range(int(24 * 365 * 3.5)):
             ts = start + timedelta(hours=i)
@@ -3569,13 +3583,12 @@ class TestTimestampPruning:
 
     def test_bulk_prune(self) -> None:
         """Test bulk pruning of many timestamps."""
-        start = datetime(2000, 1, 1, 0, 0, 0)
-        ts_all = set(
-            [
-                (start + timedelta(hours=i)).strftime("%Y%m%d_%H%M%S")
-                for i in range(int(24 * 365 * 3.5))
-            ]
-        )
+        # Archive names intentionally model naive local wall-clock keys.
+        start = datetime(2000, 1, 1, 0, 0, 0)  # noqa: DTZ001
+        ts_all = {
+            (start + timedelta(hours=i)).strftime("%Y%m%d_%H%M%S")
+            for i in range(int(24 * 365 * 3.5))
+        }
         ts_keep = ba.ts_to_keep(ts_all)
         ts_keep_verify = collections.OrderedDict(
             [
@@ -3610,20 +3623,23 @@ class TestTimestampPruning:
 
     def test_all_zero_keep_is_config_error(self) -> None:
         """Test that all keep=0 is rejected as a config error."""
-        config_file = tempfile.NamedTemporaryFile(mode="w+", delete=False)
-        config_file.write(
-            "BORG_REPO = foobar\n"
-            'BACKUP_SETS = { "set1": {"paths": ["foo"]} }\n'
-            "PRUNE_KEEP_HOURLY = 0\n"
-            "PRUNE_KEEP_DAILY = 0\n"
-            "PRUNE_KEEP_WEEKLY = 0\n"
-            "PRUNE_KEEP_MONTHLY = 0\n"
-            "PRUNE_KEEP_YEARLY = 0\n"
-        )
-        config_file.flush()
+        with tempfile.NamedTemporaryFile(
+            mode="w+", delete=False
+        ) as config_file:
+            config_file.write(
+                "BORG_REPO = foobar\n"
+                'BACKUP_SETS = { "set1": {"paths": ["foo"]} }\n'
+                "PRUNE_KEEP_HOURLY = 0\n"
+                "PRUNE_KEEP_DAILY = 0\n"
+                "PRUNE_KEEP_WEEKLY = 0\n"
+                "PRUNE_KEEP_MONTHLY = 0\n"
+                "PRUNE_KEEP_YEARLY = 0\n"
+            )
+            config_file.flush()
+            config_name = config_file.name
 
         with pytest.raises(ba.ConfigError):
-            ba.Config(config_file.name, {})
+            ba.Config(config_name, {})
 
 
 class TestBrokenPipeHandling:
@@ -3663,6 +3679,7 @@ logger.addHandler(stderr_handler)
             shell=True,
             capture_output=True,
             text=True,
+            check=False,
         )
 
     def test_stdout_closed_by_head(self, tmp_path: Path) -> None:
@@ -5365,7 +5382,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
 
     BASE_ERROR = ba.BorgadmError
     EXIT_CODE = ba.ExitCode
-    EXCLUDED_CODES = {
+    EXCLUDED_CODES: ClassVar = {
         ba.ExitCode.SUCCESS,
         ba.ExitCode.WARNING,
         ba.ExitCode.USAGE,
@@ -5465,6 +5482,7 @@ class TestLockAwareE2E:
                 env=borg_e2e._subprocess_env(),
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if probe.returncode != 0 and "lock" in probe.stderr.lower():
                 return
@@ -5487,6 +5505,7 @@ class TestLockAwareE2E:
                 env=borg_e2e._subprocess_env(),
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if probe.returncode != 0 and "lock" in probe.stderr.lower():
                 return

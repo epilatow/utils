@@ -648,8 +648,7 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
     mechanism that prevents concurrent scheduled fires. The lock file is
     left in place across runs.
     """
-    fd = open(lock_path, "w")
-    try:
+    with open(lock_path, "w") as fd:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
@@ -660,8 +659,6 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        fd.close()
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

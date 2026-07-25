@@ -338,7 +338,7 @@ class Scheduler(abc.ABC):
         the shared fire path for a backend's mutating scheduler commands
         (load, enable, restart, trigger); best-effort probes and teardowns
         that tolerate failure run their own `subprocess` calls directly."""
-        result = subprocess.run(argv)
+        result = subprocess.run(argv, check=False)
         if result.returncode != 0:
             raise crony.errors.SubprocessError(result.returncode, argv)
 

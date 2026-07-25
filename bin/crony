@@ -21,7 +21,7 @@ from pathlib import Path
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import crony.cli  # noqa: E402
+import crony.cli
 
 if __name__ == "__main__":
     raise SystemExit(crony.cli.cli())

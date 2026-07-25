@@ -410,7 +410,7 @@ def _insert_missing_uuids_in_section(
         return 0
     if not isinstance(parent, tomlkit.items.Table):
         return 0
-    for _short, subtable in parent.items():
+    for subtable in parent.values():
         if not isinstance(subtable, tomlkit.items.Table):
             continue
         if "uuid" in subtable:
@@ -1004,7 +1004,10 @@ def _resolve_addressable(
 
 
 def _resolve_action_targets(
-    config: crony.model.Config, names: list[str], *, runnable_only: bool = False
+    config: crony.model.Config,
+    names: list[str],
+    *,
+    runnable_only: bool = False,
 ) -> list[tuple[str, crony.unit.EntityRef, str]]:
     """Map normalized names to `(input, ref, unit-name)` targets for an
     action command, rejecting any that can't be acted on here.
@@ -1569,9 +1572,11 @@ def _color_items() -> list[tuple[str, str]]:
         ("red", f"{palette(_RED_CELLS)}."),
         (
             "yellow",
-            f"{palette(_YELLOW_CELLS)}, plus any cell that diverged from "
-            "the applied state (on a color stream its `^` marker is "
-            "dropped in favor of the color).",
+            (
+                f"{palette(_YELLOW_CELLS)}, plus any cell that diverged from "
+                "the applied state (on a color stream its `^` marker is "
+                "dropped in favor of the color)."
+            ),
         ),
     ]
 
@@ -2060,7 +2065,8 @@ def _render_status_cell(
 def _build_group_membership(
     config: crony.model.Config,
 ) -> tuple[
-    dict[crony.unit.EntityRef, list[str]], dict[crony.unit.EntityRef, list[str]]
+    dict[crony.unit.EntityRef, list[str]],
+    dict[crony.unit.EntityRef, list[str]],
 ]:
     """Reverse-index group membership from the pending and current
     graphs.
@@ -2413,7 +2419,7 @@ def do_status(
         if current_name is None and ref is not None:
             oe = config.orphans.get(ref)
             current_name = oe.name if oe is not None else None
-        fallback = sorted(candidates)[0] if candidates else ""
+        fallback = min(candidates) if candidates else ""
         # The config (pending) name drives tree placement, masking,
         # and the TOML-entry lookup; the displayed identity is chosen
         # by source. A masked entry is in neither graph -- fall back to
@@ -2732,8 +2738,9 @@ def do_status(
                 tree_row[_StatusCols.JOB] = indent + tree_row[_StatusCols.JOB]
             ordered.append(tree_row)
         off_tree = [row for _, row in built if id(row) not in consumed]
-        for row in sorted(off_tree, key=lambda r: r[_StatusCols.JOB_OR_UUID]):
-            ordered.append(row)
+        ordered.extend(
+            sorted(off_tree, key=lambda r: r[_StatusCols.JOB_OR_UUID])
+        )
         rows = ordered
 
     # Deferred until the displayed rows exist: the `all` alias's
@@ -3213,7 +3220,7 @@ def _legacy_platform_target_warning(names: set[str]) -> str:
     return (
         f"legacy flat platform target section(s) [target.{joined}]; "
         f"[target.platform.<platform>] is the canonical spelling "
-        f"(e.g. [target.platform.{sorted(names)[0]}]) -- update to silence"
+        f"(e.g. [target.platform.{min(names)}]) -- update to silence"
     )
 
 

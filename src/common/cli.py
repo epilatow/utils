@@ -35,7 +35,7 @@ def cli_entrypoint[**P](fn: Callable[P, int]) -> Callable[P, int]:
             # The newline lands the shell prompt below the echoed `^C`.
             print(file=sys.stderr)
             return SIGINT_EXIT_CODE
-        except Exception:
+        except Exception:  # noqa: BLE001 - convert bugs to the crash exit code
             # Reaching here is a bug -- an exception the entry point
             # should have caught. Surface the traceback and return the
             # crash code, distinct from a deliberate ERROR, rather than

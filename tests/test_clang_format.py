@@ -36,6 +36,7 @@ def test_wrapper_c_is_clang_format_clean(source: Path) -> None:
         ["xcrun", "clang-format", "--style=file", str(source)],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     rel = source.relative_to(REPO_ROOT)

@@ -23,9 +23,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import crony.platform.linux as linux  # noqa: E402
-from crony.platform import LinuxHost, PidWait  # noqa: E402
-from crony.platform.fda import FDAWrapper  # noqa: E402
+from crony.platform import (
+    LinuxHost,
+    PidWait,
+    linux,
+)
+from crony.platform.fda import FDAWrapper
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "platform" / "linux.py"

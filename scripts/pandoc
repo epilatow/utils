@@ -58,7 +58,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-import render_docs  # noqa: E402  (import after the src/ path insert above)
+import render_docs  # noqa: E402
 
 _RELEASE = "https://github.com/jgm/pandoc/releases/download"
 _RELEASES_API = "https://api.github.com/repos/jgm/pandoc/releases"

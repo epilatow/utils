@@ -15,7 +15,7 @@ import sqlite3
 import struct
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import lz4.block  # type: ignore[import-untyped]
@@ -451,7 +451,7 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
 
     PARSER_FUNC = staticmethod(fc.build_parser)
-    CASES = [
+    CASES: ClassVar = [
         (["list", "--bogus"], "list"),
         (["list-domains", "--bogus"], "list-domains"),
         (["list-profiles", "--bogus"], "list-profiles"),
@@ -1460,7 +1460,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(fc.cli)
     EXIT_CODE_USAGE = fc.ExitCode.USAGE
     TEST_SUBCOMMAND = "list-profiles"
-    EXCEPTION_EXIT_CODE_MAP = [
+    EXCEPTION_EXIT_CODE_MAP: ClassVar = [
         (fc.ConfigError("t"), fc.ExitCode.CONFIG),
         (
             fc.FirefoxCookiesError("t"),
@@ -2243,7 +2243,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
 
     BASE_ERROR = fc.FirefoxCookiesError
     EXIT_CODE = fc.ExitCode
-    EXCLUDED_CODES = {
+    EXCLUDED_CODES: ClassVar = {
         fc.ExitCode.SUCCESS,
         fc.ExitCode.WARNING,
         fc.ExitCode.SUBPROCESS,

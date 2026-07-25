@@ -160,6 +160,7 @@ def _launchctl_list() -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError, subprocess.TimeoutExpired:
         return ""
@@ -343,6 +344,7 @@ class LaunchdScheduler(Scheduler):
             ["launchctl", "bootout", self._gui(name)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         )
 
     def _await_unloaded(self, name: str) -> None:
@@ -369,7 +371,9 @@ class LaunchdScheduler(Scheduler):
         for attempt in range(_BOOTSTRAP_ATTEMPTS):
             self._bootout(name)
             self._await_unloaded(name)
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False
+            )
             if result.returncode == 0:
                 return
             # Only the errno-5 race is a transient worth re-settling and

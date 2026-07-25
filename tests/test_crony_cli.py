@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -126,7 +126,7 @@ class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
 
     PARSER_FUNC = staticmethod(crony_cli._build_parser)
-    CASES = [
+    CASES: ClassVar = [
         (["status", "--bogus"], "status"),
         (["logs", "--bogus"], "logs"),
         (["enable", "--bogus"], "enable"),
@@ -143,8 +143,8 @@ class TestCmdCallbacks(CmdCallbacksBase):
     TEST_SUBCOMMAND = "status"
     # destroy / enable / disable / trigger validators consume --all once
     # checked, so it never reaches the handler signatures.
-    POPPED_ARGS = {"all_jobs"}
-    EXCEPTION_EXIT_CODE_MAP = [
+    POPPED_ARGS: ClassVar = {"all_jobs"}
+    EXCEPTION_EXIT_CODE_MAP: ClassVar = [
         (UsageError("t"), ExitCode.USAGE),
         (ConfigError("t"), ExitCode.CONFIG),
         (
@@ -362,7 +362,8 @@ class TestBrokenPipeHandler:
     def test_handler_swaps_stream_on_broken_pipe(self, tmp_path: Path) -> None:
         # Create the handler attached to a regular file we can verify.
         log_path = tmp_path / "out"
-        stream = open(log_path, "w")
+        # The handler closes and replaces this stream on the simulated error.
+        stream = open(log_path, "w")  # noqa: SIM115
         handler = crony_cli._BrokenPipeAwareStreamHandler(stream)
         # Synthesize a "BrokenPipeError caught while emitting" by
         # stuffing one into sys.exc_info via a dummy raise.

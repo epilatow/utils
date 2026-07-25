@@ -559,7 +559,7 @@ def dispatch_notify(
             result.notifications[channel_name] = crony.model.NotificationResult(
                 sent=True, error=None, error_class=None
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - each channel is best-effort
             # Notify is best-effort; record the failure on this
             # channel and continue with the next one.
             result.notifications[channel_name] = crony.model.NotificationResult(

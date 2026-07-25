@@ -153,7 +153,8 @@ class _BrokenPipeAwareStreamHandler(logging.StreamHandler[Any]):
                 self.stream.close()
             except BrokenPipeError, OSError:
                 pass
-            self.stream = open(os.devnull, "w")
+            # The logging handler owns this replacement stream.
+            self.stream = open(os.devnull, "w")  # noqa: SIM115
             return
         super().handleError(record)
 

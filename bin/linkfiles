@@ -26,18 +26,18 @@ from typing import Self
 # through a symlink.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from common.argparse_ext import (  # noqa: E402
+from common.argparse_ext import (
     RawDescriptionDefaultsHelpFormatter,
     StrictArgumentParser,
     add_argument_ext,
 )
-from common.cli import cli_entrypoint  # noqa: E402
-from common.docspec import (  # noqa: E402
+from common.cli import cli_entrypoint
+from common.docspec import (
     ItemsSection,
     ManSpec,
     TextSection,
 )
-from common.exitcodes import CommonExitCode, ExitCodeBase  # noqa: E402
+from common.exitcodes import CommonExitCode, ExitCodeBase
 
 # =============================================================================
 # DESIGN
@@ -1791,8 +1791,10 @@ MAN_SPEC = ManSpec(
             [
                 (
                     "~/.linkfiles.installed",
-                    "Tracks installed directory pairs (source + target) and "
-                    "installation options.",
+                    (
+                        "Tracks installed directory pairs (source + target) "
+                        "and installation options."
+                    ),
                 ),
                 (
                     "~/.linkfiles.linked",
@@ -1800,9 +1802,12 @@ MAN_SPEC = ManSpec(
                 ),
                 (
                     "$REPO/.linkfiles.ignore",
-                    "A file containing gitignore style patterns used to "
-                    "specify repo files that should be ignored by linkfiles. "
-                    "Used when source_dir is $REPO or a child of $REPO.",
+                    (
+                        "A file containing gitignore style patterns used to "
+                        "specify repo files that should be ignored by "
+                        "linkfiles. Used when source_dir is $REPO or a child "
+                        "of $REPO."
+                    ),
                 ),
             ],
         ),

@@ -150,6 +150,7 @@ def _is_enabled(unit: str) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError, subprocess.TimeoutExpired:
         return ""
@@ -183,6 +184,7 @@ def _show_services(units: list[str]) -> list[dict[str, str]]:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError, subprocess.TimeoutExpired:
         return []
@@ -222,6 +224,7 @@ def _show_timer(unit: str) -> dict[str, str] | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError, subprocess.TimeoutExpired:
         return None
@@ -264,6 +267,7 @@ def _linger_enabled(user: str) -> bool | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except FileNotFoundError, subprocess.TimeoutExpired:
         return None
@@ -446,10 +450,12 @@ class SystemdScheduler(Scheduler):
         subprocess.run(
             _SYSTEMCTL_DISABLE + [_timer_filename(name)],
             stderr=subprocess.DEVNULL,
+            check=False,
         )
         subprocess.run(
             ["systemctl", "--user", "--quiet", "daemon-reload"],
             stderr=subprocess.DEVNULL,
+            check=False,
         )
 
     def remove_files(self, name: str) -> None:
@@ -462,6 +468,7 @@ class SystemdScheduler(Scheduler):
                 subprocess.run(
                     _SYSTEMCTL_DISABLE + [str(filename)],
                     stderr=subprocess.DEVNULL,
+                    check=False,
                 )
             (self.unit_dir / filename).unlink(missing_ok=True)
 
@@ -516,5 +523,6 @@ class SystemdScheduler(Scheduler):
                 subprocess.run(
                     _SYSTEMCTL_DISABLE + [str(filename)],
                     stderr=subprocess.DEVNULL,
+                    check=False,
                 )
             (self.unit_dir / filename).unlink(missing_ok=True)

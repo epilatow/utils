@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.platform import (  # noqa: E402
+from crony.platform import (
     DarwinHost,
     LaunchdScheduler,
     LinuxHost,

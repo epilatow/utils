@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony import BASENAME, paths  # noqa: E402
+from crony import BASENAME, paths
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "src" / "crony" / "paths.py"

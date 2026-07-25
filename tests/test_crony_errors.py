@@ -11,12 +11,13 @@ hierarchy every crony layer raises."""
 import subprocess
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from conftest import ExceptionHierarchyBase  # noqa: E402
+from conftest import ExceptionHierarchyBase
 
-from crony.errors import (  # noqa: E402
+from crony.errors import (
     INTERNAL_EXIT_CODES,
     ConfigError,
     CronyError,
@@ -41,7 +42,7 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
 
     BASE_ERROR = CronyError
     EXIT_CODE = ExitCode
-    EXCLUDED_CODES = {
+    EXCLUDED_CODES: ClassVar = {
         ExitCode.SUCCESS,
         ExitCode.WARNING,
         ExitCode.CRASHED,

@@ -1842,9 +1842,7 @@ def _parse_flags_field(raw: dict[str, Any], where: str) -> dict[JobFlags, bool]:
             flag = JobFlags._from_token(token)
         except ValueError as e:
             raise crony.errors.ConfigError(f"{where}: {e}") from e
-        if not sep:
-            enabled = True
-        elif value_str.strip() == "true":
+        if not sep or value_str.strip() == "true":
             enabled = True
         elif value_str.strip() == "false":
             enabled = False

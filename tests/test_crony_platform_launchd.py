@@ -20,13 +20,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.errors import SubprocessError  # noqa: E402
-from crony.platform import (  # noqa: E402
+from crony.errors import SubprocessError
+from crony.platform import (
     UnitLastExit,
     get_scheduler,
     launchd,
 )
-from crony.unit import (  # noqa: E402
+from crony.unit import (
     EntityName,
     EntityRef,
     Interval,
