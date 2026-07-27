@@ -53,6 +53,43 @@ from crony.model import (  # noqa: E402
 _script_path = REPO_ROOT / "src" / "crony" / "notify.py"
 
 
+def _run_result(
+    *,
+    channels: tuple[str, ...] | list[str] = (),
+    signal: int | None = None,
+    exit_class: ExitClass = ExitClass.FAIL,
+) -> JobRunResult:
+    """A completed-run record for the notify tests to work from.
+
+    Every field is a fixed, recognisable stand-in, so a test asserting
+    on a notification body can quote the expected text directly.
+    `channels` names the ones dispatch should attempt -- each starts
+    unsent, which is what `dispatch_notify` records against; tests that
+    only format a body pass none. It is not typed `Sequence[str]`,
+    which a bare `str` also satisfies: a dropped pair of brackets would
+    then spread a channel name into one entry per character instead of
+    failing the type check.
+
+    The exit fields follow `signal` so the record keeps a shape the
+    runner can actually produce -- a signal death carries no exit code
+    and surfaces the signal as `128 + n`.
+    """
+    return JobRunResult(
+        host="h",
+        platform="darwin",
+        started_at="2026-05-02T10:00:00-07:00",
+        ended_at="2026-05-02T10:00:01-07:00",
+        duration_sec=1.0,
+        exit_class=exit_class,
+        exit_code=None if signal is not None else 2,
+        signal=signal,
+        process_exit=128 + signal if signal is not None else 2,
+        gate=GateResult.NONE,
+        log_path="/tmp/run.log",
+        notifications={ch: NotificationResult(sent=False) for ch in channels},
+    )
+
+
 class TestSecretRetrieval:
     """retrieve_secret reads from the host keychain or a 0600 file."""
 
@@ -172,27 +209,9 @@ class TestEmailNotify:
             }
         )
 
-    def _make_failed_result(self, channels: list[str]) -> Any:
-        return JobRunResult(
-            host="h",
-            platform="darwin",
-            started_at="2026-05-02T10:00:00-07:00",
-            ended_at="2026-05-02T10:00:01-07:00",
-            duration_sec=1.0,
-            exit_class=ExitClass.FAIL,
-            exit_code=2,
-            signal=None,
-            process_exit=2,
-            gate=GateResult.NONE,
-            log_path="/tmp/run.log",
-            notifications={
-                ch: NotificationResult(sent=False) for ch in channels
-            },
-        )
-
     def test_sends_via_smtp(self, tmp_path: Path, monkeypatch: Any) -> None:
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
 
         # autospec exercises the real SMTP signature; the resulting
         # mock instance plays the context-manager role with the same
@@ -248,7 +267,7 @@ class TestEmailNotify:
                 "target": {"darwin": {"jobs": ["j"]}},
             }
         )
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
         smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
@@ -271,7 +290,7 @@ class TestEmailNotify:
         # recent run's entry. Earlier history would be noise the
         # recipient already saw in prior notifications.
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
 
         smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
@@ -297,7 +316,7 @@ class TestEmailNotify:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
 
         smtp_cls = create_autospec(
             crony_notify.smtplib.SMTP, side_effect=ConnectionRefusedError("no")
@@ -328,7 +347,7 @@ class TestEmailNotify:
                 "target": {"darwin": {"jobs": ["j"]}},
             }
         )
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
         crony_notify.dispatch_notify(result, "default.j", "log", cfg.defaults)
         assert result.notifications["email"].sent is False
         assert "no SMTP password" in (result.notifications["email"].error or "")
@@ -362,7 +381,7 @@ class TestEmailNotify:
                 "target": {"darwin": {"jobs": ["j"]}},
             }
         )
-        result = self._make_failed_result(["email"])
+        result = _run_result(channels=["email"])
         smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
@@ -403,24 +422,6 @@ class TestNtfyNotify:
             }
         )
 
-    def _make_failed_result(self, channels: list[str]) -> Any:
-        return JobRunResult(
-            host="h",
-            platform="darwin",
-            started_at="2026-05-02T10:00:00-07:00",
-            ended_at="2026-05-02T10:00:01-07:00",
-            duration_sec=1.0,
-            exit_class=ExitClass.FAIL,
-            exit_code=2,
-            signal=None,
-            process_exit=2,
-            gate=GateResult.NONE,
-            log_path="/tmp/run.log",
-            notifications={
-                ch: NotificationResult(sent=False) for ch in channels
-            },
-        )
-
     def test_strips_ansi_from_body(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -428,7 +429,7 @@ class TestNtfyNotify:
         # stripped before the log reaches any transport body (sanitized
         # once at dispatch); ntfy captures the result.
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
         captured: dict[str, Any] = {}
 
         class _Resp:
@@ -455,7 +456,7 @@ class TestNtfyNotify:
 
     def test_sends_via_urllib(self, tmp_path: Path, monkeypatch: Any) -> None:
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
 
         captured: dict[str, Any] = {}
 
@@ -525,7 +526,7 @@ class TestNtfyNotify:
         # recent run's entry, not earlier history. ntfy's 4 KB
         # message ceiling means we can't ship the whole log.
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
         captured: dict[str, Any] = {}
 
         class _Resp:
@@ -562,7 +563,7 @@ class TestNtfyNotify:
         # so the most recent failure output stays visible at the
         # bottom.
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
         captured: dict[str, Any] = {}
 
         class _Resp:
@@ -621,7 +622,7 @@ class TestNtfyNotify:
                 "job": {"j": _job(notify_channels=["ntfy"])},
             }
         )
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
         captured: dict[str, Any] = {}
 
         class _Resp:
@@ -649,7 +650,7 @@ class TestNtfyNotify:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         cfg = self._common_config(tmp_path)
-        result = self._make_failed_result(["ntfy"])
+        result = _run_result(channels=["ntfy"])
 
         # urllib raises HTTPError for 4xx/5xx responses; mirror that
         # so the test reflects real-world failure.
@@ -691,7 +692,7 @@ class TestNtfyNotify:
                 "target": {"darwin": {"jobs": ["j"]}},
             }
         )
-        result = self._make_failed_result(["ntfy-email"])
+        result = _run_result(channels=["ntfy-email"])
         captured: dict[str, Any] = {}
 
         class _Resp:
@@ -729,24 +730,6 @@ class TestDialogPopupNotify:
     the path to the log. Log content itself stays out of the dialog,
     which cannot scroll; email and ntfy carry that instead.
     """
-
-    def _make_failed_result(self, channels: list[str]) -> Any:
-        return JobRunResult(
-            host="h",
-            platform="darwin",
-            started_at="2026-05-02T10:00:00-07:00",
-            ended_at="2026-05-02T10:00:01-07:00",
-            duration_sec=1.0,
-            exit_class=ExitClass.FAIL,
-            exit_code=2,
-            signal=None,
-            process_exit=2,
-            gate=GateResult.NONE,
-            log_path="/tmp/run.log",
-            notifications={
-                ch: NotificationResult(sent=False) for ch in channels
-            },
-        )
 
     def test_validate_accepts_builtin_without_block(self) -> None:
         # No block, no other defined channels: the built-in name is
@@ -805,7 +788,7 @@ class TestDialogPopupNotify:
             return None
 
         monkeypatch.setattr(crony_commands.subprocess, "Popen", _fake_popen)
-        result = self._make_failed_result(["dialog-popup"])
+        result = _run_result(channels=["dialog-popup"])
         crony_notify.dispatch_notify(
             result, "borgadm.check-repo", "boom log line", Defaults()
         )
@@ -844,7 +827,7 @@ class TestDialogPopupNotify:
             lambda cmd, **_k: captured.setdefault("cmd", cmd),
         )
         big = "".join(f"logline{i}\n" for i in range(200))
-        result = self._make_failed_result(["dialog-popup"])
+        result = _run_result(channels=["dialog-popup"])
         crony_notify.dispatch_notify(
             result, "default.j", big, Defaults(notify_attach_log=True)
         )
@@ -862,7 +845,7 @@ class TestDialogPopupNotify:
             raise AssertionError("osascript spawned on non-darwin")
 
         monkeypatch.setattr(crony_commands.subprocess, "Popen", _boom)
-        result = self._make_failed_result(["dialog-popup"])
+        result = _run_result(channels=["dialog-popup"])
         crony_notify.dispatch_notify(result, "default.j", "log", Defaults())
         nr = result.notifications["dialog-popup"]
         assert nr.sent is False
@@ -880,7 +863,7 @@ class TestDialogPopupNotify:
             "Popen",
             lambda cmd, **_k: captured.setdefault("cmd", cmd),
         )
-        result = self._make_failed_result(["dialog-popup"])
+        result = _run_result(channels=["dialog-popup"])
         crony_notify.dispatch_notify(
             result, 'default.he said "hi" \\ bye', "log", Defaults()
         )
@@ -916,7 +899,7 @@ class TestDialogPopupNotify:
             "Popen",
             lambda cmd, **_k: captured.setdefault("cmd", cmd),
         )
-        result = self._make_failed_result(["dialog-popup"])
+        result = _run_result(channels=["dialog-popup"])
         crony_notify.dispatch_notify(
             result,
             "default.j",
@@ -970,23 +953,7 @@ class TestMultiChannelDispatch:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         cfg = self._config(tmp_path)
-        result = JobRunResult(
-            host="h",
-            platform="darwin",
-            started_at="2026-05-02T10:00:00-07:00",
-            ended_at="2026-05-02T10:00:01-07:00",
-            duration_sec=1.0,
-            exit_class=ExitClass.FAIL,
-            exit_code=2,
-            signal=None,
-            process_exit=2,
-            gate=GateResult.NONE,
-            log_path="/tmp/run.log",
-            notifications={
-                "email": NotificationResult(sent=False),
-                "ntfy": NotificationResult(sent=False),
-            },
-        )
+        result = _run_result(channels=["email", "ntfy"])
         smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
         smtp_inst = smtp_cls.return_value
         smtp_inst.__enter__.return_value = smtp_inst
@@ -1290,29 +1257,8 @@ class TestFormatSummary:
     because a reader can derive them.
     """
 
-    def _result(
-        self,
-        *,
-        signal: int | None = None,
-        exit_class: ExitClass = ExitClass.FAIL,
-    ) -> JobRunResult:
-        return JobRunResult(
-            host="h",
-            platform="darwin",
-            started_at="2026-05-02T10:00:00-07:00",
-            ended_at="2026-05-02T10:00:01-07:00",
-            duration_sec=1.0,
-            exit_class=exit_class,
-            exit_code=2,
-            signal=signal,
-            process_exit=2,
-            gate=GateResult.NONE,
-            log_path="/tmp/run.log",
-            notifications={},
-        )
-
     def test_carries_run_detail_fields(self) -> None:
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert out.startswith("Job:        default.j\n")
         assert "Host:       h\n" in out
         assert "Started:    2026-05-02T10:00:00-07:00\n" in out
@@ -1322,13 +1268,13 @@ class TestFormatSummary:
         # The outcome has to survive a body read without its label, so
         # the class stays. The code does not: it adds little beside the
         # class, and is None for a timeout or a signal death.
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert "Exit class: fail\n" in out
         assert "Exit code:" not in out
 
     def test_omits_derivable_and_constant_fields(self) -> None:
         # Ended is Started + Duration; Platform is fixed per host.
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert "Ended:" not in out
         assert "Platform:" not in out
 
@@ -1336,23 +1282,23 @@ class TestFormatSummary:
         # A blocked run never reaches dispatch -- the runner returns as
         # soon as it records the `gated` result -- so this field could
         # only ever have read `none` or `passed`.
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert "Gate:" not in out
 
     def test_signal_omitted_when_absent(self) -> None:
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert "Signal:" not in out
 
     def test_signal_present_when_killed(self) -> None:
         out = crony_notify._format_summary(
-            self._result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
+            _run_result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
         )
         assert "Signal:     9\n" in out
 
     def test_log_path_always_present(self) -> None:
         # Every transport gets the path: it is the only pointer back to
         # the full log from a notification.
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert "Log path:   /tmp/run.log\n" in out
         assert out.rstrip("\n").endswith("Log path:   /tmp/run.log")
 
@@ -1362,7 +1308,7 @@ class TestFormatSummary:
         # blank or continuation line would break that silently. Measure
         # the widest case, with the conditional Signal present.
         out = crony_notify._format_summary(
-            self._result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
+            _run_result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
         )
         lines = out.splitlines()
         assert len(lines) == 7
@@ -1371,7 +1317,7 @@ class TestFormatSummary:
     def test_narrowest_case_is_one_line_shorter(self) -> None:
         # No signal: the conditional line is the only variability in the
         # body's height.
-        out = crony_notify._format_summary(self._result(), "default.j")
+        out = crony_notify._format_summary(_run_result(), "default.j")
         assert len(out.splitlines()) == 6
 
 
