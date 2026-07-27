@@ -37,7 +37,7 @@
 
 #[defaults]
 #notify-channels      = []           # names defined below, or "dialog-popup"
-#notify-attach-log    = true         # include log content in notifications
+#notify-attach-log    = true         # include log content (email / ntfy)
 #notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
 #notify-success-ratio = "1/1"        # failure-notification floor (see below)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
@@ -94,8 +94,10 @@
 # `dialog-popup` is a zero-config built-in -- it needs no block at
 # all. Just list "dialog-popup" in `notify-channels` and a failing
 # job pops a native desktop dialog (macOS) showing the failure
-# summary and latest log. An explicit block is allowed but only ever
-# sets `transport`.
+# summary. The dialog never carries log content -- it cannot scroll,
+# so it would grow past the screen -- and so ignores
+# `notify-attach-log`; use email / ntfy for the log. An explicit
+# block is allowed but only ever sets `transport`.
 
 # Embedded SMTP channel. transport defaults to "email" since the
 # channel is named "email".

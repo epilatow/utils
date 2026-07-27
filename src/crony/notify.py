@@ -108,9 +108,10 @@ def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
 #       cancel for `crony logs --latest`.
 # `extract_latest_log_entry` finds the last `=== ... ===` header
 # and returns everything from there to EOF (the most recent run's
-# trace). Used by `crony logs --latest` (single-run readout) and
-# the ntfy notify path (3KB inline body instead of a full-log
-# attachment).
+# trace). Used by `crony logs --latest` (single-run readout) and by
+# the log-bearing notify transports, email and ntfy, each of which
+# inlines the slice under its own size budget rather than attaching
+# the whole file.
 _RUN_HEADER_RE = re.compile(r"^=== ", re.MULTILINE)
 
 
@@ -134,9 +135,10 @@ def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
     recipients know the head is missing. The marker counts toward
     the byte cap so the result still fits within max_kb.
 
-    Used by ntfy notifications (where the goal is "show the most
-    recent few KB of failure output") and reusable by any other
-    transport with a similar size constraint.
+    Used by the log-bearing notify transports (email under
+    `notify-attach-max-kb`, ntfy under its fixed inline cap), where the
+    goal is "show the most recent few KB of failure output", and
+    reusable by any other transport with a similar size constraint.
     """
     max_bytes = max_kb * 1024
     encoded = text.encode("utf-8")
@@ -155,32 +157,13 @@ def _head_truncate_to_kb(text: str, max_kb: int) -> tuple[str, bool]:
     return marker + tail, True
 
 
-def _head_truncate_to_lines(text: str, max_lines: int) -> tuple[str, bool]:
-    """Tail a string to at most max_lines lines, head-truncating.
-
-    When truncation occurs, a one-line `[... N lines truncated ...]`
-    marker replaces the dropped head (and counts toward max_lines, so
-    the result never exceeds it). Bounds a native dialog's height,
-    where a byte cap alone does not: a `display dialog` has no scroll
-    and grows vertically with its line count, so a large byte budget
-    still overflows the screen.
-    """
-    lines = text.splitlines(keepends=True)
-    if len(lines) <= max_lines:
-        return text, False
-    kept = lines[-(max_lines - 1) :] if max_lines > 1 else []
-    dropped = len(lines) - len(kept)
-    marker = f"[... {dropped} lines truncated ...]\n"
-    return marker + "".join(kept), True
-
-
 # ANSI escape sequences (color, cursor moves, window-title OSC) and other
 # non-printable control characters carry no meaning outside a terminal: in
-# a notification body -- an osascript dialog, an email, an ntfy message --
-# they render as garbage (and a stray control char can even confuse the
-# renderer). The escape matcher takes OSC first (`ESC ] ... BEL/ST`, whole
-# payload) so its `]` introducer is not half-consumed by the trailing
-# single-char Fe alternative, then CSI, then any other Fe escape. The
+# a notification body -- an email or an ntfy message -- they render as
+# garbage (and a stray control char can even confuse the renderer). The
+# escape matcher takes OSC first (`ESC ] ... BEL/ST`, whole payload) so
+# its `]` introducer is not half-consumed by the trailing single-char
+# Fe alternative, then CSI, then any other Fe escape. The
 # control matcher drops C0 and C1 controls plus DEL, keeping only tab and
 # newline (the whitespace controls that structure the text).
 _ANSI_ESCAPE_RE = re.compile(
@@ -415,49 +398,32 @@ def _send_ntfy_for(
     )
 
 
-# Log content (latest run's tail) shown inside a dialog-popup body,
-# capped so the modal stays a normal, clickable size rather than a
-# screen-filling wall of text (a `display dialog` has no scroll and
-# grows with its content, and an oversized one renders an unresponsive
-# OK button). Bounded by BOTH a line count -- the dominant driver of a
-# dialog's height -- and a small byte cap that guards very wide lines
-# that would wrap. The full log always remains on disk.
-_DIALOG_POPUP_LOG_LINES: int = 20
-_DIALOG_POPUP_LOG_KB: int = 2
-
-
-def _format_log_for_dialog(log_text: str, max_lines: int, max_kb: int) -> str:
-    """Latest run's log tail, bounded to fit a native dialog.
-
-    Applies the byte cap first (bounds a pathologically wide line that
-    would wrap into many display rows), then the line cap (the dominant
-    driver of a non-scrolling dialog's height). Line-last keeps the line
-    bound exact and leaves a single truncation marker -- the byte cap's
-    own head marker, if any, is dropped by the line cap. Keeps the tail
-    so the most recent failure output stays visible.
-    """
-    latest = extract_latest_log_entry(log_text)
-    trimmed, _ = _head_truncate_to_kb(latest, max_kb)
-    trimmed, _ = _head_truncate_to_lines(trimmed, max_lines)
-    return trimmed
-
-
 def _send_dialog_popup_for(
     _channel: crony.config.NotifyChannel,
     result: crony.model.JobRunResult,
     full_name: str,
-    log_text: str,
-    defaults: crony.config.Defaults,
+    _log_text: str,
+    _defaults: crony.config.Defaults,
 ) -> None:
     """Pop a native desktop dialog for a failed job. Raises on error.
 
     Routed through the HostPlatform's failure dialog, so it lands on a
     host with a desktop session. Where `supports_interactive` is False
     it raises, and dispatch records the channel as unsent -- the seam
-    where a Linux backend (notify-send / zenity) slots in later. The
-    channel is zero-config: `_channel` is unused, kept only to match the
-    `_NOTIFY_DISPATCH` sender signature; only the run result + log feed
-    the dialog.
+    where a Linux backend (notify-send / zenity) slots in later.
+
+    The body is the summary alone: a `display dialog` has no scroll and
+    grows vertically with its content, so log text -- unbounded in both
+    line count and line width, and wrapped into two or three display
+    rows per line by the dialog's narrow, fixed-size text column --
+    grows the modal past the screen, where its OK button stops
+    responding. Only the summary keeps the height bounded by
+    construction rather than by a cap that has to predict how the text
+    will wrap. The log still reaches the email and ntfy transports, and
+    the full log always remains on disk.
+
+    `_channel`, `_log_text`, and `_defaults` are unused, kept only to
+    match the `_NOTIFY_DISPATCH` sender signature.
     """
     host = crony.runtime.host()
     if not host.supports_interactive:
@@ -466,14 +432,7 @@ def _send_dialog_popup_for(
             f"{crony.platform.current_platform()!r}"
         )
     title = f"crony: {full_name} {result.exit_class} (exit {result.exit_code})"
-    body = _format_summary(result, full_name)
-    if defaults.notify_attach_log and log_text:
-        tail = _format_log_for_dialog(
-            log_text, _DIALOG_POPUP_LOG_LINES, _DIALOG_POPUP_LOG_KB
-        )
-        if tail.strip():
-            body = f"{body}{_LOG_SEPARATOR}{tail}"
-    host.show_failure_dialog(title, body)
+    host.show_failure_dialog(title, _format_summary(result, full_name))
 
 
 # Per-transport sender table. Each entry takes (channel, result,
@@ -535,10 +494,10 @@ def dispatch_notify(
     transport's sender. Per-channel exceptions are recorded so one
     failure doesn't suppress the others.
     """
-    # Sanitize once here so every transport body -- dialog, email, ntfy
-    # -- shows plain text rather than a terminal's ANSI / control codes.
-    # `crony logs` keeps the raw log (terminal colors intact); only the
-    # notification path is cleaned.
+    # Sanitize once here so every transport that embeds the log -- email
+    # and ntfy -- shows plain text rather than a terminal's ANSI /
+    # control codes. `crony logs` keeps the raw log (terminal colors
+    # intact); only the notification path is cleaned.
     log_text = _strip_ansi(log_text)
     for channel_name in list(result.notifications.keys()):
         try:

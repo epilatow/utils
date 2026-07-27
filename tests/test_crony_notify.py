@@ -221,6 +221,45 @@ class TestEmailNotify:
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
 
+    def test_email_body_is_summary_only_when_attach_log_disabled(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `notify_attach_log = false` means "no log content in
+        # notifications". Email honors it (the dialog ignores it and
+        # never carries log content at all), so the body is the
+        # structured summary without the trailing log section.
+        secret = tmp_path / "smtp-pw"
+        secret.write_text("hunter2")
+        secret.chmod(0o600)
+        cfg = _parse(
+            {
+                "defaults": {
+                    "notify_channels": ["email"],
+                    "notify_attach_log": False,
+                    "notify": {
+                        "email": _email_block(smtp_pass_file=str(secret))
+                    },
+                },
+                "job": {"j": _job(notify_channels=["email"])},
+                "target": {"darwin": {"jobs": ["j"]}},
+            }
+        )
+        result = self._make_failed_result(["email"])
+        smtp_cls = create_autospec(crony_notify.smtplib.SMTP)
+        smtp_inst = smtp_cls.return_value
+        smtp_inst.__enter__.return_value = smtp_inst
+        smtp_inst.__exit__.return_value = None
+        monkeypatch.setattr(crony_notify.smtplib, "SMTP", smtp_cls)
+
+        crony_notify.dispatch_notify(
+            result, "default.j", "log content not in body", cfg.defaults
+        )
+
+        body = smtp_inst.send_message.call_args[0][0].get_content()
+        assert "Job:" in body
+        assert "log content not in body" not in body
+        assert crony_notify._LOG_SEPARATOR not in body
+
     def test_email_body_is_latest_run_entry_only(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -377,6 +416,38 @@ class TestNtfyNotify:
                 ch: NotificationResult(sent=False) for ch in channels
             },
         )
+
+    def test_strips_ansi_from_body(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # ANSI color codes and control chars from a terminal log must be
+        # stripped before the log reaches any transport body (sanitized
+        # once at dispatch); ntfy captures the result.
+        cfg = self._common_config(tmp_path)
+        result = self._make_failed_result(["ntfy"])
+        captured: dict[str, Any] = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self_inner: Any) -> Any:
+                return self_inner
+
+            def __exit__(self_inner: Any, *a: object) -> None:
+                return None
+
+        def _fake_urlopen(req: Any, **_kwargs: object) -> Any:
+            captured["data"] = req.data
+            return _Resp()
+
+        monkeypatch.setattr(
+            crony_notify.urllib.request, "urlopen", _fake_urlopen
+        )
+        log = "\x1b[31mFAIL\x1b[0m test_thing\x07\n"
+        crony_notify.dispatch_notify(result, "default.j", log, cfg.defaults)
+        body = captured["data"].decode("utf-8")
+        assert "\x1b" not in body and "\x07" not in body
+        assert "FAIL test_thing" in body
 
     def test_sends_via_urllib(self, tmp_path: Path, monkeypatch: Any) -> None:
         cfg = self._common_config(tmp_path)
@@ -644,7 +715,9 @@ class TestNtfyNotify:
 class TestDialogPopupNotify:
     """The zero-config `dialog-popup` built-in channel: valid without a
     `[defaults.notify.dialog-popup]` block, and on macOS spawns a
-    detached osascript dialog carrying the failure summary + log.
+    detached osascript dialog carrying the failure summary. Log content
+    stays out of the dialog, which cannot scroll; email and ntfy carry
+    it instead.
     """
 
     def _make_failed_result(self, channels: list[str]) -> Any:
@@ -732,14 +805,21 @@ class TestDialogPopupNotify:
         assert "display dialog" in script
         assert "borgadm.check-repo" in script
         assert "(exit 2)" in script
-        assert "boom log line" in script
+        assert "boom log line" not in script
+        # Assert on a labeled summary field, not a bare name: the job
+        # name and exit code also appear in the dialog's title, so a
+        # substring check alone would pass with an empty body.
+        assert "Job:        borgadm.check-repo" in script
+        assert "Log path:   /tmp/run.log" in script
         # Detached so the modal can't stall the runner.
         assert captured["kwargs"].get("start_new_session") is True
 
-    def test_dispatch_line_bounds_large_log(self, monkeypatch: Any) -> None:
-        # A large multi-line log must reach the dialog body line-bounded
-        # (a `display dialog` grows with its line count and overflows),
-        # with a single truncation marker and the most recent output kept.
+    def test_dispatch_omits_log_however_large(self, monkeypatch: Any) -> None:
+        # No amount of log content may reach the dialog body: a
+        # `display dialog` cannot scroll, so its height stays bounded
+        # only by keeping the body to the summary. Nothing recognisable
+        # from the log -- head, tail, or a truncation marker -- may
+        # appear.
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
@@ -751,31 +831,13 @@ class TestDialogPopupNotify:
         )
         big = "".join(f"logline{i}\n" for i in range(200))
         result = self._make_failed_result(["dialog-popup"])
-        crony_notify.dispatch_notify(result, "default.j", big, Defaults())
-        script = captured["cmd"][2]
-        assert script.count("lines truncated") == 1
-        assert "logline199" in script  # tail kept
-        assert "logline0\n" not in script  # head dropped
-
-    def test_dispatch_strips_ansi_from_body(self, monkeypatch: Any) -> None:
-        # ANSI color codes and control chars from a terminal log must be
-        # stripped before the log reaches any transport body (sanitized
-        # once at dispatch); the dialog transport captures the result.
-        monkeypatch.setattr(
-            crony_platform, "current_platform", lambda: "darwin"
+        crony_notify.dispatch_notify(
+            result, "default.j", big, Defaults(notify_attach_log=True)
         )
-        captured: dict[str, Any] = {}
-        monkeypatch.setattr(
-            crony_commands.subprocess,
-            "Popen",
-            lambda cmd, **_k: captured.setdefault("cmd", cmd),
-        )
-        log = "\x1b[31mFAIL\x1b[0m test_thing\x07\n"
-        result = self._make_failed_result(["dialog-popup"])
-        crony_notify.dispatch_notify(result, "default.j", log, Defaults())
         script = captured["cmd"][2]
-        assert "\x1b" not in script and "\x07" not in script
-        assert "FAIL test_thing" in script
+        assert "logline" not in script
+        assert "truncated" not in script
+        assert crony_notify._LOG_SEPARATOR.strip() not in script
 
     def test_dispatch_records_failure_off_darwin(
         self, monkeypatch: Any
@@ -806,15 +868,31 @@ class TestDialogPopupNotify:
         )
         result = self._make_failed_result(["dialog-popup"])
         crony_notify.dispatch_notify(
-            result, "default.j", 'he said "hi" \\ bye', Defaults()
+            result, 'default.he said "hi" \\ bye', "log", Defaults()
         )
         script = captured["cmd"][2]
-        # Raw double-quotes / backslashes from the log would corrupt the
-        # AppleScript string literal; they must arrive escaped.
-        assert '\\"hi\\"' in script
-        assert "\\\\ bye" in script
+        # Raw double-quotes / backslashes would corrupt the AppleScript
+        # string literal, so everything the body is built from must
+        # arrive escaped. `_NAME_RE` keeps these characters out of a job
+        # name today, which makes this a guard on the dispatch seam
+        # rather than a reachable input: it holds the escaping contract
+        # in place for whatever summary field comes next.
+        # `test_failure_dialog_escapes_and_detaches` in
+        # test_crony_platform_host_darwin.py owns the escaper itself.
+        # `full_name` reaches both the title and the body, each escaped
+        # separately, so each metacharacter must appear twice. A bare
+        # `in` check would be satisfied by the title alone and would not
+        # notice an unescaped body.
+        assert script.count('\\"hi\\"') == 2
+        assert script.count("\\\\ bye") == 2
 
-    def test_attach_log_false_omits_log(self, monkeypatch: Any) -> None:
+    @pytest.mark.parametrize("attach", [True, False])
+    def test_log_omitted_under_either_attach_log_setting(
+        self, attach: bool, monkeypatch: Any
+    ) -> None:
+        # `notify-attach-log` governs the email / ntfy transports. The
+        # dialog omits log content either way, so neither setting is a
+        # route back to a modal that outgrows the screen.
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
@@ -829,7 +907,7 @@ class TestDialogPopupNotify:
             result,
             "default.j",
             "secret log line",
-            Defaults(notify_attach_log=False),
+            Defaults(notify_attach_log=attach),
         )
         script = captured["cmd"][2]
         assert "secret log line" not in script
@@ -1192,11 +1270,9 @@ class TestNotifyTestSubcommand:
 
 class TestLogHelpers:
     """Direct unit tests for `extract_latest_log_entry`, the
-    `_head_truncate_to_kb` / `_head_truncate_to_lines` caps, the
-    `_format_log_for_dialog` combiner, and `_strip_ansi`. Exercised
-    end-to-end via TestLogs, TestNtfyNotify, and TestDialogPopupNotify;
-    this class isolates the boundary conditions so a regression in a
-    helper surfaces here first.
+    `_head_truncate_to_kb` cap, and `_strip_ansi`. Exercised end-to-end
+    via TestLogs and TestNtfyNotify; this class isolates the boundary
+    conditions so a regression in a helper surfaces here first.
     """
 
     def test_extract_returns_from_last_header(self) -> None:
@@ -1235,40 +1311,6 @@ class TestLogHelpers:
         assert out.startswith("[... ")
         assert "bytes truncated" in out
         assert out.endswith("TAIL")
-
-    def test_head_truncate_lines_under_cap_passes_through(self) -> None:
-        text = "a\nb\nc\n"
-        out, truncated = crony_notify._head_truncate_to_lines(text, 20)
-        assert out == text
-        assert truncated is False
-
-    def test_head_truncate_lines_over_cap_keeps_tail_with_marker(
-        self,
-    ) -> None:
-        text = "".join(f"line{i}\n" for i in range(100))
-        out, truncated = crony_notify._head_truncate_to_lines(text, 20)
-        assert truncated is True
-        lines = out.splitlines()
-        assert len(lines) == 20  # 1 marker + 19 kept
-        assert lines[0].startswith("[... ") and "lines truncated" in lines[0]
-        assert lines[-1] == "line99"
-        assert "line0" not in out
-
-    def test_format_log_for_dialog_bounds_lines_and_bytes(self) -> None:
-        # A large latest-run entry is bounded to both the line and byte
-        # caps, keeping the most recent output.
-        big = "=== run j pid=1 ===\n" + "".join(
-            f"FAIL test_{i}\n" for i in range(200)
-        )
-        out = crony_notify._format_log_for_dialog(big, 20, 2)
-        assert len(out.splitlines()) <= 20
-        assert len(out.encode("utf-8")) <= 2 * 1024
-        assert "test_199" in out
-
-    def test_format_log_for_dialog_byte_cap_trims_wide_line(self) -> None:
-        wide = "=== run j pid=1 ===\n" + "x" * 10000 + "\n"
-        out = crony_notify._format_log_for_dialog(wide, 20, 2)
-        assert len(out.encode("utf-8")) <= 2 * 1024
 
     def test_strip_ansi_removes_color_and_controls(self) -> None:
         text = "\x1b[31mFAIL\x1b[0m t\n\x1b[1;32mok\x1b[0m\ty\r\ndone\x07\n"

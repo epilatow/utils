@@ -378,6 +378,9 @@ class Defaults:
     # config). The default bundle itself defaults to [] and may not use
     # the sentinel.
     notify_channels: list[str] = field(default_factory=list)
+    # Include log content in EMAIL and NTFY notifications. The
+    # dialog-popup transport never carries log content and ignores this
+    # setting; see `_send_dialog_popup_for` for why.
     notify_attach_log: bool = True
     # Cap on log content included in EMAIL notifications. ntfy
     # bodies use a fixed 3 KB inline cap (ntfy's per-message limit
