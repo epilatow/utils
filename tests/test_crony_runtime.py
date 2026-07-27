@@ -1933,6 +1933,63 @@ class TestSnapshotBackwardLoad:
         assert snap.timeout == 900
 
 
+class TestSnapshotReportedLogPath:
+    """`load_snapshot` reads the on-disk short-name alias, so a
+    snapshot loaded by `bundle:uuid` still reports the human-readable
+    log path. The runner writes to the uuid-keyed path either way; only
+    what it records (and so what notifications show) changes.
+    """
+
+    def _applied(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> tuple[_ApplyHarness, EntityRef]:
+        h = _ApplyHarness(tmp_path, monkeypatch)
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        ref = EntityRef.from_str(h.ref("j"))
+        assert ref is not None
+        return h, ref
+
+    def test_reports_alias_path_when_link_is_valid(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h, ref = self._applied(tmp_path, monkeypatch)
+        snap = crony_runtime.load_snapshot(ref)
+        alias = h.state / DEFAULT_BUNDLE_NAME / "j"
+        assert alias.is_symlink()
+        assert snap.log_path == alias / crony_model.RUN_LOG_NAME
+        # The canonical path stays uuid-keyed -- it is where the
+        # runner actually opens the file.
+        assert snap.log_path_resolved != snap.log_path
+        assert snap.log_path_resolved.parent.name != "j"
+
+    def test_falls_back_to_uuid_path_when_alias_missing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A removed alias must not strand the report on a path that
+        # does not exist; the uuid-keyed one is always real.
+        h, ref = self._applied(tmp_path, monkeypatch)
+        (h.state / DEFAULT_BUNDLE_NAME / "j").unlink()
+        snap = crony_runtime.load_snapshot(ref)
+        assert snap.log_path == snap.log_path_resolved
+
+    def test_falls_back_when_alias_points_elsewhere(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An alias left pointing at a different uuid (a hand-edited
+        # config, or a delete + re-add) names some other entry's log,
+        # so it must not be reported for this one.
+        h, ref = self._applied(tmp_path, monkeypatch)
+        alias = h.state / DEFAULT_BUNDLE_NAME / "j"
+        alias.unlink()
+        alias.symlink_to("00000000-1111-2222-3333-444455556666")
+        snap = crony_runtime.load_snapshot(ref)
+        assert snap.log_path == snap.log_path_resolved
+
+
 class TestRuntimeUnitLastExit:
     """load_config reconciles each entry's scheduler last-launch outcome
     (fetched via one bulk query) into its RuntimeState.job_status."""

@@ -513,6 +513,9 @@ def _run_job(snap: crony.model.Job) -> int:
     sd.mkdir(parents=True, exist_ok=True)
     lock_path = sd / "run.lock"
     log_path = snap.log_path_resolved
+    # Two paths, deliberately: one to write, one to record. See
+    # `_JobCommon.log_path` for which is reported and when.
+    reported_log_path = snap.log_path
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -596,7 +599,7 @@ def _run_job(snap: crony.model.Job) -> int:
                             signal=None,
                             process_exit=0,
                             gate=gate,
-                            log_path=str(log_path),
+                            log_path=str(reported_log_path),
                             notifications={},
                         )
                         crony.runtime.write_last_run(
@@ -640,7 +643,7 @@ def _run_job(snap: crony.model.Job) -> int:
                                 signal=None,
                                 process_exit=0,
                                 gate=gate,
-                                log_path=str(log_path),
+                                log_path=str(reported_log_path),
                                 notifications={},
                             )
                             crony.runtime.write_last_run(
@@ -702,7 +705,7 @@ def _run_job(snap: crony.model.Job) -> int:
                     signal=sig,
                     process_exit=surfaced_rc,
                     gate=gate,
-                    log_path=str(log_path),
+                    log_path=str(reported_log_path),
                     notifications=notifications,
                 )
 
@@ -865,6 +868,9 @@ def _run_group(snap: crony.model.JobGroup) -> int:
     sd.mkdir(parents=True, exist_ok=True)
     lock_path = sd / "run.lock"
     log_path = snap.log_path_resolved
+    # Two paths, deliberately: one to write, one to record. See
+    # `_JobCommon.log_path` for which is reported and when.
+    reported_log_path = snap.log_path
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
@@ -1142,7 +1148,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                     duration_sec=time.time() - started,
                     exit_class=_group_exit_class(faults),
                     process_exit=0,
-                    log_path=str(log_path),
+                    log_path=str(reported_log_path),
                     jobs_run=children,
                 )
                 crony.runtime.write_last_run(

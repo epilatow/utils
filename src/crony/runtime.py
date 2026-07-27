@@ -97,7 +97,9 @@ def load_snapshot(
     # its PreconditionError handler instead of crashing with a
     # traceback the scheduler never sees.
     try:
-        return crony.model.snapshot_from_dict(raw)
+        return crony.model.snapshot_from_dict(
+            raw, state_dir_symlink=_alias_pair_for_name(name_hint)
+        )
     except (TypeError, ValueError) as e:
         raise crony.errors.PreconditionError(
             f"snapshot for {display!r} has malformed fields: {e} "
@@ -791,14 +793,40 @@ def _units_changing(
     return False
 
 
+def _alias_pair_for_name(name: object) -> tuple[Path, str] | None:
+    """The on-disk alias pair for a snapshot's recorded `name` field.
+
+    Lets a snapshot loaded by ref (which knows only `bundle:uuid`)
+    report the short-name path a human recognises. Guards on the name
+    so the alias probe cannot raise ahead of the load: a snapshot whose
+    name is missing or unparseable fails in `snapshot_from_dict`
+    anyway, and that is the error the caller should see.
+    """
+    if not isinstance(name, str):
+        return None
+    try:
+        entity_name = crony.unit.EntityName.from_str(name)
+    except ValueError:
+        return None
+    return _read_symlink_pair(
+        crony.model.Job.state_dir_symlink_path_from_name(entity_name)
+    )
+
+
 def _read_symlink_pair(link: Path) -> tuple[Path, str] | None:
     """The on-disk alias pair at `link`: (link, target) when it is a
     symlink (a dangling one included), else None. `target` is the
     link's literal contents -- the bare uuid for an apply-created
     alias -- compared against the entry's uuid to tell a correct alias
     from a mis-pointed one."""
-    if link.is_symlink():
-        return (link, str(link.readlink()))
+    try:
+        if link.is_symlink():
+            return (link, str(link.readlink()))
+    except OSError:
+        # A concurrent apply / destroy can unlink between the check and
+        # the read. Callers treat a missing alias as "no alias", which
+        # is the right answer for a link that just went away.
+        return None
     return None
 
 

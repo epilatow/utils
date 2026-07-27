@@ -281,6 +281,25 @@ class TestRuntimeEnvExpansion:
 
 
 class TestRunJobBasics:
+    def test_record_reports_short_name_log_path(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The recorded path is what notifications show, so it uses the
+        # short-name alias rather than the uuid-keyed dir the runner
+        # actually writes to. Both are real; only one is readable.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"ok": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["ok"],
+        )
+        snap = h.snap(cfg, "ok")
+        crony_runner._run_job(snap)
+        recorded = h.last_run("ok")["log_path"]
+        assert recorded.endswith("/default/ok/run.log")
+        assert recorded != str(snap.log_path_resolved)
+        # The bytes still land in the canonical location.
+        assert snap.log_path_resolved.exists()
+
     def test_simple_command_succeeds(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
