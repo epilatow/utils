@@ -726,13 +726,25 @@ class TestRunJobGate:
                         "command": "exit 99",  # would fail if reached
                         "gate": "false",
                         "schedule": "daily",
+                        # A channel, so the no-dispatch assertion below
+                        # rests on the gated early return rather than on
+                        # there being nowhere to send.
+                        "notify_channels": ["dialog-popup"],
                     }
                 }
             },
             default_target_jobs=["g"],
         )
+        # The gated path returns before dispatch, which is what lets
+        # the notification summary omit the gate field entirely: a
+        # `failed` gate can never reach a notification body.
+        called: list[int] = []
+        monkeypatch.setattr(
+            crony_notify, "dispatch_notify", lambda *_a, **_k: called.append(1)
+        )
         rc = crony_runner._run_job(h.snap(cfg, "g"))
         assert rc == 0  # gated exits 0
+        assert not called
         rec = h.last_run("g")
         assert rec["exit_class"] == "gated"
         assert rec["gate"] == "failed"

@@ -93,11 +93,11 @@
 #
 # `dialog-popup` is a zero-config built-in -- it needs no block at
 # all. Just list "dialog-popup" in `notify-channels` and a failing
-# job pops a native desktop dialog (macOS) showing the failure
-# summary. The dialog never carries log content -- it cannot scroll,
-# so it would grow past the screen -- and so ignores
-# `notify-attach-log`; use email / ntfy for the log. An explicit
-# block is allowed but only ever sets `transport`.
+# job pops a native desktop dialog (macOS) carrying the run summary
+# and the path to its log. The dialog cannot scroll, so it never
+# carries log content itself and ignores `notify-attach-log`; use
+# email / ntfy to have the log inline. An explicit block is allowed
+# but only ever sets `transport`.
 
 # Embedded SMTP channel. transport defaults to "email" since the
 # channel is named "email".

@@ -8,6 +8,7 @@
 """Unit tests for crony.notify."""
 
 import logging
+import re
 import sys
 from email.message import Message
 from pathlib import Path
@@ -215,9 +216,12 @@ class TestEmailNotify:
         sent = smtp_inst.send_message.call_args[0][0]
         assert sent["To"] == "you@example.com"
         assert sent["From"] == "crony@example.com"
+        # The subject is the outcome's other carrier; the body relies on
+        # it for the exit code, so its shape is load-bearing.
+        assert sent["Subject"] == "[crony/h] default.j fail (exit 2)"
         body = sent.get_content()
         assert "Job:        default.j" in body
-        assert "fail" in body
+        assert "Log path:   /tmp/run.log" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
 
@@ -492,13 +496,19 @@ class TestNtfyNotify:
             "tags"
         )
         assert tags == "warning,fail"
+        # Like the email subject, the title carries the exit code the
+        # body leaves out.
+        title = captured["headers"].get("Title") or captured["headers"].get(
+            "title"
+        )
+        assert title == "[crony/h] default.j fail (exit 2)"
         # Body mirrors the email layout: human summary block,
         # separator, then the latest log entry. (No run-header in
         # this fixture, so latest-entry extraction passes the
         # text through unchanged.)
         body = captured["data"].decode("utf-8")
         assert "Job:" in body
-        assert "Exit class:" in body
+        assert "Log path:" in body
         assert "--- log (latest run) ---" in body
         assert "log content here" in body
         # No Filename header: the body is inline content, not an
@@ -580,7 +590,7 @@ class TestNtfyNotify:
         body = body_bytes.decode("utf-8", errors="replace")
         # Summary block intact at the top.
         assert body.startswith("Job:")
-        assert "Exit class:" in body
+        assert "Duration:" in body
         # Log section follows the separator and shows the tail.
         assert "--- log (latest run) ---" in body
         assert "MARKER-AT-TAIL" in body
@@ -632,7 +642,7 @@ class TestNtfyNotify:
         body = captured["data"].decode("utf-8")
         # Human summary keys are present; log content is not.
         assert "Job:" in body
-        assert "Exit class:" in body
+        assert "Duration:" in body
         assert "log content not in body" not in body
 
     def test_http_error_recorded(
@@ -715,9 +725,9 @@ class TestNtfyNotify:
 class TestDialogPopupNotify:
     """The zero-config `dialog-popup` built-in channel: valid without a
     `[defaults.notify.dialog-popup]` block, and on macOS spawns a
-    detached osascript dialog carrying the failure summary. Log content
-    stays out of the dialog, which cannot scroll; email and ntfy carry
-    it instead.
+    detached osascript dialog carrying the failure summary, including
+    the path to the log. Log content itself stays out of the dialog,
+    which cannot scroll; email and ntfy carry that instead.
     """
 
     def _make_failed_result(self, channels: list[str]) -> Any:
@@ -806,10 +816,14 @@ class TestDialogPopupNotify:
         assert "borgadm.check-repo" in script
         assert "(exit 2)" in script
         assert "boom log line" not in script
-        # Assert on a labeled summary field, not a bare name: the job
+        # Assert on labeled summary fields, not a bare name: the job
         # name and exit code also appear in the dialog's title, so a
         # substring check alone would pass with an empty body.
         assert "Job:        borgadm.check-repo" in script
+        assert "Duration:   " in script
+        assert "Exit class: fail" in script
+        # The dialog is the only pointer to the log a user gets from a
+        # popup, so the path has to reach the body.
         assert "Log path:   /tmp/run.log" in script
         # Detached so the modal can't stall the runner.
         assert captured["kwargs"].get("start_new_session") is True
@@ -1266,6 +1280,99 @@ class TestNotifyTestSubcommand:
         messages = [r.getMessage() for r in caplog.records]
         assert any("notification sent via default.ntfy" in m for m in messages)
         assert not any("inherited from" in m for m in messages)
+
+
+class TestFormatSummary:
+    """The summary block every transport puts at the top of its body.
+
+    Its field set is deliberately narrow, so these tests pin which
+    fields are present, which are conditional, and which are left out
+    because a reader can derive them.
+    """
+
+    def _result(
+        self,
+        *,
+        signal: int | None = None,
+        exit_class: ExitClass = ExitClass.FAIL,
+    ) -> JobRunResult:
+        return JobRunResult(
+            host="h",
+            platform="darwin",
+            started_at="2026-05-02T10:00:00-07:00",
+            ended_at="2026-05-02T10:00:01-07:00",
+            duration_sec=1.0,
+            exit_class=exit_class,
+            exit_code=2,
+            signal=signal,
+            process_exit=2,
+            gate=GateResult.NONE,
+            log_path="/tmp/run.log",
+            notifications={},
+        )
+
+    def test_carries_run_detail_fields(self) -> None:
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert out.startswith("Job:        default.j\n")
+        assert "Host:       h\n" in out
+        assert "Started:    2026-05-02T10:00:00-07:00\n" in out
+        assert "Duration:   1.0s\n" in out
+
+    def test_carries_outcome_but_not_exit_code(self) -> None:
+        # The outcome has to survive a body read without its label, so
+        # the class stays. The code does not: it adds little beside the
+        # class, and is None for a timeout or a signal death.
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert "Exit class: fail\n" in out
+        assert "Exit code:" not in out
+
+    def test_omits_derivable_and_constant_fields(self) -> None:
+        # Ended is Started + Duration; Platform is fixed per host.
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert "Ended:" not in out
+        assert "Platform:" not in out
+
+    def test_omits_gate(self) -> None:
+        # A blocked run never reaches dispatch -- the runner returns as
+        # soon as it records the `gated` result -- so this field could
+        # only ever have read `none` or `passed`.
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert "Gate:" not in out
+
+    def test_signal_omitted_when_absent(self) -> None:
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert "Signal:" not in out
+
+    def test_signal_present_when_killed(self) -> None:
+        out = crony_notify._format_summary(
+            self._result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
+        )
+        assert "Signal:     9\n" in out
+
+    def test_log_path_always_present(self) -> None:
+        # Every transport gets the path: it is the only pointer back to
+        # the full log from a notification.
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert "Log path:   /tmp/run.log\n" in out
+        assert out.rstrip("\n").endswith("Log path:   /tmp/run.log")
+
+    def test_every_line_is_a_labeled_field(self) -> None:
+        # The dialog's height is bounded by construction only if the
+        # body stays a fixed, small set of one-line fields; a stray
+        # blank or continuation line would break that silently. Measure
+        # the widest case, with the conditional Signal present.
+        out = crony_notify._format_summary(
+            self._result(signal=9, exit_class=ExitClass.SIGNAL), "default.j"
+        )
+        lines = out.splitlines()
+        assert len(lines) == 7
+        assert all(re.match(r"^[A-Z][a-z ]+: +\S", ln) for ln in lines)
+
+    def test_narrowest_case_is_one_line_shorter(self) -> None:
+        # No signal: the conditional line is the only variability in the
+        # body's height.
+        out = crony_notify._format_summary(self._result(), "default.j")
+        assert len(out.splitlines()) == 6
 
 
 class TestLogHelpers:

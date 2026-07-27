@@ -82,20 +82,38 @@ def retrieve_secret(
 
 
 def _format_summary(result: crony.model.JobRunResult, full_name: str) -> str:
-    """One-line-per-field human summary for notification bodies."""
-    return (
+    """One-line-per-field human summary for notification bodies.
+
+    Identifies the run, says how it went, and points at its log. Every
+    transport also labels the message with that much, but a label is
+    not part of the body: it can be truncated by the client, and it
+    does not travel when the body is quoted or forwarded. So the body
+    stands on its own rather than relying on one.
+
+    `Exit code` is the one outcome field left to the label. It adds
+    little beside the class it accompanies -- and unlike the class it
+    is `None` for a timeout or a signal death, so it is the half of the
+    pair worth dropping.
+
+    What else it leaves out is what a reader can derive or never
+    needed: the platform is fixed per host, and the end time is the
+    start plus the duration.
+
+    `Signal` appears only for a run that died on a signal. `Gate` is
+    absent because a blocked run never gets here: the runner returns as
+    soon as it records the `gated` result, before it reaches dispatch.
+    So the field could only ever have read `none` or `passed`.
+    """
+    summary = (
         f"Job:        {full_name}\n"
         f"Host:       {result.host}\n"
-        f"Platform:   {result.platform}\n"
         f"Started:    {result.started_at}\n"
-        f"Ended:      {result.ended_at}\n"
         f"Duration:   {result.duration_sec:.1f}s\n"
         f"Exit class: {result.exit_class}\n"
-        f"Exit code:  {result.exit_code}\n"
-        f"Signal:     {result.signal}\n"
-        f"Gate:       {result.gate}\n"
-        f"Log path:   {result.log_path}\n"
     )
+    if result.signal is not None:
+        summary += f"Signal:     {result.signal}\n"
+    return summary + f"Log path:   {result.log_path}\n"
 
 
 # Each `crony _run` invocation writes a header line to run.log.
@@ -412,15 +430,14 @@ def _send_dialog_popup_for(
     it raises, and dispatch records the channel as unsent -- the seam
     where a Linux backend (notify-send / zenity) slots in later.
 
-    The body is the summary alone: a `display dialog` has no scroll and
-    grows vertically with its content, so log text -- unbounded in both
-    line count and line width, and wrapped into two or three display
-    rows per line by the dialog's narrow, fixed-size text column --
-    grows the modal past the screen, where its OK button stops
-    responding. Only the summary keeps the height bounded by
-    construction rather than by a cap that has to predict how the text
-    will wrap. The log still reaches the email and ntfy transports, and
-    the full log always remains on disk.
+    A `display dialog` has no scroll and grows vertically with its
+    content, and one that outgrows the screen renders an OK button that
+    does not respond. The body is therefore the summary alone -- a fixed
+    handful of short fields -- which bounds the height by construction
+    rather than by a cap that would have to predict how the text wraps.
+    Log content is what has no bound, so it goes to the email and ntfy
+    transports, which have no height constraint; the full log always
+    remains on disk at the path the summary names.
 
     `_channel`, `_log_text`, and `_defaults` are unused, kept only to
     match the `_NOTIFY_DISPATCH` sender signature.
