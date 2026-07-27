@@ -322,7 +322,9 @@ Linux only.\&
 .SH CONFIGURATION
 .TP
 \f[CR]BORG_REPO\f[R]
-Path or ssh URL of the borg repository to manage (required).\&
+Path or ssh URL of the borg repository to manage; ordinary .\&
+and ..\&
+path components are not allowed, but an SSH location may use Borg\(aqs leading /./ remote\-current\-directory marker; Borg placeholders are not allowed because Borg expands them after validation, but doubled braces may be used as literals (required).\&
 .TP
 \f[CR]BORG_REPO_HOSTKEY\f[R]
 known_hosts entry for the remote repository host.\&

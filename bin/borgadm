@@ -25,6 +25,7 @@ import shlex
 import shutil
 import signal
 import stat
+import string
 import subprocess as subprocess  # noqa: PLC0414  re-exported for tests
 import sys
 import tempfile
@@ -249,7 +250,11 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "BORG_REPO",
         "",
-        "Path or ssh URL of the borg repository to manage",
+        "Path or ssh URL of the borg repository to manage; ordinary . and "
+        ".. path components are not allowed, but an SSH location may use "
+        "Borg's leading /./ remote-current-directory marker; Borg "
+        "placeholders are not allowed because Borg expands them after "
+        "validation, but doubled braces may be used as literals",
         template_value="ssh://user@host/./path/to/repo",
         required=True,
     ),
@@ -454,6 +459,16 @@ class Config:
         errors: list[str] = []
         if not self.BORG_REPO:
             errors.append(f"BORG_REPO not defined in config: {path}")
+        elif _repository_has_dot_segments(self.BORG_REPO):
+            errors.append(
+                "BORG_REPO must not contain . or .. path components "
+                "(Borg's leading /./ SSH marker is allowed)."
+            )
+        elif _repository_has_placeholder(self.BORG_REPO):
+            errors.append(
+                "BORG_REPO must not use Borg placeholders because Borg "
+                "expands them after path validation."
+            )
         # BACKUP_SETS is required to back anything up but is consumed only
         # by the create path, so most commands run without it. `validate`
         # opts into the stricter check so it can flag the gap before the
@@ -672,6 +687,46 @@ def _is_remote_repo(repo: str) -> bool:
         return True
     head, _, _ = repo.partition("/")
     return ":" in head
+
+
+def _repository_path(repo: str) -> str:
+    """Return the raw path from a local or Borg SSH repository location."""
+    if repo.startswith("ssh://"):
+        path_start = repo.find("/", len("ssh://"))
+        return "" if path_start == -1 else repo[path_start:]
+    if not _is_remote_repo(repo):
+        return repo
+
+    bracketed = re.match(r"^(?:[^/@]+@)?\[[^]/]+\]:(.*)$", repo)
+    if bracketed:
+        return bracketed.group(1)
+    return repo.split(":", 1)[1]
+
+
+def _repository_has_dot_segments(repo: str) -> bool:
+    """True for ordinary ``.`` or ``..`` repository path components.
+
+    Borg gives a leading ``/./`` in either SSH spelling special meaning: the
+    path is relative to the remote current directory. That marker is
+    configuration syntax, not a path component, so it remains supported while
+    later dot components are rejected.
+    """
+    remote = _is_remote_repo(repo)
+    raw_path = _repository_path(repo)
+    if remote and raw_path.startswith("/./"):
+        raw_path = raw_path[3:]
+    return any(part in (".", "..") for part in raw_path.split("/"))
+
+
+def _repository_has_placeholder(repo: str) -> bool:
+    """True when Borg can expand any part of the repository location."""
+    try:
+        fields = string.Formatter().parse(repo)
+        return any(field_name is not None for _, field_name, _, _ in fields)
+    except ValueError:
+        # Borg reports malformed placeholder syntax itself. This validation
+        # owns only the path-traversal policy.
+        return False
 
 
 def initialize_borg_environment() -> None:

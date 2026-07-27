@@ -336,7 +336,11 @@ configured repository.
 ## CONFIGURATION
 
 - **`BORG_REPO`**\
-  Path or ssh URL of the borg repository to manage (required).
+  Path or ssh URL of the borg repository to manage; ordinary . and .. path
+  components are not allowed, but an SSH location may use Borg's leading /./
+  remote-current-directory marker; Borg placeholders are not allowed because
+  Borg expands them after validation, but doubled braces may be used as
+  literals (required).
 - **`BORG_REPO_HOSTKEY`**\
   known_hosts entry for the remote repository host.
 - **`BORG_PASSPHRASE_FILE`**\

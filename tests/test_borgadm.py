@@ -3215,6 +3215,129 @@ class TestConfigCommands:
         ):
             assert ba.cli() == ba.ExitCode.CONFIG
 
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "/./repo",
+            "/srv/backups/../repo",
+            "relative/./repo",
+            "ssh://user@host/backups/../repo",
+            "ssh://user@host/backups?/../repo",
+            "ssh://user@host/backups#/../repo",
+            "user@host:backups/./repo",
+            "user@host:../before]:tail/repo",
+        ],
+    )
+    def test_config_rejects_repository_dot_segments(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        cfg_file = tmp_path / "dot_segments"
+        cfg_file.write_text(
+            f"BORG_REPO = {repo.replace('%', '%%')}\n"
+            'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ba.ConfigError, match="BORG_REPO must not contain"):
+            ba.Config(str(cfg_file), {})
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "ssh://user@host/./backups/data",
+            "user@host:/./backups/data",
+            "user@[2001:db8::1]:/./backups/data",
+        ],
+    )
+    def test_config_allows_borg_remote_current_directory_marker(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        cfg_file = tmp_path / "remote_current_directory"
+        cfg_file.write_text(
+            f'BORG_REPO = {repo}\nBACKUP_SETS = {{"s": {{"paths": ["x"]}}}}\n',
+            encoding="utf-8",
+        )
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BORG_REPO == repo
+
+    def test_config_allows_literal_percent_dot_path(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_file = tmp_path / "percent_dot"
+        cfg_file.write_text(
+            "BORG_REPO = ssh://user@host/backups/%%2e%%2e/data\n"
+            'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BORG_REPO == "ssh://user@host/backups/%2e%2e/data"
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "/backups/{now:../repo}",
+            "ssh://user@host/backups/{utcnow:%Y/%m}",
+            "user@host:backups/{now:%Y/%m}",
+            "/safe/..{borgversion:.0}/repo",
+            "ssh://user@host/safe/.{user:.0}/repo",
+            "/backups/{now}",
+            "ssh://user@host/backups/{utcnow}",
+            "user@host:backups/{uuid4}",
+            "/backups/{hostname}",
+            "/backups/{user}",
+        ],
+    )
+    def test_config_rejects_borg_placeholders(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        cfg_file = tmp_path / "borg_placeholder"
+        cfg_file.write_text(
+            f"BORG_REPO = {repo.replace('%', '%%')}\n"
+            'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ba.ConfigError, match="Borg placeholder"):
+            ba.Config(str(cfg_file), {})
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "/backups/{{literal}}",
+            "ssh://user@host/backups/{{literal}}",
+            "user@host:backups/{{literal}}",
+            "/backups/{{now:%Y/%m}}",
+        ],
+    )
+    def test_config_allows_escaped_literal_braces(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        cfg_file = tmp_path / "literal_braces"
+        cfg_file.write_text(
+            f"BORG_REPO = {repo.replace('%', '%%')}\n"
+            'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
+            encoding="utf-8",
+        )
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BORG_REPO == repo
+
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "ssh://user#tag@host/path",
+            "ssh://user?tag@host/path",
+            "ssh://user[tag@host/path",
+        ],
+    )
+    def test_config_leaves_ssh_authority_validation_to_borg(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        cfg_file = tmp_path / "borg_authority"
+        cfg_file.write_text(
+            f'BORG_REPO = {repo}\nBACKUP_SETS = {{"s": {{"paths": ["x"]}}}}\n',
+            encoding="utf-8",
+        )
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BORG_REPO == repo
+
     def test_validate_cli_flags_missing_backup_sets(
         self, tmp_path: Path
     ) -> None:
