@@ -87,8 +87,10 @@ This repo is a personal-utilities collection. Top-level structure:
   pandoc) and run through mdformat, so they satisfy the prose mdformat /
   markdownlint gates like any hand-written doc. Generated build artifacts,
   never hand-edited; the freshness gate (see Testing) fails if they drift.
-- `tests/` -- pytest suite. Shared fixtures live in `conftest.py`; the full
-  suite runs via `tests/run_all.py`.
+- `tests/` -- pytest suite. Repository-wide fixtures live in `conftest.py`;
+  component-specific shared fixtures and helpers live in
+  `conftest_<component>.py` and are explicitly imported by each consuming test
+  module. The full suite runs via `tests/run_all.py`.
 - `Applications/` -- macOS app bundles built and consumed by some of the
   utilities. Crony.app is a Mach-O wrapper that lets a Python script (which
   can never hold the grant itself) run under a Full Disk Access grant: it is
