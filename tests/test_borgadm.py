@@ -2842,6 +2842,7 @@ class TestInitializeBorgEnvironmentSshGating:
         with self._patch_externals("user@host:/srv/borg"):
             ba.initialize_borg_environment()
         rsh = os.environ["BORG_RSH"]
+        assert f"-o ConnectTimeout={ba.get_cfg().CMD_TIMEOUT}" in rsh
         assert "-o ServerAliveInterval=15" in rsh
         assert "-o ServerAliveCountMax=30" in rsh
 

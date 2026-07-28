@@ -226,7 +226,8 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "CMD_TIMEOUT",
         60,
-        "Timeout for non-borg commands, in seconds",
+        "Timeout for non-borg commands and SSH connection establishment, "
+        "in seconds",
     ),
     ConfigField(
         "LOCK_CHECK_TIMEOUT",
@@ -669,6 +670,38 @@ def _repository_has_placeholder(repo: str) -> bool:
         return False
 
 
+def _borg_rsh_argv() -> list[str]:
+    """Return the complete SSH client argv Borg should use."""
+    cfg = get_cfg()
+    # -F /dev/null ignores the user's ~/.ssh/config, whose settings
+    # (like IdentityAgent) can conflict with our ssh-agent setup --
+    # which also means the keepalive options here are the only ones
+    # in effect. A `borg mount` of a remote repo holds its ssh
+    # session open for the whole rsync (hours for a full set), with
+    # idle gaps while rsync reads the other archive's mount or scans
+    # the target. ServerAlive probes are answered by the remote sshd
+    # (not the busy `borg serve`), so they keep NAT/firewall state
+    # warm across those gaps; without them an evicted-but-undetected
+    # connection leaves the FUSE mount returning ENOTCONN and every
+    # subsequent read fails. CountMax x Interval bounds how long a
+    # genuinely dead link hangs before ssh tears it down.
+    return [
+        "ssh",
+        "-F",
+        "/dev/null",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"ConnectTimeout={cfg.CMD_TIMEOUT}",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=30",
+        "-o",
+        f"UserKnownHostsFile={_hostkey_file.name}",
+    ]
+
+
 def initialize_borg_environment() -> None:
     cfg = get_cfg()
 
@@ -683,25 +716,7 @@ def initialize_borg_environment() -> None:
     if _is_remote_repo(cfg.BORG_REPO):
         _hostkey_file.write(cfg.BORG_REPO_HOSTKEY)
         _hostkey_file.flush()
-        # -F /dev/null ignores the user's ~/.ssh/config, whose settings
-        # (like IdentityAgent) can conflict with our ssh-agent setup --
-        # which also means our keepalive options below are the only ones
-        # in effect. A `borg mount` of a remote repo holds its ssh
-        # session open for the whole rsync (hours for a full set), with
-        # idle gaps while rsync reads the other archive's mount or scans
-        # the target. ServerAlive probes are answered by the remote sshd
-        # (not the busy `borg serve`), so they keep NAT/firewall state
-        # warm across those gaps; without them an evicted-but-undetected
-        # connection leaves the FUSE mount returning ENOTCONN and every
-        # subsequent read fails. CountMax x Interval bounds how long a
-        # genuinely dead link hangs before ssh tears it down.
-        os.environ["BORG_RSH"] = (
-            f"ssh -F /dev/null "
-            f"-o StrictHostKeyChecking=yes "
-            f"-o ServerAliveInterval=15 "
-            f"-o ServerAliveCountMax=30 "
-            f"-o UserKnownHostsFile={_hostkey_file.name}"
-        )
+        os.environ["BORG_RSH"] = shlex.join(_borg_rsh_argv())
         logger.debug(f"BORG_RSH={os.environ['BORG_RSH']}")
         start_ssh_agent()
     _borg_env_initialized = True

@@ -353,7 +353,8 @@ configured repository.
 - **`BORG_CMD_TIMEOUT`**\
   Timeout for borg commands, in seconds (default: 14400).
 - **`CMD_TIMEOUT`**\
-  Timeout for non-borg commands, in seconds (default: 60).
+  Timeout for non-borg commands and SSH connection establishment, in seconds
+  (default: 60).
 - **`LOCK_CHECK_TIMEOUT`**\
   Seconds to wait for a borg lock before announcing the wait (default: 5).
 - **`BACKUP_NAME`**\
