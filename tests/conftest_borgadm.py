@@ -148,6 +148,12 @@ class BorgE2EFixture:
     def _subprocess_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.home)
+        borg_state = self.home / ".borg-test-state"
+        env["BORG_BASE_DIR"] = str(borg_state / "base")
+        env["BORG_CACHE_DIR"] = str(borg_state / "cache")
+        env["BORG_CONFIG_DIR"] = str(borg_state / "config")
+        env["BORG_KEYS_DIR"] = str(borg_state / "keys")
+        env["BORG_SECURITY_DIR"] = str(borg_state / "security")
         # Borgadm is a `uv run --script` entrypoint, so each subprocess
         # call resolves its script venv via uv's cache. Without this, uv
         # falls back to $HOME/.cache/uv -- our fake-HOME -- which is
@@ -247,8 +253,53 @@ def _require_borg_or_fail() -> None:
         )
 
 
+def _initialize_borg_repo_template(repo: Path, state: Path) -> None:
+    """Initialize a repository without using the invoking user's Borg state."""
+    home = state / "home"
+    home.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "BORG_BASE_DIR": str(state / "base"),
+        "BORG_CACHE_DIR": str(state / "cache"),
+        "BORG_CONFIG_DIR": str(state / "config"),
+        "BORG_KEYS_DIR": str(state / "keys"),
+        "BORG_SECURITY_DIR": str(state / "security"),
+    }
+    subprocess.run(
+        ["borg", "init", "--encryption=none", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.fixture(name="_borg_repo_template", scope="session")
+def _borg_repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Create one clean repository for this worker's E2E copies.
+
+    Each test receives a real copy rather than hardlinks, so repository
+    mutations remain isolated. Copies intentionally share the template's
+    repository ID; the function-scoped fake HOME keeps their Borg cache and
+    security state separate.
+    """
+    _require_borg_or_fail()
+    root = tmp_path_factory.mktemp("borg-template")
+    template = root / "repo"
+    _initialize_borg_repo_template(
+        template,
+        root / "state",
+    )
+    return template
+
+
 @pytest.fixture(name="borg_e2e")
-def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
+def borg_e2e(
+    _isolate_home: Path,
+    _borg_repo_template: Path,
+    tmp_path: Path,
+) -> Iterator[BorgE2EFixture]:
     """Spin up a real local borg repo with a minimal borgadm config so
     tests can drive `borgadm` via subprocess against actual archives.
 
@@ -279,12 +330,7 @@ def borg_e2e(_isolate_home: Path, tmp_path: Path) -> Iterator[BorgE2EFixture]:
     passphrase_file.write_text("e2e-test-passphrase\n")
     passphrase_file.chmod(0o600)
 
-    subprocess.run(
-        ["borg", "init", "--encryption=none", str(repo_path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    shutil.copytree(_borg_repo_template, repo_path)
 
     backup_sets_cfg = {name: {"paths": _E2E_SETS[name]} for name in _E2E_SETS}
     config_path = home / ".borgadm"

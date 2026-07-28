@@ -54,8 +54,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from conftest_borgadm import (  # noqa: E402
     BorgE2EFixture,
     _archive_name,
+    _initialize_borg_repo_template,
     _require_borg_or_fail,
     mock_config_constructor,
+)
+from conftest_borgadm import (  # noqa: E402, F401
+    _borg_repo_template as _borg_repo_template_fixture,
 )
 from conftest_borgadm import (  # noqa: E402, F401
     _isolate_home as _isolate_home_fixture,
@@ -3749,6 +3753,55 @@ class TestE2EFixture:
     is the job of the per-subcommand E2E test classes added in subsequent
     commits. The goal here is to detect fixture-setup regressions early.
     """
+
+    def test_template_init_isolates_borg_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Template initialization cannot write to the invoking user's HOME."""
+        outer_home = tmp_path / "outer-home"
+        outer_home.mkdir()
+        monkeypatch.setenv("HOME", str(outer_home))
+        root = tmp_path / "template"
+
+        _initialize_borg_repo_template(root / "repo", root / "state")
+
+        assert not any(outer_home.iterdir())
+        assert any((root / "state" / "cache").iterdir())
+        assert any((root / "state" / "security").iterdir())
+
+    def test_clones_isolate_inherited_borg_state(
+        self,
+        borg_e2e: BorgE2EFixture,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Clones sharing an ID do not share inherited Borg client state."""
+        inherited_state = tmp_path / "inherited-state"
+        for name in (
+            "BORG_BASE_DIR",
+            "BORG_CACHE_DIR",
+            "BORG_CONFIG_DIR",
+            "BORG_KEYS_DIR",
+            "BORG_SECURITY_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+        ):
+            monkeypatch.setenv(name, str(inherited_state / name.lower()))
+
+        assert borg_e2e.archives() == []
+        second_repo = tmp_path / "second-repo"
+        second_home = tmp_path / "second-home"
+        second_home.mkdir()
+        shutil.copytree(borg_e2e.repo_path, second_repo)
+        second = BorgE2EFixture(
+            repo_path=second_repo,
+            backup_root=borg_e2e.backup_root,
+            home=second_home,
+            config_path=second_home / ".borgadm",
+        )
+
+        assert second.archives() == []
+        assert not inherited_state.exists()
 
     def test_fixture_lays_out_repo_and_config(
         self, borg_e2e: BorgE2EFixture
