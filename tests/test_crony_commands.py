@@ -621,7 +621,8 @@ class TestApplySelfUpdate:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # systemd's reload does not stop a running service, so a self
-        # apply proceeds normally -- the guard is launchd-specific.
+        # apply that only rewrites the unit proceeds normally -- the
+        # reload guard is launchd-specific.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -686,6 +687,111 @@ class TestApplySelfUpdate:
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
         assert exc.value.code == int(ExitCode.WARNING)
+
+
+class TestApplyRenameRetire:
+    """Applying a renamed entry retires its old name's units, and
+    retiring a unit stops it. An entry with a run in flight defers
+    instead of being killed partway through -- on every scheduler, and
+    whether the apply comes from the entry's own run or from an operator
+    elsewhere. The guard keys on the run lock, not on which process is
+    applying, so both reach it by the same path.
+    """
+
+    def _unit(self, h: _ApplyHarness, platform: str, short: str) -> Path:
+        """The entry's platform unit file under `short`'s name."""
+        if platform == "darwin":
+            return h.agents / f"org.crony.{h.full(short)}.plist"
+        return h.sysd / f"crony-{h.full(short)}.service"
+
+    def _rename_to_k(self, h: _ApplyHarness) -> None:
+        """Apply `j`, then rewrite config renaming it to `k` (same uuid)
+        without re-applying."""
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        h.config(
+            {
+                "job": {
+                    "k": {
+                        "uuid": cfg.jobs["j"].uuid,
+                        "command": "true",
+                        "schedule": "*-*-* 03:00",
+                    }
+                }
+            },
+            default_target_jobs=["k"],
+        )
+
+    def _assert_defers(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        *,
+        platform: str,
+        self_apply: bool,
+    ) -> None:
+        """Rename `j` to `k`, then apply `k` while its run lock is held,
+        asserting the apply defers and wrote nothing. `self_apply` also
+        names the entry as the one performing the apply."""
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._rename_to_k(h)
+        old_unit = self._unit(h, platform, "j")
+        before = old_unit.read_text()
+        if self_apply:
+            monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("k"))
+        sd = h.state_dir("k")
+        sd.mkdir(parents=True, exist_ok=True)
+        h.calls.clear()
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            assert h.apply("k") == "deferred"
+        # All-or-nothing, as for a deferred reload: the running unit is
+        # neither stopped nor unlinked, no unit is installed under the new
+        # name, and the snapshot still describes the old one.
+        assert old_unit.read_text() == before
+        assert not self._unit(h, platform, "k").exists()
+        scheduler_bin = "launchctl" if platform == "darwin" else "systemctl"
+        assert all(c[0] != scheduler_bin for c in h.calls)
+        snap = json.loads((sd / "snapshot.json").read_text())
+        assert snap["name"] == h.full("j")
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_defers_rename_of_running_entry(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # An operator's `crony apply` after a rename would stop a run in
+        # flight, leaving the old unit gone and the new one not yet
+        # installed. `destroy` refuses a running entry for the same
+        # reason; the apply path owes it the same protection.
+        self._assert_defers(
+            tmp_path, monkeypatch, platform=platform, self_apply=False
+        )
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_defers_own_rename(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # The entry performing the apply is its own running job, so the
+        # retire would kill the very process doing the renaming. Its
+        # runner holds the lock from another process, so the lock guard
+        # covers this too -- no separate identity check needed.
+        self._assert_defers(
+            tmp_path, monkeypatch, platform=platform, self_apply=True
+        )
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_rename_without_run_in_flight_applies(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # The guard is scoped to a run in flight: with the lock free, a
+        # rename retires the old units and installs the new ones.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._rename_to_k(h)
+        assert h.apply("k") == "updated"
+        assert self._unit(h, platform, "k").exists()
+        assert not self._unit(h, platform, "j").exists()
 
 
 class TestApplyFullDiskAccess:

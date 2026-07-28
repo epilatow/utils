@@ -236,6 +236,17 @@ def _show_timer(unit: str) -> dict[str, str] | None:
     return props
 
 
+def _disable_unit(unit: str) -> None:
+    """Retire one unit by filename: `--now` stops it if it is running,
+    `disable` drops any `*.wants` symlink pointing at it. A unit systemd
+    does not know is tolerated, so a caller need not check first."""
+    subprocess.run(
+        _SYSTEMCTL_DISABLE + [unit],
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def _current_user() -> str:
     """Best-effort resolution of the invoking user's name, for the
     linger check. Falls back through env vars and getpwuid so the
@@ -448,11 +459,13 @@ class SystemdScheduler(Scheduler):
             self._run_checked(_SYSTEMCTL_RESTART + [timer])
 
     def deactivate(self, name: str) -> None:
-        subprocess.run(
-            _SYSTEMCTL_DISABLE + [_timer_filename(name)],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        # Both units, because either can be holding the entry live: the
+        # `.timer` arms a scheduled entry, and the `.service` is the unit
+        # that actually runs it -- and the only unit a schedule-less
+        # entry has at all. A `.timer` the entry never installed is
+        # simply unknown to systemd, which this tolerates.
+        for filename in (_timer_filename(name), _service_filename(name)):
+            _disable_unit(filename)
         subprocess.run(
             ["systemctl", "--user", "--quiet", "daemon-reload"],
             stderr=subprocess.DEVNULL,
@@ -460,17 +473,15 @@ class SystemdScheduler(Scheduler):
         )
 
     def remove_files(self, name: str) -> None:
-        # `deactivate` disables the canonical service / timer; a discovered
-        # `.timer` under any other suffix (a leftover) is disabled here too
-        # so no enabled `timers.target.wants` symlink survives its unlink.
+        # `deactivate` retires the canonical service / timer and settles
+        # the manager; the loop then retires every file actually on disk
+        # -- which includes a leftover under an old naming scheme that
+        # the canonical names don't reach. Re-retiring the canonical pair
+        # is redundant but harmless, and cheaper than reasoning about
+        # which discovered file `deactivate` already covered.
         self.deactivate(name)
         for filename in self._discover_unit_files(name):
-            if filename.suffix == ".timer":
-                subprocess.run(
-                    _SYSTEMCTL_DISABLE + [str(filename)],
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+            _disable_unit(str(filename))
             (self.unit_dir / filename).unlink(missing_ok=True)
 
     def verify(self) -> None:
@@ -515,15 +526,10 @@ class SystemdScheduler(Scheduler):
     def prune_units(self, name: str, keep: set[str]) -> None:
         # Remove every discovered unit file not in `keep`: an orphaned
         # .timer (scheduled -> unscheduled), or any stale file left by an
-        # old naming scheme. A .timer is disabled in the scheduler before
-        # it is unlinked.
+        # old naming scheme. Each is retired in the scheduler before it
+        # is unlinked.
         for filename in self._discover_unit_files(name):
             if str(filename) in keep:
                 continue
-            if filename.suffix == ".timer":
-                subprocess.run(
-                    _SYSTEMCTL_DISABLE + [str(filename)],
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+            _disable_unit(str(filename))
             (self.unit_dir / filename).unlink(missing_ok=True)

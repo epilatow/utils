@@ -23,7 +23,7 @@ import logging
 import os
 import shutil as shutil  # noqa: PLC0414  re-exported for tests
 import uuid
-from collections.abc import Iterator
+from collections.abc import Container, Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -793,6 +793,26 @@ def _units_changing(
     return False
 
 
+def _retired_name(
+    current: crony.model.Job | crony.model.JobGroup,
+    full_name: str,
+    live_full_names: Container[str],
+) -> str | None:
+    """The name whose platform units this apply retires, or None when it
+    retires none.
+
+    An entry that moves to a new name (same uuid, already applied under a
+    different one) keeps its uuid-keyed state dir but leaves its old
+    name's units behind, so those are retired and only the new name's
+    remain. The exception is a name-swap edit that handed the old name to
+    a live sibling: that sibling owns those units now, so they are not
+    this entry's to retire."""
+    old = str(current.entity_name)
+    if old == full_name or old in live_full_names:
+        return None
+    return old
+
+
 def _alias_pair_for_name(name: object) -> tuple[Path, str] | None:
     """The on-disk alias pair for a snapshot's recorded `name` field.
 
@@ -1005,11 +1025,9 @@ class ApplyResult(StrEnum):
     """The outcome of applying one entry, returned by `apply_one`.
 
     ADDED / UPDATED / UNCHANGED are the normal install verdicts.
-    DEFERRED means the entry's own running job is performing this apply
-    on a scheduler whose reload terminates the running unit (launchd)
-    and the apply would change the unit, so nothing is written and a
-    later apply reconciles it. A StrEnum so the apply log line renders
-    it as its plain value."""
+    DEFERRED means applying now would take a unit out from under a job
+    that is running, so nothing is written and a later apply reconciles
+    it. A StrEnum so the apply log line renders it as its plain value."""
 
     ADDED = "added"
     UPDATED = "updated"
@@ -1022,13 +1040,16 @@ def apply_one(
 ) -> ApplyResult:
     """Apply one selected entry from the loaded model.
 
-    DEFERRED means the entry's own running job is performing this
-    apply on a scheduler whose reload terminates the running unit
-    (launchd) and the apply would change the unit: nothing is written
-    (snapshot included) so the apply doesn't reload itself to death and
-    disk stays consistent. The caller surfaces a warning and a non-zero
-    exit, and a later apply reconciles the entry. A self-apply that
-    changes only the snapshot (no unit change) is applied normally.
+    DEFERRED means applying now would take a unit out from under a
+    running job, in either of two ways: the entry's own running job is
+    performing this apply on a scheduler whose reload terminates the
+    running unit (launchd) and the unit would change, or the entry is
+    moving to a new name while a run is in flight, whose retiring of the
+    old name's units stops them on every scheduler. Nothing is written
+    (snapshot included), so disk stays consistent; the caller surfaces a
+    warning and a non-zero exit, and a later apply reconciles the entry.
+    A self-apply that changes only the snapshot -- no unit change and no
+    rename -- is applied normally.
 
     `ref` must be a selected pending entry of `config` -- `do_apply`
     only applies what `config.pending` selected on this host. The
@@ -1140,21 +1161,38 @@ def apply_one(
             f"`crony apply` or `crony destroy` them first"
         )
 
-    # Same uuid, new name: the entry was renamed in config. The
-    # state dir (uuid-keyed) is reused under the new name, but the
-    # old name's platform unit is now stale -- remove it so only
-    # the new name's unit remains. The shared state dir is left
-    # alone (passing no state_dir to destroy_one). Skip when the
-    # old name is itself a live entry (a name-swap edit handed it
-    # to a sibling): that sibling owns the unit now, so removing it
-    # would unlink a unit a live entry is firing from.
+    # The rename cleanup below retires the old name's units, and
+    # retiring a unit stops it -- so an entry with a run in flight would
+    # be killed partway through, its old unit gone and the new one not
+    # yet installed. Defer instead, on every scheduler: `destroy`
+    # already refuses a running entry for this reason, and an apply that
+    # reaches the same teardown owes the run the same protection. The
+    # lock answers for any runner, including this entry applying itself
+    # (its runner holds the lock from another process).
     if (
         current_snapshot is not None
-        and str(current_snapshot.entity_name) != full_name
-        and str(current_snapshot.entity_name) not in live_full_names
+        and _retired_name(current_snapshot, full_name, live_full_names)
+        and run_in_progress(current_snapshot.state_dir)
+    ):
+        logger.warning(
+            "%s: deferring rename -- cannot retire the units of a "
+            "running job without terminating it; re-run "
+            "`crony apply %s` after this run exits",
+            full_name,
+            full_name,
+        )
+        return ApplyResult.DEFERRED
+
+    # Retire the units the entry left behind under a previous name. The
+    # shared uuid-keyed state dir is reused under the new name and is
+    # left alone (passing no state_dir to destroy_one); only the stale
+    # name's units go. A run in flight was already deferred above, so
+    # nothing here stops a live job.
+    if current_snapshot is not None and (
+        retired := _retired_name(current_snapshot, full_name, live_full_names)
     ):
         destroy_one(
-            str(current_snapshot.entity_name),
+            retired,
             None,
             current_snapshot.state_dir_symlink_path,
         )

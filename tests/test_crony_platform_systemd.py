@@ -118,7 +118,8 @@ class TestSystemdPriority:
 
 
 class TestSystemdScheduler:
-    """render() returns the right unit files for each schedule shape."""
+    """render() returns the right unit files for each schedule shape,
+    and the teardown side retires those units before unlinking them."""
 
     def _spec(self, timing: Timing | None) -> UnitSpec:
         return UnitSpec(
@@ -158,6 +159,28 @@ class TestSystemdScheduler:
             Path("crony-default.brew.service")
         ]
 
+    def test_deactivate_disables_service_and_timer(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Unlinking a unit file does not stop what systemd is already
+        # running, so both units are disabled first -- the `.timer` that
+        # arms a scheduled entry and the `.service` that runs it.
+        calls: list[list[str]] = []
+
+        def fake_run(*args: Any, **kwargs: Any) -> None:
+            calls.append(list(args[0] if args else kwargs.get("args", [])))
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        get_scheduler("linux", tmp_path).deactivate("default.brew")
+        disable = ["systemctl", "--user", "--quiet", "disable", "--now"]
+        timer = disable + ["crony-default.brew.timer"]
+        service = disable + ["crony-default.brew.service"]
+        assert timer in calls
+        assert service in calls
+        # Timer first: disarming after stopping the service would leave a
+        # window in which the still-armed timer re-fires it.
+        assert calls.index(timer) < calls.index(service)
+
     def test_remove_files_unlinks_service_and_timer(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -191,6 +214,7 @@ class TestSystemdScheduler:
         assert not service.exists()
         assert not leftover.exists()
         assert any("crony-default.j.oldscheme.timer" in c for c in calls)
+        assert any("crony-default.j.service" in c for c in calls)
 
     def test_remove_files_tolerates_absent(
         self, tmp_path: Path, monkeypatch: Any
@@ -671,6 +695,26 @@ class TestSystemdPruneDiscovers:
         sched.prune_units("default.j", {"crony-default.j.service"})
         assert service.exists()
         assert not leftover.exists()
+
+    def test_prune_retires_leftover_service(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A leftover `.service` is retired before it is unlinked, not
+        # just unlinked: unlinking leaves whatever systemd is running
+        # from it running, with no file left describing it.
+        calls: list[list[str]] = []
+
+        def fake_run(*args: Any, **kwargs: Any) -> None:
+            calls.append(list(args[0] if args else kwargs.get("args", [])))
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        leftover = tmp_path / "crony-default.j.oldscheme.service"
+        leftover.write_text("x")
+        sched = get_scheduler("linux", tmp_path)
+        sched.prune_units("default.j", set())
+        assert not leftover.exists()
+        disable = ["systemctl", "--user", "--quiet", "disable", "--now"]
+        assert disable + ["crony-default.j.oldscheme.service"] in calls
 
 
 class TestSystemdDefaultUnitDir:
