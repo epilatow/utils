@@ -42,7 +42,6 @@ from unittest.mock import Mock, call, patch
 import pytest
 from conftest import (
     CmdCallbacksBase,
-    ExceptionHierarchyBase,
     HelpWidthBase,
     UnknownArgRoutedToSubparserBase,
 )
@@ -62,7 +61,8 @@ _REAL_UV_CACHE_DIR = os.environ.get(
 
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import borgadm as ba  # noqa: E402
+import borgadm.errors as berr  # noqa: E402
+import borgadm_cli as ba  # noqa: E402
 import crony.cli as crony_cli  # noqa: E402
 import crony.unit  # noqa: E402
 
@@ -532,33 +532,33 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CALLBACKS = ba.COMMAND_CALLBACKS
     PARSER_FUNC = ba.args_parser
     CLI_FUNC = staticmethod(ba.cli)
-    EXIT_CODE_USAGE = ba.ExitCode.USAGE
+    EXIT_CODE_USAGE = berr.ExitCode.USAGE
     TEST_SUBCOMMAND = "environment"
     EXCEPTION_EXIT_CODE_MAP: ClassVar = [
-        (ba.ConfigError("t"), ba.ExitCode.CONFIG),
+        (berr.ConfigError("t"), berr.ExitCode.CONFIG),
         (
-            ba.SubprocessError(1, "cmd"),
-            ba.ExitCode.SUBPROCESS,
+            berr.SubprocessError(1, "cmd"),
+            berr.ExitCode.SUBPROCESS,
         ),
         (
-            ba.CheckNoBackupsError("t"),
-            ba.ExitCode.CHECK_NO_BACKUPS,
+            berr.CheckNoBackupsError("t"),
+            berr.ExitCode.CHECK_NO_BACKUPS,
         ),
-        (ba.CheckAgeError("t"), ba.ExitCode.CHECK_AGE),
+        (berr.CheckAgeError("t"), berr.ExitCode.CHECK_AGE),
         (
-            ba.CheckRepoError("t"),
-            ba.ExitCode.CHECK_REPO,
-        ),
-        (
-            ba.CheckArchivesError("t"),
-            ba.ExitCode.CHECK_ARCHIVES,
+            berr.CheckRepoError("t"),
+            berr.ExitCode.CHECK_REPO,
         ),
         (
-            ba.CheckPruneError("t"),
-            ba.ExitCode.CHECK_PRUNE,
+            berr.CheckArchivesError("t"),
+            berr.ExitCode.CHECK_ARCHIVES,
         ),
-        (ba.BorgadmError("t"), ba.ExitCode.ERROR),
-        (RuntimeError("t"), ba.ExitCode.CRASHED),
+        (
+            berr.CheckPruneError("t"),
+            berr.ExitCode.CHECK_PRUNE,
+        ),
+        (berr.BorgadmError("t"), berr.ExitCode.ERROR),
+        (RuntimeError("t"), berr.ExitCode.CRASHED),
     ]
     POPPED_ARGS: ClassVar = {
         "config",
@@ -776,7 +776,7 @@ class TestDelete:
                 autospec=True,
                 return_value={},
             ),
-            pytest.raises(ba.BorgadmError),
+            pytest.raises(berr.BorgadmError),
         ):
             ba.do_delete(
                 archive=None,
@@ -850,7 +850,7 @@ class TestDelete:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(ba.BorgadmError),
+            pytest.raises(berr.BorgadmError),
         ):
             ba.do_delete(
                 archive="20250101_120000",
@@ -917,7 +917,7 @@ class TestDelete:
                 autospec=True,
                 return_value=raw_result,
             ),
-            pytest.raises(ba.BorgadmError),
+            pytest.raises(berr.BorgadmError),
         ):
             ba.do_delete(
                 archive="home-set1-20250101_120000",
@@ -1380,7 +1380,7 @@ class TestAutomate(CronyAutomateBase):
 
     MODULE: ClassVar[Any] = ba
     BUNDLE = "borgadm"
-    ERROR = ba.BorgadmError
+    ERROR = berr.BorgadmError
     CRONY_PARSER = staticmethod(crony_cli._build_parser)
     EXPECTED_VERBS: ClassVar = {"apply", "status", "logs", "destroy"}
 
@@ -2028,7 +2028,7 @@ class TestCheck:
         """Test check age raises CheckNoBackupsError."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
-            pytest.raises(ba.CheckNoBackupsError),
+            pytest.raises(berr.CheckNoBackupsError),
         ):
             ba.do_check_age(bypass_lock=False)
 
@@ -2045,7 +2045,7 @@ class TestCheck:
                 autospec=True,
                 return_value={old_ts: ["repo::backup"]},
             ),
-            pytest.raises(ba.CheckAgeError),
+            pytest.raises(berr.CheckAgeError),
         ):
             ba.do_check_age(bypass_lock=False)
 
@@ -2068,7 +2068,7 @@ class TestCheck:
         """check archives --latest raises when no full backups exist."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
-            pytest.raises(ba.CheckNoBackupsError),
+            pytest.raises(berr.CheckNoBackupsError),
         ):
             ba.do_check_archives(
                 progress=False, latest=True, archive=[], bypass_lock=False
@@ -2104,11 +2104,11 @@ class TestCheck:
 
     def test_check_full_failure_raises(self, mock_cfg: Any) -> None:
         """A failing borg check surfaces as CheckFullError."""
-        err = ba.SubprocessError(2, ["borg", "check", mock_cfg.BORG_REPO])
+        err = berr.SubprocessError(2, ["borg", "check", mock_cfg.BORG_REPO])
         with (
             patch.object(ba, "run_borg", autospec=True, side_effect=err),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            pytest.raises(ba.CheckFullError),
+            pytest.raises(berr.CheckFullError),
         ):
             ba.do_check_full(progress=False, bypass_lock=False)
 
@@ -2230,7 +2230,7 @@ class TestCheck:
             patch.object(ba, "list_backups", autospec=True, return_value={}),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
-            pytest.raises(ba.BorgadmError, match="timestamp"),
+            pytest.raises(berr.BorgadmError, match="timestamp"),
         ):
             ba.do_check_archives(
                 progress=False,
@@ -2251,7 +2251,7 @@ class TestCheck:
             ),
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as mock_run_borg,
-            pytest.raises(ba.BorgadmError),
+            pytest.raises(berr.BorgadmError),
         ):
             ba.do_check_archives(
                 progress=False,
@@ -2305,7 +2305,7 @@ class TestCheck:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(ba.CheckPruneError),
+            pytest.raises(berr.CheckPruneError),
         ):
             ba.do_check_prune(bypass_lock=False)
 
@@ -2336,7 +2336,7 @@ class TestCheck:
                 autospec=True,
                 side_effect=list_backups_side_effect,
             ),
-            pytest.raises(ba.CheckPruneError),
+            pytest.raises(berr.CheckPruneError),
         ):
             ba.do_check_prune(bypass_lock=False)
 
@@ -2391,7 +2391,7 @@ class TestSelectedBackup:
         """No selector against a repo with no full backups fails."""
         with (
             patch.object(ba, "list_backups", autospec=True, return_value={}),
-            pytest.raises(ba.BorgadmError, match="No full backups"),
+            pytest.raises(berr.BorgadmError, match="No full backups"),
         ):
             ba._selected_backup(None, bypass_lock=False)
 
@@ -2452,7 +2452,7 @@ class TestSelectedBackup:
             patch.object(
                 ba, "list_backups_raw", autospec=True, return_value=raw
             ),
-            pytest.raises(ba.BorgadmError, match="borgadm-managed"),
+            pytest.raises(berr.BorgadmError, match="borgadm-managed"),
         ):
             ba._selected_backup("someone-elses-archive", bypass_lock=False)
 
@@ -2566,13 +2566,13 @@ class TestRunBorg:
         self, mock_cfg: Any
     ) -> None:
         """The sudo cleanup runs even when the borg command raises."""
-        err = ba.SubprocessError(2, ["borg"], output="", stderr="boom")
+        err = berr.SubprocessError(2, ["borg"], output="", stderr="boom")
         with (
             patch.object(
                 ba, "run_cmd", autospec=True, side_effect=[err, None]
             ) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            pytest.raises(ba.SubprocessError),
+            pytest.raises(berr.SubprocessError),
         ):
             ba.run_borg(
                 ["borg", "mount", mock_cfg.BORG_REPO, "/mnt"],
@@ -2702,7 +2702,7 @@ class TestRunBorg:
                 ba, "run_cmd", autospec=True, return_value=failure
             ) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            pytest.raises(ba.SubprocessError) as exc,
+            pytest.raises(berr.SubprocessError) as exc,
         ):
             ba.run_borg(["borg", "create", mock_cfg.BORG_REPO], repo_write=True)
         assert exc.value.returncode == 2
@@ -3049,7 +3049,7 @@ class TestRsyncMountCleanup:
         target = tmp_path / "borg-rsync"
         target.mkdir()
         archives = ["repo::home-fuse-1of2"]
-        err = ba.SubprocessError(2, ["borg"], output="", stderr="boom")
+        err = berr.SubprocessError(2, ["borg"], output="", stderr="boom")
 
         def fake_mounts(root: Path) -> list[tuple[Path, str]]:
             return [(root / "home-fuse-1of2", "fuse")]
@@ -3069,7 +3069,7 @@ class TestRsyncMountCleanup:
                 ba, "_mounts_under", autospec=True, side_effect=fake_mounts
             ),
             patch.object(ba, "run_cmd", autospec=True) as mock_run,
-            pytest.raises(ba.SubprocessError),
+            pytest.raises(berr.SubprocessError),
         ):
             ba.do_rsync(
                 target,
@@ -3129,7 +3129,7 @@ class TestConfigCommands:
     def test_init_refuses_existing_without_force(self) -> None:
         """An existing config is left intact unless --force is given."""
         ba.CONFIG.write_text("KEEP ME", encoding="utf-8")
-        with pytest.raises(ba.ConfigError, match="already exists"):
+        with pytest.raises(berr.ConfigError, match="already exists"):
             ba.do_config_init(str(ba.CONFIG), force=False)
         assert ba.CONFIG.read_text(encoding="utf-8") == "KEEP ME"
 
@@ -3167,12 +3167,12 @@ class TestConfigCommands:
     def test_init_cli_writes_then_refuses_then_forces(self) -> None:
         """`config init` writes, refuses a second run, and --force wins."""
         with patch("sys.argv", ["borgadm", "config", "init"]):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
         assert ba.CONFIG.exists()
         with patch("sys.argv", ["borgadm", "config", "init"]):
-            assert ba.cli() == ba.ExitCode.CONFIG
+            assert ba.cli() == berr.ExitCode.CONFIG
         with patch("sys.argv", ["borgadm", "config", "init", "--force"]):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
 
     def test_init_cli_honors_config_flag(self, tmp_path: Path) -> None:
         """`config init --config PATH` writes PATH, not the default."""
@@ -3181,7 +3181,7 @@ class TestConfigCommands:
             "sys.argv",
             ["borgadm", "config", "init", "--config", str(dest)],
         ):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
         assert dest.exists()
         assert not ba.CONFIG.exists()
 
@@ -3200,7 +3200,7 @@ class TestConfigCommands:
             ),
             caplog.at_level(logging.INFO),
         ):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
         assert any("config valid:" in r.message for r in caplog.records)
 
     def test_validate_cli_reports_errors(self, tmp_path: Path) -> None:
@@ -3213,7 +3213,7 @@ class TestConfigCommands:
             "sys.argv",
             ["borgadm", "config", "validate", "--config", str(cfg_file)],
         ):
-            assert ba.cli() == ba.ExitCode.CONFIG
+            assert ba.cli() == berr.ExitCode.CONFIG
 
     @pytest.mark.parametrize(
         "repo",
@@ -3237,7 +3237,7 @@ class TestConfigCommands:
             'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
             encoding="utf-8",
         )
-        with pytest.raises(ba.ConfigError, match="BORG_REPO must not contain"):
+        with pytest.raises(berr.ConfigError, match="BORG_REPO must not contain"):
             ba.Config(str(cfg_file), {})
 
     @pytest.mark.parametrize(
@@ -3295,7 +3295,7 @@ class TestConfigCommands:
             'BACKUP_SETS = {"s": {"paths": ["x"]}}\n',
             encoding="utf-8",
         )
-        with pytest.raises(ba.ConfigError, match="Borg placeholder"):
+        with pytest.raises(berr.ConfigError, match="Borg placeholder"):
             ba.Config(str(cfg_file), {})
 
     @pytest.mark.parametrize(
@@ -3349,7 +3349,7 @@ class TestConfigCommands:
             "sys.argv",
             ["borgadm", "config", "validate", "--config", str(cfg_file)],
         ):
-            assert ba.cli() == ba.ExitCode.CONFIG
+            assert ba.cli() == berr.ExitCode.CONFIG
 
     def test_validate_cli_missing_file(self, tmp_path: Path) -> None:
         """Validating an absent config file fails with CONFIG."""
@@ -3363,7 +3363,7 @@ class TestConfigCommands:
                 str(tmp_path / "nope"),
             ],
         ):
-            assert ba.cli() == ba.ExitCode.CONFIG
+            assert ba.cli() == berr.ExitCode.CONFIG
 
     def test_generated_config_is_valid(self, tmp_path: Path) -> None:
         """The config `config init` generates is ASCII, parses as INI,
@@ -3401,12 +3401,12 @@ class TestConfigCommands:
             "sys.argv",
             ["borgadm", "config", "init", "--config", str(cfg_file)],
         ):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
         with patch(
             "sys.argv",
             ["borgadm", "config", "validate", "--config", str(cfg_file)],
         ):
-            assert ba.cli() == ba.ExitCode.SUCCESS
+            assert ba.cli() == berr.ExitCode.SUCCESS
 
 
 class TestRequireBorgOrFail:
@@ -3439,11 +3439,11 @@ class TestMain:
                 ba,
                 "Config",
                 autospec=True,
-                side_effect=ba.ConfigError("setup-boom"),
+                side_effect=berr.ConfigError("setup-boom"),
             ),
             patch.object(ba, "initialize_logger", autospec=True),
             caplog.at_level(logging.ERROR),
-            pytest.raises(ba.ConfigError),
+            pytest.raises(berr.ConfigError),
         ):
             ba.main(
                 command="environment",
@@ -3635,10 +3635,10 @@ class TestStartEndMarkers:
             patch.object(ba, "initialize_borg_environment", autospec=True),
             patch.dict(
                 ba.COMMAND_CALLBACKS,
-                {"compact": Mock(side_effect=ba.BorgadmError("test error"))},
+                {"compact": Mock(side_effect=berr.BorgadmError("test error"))},
             ),
             caplog.at_level(logging.INFO),
-            pytest.raises(ba.BorgadmError),
+            pytest.raises(berr.BorgadmError),
         ):
             ba.main(
                 command="compact",
@@ -3761,7 +3761,7 @@ class TestTimestampPruning:
             config_file.flush()
             config_name = config_file.name
 
-        with pytest.raises(ba.ConfigError):
+        with pytest.raises(berr.ConfigError):
             ba.Config(config_name, {})
 
 
@@ -3776,7 +3776,7 @@ import logging
 import sys
 
 sys.path.insert(0, {src!r})
-import borgadm
+import borgadm_cli as borgadm
 
 logger = logging.getLogger("test_pipe")
 logger.setLevel(logging.DEBUG)
@@ -3977,7 +3977,7 @@ class TestCli:
                 # a direct attribute write fails mypy --strict
                 # (attr-defined), so setattr stays.
                 setattr(ba, "_warning_occurred", True)  # noqa: B010
-                assert ba.cli() == ba.ExitCode.WARNING
+                assert ba.cli() == berr.ExitCode.WARNING
         finally:
             setattr(ba, "_warning_occurred", original)  # noqa: B010
 
@@ -3999,7 +3999,7 @@ class TestCli:
             pytest.raises(SystemExit) as exc_info,
         ):
             ba.cli()
-        assert exc_info.value.code == ba.ExitCode.USAGE
+        assert exc_info.value.code == berr.ExitCode.USAGE
         out = capsys.readouterr().out
         assert f"usage: borgadm {sub}" in out
         # Full help lists the subcommand's available actions.
@@ -4013,7 +4013,7 @@ class TestCli:
             patch.object(ba, "main", autospec=True) as mock_main,
         ):
             result = ba.cli()
-        assert result == ba.ExitCode.SUCCESS
+        assert result == berr.ExitCode.SUCCESS
         mock_main.assert_called_once()
 
 
@@ -5498,19 +5498,6 @@ class TestE2ECfgDrift:
             _archive_name("set-a", keep_ts, 1, 2),
             _archive_name("set-b", keep_ts, 2, 2),
         ]
-
-
-class TestExceptionHierarchy(ExceptionHierarchyBase):
-    """Test BorgadmError exception hierarchy."""
-
-    BASE_ERROR = ba.BorgadmError
-    EXIT_CODE = ba.ExitCode
-    EXCLUDED_CODES: ClassVar = {
-        ba.ExitCode.SUCCESS,
-        ba.ExitCode.WARNING,
-        ba.ExitCode.USAGE,
-        ba.ExitCode.CRASHED,
-    }
 
 
 class TestHelpWidth(HelpWidthBase):

@@ -46,9 +46,11 @@ mypy-python-version = "3.14"
 # which ruff/mypy auto-discovery (it globs ``*.py``) can't see. Each is
 # exposed to discovery -- and made importable as a typed module by the
 # tests -- via a ``src/<module>.py`` symlink to it, resolved against
-# ``[tool.mypy] mypy_path = ["src"]``. ``bin/crony`` is the exception:
-# its logic lives in the ``src/crony`` package, so a ``src/crony.py``
-# alias would collide with that package; it stays a manual target here.
+# ``[tool.mypy] mypy_path = ["src"]``. Borgadm's alias lives at
+# ``src/borgadm_cli.py`` because its implementation package occupies the
+# top-level name. ``bin/crony`` is the other exception: its logic lives in
+# the ``src/crony`` package, so a ``src/crony.py`` alias would collide with
+# that package; it stays a manual target here.
 # ``tests/`` is picked up by discovery automatically.
 python-targets = [
     "bin/crony",
