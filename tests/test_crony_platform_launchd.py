@@ -295,11 +295,21 @@ class TestLaunchdReload:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.activate("default.j", scheduled=True)
+        sched.activate("default.j", Interval.from_str("1h"))
         assert self._subs(calls) == ["bootout", "bootstrap"]
         # No deprecated load/unload anywhere.
         assert "load" not in self._subs(calls)
         assert "unload" not in self._subs(calls)
+
+    def test_schedule_less_entry_is_bootstrapped(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        # A grouped / disabled entry has no timing to arm, and launchd
+        # carries the schedule in the plist itself, so activate loads it
+        # exactly like a scheduled one -- registered, just dormant.
+        sched, calls = self._setup(monkeypatch, tmp_path)
+        sched.activate("default.j", None)
+        assert self._subs(calls) == ["bootout", "bootstrap"]
 
     def test_bootstrap_retries_spurious_eio(
         self, monkeypatch: Any, tmp_path: Path
@@ -307,7 +317,7 @@ class TestLaunchdReload:
         # First bootstrap returns errno 5, second succeeds: the reload
         # re-settles and retries rather than surfacing the race.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(5, 0))
-        sched.activate("default.j", scheduled=True)
+        sched.activate("default.j", Interval.from_str("1h"))
         assert self._subs(calls).count("bootstrap") == 2
         assert self._subs(calls).count("bootout") == 2
 
@@ -318,7 +328,7 @@ class TestLaunchdReload:
             monkeypatch, tmp_path, bootstrap_rcs=(5, 5, 5)
         )
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", scheduled=True)
+            sched.activate("default.j", Interval.from_str("1h"))
         assert (
             self._subs(calls).count("bootstrap") == launchd._BOOTSTRAP_ATTEMPTS
         )
@@ -330,7 +340,7 @@ class TestLaunchdReload:
         # surfaces at once rather than burning the retry budget.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(1,))
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", scheduled=True)
+            sched.activate("default.j", Interval.from_str("1h"))
         assert self._subs(calls).count("bootstrap") == 1
 
     def test_plutil_validation_failure_raises_subprocess_error(
@@ -350,7 +360,7 @@ class TestLaunchdReload:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", scheduled=True)
+            sched.activate("default.j", Interval.from_str("1h"))
         assert not any(c[:2] == ["launchctl", "bootstrap"] for c in calls)
 
     def test_trigger_failure_raises_subprocess_error(
@@ -389,7 +399,7 @@ class TestLaunchdReload:
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
         monkeypatch.setattr(launchd, "_is_loaded", is_loaded)
-        sched.activate("default.j", scheduled=True)
+        sched.activate("default.j", Interval.from_str("1h"))
         # Polled until the label cleared, then bootstrapped.
         assert len(polled) >= 3
         assert self._subs(calls) == ["bootout", "bootstrap"]
@@ -410,7 +420,7 @@ class TestLaunchdReload:
             return elapsed[0]
 
         monkeypatch.setattr(time, "monotonic", fake_monotonic)
-        sched.activate("default.j", scheduled=True)
+        sched.activate("default.j", Interval.from_str("1h"))
         assert "bootstrap" in self._subs(calls)
 
 
@@ -622,7 +632,7 @@ class TestLaunchdJitter:
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
         monkeypatch.setattr(launchd, "_is_loaded", lambda _lbl: False)
         get_scheduler("darwin", tmp_path).activate(
-            "default.brew", scheduled=True
+            "default.brew", Interval.from_str("1h")
         )
         bootstrapped = {
             c[3].rsplit("/", 1)[-1]

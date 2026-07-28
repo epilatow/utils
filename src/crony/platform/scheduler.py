@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import crony.errors
-from crony.unit import UnitSpec, is_scheduled
+from crony.unit import Timing, UnitSpec
 
 # On-disk unit-naming prefix. Existing units are named
 # `org.crony.<name>.plist` (launchd) / `crony-<name>.{service,timer}`
@@ -202,8 +202,8 @@ class Scheduler(abc.ABC):
         stale anchor. All files are written before any reload. `activate`
         is False only for a self-reload that fell through because the unit
         did not change (reloading would kill the running job for nothing).
-        Whether the entry arms a schedule is `is_scheduled(spec.timing)`
-        -- a disabled, on-demand, or transit entry renders dormant."""
+        The spec's timing reaches `activate` whole, which decides what to
+        arm."""
         rendered = self.render_units(spec)
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         keep = {str(u.filename) for u in rendered.units}
@@ -211,7 +211,7 @@ class Scheduler(abc.ABC):
         for u in rendered.units:
             (self.unit_dir / u.filename).write_text(u.content, encoding="utf-8")
         if activate:
-            self.activate(str(spec.name), scheduled=is_scheduled(spec.timing))
+            self.activate(str(spec.name), spec.timing)
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:
@@ -284,16 +284,21 @@ class Scheduler(abc.ABC):
         the live outcome."""
 
     @abc.abstractmethod
-    def activate(self, name: str, *, scheduled: bool) -> None:
+    def activate(self, name: str, timing: Timing | None, /) -> None:
         """Load the unit (whose files the caller has already written)
-        into the scheduler. `scheduled` is False for a schedule-less
-        entry -- a grouped / transit unit or a disabled one -- that
-        registers (loaded, triggerable) but does not arm a schedule."""
+        into the scheduler, arming whatever `timing` calls for.
+
+        `timing` is the entry's firing mode as the model resolved it, so
+        a backend reads from it whichever distinctions its own scheduler
+        draws rather than being handed one pre-collapsed answer. A
+        schedule-less entry -- a grouped / transit unit or a disabled one
+        -- registers (loaded, triggerable) but arms nothing."""
 
     @abc.abstractmethod
     def deactivate(self, name: str) -> None:
-        """Remove the unit from the scheduler. Tolerant of an
-        already-absent unit so destroy never fails on a missing one."""
+        """Remove the unit from the scheduler, stopping it if it is
+        running. Tolerant of an already-absent unit so destroy never
+        fails on a missing one."""
 
     # B027: the empty body is an intentional default no-op hook, not a
     # forgotten @abstractmethod -- most backends render no companion.

@@ -25,6 +25,7 @@ from crony.unit import (
     Interval,
     PriorityClass,
     Schedule,
+    Timing,
     UnitSpec,
     is_scheduled,
 )
@@ -430,7 +431,7 @@ class SystemdScheduler(Scheduler):
             out[name] = UnitLastExit(exit_status=-raw if killed else raw)
         return out
 
-    def activate(self, name: str, *, scheduled: bool) -> None:
+    def activate(self, name: str, timing: Timing | None, /) -> None:
         # --quiet suppresses systemctl's success-path "Created symlink"
         # chatter; real errors still print.
         self._run_checked(["systemctl", "--user", "--quiet", "daemon-reload"])
@@ -441,7 +442,7 @@ class SystemdScheduler(Scheduler):
         # running -- a plain `enable --now` would no-op the start on an
         # active timer and leave an interval schedule stuck on its stale
         # activation, unable to fire.
-        if scheduled:
+        if is_scheduled(timing):
             timer = _timer_filename(name)
             self._run_checked(_SYSTEMCTL_ENABLE + [timer])
             self._run_checked(_SYSTEMCTL_RESTART + [timer])

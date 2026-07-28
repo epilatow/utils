@@ -399,8 +399,9 @@ class LaunchdScheduler(Scheduler):
             )
         ]
 
-    def activate(self, name: str, *, scheduled: bool) -> None:
-        del scheduled  # a plist with no Start* keys loads fine, dormant
+    def activate(self, name: str, _timing: Timing | None, /) -> None:
+        # The schedule rides in the plist itself, so there is nothing to
+        # arm separately: a plist with no Start* keys loads fine, dormant.
         # Bootstrap every unit the entity left on disk -- the service and,
         # for a jittered interval job, its companion. A re-apply re-anchors
         # the service, so the companion (which self-unloads after its one

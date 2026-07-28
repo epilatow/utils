@@ -223,7 +223,7 @@ class TestSystemdActivate:
     ) -> None:
         calls = self._record(monkeypatch)
         get_scheduler("linux", tmp_path).activate(
-            "default.brew", scheduled=True
+            "default.brew", Interval.from_str("1h")
         )
         timer = "crony-default.brew.timer"
         reload_c = ["systemctl", "--user", "--quiet", "daemon-reload"]
@@ -241,9 +241,7 @@ class TestSystemdActivate:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         calls = self._record(monkeypatch)
-        get_scheduler("linux", tmp_path).activate(
-            "default.grp", scheduled=False
-        )
+        get_scheduler("linux", tmp_path).activate("default.grp", None)
         assert calls == [["systemctl", "--user", "--quiet", "daemon-reload"]]
 
     def test_failed_command_raises_subprocess_error(
@@ -259,7 +257,7 @@ class TestSystemdActivate:
         )
         with pytest.raises(SubprocessError):
             get_scheduler("linux", tmp_path).activate(
-                "default.brew", scheduled=True
+                "default.brew", Interval.from_str("1h")
             )
 
     def test_trigger_uses_no_block(
