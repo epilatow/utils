@@ -23,12 +23,15 @@ class ExitCode(ExitCodeBase):
     CRASHED = CommonExitCode.CRASHED
     LOCK_BUSY = 10, "run.lock held by another instance"
     PRECONDITION = 11, "run precondition failed before exec"
+    DAEMON_EXITED = 12, "daemon command exited; supervisor should restart"
 
 
 # Exit codes returned only by the internal `crony _run` path, never by a
 # user-facing subcommand. Omitted from user documentation (the man page),
 # the same way `_run` itself is.
-INTERNAL_EXIT_CODES = frozenset({ExitCode.LOCK_BUSY, ExitCode.PRECONDITION})
+INTERNAL_EXIT_CODES = frozenset(
+    {ExitCode.LOCK_BUSY, ExitCode.PRECONDITION, ExitCode.DAEMON_EXITED}
+)
 
 
 class CronyError(RuntimeError):

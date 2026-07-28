@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -2403,3 +2404,74 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestDaemonJobStatus:
+    """A daemon's STATUS cell is about whether it is up. A disabled one
+    reports `disabled` rather than the signal death that stopping it
+    recorded, which would otherwise read `fail`."""
+
+    def _derive(self, **kw: Any) -> Any:
+        args: dict[str, Any] = {
+            "is_running": False,
+            "is_pending": False,
+            "run_pid": None,
+            "last_run": None,
+            "unit_last_exit": None,
+        }
+        args.update(kw)
+        return crony_runtime._derive_job_status(**args)
+
+    def test_disabled_daemon_reports_disabled(self) -> None:
+        assert (
+            self._derive(disabled_daemon=True) == crony_model.JobStatus.DISABLED
+        )
+
+    def test_running_outranks_disabled(self) -> None:
+        # A disabled daemon someone triggered by hand really is running,
+        # and that is the more useful cell.
+        assert (
+            self._derive(is_running=True, disabled_daemon=True)
+            == crony_model.JobStatus.RUNNING
+        )
+
+    def test_enabled_daemon_is_unaffected(self) -> None:
+        assert self._derive() == crony_model.JobStatus.NEVER
+
+
+class TestDestroyRunSettle:
+    """`destroy_one` retires the unit before removing the state dir, but
+    stopping it is not synchronous everywhere and a runner ignores the
+    stop signal so it can record first. The removal waits for that."""
+
+    def _state_dir(self, tmp_path: Path) -> Path:
+        sd = tmp_path / "state"
+        sd.mkdir()
+        return sd
+
+    def test_waits_for_a_held_lock(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        sd = self._state_dir(tmp_path)
+        released: list[float] = []
+
+        def fake_run_in_progress(_sd: Path) -> bool:
+            # Held for the first few polls, then free.
+            released.append(time.monotonic())
+            return len(released) < 3
+
+        monkeypatch.setattr(
+            crony_runtime, "run_in_progress", fake_run_in_progress
+        )
+        crony_runtime._await_run_finished(sd)
+        assert len(released) >= 3
+        assert sd.is_dir()  # the wait itself removes nothing
+
+    def test_is_bounded(self, tmp_path: Path, monkeypatch: Any) -> None:
+        # A wedged runner must delay a destroy, not hang it.
+        sd = self._state_dir(tmp_path)
+        monkeypatch.setattr(crony_runtime, "run_in_progress", lambda _sd: True)
+        monkeypatch.setattr(crony_runtime, "_RUN_SETTLE_TIMEOUT_SEC", 0.2)
+        started = time.monotonic()
+        crony_runtime._await_run_finished(sd)
+        assert time.monotonic() - started < 5

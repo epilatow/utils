@@ -15,7 +15,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.unit import (
+    DAEMON_SPEC,
     ON_DEMAND_SPEC,
+    Daemon,
     EntityName,
     EntityRef,
     Interval,
@@ -24,6 +26,8 @@ from crony.unit import (
     PriorityClass,
     Schedule,
     UnitSpec,
+    is_daemon,
+    is_scheduled,
     name_is_dotted_prefix,
 )
 
@@ -267,3 +271,36 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestDaemonTiming:
+    """The continuous firing mode: its own Timing variant, arming no
+    timer, and its supervision carrier on the UnitSpec."""
+
+    def test_str_round_trips_the_display_token(self) -> None:
+        assert str(Daemon()) == DAEMON_SPEC == "daemon"
+
+    def test_is_daemon_discriminates(self) -> None:
+        assert is_daemon(Daemon())
+        for other in (
+            Schedule.from_str("daily"),
+            Interval.from_str("1h"),
+            OnDemand(),
+            None,
+        ):
+            assert not is_daemon(other)
+
+    def test_arms_no_timer(self) -> None:
+        # A daemon starts itself, but not off a timer -- so the backends'
+        # "does this need a .timer / Start* key" question is False.
+        assert not is_scheduled(Daemon())
+
+    def test_unit_spec_daemon_defaults_none(self) -> None:
+        spec = UnitSpec(
+            name=EntityName.from_str("default.j"),
+            cmd=("/bin/true",),
+            timing=Daemon(),
+            priority=PriorityClass.NORMAL,
+        )
+        # Timing alone never implies the carrier; the model sets it.
+        assert spec.daemon is None

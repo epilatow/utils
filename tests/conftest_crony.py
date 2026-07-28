@@ -66,7 +66,8 @@ def _resolved_flags(
         return by_name[short]
     entry = config.jobs.get(short) or config.job_groups.get(short)
     delta = entry.flags if entry is not None else {}
-    return config.composed_flags(delta)
+    timing = entry.timing if entry is not None else None
+    return config.composed_flags(delta, timing)
 
 
 def _resolve_snapshot_for(

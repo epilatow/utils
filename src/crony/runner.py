@@ -36,6 +36,7 @@ from typing import (
     get_args,
 )
 
+import crony.config
 import crony.errors
 import crony.model
 import crony.notify
@@ -499,6 +500,12 @@ def _run_job(snap: crony.model.Job) -> int:
     skip. Precondition failures (missing script) are signalled by
     raising PreconditionError -- cli() maps that to
     ExitCode.PRECONDITION.
+
+    For a daemon the code is instead a message to the supervisor about
+    whether to restart: ExitCode.DAEMON_EXITED when the command exited
+    cleanly (bring it back), and 0 for both a gated skip and lock
+    contention (leave it down -- its precondition is unmet, or another
+    instance already holds the lock).
     """
     full_name = str(snap.entity_name)
 
@@ -519,9 +526,20 @@ def _run_job(snap: crony.model.Job) -> int:
     last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
+    # A daemon's exit codes mean something different to the supervisor;
+    # see the DAEMON_EXITED arm below.
+    is_daemon = crony.unit.is_daemon(snap.timing)
     notify_channels, notify_defaults, success_ratio = (
         crony.notify.resolve_notify_at_runtime(full_name)
     )
+    if is_daemon:
+        # A daemon sends no failure notifications: its command exiting is
+        # routine, and the supervisor restarts it -- a crash loop must
+        # not become a notification loop. Clearing the channels is what
+        # makes the dispatch below a no-op; the ratio goes back to the
+        # default so no exit-history window is kept for one either.
+        notify_channels = []
+        success_ratio = crony.config.DEFAULT_SUCCESS_RATIO
     # snap.env stores the user-written env literally; overlay it on
     # the inherited env at fire time (see _runtime_env).
     env = _runtime_env(snap.env)
@@ -681,6 +699,13 @@ def _run_job(snap: crony.model.Job) -> int:
                     exit_class = crony.model.ExitClass.OK
                     exit_code = rc
                     surfaced_rc = 0
+                    if is_daemon:
+                        # A daemon exiting is not the end of its work, so
+                        # the surfaced code has to ask the supervisor for
+                        # a restart. The record still says `ok` -- the
+                        # command did exit cleanly -- and only the code
+                        # the scheduler sees changes.
+                        surfaced_rc = int(crony.errors.ExitCode.DAEMON_EXITED)
                 else:
                     exit_class = crony.model.ExitClass.FAIL
                     exit_code = rc
@@ -764,6 +789,12 @@ def _run_job(snap: crony.model.Job) -> int:
                 f"[{crony.runtime.now_iso()}] LOCK_BUSY: skipping "
                 f"(already running)\n".encode()
             )
+        # For a daemon every non-zero exit asks the supervisor to restart,
+        # so surfacing LOCK_BUSY would have it respawn against the runner
+        # already holding the lock, once per backoff, forever. The
+        # instance holding the lock is the one that should keep running.
+        if is_daemon:
+            return 0
         return int(crony.errors.ExitCode.LOCK_BUSY)
 
 

@@ -172,7 +172,12 @@ gated by platform checks.
   test-only live env seams -- `CRONY_MIN_INTERVAL_SECONDS` (the config floor)
   and `CRONY_JITTER_FLOOR_SECONDS` (the jitter-eligibility floor) -- so the
   companion fires within seconds instead of the 10m production floor; both
-  read live per call and default to the production values when unset.
+  read live per call and default to the production values when unset. The
+  daemon tests drive a third seam the same way, `CRONY_DAEMON_RESTART_SECONDS`
+  (the supervisor's restart backoff), so a restart lands in seconds instead of
+  the 30s production default. It is baked into the rendered unit, so it must
+  stay set for the whole test -- including any `crony status` call, which
+  would otherwise report drift.
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm
   suite ~20x slower than Linux and intermittently cross its 120s per-call

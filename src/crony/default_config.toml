@@ -149,8 +149,9 @@
 # scheduled group dispatches it. Validation rejects a target chain
 # that reaches a job through a path with no firing point anywhere --
 # give the job a schedule / interval, place it under a scheduled group,
-# or set `on-demand = true` (see reindex below) to make it a
-# trigger-only job run solely via `crony trigger`.
+# set `on-demand = true` (see reindex below) to make it a trigger-only
+# job run solely via `crony trigger`, or set `daemon = true` (see
+# codex-remote-control below) to run it continuously.
 #
 # `uuid` is the stable per-bundle identity of the entry, decoupled
 # from `name` so that renaming a job in this file is recognized as
@@ -224,6 +225,30 @@
 #command   = "reindex --full"
 #on-demand = true
 
+# Daemon job: runs continuously instead of at scheduled times. It starts
+# at login and is restarted whenever its command exits, so use it for a
+# process that is meant to stay up. `daemon = true` is mutually
+# exclusive with `schedule` / `interval` / `on-demand`, and shows
+# `daemon` in `crony status`.
+#
+# The gate runs before every start, so it doubles as a precondition: a
+# daemon whose gate fails stays stopped rather than restarting in a loop,
+# and comes back at the next login, `crony apply`, or `crony trigger`.
+#
+# A daemon cannot be a [job-group.*] member (a group waits for each child
+# to finish), and rejects a non-zero `job-timeout-sec` (it is uncapped by
+# definition), `interactive` / `keep-awake`, and the notify keys
+# (`notify-channels` / `notify-success-ratio`) -- its command exiting is
+# routine, not a failure to report. Only a setting that asks for
+# something the mode does not already do is rejected, so the "off"
+# spellings (`job-timeout-sec = 0`, `notify-channels = []`, a flag set
+# false) are accepted. An inherited value is dropped rather than
+# rejected, so a [defaults] setting never invalidates a daemon.
+#[job.codex-remote-control]
+#command = "codex remote-control"
+#gate    = "command -v codex"
+#daemon  = true
+
 # Interactive job: sits pending after its fire and pops a
 # desktop dialog (Run / Delay / Cancel) once the user has been
 # active continuously for `interactive-active` (default 10min).
@@ -248,10 +273,15 @@
 # Schedule / interval are optional: a group with no schedule is a
 # "transit" group that fires only when a parent group dispatches it.
 # Every chain from a target down through groups to a leaf job must reach
-# a firing point somewhere -- a schedule, an interval, or an on-demand
-# entry (`on-demand = true`, valid on a group too) -- or validation
-# rejects it. An on-demand group is triggered as a unit via
-# `crony trigger <group>`, dispatching its children on demand.
+# a firing point somewhere -- a schedule, an interval, an on-demand
+# entry (`on-demand = true`, valid on a group too), or a daemon
+# (`daemon = true`, jobs only) -- or validation rejects it. An on-demand
+# group is triggered as a unit via `crony trigger <group>`, dispatching
+# its children on demand.
+#
+# A group runs each child to completion before the next, so neither a
+# group itself nor any of its members may be a daemon: `daemon = true`
+# here, or a `jobs` entry naming one, is a config error.
 
 #[job-group.daily-updates]
 #uuid      = "11223344-5566-7788-99aa-bbccddeeff00"

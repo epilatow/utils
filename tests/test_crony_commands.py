@@ -49,6 +49,7 @@ from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
 from crony import runner as crony_runner  # noqa: E402
 from crony import runtime as crony_runtime  # noqa: E402
+from crony import unit as crony_unit  # noqa: E402
 from crony.config import (  # noqa: E402
     DEFAULT_BUNDLE_NAME,
     JobFlagNames,
@@ -7273,8 +7274,9 @@ class TestStatusFullDiskAccess:
 
 class TestStatusExcludeHealthy:
     """`crony status --exclude-healthy` drops synced + ok / never /
-    gated rows and renders flat (no tree indent). Always exits 0 --
-    this is a filter on the display, not a gate.
+    gated rows -- plus a daemon that is running, its steady state --
+    and renders flat (no tree indent). Always exits 0 -- this is a
+    filter on the display, not a gate.
     """
 
     def test_healthy_row_filtered_out(
@@ -7386,6 +7388,90 @@ class TestStatusExcludeHealthy:
         )
         out = capsys.readouterr().out
         assert "default.paused" in out
+
+    def _status_excluding_healthy(self, capsys: Any) -> str:
+        crony_commands.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=True,
+        )
+        return str(capsys.readouterr().out)
+
+    def test_running_daemon_is_healthy(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Staying up is a daemon's steady state, so a running one is
+        # not a problem to surface -- otherwise every daemon would be
+        # permanent noise in the filtered view.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        sd = h.state_dir("d")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            assert "default.d" not in self._status_excluding_healthy(capsys)
+
+    def test_gated_daemon_is_healthy(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A gate declining to run a daemon is the gate working, not a
+        # fault -- the daemon is deliberately down, so it is not
+        # something the filtered view should surface.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        (h.state_dir("d") / "last-run.json").write_text(
+            '{"exit_class": "gated", "exit_code": 0, '
+            '"started_at": "2026-01-01T00:00:00-08:00"}',
+            encoding="utf-8",
+        )
+        assert "default.d" not in self._status_excluding_healthy(capsys)
+
+    def test_daemon_that_stopped_on_its_own_is_unhealthy(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A daemon that stopped without being told to is down and stays
+        # down, which is exactly what this filter should surface -- a
+        # scheduled job's next fire would have retried it.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        (h.state_dir("d") / "last-run.json").write_text(
+            '{"exit_class": "fail", "exit_code": 1, '
+            '"started_at": "2026-01-01T00:00:00-08:00"}',
+            encoding="utf-8",
+        )
+        assert "default.d" in self._status_excluding_healthy(capsys)
+
+    def test_running_scheduled_job_is_not_healthy(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # For a scheduled job a run in flight is a transient, and one
+        # wedged there is exactly what this filter should surface -- so
+        # the daemon carve-out must not swallow it.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            assert "default.j" in self._status_excluding_healthy(capsys)
 
 
 class TestSnapshotLifecycle:
@@ -8708,3 +8794,401 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestDaemonLifecycle:
+    """A daemon holds its run lock for as long as it is up, so the
+    lifecycle verbs that consult the lock or re-render the unit need to
+    treat it differently from a job that merely happens to be running."""
+
+    def _daemon_cfg(self, h: _ApplyHarness) -> Any:
+        return h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+
+    def _unit(self, h: _ApplyHarness, platform: str) -> Path:
+        if platform == "darwin":
+            return h.agents / f"org.crony.{h.full('d')}.plist"
+        return h.sysd / f"crony-{h.full('d')}.service"
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_status_shows_daemon_schedule(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        ref = crony_unit.EntityRef.from_str(h.ref("d", cfg))
+        assert ref is not None
+        node = crony_runtime.load_config().pending.job_from_ref(ref)
+        assert node is not None
+        assert crony_commands._schedule_display(node.timing) == "daemon"
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_destroy_succeeds_while_running(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # A daemon's lock is held for its whole life, so the
+        # run-in-progress refusal would never clear for one -- there is
+        # no later moment at which it is not running.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        sd.mkdir(parents=True, exist_ok=True)
+        unit = self._unit(h, platform)
+        assert unit.exists()
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            crony_commands.do_destroy(jobs=["d"], bundle=None, orphans=False)
+        assert not unit.exists()
+        assert not sd.exists()
+
+    def test_destroy_still_refuses_a_running_scheduled_job(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The exemption is scoped to daemons; an ordinary job mid-run is
+        # still protected from being yanked.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j")
+        sd.mkdir(parents=True, exist_ok=True)
+        with (
+            crony_runtime.acquire_lock(sd / "run.lock"),
+            pytest.raises(LockBusyError),
+        ):
+            crony_commands.do_destroy(jobs=["j"], bundle=None, orphans=False)
+
+    def test_disable_stops_it_and_drops_the_boot_wiring(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Rewriting the unit file neither stops a running daemon nor
+        # removes its boot symlink, so disabling has to act on the
+        # scheduler as well -- otherwise a "disabled" daemon keeps
+        # running now and returns at the next login.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        service = f"crony-{h.full('d')}.service"
+        h.calls.clear()
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        assert [
+            "systemctl",
+            "--user",
+            "--quiet",
+            "disable",
+            "--now",
+            service,
+        ] in h.calls
+        # The rendered unit loses its [Install] section, so it cannot be
+        # pulled in at boot even if the symlink were restored by hand.
+        assert "[Install]" not in self._unit(h, "linux").read_text()
+
+    def test_enable_restores_it(self, tmp_path: Path, monkeypatch: Any) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        h.calls.clear()
+        crony_commands.do_enable(jobs=["d"], bundle=None)
+        service = f"crony-{h.full('d')}.service"
+        assert ["systemctl", "--user", "--quiet", "enable", service] in h.calls
+        assert "[Install]" in self._unit(h, "linux").read_text()
+
+    def _status_cells(self, capsys: Any, full: str) -> list[str]:
+        """The status row for `full`, split into cells. Default columns
+        are job-or-uuid, config, schedule, status, last-ran."""
+        crony_commands.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out: str = capsys.readouterr().out
+        for line in out.splitlines():
+            toks = line.split()
+            if toks and toks[0] == full:
+                return toks
+        raise AssertionError(f"no status row for {full}")
+
+    def test_disabled_daemon_that_was_triggered_reads_disabled_running(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Triggering a disabled daemon starts it without clearing the
+        # operator-disable, so the two cells report different things and
+        # both are right: SCHEDULE says it will not start itself again,
+        # STATUS says it is up right now. The disable override on the
+        # SCHEDULE cell is not kind-specific, so a daemon reads
+        # `disabled` there exactly like any other disabled entry.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        sd = h.state_dir("d")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            cells = self._status_cells(capsys, h.full("d"))
+        assert cells[2] == crony_model.ScheduleValue.DISABLED.value
+        assert cells[3] == crony_model.JobStatus.RUNNING
+        # Once that run ends the lock frees and it reports disabled.
+        assert (
+            self._status_cells(capsys, h.full("d"))[3]
+            == crony_model.JobStatus.DISABLED
+        )
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_reapply_is_a_no_op(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # The drift compare renders its yardstick from a spec built by
+        # hand; if that spec omits the daemon carrier it renders an
+        # ordinary unit, which can never match the daemon unit on disk.
+        # The entry would then read `stale` forever AND every routine
+        # `crony apply` would re-install it -- which on both schedulers
+        # means stopping and restarting a process meant to stay up.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        assert h.apply("d") == "added"
+        assert h.apply("d") == "unchanged"
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_reapply_is_a_no_op_while_disabled(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # Same for the disabled form, whose rendered timing is None and
+        # so relies entirely on the carrier to render as a daemon.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        assert h.apply("d") == "unchanged"
+
+    def test_disabled_daemon_status_reads_disabled(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Stopping a daemon records a signal death, which would render
+        # `fail` -- a deliberately disabled daemon must not look broken.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        ref = crony_unit.EntityRef.from_str(h.ref("d", cfg))
+        assert ref is not None
+        state = crony_runtime.load_config().runtime[ref]
+        assert state.job_status == crony_model.JobStatus.DISABLED
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_leaving_the_mode_retires_the_daemon_unit(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # The entry keeps its `.service` filename across the change, so
+        # nothing prunes the daemon unit, and arming the new schedule
+        # starts a timer without touching the service the old daemon is
+        # running under -- which would leave it up forever, holding the
+        # run lock the new schedule's fires need.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        h.config(
+            {
+                "job": {
+                    "d": {
+                        "uuid": cfg.jobs["d"].uuid,
+                        "command": "serve",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        h.calls.clear()
+        assert h.apply("d") == "updated"
+        if platform == "linux":
+            assert [
+                "systemctl",
+                "--user",
+                "--quiet",
+                "disable",
+                "--now",
+                f"crony-{h.full('d')}.service",
+            ] in h.calls
+        else:
+            # launchd retires by booting the label out of the domain.
+            assert any(c[:2] == ["launchctl", "bootout"] for c in h.calls)
+
+    def test_defers_a_daemons_apply_of_itself(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Activating a daemon restarts the service running the job, so a
+        # daemon whose command runs `crony apply` would be killed by its
+        # own apply -- unit rewritten, snapshot never written, entry
+        # stale forever. systemd is the case that needs the guard: its
+        # reload leaves an ordinary running job alone, so the general
+        # per-scheduler flag does not cover a daemon.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        service = self._unit(h, "linux")
+        before = service.read_text()
+        h.config(
+            {
+                "job": {
+                    "d": {
+                        "uuid": cfg.jobs["d"].uuid,
+                        "command": "serve",
+                        "daemon": True,
+                        "priority": "low",
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("d"))
+        h.calls.clear()
+        assert h.apply("d") == "deferred"
+        assert service.read_text() == before
+        assert all(c[0] != "systemctl" for c in h.calls)
+
+    def test_defers_a_daemons_apply_of_itself_leaving_the_mode(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Leaving the mode retires the daemon unit, which stops the
+        # process -- including a `crony apply` the daemon's own command
+        # spawned. Deferring has to cover both directions: the pending
+        # entry is no longer a daemon, so only the applied side knows
+        # there is a daemon unit to retire.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        service = self._unit(h, "linux")
+        before = service.read_text()
+        h.config(
+            {
+                "job": {
+                    "d": {
+                        "uuid": cfg.jobs["d"].uuid,
+                        "command": "serve",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        monkeypatch.setenv(crony_runtime.RUNNING_REF_ENV, h.ref("d"))
+        h.calls.clear()
+        assert h.apply("d") == "deferred"
+        assert service.read_text() == before
+        assert all(c[0] != "systemctl" for c in h.calls)
+
+    def test_renaming_a_running_daemon_is_not_deferred(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The rename guard defers while a run is in flight, but a daemon
+        # holds its lock for as long as it is up -- deferring on one
+        # would defer forever. Retiring the old unit stops it and the
+        # new unit starts a fresh instance, which is what renaming a
+        # daemon has to mean.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        h.config(
+            {
+                "job": {
+                    "renamed": {
+                        "uuid": cfg.jobs["d"].uuid,
+                        "command": "serve",
+                        "daemon": True,
+                    }
+                }
+            },
+            default_target_jobs=["renamed"],
+        )
+        sd = h.state_dir("renamed")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            assert h.apply("renamed") == "updated"
+        assert (h.sysd / f"crony-{h.full('renamed')}.service").exists()
+        assert not (h.sysd / f"crony-{h.full('d')}.service").exists()
+
+    def test_trigger_wait_rejection_reads_applied_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `trigger` fires the unit that is installed, so an un-applied
+        # edit must not decide whether waiting is possible. The config
+        # here no longer says daemon; the installed unit still is one.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        cfg = self._daemon_cfg(h)
+        h.apply("d")
+        h.config(
+            {
+                "job": {
+                    "d": {
+                        "uuid": cfg.jobs["d"].uuid,
+                        "command": "serve",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        with pytest.raises(UsageError, match="daemon"):
+            crony_commands.do_trigger(
+                jobs=["d"], wait=True, trigger_timeout=None, bundle=None
+            )
+
+    def test_trigger_all_wait_rejects_before_firing_anything(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The daemon check runs as a pre-flight pass: discovering it
+        # partway through the list would leave the earlier names already
+        # fired and waited on.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {
+                "job": {
+                    "a": {"command": "true", "schedule": "daily"},
+                    "d": {"command": "serve", "daemon": True},
+                }
+            },
+            default_target_jobs=["a", "d"],
+        )
+        h.apply("a")
+        h.apply("d")
+        h.calls.clear()
+        with pytest.raises(UsageError, match="daemon"):
+            crony_commands.do_trigger(
+                jobs=[], wait=True, trigger_timeout=None, bundle=None
+            )
+        assert not any("start" in c for c in h.calls)
+
+    def test_trigger_wait_rejects_a_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # --wait blocks for the next completion; a daemon has none.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        with pytest.raises(UsageError, match="daemon"):
+            crony_commands.do_trigger(
+                jobs=["d"], wait=True, trigger_timeout=None, bundle=None
+            )
+
+    def test_plain_trigger_accepts_a_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Starting a daemon is the meaningful operation -- it is how a
+        # gate-downed one comes back without waiting for a reboot.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_trigger(
+            jobs=["d"], wait=False, trigger_timeout=None, bundle=None
+        )
+        assert any("start" in c for c in h.calls)

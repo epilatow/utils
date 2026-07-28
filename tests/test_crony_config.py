@@ -53,6 +53,7 @@ from crony.errors import (  # noqa: E402
     ConfigError,
 )
 from crony.unit import (  # noqa: E402
+    Daemon,
     Interval,
     OnDemand,
     PriorityClass,
@@ -3114,3 +3115,180 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestParseDaemon:
+    """`daemon = true` is a firing mode of its own, mutually exclusive
+    with the others, and rejects the keys that make no sense for a
+    process meant to stay up."""
+
+    def _daemon(self, **overrides: Any) -> dict[str, Any]:
+        body: dict[str, Any] = {"command": "serve", "daemon": True}
+        body.pop("schedule", None)
+        body.update(overrides)
+        return body
+
+    def test_parses_to_daemon_timing(self) -> None:
+        cfg = _parse({"job": {"d": self._daemon()}})
+        assert isinstance(cfg.jobs["d"].timing, Daemon)
+
+    @pytest.mark.parametrize(
+        "other",
+        [{"schedule": "daily"}, {"interval": "1h"}, {"on-demand": True}],
+    )
+    def test_mutually_exclusive_with_other_modes(
+        self, other: dict[str, Any]
+    ) -> None:
+        _assert_errored_job(
+            {"job": {"d": self._daemon(**other)}},
+            "d",
+            "mutually exclusive",
+        )
+
+    def test_rejected_on_a_group(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"a": _job()},
+                "job-group": {"g": {"jobs": ["a"], "daemon": True}},
+            }
+        )
+        assert "g" in cfg.errored_job_groups
+        assert "not valid" in cfg.errored_job_groups["g"] or (
+            "applies to a job" in cfg.errored_job_groups["g"]
+        )
+
+    def test_rejects_explicit_job_timeout(self) -> None:
+        _assert_errored_job(
+            {"job": {"d": self._daemon(**{"job-timeout-sec": 30})}},
+            "d",
+            "not valid on a daemon",
+        )
+
+    @pytest.mark.parametrize("flag", ["interactive", "keep-awake"])
+    def test_rejects_incompatible_flags(self, flag: str) -> None:
+        _assert_errored_job(
+            {"job": {"d": self._daemon(**{flag: True})}},
+            "d",
+            "not valid on a daemon",
+        )
+
+    @pytest.mark.parametrize("flag", ["interactive", "keep-awake"])
+    def test_explicit_opt_out_is_not_a_conflict(self, flag: str) -> None:
+        # The rejection keys on the requested state, not on mere presence
+        # -- turning a flag OFF on a daemon is exactly what a user would
+        # write to escape an inherited default.
+        cfg = _parse({"job": {"d": self._daemon(**{flag: False})}})
+        assert "d" in cfg.jobs, cfg.errored_jobs.get("d")
+
+    def test_rejects_explicit_notify_channels(self) -> None:
+        _assert_errored_job(
+            {
+                "defaults": {
+                    "notify": {"n": {"transport": "dialog-popup"}},
+                },
+                "job": {"d": self._daemon(**{"notify-channels": ["n"]})},
+            },
+            "d",
+            "not valid on a daemon",
+        )
+
+    def test_empty_notify_channels_is_not_a_conflict(self) -> None:
+        # `notify-channels = []` is the documented "silence just this
+        # job" spelling; on a daemon it asks for what the mode already
+        # enforces, so rejecting it would break migrating an existing
+        # job to `daemon = true`.
+        cfg = _parse({"job": {"d": self._daemon(**{"notify-channels": []})}})
+        assert "d" in cfg.jobs, cfg.errored_jobs.get("d")
+
+    def test_zero_job_timeout_is_not_a_conflict(self) -> None:
+        # 0 is the "no cap" spelling, which is what a daemon already
+        # resolves to -- rejecting it would fail a migration on a
+        # setting the mode agrees with, and the config template
+        # documents it as accepted.
+        cfg = _parse({"job": {"d": self._daemon(**{"job-timeout-sec": 0})}})
+        assert "d" in cfg.jobs, cfg.errored_jobs.get("d")
+        assert cfg.resolved_job_timeout_sec(cfg.jobs["d"]) == 0
+
+    def test_rejects_explicit_notify_success_ratio(self) -> None:
+        # Rejected on the same terms as the channels it modifies -- a
+        # daemon notifies about nothing, so a ratio over it is dead.
+        _assert_errored_job(
+            {"job": {"d": self._daemon(**{"notify-success-ratio": "2/3"})}},
+            "d",
+            "not valid on a daemon",
+        )
+
+    def test_cannot_be_a_group_member(self) -> None:
+        cfg = _parse(
+            {
+                "job": {"d": self._daemon()},
+                "job-group": {"g": {"jobs": ["d"], "schedule": "daily"}},
+            }
+        )
+        assert "g" in cfg.errored_job_groups
+        assert "daemon" in cfg.errored_job_groups["g"]
+
+    def test_timeout_resolves_uncapped(self) -> None:
+        # Uncapped regardless of the [defaults] cascade: a wallclock cap
+        # would just kill the daemon on a timer.
+        cfg = _parse(
+            {
+                "defaults": {"job-timeout-sec": 60},
+                "job": {"d": self._daemon()},
+            }
+        )
+        assert cfg.resolved_job_timeout_sec(cfg.jobs["d"]) == 0
+
+    @pytest.mark.parametrize("flag", ["interactive", "keep-awake"])
+    def test_inherited_incompatible_flags_are_stripped(self, flag: str) -> None:
+        # An inherited value must not error (it says nothing about this
+        # job) but must not reach the daemon either -- interactive would
+        # block every start on a dialog, keep-awake would hold a power
+        # assertion forever.
+        cfg = _parse(
+            {
+                "defaults": {flag: True},
+                "job": {"d": self._daemon(), "s": _job()},
+                "target": {"all": {"jobs": ["d", "s"]}},
+            }
+        )
+        resolved = cfg.resolved_flags_by_name(cfg.resolve_target("h", "darwin"))
+        member = JobFlags._from_token(flag)
+        assert member not in resolved["d"]
+        # The same default still reaches an ordinary job.
+        assert member in resolved["s"]
+
+    def test_counts_as_a_firing_point(self) -> None:
+        # A daemon needs no scheduled ancestor: it is its own firing
+        # point, so the "would never fire" chain check accepts it.
+        cfg = _parse(
+            {
+                "job": {"d": self._daemon()},
+                "target": {"all": {"jobs": ["d"]}},
+            }
+        )
+        assert "d" not in cfg.errored_jobs
+        assert cfg.resolve_target("h", "darwin") is not None
+
+
+class TestDaemonRestartSeconds:
+    """The restart backoff is written verbatim into a unit file, so the
+    seam that overrides it has to stay in a range a scheduler accepts."""
+
+    def test_defaults_to_the_production_value(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("CRONY_DAEMON_RESTART_SECONDS", raising=False)
+        assert crony_config.daemon_restart_seconds() == 30
+
+    def test_reads_the_override_live(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", "2")
+        assert crony_config.daemon_restart_seconds() == 2
+
+    @pytest.mark.parametrize("bad", ["0", "-5", "not-a-number"])
+    def test_unusable_override_never_reaches_a_unit_file(
+        self, monkeypatch: Any, bad: str
+    ) -> None:
+        # A non-positive restart interval renders a unit the scheduler
+        # rejects or ignores, so the floor holds regardless of the
+        # override; a non-integer falls back to the default.
+        monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", bad)
+        assert crony_config.daemon_restart_seconds() >= 1

@@ -11,10 +11,12 @@ on macOS/darwin (via launchd) and linux (via systemd). It reads one or more
 TOML config bundles and can deploy the corresponding platform units. It runs
 jobs through a uniform shim, which provides consistent logging, execution
 gates, timeouts, environment management, etc. Jobs can be grouped, and groups
-or jobs run on a schedule. Jobs can also be managed manually (enabled/disabled
-independently of the underlying scheduler, and run at will via the `trigger`
-subcommand). Crony supports the following notification mechanisms for job
-failures: email/smtp, ntfy, and pop-ups (on macOS/darwin).
+or jobs run on a schedule; a job can instead be a daemon, which runs
+continuously and is restarted whenever it stops. Jobs can also be managed
+manually (enabled/disabled independently of the underlying scheduler, and run
+at will via the `trigger` subcommand). Crony supports the following
+notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
+macOS/darwin).
 
 Subcommands fall into categories:
 
@@ -144,7 +146,8 @@ target: job(s) or --all.
 ### `disable [--all] [-b BUNDLE] [job ...]`
 
 Disarm the named jobs' schedules: loaded and triggerable, but not firing on
-their own. Requires a target: job(s) or --all.
+their own. Disabling a daemon stops it; it stays stopped across a reboot until
+re-enabled. Requires a target: job(s) or --all.
 
 ### `trigger [--all] [-b BUNDLE] [-w] [--trigger-timeout TRIGGER_TIMEOUT] [job ...]`
 
@@ -153,7 +156,8 @@ scheduled fire uses. Requires a target: job(s) or --all.
 
 - **`-w, --wait`**\
   Block until each named entry's next completion and exit with that exit code
-  (worst across multiple names).
+  (worst across multiple names). Naming a daemon is an error -- it runs until
+  stopped, so there is no completion to wait for.
 - **`--trigger-timeout TRIGGER_TIMEOUT`**\
   Override [defaults].trigger_timeout_sec (seconds to wait for a runner to
   come online after kickstart). Only meaningful with --wait.
@@ -181,8 +185,9 @@ the two.
   value from the config (the default).
 - **`--exclude-healthy`**\
   Drop rows that are config=synced, enabled in the scheduler, and last in
-  ok/never/gated. Output is flat (no tree indent). Always exits 0 -- this is a
-  filter on the display, not a gate.
+  ok/never/gated -- or, for a daemon, running/gated (up, or deliberately kept
+  down by its gate). Output is flat (no tree indent). Always exits 0 -- this
+  is a filter on the display, not a gate.
 
 ### `logs [-n N] [-s SINCE] [-t | -l] [-p] job`
 
@@ -327,6 +332,11 @@ Send a synthetic failure notification.
   A trigger-only job/group (on-demand = true) with no schedule of its own and
   no scheduled parent. It runs only when run manually via the `trigger`
   subcommand.
+- **`daemon`**\
+  A job (daemon = true) that runs continuously rather than at scheduled times.
+  It starts at login and is restarted whenever its command exits. If its
+  execution gate fails it stays stopped until the next login, `apply`, or
+  `trigger`.
 - **`disabled`**\
   A job that has been disabled via the `disable` subcommand; it will not be
   run via any schedule. It can be run manually via the `trigger` subcommand,
@@ -363,6 +373,12 @@ Send a synthetic failure notification.
 - **`pending`**\
   Jobs only. An interactive job is either waiting for an active user, or
   waiting for that user to confirm execution (via a pop-up dialog).
+- **`disabled`**\
+  Daemons only. The daemon has been disabled via the `disable` subcommand, so
+  it is stopped and will not start itself again -- neither at boot nor by a
+  restart -- until it is re-enabled. It can still be started manually via the
+  `trigger` subcommand. A scheduled job reports its last run's outcome
+  instead; its SCHEDULE cell carries the disabled state.
 - **`never`**\
   Jobs and groups. A newly deployed job or group that hasn't been run yet.
 - **`unknown`**\
@@ -399,8 +415,8 @@ or piped output is plain, where drift shows as a trailing `^` plus a footnote
 legend instead.
 
 - **`red`**\
-  CONFIG broken / error / missing / orphan; STATUS canceled / crashed / fail /
-  timeout; SCHEDULE disabled.
+  CONFIG broken / error / missing / orphan; STATUS canceled / crashed /
+  disabled / fail / timeout; SCHEDULE disabled.
 - **`yellow`**\
   CONFIG stale, plus any cell that diverged from the applied state (on a color
   stream its `^` marker is dropped in favor of the color).

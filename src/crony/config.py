@@ -12,7 +12,9 @@ maps rather than aborting the whole bundle.
 
 import contextvars
 import enum
+import functools
 import logging
+import operator
 import os
 import re
 import uuid
@@ -193,6 +195,32 @@ _FLAG_SCALAR_KEYS: dict[str, JobFlags] = {
     flag.token: flag for flag in JobFlags.members()
 }
 _FLAG_TOKENS: frozenset[str] = frozenset(_FLAG_SCALAR_KEYS)
+
+
+# Flags a daemon cannot carry, each with why. Setting one on a daemon
+# directly is a config error; an inherited value is dropped during
+# resolution instead, so an unrelated `[defaults]` never invalidates one.
+_DAEMON_FLAG_REASONS: dict[JobFlags, str] = {
+    JobFlags.INTERACTIVE: ("every start would block on a confirmation dialog"),
+    JobFlags.KEEP_AWAKE: (
+        "the power assertion would be held for the daemon's whole life"
+    ),
+}
+
+
+_DAEMON_INCOMPATIBLE_FLAGS: JobFlags = functools.reduce(
+    operator.or_, _DAEMON_FLAG_REASONS, JobFlags(0)
+)
+
+
+def _daemon_safe_flags(
+    flags: JobFlags, timing: crony.unit.Timing | None
+) -> JobFlags:
+    """`flags` with the flags a daemon cannot carry cleared, for a daemon
+    entry; unchanged for any other firing mode."""
+    if not crony.unit.is_daemon(timing):
+        return flags
+    return flags & ~_DAEMON_INCOMPATIBLE_FLAGS
 
 
 def _compose_flags(
@@ -968,6 +996,12 @@ class TomlBundleConfig:
         knob; see the `Target` and `TomlJobGroup` docstrings for the
         rationale.
         """
+        if crony.unit.is_daemon(job.timing):
+            # A daemon runs until something stops it, so a wallclock cap
+            # would just kill it on a timer. Setting one explicitly is a
+            # config error; the [defaults] value is ignored here so an
+            # unrelated default cannot cap one.
+            return 0
         if job.job_timeout_sec is not None:
             return job.job_timeout_sec
         return self.defaults.job_timeout_sec
@@ -1012,7 +1046,10 @@ class TomlBundleConfig:
                 return
             seen = seen | {name}
             if name in self.jobs:
-                out[name] = _compose_flags(inherited, self.jobs[name].flags)
+                job = self.jobs[name]
+                out[name] = _daemon_safe_flags(
+                    _compose_flags(inherited, job.flags), job.timing
+                )
             elif name in self.job_groups:
                 g = self.job_groups[name]
                 resolved = _compose_flags(inherited, g.flags)
@@ -1024,12 +1061,21 @@ class TomlBundleConfig:
             _walk(name, base, set())
         return out
 
-    def composed_flags(self, delta: dict[JobFlags, bool]) -> JobFlags:
+    def composed_flags(
+        self,
+        delta: dict[JobFlags, bool],
+        timing: crony.unit.Timing | None,
+    ) -> JobFlags:
         """The bundle defaults composed with one entry's own `delta` --
         the resolved flags for an entry that inherits only the defaults,
-        with no ancestor-group chain above it."""
-        return _compose_flags(
-            _compose_flags(JobFlags(0), self.defaults.flags), delta
+        with no ancestor-group chain above it. `timing` is the entry's
+        firing mode, which decides whether an inherited flag survives
+        (see `_daemon_safe_flags`)."""
+        return _daemon_safe_flags(
+            _compose_flags(
+                _compose_flags(JobFlags(0), self.defaults.flags), delta
+            ),
+            timing,
         )
 
     def resolved_env(self, job: TomlJob) -> dict[str, str]:
@@ -1269,9 +1315,10 @@ class TomlConfig:
 # =============================================================================
 # TIMING PARSING
 # =============================================================================
-# The three mutually-exclusive firing modes: schedules use systemd
-# OnCalendar syntax, intervals use systemd time-span syntax, and
-# `on-demand = true` is trigger-only. Schedule / Interval are parsed and
+# The four mutually-exclusive firing modes: schedules use systemd
+# OnCalendar syntax, intervals use systemd time-span syntax,
+# `on-demand = true` is trigger-only, and `daemon = true` runs
+# continuously. Schedule / Interval are parsed and
 # validated by the crony.unit value objects; `_parse_timing` wraps them
 # for the config loader, resolves the on-demand mode, enforces the
 # one-mode-at-a-time rule, and adds the loader's own interval floor
@@ -1301,6 +1348,20 @@ def jitter_floor_seconds() -> int:
     return _env_int("JITTER_FLOOR_SECONDS", 600)
 
 
+def daemon_restart_seconds() -> int:
+    """How long a supervisor waits before restarting a daemon whose
+    command exited, in seconds -- 30 by default.
+
+    Long enough that a command failing instantly cannot spin the
+    supervisor, short enough that a real outage recovers promptly. Read
+    live from `CRONY_DAEMON_RESTART_SECONDS` so a test can drive a short
+    backoff; a non-integer override falls back to the default, and the
+    result is floored at 1 -- the value is written verbatim into a unit
+    file, and a scheduler rejects or ignores a non-positive restart
+    interval."""
+    return max(1, _env_int("DAEMON_RESTART_SECONDS", 30))
+
+
 def _min_interval_seconds() -> int:
     """The shortest interval crony accepts at config load, in seconds --
     1 minute by default. Below a minute the two backends stop honoring the
@@ -1319,20 +1380,23 @@ def _parse_timing(
     schedule_str: str | None,
     interval_str: str | None,
     on_demand: bool,
+    daemon: bool,
     where: str,
 ) -> crony.unit.Timing | None:
     """Build a unit's firing mode from the config's mutually-exclusive
-    `schedule` / `interval` / `on-demand` keys, or None when none is set
-    (a transit group or group-only job). `on-demand = true` selects the
-    trigger-only firing mode (`crony.unit.OnDemand`). Surfaces the value
-    objects' validation as a config error tied to `where`. Intervals
-    below `_min_interval_seconds` are rejected."""
+    `schedule` / `interval` / `on-demand` / `daemon` keys, or None when
+    none is set (a transit group or group-only job). `on-demand = true`
+    selects the trigger-only mode (`crony.unit.OnDemand`) and
+    `daemon = true` the continuous one (`crony.unit.Daemon`). Surfaces
+    the value objects' validation as a config error tied to `where`.
+    Intervals below `_min_interval_seconds` are rejected."""
     present = [
         name
         for name, given in (
             ("schedule", schedule_str is not None),
             ("interval", interval_str is not None),
             ("on-demand", on_demand),
+            ("daemon", daemon),
         )
         if given
     ]
@@ -1348,6 +1412,8 @@ def _parse_timing(
         )
     if on_demand:
         return crony.unit.OnDemand()
+    if daemon:
+        return crony.unit.Daemon()
     try:
         if schedule_str is not None:
             return crony.unit.Schedule.from_str(schedule_str)
@@ -1427,6 +1493,7 @@ _KNOWN_JOB: frozenset[str] = (
             "schedule",
             "interval",
             "on-demand",
+            "daemon",
             "priority",
             "platforms",
             "hosts",
@@ -1451,6 +1518,7 @@ _KNOWN_JOB_GROUP: frozenset[str] = (
             "schedule",
             "interval",
             "on-demand",
+            "daemon",
             "platforms",
             "hosts",
             "flags",
@@ -2192,6 +2260,53 @@ def _parse_priority_field(
     return _parse_priority(_typed_field(raw, "priority", str, where), where)
 
 
+def _reject_daemon_conflicts(
+    where: str,
+    *,
+    flags: dict[JobFlags, bool],
+    job_timeout_sec: int | None,
+    channels: list[str] | None,
+    success_ratio: SuccessRatio | None,
+) -> None:
+    """Reject the keys a daemon job cannot carry.
+
+    Each is rejected only when the job sets it itself; a value the job
+    merely inherits from `[defaults]` or an ancestor group is dropped
+    during resolution instead, so an unrelated default never invalidates
+    a daemon. `flags` is the job's own per-flag delta, so a flag it
+    explicitly turns OFF is not a conflict.
+    """
+    for flag in JobFlags.members():
+        if flag & _DAEMON_INCOMPATIBLE_FLAGS and flags.get(flag) is True:
+            raise crony.errors.ConfigError(
+                f"{where}: '{flag.token}' is not valid on a daemon; "
+                f"{_DAEMON_FLAG_REASONS[flag]}"
+            )
+    # 0 is the "no cap" spelling, which is what a daemon already
+    # resolves to -- accepted for the same reason an empty
+    # `notify-channels` is, so migrating an existing job to
+    # `daemon = true` does not fail on a setting it already agrees with.
+    if job_timeout_sec:
+        raise crony.errors.ConfigError(
+            f"{where}: 'job-timeout-sec' is not valid on a daemon, which "
+            f"runs until something stops it; a cap would just kill it on "
+            f"a timer"
+        )
+    # An empty `notify-channels` is the documented "silence just this
+    # job" spelling, which asks for exactly what a daemon already does --
+    # accepted for the same reason turning a flag off is (see above).
+    for key, given in (
+        ("notify-channels", bool(channels)),
+        ("notify-success-ratio", success_ratio is not None),
+    ):
+        if given:
+            raise crony.errors.ConfigError(
+                f"{where}: '{key}' is not valid on a daemon, which sends "
+                f"no failure notifications -- its command exiting is "
+                f"routine, and the supervisor restarts it"
+            )
+
+
 def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     """Parse [job.<name>]."""
     _validate_name(name, f"[job.{name}]")
@@ -2229,7 +2344,8 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
-    timing = _parse_timing(schedule_str, interval_str, on_demand, where)
+    daemon = _typed_field(raw, "daemon", bool, where, default=False)
+    timing = _parse_timing(schedule_str, interval_str, on_demand, daemon, where)
     priority = _parse_priority_field(raw, where)
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
     keep_awake = flags.get(JobFlags.KEEP_AWAKE)
@@ -2242,6 +2358,14 @@ def _parse_job(name: str, raw: dict[str, Any]) -> TomlJob:
     if job_timeout_sec is not None and job_timeout_sec < 0:
         raise crony.errors.ConfigError(
             f"{where}: 'job-timeout-sec' must be >= 0, got {job_timeout_sec}"
+        )
+    if daemon:
+        _reject_daemon_conflicts(
+            where,
+            flags=flags,
+            job_timeout_sec=job_timeout_sec,
+            channels=channels,
+            success_ratio=success_ratio,
         )
     interactive = flags.get(JobFlags.INTERACTIVE, False)
     interactive_active_sec, interactive_delay_sec = (
@@ -2299,7 +2423,13 @@ def _parse_job_group(name: str, raw: dict[str, Any]) -> TomlJobGroup:
     schedule_str = _typed_field(raw, "schedule", str, where)
     interval_str = _typed_field(raw, "interval", str, where)
     on_demand = _typed_field(raw, "on-demand", bool, where, default=False)
-    timing = _parse_timing(schedule_str, interval_str, on_demand, where)
+    if _typed_field(raw, "daemon", bool, where, default=False):
+        raise crony.errors.ConfigError(
+            f"{where}: 'daemon' applies to a job, not a job group -- a "
+            f"group sequences its children and returns, so it has no "
+            f"process to keep running"
+        )
+    timing = _parse_timing(schedule_str, interval_str, on_demand, False, where)
     platforms = _parse_platforms_field(raw, where)
     hosts = _parse_hosts_field(raw, where)
     flags = _parse_flags_partial(raw, where, scalar_keys=_FLAG_SCALAR_KEYS)
@@ -2478,6 +2608,16 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                     f"undefined name {child!r}"
                 )
                 break
+            # A group runs each child to completion before the next, so
+            # a member that never exits would stall the group forever.
+            child_job = config.jobs.get(child)
+            if child_job is not None and crony.unit.is_daemon(child_job.timing):
+                bad_group[gname] = (
+                    f"[job-group.{gname}]: 'jobs' references daemon "
+                    f"{child!r}; a group waits for each child to finish, "
+                    f"and a daemon never does"
+                )
+                break
     for gname, msg in bad_group.items():
         del config.job_groups[gname]
         config.errored_job_groups[gname] = msg
@@ -2549,11 +2689,12 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 return notify_msg
         # Chain walk: every path from the target through groups to a
         # leaf job must reach a firing point somewhere -- a schedule, an
-        # interval, or a trigger-only `on-demand = true` entry (any
-        # non-None timing). Cycles in the group graph are caught on the
-        # way down. A walk into an errored entry stops without complaint
-        # -- the per-entity error is already attributed and piling on a
-        # derived "would never fire" would just hide it.
+        # interval, a trigger-only `on-demand = true` entry, or a
+        # `daemon = true` one (any non-None timing). Cycles in the group
+        # graph are caught on the way down. A walk into an errored entry
+        # stops without complaint -- the per-entity error is already
+        # attributed and piling on a derived "would never fire" would
+        # just hide it.
         chain_error: list[str] = []
 
         def _walk_chain(
@@ -2583,9 +2724,10 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                         f"{label}: chain {' -> '.join(path)} has "
                         f"no firing point anywhere -- {ref!r} would "
                         f"never fire (give it a schedule / interval, "
-                        f"place it under a scheduled group, or set "
+                        f"place it under a scheduled group, set "
                         f"on-demand = true to run it only via "
-                        f"`crony trigger`)"
+                        f"`crony trigger`, or daemon = true to run it "
+                        f"continuously)"
                     )
                 return
             group = config.job_groups[ref]

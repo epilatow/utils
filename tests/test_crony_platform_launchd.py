@@ -27,6 +27,8 @@ from crony.platform import (
     launchd,
 )
 from crony.unit import (
+    Daemon,
+    DaemonSpec,
     EntityName,
     EntityRef,
     Interval,
@@ -48,6 +50,24 @@ _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
 # The run argv the runtime layer hands the backend as `spec.cmd`.
 _CMD = (str(_UV), "run", "--script", str(_CRONY), "_run", str(_REF))
+
+
+def _activate_spec(
+    name: str,
+    timing: Timing | None,
+    daemon: DaemonSpec | None = None,
+) -> UnitSpec:
+    """A minimal spec for driving `activate` -- only the fields it
+    reads (the name, what to arm, and whether it is a daemon)."""
+    return UnitSpec(
+        name=EntityName.from_str(name),
+        cmd=_CMD,
+        timing=timing,
+        priority=PriorityClass.NORMAL,
+        daemon=daemon,
+    )
+
+
 # render() / dispatch don't read the unit dir; pin a placeholder.
 _DIR = Path("/unused")
 
@@ -295,7 +315,7 @@ class TestLaunchdReload:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.activate("default.j", Interval.from_str("1h"))
+        sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert self._subs(calls) == ["bootout", "bootstrap"]
         # No deprecated load/unload anywhere.
         assert "load" not in self._subs(calls)
@@ -308,7 +328,7 @@ class TestLaunchdReload:
         # carries the schedule in the plist itself, so activate loads it
         # exactly like a scheduled one -- registered, just dormant.
         sched, calls = self._setup(monkeypatch, tmp_path)
-        sched.activate("default.j", None)
+        sched.activate(_activate_spec("default.j", None))
         assert self._subs(calls) == ["bootout", "bootstrap"]
 
     def test_bootstrap_retries_spurious_eio(
@@ -317,7 +337,7 @@ class TestLaunchdReload:
         # First bootstrap returns errno 5, second succeeds: the reload
         # re-settles and retries rather than surfacing the race.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(5, 0))
-        sched.activate("default.j", Interval.from_str("1h"))
+        sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert self._subs(calls).count("bootstrap") == 2
         assert self._subs(calls).count("bootout") == 2
 
@@ -328,7 +348,7 @@ class TestLaunchdReload:
             monkeypatch, tmp_path, bootstrap_rcs=(5, 5, 5)
         )
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", Interval.from_str("1h"))
+            sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert (
             self._subs(calls).count("bootstrap") == launchd._BOOTSTRAP_ATTEMPTS
         )
@@ -340,7 +360,7 @@ class TestLaunchdReload:
         # surfaces at once rather than burning the retry budget.
         sched, calls = self._setup(monkeypatch, tmp_path, bootstrap_rcs=(1,))
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", Interval.from_str("1h"))
+            sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert self._subs(calls).count("bootstrap") == 1
 
     def test_plutil_validation_failure_raises_subprocess_error(
@@ -360,7 +380,7 @@ class TestLaunchdReload:
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         with pytest.raises(SubprocessError):
-            sched.activate("default.j", Interval.from_str("1h"))
+            sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert not any(c[:2] == ["launchctl", "bootstrap"] for c in calls)
 
     def test_trigger_failure_raises_subprocess_error(
@@ -399,7 +419,7 @@ class TestLaunchdReload:
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
         monkeypatch.setattr(launchd, "_is_loaded", is_loaded)
-        sched.activate("default.j", Interval.from_str("1h"))
+        sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         # Polled until the label cleared, then bootstrapped.
         assert len(polled) >= 3
         assert self._subs(calls) == ["bootout", "bootstrap"]
@@ -420,7 +440,7 @@ class TestLaunchdReload:
             return elapsed[0]
 
         monkeypatch.setattr(time, "monotonic", fake_monotonic)
-        sched.activate("default.j", Interval.from_str("1h"))
+        sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert "bootstrap" in self._subs(calls)
 
 
@@ -632,7 +652,7 @@ class TestLaunchdJitter:
         monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
         monkeypatch.setattr(launchd, "_is_loaded", lambda _lbl: False)
         get_scheduler("darwin", tmp_path).activate(
-            "default.brew", Interval.from_str("1h")
+            _activate_spec("default.brew", Interval.from_str("1h"))
         )
         bootstrapped = {
             c[3].rsplit("/", 1)[-1]
@@ -688,3 +708,42 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestLaunchdDaemon:
+    """A daemon plist starts at load and is respawned when its command
+    exits non-zero; disabling it renders the plist inert."""
+
+    _DAEMON = DaemonSpec(restart_seconds=7)
+
+    def _plist(self, *, armed: bool) -> dict[str, Any]:
+        spec = UnitSpec(
+            name=EntityName.from_str("default.d"),
+            cmd=_CMD,
+            timing=Daemon() if armed else None,
+            priority=PriorityClass.NORMAL,
+            daemon=self._DAEMON,
+        )
+        units = get_scheduler("darwin", _DIR).render_units(spec)
+        assert [u.filename for u in units.units] == [
+            Path("org.crony.default.d.plist")
+        ]
+        return dict(plistlib.loads(units.units[0].content.encode()))
+
+    def test_starts_at_load_and_respawns_on_failure(self) -> None:
+        data = self._plist(armed=True)
+        assert data["RunAtLoad"] is True
+        # launchd's native spelling of the runner's contract: respawn on
+        # a non-zero exit (the command died), stay down on a zero one
+        # (the gate declined to run it).
+        assert data["KeepAlive"] == {"SuccessfulExit": False}
+        assert data["ThrottleInterval"] == 7
+        # A daemon names no times, so it carries no schedule keys.
+        assert "StartInterval" not in data
+        assert "StartCalendarInterval" not in data
+
+    def test_disabled_daemon_is_inert(self) -> None:
+        data = self._plist(armed=False)
+        assert data["RunAtLoad"] is False
+        assert data["KeepAlive"] is False
+        assert "ThrottleInterval" not in data

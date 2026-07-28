@@ -3,8 +3,9 @@
 """launchd (macOS) scheduler backend.
 
 An entity is a service LaunchAgent plist -- a scheduled entry carries a
-`StartInterval` / `StartCalendarInterval`, a schedule-less one just sits
-dormant (`RunAtLoad=false`) until something fires it. A jittered interval
+`StartInterval` / `StartCalendarInterval`, a daemon starts at load and is
+kept alive, and a schedule-less one just sits dormant
+(`RunAtLoad=false`) until something fires it. A jittered interval
 job (one whose `UnitSpec` carries a `jitter`) additionally gets a jitter
 companion plist that phases the service's first fire, since launchd has no
 native start-time randomization.
@@ -26,6 +27,7 @@ from crony.platform.scheduler import (
     UnitLastExit,
 )
 from crony.unit import (
+    DaemonSpec,
     Interval,
     PriorityClass,
     Schedule,
@@ -88,11 +90,17 @@ def _render_plist(
     cmd: tuple[str, ...],
     timing: Timing | None,
     priority: PriorityClass = PriorityClass.NORMAL,
+    daemon: DaemonSpec | None = None,
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
     The Label uses the full namespaced name for human readability;
     `cmd` is the argv the unit executes.
+
+    A `daemon` unit starts on load and is respawned when its command
+    exits non-zero. A daemon whose `timing` is None is operator-disabled:
+    it renders inert (no start, no respawn) so it stays stopped across a
+    reboot, while remaining a daemon for teardown purposes.
 
     Serialized with `plistlib` so the XML is well-formed by
     construction (escaping, typed values, DOCTYPE); `sort_keys`
@@ -117,7 +125,17 @@ def _render_plist(
         "AbandonProcessGroup": False,
     }
     contents.update(_priority_keys(priority))
-    if isinstance(timing, Interval):
+    if daemon is not None and timing is not None:
+        # `SuccessfulExit: false` is launchd's native spelling of the
+        # runner's contract: respawn on a non-zero exit, stay down on a
+        # zero one. The runner surfaces non-zero when the command exited
+        # (restart it) and zero when its gate declined to run it (leave
+        # it down until the next load). ThrottleInterval floors the
+        # respawn rate so a command failing instantly cannot spin.
+        contents["RunAtLoad"] = True
+        contents["KeepAlive"] = {"SuccessfulExit": False}
+        contents["ThrottleInterval"] = daemon.restart_seconds
+    elif isinstance(timing, Interval):
         contents["StartInterval"] = timing.total_seconds
     elif isinstance(timing, Schedule):
         contents["StartCalendarInterval"] = timing.to_plist_calendar()
@@ -225,7 +243,9 @@ class LaunchdScheduler(Scheduler):
         units = [
             RenderedUnit(
                 Path(_plist_filename(name)),
-                _render_plist(name, spec.cmd, spec.timing, spec.priority),
+                _render_plist(
+                    name, spec.cmd, spec.timing, spec.priority, spec.daemon
+                ),
             ),
         ]
         if spec.jitter is not None:
@@ -399,9 +419,13 @@ class LaunchdScheduler(Scheduler):
             )
         ]
 
-    def activate(self, name: str, _timing: Timing | None, /) -> None:
+    def activate(self, spec: UnitSpec, /) -> None:
         # The schedule rides in the plist itself, so there is nothing to
-        # arm separately: a plist with no Start* keys loads fine, dormant.
+        # arm separately: a plist with no Start* keys loads fine, dormant,
+        # and a disabled daemon's inert plist loads without starting.
+        # Bootstrapping is also how a re-applied daemon picks up new
+        # config -- bootout stops the running instance first.
+        name = str(spec.name)
         # Bootstrap every unit the entity left on disk -- the service and,
         # for a jittered interval job, its companion. A re-apply re-anchors
         # the service, so the companion (which self-unloads after its one

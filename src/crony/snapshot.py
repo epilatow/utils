@@ -80,6 +80,12 @@ class _SnapshotCommon(_SnapshotModel):
     on_demand: Annotated[bool, _Since(7)] = _disk_key(
         "on-demand", default=False
     )
+    # The continuous firing mode (`daemon = true` in config); mutually
+    # exclusive with the timing keys above. Persisted so the applied side
+    # shows `daemon`, so a switch to / from another mode reads as drift,
+    # and so teardown can tell a disabled daemon (which renders without a
+    # timing at all) from an ordinary dormant entry.
+    daemon: Annotated[bool, _Since(8)] = False
     unit_disabled: Annotated[bool, _Since(6)] = False
     # One boolean per JobFlags member, keyed on disk by the flag's dash
     # token. A drift test asserts these stay in lockstep with
@@ -104,10 +110,13 @@ class _SnapshotCommon(_SnapshotModel):
 
     def timing(self) -> crony.unit.Timing | None:
         """The Timing value object for this snapshot's timing keys:
-        OnDemand for the trigger-only mode, else the schedule / interval
-        string, else None (a transit group or group-only job)."""
+        OnDemand for the trigger-only mode, Daemon for the continuous
+        one, else the schedule / interval string, else None (a transit
+        group or group-only job)."""
         if self.on_demand:
             return crony.unit.OnDemand()
+        if self.daemon:
+            return crony.unit.Daemon()
         if self.schedule is not None:
             return crony.unit.Schedule.from_str(self.schedule)
         if self.interval is not None:

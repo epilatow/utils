@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import crony.errors
-from crony.unit import Timing, UnitSpec
+from crony.unit import UnitSpec
 
 # On-disk unit-naming prefix. Existing units are named
 # `org.crony.<name>.plist` (launchd) / `crony-<name>.{service,timer}`
@@ -105,12 +105,14 @@ class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
 
     # Whether picking up a changed unit file forces a reload that
-    # terminates an in-flight run of that same unit. True for launchd
-    # (the reload is unload+load, which kills the running job's process
-    # group); False for systemd (`daemon-reload` leaves running units
-    # untouched). `apply_one` reads this to refuse rewriting the unit of
-    # the entry whose own runner is performing the apply, so the apply
-    # can't reload itself to death. Each backend sets it explicitly.
+    # terminates an in-flight run of that same unit, for EVERY entry
+    # this backend manages. True for launchd (the reload is unload+load,
+    # which kills the running job's process group); False for systemd,
+    # whose `daemon-reload` plus timer re-arm leaves the running
+    # `.service` untouched. A caller may widen it per entry -- a
+    # self-starting unit has no separate arming unit, so activating it
+    # restarts the thing that is running whatever this says. Each
+    # backend sets it explicitly.
     reload_terminates_running_job: bool
 
     def __init__(self, unit_dir: Path | None = None) -> None:
@@ -202,8 +204,7 @@ class Scheduler(abc.ABC):
         stale anchor. All files are written before any reload. `activate`
         is False only for a self-reload that fell through because the unit
         did not change (reloading would kill the running job for nothing).
-        The spec's timing reaches `activate` whole, which decides what to
-        arm."""
+        The spec reaches `activate` whole, which decides what to arm."""
         rendered = self.render_units(spec)
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         keep = {str(u.filename) for u in rendered.units}
@@ -211,7 +212,7 @@ class Scheduler(abc.ABC):
         for u in rendered.units:
             (self.unit_dir / u.filename).write_text(u.content, encoding="utf-8")
         if activate:
-            self.activate(str(spec.name), spec.timing)
+            self.activate(spec)
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:
@@ -284,15 +285,17 @@ class Scheduler(abc.ABC):
         the live outcome."""
 
     @abc.abstractmethod
-    def activate(self, name: str, timing: Timing | None, /) -> None:
+    def activate(self, spec: UnitSpec, /) -> None:
         """Load the unit (whose files the caller has already written)
-        into the scheduler, arming whatever `timing` calls for.
+        into the scheduler, arming whatever `spec` calls for.
 
-        `timing` is the entry's firing mode as the model resolved it, so
-        a backend reads from it whichever distinctions its own scheduler
-        draws rather than being handed one pre-collapsed answer. A
-        schedule-less entry -- a grouped / transit unit or a disabled one
-        -- registers (loaded, triggerable) but arms nothing."""
+        The whole spec, so a backend reads whichever distinctions its own
+        scheduler draws rather than being handed one pre-collapsed
+        answer. `timing` None is a schedule-less entry -- a grouped /
+        transit unit, or one the operator disabled -- which registers
+        (loaded, triggerable) but arms nothing; combined with a `daemon`
+        spec it is a disabled daemon, which must additionally be stopped
+        and kept from starting at boot."""
 
     @abc.abstractmethod
     def deactivate(self, name: str) -> None:

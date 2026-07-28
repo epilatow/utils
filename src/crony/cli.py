@@ -57,11 +57,12 @@ jobs on macOS/darwin (via launchd) and linux (via systemd). It reads one
 or more TOML config bundles and can deploy the corresponding platform
 units. It runs jobs through a uniform shim, which provides consistent
 logging, execution gates, timeouts, environment management, etc. Jobs can
-be grouped, and groups or jobs run on a schedule. Jobs can also be managed
-manually (enabled/disabled independently of the underlying scheduler, and
-run at will via the `trigger` subcommand). Crony supports the following
-notification mechanisms for job failures: email/smtp, ntfy, and pop-ups
-(on macOS/darwin).
+be grouped, and groups or jobs run on a schedule; a job can instead be a
+daemon, which runs continuously and is restarted whenever it stops. Jobs
+can also be managed manually (enabled/disabled independently of the
+underlying scheduler, and run at will via the `trigger` subcommand). Crony
+supports the following notification mechanisms for job failures:
+email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
 Subcommands fall into categories:
 - configuration (`config`): manage config files
@@ -479,8 +480,9 @@ def _build_parser() -> StrictArgumentParser:
         help="Disarm the named jobs' schedules (still triggerable).",
         description=(
             "Disarm the named jobs' schedules: loaded and triggerable, "
-            "but not firing on their own. Requires a target: job(s) or "
-            "--all."
+            "but not firing on their own. Disabling a daemon stops it; "
+            "it stays stopped across a reboot until re-enabled. "
+            "Requires a target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_disable)
@@ -507,7 +509,9 @@ def _build_parser() -> StrictArgumentParser:
         action="store_true",
         help=(
             "Block until each named entry's next completion and "
-            "exit with that exit code (worst across multiple names)."
+            "exit with that exit code (worst across multiple names). "
+            "Naming a daemon is an error -- it runs until stopped, so "
+            "there is no completion to wait for."
         ),
     )
     p_trigger.add_argument(
@@ -576,9 +580,10 @@ def _build_parser() -> StrictArgumentParser:
         action="store_true",
         help=(
             "Drop rows that are config=synced, enabled in the "
-            "scheduler, and last in ok/never/gated. Output is "
-            "flat (no tree indent). Always exits 0 -- this is a "
-            "filter on the display, not a gate."
+            "scheduler, and last in ok/never/gated -- or, for a "
+            "daemon, running/gated (up, or deliberately kept down by "
+            "its gate). Output is flat (no tree indent). Always exits "
+            "0 -- this is a filter on the display, not a gate."
         ),
     )
 

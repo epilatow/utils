@@ -25,6 +25,10 @@ alone modify -- the operator's real jobs. Each test tears its bundle
 down at fixture teardown, and the fixture also destroys the bundle
 before it runs, sweeping any leftovers from a previously killed run.
 
+A daemon job is restarted by the supervisor whenever it stops, so
+teardown sweeps the scheduler directly after `crony destroy` rather than
+trusting that call alone.
+
 If a run is hard-killed (SIGKILL / power loss) before teardown, remove
 leftovers by hand:
 
@@ -47,7 +51,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -140,6 +144,11 @@ def _require_scheduler() -> None:
 pytestmark = pytest.mark.e2e
 
 
+# Every unit this suite installs is prefixed with the reserved bundle
+# name, so a teardown sweep keyed on it cannot reach a real job.
+_UNIT_GLOB = f"crony-{E2E_BUNDLE}."
+
+
 class _CronyE2E:
     """A subprocess `crony` driver over an isolated config / state /
     unit-dir namespace scoped to the reserved e2e bundle."""
@@ -230,21 +239,80 @@ class _CronyE2E:
             == 0
         )
 
-    def status_config(self, full_name: str) -> str | None:
-        """The CONFIG cell `crony status` shows for `full_name`, or None
-        when the entry has no row."""
+    def _status_row(self, full_name: str) -> list[str] | None:
+        """`crony status`'s row for `full_name` split into cells, or None
+        when the entry has no row. The default columns are job-or-uuid,
+        config, schedule, status, last-ran."""
         out = self.crony("status", "-b", E2E_BUNDLE, check=False).stdout
         for line in out.splitlines():
             toks = line.split()
             if toks and toks[0] == full_name:
-                return toks[1]
+                return toks
         return None
 
+    def status_config(self, full_name: str) -> str | None:
+        """The CONFIG cell `crony status` shows for `full_name`, or None
+        when the entry has no row."""
+        row = self._status_row(full_name)
+        return row[1] if row else None
+
+    def status_status(self, full_name: str) -> str | None:
+        """The STATUS cell `crony status` shows for `full_name`, or None
+        when the entry has no row."""
+        row = self._status_row(full_name)
+        return row[3] if row and len(row) > 3 else None
+
     def destroy_bundle(self) -> None:
-        """Best-effort teardown of every unit in the reserved bundle."""
+        """Best-effort teardown of every unit in the reserved bundle.
+
+        Falls back to the platform directly afterwards: a daemon is
+        restarted whenever it stops, so anything `crony destroy` failed
+        to reach would keep coming back rather than simply lingering."""
         self.crony("destroy", "--all", "-b", E2E_BUNDLE, check=False)
         if _IS_LINUX:
             self.systemctl_user("daemon-reload")
+        self._force_stop_leftovers()
+
+    def _force_stop_leftovers(self) -> None:
+        """Stop any reserved-bundle unit still registered with the
+        scheduler. Every target is name-scoped to the reserved bundle, so
+        this can only reach units this suite installed."""
+        if _IS_LINUX:
+            listed = self.systemctl_user(
+                "list-units", "--all", "--no-legend", f"{_UNIT_GLOB}*"
+            ).stdout
+            for line in listed.splitlines():
+                unit = line.split()[0] if line.split() else ""
+                if unit.startswith(_UNIT_GLOB):
+                    self.systemctl_user("disable", "--now", unit)
+            self.systemctl_user("daemon-reload")
+            return
+        listed = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        for token in listed.split():
+            if token.startswith(f"org.crony.{E2E_BUNDLE}."):
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}/{token}"],
+                    capture_output=True,
+                    check=False,
+                )
+
+    def wait_until(
+        self, predicate: Callable[[], bool], *, timeout: float, what: str
+    ) -> None:
+        """Poll `predicate` until it holds, failing with `what` on
+        timeout. The supervisors act asynchronously, so every assertion
+        about a daemon being up (or gone) has to wait for it."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.5)
+        raise AssertionError(f"timed out waiting for {what}")
 
 
 @pytest.fixture
@@ -506,6 +574,154 @@ class TestLaunchdJitter:
         ), "jitter companion did not self-unload after firing"
         # The service is untouched: still loaded, firing on its interval.
         assert e2e.launchctl_loaded(e2e.darwin_label("probe"))
+
+
+class TestDaemonSupervision:
+    """A daemon under the real supervisor: the rendered unit starts
+    itself and is respawned when it exits, and disable / destroy stop it.
+
+    These assert on scheduler-observable state (the respawn counter, unit
+    registration) rather than on the job's command running. crony bakes
+    no CRONY_* overrides into a rendered unit, so a runner the scheduler
+    spawns reads the real state dir and exits before it reaches the
+    command -- which is itself a non-zero exit, so it exercises the
+    respawn path. The runner's own exit-code contract (which code means
+    restart, which means stay down) is unit-tested.
+    """
+
+    def _apply_daemon(self, e2e: _CronyE2E) -> None:
+        # Short backoff so a respawn lands inside the poll window.
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
+        e2e.write_bundle('[job.d]\ncommand = "true"\ndaemon = true\n', ["d"])
+        e2e.crony("apply", e2e.full("d"))
+
+    def _start_marker(self, e2e: _CronyE2E) -> str:
+        """A value that changes every time the supervisor starts the
+        unit, or `""` when it has never started.
+
+        Deliberately not a restart counter. systemd's `NRestarts` moves
+        only for an *automatic* restart, so a manual `crony trigger`
+        leaves it flat; the main process's start timestamp moves however
+        the start was initiated. launchd's `runs` counts every launch,
+        including a kickstart, so it already has that property.
+        """
+        if _IS_LINUX:
+            out = e2e.systemctl_user(
+                "show",
+                "-p",
+                "ExecMainStartTimestampMonotonic",
+                f"crony-{e2e.full('d')}.service",
+            ).stdout
+            _, _, value = out.strip().partition("=")
+            return "" if value in ("", "0") else value
+        out = subprocess.run(
+            [
+                "launchctl",
+                "print",
+                f"gui/{os.getuid()}/{e2e.darwin_label('d')}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        m = re.search(r"^\s*runs = (\d+)", out, re.MULTILINE)
+        return "" if m is None or m.group(1) == "0" else m.group(1)
+
+    def _loaded(self, e2e: _CronyE2E) -> bool:
+        if _IS_LINUX:
+            state = e2e.systemctl_user(
+                "is-active", f"crony-{e2e.full('d')}.service"
+            ).stdout.strip()
+            return state in ("active", "activating")
+        return e2e.launchctl_loaded(e2e.darwin_label("d"))
+
+    def _wait_started(self, e2e: _CronyE2E, what: str) -> str:
+        """Block until the unit has been started, and return the marker
+        for that start."""
+        e2e.wait_until(
+            lambda: bool(self._start_marker(e2e)), timeout=60, what=what
+        )
+        return self._start_marker(e2e)
+
+    def test_starts_itself_without_a_trigger(self, e2e: _CronyE2E) -> None:
+        # No timer and nothing kickstarts it: applying a daemon is what
+        # starts it, which is the whole point of the mode.
+        self._apply_daemon(e2e)
+        self._wait_started(e2e, "the daemon to be started by the supervisor")
+
+    def test_supervisor_respawns_it_after_it_exits(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # The unit must be rendered so the supervisor brings it back --
+        # KeepAlive on launchd, Restart= on systemd. The marker moving
+        # again is that policy working against a command that keeps
+        # exiting.
+        self._apply_daemon(e2e)
+        first = self._wait_started(e2e, "the daemon to start")
+        e2e.wait_until(
+            lambda: self._start_marker(e2e) not in ("", first),
+            timeout=120,
+            what="the supervisor to respawn the daemon",
+        )
+
+    def test_disable_stops_it(self, e2e: _CronyE2E) -> None:
+        # Rewriting the unit file neither stops a running daemon nor
+        # un-arms it, so disable has to reach the scheduler.
+        self._apply_daemon(e2e)
+        self._wait_started(e2e, "the daemon to start")
+        e2e.crony("disable", e2e.full("d"))
+        # A disabled entry stays registered with the scheduler on
+        # purpose -- dormant but triggerable -- so "stopped" is that it
+        # is no longer being restarted, not that its unit is gone.
+        time.sleep(3)
+        settled = self._start_marker(e2e)
+        time.sleep(6)
+        assert self._start_marker(e2e) == settled, (
+            "disabled daemon was still being respawned"
+        )
+
+    def test_triggering_a_disabled_daemon_runs_it_once(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # A disabled daemon stays registered and triggerable, so it can
+        # be started by hand -- but disabling stripped the supervision
+        # (launchd `KeepAlive`, systemd `Restart=`), so what starts is a
+        # one-shot: the scheduler does not bring it back when it stops,
+        # and it is still disabled for the next boot.
+        self._apply_daemon(e2e)
+        self._wait_started(e2e, "the daemon to start")
+        e2e.crony("disable", e2e.full("d"))
+        time.sleep(3)
+        settled = self._start_marker(e2e)
+
+        e2e.crony("trigger", e2e.full("d"))
+        e2e.wait_until(
+            lambda: self._start_marker(e2e) not in ("", settled),
+            timeout=60,
+            what="the triggered daemon to start",
+        )
+        started = self._start_marker(e2e)
+        # Several restart intervals: it must not start again.
+        time.sleep(8)
+        assert self._start_marker(e2e) == started, (
+            "a triggered disabled daemon was respawned after it stopped"
+        )
+        # Triggering does not clear the operator-disable, so the entry
+        # reports disabled again once the run it started has ended.
+        assert e2e.status_status(e2e.full("d")) == "disabled"
+
+    def test_destroy_removes_a_running_daemon(self, e2e: _CronyE2E) -> None:
+        # A daemon holds its run lock for its whole life, so destroy has
+        # to stop the unit rather than wait for the lock to clear.
+        self._apply_daemon(e2e)
+        self._wait_started(e2e, "the daemon to start")
+        e2e.crony("destroy", e2e.full("d"))
+        assert e2e.status_config(e2e.full("d")) in (None, "missing")
+        e2e.wait_until(
+            lambda: not self._loaded(e2e),
+            timeout=60,
+            what="the destroyed daemon to stop",
+        )
 
 
 if __name__ == "__main__":

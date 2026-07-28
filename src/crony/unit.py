@@ -358,6 +358,31 @@ class OnDemand:
         return ON_DEMAND_SPEC
 
 
+# The canonical display token for the continuous firing mode (see
+# Daemon) -- what `str(Daemon())` and the status SCHEDULE cell show. The
+# config spells the mode as the `daemon = true` key, not this string.
+DAEMON_SPEC = "daemon"
+
+
+@dataclass(frozen=True)
+class Daemon:
+    """The continuous firing mode: an entry that declares
+    ``daemon = true`` and runs for as long as it can, restarted by the
+    platform supervisor whenever its command exits.
+
+    A firing mode in its own right, distinct from the timed modes
+    (Schedule / Interval) because it names no times at all, and from the
+    dormant ones (OnDemand / no timing) because its unit starts itself
+    and is kept running. It arms no timer, so ``is_scheduled`` is False
+    for it; a backend asks ``is_daemon`` -- or, once the entry may be
+    operator-disabled, ``UnitSpec.daemon`` -- to tell it from an entry
+    that merely sits dormant.
+    """
+
+    def __str__(self) -> str:
+        return DAEMON_SPEC
+
+
 def _check_range(name: str, value: int, low: int, high: int) -> None:
     if not low <= value <= high:
         raise ValueError(f"{name} {value} out of range {low}-{high}")
@@ -421,23 +446,32 @@ def _unsupported_schedule(text: str) -> ValueError:
     )
 
 
-# How an entry fires: a calendar Schedule, a repeat Interval, or
-# OnDemand (trigger-only). The three are mutually exclusive, so a single
-# value (or None, for an entry that declares no firing mode -- a transit
-# group or a group-only job) models it without an "at most one set"
-# invariant. isinstance discriminates the variant.
-Timing = Schedule | Interval | OnDemand
+# How an entry fires: a calendar Schedule, a repeat Interval, OnDemand
+# (trigger-only), or Daemon (continuously). The four are mutually
+# exclusive, so a single value (or None, for an entry that declares no
+# firing mode -- a transit group or a group-only job) models it without
+# an "at most one set" invariant. isinstance discriminates the variant.
+Timing = Schedule | Interval | OnDemand | Daemon
 
 
 def is_scheduled(timing: Timing | None) -> TypeIs[Schedule | Interval]:
     """Whether `timing` arms a scheduler timer. A Schedule or Interval
-    does; OnDemand (trigger-only) and None (a transit group or group-only
-    job) render a dormant unit -- loaded but with no timer, run only on
-    `crony trigger` or a parent group's dispatch. The single predicate
-    the model, status, and the backends share, so "has a timer" is
-    decided identically everywhere; a TypeIs so a backend guarded by it
-    narrows to the real-timer type."""
+    does; OnDemand (trigger-only), Daemon (which runs continuously rather
+    than at times), and None (a transit group or group-only job) do not.
+    The single predicate the model, status, and the backends share, so
+    "has a timer" is decided identically everywhere; a TypeIs so a
+    backend guarded by it narrows to the real-timer type.
+
+    Not the same question as "does the unit start itself": a Daemon does,
+    without a timer. A backend that needs that asks `UnitSpec.daemon`."""
     return isinstance(timing, (Schedule, Interval))
+
+
+def is_daemon(timing: Timing | None) -> TypeIs[Daemon]:
+    """Whether `timing` is the continuous firing mode. Distinct from
+    `is_scheduled` (a daemon arms no timer) and from the dormant modes (a
+    daemon starts itself and is restarted when it stops)."""
+    return isinstance(timing, Daemon)
 
 
 @dataclass(frozen=True)
@@ -463,16 +497,38 @@ class JitterSpec:
 
 
 @dataclass(frozen=True)
+class DaemonSpec:
+    """The supervision parameters a daemon unit carries.
+
+    A pure carrier the model fills in and each backend renders per its
+    own mechanism -- it holds no policy. Its presence on a `UnitSpec` is
+    what identifies the unit as a daemon; `timing` cannot answer that
+    once the entry is disabled, since a disabled entry renders with no
+    timing at all.
+
+    restart_seconds  The minimum spacing between restarts. Each
+                     supervisor applies it its own way -- systemd waits
+                     this long after the command exits, launchd floors
+                     the interval between launches -- so it bounds how
+                     fast a failing command can be retried rather than
+                     naming an exact delay.
+    """
+
+    restart_seconds: int
+
+
+@dataclass(frozen=True)
 class UnitSpec:
     """One scheduled unit, described without crony's job/group model.
 
     name        The unit's full name; basis for its platform label.
     cmd         The argv the unit runs.
     timing      The entry's firing mode: a Schedule or Interval (which
-                arm a timer -- `is_scheduled`), OnDemand (trigger-only),
-                or None (a transit group or group-only job). A backend
-                renders OnDemand and None the same way -- a dormant unit
-                with no timer. A disabled entry is rendered with None.
+                arm a timer -- `is_scheduled`), Daemon (continuous),
+                OnDemand (trigger-only), or None (a transit group or
+                group-only job). A backend renders OnDemand and None the
+                same way -- a dormant unit with no timer. A disabled
+                entry is rendered with None, whatever its mode.
     priority    The unit's priority class. NORMAL when no special
                 scheduling is requested (groups always render NORMAL);
                 only HIGH / LOW emit platform directives.
@@ -480,6 +536,11 @@ class UnitSpec:
                 None when it is not jittered (a calendar / short-interval /
                 grouped / disabled entry). An eligibility decision the
                 model owns; the backends only render it.
+    daemon      The supervision parameters when this unit is a daemon,
+                else None. Set independently of `timing`, so it still
+                identifies a disabled daemon -- whose timing is None,
+                and which must therefore be rendered and torn down as a
+                daemon rather than as an ordinary dormant entry.
     """
 
     name: EntityName
@@ -487,3 +548,4 @@ class UnitSpec:
     timing: Timing | None
     priority: PriorityClass
     jitter: JitterSpec | None = None
+    daemon: DaemonSpec | None = None

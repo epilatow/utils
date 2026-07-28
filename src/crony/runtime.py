@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import shutil as shutil  # noqa: PLC0414  re-exported for tests
+import time
 import uuid
 from collections.abc import Container, Iterator
 from enum import StrEnum
@@ -207,6 +208,7 @@ def _derive_job_status(
     last_run: crony.model.LastRun | None,
     unit_last_exit: crony.platform.UnitLastExit | None,
     killed_on_timeout: bool = False,
+    disabled_daemon: bool = False,
 ) -> crony.model.JobStatus:
     """The entity's current run status from its runtime facts.
 
@@ -221,10 +223,19 @@ def _derive_job_status(
     `killed_on_timeout` is the guard's killed-flag: when a run crashed
     (never recorded) because the guard had to SIGKILL it on its timeout,
     the flag names the crash a `timeout` instead.
+
+    `disabled_daemon` reports `disabled` for a daemon the operator turned
+    off. A daemon's status is about whether it is up, and its last record
+    is an artifact of being stopped (a signal death, which would read
+    `fail`), so the last outcome is not the useful answer the way it is
+    for a scheduled job. It ranks below `is_running`: a disabled daemon
+    someone triggered by hand really is running.
     """
     js = crony.model.JobStatus
     if is_running:
         return js.PENDING if is_pending else js.RUNNING
+    if disabled_daemon:
+        return js.DISABLED
     if _crashed(is_running, run_pid, last_run, unit_last_exit):
         return js.TIMEOUT if killed_on_timeout else js.CRASHED
     if last_run is None or last_run.exit_class is None:
@@ -237,6 +248,7 @@ def _read_runtime_state(
     *,
     full_name: str | None,
     last_exits: dict[str, crony.platform.UnitLastExit] | None = None,
+    disabled_daemon: bool = False,
 ) -> crony.model.RuntimeState:
     """Snapshot the runtime state inside one state dir into a
     RuntimeState: the parsed last-run record, the last launch's start
@@ -249,7 +261,9 @@ def _read_runtime_state(
 
     `last_exits` is the scheduler's bulk last-launch map (keyed by full
     name); the entry for `full_name`, if any, feeds the crash
-    reconciliation in `_derive_job_status`.
+    reconciliation in `_derive_job_status`. `disabled_daemon` comes from
+    the caller's parsed node (a state dir alone cannot say whether its
+    entry is a daemon) and reaches the same deriver.
     """
     last_run: crony.model.LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -289,6 +303,7 @@ def _read_runtime_state(
         last_run,
         unit_last_exit,
         killed_on_timeout,
+        disabled_daemon,
     )
     return crony.model.RuntimeState(
         state_dir=state_dir,
@@ -469,6 +484,8 @@ def _build_current_graph(
                 uuid_dir,
                 full_name=full,
                 last_exits=last_exits,
+                disabled_daemon=snap.unit_disabled
+                and crony.unit.is_daemon(snap.timing),
             )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /
@@ -791,6 +808,28 @@ def _units_changing(
         if on_disk.get(u.filename) != u.content:
             return True
     return False
+
+
+def _reload_kills_run(
+    sched: crony.platform.Scheduler,
+    snapshot: crony.model.Job | crony.model.JobGroup,
+    current: crony.model.Job | crony.model.JobGroup | None,
+) -> bool:
+    """Whether applying `snapshot` stops the run currently under its
+    unit.
+
+    True on a scheduler whose reload is a stop-and-start of every unit
+    (launchd). True for a daemon on any scheduler, in either direction:
+    a daemon has no separate arming unit, so activating one restarts the
+    service that is running the job rather than a timer beside it, and
+    leaving the mode retires the daemon unit outright. `current` is the
+    applied node, which is the only side that knows the entry is a
+    daemon today when the pending side no longer is."""
+    return (
+        sched.reload_terminates_running_job
+        or crony.unit.is_daemon(snapshot.timing)
+        or (current is not None and crony.unit.is_daemon(current.timing))
+    )
 
 
 def _retired_name(
@@ -1119,12 +1158,15 @@ def apply_one(
     running_ref = crony.unit.EntityRef.from_str(
         os.environ.get(RUNNING_REF_ENV, "")
     )
-    self_reload = running_ref == ref and sched.reload_terminates_running_job
+    self_reload = running_ref == ref and _reload_kills_run(
+        sched, snapshot, current_snapshot
+    )
     if self_reload and _units_changing(snapshot, sched):
         logger.warning(
             "%s: deferring update -- cannot reload the unit of a "
             "running job without terminating it; re-run "
-            "`crony apply %s` after this run exits",
+            "`crony apply %s` from outside that job (a daemon's own "
+            "run does not exit on its own)",
             full_name,
             full_name,
         )
@@ -1169,8 +1211,14 @@ def apply_one(
     # reaches the same teardown owes the run the same protection. The
     # lock answers for any runner, including this entry applying itself
     # (its runner holds the lock from another process).
+    #
+    # A daemon is exempt for the same reason `destroy` exempts one: it
+    # holds its lock for as long as it is up, so deferring would defer
+    # forever. Retiring its old unit stops it, and the new unit starts a
+    # fresh instance -- which is what renaming a daemon has to mean.
     if (
         current_snapshot is not None
+        and not crony.unit.is_daemon(current_snapshot.timing)
         and _retired_name(current_snapshot, full_name, live_full_names)
         and run_in_progress(current_snapshot.state_dir)
     ):
@@ -1196,6 +1244,27 @@ def apply_one(
             None,
             current_snapshot.state_dir_symlink_path,
         )
+
+    # Leaving the daemon mode retires the daemon unit first. Installing
+    # over it is not enough: the entry keeps the same `.service`
+    # filename, so nothing prunes it, and a backend that arms the new
+    # shape by starting a timer never touches the service the old daemon
+    # is still running under -- leaving the process up forever, holding
+    # the run lock the new schedule's fires need, and (on systemd) its
+    # boot symlink behind. The reverse direction needs nothing: entering
+    # the mode installs a unit that starts itself.
+    #
+    # Either direction ends whatever is running under the old unit, and
+    # deliberately so: a mode change replaces the unit, and the two
+    # shapes cannot both be live. Only a run belonging to the applying
+    # entry itself is spared, by the defer above -- there the apply
+    # would be killing the process performing it.
+    if (
+        current_snapshot is not None
+        and crony.unit.is_daemon(current_snapshot.timing)
+        and not crony.unit.is_daemon(snapshot.timing)
+    ):
+        sched.deactivate(full_name)
 
     # The operator-disabled state is preserved across a re-apply by
     # `load_config`, which mirrors a disabled current entry's flag onto
@@ -1285,6 +1354,26 @@ def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:
     link.symlink_to(node.uuid)
 
 
+# How long `destroy_one` waits for a stopped run to finish writing
+# before it removes the state dir out from under it.
+_RUN_SETTLE_TIMEOUT_SEC = 5.0
+_RUN_SETTLE_POLL_SEC = 0.05
+
+
+def _await_run_finished(state_dir: Path) -> None:
+    """Block until no run holds `state_dir`'s lock, bounded.
+
+    The unit is retired before this, but stopping it is not synchronous
+    everywhere -- `launchctl bootout` returns before the process group
+    is gone -- and a runner ignores the stop signal so it can record its
+    outcome first. Without this the state dir could be removed while
+    that write is still in flight, recreating it as a stray. Bounded so
+    a wedged runner delays a destroy rather than hanging it."""
+    deadline = time.monotonic() + _RUN_SETTLE_TIMEOUT_SEC
+    while run_in_progress(state_dir) and time.monotonic() < deadline:
+        time.sleep(_RUN_SETTLE_POLL_SEC)
+
+
 def destroy_one(
     name: str | None,
     state_dir: Path | None,
@@ -1312,4 +1401,5 @@ def destroy_one(
         alias_dir.unlink()
     if state_dir is None or not state_dir.is_dir():
         return
+    _await_run_finished(state_dir)
     shutil.rmtree(state_dir)

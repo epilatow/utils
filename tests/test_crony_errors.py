@@ -46,6 +46,9 @@ class TestExceptionHierarchy(ExceptionHierarchyBase):
         ExitCode.SUCCESS,
         ExitCode.WARNING,
         ExitCode.CRASHED,
+        # Returned by the runner to tell the supervisor a daemon's
+        # command exited; nothing raises it, so it has no exception.
+        ExitCode.DAEMON_EXITED,
     }
 
 
@@ -56,6 +59,7 @@ class TestInternalExitCodes:
         assert INTERNAL_EXIT_CODES == {
             ExitCode.LOCK_BUSY,
             ExitCode.PRECONDITION,
+            ExitCode.DAEMON_EXITED,
         }
 
 

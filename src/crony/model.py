@@ -182,6 +182,23 @@ def _jitter_spec(
     )
 
 
+def _daemon_spec(
+    timing: crony.unit.Timing | None,
+) -> crony.unit.DaemonSpec | None:
+    """The `DaemonSpec` for a daemon entry, else None.
+
+    Read from the entry's OWN timing rather than the one being rendered:
+    a disabled entry renders schedule-less, so the rendered timing cannot
+    say whether it is a daemon, and a disabled daemon still has to be
+    rendered and torn down as one (it is stopped and kept from starting
+    at boot, not merely left dormant)."""
+    if not crony.unit.is_daemon(timing):
+        return None
+    return crony.unit.DaemonSpec(
+        restart_seconds=crony.config.daemon_restart_seconds()
+    )
+
+
 def _run_argv(
     uv_path: Path, crony_path: Path, ref: crony.unit.EntityRef
 ) -> tuple[str, ...]:
@@ -252,13 +269,19 @@ def _normalized_spec(
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
     guard_interactive: bool,
+    daemon_timing: crony.unit.Timing | None,
 ) -> crony.unit.UnitSpec:
     """A UnitSpec with blank (`Path("")`) executable paths -- the
     path-independent form both graphs normalize to for the drift compare.
     Rendering it drops any dependence on where the uv / crony binaries
     live, so a moved-but-present binary collapses to the same content as
     the live one and does not read as drift. Buildable even for a node
-    with no resolved executables."""
+    with no resolved executables.
+
+    `timing` is what gets rendered (None for a disabled entry);
+    `daemon_timing` is the entry's own mode, which a disabled entry's
+    render can no longer report but which still decides whether this is
+    a daemon unit."""
     cmd = _guarded_argv(
         Path(""), Path(""), ref, guard_timeout, guard_interactive
     )
@@ -268,6 +291,7 @@ def _normalized_spec(
         timing=timing,
         priority=priority,
         jitter=_jitter_spec(name, ref, timing, Path(""), Path("")),
+        daemon=_daemon_spec(daemon_timing),
     )
 
 
@@ -313,8 +337,9 @@ class _JobCommon:
     state_dir_symlink: tuple[Path, str] | None = field(
         default=None, kw_only=True
     )
-    # The per-entry firing mode (Schedule / Interval / OnDemand) that
-    # drove the rendered platform unit, pinned so `crony status` shows the
+    # The per-entry firing mode (Schedule / Interval / OnDemand /
+    # Daemon) that drove the rendered platform unit, pinned so
+    # `crony status` shows the
     # applied schedule independently of any later live-config edit.
     # Default-None (a transit group or group-only job) for back-compat
     # with snapshots written before a timing was pinned; loaders rely on
@@ -332,7 +357,9 @@ class _JobCommon:
     # disable`). The schedule stays pinned in `timing` (so `enable`
     # restores it), but a disabled entry renders its unit with no
     # schedule (`unit_spec` drops the timing) -- loaded and triggerable,
-    # just not firing on its own. Persisted in snapshot.json (it is real
+    # just not firing on its own. For a daemon, whose only mode of
+    # firing is its own, that means an inert unit: stopped, and started
+    # by neither boot nor a restart. Persisted in snapshot.json (it is real
     # applied state, not derived), and defaulted False so config-built
     # nodes start enabled (config has no disabled notion). `load_config`
     # mirrors a disabled current node's flag onto its pending node so the
@@ -505,7 +532,9 @@ class _JobCommon:
         `timing` field so `enable` restores it. A trigger-only OnDemand
         entry keeps its OnDemand timing here (so status shows `on-demand`)
         and the backend renders it dormant like any non-`is_scheduled`
-        entry.
+        entry. A daemon additionally carries its supervision parameters,
+        read from the node's own timing rather than the rendered one so
+        a disabled daemon is still rendered (and torn down) as a daemon.
 
         Requires those paths; a node only ever compared, never installed
         (a bare snapshot load), has no unit to render and raises. The
@@ -533,6 +562,7 @@ class _JobCommon:
             jitter=_jitter_spec(
                 self.entity_name, self.entity_ref, timing, uv_path, crony_path
             ),
+            daemon=_daemon_spec(self.timing),
         )
 
     def with_unit_disabled(
@@ -553,6 +583,7 @@ class _JobCommon:
                 self._unit_priority,
                 self._guard_timeout,
                 self._guard_interactive,
+                self.timing,
             ),
         )
 
@@ -579,6 +610,13 @@ class _JobCommon:
         (persisted so the applied side shows `on-demand` and a switch to
         or from a schedule reads as drift)."""
         return isinstance(self.timing, crony.unit.OnDemand)
+
+    def _daemon(self) -> bool:
+        """Whether this entry's timing is the continuous Daemon mode
+        (persisted for the same reasons as `_on_demand`, and so a
+        disabled daemon -- which renders with no timing -- is still
+        recognizable as one)."""
+        return crony.unit.is_daemon(self.timing)
 
     def _to_snapshot(
         self,
@@ -720,7 +758,7 @@ class Job(_JobCommon):
         once); None leaves the node unrenderable, fine for a node only
         compared, never installed."""
         if flags is None:
-            flags = config.composed_flags(job.flags)
+            flags = config.composed_flags(job.flags, job.timing)
         args = [_expand_path_field(a) for a in job.args]
         gate_args = [_expand_path_field(a) for a in job.gate_args]
         script = (
@@ -742,6 +780,7 @@ class Job(_JobCommon):
             priority,
             timeout,
             interactive,
+            job.timing,
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -788,6 +827,7 @@ class Job(_JobCommon):
             schedule=self._schedule_str(),
             interval=self._interval_str(),
             on_demand=self._on_demand(),
+            daemon=self._daemon(),
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -844,6 +884,7 @@ class Job(_JobCommon):
             priority,
             snap.timeout,
             interactive,
+            timing,
             ondisk_units,
             installed_uv,
             installed_crony,
@@ -958,7 +999,7 @@ class JobGroup(_JobCommon):
                 continue
             children.append(crony.unit.EntityRef(name.bundle, child_uuid))
         if flags is None:
-            flags = config.composed_flags(group.flags)
+            flags = config.composed_flags(group.flags, group.timing)
         timeout = config.resolved_group_timeout_sec(target, group.name)
         rendered_units = _pending_rendered_units(
             platform,
@@ -968,6 +1009,7 @@ class JobGroup(_JobCommon):
             crony.unit.PriorityClass.NORMAL,
             timeout,
             False,
+            group.timing,
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -996,6 +1038,7 @@ class JobGroup(_JobCommon):
             schedule=self._schedule_str(),
             interval=self._interval_str(),
             on_demand=self._on_demand(),
+            daemon=self._daemon(),
             unit_disabled=self.unit_disabled,
             interactive=crony.config.JobFlags.INTERACTIVE in self.flags,
             keep_awake=crony.config.JobFlags.KEEP_AWAKE in self.flags,
@@ -1037,6 +1080,7 @@ class JobGroup(_JobCommon):
             crony.unit.PriorityClass.NORMAL,
             snap.timeout,
             False,
+            timing,
             ondisk_units,
             installed_uv,
             installed_crony,
@@ -1072,6 +1116,7 @@ def _pending_rendered_units(
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
     guard_interactive: bool,
+    daemon_timing: crony.unit.Timing | None,
 ) -> crony.platform.RenderedUnits:
     """The normalized `RenderedUnits` for a config-built (pending) node:
     the platform render of the entry's blank-path unit spec, so the form
@@ -1079,13 +1124,21 @@ def _pending_rendered_units(
     config unit renders first, matching a current node's on-disk view, so
     the two relate slot-for-slot and any extra on-disk file (a leftover)
     surfaces as a trailing difference. Pure (no disk I/O); `platform`
-    defaults to the running host's."""
+    defaults to the running host's. `daemon_timing` is the entry's own
+    firing mode, which a disabled entry's stripped `timing` can no longer
+    report -- see `_normalized_spec`."""
     sched = crony.platform.get_scheduler(
         platform or crony.platform.current_platform()
     )
     return sched.render_units(
         _normalized_spec(
-            name, ref, timing, priority, guard_timeout, guard_interactive
+            name,
+            ref,
+            timing,
+            priority,
+            guard_timeout,
+            guard_interactive,
+            daemon_timing,
         )
     )
 
@@ -1098,6 +1151,7 @@ def _current_rendered_units(
     priority: crony.unit.PriorityClass,
     guard_timeout: int,
     guard_interactive: bool,
+    daemon_timing: crony.unit.Timing | None,
     ondisk_units: crony.platform.RenderedUnits,
     installed_uv: Path | None,
     installed_crony: Path | None,
@@ -1120,7 +1174,8 @@ def _current_rendered_units(
 
     `ondisk_units` empty is a bare load with no disk view (the runner
     reading its own snapshot): there is nothing to score, so the node
-    carries no units to compare."""
+    carries no units to compare. `daemon_timing` is the entry's own
+    firing mode -- see `_normalized_spec`."""
     if not ondisk_units.units:
         return _EMPTY_RENDERED_UNITS
     sched = crony.platform.get_scheduler(
@@ -1130,7 +1185,13 @@ def _current_rendered_units(
         u.filename: u.content
         for u in sched.render_units(
             _normalized_spec(
-                name, ref, timing, priority, guard_timeout, guard_interactive
+                name,
+                ref,
+                timing,
+                priority,
+                guard_timeout,
+                guard_interactive,
+                daemon_timing,
             )
         ).units
     }
@@ -1160,6 +1221,7 @@ def _current_rendered_units(
                     jitter=_jitter_spec(
                         name, ref, timing, installed_uv, installed_crony
                     ),
+                    daemon=_daemon_spec(daemon_timing),
                 )
             ).units
         }
@@ -1456,6 +1518,18 @@ class JobStatus(_DescribedStrEnum):
             "pop-up dialog)."
         ),
     )
+    DISABLED = (
+        "disabled",
+        (
+            "Daemons only. The daemon has been disabled via the `disable` "
+            "subcommand, so it is stopped and will not start itself again "
+            "-- neither at boot nor by a restart -- until it is "
+            "re-enabled. It can still be started manually via the "
+            "`trigger` subcommand. A scheduled job reports its last run's "
+            "outcome instead; its SCHEDULE cell carries the disabled "
+            "state."
+        ),
+    )
     NEVER = (
         "never",
         (
@@ -1533,10 +1607,11 @@ class ConfigStatus(_DescribedStrEnum):
 
 class ScheduleValue(_DescribedStrEnum):
     """The kinds of value the `crony status` SCHEDULE column shows. Each
-    member's value is its `--help` display label. GROUPED, ON_DEMAND, and
-    DISABLED's values are also the literal cell strings the renderer
-    emits; INTERVAL's value is the cell template, whose `<x>` the renderer
-    replaces with the actual time span. All thus have a single home here.
+    member's value is its `--help` display label. GROUPED, ON_DEMAND,
+    DAEMON, and DISABLED's values are also the literal cell strings the
+    renderer emits; INTERVAL's value is the cell template, whose `<x>`
+    the renderer replaces with the actual time span. All thus have a
+    single home here.
     SCHEDULE is a pure category label -- a scheduled entry renders its raw
     OnCalendar string."""
 
@@ -1561,6 +1636,15 @@ class ScheduleValue(_DescribedStrEnum):
             "A trigger-only job/group (on-demand = true) with no schedule of "
             "its own and no scheduled parent. It runs only when run manually "
             "via the `trigger` subcommand."
+        ),
+    )
+    DAEMON = (
+        "daemon",
+        (
+            "A job (daemon = true) that runs continuously rather than at "
+            "scheduled times. It starts at login and is restarted whenever "
+            "its command exits. If its execution gate fails it stays "
+            "stopped until the next login, `apply`, or `trigger`."
         ),
     )
     DISABLED = (

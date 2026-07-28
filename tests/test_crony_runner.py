@@ -3741,3 +3741,98 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestRunDaemon:
+    """A daemon's exit code is the whole channel to the supervisor:
+    non-zero asks for a restart, zero leaves it down. The recorded
+    outcome is unchanged -- only the surfaced code differs."""
+
+    def _cfg(self, h: Any, **overrides: Any) -> Any:
+        body: dict[str, Any] = {"command": "true", "daemon": True}
+        body.update(overrides)
+        return h.config({"job": {"d": body}}, default_target_jobs=["d"])
+
+    def test_clean_exit_asks_for_a_restart(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h)
+        rc = crony_runner._run_job(h.snap(cfg, "d"))
+        assert rc == int(ExitCode.DAEMON_EXITED)
+        rec = h.last_run("d")
+        # The record stays honest -- the command did exit cleanly.
+        assert rec["exit_class"] == "ok"
+        assert rec["exit_code"] == 0
+        # `_crashed` compares the scheduler's last exit against this, so
+        # it has to be the code the scheduler actually saw or every
+        # restart would display as `crashed`.
+        assert rec["process_exit"] == int(ExitCode.DAEMON_EXITED)
+
+    def test_gate_failure_leaves_it_down(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Zero is what tells both supervisors not to respawn, so a daemon
+        # whose precondition is unmet stays stopped instead of spinning.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, gate="false", command="exit 99")
+        assert crony_runner._run_job(h.snap(cfg, "d")) == 0
+        assert h.last_run("d")["exit_class"] == "gated"
+
+    def test_failure_asks_for_a_restart(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 3")
+        assert crony_runner._run_job(h.snap(cfg, "d")) == 3
+        assert h.last_run("d")["exit_class"] == "fail"
+
+    def test_success_exit_codes_do_not_suppress_the_restart(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A declared-success code still means the command exited, which
+        # for a daemon is the thing the supervisor has to undo.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 1", success_exit_codes=[1])
+        rc = crony_runner._run_job(h.snap(cfg, "d"))
+        assert rc == int(ExitCode.DAEMON_EXITED)
+        assert h.last_run("d")["exit_class"] == "ok"
+
+    def test_sends_no_notifications(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A daemon's command exiting is routine, not a failure to report,
+        # and the supervisor restarts it -- so a crash loop must not
+        # become a notification loop.
+        # The channel is inherited, not set on the job -- setting one on
+        # a daemon directly is a config error, so this is the only shape
+        # in which channels can reach one.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "defaults": {"notify_channels": ["dialog-popup"]},
+                "job": {
+                    "d": {"command": "exit 3", "daemon": True},
+                },
+            },
+            default_target_jobs=["d"],
+        )
+        called: list[int] = []
+        monkeypatch.setattr(
+            crony_notify, "dispatch_notify", lambda *_a, **_k: called.append(1)
+        )
+        crony_runner._run_job(h.snap(cfg, "d"))
+        assert not called
+
+    def test_lock_contention_does_not_ask_for_a_restart(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Surfacing LOCK_BUSY would have the supervisor respawn against
+        # the runner already holding the lock, once per backoff, forever.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h)
+        snap = h.snap(cfg, "d")
+        sd = h.state_dir("d")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            assert crony_runner._run_job(snap) == 0

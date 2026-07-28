@@ -67,6 +67,7 @@ from crony.snapshot import (  # noqa: E402
     parse,
 )
 from crony.unit import (  # noqa: E402
+    Daemon,
     EntityKind,
     EntityName,
     EntityRef,
@@ -1076,3 +1077,63 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestDaemonSnapshot:
+    """The daemon mode round-trips through snapshot.json, and the
+    supervision carrier survives the timing-stripping that disabling
+    applies -- which is what lets a disabled daemon still be rendered and
+    torn down as one."""
+
+    def _snap(self, **over: Any) -> Any:
+        body: dict[str, Any] = {"command": "serve", "daemon": True}
+        body.update(over)
+        return _resolve_snapshot_for(_parse({"job": {"d": body}}), "d")
+
+    def _renderable(self, **over: Any) -> Any:
+        """A node with executables resolved, so `unit_spec` can render.
+        A config-built node carries them only after a real apply."""
+        return dataclasses.replace(
+            self._snap(**over),
+            uv_path=Path("/uv"),
+            crony_path=Path("/crony"),
+        )
+
+    def test_round_trips(self) -> None:
+        snap = self._snap()
+        assert isinstance(snap.timing, Daemon)
+        assert snap.to_dict()["daemon"] is True
+        assert isinstance(snapshot_from_dict(snap.to_dict()).timing, Daemon)
+
+    def test_schema_is_current(self) -> None:
+        # The `daemon` key raised the schema, and every version still in
+        # the compat window must remain loadable.
+        assert self._snap().snapshot_schema == CURRENT_SNAPSHOT_SCHEMA
+        assert CURRENT_SNAPSHOT_SCHEMA in COMPAT_SNAPSHOT_SCHEMA
+
+    def test_older_snapshot_without_the_key_loads(self) -> None:
+        # A snapshot written before the key existed has no `daemon`
+        # entry; it must read back as a non-daemon rather than failing.
+        d = self._snap().to_dict()
+        del d["daemon"]
+        d["schema"] = CURRENT_SNAPSHOT_SCHEMA - 1
+        assert snapshot_from_dict(d).timing is None
+
+    def test_unit_spec_carries_supervision(self) -> None:
+        spec = self._renderable().unit_spec()
+        assert spec.daemon is not None
+        assert spec.timing is not None
+
+    def test_disabled_daemon_keeps_its_carrier(self) -> None:
+        # Disabling strips the timing, so `timing` can no longer say this
+        # is a daemon -- the carrier is what keeps it recognizable.
+        spec = self._renderable().with_unit_disabled(True).unit_spec()
+        assert spec.timing is None
+        assert spec.daemon is not None
+
+    def test_timeout_is_uncapped_so_no_guard_wraps_it(self) -> None:
+        # A daemon resolves uncapped, so the run command is the bare
+        # runner argv -- the timeout guard would otherwise kill it.
+        snap = self._renderable()
+        assert snap.timeout == 0
+        assert "_run-guard" not in " ".join(snap.unit_spec().cmd)

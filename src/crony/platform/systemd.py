@@ -4,7 +4,9 @@
 
 Each entity is a `.service` unit; scheduled entries also get a `.timer`
 that arms it. Schedule-less entries install only the static `.service`,
-which sits dormant until `crony trigger` or a parent group fires it.
+which sits dormant until `crony trigger` or a parent group fires it. A
+daemon's `.service` needs no timer either, but starts itself and is
+restarted when it exits.
 """
 
 import configparser
@@ -22,10 +24,10 @@ from crony.platform.scheduler import (
     UnitLastExit,
 )
 from crony.unit import (
+    DaemonSpec,
     Interval,
     PriorityClass,
     Schedule,
-    Timing,
     UnitSpec,
     is_scheduled,
 )
@@ -69,13 +71,55 @@ def _render_service(
     name: str,
     cmd: tuple[str, ...],
     priority: PriorityClass = PriorityClass.NORMAL,
+    daemon: DaemonSpec | None = None,
+    *,
+    armed: bool = True,
 ) -> str:
-    """Render the systemd `.service` unit. Independent of schedule.
+    """Render the systemd `.service` unit.
 
     `cmd` is the argv ExecStart runs. The unit description carries the
     human-readable name. `priority` adds CPU / IO scheduling directives
     inherited by the spawned command.
+
+    A timed entry's service is a `oneshot` the `.timer` starts, so it is
+    independent of the schedule. A `daemon` runs long enough to be a
+    `simple` service (`oneshot` cannot carry `Restart=`) that restarts
+    when its command fails and is wanted at login. `armed` False is an
+    operator-disabled daemon: same shape, minus the `[Install]` section,
+    so the unit is `static` -- it cannot start at boot, and `is-enabled`
+    still reports it loaded rather than reading as drift.
     """
+    if daemon is not None:
+        # `on-failure`, not `always`, so the runner's exit code decides:
+        # non-zero means the command exited and should be restarted, zero
+        # means its gate declined to run it and it should stay down until
+        # the next boot or apply. StartLimitIntervalSec=0 disables the
+        # start-rate limiter, which would otherwise wedge a crash-looping
+        # daemon into `failed` permanently instead of retrying forever.
+        # Disabled drops the supervision as well as the boot wiring:
+        # leaving `Restart=` in place would put the daemon back under
+        # permanent supervision the moment anything started it (a
+        # `crony trigger`, a stray `systemctl start`), which is not what
+        # "disabled" promises.
+        supervise = (
+            f"Restart=on-failure\nRestartSec={daemon.restart_seconds}\n"
+            if armed
+            else ""
+        )
+        install = "\n[Install]\nWantedBy=default.target\n" if armed else ""
+        return (
+            "[Unit]\n"
+            f"Description=crony daemon {name}\n"
+            "StartLimitIntervalSec=0\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f"ExecStart={shlex.join(cmd)}\n"
+            "WorkingDirectory=%h\n"
+            f"{supervise}"
+            f"{_priority_block(priority)}"
+            f"{install}"
+        )
     return (
         "[Unit]\n"
         f"Description=crony job {name}\n"
@@ -297,10 +341,13 @@ class SystemdScheduler(Scheduler):
     """systemd backend: a `.service` per entity, plus a `.timer` when
     the entity carries a schedule."""
 
-    # A reload is `daemon-reload` plus enabling and restarting the timer;
-    # restarting the `.timer` re-arms the schedule but does not touch the
-    # `.service`, so a job can rewrite its own unit while in flight
-    # without killing its runner.
+    # For a scheduled entry a reload is `daemon-reload` plus enabling and
+    # restarting the `.timer`, which re-arms the schedule without
+    # touching the `.service` -- so a job can rewrite its own unit while
+    # in flight without killing its runner. A daemon has no timer and is
+    # restarted directly, so a self-applying daemon does take itself
+    # down; that is inherent to updating the unit a process is running
+    # under, and the same is true of every entry on launchd.
     reload_terminates_running_job = False
 
     @staticmethod
@@ -318,7 +365,15 @@ class SystemdScheduler(Scheduler):
         units = [
             RenderedUnit(
                 Path(_service_filename(name)),
-                _render_service(name, spec.cmd, spec.priority),
+                _render_service(
+                    name,
+                    spec.cmd,
+                    spec.priority,
+                    spec.daemon,
+                    # A daemon renders schedule-less only when the
+                    # operator disabled it, which is what un-arms it.
+                    armed=spec.timing is not None,
+                ),
             )
         ]
         if is_scheduled(spec.timing):
@@ -442,10 +497,27 @@ class SystemdScheduler(Scheduler):
             out[name] = UnitLastExit(exit_status=-raw if killed else raw)
         return out
 
-    def activate(self, name: str, timing: Timing | None, /) -> None:
+    def activate(self, spec: UnitSpec, /) -> None:
+        name = str(spec.name)
         # --quiet suppresses systemctl's success-path "Created symlink"
         # chatter; real errors still print.
         self._run_checked(["systemctl", "--user", "--quiet", "daemon-reload"])
+        if spec.daemon is not None:
+            service = _service_filename(name)
+            if spec.timing is None:
+                # Operator-disabled: stop it now and drop the boot
+                # symlink. Rewriting the unit file does neither -- the
+                # running instance keeps going and the existing
+                # `default.target.wants` link survives -- so a disabled
+                # daemon would otherwise stay up and return at boot.
+                _disable_unit(service)
+                return
+            # Enable for boot, then restart so an apply always leaves the
+            # daemon running the config just written rather than the one
+            # it started with.
+            self._run_checked(_SYSTEMCTL_ENABLE + [service])
+            self._run_checked(_SYSTEMCTL_RESTART + [service])
+            return
         # Only a scheduled entry has a `.timer`; a schedule-less `.service`
         # (grouped or disabled) sits dormant. Enable creates the boot
         # symlink; restart re-activates the timer so its monotonic anchor
@@ -453,7 +525,7 @@ class SystemdScheduler(Scheduler):
         # running -- a plain `enable --now` would no-op the start on an
         # active timer and leave an interval schedule stuck on its stale
         # activation, unable to fire.
-        if is_scheduled(timing):
+        if is_scheduled(spec.timing):
             timer = _timer_filename(name)
             self._run_checked(_SYSTEMCTL_ENABLE + [timer])
             self._run_checked(_SYSTEMCTL_RESTART + [timer])
@@ -508,8 +580,8 @@ class SystemdScheduler(Scheduler):
     def trigger(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.
         # --no-block enqueues the start job and returns without waiting
-        # for it: the .service is Type=oneshot, for which a plain
-        # `systemctl start` blocks until ExecStart exits. trigger's
+        # for it: a scheduled entry's .service is Type=oneshot, for which
+        # a plain `systemctl start` blocks until ExecStart exits. trigger's
         # contract is to return once the platform accepts the fire, not
         # once the job finishes -- a caller that wants completion waits
         # for it separately.

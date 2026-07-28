@@ -42,10 +42,11 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   TOML config bundles and can deploy the corresponding platform units. It runs
   jobs through a uniform shim, which provides consistent logging, execution
   gates, timeouts, environment management, etc. Jobs can be grouped, and
-  groups or jobs run on a schedule. Jobs can also be managed manually
-  (enabled/disabled independently of the underlying scheduler, and run at will
-  via the `trigger` subcommand). Crony supports the following notification
-  mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
+  groups or jobs run on a schedule; a job can instead be a daemon, which runs
+  continuously and is restarted whenever it stops. Jobs can also be managed
+  manually (enabled/disabled independently of the underlying scheduler, and
+  run at will via the `trigger` subcommand). Crony supports the following
+  notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
   macOS/darwin).
 - **[darwin-tz-watchdog](docs/darwin-tz-watchdog.md)**\
   darwin-tz-watchdog restarts macOS UserEventAgent-Aqua when its cached

@@ -69,10 +69,11 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
 
     A Schedule shows its OnCalendar source; an Interval shows
     `interval=<spec>`. A trigger-only OnDemand entry displays as
-    `on-demand`. An entry with no timing -- a transit group or a
-    group-only job -- displays as `grouped`. This renders only the
-    schedule shape; the caller overrides the cell with `disabled` for an
-    operator-disabled entry (it has the snapshot's disable flag).
+    `on-demand` and a continuous Daemon one as `daemon`. An entry with no
+    timing -- a transit group or a group-only job -- displays as
+    `grouped`. This renders only the schedule shape; the caller overrides
+    the cell with `disabled` for an operator-disabled entry (it has the
+    snapshot's disable flag).
     """
     if isinstance(timing, crony.unit.Schedule):
         return str(timing)
@@ -82,6 +83,8 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
         )
     if isinstance(timing, crony.unit.OnDemand):
         return crony.model.ScheduleValue.ON_DEMAND.value
+    if crony.unit.is_daemon(timing):
+        return crony.model.ScheduleValue.DAEMON.value
     return crony.model.ScheduleValue.GROUPED.value
 
 
@@ -659,7 +662,23 @@ def _reclaim_entity(
     sd = entity.state_dir
     on_disk = sd if sd.is_dir() else None
     label = entity.full_name or str(entity.entity_ref)
-    if on_disk is not None and crony.runtime.run_in_progress(on_disk):
+    # A daemon holds its run lock for as long as it is up, so the guard
+    # below would never clear for one -- there is no later moment when it
+    # is not running. Removal stops its unit first, so the run it ends is
+    # ended deliberately rather than raced. That only holds on the full
+    # path: a shadowed collision loser is reclaimed state-dir-only (a
+    # different live entry owns the name-keyed unit), so nothing there
+    # stops the daemon and the refusal must still apply.
+    is_daemon = (
+        isinstance(entity, crony.model.Job)
+        and crony.unit.is_daemon(entity.timing)
+        and entity.entity_ref not in config.shadowed
+    )
+    if (
+        not is_daemon
+        and on_disk is not None
+        and crony.runtime.run_in_progress(on_disk)
+    ):
         if raise_on_lock:
             raise crony.errors.LockBusyError(
                 f"{label}: run in progress; will not destroy"
@@ -1106,7 +1125,10 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
 
     Re-renders each installed unit with no schedule -- loaded and
     triggerable, but not firing on its own -- and records `unit_disabled`
-    on its snapshot so a later `crony apply` preserves it. Names are full
+    on its snapshot so a later `crony apply` preserves it. For a daemon
+    that means stopping it: firing on its own is all it does, so a
+    disabled one is rendered inert (it neither starts at boot nor is
+    restarted if something starts it) and torn down now. Names are full
     namespaced (`<bundle>.<short>`); bare input is shorthand for
     `default.<short>`. A rename (same uuid, new config name) is
     addressable by either name; a name mapping to different uuids in
@@ -1155,7 +1177,12 @@ def do_trigger(
     trigger returns as soon as the platform has accepted it. With
     `--wait`, blocks until each named entry's next completion and exits
     with that exit code (the worst exit code across multiple names if
-    more than one).
+    more than one); a daemon has no completion to wait for, so naming
+    one with `--wait` is a usage error.
+
+    Triggering a daemon starts it -- useful when its gate previously
+    declined and now would pass. Triggering one that is already running
+    is the same no-op it is for any running unit.
 
     `--trigger-timeout <sec>` (only with `--wait`) overrides the
     default 15s "trigger never produced a run" deadline.
@@ -1191,9 +1218,24 @@ def do_trigger(
             logger.info("%s: triggered", full)
         return
 
-    # Synchronous waiter mode. Resolve per-name timeouts via each
-    # name's bundle; bundles can disagree about defaults so we look
-    # up trigger_timeout_sec per-bundle too.
+    # Synchronous waiter mode. Reject any daemon up front: --wait has no
+    # completion to wait for on one, and finding that out partway through
+    # the list would leave the earlier names already fired.
+    for full, ref, _unit_name in targets:
+        # The APPLIED mode, not the config's: `trigger` fires the unit
+        # that is installed, so an un-applied edit either way must not
+        # decide whether waiting is possible.
+        applied = config.current.job_from_ref(ref)
+        if applied is not None and crony.unit.is_daemon(applied.timing):
+            raise crony.errors.UsageError(
+                f"{full!r} is a daemon, which runs until it is stopped; "
+                f"--wait has no completion to wait for. Trigger it "
+                f"without --wait to start it."
+            )
+
+    # Resolve per-name timeouts via each name's bundle; bundles can
+    # disagree about defaults so we look up trigger_timeout_sec
+    # per-bundle too.
     worst_rc = 0
     for full, ref, unit_name in targets:
         bn, short = crony.config.parse_full_name(full)
@@ -1731,6 +1773,7 @@ _RED_CELLS: dict[str, frozenset[str]] = {
             crony.model.JobStatus.TIMEOUT,
             crony.model.JobStatus.CANCELED,
             crony.model.JobStatus.CRASHED,
+            crony.model.JobStatus.DISABLED,
         }
     ),
     _StatusCols.SCHEDULE: frozenset({crony.model.ScheduleValue.DISABLED.value}),
@@ -1943,9 +1986,11 @@ def _entry_is_scheduled(
     entry: crony.config.TomlJob | crony.config.TomlJobGroup | None,
 ) -> bool:
     # "Scheduled" selects the `.timer` unit name over the bare
-    # `.service`. A dormant entry (transit group, trigger-only OnDemand,
-    # or no timing) is not scheduled -- `is_scheduled` is the shared
-    # "arms a real timer" test.
+    # `.service`. Anything that arms no timer (a transit group, a
+    # trigger-only OnDemand entry, a daemon, or no timing) is not
+    # scheduled -- `is_scheduled` is the shared "arms a real timer" test.
+    # A daemon reads False and so names its `.service`, which is the
+    # only unit it has.
     if entry is None:
         return False
     return crony.unit.is_scheduled(entry.timing)
@@ -1956,10 +2001,10 @@ def _snapshot_says_scheduled(
 ) -> bool | None:
     """`True` / `False` if the current-graph entry for `full`
     arms a real timer (a Schedule / Interval, so the scheduler names
-    its `.timer`); `None` otherwise. A dormant entry -- a transit group
-    or a trigger-only OnDemand job -- reads `False` (the bare
-    `.service`). Used to guess UNIT NAME for entries whose live config no
-    longer exists.
+    its `.timer`); `None` otherwise. An entry that arms no timer -- a
+    transit group, a trigger-only OnDemand job, or a daemon -- reads
+    `False` (the bare `.service`). Used to guess UNIT NAME for entries
+    whose live config no longer exists.
 
     The lookup goes through `resolve_runnable` (current only).
     A broken or unit-only or pending-only entry returns `None`
@@ -2254,11 +2299,15 @@ def do_status(
     whenever the two sources differ. The two flags are mutually
     exclusive.
 
-    `--exclude-healthy` drops rows where CONFIG is `synced`, the
-    entry is not disabled, and STATUS is `ok` / `never` / `gated`.
-    A disabled entry is unhealthy (it isn't firing), so it survives
-    the filter. Output is flat (no tree indent). Always exits 0 --
-    this is a filter on the display, not a gate.
+    `--exclude-healthy` drops rows where CONFIG is `synced`, the entry
+    is not disabled, and STATUS is `ok` / `never` / `gated` -- or, for a
+    daemon, `running` / `gated`. A daemon is healthy when it is up, or
+    when its gate deliberately kept it down; its other outcomes mean it
+    stopped without being told to, where a scheduled job's next fire
+    retries them. A disabled entry is unhealthy (it isn't firing), so it
+    survives the filter, as does a scheduled job stuck mid-run. Output
+    is flat (no tree indent). Always exits 0 -- this is a filter on the
+    display, not a gate.
 
     On a color-capable TTY (NO_COLOR unset) broken / failed verdicts
     render red and reconcilable drift renders yellow; see the
@@ -2692,21 +2741,35 @@ def do_status(
         # disabled entry is unhealthy because it isn't firing; its
         # SCHEDULE cell reads `disabled`. (A not-loaded unit is
         # already excluded by `config != synced` -- it reads broken.)
+        # A daemon is healthy when it is up, or when it is deliberately
+        # not up: `gated` means its own precondition declined to run it,
+        # which is the gate working, not a fault. Its other outcomes mean
+        # it stopped without being told to, so they survive the filter --
+        # unlike a scheduled job, whose next fire retries them. A run in
+        # flight is the reverse: a daemon's steady state, but for a
+        # scheduled job one wedged there is worth showing.
         healthy_status = {
             crony.model.JobStatus.OK,
             crony.model.JobStatus.NEVER,
             crony.model.JobStatus.GATED,
         }
-        rows = [
-            r
-            for r in rows
-            if not (
-                r[_StatusCols.CONFIG] == crony.model.ConfigStatus.SYNCED
-                and r[_StatusCols.SCHEDULE]
-                != crony.model.ScheduleValue.DISABLED.value
-                and r[_StatusCols.STATUS] in healthy_status
-            )
-        ]
+        healthy_daemon_status = {
+            crony.model.JobStatus.RUNNING,
+            crony.model.JobStatus.GATED,
+        }
+
+        def _healthy(row: dict[str, str]) -> bool:
+            if row[_StatusCols.CONFIG] != crony.model.ConfigStatus.SYNCED:
+                return False
+            schedule = row[_StatusCols.SCHEDULE]
+            if schedule == crony.model.ScheduleValue.DISABLED.value:
+                return False
+            status = row[_StatusCols.STATUS]
+            if schedule == crony.model.ScheduleValue.DAEMON.value:
+                return status in healthy_daemon_status
+            return status in healthy_status
+
+        rows = [r for r in rows if not _healthy(r)]
         rows = sorted(rows, key=lambda r: r[_StatusCols.JOB_OR_UUID])
     else:
         # Order rows by tree DFS to surface execution order rather

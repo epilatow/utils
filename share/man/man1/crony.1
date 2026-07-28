@@ -9,7 +9,7 @@ Crony is a multi\-platform user\-level scheduled\-job manager.\&
 It supports jobs on macOS/darwin (via launchd) and linux (via systemd).\&
 It reads one or more TOML config bundles and can deploy the corresponding platform units.\&
 It runs jobs through a uniform shim, which provides consistent logging, execution gates, timeouts, environment management, etc.\&
-Jobs can be grouped, and groups or jobs run on a schedule.\&
+Jobs can be grouped, and groups or jobs run on a schedule; a job can instead be a daemon, which runs continuously and is restarted whenever it stops.\&
 Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gatrigger\(ga subcommand).\&
 Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
 .PP
@@ -130,6 +130,7 @@ Requires a target: job(s) or \-\-all.\&
 .TP
 \f[B]disable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
 Disarm the named jobs\(aq schedules: loaded and triggerable, but not firing on their own.\&
+Disabling a daemon stops it; it stays stopped across a reboot until re\-enabled.\&
 Requires a target: job(s) or \-\-all.\&
 .TP
 \f[B]trigger\f[R] [\-\-all] [\-b BUNDLE] [\-w] [\-\-trigger\-timeout TRIGGER_TIMEOUT] [job ...]\&
@@ -139,6 +140,7 @@ Requires a target: job(s) or \-\-all.\&
 .TP
 \f[CR]\-w, \-\-wait\f[R]
 Block until each named entry\(aqs next completion and exit with that exit code (worst across multiple names).\&
+Naming a daemon is an error \-\- it runs until stopped, so there is no completion to wait for.\&
 .TP
 \f[CR]\-\-trigger\-timeout TRIGGER_TIMEOUT\f[R]
 Override [defaults].trigger_timeout_sec (seconds to wait for a runner to come online after kickstart).\&
@@ -166,7 +168,7 @@ For dual\-source columns (name, schedule, groups, ...), show the currently\-acti
 For dual\-source columns (name, schedule, groups, ...), show the pending value from the config (the default).\&
 .TP
 \f[CR]\-\-exclude\-healthy\f[R]
-Drop rows that are config=synced, enabled in the scheduler, and last in ok/never/gated.\&
+Drop rows that are config=synced, enabled in the scheduler, and last in ok/never/gated \-\- or, for a daemon, running/gated (up, or deliberately kept down by its gate).\&
 Output is flat (no tree indent).\&
 Always exits 0 \-\- this is a filter on the display, not a gate.\&
 .RE
@@ -327,6 +329,11 @@ A job/group with no schedule of its own, it runs when triggered by a parent job 
 A trigger\-only job/group (on\-demand = true) with no schedule of its own and no scheduled parent.\&
 It runs only when run manually via the \(gatrigger\(ga subcommand.\&
 .TP
+\f[I]daemon\f[R]
+A job (daemon = true) that runs continuously rather than at scheduled times.\&
+It starts at login and is restarted whenever its command exits.\&
+If its execution gate fails it stays stopped until the next login, \(gaapply\(ga, or \(gatrigger\(ga.\&
+.TP
 \f[I]disabled\f[R]
 A job that has been disabled via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
 It can be run manually via the \(gatrigger\(ga subcommand, and re\-enabled via the \(gaenable\(ga subcommand.\&
@@ -368,6 +375,12 @@ The job or group is currently running.\&
 Jobs only.\&
 An interactive job is either waiting for an active user, or waiting for that user to confirm execution (via a pop\-up dialog).\&
 .TP
+\f[I]disabled\f[R]
+Daemons only.\&
+The daemon has been disabled via the \(gadisable\(ga subcommand, so it is stopped and will not start itself again \-\- neither at boot nor by a restart \-\- until it is re\-enabled.\&
+It can still be started manually via the \(gatrigger\(ga subcommand.\&
+A scheduled job reports its last run\(aqs outcome instead; its SCHEDULE cell carries the disabled state.\&
+.TP
 \f[I]never\f[R]
 Jobs and groups.\&
 A newly deployed job or group that hasn\(aqt been run yet.\&
@@ -406,7 +419,7 @@ The job group doesn\(aqt contain any unmasked jobs.\&
 On a color\-capable TTY (and NO_COLOR unset) some cells are colored; redirected or piped output is plain, where drift shows as a trailing \(ga\(ha\(ga plus a footnote legend instead.\&
 .TP
 \f[I]red\f[R]
-CONFIG broken / error / missing / orphan; STATUS canceled / crashed / fail / timeout; SCHEDULE disabled.\&
+CONFIG broken / error / missing / orphan; STATUS canceled / crashed / disabled / fail / timeout; SCHEDULE disabled.\&
 .TP
 \f[I]yellow\f[R]
 CONFIG stale, plus any cell that diverged from the applied state (on a color stream its \(ga\(ha\(ga marker is dropped in favor of the color).\&

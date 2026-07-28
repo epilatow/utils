@@ -25,6 +25,8 @@ from crony.platform import (
     systemd,
 )
 from crony.unit import (
+    Daemon,
+    DaemonSpec,
     EntityName,
     EntityRef,
     Interval,
@@ -45,6 +47,24 @@ _UV = Path("/abs/uv")
 _CRONY = Path("/abs/crony")
 # The run argv the runtime layer hands the backend as `spec.cmd`.
 _CMD = (str(_UV), "run", "--script", str(_CRONY), "_run", str(_REF))
+
+
+def _activate_spec(
+    name: str,
+    timing: Timing | None,
+    daemon: DaemonSpec | None = None,
+) -> UnitSpec:
+    """A minimal spec for driving `activate` -- only the fields it
+    reads (the name, what to arm, and whether it is a daemon)."""
+    return UnitSpec(
+        name=EntityName.from_str(name),
+        cmd=_CMD,
+        timing=timing,
+        priority=PriorityClass.NORMAL,
+        daemon=daemon,
+    )
+
+
 # render() / dispatch don't read the unit dir; pin a placeholder.
 _DIR = Path("/unused")
 
@@ -247,7 +267,7 @@ class TestSystemdActivate:
     ) -> None:
         calls = self._record(monkeypatch)
         get_scheduler("linux", tmp_path).activate(
-            "default.brew", Interval.from_str("1h")
+            _activate_spec("default.brew", Interval.from_str("1h"))
         )
         timer = "crony-default.brew.timer"
         reload_c = ["systemctl", "--user", "--quiet", "daemon-reload"]
@@ -265,7 +285,9 @@ class TestSystemdActivate:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         calls = self._record(monkeypatch)
-        get_scheduler("linux", tmp_path).activate("default.grp", None)
+        get_scheduler("linux", tmp_path).activate(
+            _activate_spec("default.grp", None)
+        )
         assert calls == [["systemctl", "--user", "--quiet", "daemon-reload"]]
 
     def test_failed_command_raises_subprocess_error(
@@ -281,7 +303,7 @@ class TestSystemdActivate:
         )
         with pytest.raises(SubprocessError):
             get_scheduler("linux", tmp_path).activate(
-                "default.brew", Interval.from_str("1h")
+                _activate_spec("default.brew", Interval.from_str("1h"))
             )
 
     def test_trigger_uses_no_block(
@@ -492,33 +514,59 @@ class TestSystemdAnalyzeVerify:
         # irrelevant to verify (the unit is never run).
         real = Path(sys.executable)
         sched = get_scheduler("linux", tmp_path)
-        shapes: list[tuple[str, Schedule | Interval | None, PriorityClass]] = [
+        shapes: list[
+            tuple[str, Timing | None, PriorityClass, DaemonSpec | None]
+        ] = [
             (
                 "default.cal-normal",
                 Schedule.from_str("*-*-* 03:00"),
                 PriorityClass.NORMAL,
+                None,
             ),
             (
                 "default.cal-high",
                 Schedule.from_str("Mon *-*-* 09:00"),
                 PriorityClass.HIGH,
+                None,
             ),
-            ("default.cal-low", Schedule.from_str("daily"), PriorityClass.LOW),
+            (
+                "default.cal-low",
+                Schedule.from_str("daily"),
+                PriorityClass.LOW,
+                None,
+            ),
             (
                 "default.interval",
                 Interval.from_str("30min"),
                 PriorityClass.HIGH,
+                None,
             ),
-            ("default.scheduleless", None, PriorityClass.LOW),
+            ("default.scheduleless", None, PriorityClass.LOW, None),
+            # A daemon renders Type=simple with Restart=/RestartSec=,
+            # which `oneshot` cannot carry -- exactly the pairing this
+            # gate exists to catch. Its disabled form drops [Install].
+            (
+                "default.daemon",
+                Daemon(),
+                PriorityClass.NORMAL,
+                DaemonSpec(restart_seconds=30),
+            ),
+            (
+                "default.daemon-disabled",
+                None,
+                PriorityClass.LOW,
+                DaemonSpec(restart_seconds=5),
+            ),
         ]
         written: list[Path] = []
-        for nm, timing, prio in shapes:
+        for nm, timing, prio, daemon in shapes:
             cmd = (str(real), "run", "--script", str(real), "_run", str(_REF))
             spec = UnitSpec(
                 name=EntityName.from_str(nm),
                 cmd=cmd,
                 timing=timing,
                 priority=prio,
+                daemon=daemon,
             )
             for u in sched.render_units(spec).units:
                 if not u.content:
@@ -737,3 +785,114 @@ if __name__ == "__main__":
     from conftest import run_tests
 
     run_tests(__file__, _script_path, REPO_ROOT)
+
+
+class TestSystemdDaemon:
+    """A daemon renders a self-starting, restarting `.service` and no
+    `.timer`; disabling it drops the boot wiring and stops it."""
+
+    _DAEMON = DaemonSpec(restart_seconds=7)
+
+    def _spec(self, *, armed: bool) -> UnitSpec:
+        return UnitSpec(
+            name=EntityName.from_str("default.d"),
+            cmd=_CMD,
+            timing=Daemon() if armed else None,
+            priority=PriorityClass.NORMAL,
+            daemon=self._DAEMON,
+        )
+
+    def test_renders_service_only(self) -> None:
+        units = get_scheduler("linux", _DIR).render_units(
+            self._spec(armed=True)
+        )
+        assert [u.filename for u in units.units] == [
+            Path("crony-default.d.service")
+        ]
+
+    def test_service_is_simple_and_restarting(self) -> None:
+        svc = (
+            get_scheduler("linux", _DIR)
+            .render_units(self._spec(armed=True))
+            .units[0]
+            .content
+        )
+        # oneshot cannot carry Restart=, so a daemon must be simple.
+        assert "Type=simple" in svc
+        assert "Type=oneshot" not in svc
+        assert "Restart=on-failure" in svc
+        assert "RestartSec=7" in svc
+        # Without this a crash burst wedges the unit into `failed`
+        # permanently instead of retrying forever.
+        assert "StartLimitIntervalSec=0" in svc
+        assert "WantedBy=default.target" in svc
+
+    def test_disabled_service_is_static(self) -> None:
+        svc = (
+            get_scheduler("linux", _DIR)
+            .render_units(self._spec(armed=False))
+            .units[0]
+            .content
+        )
+        # No [Install] -- the unit cannot start at boot, and `is-enabled`
+        # reports `static` (which still reads as loaded, not as drift).
+        assert "[Install]" not in svc
+        assert "Type=simple" in svc
+
+    def test_disabled_service_drops_supervision(self) -> None:
+        # Without this, anything that started a disabled daemon -- a
+        # `crony trigger`, a stray `systemctl start` -- would put it back
+        # under permanent supervision, which is not what disabled means.
+        svc = (
+            get_scheduler("linux", _DIR)
+            .render_units(self._spec(armed=False))
+            .units[0]
+            .content
+        )
+        assert "Restart=" not in svc
+        assert "RestartSec=" not in svc
+
+    def _activate_calls(
+        self, tmp_path: Path, monkeypatch: Any, *, armed: bool
+    ) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def fake_run(*args: Any, **kwargs: Any) -> Any:
+            argv = list(args[0] if args else kwargs.get("args", []))
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        get_scheduler("linux", tmp_path).activate(self._spec(armed=armed))
+        return calls
+
+    def test_activate_enables_and_restarts_the_service(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._activate_calls(tmp_path, monkeypatch, armed=True)
+        service = "crony-default.d.service"
+        assert ["systemctl", "--user", "--quiet", "enable", service] in calls
+        # restart, not start: an apply must leave the daemon running the
+        # config it just wrote, not the one it started with.
+        assert ["systemctl", "--user", "--quiet", "restart", service] in calls
+        assert not any("timer" in " ".join(c) for c in calls)
+
+    def test_activate_disables_and_stops_a_disabled_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Rewriting the unit file neither stops the running instance nor
+        # removes its boot symlink, so a disabled daemon would otherwise
+        # stay up and come back at login.
+        calls = self._activate_calls(tmp_path, monkeypatch, armed=False)
+        service = "crony-default.d.service"
+        assert [
+            "systemctl",
+            "--user",
+            "--quiet",
+            "disable",
+            "--now",
+            service,
+        ] in calls
+        # And nothing re-arms it: an `enable` here would restore the boot
+        # symlink the disable just dropped.
+        assert not any("enable" in c for c in calls)
