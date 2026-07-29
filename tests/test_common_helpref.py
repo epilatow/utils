@@ -12,14 +12,18 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+REPO_ROOT = Path(__file__).parent.parent
 
-from common.helpref import (
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from common.helpref import (  # noqa: E402
     ReferenceSection,
     definition_list,
     reference_section_text,
     value_reference,
 )
+
+_script_path = REPO_ROOT / "src" / "common" / "helpref.py"
 
 _ITEMS = [
     ("alpha", "Short description."),
@@ -90,3 +94,9 @@ class TestReferenceSectionText:
         section = ReferenceSection("Sample Values", _ITEMS, lead="Lead.")
         text = reference_section_text(section, width=76)
         assert all(len(line) <= 78 for line in text.splitlines())
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

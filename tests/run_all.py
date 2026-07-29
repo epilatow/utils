@@ -85,10 +85,12 @@ def run_test_file(
 ) -> TestResult:
     """Run a single test file as a subprocess.
 
-    Every test file must accept ``--e2e``; today this is satisfied
-    by routing through ``conftest.run_tests``, which owns the flag.
-    A new test file that bypasses ``run_tests`` must accept ``--e2e``
-    on its own.
+    The file is expected to run its own tests when executed, which
+    every test file does by routing through ``conftest.run_tests`` --
+    that also owns the ``--e2e`` flag passed below. A file that runs
+    nothing would report a passing phase having tested nothing, so the
+    routing is required rather than conventional and
+    ``test_run_all.TestEveryTestFileRunsItsTests`` enforces it.
     """
     name = path.stem
     print_banner(f"Test: {name}")

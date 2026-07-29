@@ -398,6 +398,46 @@ class TestMain:
         assert rc == ra.EXIT_INFRA_ERROR
 
 
+# =============================================================
+# Tests: the convention every discovered test file must follow
+# =============================================================
+
+
+class TestEveryTestFileRunsItsTests:
+    """`run_all` executes each discovered file as a subprocess, so a file
+    that does not invoke pytest when run directly contributes a passing
+    phase and zero tests -- missing coverage that looks like success.
+
+    Unlike the rest of this module these read the real `TESTS_DIR`
+    rather than synthetic files: the convention is only worth anything
+    if it is checked against the suite that actually runs."""
+
+    @staticmethod
+    def _main_block(text: str) -> str:
+        """The file's `__main__` block, or "" when it has none.
+
+        Only this region counts: prose elsewhere in a file (this
+        module's own assertion message, for one) mentions the call
+        without arranging for it to happen.
+        """
+        marker = '\nif __name__ == "__main__":\n'
+        index = text.find(marker)
+        return "" if index < 0 else text[index:]
+
+    def test_every_discovered_file_invokes_run_tests(self) -> None:
+        missing = [
+            path.name
+            for path in ra.discover_test_files(ra.TESTS_DIR)
+            if "run_tests(__file__"
+            not in self._main_block(path.read_text(encoding="utf-8"))
+        ]
+        assert missing == [], (
+            f"test files that run no tests as a subprocess: {missing} -- "
+            f'add the `if __name__ == "__main__":` block that calls '
+            f"conftest.run_tests"
+        )
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

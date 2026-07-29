@@ -18,9 +18,13 @@ from unittest.mock import patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+REPO_ROOT = Path(__file__).parent.parent
 
-from common.crony_automate import CronyAutomation
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from common.crony_automate import CronyAutomation  # noqa: E402
+
+_script_path = REPO_ROOT / "src" / "common" / "crony_automate.py"
 
 _NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "test-crony-automate")
 
@@ -301,3 +305,9 @@ class TestDestroy:
         with pytest.raises(StubError, match="crony destroy failed"):
             d.destroy(config_only=False)
         assert (dropin / "stub.toml").exists()
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)
