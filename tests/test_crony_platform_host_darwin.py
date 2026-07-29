@@ -29,6 +29,7 @@ from crony.platform import (
     PidWait,
     fda,
 )
+from crony.platform import darwin as darwin_platform
 from crony.platform.fda import FDAWrapper
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -286,7 +287,7 @@ class TestDarwinInteractive:
         def fake_run(cmd: list[str], **_k: object) -> Any:
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="button returned:Run Job\n", stderr=""
+                cmd, 0, stdout="Run Job\n", stderr=""
             )
 
         monkeypatch.setattr(subprocess, "run", fake_run)
@@ -294,11 +295,35 @@ class TestDarwinInteractive:
             "crony: j", "go?", ["Cancel Job", "Delay Job", "Run Job"]
         )
         assert clicked == "Run Job"
-        script = captured["cmd"][2]
-        # The last button is the AppleScript default, the first the
-        # cancel button.
-        assert 'default button "Run Job"' in script
-        assert 'cancel button "Cancel Job"' in script
+        cmd = captured["cmd"]
+        assert cmd[0:3] == ["osascript", "-l", "JavaScript"]
+        assert cmd[3] == str(darwin_platform._dialog_script())
+        # Title, body, and every button travel as their own argv entry,
+        # in the order the script reads them: no text is interpolated
+        # into a script literal, so nothing needs escaping.
+        assert cmd[4:] == [
+            "crony: j",
+            "go?",
+            "Cancel Job",
+            "Delay Job",
+            "Run Job",
+        ]
+
+    def test_show_dialog_passes_text_through_unescaped(
+        self, monkeypatch: Any
+    ) -> None:
+        # Quotes and backslashes reach the script exactly as given --
+        # the argv boundary is what makes an escaping layer unnecessary.
+        captured: dict[str, Any] = {}
+        body = 'a "q" \\ b'
+
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        DarwinHost().show_dialog("t", body, ["No", "Yes"])
+        assert captured["cmd"][5] == body
 
     def test_show_dialog_exact_match_not_substring(
         self, monkeypatch: Any
@@ -307,14 +332,39 @@ class TestDarwinInteractive:
         # it: clicking "Run" returns "Run", not "Run Job".
         def fake_run(cmd: list[str], **_k: object) -> Any:
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="button returned:Run\n", stderr=""
+                cmd, 0, stdout="Run\n", stderr=""
             )
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         assert DarwinHost().show_dialog("t", "b", ["Run Job", "Run"]) == "Run"
 
+    def test_show_dialog_cancel_button_returns_its_label(
+        self, monkeypatch: Any
+    ) -> None:
+        # The cancel button is an ordinary button: clicking it reports
+        # its label like any other, and the caller decides what that
+        # means. Only a dismissal answers nothing.
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Cancel Job\n", stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        clicked = DarwinHost().show_dialog("t", "b", ["Cancel Job", "Run Job"])
+        assert clicked == "Cancel Job"
+
+    def test_show_dialog_unanswered_returns_empty(
+        self, monkeypatch: Any
+    ) -> None:
+        # A window closed without a click prints nothing at all.
+        def fake_run(cmd: list[str], **_k: object) -> Any:
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert DarwinHost().show_dialog("t", "b", ["No", "Yes"]) == ""
+
     def test_show_dialog_nonzero_returns_empty(self, monkeypatch: Any) -> None:
-        # osascript exits non-zero when the cancel button is clicked.
+        # osascript exits non-zero when the script throws.
         def fake_run(cmd: list[str], **_k: object) -> Any:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
@@ -330,7 +380,7 @@ class TestDarwinInteractive:
         monkeypatch.setattr(subprocess, "run", fake_run)
         assert DarwinHost().show_dialog("t", "b", ["No", "Yes"]) == ""
 
-    def test_failure_dialog_escapes_and_detaches(
+    def test_failure_dialog_is_caution_one_button_and_detached(
         self, monkeypatch: Any
     ) -> None:
         captured: dict[str, Any] = {}
@@ -342,14 +392,23 @@ class TestDarwinInteractive:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         DarwinHost().show_failure_dialog("crony: boom", 'a "q" \\ b')
-        assert captured["cmd"][0:2] == ["osascript", "-e"]
-        script = captured["cmd"][2]
-        assert "display dialog" in script
-        # Raw quotes / backslashes from the body arrive escaped.
-        assert '\\"q\\"' in script
-        assert "\\\\ b" in script
-        # Detached so the modal can't stall the runner.
+        cmd = captured["cmd"]
+        assert cmd[0:3] == ["osascript", "-l", "JavaScript"]
+        assert cmd[3] == str(darwin_platform._dialog_script())
+        # The failure popup is the caution-icon, single-OK variant, and
+        # its body reaches the script unescaped.
+        assert cmd[4] == "--caution"
+        assert cmd[5:] == ["crony: boom", 'a "q" \\ b', "OK"]
+        # Detached so the dialog can't stall the runner.
         assert captured["kwargs"].get("start_new_session") is True
+
+    def test_dialog_script_is_shipped(self) -> None:
+        # The argv above is built from this path, so asserting the file
+        # is there ties the command to the shipped script: moving one
+        # without the other fails here rather than at a user's dialog.
+        script = darwin_platform._dialog_script()
+        assert script.is_file()
+        assert script == REPO_ROOT / "src" / "crony" / "platform" / "dialog.js"
 
 
 class TestDarwinMachineId:

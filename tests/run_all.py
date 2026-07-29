@@ -82,6 +82,7 @@ def run_test_file(
     verbose: bool = False,
     coverage: bool = False,
     e2e: bool = False,
+    visible_dialog: bool = False,
 ) -> TestResult:
     """Run a single test file as a subprocess.
 
@@ -102,6 +103,8 @@ def run_test_file(
         cmd.append("--coverage")
     if e2e:
         cmd.append("--e2e")
+    if visible_dialog:
+        cmd.append("--run-visible-dialog")
 
     cp = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
     return TestResult(name=name, returncode=cp.returncode)
@@ -217,6 +220,15 @@ def main() -> int:
     """
     parser = build_parser()
     add_arguments(parser)
+    parser.add_argument(
+        "--run-visible-dialog",
+        action="store_true",
+        help=(
+            "Include tests marked @pytest.mark.visible_dialog, which "
+            "display real desktop windows. Off by default so a run never "
+            "takes the screen from whoever started it."
+        ),
+    )
     args = parser.parse_args()
 
     test_files = discover_test_files(TESTS_DIR)
@@ -234,6 +246,7 @@ def main() -> int:
             verbose=args.verbose,
             coverage=args.coverage,
             e2e=args.e2e,
+            visible_dialog=args.run_visible_dialog,
         )
         results.append(result)
 

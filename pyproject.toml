@@ -27,6 +27,7 @@ mypy_path = ["src"]
 testpaths = ["_repo_shared/tests"]
 markers = [
     "e2e: end-to-end tests that subprocess the script under test (slow; opt-in via --e2e)",
+    "visible_dialog: tests that display a real desktop dialog (opt-in via --run-visible-dialog)",
 ]
 
 [tool.repo-shared.markdown]

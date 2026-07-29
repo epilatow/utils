@@ -430,11 +430,11 @@ def _send_dialog_popup_for(
     it raises, and dispatch records the channel as unsent -- the seam
     where a Linux backend (notify-send / zenity) slots in later.
 
-    A `display dialog` has no scroll and grows vertically with its
-    content, and one that outgrows the screen renders an OK button that
-    does not respond. The body is therefore the summary alone -- a fixed
-    handful of short fields -- which bounds the height by construction
-    rather than by a cap that would have to predict how the text wraps.
+    The dialog does not scroll and is sized to its content, so a body
+    tall enough to outgrow the screen would put its button out of
+    reach. The body is therefore the summary alone -- a fixed handful
+    of short fields -- which bounds the height by construction rather
+    than by a cap that would have to predict how the text wraps.
     Log content is what has no bound, so it goes to the email and ntfy
     transports, which have no height constraint; the full log always
     remains on disk at the path the summary names.

@@ -64,6 +64,15 @@ This repo is a personal-utilities collection. Top-level structure:
   logic already lives in the `src/crony` package, so it has no alias and
   `bin/crony` stays a manual `python-targets` entry.
 
+- `src/crony/platform/dialog.js` -- the only code under `src/` written for
+  another interpreter: a JXA script `osascript` runs to draw crony's two macOS
+  desktop prompts, the interactive approval dialog and the job-failure pop-up.
+  It builds a Cocoa window through the ObjC bridge instead of calling
+  `display dialog`, so a prompt never takes the keyboard from the application
+  the user is working in; the file's own header documents why
+  StandardAdditions cannot be made to behave that way. Being bridge code that
+  no static gate can check, it is covered by running it (see Testing).
+
 - `scripts/` -- developer/build tooling, not user-facing utilities.
   `scripts/render-docs` generates docs from the utilities' argparse parsers (a
   roff man page and a GitHub-browsable GFM doc per utility, plus the repo
@@ -137,8 +146,10 @@ gated by platform checks.
 - pytest, with the suite runnable via `tests/run_all.py`. The delivered
   `epilatow-repo-shared` gates run as a phase of that script and also via
   `uv run pytest _repo_shared/tests`.
+
 - The test suite owns ruff and mypy enforcement -- a green run is the gate for
   "ready to commit".
+
 - `tests/test_render_docs.py` is a freshness gate: for each utility it
   re-renders the roff man page (e.g. `share/man/man1/crony.1`) and the GFM doc
   (e.g. `docs/crony.md`) from the argparse parser, and re-renders the repo
@@ -163,6 +174,7 @@ gated by platform checks.
   `--help` text, run `scripts/render-docs` to regenerate the affected
   artifacts -- the utility's man page and GFM doc, plus its `README.md` blurb
   (taken from its DESCRIPTION) -- and commit them alongside the code.
+
 - `tests/test_run_all.py` gates the per-file `__main__` block
   (`TestEveryTestFileRunsItsTests`), walking `run_all`'s own discovery list so
   a new test file can't silently skip its tests. The failure it prevents is
@@ -171,6 +183,7 @@ gated by platform checks.
   gates that the block is last in its file -- code after it still runs, since
   pytest re-imports the module to collect it, but it reads as the end of the
   file and splits where the next class should go.
+
 - `--help` width gate: every utility's `--help` (and every subcommand's) must
   fit 78 columns at an 80-column terminal, and every subcommand group must set
   `metavar="<command>"`. A utility opts in by subclassing
@@ -179,6 +192,93 @@ gated by platform checks.
   asserts both. What overflows is the text argparse copies verbatim (a long
   `description=` or `RawDescriptionHelpFormatter` epilog prose); wrap such
   prose narrower so a 2-space epilog indent still fits.
+
+- `tests/test_crony_dialog_js.py` runs the real `src/crony/platform/dialog.js`
+  under `osascript` and asserts on the window it built: that the app never
+  activates, that the window is visible but not key, that its default button
+  therefore carries no Return equivalent, that the wait dispatches queued
+  events rather than only spinning the run loop, and that `run(argv)` parses
+  what `_dialog_argv` emits. Those are runtime AppKit properties, invisible to
+  a mocked subprocess, so the tests evaluate the shipped file rather than a
+  copy -- which is also what catches a typo in a bridged selector, since
+  nothing static checks those.
+
+  **Every test that builds a dialog is behind `--run-visible-dialog`**,
+  because building one puts a window on screen and an icon in the Dock. A
+  default `run_all.py` builds none, so a suite run never interrupts whoever
+  started it -- which matters because these are run while working in the repo,
+  and an unheralded window can take keystrokes. `TestDialogUsage` is the
+  exception and runs by default: `run` rejects a short argv before reaching
+  `buildDialog`, so it draws nothing and sets no activation policy.
+
+  Everything else, including the argv-seam test, is gated -- so **a default
+  green says nothing about `dialog.js`**: the only things covered are that
+  short-argv guard, the argv crony emits (against a mocked subprocess), and
+  that the script is where the command says it is. The `--caution` literal and
+  the title / message / buttons order are pinned only inside the gated run.
+  Use the opt-in run after changing that file. The flag is registered in
+  `tests/conftest.py` for `uv run pytest`, plumbed through
+  `conftest.run_tests` so a test file executed directly takes it, and
+  forwarded by `run_all.py` the way `--e2e` is, so there is a whole-suite form
+  too:
+
+  ```console
+  $ ./tests/test_crony_dialog_js.py --run-visible-dialog
+  18 passed
+  $ tests/run_all.py --run-visible-dialog
+  ```
+
+  Opted in on a host with no reachable window server, the harness fails rather
+  than skipping, on the same reasoning as the `--e2e` suites: a run somebody
+  explicitly asked for that quietly passed would hide the missing coverage.
+  Being gated is also why nothing in the module works around being seen -- an
+  opt-in run presents the dialogs exactly as production does, which is the
+  more faithful test.
+
+- Two properties of the dialog are not reachable by any offline test, so they
+  are manual checks. Run both after changing how `dialog.js` presents or waits
+  -- and note that a default `run_all.py` executes none of that file, so a
+  green suite says nothing about either.
+
+  **That a click is delivered.** Synthetic events do not reach a panel that is
+  deliberately never key, and `performClick` bypasses event dispatch entirely,
+  so a suite using it would stay green on a dialog nobody could click:
+
+  ```console
+  $ osascript -l JavaScript src/crony/platform/dialog.js 'crony: manual check' \
+      'Click Run Job.' 'Cancel Job' 'Run Job'
+  Run Job
+  ```
+
+  It must print the clicked label and exit 0 (and print a bare newline, still
+  exit 0, when the window is closed instead).
+
+  **That it takes no keyboard focus.** This is the part worth reading before
+  trusting any check: **no automated measurement available here detects focus
+  theft.** Both obvious oracles were tried against a build known to steal the
+  keyboard and both reported it clean -- `NSApp.isActive` read from inside the
+  dialog, which reflects what the app has processed rather than what the
+  window server did, and `lsappinfo front` sampled every 50ms from another
+  process, which never left the launching app. The only gate that works is
+  typing, without clicking the dialog first:
+
+  ```console
+  $ osascript -l JavaScript src/crony/platform/dialog.js 'crony: focus test' \
+      'Do NOT click me. Type hello+Enter in the terminal.' \
+      'Cancel Job' 'Run Job' & sleep 1; read line; echo "captured: $line"; \
+      kill %1
+  captured: hello
+  ```
+
+  What the shell captured is the answer: the keystrokes must reach the
+  terminal, not the dialog. The trailing `kill` matters -- this recipe never
+  answers the dialog, so without it the panel floats until dismissed by hand.
+  Two things keep the property true and both are load-bearing -- the panel is
+  a non-activating `NSPanel`, which takes key status only for a view needing
+  first responder and so never for one holding just buttons, and the wait
+  deliberately does not call `finishLaunching`, which is what performs a
+  regular-policy app's launch activation.
+
 - Tests carrying the `@pytest.mark.e2e` marker are end-to-end suites that
   subprocess the script under test: the borgadm suite under
   `tests/test_borgadm.py`, and the crony suite under `tests/test_crony_e2e.py`
@@ -188,6 +288,7 @@ gated by platform checks.
   Run them via `tests/run_all.py --e2e` (or the individual test file with
   `--e2e`). When making changes to a utility that has an e2e suite, run with
   `--e2e` before declaring the change complete.
+
 - The crony e2e suite installs jobs only in a reserved `crony-e2e` bundle
   under a throwaway config / state / unit-dir namespace (via the `CRONY_*`
   path overrides, including `CRONY_UNIT_DIR` on darwin) and tears them down at
@@ -216,6 +317,7 @@ gated by platform checks.
   those overrides and reloads it, so the scheduler-spawned runner keeps its
   persistent state inside the throwaway namespace. That rewrite is drift, so
   such a test cannot also assert on the CONFIG column.
+
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm
   suite ~20x slower than Linux and intermittently cross its 120s per-call
@@ -225,6 +327,7 @@ gated by platform checks.
   (`tests/test_crony_e2e.py --e2e`) -- the light suite that carries the only
   coverage of the launchd backend. The heavy borgadm e2e stays Linux-only, so
   a local `--e2e` run remains the way to exercise it on macOS.
+
 - `tests/linux-docker-test.sh` reproduces the CI Linux leg from a non-Linux
   host: it runs the full suite (extra args pass through to `run_all.py`, e.g.
   `--e2e`) in a throwaway Linux container. It is a manual tool -- `run_all.py`

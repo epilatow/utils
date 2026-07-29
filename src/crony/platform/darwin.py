@@ -5,30 +5,51 @@
 Implements the `HostPlatform` services on darwin: a kqueue-based
 pid-exit wait, a Keychain-backed secret lookup, a `caffeinate`
 sleep-inhibitor wrap, and the desktop-interaction primitives (HID idle
-/ screen-lock probes via `ioreg`, approval and failure dialogs via
-`osascript`).
+/ screen-lock probes via `ioreg`, approval and failure dialogs drawn by
+the sibling `dialog.js` through `osascript`).
 """
 
 import select
 import shutil
 import subprocess
+from pathlib import Path
 
 import crony.errors
 import crony.platform.fda
 from crony.platform.fda import FDAWrapper
 from crony.platform.host import HostPlatform, PidWait
 
+# Shows the system caution icon, for the failure popup; mirrors the flag
+# dialog.js parses.
+_CAUTION_FLAG = "--caution"
 
-def _applescript_escape(s: str) -> str:
-    """Escape `s` for inclusion in an AppleScript "..." literal.
 
-    Backslash and double-quote are the only specials inside such a
-    literal. This is NOT shell escaping -- the script is passed as a
-    single argv entry to `osascript -e`, so no shell parser sees it;
-    `shlex.quote` would emit POSIX single-quoted bytes that AppleScript
-    would parse as something else entirely.
+def _dialog_script() -> Path:
+    """The JXA script that draws crony's desktop dialogs."""
+    return Path(__file__).resolve().parent / "dialog.js"
+
+
+def _dialog_argv(
+    title: str, body: str, buttons: list[str], *, caution: bool
+) -> list[str]:
+    """argv showing `title` / `body` / `buttons` through dialog.js.
+
+    Every value travels as its own argv entry, so no text is ever
+    interpolated into a script literal and nothing needs escaping.
+    Buttons keep the first..last ordering `HostPlatform.show_dialog`
+    defines; the script reads them the same way.
     """
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    flag = [_CAUTION_FLAG] if caution else []
+    return [
+        "osascript",
+        "-l",
+        "JavaScript",
+        str(_dialog_script()),
+        *flag,
+        title,
+        body,
+        *buttons,
+    ]
 
 
 class DarwinHost(HostPlatform):
@@ -190,48 +211,32 @@ class DarwinHost(HostPlatform):
         return '"CGSSessionScreenIsLocked"=Yes' in proc.stdout
 
     def show_dialog(self, title: str, body: str, buttons: list[str]) -> str:
-        btn_list = ", ".join(f'"{_applescript_escape(b)}"' for b in buttons)
-        script = (
-            f'display dialog "{_applescript_escape(body)}" '
-            f'with title "{_applescript_escape(title)}" '
-            f"buttons {{{btn_list}}} "
-            f'default button "{_applescript_escape(buttons[-1])}" '
-            f'cancel button "{_applescript_escape(buttons[0])}"'
-        )
         try:
             proc = subprocess.run(
-                ["osascript", "-e", script],
+                _dialog_argv(title, body, buttons, caution=False),
                 capture_output=True,
                 text=True,
                 check=False,
             )
         except FileNotFoundError:
             return ""
-        # Clicking the cancel button exits osascript non-zero (the
-        # AppleScript "User canceled" error); a dismissed or unshowable
-        # dialog lands here too. All map to "" (no choice).
+        # The script throws on a bad invocation, which osascript reports
+        # as a non-zero exit; that maps to "" (no choice), as a dismissal
+        # does.
         if proc.returncode != 0:
             return ""
-        # osascript prints `button returned:<label>` for a click. Match
-        # the label exactly (not a substring of stdout) so a button
-        # whose name is a substring of another can't shadow it.
-        marker = "button returned:"
-        idx = proc.stdout.find(marker)
-        if idx == -1:
-            return ""
-        label = proc.stdout[idx + len(marker) :].splitlines()[0].strip()
+        # It prints the clicked label alone, and an empty line when the
+        # window is closed unanswered. Match the whole of stdout against
+        # the labels, so a button whose name is a substring of another
+        # cannot shadow it and nothing but a real answer is accepted.
+        label = proc.stdout.strip()
         return label if label in buttons else ""
 
     def show_failure_dialog(self, title: str, body: str) -> None:
-        script = (
-            f'display dialog "{_applescript_escape(body)}" '
-            f'with title "{_applescript_escape(title)}" '
-            f'buttons {{"OK"}} default button "OK" with icon stop'
-        )
-        # start_new_session detaches the modal so it survives the runner
+        # start_new_session detaches the dialog so it survives the runner
         # exiting; Popen returns as soon as osascript is launched.
         subprocess.Popen(
-            ["osascript", "-e", script],
+            _dialog_argv(title, body, ["OK"], caution=True),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,

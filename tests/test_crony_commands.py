@@ -8196,18 +8196,40 @@ class TestInteractiveHelpers:
         host = self._dialog_host("Delay Job")
         monkeypatch.setattr(crony_runtime, "host", lambda: host)
         assert crony_runner._show_interactive_dialog("foo", "msg") == "delay"
-        # The cancel button is first and the run button last, so the
-        # backend uses them as the AppleScript cancel / default buttons.
+        # The cancel button is first and the run button last, which is
+        # the order the backend reads to pick the dialog's cancel and
+        # default buttons.
         assert host.captured["buttons"] == [
             "Cancel Job",
             "Delay Job",
             "Run Job",
         ]
 
+    def test_dialog_cancel_button_maps_to_cancel(
+        self, monkeypatch: Any
+    ) -> None:
+        # The cancel button reports its own label like any other, so
+        # this arrives as a real choice rather than as the empty "no
+        # choice" below. Both must reach 'cancel': an explicit click on
+        # Cancel Job that fell through to RUN would start the job the
+        # user just refused.
+        host = self._dialog_host("Cancel Job")
+        monkeypatch.setattr(crony_runtime, "host", lambda: host)
+        assert crony_runner._show_interactive_dialog("foo", "msg") == "cancel"
+
     def test_dialog_no_choice_maps_to_cancel(self, monkeypatch: Any) -> None:
-        # The backend returns "" for a cancel-button click, a dismissed
-        # dialog, or an unavailable osascript; all map to 'cancel'.
+        # The backend returns "" for a dismissed dialog or one it could
+        # not show at all; both map to 'cancel'.
         host = self._dialog_host("")
+        monkeypatch.setattr(crony_runtime, "host", lambda: host)
+        assert crony_runner._show_interactive_dialog("foo", "msg") == "cancel"
+
+    def test_dialog_unknown_label_maps_to_cancel(
+        self, monkeypatch: Any
+    ) -> None:
+        # A label this mapping does not recognise must not start the
+        # job either -- the fallthrough is load-bearing, not incidental.
+        host = self._dialog_host("Some Other Button")
         monkeypatch.setattr(crony_runtime, "host", lambda: host)
         assert crony_runner._show_interactive_dialog("foo", "msg") == "cancel"
 

@@ -57,7 +57,7 @@ class HostPlatform(abc.ABC):
     @property
     @abc.abstractmethod
     def supports_interactive(self) -> bool:
-        """True when the host has a desktop session crony can pop modal
+        """True when the host has a desktop session crony can pop
         dialogs on -- gating both the interactive-job approval prompt
         and the dialog-popup notify channel. Where it is False, the idle
         / lock probes and the dialog methods are unavailable and raise."""
@@ -143,12 +143,13 @@ class HostPlatform(abc.ABC):
 
     @abc.abstractmethod
     def show_dialog(self, title: str, body: str, buttons: list[str]) -> str:
-        """Pop a modal dialog and block for the user's choice. `buttons`
-        is ordered first..last; the last is the default and the first is
-        the cancel button. Returns the clicked button's label, or ""
-        when the dialog is canceled, dismissed, or cannot be shown.
-        Only meaningful where `supports_interactive` (raises
-        otherwise)."""
+        """Pop a dialog and block for the user's choice. `buttons` is
+        ordered first..last; the last is the default and the first is
+        the cancel button. Returns the clicked button's label -- the
+        cancel button included, since a caller decides what a cancel
+        means from the label it named -- or "" when the dialog is
+        dismissed without a choice or cannot be shown. Only meaningful
+        where `supports_interactive` (raises otherwise)."""
 
     @abc.abstractmethod
     def show_failure_dialog(self, title: str, body: str) -> None:

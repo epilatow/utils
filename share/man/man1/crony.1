@@ -379,7 +379,7 @@ The job or group is currently running.\&
 .TP
 \f[I]pending\f[R]
 Jobs only.\&
-An interactive job is either waiting for an active user, or waiting for that user to confirm execution (via a pop\-up dialog).\&
+An interactive job is either waiting for an active user, or waiting for that user to confirm execution (via a pop\-up dialog, which must be clicked \-\- it does not take keyboard focus).\&
 .TP
 \f[I]disabled\f[R]
 Daemons only.\&
@@ -399,6 +399,7 @@ We\(aqre unable to determine the status.\&
 \f[I]interactive\f[R]
 macOS/Darwin only.\&
 Delay job execution until an active user is detected, and then request the user to confirm execution of the job via a pop\-up.\&
+The pop\-up deliberately does not take keyboard focus, so it must be clicked: it floats above other windows until answered, and Return and Escape do not reach it.\&
 .TP
 \f[I]keep\-awake\f[R]
 Prevent the system from sleeping while the job is executing, where the platform allows it.\&

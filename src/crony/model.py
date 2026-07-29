@@ -1518,7 +1518,8 @@ class JobStatus(_DescribedStrEnum):
         (
             "Jobs only. An interactive job is either waiting for an active "
             "user, or waiting for that user to confirm execution (via a "
-            "pop-up dialog)."
+            "pop-up dialog, which must be clicked -- it does not take "
+            "keyboard focus)."
         ),
     )
     DISABLED = (

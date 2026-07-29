@@ -415,10 +415,12 @@ def _show_interactive_dialog(job_name: str, message: str) -> _InteractiveChoice:
     decision.
 
     Delegates the dialog to the HostPlatform backend: Run Job -> RUN,
-    Delay Job -> DELAY. Clicking the cancel button, dismissing the
-    dialog, or any backend failure yields no choice and maps to CANCEL
-    -- silently running without user confirmation would defeat the
-    whole point of the flag.
+    Delay Job -> DELAY. Everything else maps to CANCEL -- the cancel
+    button, which reports its own label like any other; a dismissal or
+    backend failure, which reports no choice at all; and any label this
+    function does not recognise. Silently running without user
+    confirmation would defeat the whole point of the flag, so the
+    permissive direction is the one that does not start the job.
     """
     clicked = crony.runtime.host().show_dialog(
         f"crony: {job_name}", message, _INTERACTIVE_BUTTONS

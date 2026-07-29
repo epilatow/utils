@@ -140,7 +140,9 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
     JobFlags.INTERACTIVE: (
         "macOS/Darwin only. Delay job execution until an active user is "
         "detected, and then request the user to confirm execution of the "
-        "job via a pop-up."
+        "job via a pop-up. The pop-up deliberately does not take keyboard "
+        "focus, so it must be clicked: it floats above other windows "
+        "until answered, and Return and Escape do not reach it."
     ),
     JobFlags.KEEP_AWAKE: (
         "Prevent the system from sleeping while the job is executing, "

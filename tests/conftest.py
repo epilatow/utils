@@ -60,6 +60,43 @@ def pytest_sessionfinish() -> None:
     _cleanup_all_caches()
 
 
+_VISIBLE_DIALOG_FLAG = "--run-visible-dialog"
+
+
+def pytest_addoption(parser: Any) -> None:
+    """Register the opt-in for tests that put a window on screen."""
+    parser.addoption(
+        _VISIBLE_DIALOG_FLAG,
+        action="store_true",
+        default=False,
+        help=(
+            "Include tests that display a real, visible desktop dialog. "
+            "Off by default so a run never steals the screen from "
+            "whoever started it."
+        ),
+    )
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    """Skip visible-dialog tests unless they were asked for.
+
+    A dialog that appears is the one kind of test that interrupts
+    unrelated work on the same machine -- it can take keystrokes aimed
+    at an editor -- so it is opt-in rather than merely slow. Nothing
+    these cover runs by default as a result, which is why a change to
+    the dialog needs the opt-in run and a default green says nothing
+    about it.
+    """
+    if config.getoption(_VISIBLE_DIALOG_FLAG, default=False):
+        return
+    skip = pytest.mark.skip(
+        reason=f"shows a real window; opt in with {_VISIBLE_DIALOG_FLAG}"
+    )
+    for item in items:
+        if "visible_dialog" in item.keywords:
+            item.add_marker(skip)
+
+
 class ExceptionHierarchyBase:
     """Base class for exception hierarchy tests.
 
@@ -604,9 +641,23 @@ def run_tests(
             "utility-change verification."
         ),
     )
+    parser.add_argument(
+        _VISIBLE_DIALOG_FLAG,
+        action="store_true",
+        help=(
+            "Include tests marked @pytest.mark.visible_dialog, which "
+            "display a real desktop dialog. Off by default so a run "
+            "never takes the screen from whoever started it."
+        ),
+    )
     args = parser.parse_args()
 
     pytest_args = [test_file, "-p", "no:cacheprovider"]
+    # Accepted here as well as through pytest's own option so a test
+    # file run directly -- the way every file in this repo runs itself
+    # -- takes the same flag as `uv run pytest`.
+    if args.run_visible_dialog:
+        pytest_args.append(_VISIBLE_DIALOG_FLAG)
     if args.e2e:
         # pytest-xdist parallelises the slow E2E suite if the
         # test file's PEP 723 deps include it; otherwise we

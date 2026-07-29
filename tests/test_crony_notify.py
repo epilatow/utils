@@ -723,12 +723,27 @@ class TestNtfyNotify:
         assert h.get("Tags") or h.get("tags")
 
 
+def _dialog_title(cmd: list[str]) -> str:
+    """The title from a captured dialog-popup argv.
+
+    The failure popup runs as `osascript -l JavaScript <dialog.js>
+    --caution <title> <body> OK`, so the title and body are the last
+    entries before the single button.
+    """
+    return cmd[-3]
+
+
+def _dialog_body(cmd: list[str]) -> str:
+    """The summary body from a captured dialog-popup argv."""
+    return cmd[-2]
+
+
 class TestDialogPopupNotify:
     """The zero-config `dialog-popup` built-in channel: valid without a
     `[defaults.notify.dialog-popup]` block, and on macOS spawns a
-    detached osascript dialog carrying the failure summary, including
-    the path to the log. Log content itself stays out of the dialog,
-    which cannot scroll; email and ntfy carry that instead.
+    detached dialog carrying the failure summary, including the path to
+    the log. Log content itself stays out of the dialog, which cannot
+    scroll; email and ntfy carry that instead.
     """
 
     def test_validate_accepts_builtin_without_block(self) -> None:
@@ -793,30 +808,32 @@ class TestDialogPopupNotify:
             result, "borgadm.check-repo", "boom log line", Defaults()
         )
         assert result.notifications["dialog-popup"].sent is True
-        assert captured["cmd"][0:2] == ["osascript", "-e"]
-        script = captured["cmd"][2]
-        assert "display dialog" in script
-        assert "borgadm.check-repo" in script
-        assert "(exit 2)" in script
-        assert "boom log line" not in script
+        cmd = captured["cmd"]
+        assert cmd[0:3] == ["osascript", "-l", "JavaScript"]
+        assert Path(cmd[3]).name == "dialog.js"
+        title = _dialog_title(cmd)
+        body = _dialog_body(cmd)
+        assert "borgadm.check-repo" in title
+        assert "(exit 2)" in title
+        assert "boom log line" not in body
         # Assert on labeled summary fields, not a bare name: the job
         # name and exit code also appear in the dialog's title, so a
         # substring check alone would pass with an empty body.
-        assert "Job:        borgadm.check-repo" in script
-        assert "Duration:   " in script
-        assert "Exit class: fail" in script
+        assert "Job:        borgadm.check-repo" in body
+        assert "Duration:   " in body
+        assert "Exit class: fail" in body
         # The dialog is the only pointer to the log a user gets from a
         # popup, so the path has to reach the body.
-        assert "Log path:   /tmp/run.log" in script
-        # Detached so the modal can't stall the runner.
+        assert "Log path:   /tmp/run.log" in body
+        # Detached so the dialog can't stall the runner.
         assert captured["kwargs"].get("start_new_session") is True
 
     def test_dispatch_omits_log_however_large(self, monkeypatch: Any) -> None:
-        # No amount of log content may reach the dialog body: a
-        # `display dialog` cannot scroll, so its height stays bounded
-        # only by keeping the body to the summary. Nothing recognisable
-        # from the log -- head, tail, or a truncation marker -- may
-        # appear.
+        # No amount of log content may reach the dialog body: the
+        # dialog cannot scroll and is sized to its content, so its
+        # height stays bounded only by keeping the body to the summary.
+        # Nothing recognisable from the log -- head, tail, or a
+        # truncation marker -- may appear.
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
@@ -831,10 +848,10 @@ class TestDialogPopupNotify:
         crony_notify.dispatch_notify(
             result, "default.j", big, Defaults(notify_attach_log=True)
         )
-        script = captured["cmd"][2]
-        assert "logline" not in script
-        assert "truncated" not in script
-        assert crony_notify._LOG_SEPARATOR.strip() not in script
+        body = _dialog_body(captured["cmd"])
+        assert "logline" not in body
+        assert "truncated" not in body
+        assert crony_notify._LOG_SEPARATOR.strip() not in body
 
     def test_dispatch_records_failure_off_darwin(
         self, monkeypatch: Any
@@ -851,7 +868,7 @@ class TestDialogPopupNotify:
         assert nr.sent is False
         assert nr.error_class == "CronyError"
 
-    def test_body_escapes_quotes_and_backslashes(
+    def test_title_and_body_reach_the_dialog_verbatim(
         self, monkeypatch: Any
     ) -> None:
         monkeypatch.setattr(
@@ -867,21 +884,19 @@ class TestDialogPopupNotify:
         crony_notify.dispatch_notify(
             result, 'default.he said "hi" \\ bye', "log", Defaults()
         )
-        script = captured["cmd"][2]
-        # Raw double-quotes / backslashes would corrupt the AppleScript
-        # string literal, so everything the body is built from must
-        # arrive escaped. `_NAME_RE` keeps these characters out of a job
-        # name today, which makes this a guard on the dispatch seam
-        # rather than a reachable input: it holds the escaping contract
-        # in place for whatever summary field comes next.
-        # `test_failure_dialog_escapes_and_detaches` in
-        # test_crony_platform_host_darwin.py owns the escaper itself.
-        # `full_name` reaches both the title and the body, each escaped
-        # separately, so each metacharacter must appear twice. A bare
-        # `in` check would be satisfied by the title alone and would not
-        # notice an unescaped body.
-        assert script.count('\\"hi\\"') == 2
-        assert script.count("\\\\ bye") == 2
+        cmd = captured["cmd"]
+        # Each value is its own argv entry, so quotes and backslashes
+        # are ordinary characters rather than metacharacters that could
+        # corrupt a script literal -- they must arrive exactly as
+        # written, neither escaped nor stripped. `_NAME_RE` keeps these
+        # characters out of a job name today, which makes this a guard
+        # on the dispatch seam rather than a reachable input: it pins
+        # the pass-through for whatever summary field comes next.
+        # `full_name` reaches both the title and the body, so check
+        # each; asserting only one would miss a value mangled on its
+        # way to the other.
+        assert 'he said "hi" \\ bye' in _dialog_title(cmd)
+        assert 'he said "hi" \\ bye' in _dialog_body(cmd)
 
     @pytest.mark.parametrize("attach", [True, False])
     def test_log_omitted_under_either_attach_log_setting(
@@ -889,7 +904,7 @@ class TestDialogPopupNotify:
     ) -> None:
         # `notify-attach-log` governs the email / ntfy transports. The
         # dialog omits log content either way, so neither setting is a
-        # route back to a modal that outgrows the screen.
+        # route back to a window that outgrows the screen.
         monkeypatch.setattr(
             crony_platform, "current_platform", lambda: "darwin"
         )
@@ -906,9 +921,9 @@ class TestDialogPopupNotify:
             "secret log line",
             Defaults(notify_attach_log=attach),
         )
-        script = captured["cmd"][2]
-        assert "secret log line" not in script
-        assert crony_notify._LOG_SEPARATOR not in script
+        body = _dialog_body(captured["cmd"])
+        assert "secret log line" not in body
+        assert crony_notify._LOG_SEPARATOR not in body
 
 
 class TestMultiChannelDispatch:

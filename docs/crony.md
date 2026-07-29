@@ -381,7 +381,8 @@ Send a synthetic failure notification.
   Jobs and groups. The job or group is currently running.
 - **`pending`**\
   Jobs only. An interactive job is either waiting for an active user, or
-  waiting for that user to confirm execution (via a pop-up dialog).
+  waiting for that user to confirm execution (via a pop-up dialog, which must
+  be clicked -- it does not take keyboard focus).
 - **`disabled`**\
   Daemons only. The daemon has been disabled via the `disable` subcommand, so
   it is stopped and will not start itself again -- neither at boot nor by a
@@ -397,7 +398,10 @@ Send a synthetic failure notification.
 
 - **`interactive`**\
   macOS/Darwin only. Delay job execution until an active user is detected, and
-  then request the user to confirm execution of the job via a pop-up.
+  then request the user to confirm execution of the job via a pop-up. The
+  pop-up deliberately does not take keyboard focus, so it must be clicked: it
+  floats above other windows until answered, and Return and Escape do not
+  reach it.
 - **`keep-awake`**\
   Prevent the system from sleeping while the job is executing, where the
   platform allows it. A host that cannot take a sleep inhibitor (e.g. an
