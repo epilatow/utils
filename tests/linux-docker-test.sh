@@ -24,6 +24,7 @@
 #     output varies between versions.
 #   - Node >= 20 (from the base image): the repo-shared markdown gate runs
 #     `npx markdownlint-cli2`, and markdownlint-cli2 requires Node >= 20.
+#     `tests/test_prettier.py` reaches prettier the same way.
 #   - git: uv builds the repo-shared gate from its `git+https://` source
 #     (see pyproject.toml), so git must be present to resolve deps.
 #   - a non-root user: test_secure_archiver asserts a 0o555 dir is "not

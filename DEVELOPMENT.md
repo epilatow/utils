@@ -24,6 +24,11 @@ Development conventions for working in this repo are layered:
   absent), rather than letting each environment pick the newest it happens to
   have. The `>=3.14` floor in every PEP 723 block and in `pyproject.toml` is
   kept in lockstep with the pin; bump both together to adopt a newer Python.
+- Node, for the two `npx`-launched gates -- markdownlint and prettier. Both
+  fail rather than skip without it, so the suite needs it on any host that
+  runs the whole thing: a formatting or lint gate that quietly covered nothing
+  would be worse than a loud missing tool. Install with `brew install node` on
+  macOS or `apt install nodejs npm` on Debian / Ubuntu.
 - A pinned pandoc, fetched into `.tools/` (gitignored) by
   **`scripts/pandoc install`** -- run it once after cloning. The man-page
   freshness gate renders with this exact binary and nothing else (not a system
@@ -71,7 +76,8 @@ This repo is a personal-utilities collection. Top-level structure:
   `display dialog`, so a prompt never takes the keyboard from the application
   the user is working in; the file's own header documents why
   StandardAdditions cannot be made to behave that way. Being bridge code that
-  no static gate can check, it is covered by running it (see Testing).
+  no static analyser can judge, its behavior is covered by running it, while
+  its layout is held by a prettier gate (both under Testing).
 
 - `scripts/` -- developer/build tooling, not user-facing utilities.
   `scripts/render-docs` generates docs from the utilities' argparse parsers (a
@@ -174,6 +180,26 @@ gated by platform checks.
   `--help` text, run `scripts/render-docs` to regenerate the affected
   artifacts -- the utility's man page and GFM doc, plus its `README.md` blurb
   (taken from its DESCRIPTION) -- and commit them alongside the code.
+
+- `tests/test_prettier.py` holds the repo's first-party JavaScript to
+  prettier, the way `tests/test_clang_format.py` holds the wrapper C to
+  `.clang-format` -- both carry a discovery guard so a layout change that hid
+  every source could not make the gate pass by covering nothing. prettier runs
+  with its **defaults**: the JavaScript follows its own language's convention
+  rather than the 4-space style of the C beside it. No `.prettierrc.json` is
+  shipped, which is deliberate beyond just wanting the defaults -- a config at
+  the repo root applies to every type prettier handles, and would quietly make
+  it an authority over the markdown `mdformat` and `markdownlint` own.
+
+  Two details worth knowing before touching it. prettier is pinned to an exact
+  version in that file, because a formatter's output varies between releases
+  and an unpinned one would start failing on untouched code as soon as
+  somebody's `npx` resolved a newer build -- the same reason pandoc is pinned,
+  and why markdownlint, being a linter, floats. And the check passes
+  `--ignore-path /dev/null`, so a `.prettierignore` added later cannot empty
+  the gate: prettier reports success for a file it was told to ignore, which
+  the discovery guard could not notice. Reformat with the command the failure
+  message prints.
 
 - `tests/test_run_all.py` gates the per-file `__main__` block
   (`TestEveryTestFileRunsItsTests`), walking `run_all`'s own discovery list so
@@ -335,14 +361,14 @@ gated by platform checks.
   runs automatically. The container boots systemd as PID 1 (so the crony e2e
   can drive a real `systemctl --user`) and starts a lingering user manager for
   the test user, then adds what the GitHub runner supplies implicitly -- Node
-  20+ (the markdownlint gate), systemd-analyze (the systemd-unit verify test),
-  borg (the borgadm e2e suite), the pinned pandoc (the `test_render_docs`
-  man-page gate, via `scripts/pandoc install`), and git (uv builds the
-  repo-shared gate from a git source) -- and runs as a non-root user (the
-  secure_archiver permission test); the script header maps each dep to the
-  test that needs it. Booting systemd needs `--privileged` and the cgroup
-  mount, so the container is more heavyweight than a plain `bash` one. It
-  tests the committed HEAD, not the working tree.
+  20+ (the markdownlint and prettier gates), systemd-analyze (the systemd-unit
+  verify test), borg (the borgadm e2e suite), the pinned pandoc (the
+  `test_render_docs` man-page gate, via `scripts/pandoc install`), and git (uv
+  builds the repo-shared gate from a git source) -- and runs as a non-root
+  user (the secure_archiver permission test); the script header maps each dep
+  to the test that needs it. Booting systemd needs `--privileged` and the
+  cgroup mount, so the container is more heavyweight than a plain `bash` one.
+  It tests the committed HEAD, not the working tree.
 
 ### Updating the pinned pandoc
 
