@@ -40,6 +40,7 @@ from conftest_crony import (  # noqa: E402
 )
 
 from crony import commands as crony_commands  # noqa: E402
+from crony import config as crony_config  # noqa: E402
 from crony import notify as crony_notify  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -522,6 +523,63 @@ class TestRunJobBasics:
         assert rec["process_exit"] == int(ExitCode.PRECONDITION)
         assert "script not found" in rec["reason"]
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+
+    def test_daemon_precondition_stops_after_retry_budget(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "d": {
+                        "script": "/nonexistent/daemon",
+                        "daemon": True,
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        h.write_snap(cfg, "d")
+        ref = h.ref("d", cfg)
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT):
+            with pytest.raises(PreconditionError, match="script not found"):
+                crony_runner.do_run(ref)
+
+        with pytest.raises(SystemExit) as exc:
+            crony_runner.do_run(ref)
+        assert exc.value.code == 0
+        rec = h.last_run("d", cfg)
+        assert rec["exit_class"] == "fail"
+        assert rec["exit_code"] == int(ExitCode.PRECONDITION)
+        assert rec["process_exit"] == 0
+        # `crony logs` is where an operator finds out why it stopped
+        # coming back, so the giving-up has to say so there too.
+        log_text = (h.state_dir("d", cfg=cfg) / "run.log").read_text()
+        assert "FAILED" in log_text
+        assert "daemon retry limit reached" in log_text
+
+    def test_daemon_precondition_does_not_count_against_a_live_run(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A held lock means a different instance is up, so this launch
+        # is not that daemon's own exit and must not spend an attempt --
+        # otherwise a stray `crony _run` could retire a healthy daemon.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"d": {"script": "/nonexistent/daemon", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        h.write_snap(cfg, "d")
+        ref = h.ref("d", cfg)
+        sd = h.state_dir("d", cfg=cfg)
+        sd.mkdir(parents=True, exist_ok=True)
+
+        with (
+            crony_runtime.acquire_lock(sd / "run.lock"),
+            pytest.raises(PreconditionError, match="script not found"),
+        ):
+            crony_runner.do_run(ref)
+        assert crony_runtime.read_exit_history(sd).runs == []
 
     def test_canceled_surfaces_in_status_column(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
@@ -3746,7 +3804,9 @@ if __name__ == "__main__":
 class TestRunDaemon:
     """A daemon's exit code is the whole channel to the supervisor:
     non-zero asks for a restart, zero leaves it down. The recorded
-    outcome is unchanged -- only the surfaced code differs."""
+    outcome tracks the command while retries remain -- only the surfaced
+    code differs. Exhausting the budget is the one place the record
+    itself changes: the run reads `fail` however the command exited."""
 
     def _cfg(self, h: Any, **overrides: Any) -> Any:
         body: dict[str, Any] = {"command": "true", "daemon": True}
@@ -3776,8 +3836,19 @@ class TestRunDaemon:
         # whose precondition is unmet stays stopped instead of spinning.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = self._cfg(h, gate="false", command="exit 99")
-        assert crony_runner._run_job(h.snap(cfg, "d")) == 0
+        snap = h.snap(cfg, "d")
+        # Seed a partly-spent budget: a gate declining is a precondition,
+        # not an attempt, so it releases what earlier exits consumed
+        # rather than adding to them.
+        snap.state_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(crony_config.DAEMON_RETRY_LIMIT - 1):
+            crony_runtime.record_daemon_exit(
+                snap.state_dir, 1, ExitClass.FAIL, f"t{i}"
+            )
+
+        assert crony_runner._run_job(snap) == 0
         assert h.last_run("d")["exit_class"] == "gated"
+        assert crony_runtime.read_exit_history(snap.state_dir).runs == []
 
     def test_failure_asks_for_a_restart(
         self, tmp_path: Path, monkeypatch: Any
@@ -3786,6 +3857,130 @@ class TestRunDaemon:
         cfg = self._cfg(h, command="exit 3")
         assert crony_runner._run_job(h.snap(cfg, "d")) == 3
         assert h.last_run("d")["exit_class"] == "fail"
+
+    def test_stops_after_five_automatic_retries(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 3")
+        snap = h.snap(cfg, "d")
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT):
+            assert crony_runner._run_job(snap) == 3
+
+        # Initial launch plus five retries have now exited. Scheduler-
+        # facing success suppresses another automatic restart while the
+        # last-run record preserves the command's failure.
+        assert crony_runner._run_job(snap) == 0
+        rec = h.last_run("d")
+        assert rec["exit_class"] == "fail"
+        assert rec["exit_code"] == 3
+        assert rec["process_exit"] == 0
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == (
+            crony_config.DAEMON_RETRY_LIMIT + 1
+        )
+        assert "retry limit reached" in snap.log_path_resolved.read_text()
+
+    def test_a_cleanly_exiting_daemon_still_exhausts_and_reads_fail(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A command that exits zero every time is still a process that
+        # will not stay up, so the budget bounds it like any other and
+        # the record stops calling the result ok -- crony has given up
+        # on keeping it alive, which is not a healthy entry to show.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="true")
+        snap = h.snap(cfg, "d")
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT):
+            assert crony_runner._run_job(snap) == int(ExitCode.DAEMON_EXITED)
+            assert h.last_run("d")["exit_class"] == "ok"
+
+        assert crony_runner._run_job(snap) == 0
+        rec = h.last_run("d")
+        assert rec["exit_class"] == "fail"
+        # The command's own code is preserved; only the class and the
+        # scheduler-facing code are overridden.
+        assert rec["exit_code"] == 0
+        assert rec["process_exit"] == 0
+        assert "retry limit reached" in snap.log_path_resolved.read_text()
+
+    def test_trigger_rearms_an_exhausted_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 7")
+        snap = h.snap(cfg, "d")
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runner._run_job(snap)
+        crony_runtime.write_user_trigger_flag(snap.state_dir)
+
+        assert crony_runner._run_job(snap) == 7
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
+
+    def test_an_external_start_rearms_without_any_sentinel(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Login, boot, or an out-of-band start of an exhausted daemon
+        # gets a fresh budget with nothing written to say so: the last
+        # run returned zero to stop the automatic restarts, so a launch
+        # happening at all means something external started it.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 7")
+        snap = h.snap(cfg, "d")
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runner._run_job(snap)
+        assert crony_runtime.daemon_retries_exhausted(snap.state_dir)
+        assert not crony_runtime.user_trigger_flag_path(snap.state_dir).exists()
+
+        # Asks for a restart again rather than staying down, and the
+        # window restarts at this one exit.
+        assert crony_runner._run_job(snap) == 7
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
+
+    def test_a_fresh_trigger_rearms_a_partly_spent_budget(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # With attempts still left the exhausted-history inference does
+        # not apply, so this is the sentinel's own arm: an operator who
+        # triggers a struggling daemon gets it a full budget rather than
+        # whatever remained.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 7")
+        snap = h.snap(cfg, "d")
+        for _ in range(3):
+            crony_runner._run_job(snap)
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 3
+        assert not crony_runtime.daemon_retries_exhausted(snap.state_dir)
+        crony_runtime.write_user_trigger_flag(snap.state_dir)
+
+        assert crony_runner._run_job(snap) == 7
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
+
+    def test_a_stale_trigger_flag_does_not_rearm(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A sentinel left behind by a trigger the scheduler swallowed
+        # must not hand a much later automatic restart a fresh budget --
+        # otherwise a daemon triggered once while healthy could never
+        # exhaust its retries.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command="exit 7")
+        snap = h.snap(cfg, "d")
+        for _ in range(crony_config.DAEMON_RETRY_LIMIT):
+            crony_runner._run_job(snap)
+        flag = crony_runtime.user_trigger_flag_path(snap.state_dir)
+        crony_runtime.write_user_trigger_flag(snap.state_dir)
+        stale = time.time() - (
+            crony_config.DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS + 60
+        )
+        os.utime(flag, (stale, stale))
+
+        # The budget is spent, so this launch exhausts it rather than
+        # starting over. The flag is consumed either way.
+        assert crony_runner._run_job(snap) == 0
+        assert not flag.exists()
+        assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == (
+            crony_config.DAEMON_RETRY_LIMIT + 1
+        )
 
     def test_success_exit_codes_do_not_suppress_the_restart(
         self, tmp_path: Path, monkeypatch: Any
@@ -3802,7 +3997,7 @@ class TestRunDaemon:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A daemon's command exiting is routine, not a failure to report,
-        # and the supervisor restarts it -- so a crash loop must not
+        # and the supervisor retries it -- so a crash loop must not
         # become a notification loop.
         # The channel is inherited, not set on the job -- setting one on
         # a daemon directly is a config error, so this is the only shape

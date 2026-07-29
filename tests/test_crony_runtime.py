@@ -2400,6 +2400,77 @@ class TestExitHistoryPersistence:
         ] == ["t2", "t3", "t4"]
 
 
+class TestDaemonRetryHistory:
+    def test_records_consecutive_exits(self, tmp_path: Path) -> None:
+        first = crony_runtime.record_daemon_exit(
+            tmp_path, 1, crony_model.ExitClass.FAIL, "t0"
+        )
+        second = crony_runtime.record_daemon_exit(
+            tmp_path, 2, crony_model.ExitClass.OK, "t1"
+        )
+        assert len(first.runs) == 1
+        assert [entry.exit_class for entry in second.runs] == [
+            crony_model.ExitClass.FAIL,
+            crony_model.ExitClass.OK,
+        ]
+
+    def test_stable_run_begins_a_fresh_streak(self, tmp_path: Path) -> None:
+        crony_runtime.record_daemon_exit(
+            tmp_path, 1, crony_model.ExitClass.FAIL, "t0"
+        )
+        state = crony_runtime.record_daemon_exit(
+            tmp_path,
+            crony_config.DAEMON_RETRY_RESET_SECONDS,
+            crony_model.ExitClass.FAIL,
+            "t1",
+        )
+        assert len(state.runs) == 1
+        assert state.runs[0].ended_at == "t1"
+
+    def test_the_window_saturates_at_the_budget(self, tmp_path: Path) -> None:
+        # Exhaustion is read as a count, so the window has to stop
+        # growing once it is reached rather than accumulating an entry
+        # per exit for as long as something keeps starting the daemon.
+        for i in range(crony_config.DAEMON_RETRY_LIMIT * 3):
+            state = crony_runtime.record_daemon_exit(
+                tmp_path, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        assert len(state.runs) == crony_config.DAEMON_RETRY_LIMIT + 1
+        assert crony_runtime.daemon_retries_exhausted(tmp_path)
+
+
+class TestUserTriggerFlagAge:
+    """The sentinel is deleted on read either way; `max_age_sec` decides
+    whether the reader is allowed to act on it."""
+
+    def test_a_fresh_flag_is_honored(self, tmp_path: Path) -> None:
+        crony_runtime.write_user_trigger_flag(tmp_path)
+        assert crony_runtime.consume_user_trigger_flag(tmp_path, max_age_sec=60)
+
+    def test_a_stale_flag_is_consumed_but_ignored(self, tmp_path: Path) -> None:
+        crony_runtime.write_user_trigger_flag(tmp_path)
+        path = crony_runtime.user_trigger_flag_path(tmp_path)
+        old = time.time() - 120
+        os.utime(path, (old, old))
+        assert not crony_runtime.consume_user_trigger_flag(
+            tmp_path, max_age_sec=60
+        )
+        # Left on disk it would be read again by the next launch.
+        assert not path.exists()
+
+    def test_age_is_ignored_without_a_bound(self, tmp_path: Path) -> None:
+        crony_runtime.write_user_trigger_flag(tmp_path)
+        path = crony_runtime.user_trigger_flag_path(tmp_path)
+        old = time.time() - 86400
+        os.utime(path, (old, old))
+        assert crony_runtime.consume_user_trigger_flag(tmp_path)
+
+    def test_a_missing_flag_reads_absent(self, tmp_path: Path) -> None:
+        assert not crony_runtime.consume_user_trigger_flag(
+            tmp_path, max_age_sec=60
+        )
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 
@@ -2437,6 +2508,28 @@ class TestDaemonJobStatus:
 
     def test_enabled_daemon_is_unaffected(self) -> None:
         assert self._derive() == crony_model.JobStatus.NEVER
+
+    def test_exhausted_daemon_preserves_failure_with_scheduler_success(
+        self,
+    ) -> None:
+        last_run = crony_model.LastRun(
+            exit_class=crony_model.ExitClass.FAIL,
+            started_at="2026-01-01T00:00:00+00:00",
+            process_exit=0,
+            pid=123,
+        )
+        scheduler_exit = crony_platform.UnitLastExit(exit_status=0)
+        # The zero the runner surfaced to stop the restarts matches what
+        # the scheduler recorded, and the pid matches the last run, so
+        # neither `crashed` branch fires and the recorded fail stands.
+        assert (
+            self._derive(
+                last_run=last_run,
+                unit_last_exit=scheduler_exit,
+                run_pid=123,
+            )
+            == crony_model.JobStatus.FAIL
+        )
 
 
 class TestDestroyRunSettle:

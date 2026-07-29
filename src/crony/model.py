@@ -1469,9 +1469,12 @@ class JobStatus(_DescribedStrEnum):
         ExitClass.FAIL,
         (
             "Jobs and groups. The job's last run failed (exited with a "
-            "non-zero status). For a job group: the group could not fire one "
-            "of its children -- that child's unit or snapshot is missing on "
-            "this host, or the scheduler refused to fire it."
+            "non-zero status), or was a daemon that used up its restart "
+            "budget -- one crony has stopped keeping alive reads as failed "
+            "even if its command exited zero. For a job group: the group "
+            "could not fire one of its children -- that child's unit or "
+            "snapshot is missing on this host, or the scheduler refused to "
+            "fire it."
         ),
     )
     TIMEOUT = (
@@ -1642,9 +1645,12 @@ class ScheduleValue(_DescribedStrEnum):
         "daemon",
         (
             "A job (daemon = true) that runs continuously rather than at "
-            "scheduled times. It starts at login and is restarted whenever "
-            "its command exits. If its execution gate fails it stays "
-            "stopped until the next login, `apply`, or `trigger`."
+            "scheduled times. It starts at login and gets five automatic "
+            "restarts when its command exits prematurely. After exhausting "
+            "them it reports fail and stays stopped until the next login, "
+            "`apply`, `enable`, or `trigger`. Five minutes of continuous "
+            "runtime resets the retry budget. If its execution gate fails "
+            "it stays stopped without consuming retries."
         ),
     )
     DISABLED = (
@@ -1708,7 +1714,15 @@ class _CommonRunResult:
 class JobRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed job run. Its
     `process_exit` is 0 for ok / gated / canceled, the job's own code
-    for fail, the timeout code, or 128+sig for a signal-killed child."""
+    for fail, the timeout code, or 128+sig for a signal-killed child.
+
+    A daemon's `process_exit` is instead what the supervisor is being
+    told to do, so an ok run carries `ExitCode.DAEMON_EXITED` (restart
+    it). Exhausting the retry budget inverts that: `process_exit` is 0
+    to stop the restarts, `exit_code` keeps the command's own code, and
+    `exit_class` reads `fail` even when the command exited cleanly -- a
+    continuous service crony has given up on keeping alive is not
+    healthy."""
 
     exit_code: int | None
     signal: int | None
@@ -1817,10 +1831,13 @@ EXIT_HISTORY_SCHEMA: int = 1
 
 @dataclass
 class ExitHistoryEntry:
-    """One completed run in `exit-history.json`. `exit_class` drives the
-    notify-success-ratio count (a success is `ExitClass.OK`); `ended_at`
-    is retained for forensics -- inspecting why a failure was or was not
-    notified -- and is not read by the ratio itself."""
+    """One completed run in `exit-history.json`.
+
+    `exit_class` drives notify-success-ratio (a success is
+    `ExitClass.OK`); a daemon's restart budget instead counts every
+    entry, because any exit is premature for a continuous process.
+    `ended_at` is retained for forensics and ordering.
+    """
 
     exit_class: ExitClass
     ended_at: str
@@ -1828,12 +1845,16 @@ class ExitHistoryEntry:
 
 @dataclass
 class ExitHistory:
-    """`exit-history.json`: a job's bounded, append-ordered log of recent
-    run outcomes, kept beside `last-run.json` so the notify-success-ratio
-    floor can look back over the last N runs. Only jobs whose resolved
-    ratio has N > 1 maintain it. Distinct from `last-run.json`, which is
-    a single most-recent record; this is the outcome history, holding no
-    notification state.
+    """`exit-history.json`: a job's bounded, append-ordered outcome log.
+
+    Kept beside `last-run.json` for either of two windowed policies:
+    notify-success-ratio looks back over the last N runs, while a daemon
+    counts premature exits toward its restart budget. Ordinary jobs
+    maintain it only when their resolved notification ratio has N > 1;
+    daemons maintain a six-entry window regardless of notification
+    settings and clear it after a stable run or explicit rearm. Distinct
+    from `last-run.json`, which is the single most-recent record; this
+    history holds no notification or scheduler state.
 
     A versioned container (unlike the unversioned `last-run.json`) so the
     entry shape can evolve behind the `schema` field; a record whose

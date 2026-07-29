@@ -503,18 +503,12 @@ def _run_job(snap: crony.model.Job) -> int:
 
     For a daemon the code is instead a message to the supervisor about
     whether to restart: ExitCode.DAEMON_EXITED when the command exited
-    cleanly (bring it back), and 0 for both a gated skip and lock
-    contention (leave it down -- its precondition is unmet, or another
-    instance already holds the lock).
+    cleanly (bring it back), and 0 for a gated skip, lock contention, or
+    an exhausted retry budget (leave it down). The retry budget is owned
+    here rather than by either scheduler so launchd and systemd behave
+    identically.
     """
     full_name = str(snap.entity_name)
-
-    if snap.script is not None:
-        sp = Path(snap.script)
-        if not sp.exists():
-            raise crony.errors.PreconditionError(f"script not found: {sp}")
-        if not os.access(sp, os.X_OK):
-            raise crony.errors.PreconditionError(f"script not executable: {sp}")
 
     sd = snap.state_dir
     sd.mkdir(parents=True, exist_ok=True)
@@ -529,15 +523,35 @@ def _run_job(snap: crony.model.Job) -> int:
     # A daemon's exit codes mean something different to the supervisor;
     # see the DAEMON_EXITED arm below.
     is_daemon = crony.unit.is_daemon(snap.timing)
+    if is_daemon:
+        # A recent `crony trigger` explicitly starts a new retry budget;
+        # apply and enable clear the history themselves. An
+        # already-exhausted state also means this launch could not be an
+        # automatic restart (the prior run returned zero to stop them),
+        # so login or another external start gets a fresh budget too.
+        user_triggered = crony.runtime.consume_user_trigger_flag(
+            sd,
+            max_age_sec=crony.config.DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS,
+        )
+        if user_triggered or crony.runtime.daemon_retries_exhausted(sd):
+            crony.runtime.clear_exit_history(sd)
+    if snap.script is not None:
+        sp = Path(snap.script)
+        if not sp.exists():
+            raise crony.errors.PreconditionError(f"script not found: {sp}")
+        if not os.access(sp, os.X_OK):
+            raise crony.errors.PreconditionError(f"script not executable: {sp}")
     notify_channels, notify_defaults, success_ratio = (
         crony.notify.resolve_notify_at_runtime(full_name)
     )
     if is_daemon:
         # A daemon sends no failure notifications: its command exiting is
-        # routine, and the supervisor restarts it -- a crash loop must
+        # routine, and the supervisor retries it -- a crash loop must
         # not become a notification loop. Clearing the channels is what
         # makes the dispatch below a no-op; the ratio goes back to the
-        # default so no exit-history window is kept for one either.
+        # default so the notification path does not append history.
+        # Daemon supervision maintains its own window in that same
+        # exit-history file after each premature exit.
         notify_channels = []
         success_ratio = crony.config.DEFAULT_SUCCESS_RATIO
     # snap.env stores the user-written env literally; overlay it on
@@ -603,6 +617,12 @@ def _run_job(snap: crony.model.Job) -> int:
                     )
 
                     if gate == crony.model.GateResult.FAILED:
+                        if is_daemon:
+                            # A gate is an external precondition, not a
+                            # crashing command. It stops immediately and
+                            # leaves the next explicit start with a fresh
+                            # retry budget.
+                            crony.runtime.clear_exit_history(sd)
                         log_file.write(
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
@@ -711,6 +731,42 @@ def _run_job(snap: crony.model.Job) -> int:
                     exit_code = rc
                     surfaced_rc = rc
 
+                duration_sec = time.time() - started
+                ended_at = crony.runtime.now_iso()
+                if is_daemon:
+                    retry_history = crony.runtime.record_daemon_exit(
+                        sd, duration_sec, exit_class, ended_at
+                    )
+                    premature_exits = len(retry_history.runs)
+                    if premature_exits > crony.config.DAEMON_RETRY_LIMIT:
+                        # Scheduler-facing success is the portable
+                        # "stop automatically restarting" signal for
+                        # launchd SuccessfulExit=false and systemd
+                        # Restart=on-failure. Preserve the command's
+                        # actual exit_code, but a cleanly exiting
+                        # continuous service is still unhealthy once
+                        # crony gives up on keeping it alive.
+                        surfaced_rc = 0
+                        if exit_class == crony.model.ExitClass.OK:
+                            exit_class = crony.model.ExitClass.FAIL
+                        log_file.write(
+                            (
+                                "daemon: retry limit reached after "
+                                f"{premature_exits} premature exits; "
+                                "leaving stopped (the next login, or "
+                                "crony trigger / apply / enable, "
+                                "retries it)\n"
+                            ).encode()
+                        )
+                    else:
+                        log_file.write(
+                            (
+                                "daemon: requesting automatic retry "
+                                f"{premature_exits} of "
+                                f"{crony.config.DAEMON_RETRY_LIMIT}\n"
+                            ).encode()
+                        )
+
                 # Pre-populate per-channel slots with sent=False so
                 # the dispatcher can update each entry in place. Order
                 # is preserved (Python dict insertion order) so the
@@ -723,8 +779,8 @@ def _run_job(snap: crony.model.Job) -> int:
                     host=host,
                     platform=platform,
                     started_at=started_iso,
-                    ended_at=crony.runtime.now_iso(),
-                    duration_sec=time.time() - started,
+                    ended_at=ended_at,
+                    duration_sec=duration_sec,
                     exit_class=exit_class,
                     exit_code=exit_code,
                     signal=sig,
@@ -1216,7 +1272,9 @@ def trigger_unit(
 
     `triggered_by_user` writes a one-shot sentinel flag in the
     entity's state dir, consumed by `crony _run` on startup to
-    skip the interactive wait. The caller passes `state_dir`
+    skip the interactive wait or reset a daemon's retry budget.
+    Callers decide whether this fire earns one -- a fire the
+    scheduler will swallow does not. The caller passes `state_dir`
     (resolved from the entity's `(bundle, uuid)` via Config) so
     the flag lands in the right uuid-keyed dir; when
     `triggered_by_user` is True and `state_dir` is None the call
@@ -1808,7 +1866,10 @@ def do_run(ref: str) -> None:
     surfaces in `crony status` and isn't silently dropped by the
     scheduler. The "canceled" label is shared with interactive-
     job cancels: both have the same operator-facing meaning
-    ("crony _run never got to the user's command"). Without this
+    ("crony _run never got to the user's command"). A daemon whose
+    precondition keeps failing spends its retry budget on those
+    launches; the one that exhausts it records `fail` and exits zero,
+    so the supervisor stops restarting it. Without this
     record the scheduled fire fails, leaving the prior outcome in
     place: a snapshot-schema bump looks like ordinary
     "edited config, not yet applied" drift, and a per-run precondition
@@ -1821,6 +1882,7 @@ def do_run(ref: str) -> None:
             f"this entry point is for platform-unit invocation. "
             f"Use `crony trigger <name>` to fire by name."
         )
+    snap: crony.model.Job | crony.model.JobGroup | None = None
     try:
         snap = crony.runtime.load_snapshot(parsed)
         if isinstance(snap, crony.model.Job):
@@ -1828,19 +1890,56 @@ def do_run(ref: str) -> None:
         else:
             rc = _run_group(snap)
     except crony.errors.PreconditionError as exc:
-        _record_precondition_cancel(parsed, exc)
+        daemon_exhausted = False
+        if isinstance(snap, crony.model.Job) and crony.unit.is_daemon(
+            snap.timing
+        ):
+            # _run_job raises without holding run.lock -- either before
+            # taking it (a missing script) or on the way out of the
+            # `with` that released it (an ungranted full-disk-access
+            # wrapper). Take it here so the count is serialized like
+            # every other one. Contention means a different instance is
+            # live, so this launch is not that daemon's own exit and
+            # does not spend an attempt.
+            try:
+                with crony.runtime.acquire_lock(snap.state_dir / "run.lock"):
+                    state = crony.runtime.record_daemon_exit(
+                        snap.state_dir,
+                        0.0,
+                        crony.model.ExitClass.CANCELED,
+                        crony.runtime.now_iso(),
+                    )
+                daemon_exhausted = (
+                    len(state.runs) > crony.config.DAEMON_RETRY_LIMIT
+                )
+            except crony.errors.LockBusyError:
+                daemon_exhausted = False
+        _record_precondition_cancel(
+            parsed, exc, daemon_exhausted=daemon_exhausted
+        )
+        if daemon_exhausted:
+            raise SystemExit(0) from None
         raise
     raise SystemExit(rc)
 
 
 def _record_precondition_cancel(
-    ref: crony.unit.EntityRef, exc: crony.errors.PreconditionError
+    ref: crony.unit.EntityRef,
+    exc: crony.errors.PreconditionError,
+    *,
+    daemon_exhausted: bool = False,
 ) -> None:
     """Write a minimal `last-run.json` recording a precondition
     failure as `canceled` so it surfaces in `crony status` -- same
     `canceled` label interactive-job cancels use. Covers any
     `PreconditionError` raised before the command runs (snapshot
     load, missing script, and other per-run preconditions).
+
+    `daemon_exhausted` records the launch that spent a daemon's last
+    retry instead: `fail` rather than `canceled`, and `process_exit`
+    0 rather than the precondition code, matching the zero `do_run`
+    returns to stop the supervisor restarting it. The run.log line
+    reads FAILED and names the exhausted budget.
 
     Skipped when the state dir doesn't exist on disk: creating it
     just to hold the error record would leave an orphaned dir
@@ -1860,24 +1959,44 @@ def _record_precondition_cancel(
     if not state_dir.is_dir():
         return
     now = crony.runtime.now_iso()
+    process_exit = (
+        0 if daemon_exhausted else int(crony.errors.ExitCode.PRECONDITION)
+    )
+    exit_class = (
+        crony.model.ExitClass.FAIL
+        if daemon_exhausted
+        else crony.model.ExitClass.CANCELED
+    )
     payload: dict[str, Any] = {
         "host": crony.platform.current_host(),
         "platform": crony.platform.current_platform(),
         "started_at": now,
         "ended_at": now,
         "duration_sec": 0.0,
-        "exit_class": "canceled",
+        "exit_class": str(exit_class),
         "exit_code": int(crony.errors.ExitCode.PRECONDITION),
-        # The process exits with this code (do_run re-raises and cli
-        # maps it), so it matches what the scheduler records for this
-        # launch -- a mismatch would read as a launch that recorded no
-        # result (a crash).
-        "process_exit": int(crony.errors.ExitCode.PRECONDITION),
+        # Normally do_run re-raises and cli maps the precondition code.
+        # At daemon exhaustion it instead exits zero to stop supervisor
+        # retries. Either way this is the code the scheduler records for
+        # the launch, so the exit-code half of the `crashed` check
+        # agrees. The pid half does not: this record carries no pid, so
+        # whenever `run.pid` exists the entry reconciles as `crashed`
+        # rather than showing the class recorded here. That covers a
+        # daemon whose earlier launch left a pid behind, and any
+        # precondition raised after the run took the lock and published
+        # one. Both classes are unhealthy, so the entry still surfaces.
+        "process_exit": process_exit,
         "reason": str(exc),
     }
     crony.runtime.write_last_run(state_dir / "last-run.json", payload)
     log_path = state_dir / crony.model.RUN_LOG_NAME
-    line = f"\n=== {now} CANCELED {ref} ===\n   {exc}\n"
+    verdict = "FAILED" if daemon_exhausted else "CANCELED"
+    suffix = (
+        "\n   daemon retry limit reached; leaving stopped"
+        if daemon_exhausted
+        else ""
+    )
+    line = f"\n=== {now} {verdict} {ref} ===\n   {exc}{suffix}\n"
     with open(log_path, "ab") as f:
         f.write(line.encode("utf-8"))
 

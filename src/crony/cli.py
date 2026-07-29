@@ -58,8 +58,10 @@ or more TOML config bundles and can deploy the corresponding platform
 units. It runs jobs through a uniform shim, which provides consistent
 logging, execution gates, timeouts, environment management, etc. Jobs can
 be grouped, and groups or jobs run on a schedule; a job can instead be a
-daemon, which runs continuously and is restarted whenever it stops. Jobs
-can also be managed manually (enabled/disabled independently of the
+daemon, which runs continuously and gets five automatic restarts when it
+stops prematurely. An exhausted daemon stays loaded but stopped until the
+next login, `trigger`, `apply`, or `enable` starts a fresh retry budget.
+Jobs can also be managed manually (enabled/disabled independently of the
 underlying scheduler, and run at will via the `trigger` subcommand). Crony
 supports the following notification mechanisms for job failures:
 email/smtp, ntfy, and pop-ups (on macOS/darwin).
@@ -423,7 +425,9 @@ def _build_parser() -> StrictArgumentParser:
             "Render and activate platform units to match config. With "
             "no job arguments this is a full sync (install missing, fix "
             "drift, remove orphans); with names it surgically updates "
-            "just those entries."
+            "just those entries. A daemon left stopped by an exhausted "
+            "retry budget or a declined gate is restarted with a fresh "
+            "budget, reported as `rearmed`."
         ),
     )
     _add_jobs_argument(p_apply)
@@ -466,7 +470,9 @@ def _build_parser() -> StrictArgumentParser:
         help="Re-arm the named jobs' schedules.",
         description=(
             "Re-arm the named jobs' schedules (clear the "
-            "operator-disable). Requires a target: job(s) or --all."
+            "operator-disable). Enabling an already-enabled daemon "
+            "restarts one that an exhausted retry budget or a declined "
+            "gate left stopped. Requires a target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_enable)
@@ -496,8 +502,9 @@ def _build_parser() -> StrictArgumentParser:
         help="Ask the platform scheduler to fire the named jobs now.",
         description=(
             "Ask the platform scheduler to fire the named jobs now, via "
-            "the same path a scheduled fire uses. Requires a target: "
-            "job(s) or --all."
+            "the same path a scheduled fire uses. Starting a stopped "
+            "daemon this way gives it a fresh retry budget. Requires a "
+            "target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_trigger)

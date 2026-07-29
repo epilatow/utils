@@ -1105,6 +1105,11 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     dispatch skips it, so the operator-disable is meaningful even with
     no timer to disarm.
 
+    Enabling an already-enabled daemon is not a no-op: one left stopped
+    by an exhausted retry budget or a declined gate is started again
+    with a fresh budget, so `enable` revives a daemon without an edit to
+    its config.
+
     With `--all`, enables every stamped entry, narrowed to one bundle
     when `--bundle <name>` is also given. With `--bundle` plus
     positional args, bare names resolve in `<name>` and qualified
@@ -1116,8 +1121,15 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     normalized = _resolve_bulk_names(jobs, bundle, installed)
     targets = _resolve_action_targets(config, normalized)
     for full, ref, _unit_name in targets:
-        crony.runtime.set_disabled(config, ref, disabled=False)
-        logger.info("%s: enabled", full)
+        # An entry that was already enabled and still changed something
+        # is the daemon-rearm path; say so rather than reporting an
+        # enable that did not happen.
+        current = config.current.job_from_ref(ref)
+        was_enabled = current is not None and not current.unit_disabled
+        changed = crony.runtime.set_disabled(config, ref, disabled=False)
+        logger.info(
+            "%s: %s", full, "rearmed" if was_enabled and changed else "enabled"
+        )
 
 
 def do_disable(jobs: list[str], bundle: str | None) -> None:
@@ -1180,9 +1192,11 @@ def do_trigger(
     more than one); a daemon has no completion to wait for, so naming
     one with `--wait` is a usage error.
 
-    Triggering a daemon starts it -- useful when its gate previously
-    declined and now would pass. Triggering one that is already running
-    is the same no-op it is for any running unit.
+    Triggering a daemon starts it with a fresh retry budget -- useful
+    when its gate previously declined and now would pass, or when it
+    used up its automatic restarts. Triggering one that is already
+    running is the same no-op it is for any running unit, and writes no
+    sentinel, so it cannot rearm a later restart.
 
     `--trigger-timeout <sec>` (only with `--wait`) overrides the
     default 15s "trigger never produced a run" deadline.
@@ -1208,12 +1222,26 @@ def do_trigger(
 
     if not wait:
         for full, ref, unit_name in targets:
+            state_dir = crony.model.Job.state_dir_from_ref(ref)
+            # Triggering a running daemon is a no-op the scheduler
+            # swallows, so the sentinel would sit unread until some
+            # later automatic restart consumed it and handed that
+            # restart a retry budget nobody asked for. Skip writing it
+            # rather than leave it stranded. Any other running entry
+            # still gets one: an interactive job's pending run polls
+            # for it to break out of its wait.
+            applied = config.current.job_from_ref(ref)
+            running_daemon = (
+                applied is not None
+                and crony.unit.is_daemon(applied.timing)
+                and crony.runtime.run_in_progress(state_dir)
+            )
             # Fire the unit under its installed (current) name; the
             # user-trigger flag lands in the uuid-keyed state dir.
             crony.runner.trigger_unit(
                 unit_name,
-                triggered_by_user=True,
-                state_dir=crony.model.Job.state_dir_from_ref(ref),
+                triggered_by_user=not running_daemon,
+                state_dir=state_dir,
             )
             logger.info("%s: triggered", full)
         return
@@ -2744,8 +2772,10 @@ def do_status(
         # A daemon is healthy when it is up, or when it is deliberately
         # not up: `gated` means its own precondition declined to run it,
         # which is the gate working, not a fault. Its other outcomes mean
-        # it stopped without being told to, so they survive the filter --
-        # unlike a scheduled job, whose next fire retries them. A run in
+        # it stopped without being told to, so they survive the filter.
+        # A daemon that will be retried still surfaces: the retries are
+        # bounded, and the filter has no way to know a given `fail` is
+        # not the last one. A run in
         # flight is the reverse: a daemon's steady state, but for a
         # scheduled job one wedged there is worth showing.
         healthy_status = {

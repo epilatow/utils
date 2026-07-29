@@ -44,6 +44,7 @@ from conftest_crony import (  # noqa: E402
 
 from crony import cli as crony_cli  # noqa: E402
 from crony import commands as crony_commands  # noqa: E402
+from crony import config as crony_config  # noqa: E402
 from crony import model as crony_model  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -62,6 +63,7 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     LockBusyError,
     PreconditionError,
+    UnitNotInstalledError,
     UsageError,
 )
 from crony.model import (  # noqa: E402
@@ -8899,6 +8901,69 @@ class TestDaemonLifecycle:
         assert ["systemctl", "--user", "--quiet", "enable", service] in h.calls
         assert "[Install]" in self._unit(h, "linux").read_text()
 
+    def test_enable_from_disabled_clears_the_budget(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Re-enabling puts the daemon back under supervision, so it
+        # starts over rather than inheriting attempts spent before it
+        # was disabled (the stop itself records one).
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+
+        crony_commands.do_enable(jobs=["d"], bundle=None)
+        assert crony_runtime.read_exit_history(sd).runs == []
+
+    def test_reapply_does_not_rearm_a_disabled_exhausted_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An operator-disabled daemon is meant to stay down; apply must
+        # not start it just because its budget ran out.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        h.calls.clear()
+
+        assert h.apply("d") == "unchanged"
+        assert not any("start" in c for c in h.calls)
+        assert crony_runtime.daemon_retries_exhausted(sd)
+
+    def test_enable_rearms_exhausted_enabled_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        h.calls.clear()
+
+        crony_commands.do_enable(jobs=["d"], bundle=None)
+        assert [
+            "systemctl",
+            "--user",
+            "start",
+            "--no-block",
+            f"crony-{h.full('d')}.service",
+        ] in h.calls
+        assert not crony_runtime.daemon_retries_exhausted(sd)
+        assert crony_runtime.read_exit_history(sd).runs == []
+
     def _status_cells(self, capsys: Any, full: str) -> list[str]:
         """The status row for `full`, split into cells. Default columns
         are job-or-uuid, config, schedule, status, last-ran."""
@@ -8957,6 +9022,213 @@ class TestDaemonLifecycle:
         self._daemon_cfg(h)
         assert h.apply("d") == "added"
         assert h.apply("d") == "unchanged"
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_reapply_rearms_an_exhausted_daemon(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        h.calls.clear()
+
+        assert h.apply("d") == "rearmed"
+        if platform == "linux":
+            assert [
+                "systemctl",
+                "--user",
+                "start",
+                "--no-block",
+                f"crony-{h.full('d')}.service",
+            ] in h.calls
+        else:
+            assert [
+                "launchctl",
+                "kickstart",
+                f"gui/{os.getuid()}/org.crony.{h.full('d')}",
+            ] in h.calls
+        assert not crony_runtime.daemon_retries_exhausted(sd)
+        assert crony_runtime.read_exit_history(sd).runs == []
+
+    def test_reapply_reinstalls_an_unloaded_exhausted_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A daemon the scheduler has no record of is broken, not resting.
+        # `unit_armed` tracks loadedness for a daemon on both backends
+        # and is a compared field, so the snapshots differ and apply
+        # reinstalls -- the recovery that actually reloads it. Rearming
+        # instead would kickstart a label the scheduler cannot resolve.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+
+        assert h.apply("d") == "updated"
+
+    def test_enable_does_not_rearm_an_unloaded_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # `enable` decides from the operator-disable flag alone -- it
+        # compares no snapshot fields -- so it is the path that can reach
+        # a rearm for a unit the scheduler has lost. Starting one by name
+        # would fail the scheduler call and abort an `enable --all`
+        # batch partway.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        h.calls.clear()
+
+        crony_commands.do_enable(jobs=["d"], bundle=None)
+        assert not any("start" in c for c in h.calls)
+        assert crony_runtime.daemon_retries_exhausted(sd)
+
+    def test_enable_reports_a_rearm_as_such(
+        self, tmp_path: Path, monkeypatch: Any, caplog: Any
+    ) -> None:
+        # "enabled" would be a lie for an entry that already was.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+
+        with caplog.at_level(logging.INFO):
+            crony_commands.do_enable(jobs=["d"], bundle=None)
+        assert f"{h.full('d')}: rearmed" in caplog.text
+
+    def test_enable_of_a_loaded_daemon_missing_its_unit_file_refuses(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The scheduler still has the label, but the file a fire would
+        # read is gone. crony says so rather than letting a raw
+        # scheduler error out of the enable path.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT + 1):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        self._unit(h, "linux").unlink()
+
+        with pytest.raises(UnitNotInstalledError):
+            crony_commands.do_enable(jobs=["d"], bundle=None)
+
+    def test_reapply_restarts_a_gated_daemon(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A gate that declined leaves the daemon deliberately stopped,
+        # and re-running apply is how an operator retries it once the
+        # precondition holds -- reporting `unchanged` and leaving it
+        # down would make apply a no-op exactly when it is being used
+        # to recover.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        (h.state_dir("d") / "last-run.json").write_text(
+            '{"exit_class": "gated", "exit_code": 0, '
+            '"started_at": "2026-01-01T00:00:00-08:00"}',
+            encoding="utf-8",
+        )
+        h.calls.clear()
+
+        assert h.apply("d") == "rearmed"
+        assert [
+            "systemctl",
+            "--user",
+            "start",
+            "--no-block",
+            f"crony-{h.full('d')}.service",
+        ] in h.calls
+
+    def test_reapplying_a_changed_daemon_clears_its_budget(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The install replaces the unit and restarts the process, so the
+        # attempts the previous shape spent do not carry over.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
+            )
+        h.config(
+            {"job": {"d": {"command": "serve --verbose", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+
+        assert h.apply("d") == "updated"
+        assert crony_runtime.read_exit_history(sd).runs == []
+
+    def test_entering_the_daemon_mode_clears_it_even_while_disabled(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A disabled daemon is still triggerable by hand, so it must not
+        # start its first budget holding entries the scheduled shape's
+        # ratio window left behind.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"d": {"command": "serve", "interval": "1h"}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        crony_commands.do_disable(jobs=["d"], bundle=None)
+        sd = h.state_dir("d")
+        crony_runtime.append_exit_history(
+            sd, crony_model.ExitClass.FAIL, "t0", cap=6
+        )
+        h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+
+        assert h.apply("d") == "updated"
+        assert crony_runtime.read_exit_history(sd).runs == []
+
+    def test_leaving_the_daemon_mode_clears_the_shared_history(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The retry budget and the notify-success-ratio window are the
+        # same file. Daemon-era entries count every exit, so left behind
+        # they would seed the scheduled shape's ratio window with runs
+        # its own policy never classified.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        for i in range(crony_config.DAEMON_RETRY_LIMIT):
+            crony_runtime.record_daemon_exit(
+                sd, 1, crony_model.ExitClass.OK, f"t{i}"
+            )
+        h.config(
+            {"job": {"d": {"command": "serve", "interval": "1h"}}},
+            default_target_jobs=["d"],
+        )
+
+        assert h.apply("d") == "updated"
+        assert crony_runtime.read_exit_history(sd).runs == []
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_reapply_is_a_no_op_while_disabled(
@@ -9192,3 +9464,23 @@ class TestDaemonLifecycle:
             jobs=["d"], wait=False, trigger_timeout=None, bundle=None
         )
         assert any("start" in c for c in h.calls)
+        assert crony_runtime.user_trigger_flag_path(h.state_dir("d")).is_file()
+
+    def test_trigger_of_a_running_daemon_writes_no_sentinel(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The scheduler swallows the fire, so nothing consumes the
+        # sentinel now. Left on disk it would be picked up by whichever
+        # automatic restart came next and silently rearm that daemon's
+        # retry budget.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        self._daemon_cfg(h)
+        h.apply("d")
+        sd = h.state_dir("d")
+        sd.mkdir(parents=True, exist_ok=True)
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            crony_commands.do_trigger(
+                jobs=["d"], wait=False, trigger_timeout=None, bundle=None
+            )
+        assert any("start" in c for c in h.calls)
+        assert not crony_runtime.user_trigger_flag_path(sd).exists()

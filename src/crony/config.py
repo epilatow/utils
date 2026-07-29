@@ -358,11 +358,13 @@ class NotifyChannel:
         )
 
 
-# Upper bound on N (the denominator of notify-success-ratio) and, by
-# construction, on how many outcomes exit-history.json retains: N is
+# Upper bound on N (the denominator of notify-success-ratio), and so on
+# how many outcomes exit-history.json retains for that policy: N is
 # validated <= this, so the tail the ratio reads never exceeds what is
 # stored. 100 recent runs is far more window than any real failure
-# floor needs.
+# floor needs. A daemon writes the same file under its own, much
+# smaller cap (DAEMON_RETRY_LIMIT + 1); the two never share an entry,
+# because apply clears the history on either mode transition.
 MAX_SUCCESS_RATIO_WINDOW: int = 100
 
 
@@ -387,6 +389,19 @@ class SuccessRatio:
 
 
 DEFAULT_SUCCESS_RATIO: SuccessRatio = SuccessRatio(1, 1)
+
+# A daemon gets its initial launch plus this many automatic restarts
+# before the runner returns scheduler-facing success and leaves the unit
+# loaded but stopped. A run that stays up this long begins a fresh
+# failure streak when it eventually exits.
+DAEMON_RETRY_LIMIT: int = 5
+DAEMON_RETRY_RESET_SECONDS: int = 5 * 60
+
+# How long a `crony trigger` sentinel still counts as the reason a
+# daemon is starting. Past this the launch is an automatic restart that
+# happens to find an abandoned flag, and honoring it would hand out an
+# unearned budget.
+DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS: int = 60
 
 
 @dataclass
@@ -2303,7 +2318,7 @@ def _reject_daemon_conflicts(
             raise crony.errors.ConfigError(
                 f"{where}: '{key}' is not valid on a daemon, which sends "
                 f"no failure notifications -- its command exiting is "
-                f"routine, and the supervisor restarts it"
+                f"routine, and the supervisor retries it"
             )
 
 

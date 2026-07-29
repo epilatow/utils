@@ -128,10 +128,10 @@ def _render_plist(
     if daemon is not None and timing is not None:
         # `SuccessfulExit: false` is launchd's native spelling of the
         # runner's contract: respawn on a non-zero exit, stay down on a
-        # zero one. The runner surfaces non-zero when the command exited
-        # (restart it) and zero when its gate declined to run it (leave
-        # it down until the next load). ThrottleInterval floors the
-        # respawn rate so a command failing instantly cannot spin.
+        # zero one. The runner surfaces non-zero while its cross-platform
+        # retry budget remains, and zero when its gate declines to run it
+        # or that budget is exhausted. ThrottleInterval floors the
+        # bounded respawn rate so a command failing instantly cannot spin.
         contents["RunAtLoad"] = True
         contents["KeepAlive"] = {"SuccessfulExit": False}
         contents["ThrottleInterval"] = daemon.restart_seconds

@@ -12,7 +12,9 @@ TOML config bundles and can deploy the corresponding platform units. It runs
 jobs through a uniform shim, which provides consistent logging, execution
 gates, timeouts, environment management, etc. Jobs can be grouped, and groups
 or jobs run on a schedule; a job can instead be a daemon, which runs
-continuously and is restarted whenever it stops. Jobs can also be managed
+continuously and gets five automatic restarts when it stops prematurely. An
+exhausted daemon stays loaded but stopped until the next login, `trigger`,
+`apply`, or `enable` starts a fresh retry budget. Jobs can also be managed
 manually (enabled/disabled independently of the underlying scheduler, and run
 at will via the `trigger` subcommand). Crony supports the following
 notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
@@ -123,7 +125,9 @@ Print one freshly-minted UUID.
 
 Render and activate platform units to match config. With no job arguments this
 is a full sync (install missing, fix drift, remove orphans); with names it
-surgically updates just those entries.
+surgically updates just those entries. A daemon left stopped by an exhausted
+retry budget or a declined gate is restarted with a fresh budget, reported as
+`rearmed`.
 
 - **`-v, --verbose`**\
   Also print 'unchanged' lines.
@@ -140,8 +144,9 @@ both go away. Requires a target: job(s), --all, or --orphans.
 
 ### `enable [--all] [-b BUNDLE] [job ...]`
 
-Re-arm the named jobs' schedules (clear the operator-disable). Requires a
-target: job(s) or --all.
+Re-arm the named jobs' schedules (clear the operator-disable). Enabling an
+already-enabled daemon restarts one that an exhausted retry budget or a
+declined gate left stopped. Requires a target: job(s) or --all.
 
 ### `disable [--all] [-b BUNDLE] [job ...]`
 
@@ -152,7 +157,8 @@ re-enabled. Requires a target: job(s) or --all.
 ### `trigger [--all] [-b BUNDLE] [-w] [--trigger-timeout TRIGGER_TIMEOUT] [job ...]`
 
 Ask the platform scheduler to fire the named jobs now, via the same path a
-scheduled fire uses. Requires a target: job(s) or --all.
+scheduled fire uses. Starting a stopped daemon this way gives it a fresh retry
+budget. Requires a target: job(s) or --all.
 
 - **`-w, --wait`**\
   Block until each named entry's next completion and exit with that exit code
@@ -334,9 +340,11 @@ Send a synthetic failure notification.
   subcommand.
 - **`daemon`**\
   A job (daemon = true) that runs continuously rather than at scheduled times.
-  It starts at login and is restarted whenever its command exits. If its
-  execution gate fails it stays stopped until the next login, `apply`, or
-  `trigger`.
+  It starts at login and gets five automatic restarts when its command exits
+  prematurely. After exhausting them it reports fail and stays stopped until
+  the next login, `apply`, `enable`, or `trigger`. Five minutes of continuous
+  runtime resets the retry budget. If its execution gate fails it stays
+  stopped without consuming retries.
 - **`disabled`**\
   A job that has been disabled via the `disable` subcommand; it will not be
   run via any schedule. It can be run manually via the `trigger` subcommand,
@@ -350,10 +358,11 @@ Send a synthetic failure notification.
   skipped, not run) -- whatever those children then did is reported on their
   own rows, and a failing child does not fail its group.
 - **`fail`**\
-  Jobs and groups. The job's last run failed (exited with a non-zero status).
-  For a job group: the group could not fire one of its children -- that
-  child's unit or snapshot is missing on this host, or the scheduler refused
-  to fire it.
+  Jobs and groups. The job's last run failed (exited with a non-zero status),
+  or was a daemon that used up its restart budget -- one crony has stopped
+  keeping alive reads as failed even if its command exited zero. For a job
+  group: the group could not fire one of its children -- that child's unit or
+  snapshot is missing on this host, or the scheduler refused to fire it.
 - **`timeout`**\
   Jobs and groups. The job was killed after exceeding its wallclock execution
   timeout. For a job group: the group ran out of time on a child before it

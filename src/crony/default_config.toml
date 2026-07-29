@@ -226,14 +226,19 @@
 #on-demand = true
 
 # Daemon job: runs continuously instead of at scheduled times. It starts
-# at login and is restarted whenever its command exits, so use it for a
-# process that is meant to stay up. `daemon = true` is mutually
-# exclusive with `schedule` / `interval` / `on-demand`, and shows
-# `daemon` in `crony status`.
+# at login and gets five automatic restarts when its command exits
+# prematurely (six attempts total), so use it for a process that is meant
+# to stay up. After the sixth exit it reports `fail` and stays loaded but
+# stopped until the next login, `crony trigger`, `crony apply`, or `crony
+# enable` starts a fresh retry budget. Running continuously for five
+# minutes also resets the budget before a later exit. `daemon = true` is
+# mutually exclusive with `schedule` / `interval` / `on-demand`, and
+# shows `daemon` in `crony status`.
 #
 # The gate runs before every start, so it doubles as a precondition: a
-# daemon whose gate fails stays stopped rather than restarting in a loop,
-# and comes back at the next login, `crony apply`, or `crony trigger`.
+# daemon whose gate fails stays stopped immediately rather than consuming
+# retries, and comes back at the next login, `crony apply`, `crony enable`,
+# or `crony trigger`.
 #
 # A daemon cannot be a [job-group.*] member (a group waits for each child
 # to finish), and rejects a non-zero `job-timeout-sec` (it is uncapped by

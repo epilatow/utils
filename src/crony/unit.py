@@ -367,8 +367,9 @@ DAEMON_SPEC = "daemon"
 @dataclass(frozen=True)
 class Daemon:
     """The continuous firing mode: an entry that declares
-    ``daemon = true`` and runs for as long as it can, restarted by the
-    platform supervisor whenever its command exits.
+    ``daemon = true`` and runs for as long as it can. The platform
+    supervisor restarts it when the runner requests one; the runner
+    bounds that retry policy consistently across platforms.
 
     A firing mode in its own right, distinct from the timed modes
     (Schedule / Interval) because it names no times at all, and from the
@@ -470,7 +471,7 @@ def is_scheduled(timing: Timing | None) -> TypeIs[Schedule | Interval]:
 def is_daemon(timing: Timing | None) -> TypeIs[Daemon]:
     """Whether `timing` is the continuous firing mode. Distinct from
     `is_scheduled` (a daemon arms no timer) and from the dormant modes (a
-    daemon starts itself and is restarted when it stops)."""
+    daemon starts itself and is retried when it stops prematurely)."""
     return isinstance(timing, Daemon)
 
 

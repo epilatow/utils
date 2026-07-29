@@ -5,8 +5,8 @@
 Each entity is a `.service` unit; scheduled entries also get a `.timer`
 that arms it. Schedule-less entries install only the static `.service`,
 which sits dormant until `crony trigger` or a parent group fires it. A
-daemon's `.service` needs no timer either, but starts itself and is
-restarted when it exits.
+daemon's `.service` needs no timer either, but starts itself and carries
+`Restart=` so the supervisor can bring it back when the runner asks.
 """
 
 import configparser
@@ -84,7 +84,7 @@ def _render_service(
     A timed entry's service is a `oneshot` the `.timer` starts, so it is
     independent of the schedule. A `daemon` runs long enough to be a
     `simple` service (`oneshot` cannot carry `Restart=`) that restarts
-    when its command fails and is wanted at login. `armed` False is an
+    when the runner requests it and is wanted at login. `armed` False is an
     operator-disabled daemon: same shape, minus the `[Install]` section,
     so the unit is `static` -- it cannot start at boot, and `is-enabled`
     still reports it loaded rather than reading as drift.
@@ -92,10 +92,11 @@ def _render_service(
     if daemon is not None:
         # `on-failure`, not `always`, so the runner's exit code decides:
         # non-zero means the command exited and should be restarted, zero
-        # means its gate declined to run it and it should stay down until
-        # the next boot or apply. StartLimitIntervalSec=0 disables the
-        # start-rate limiter, which would otherwise wedge a crash-looping
-        # daemon into `failed` permanently instead of retrying forever.
+        # means its gate declined to run it or its cross-platform retry
+        # budget is exhausted, and it should stay down until an explicit
+        # rearm or the next boot. StartLimitIntervalSec=0 disables the
+        # separate native rate limiter: the runner owns the retry count,
+        # keeping systemd and launchd behavior identical.
         # Disabled drops the supervision as well as the boot wiring:
         # leaving `Restart=` in place would put the daemon back under
         # permanent supervision the moment anything started it (a

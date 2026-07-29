@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Container, Iterator
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import crony.config
 import crony.errors
@@ -700,13 +700,13 @@ def write_last_run(path: Path, payload: dict[str, Any]) -> None:
 
 
 def exit_history_path(state_dir: Path) -> Path:
-    """Path to a job's `exit-history.json` (may not exist)."""
+    """Path to a job's shared outcome-window history (may not exist)."""
     return state_dir / "exit-history.json"
 
 
 def read_exit_history(state_dir: Path) -> crony.model.ExitHistory:
-    """Load a job's `exit-history.json`, tolerating a missing or corrupt
-    file as an empty history (see `ExitHistory.from_raw`)."""
+    """Load a job's outcome history, tolerating a missing or corrupt file
+    as an empty history (see `ExitHistory.from_raw`)."""
     path = exit_history_path(state_dir)
     if not path.is_file():
         return crony.model.ExitHistory.empty()
@@ -715,6 +715,19 @@ def read_exit_history(state_dir: Path) -> crony.model.ExitHistory:
     except OSError, json.JSONDecodeError:
         return crony.model.ExitHistory.empty()
     return crony.model.ExitHistory.from_raw(raw)
+
+
+def clear_exit_history(state_dir: Path) -> None:
+    """Forget an entry's persisted outcome window.
+
+    Unlike the appenders, this does not require `run.lock`: its callers
+    are the rearm paths, which cannot always take it (apply and enable
+    run outside any job). Losing a race with a concurrent append leaves
+    an extra entry, which for a daemon means one fewer retry in the new
+    budget -- and every such race resolves within one more exit, since
+    the budget is only ever read as a count.
+    """
+    exit_history_path(state_dir).unlink(missing_ok=True)
 
 
 def append_exit_history(
@@ -738,6 +751,44 @@ def append_exit_history(
         del history.runs[:-cap]
     _atomic_write_json(exit_history_path(state_dir), history.to_payload())
     return history
+
+
+def record_daemon_exit(
+    state_dir: Path,
+    duration_sec: float,
+    exit_class: crony.model.ExitClass,
+    ended_at: str,
+) -> crony.model.ExitHistory:
+    """Record one daemon exit in the shared outcome-history mechanism.
+
+    Five minutes of continuous runtime resets the prior streak before
+    this exit is counted, so the exit becomes attempt one of a new
+    budget. Daemons do not use this history for notifications, but the
+    same typed, versioned ledger can track their bounded restart window.
+    Callers serialize the read-modify-write by holding the job's
+    `run.lock` across it.
+
+    The budget counts what the runner lives to record. A runner killed
+    outright -- OOM, SIGKILL, the scheduler tearing its unit down --
+    appends nothing, so the respawn the supervisor performs for it is
+    unbounded. Bounding that would take the accounting out of the
+    runner, and the two supervisors disagree on what they expose.
+    """
+    if duration_sec >= crony.config.DAEMON_RETRY_RESET_SECONDS:
+        clear_exit_history(state_dir)
+    return append_exit_history(
+        state_dir,
+        exit_class,
+        ended_at,
+        cap=crony.config.DAEMON_RETRY_LIMIT + 1,
+    )
+
+
+def daemon_retries_exhausted(state_dir: Path) -> bool:
+    """Whether the initial launch plus all automatic retries have exited."""
+    return (
+        len(read_exit_history(state_dir).runs) > crony.config.DAEMON_RETRY_LIMIT
+    )
 
 
 def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
@@ -960,16 +1011,29 @@ def write_user_trigger_flag(state_dir: Path) -> None:
     user_trigger_flag_path(state_dir).write_bytes(b"")
 
 
-def consume_user_trigger_flag(state_dir: Path) -> bool:
-    """Read-and-delete the user-trigger sentinel. Returns True if
-    the flag was present (the runner should bypass the interactive
-    wait), False otherwise.
+def consume_user_trigger_flag(
+    state_dir: Path, *, max_age_sec: float | None = None
+) -> bool:
+    """Read-and-delete the user-trigger sentinel. Returns True when this
+    caller claimed a trigger worth acting on (the runner should bypass
+    the interactive wait), False otherwise.
+
+    The `unlink` is the claim: it succeeds for exactly one caller, so
+    concurrent readers cannot both act on one trigger. `max_age_sec`
+    bounds how long a trigger stays meaningful -- an older flag is still
+    claimed and deleted, but reported as nothing to act on. A caller
+    that cannot guarantee its launch was the one the trigger kicked
+    passes a bound so an abandoned sentinel cannot be honored by an
+    unrelated later launch; the interactive bypass, which is consumed by
+    the run the trigger started, passes none.
     """
+    path = user_trigger_flag_path(state_dir)
     try:
-        user_trigger_flag_path(state_dir).unlink()
+        age_sec = time.time() - path.stat().st_mtime
+        path.unlink()
     except FileNotFoundError:
         return False
-    return True
+    return max_age_sec is None or age_sec <= max_age_sec
 
 
 def read_pid_file(pid_path: Path) -> int | None:
@@ -1064,6 +1128,13 @@ class ApplyResult(StrEnum):
     """The outcome of applying one entry, returned by `apply_one`.
 
     ADDED / UPDATED / UNCHANGED are the normal install verdicts.
+    REARMED means an unchanged daemon was sitting stopped -- its retry
+    budget exhausted, or its gate declined -- and this apply started it
+    again with a fresh budget rather than reporting UNCHANGED and
+    leaving it down. A daemon whose gate declines most of the time
+    therefore reports REARMED on every apply, each one firing a start
+    the gate turns away again; that is the cost of apply being the way
+    an operator retries one.
     DEFERRED means applying now would take a unit out from under a job
     that is running, so nothing is written and a later apply reconciles
     it. A StrEnum so the apply log line renders it as its plain value."""
@@ -1071,7 +1142,69 @@ class ApplyResult(StrEnum):
     ADDED = "added"
     UPDATED = "updated"
     UNCHANGED = "unchanged"
+    REARMED = "rearmed"
     DEFERRED = "deferred"
+
+
+def _daemon_needs_rearm(
+    snapshot: crony.model.Job | crony.model.JobGroup,
+    config: crony.model.Config,
+    ref: crony.unit.EntityRef,
+) -> TypeGuard[crony.model.Job]:
+    """Whether an enabled daemon is deliberately loaded but stopped.
+
+    Narrows `snapshot` so callers can hand it straight to the rearm
+    without re-testing what this already established. Pass the *current*
+    node: `unit_loaded` is a load-time scheduler fact that only the
+    current graph carries.
+
+    Deliberately stopped is the point -- a daemon the scheduler has no
+    record of is broken rather than resting, and starting it is not this
+    function's business. `cfg_status` already scores that `broken`, and
+    a rearm there would only fail against a label the scheduler cannot
+    resolve.
+    """
+    if (
+        not isinstance(snapshot, crony.model.Job)
+        or not crony.unit.is_daemon(snapshot.timing)
+        or snapshot.unit_disabled
+        or not snapshot.unit_loaded
+    ):
+        return False
+    runtime_state = config.runtime.get(ref)
+    gated = (
+        runtime_state is not None
+        and runtime_state.job_status == crony.model.JobStatus.GATED
+    )
+    return gated or daemon_retries_exhausted(snapshot.state_dir)
+
+
+def _rearm_daemon(snapshot: crony.model.Job) -> None:
+    """Start an installed daemon with a fresh runner-owned retry budget.
+
+    Clearing before the start is safe here: an exhausted daemon is
+    stopped by definition, so no run is live to append its own exit
+    behind the clear. A gated one is judged from the load-time runtime
+    snapshot, so it can in principle have started since -- the clear
+    then hands a live daemon a fresh budget and the start is a no-op the
+    scheduler swallows. That errs toward more retries, never fewer. A
+    start that fails leaves the budget clear, which is what the next
+    start wants anyway.
+
+    Raises `UnitNotInstalledError` when the unit file is gone. `apply`
+    cannot reach that (a missing unit makes the snapshots differ, so it
+    installs instead of rearming), but `enable` decides from the
+    disabled flag alone and would otherwise surface a raw scheduler
+    error.
+    """
+    name = str(snapshot.entity_name)
+    if not dispatch_unit_path(name).exists():
+        raise crony.errors.UnitNotInstalledError(
+            f"unit for {name!r} is not installed on this host "
+            f"(run `crony apply` to reinstall it)"
+        )
+    clear_exit_history(snapshot.state_dir)
+    scheduler().trigger(name)
 
 
 def apply_one(
@@ -1142,6 +1275,12 @@ def apply_one(
     # and an otherwise-clean apply still re-renders the platform side.
     current_snapshot = config.current.job_from_ref(ref)
     if current_snapshot == snapshot:
+        # The current node, not the pending one: they compare equal here
+        # (the scheduler facts are `compare=False`), but only the current
+        # one carries them.
+        if _daemon_needs_rearm(current_snapshot, config, ref):
+            _rearm_daemon(current_snapshot)
+            return ApplyResult.REARMED
         return ApplyResult.UNCHANGED
     is_update = current_snapshot is not None
 
@@ -1276,6 +1415,25 @@ def apply_one(
     # deferred above), so reloading would only terminate this very run
     # for no benefit.
     _install_unit(snapshot, sched, activate=not self_reload)
+    entering_daemon = isinstance(
+        snapshot, crony.model.Job
+    ) and crony.unit.is_daemon(snapshot.timing)
+    leaving_daemon = current_snapshot is not None and crony.unit.is_daemon(
+        current_snapshot.timing
+    )
+    if entering_daemon or leaving_daemon:
+        # The retry budget and the notify-success-ratio window share one
+        # exit-history.json, so neither shape may read the other's
+        # entries: a re-applied daemon starts over with a full budget,
+        # and one leaving the mode must not seed its ratio window with
+        # daemon-era exits (a different cap, and a daemon counts every
+        # exit rather than only failures). Clear after the install: on
+        # the paths that stop the old instance, doing it earlier would
+        # let that instance append its own exit behind the clear and
+        # spend an attempt the new unit never took. A self-reload stops
+        # nothing, so there the running daemon simply keeps going with a
+        # cleared budget -- more retries, never fewer.
+        clear_exit_history(snapshot.state_dir)
     return ApplyResult.UPDATED if is_update else ApplyResult.ADDED
 
 
@@ -1310,9 +1468,13 @@ def set_disabled(
     unit (schedule-stripped when disabling, with its schedule when
     enabling), reload it, and re-persist its snapshot with the new
     `unit_disabled`. Returns True when it changed something, False when
-    the entry was already in the requested state. The entry must be
-    currently applied; the `enable` / `disable` commands resolve only
-    installed entries.
+    the entry was already in the requested state. Enabling an
+    already-enabled daemon is the one case where "already in the
+    requested state" still acts: one left stopped by an exhausted retry
+    budget or a failed gate is started again with a fresh budget, so
+    `enable` is a way to revive it without editing config. The entry
+    must be currently applied; the `enable` / `disable` commands resolve
+    only installed entries.
 
     Like an apply, the re-render bakes the live uv / crony executables --
     stamped onto the node here, since the current graph carries the paths
@@ -1324,6 +1486,9 @@ def set_disabled(
             f"{ref} has no applied snapshot to enable / disable"
         )
     if current.unit_disabled == disabled:
+        if not disabled and _daemon_needs_rearm(current, config, ref):
+            _rearm_daemon(current)
+            return True
         return False
     snapshot = dataclasses.replace(
         current,
@@ -1332,6 +1497,17 @@ def set_disabled(
         crony_path=_crony_executable(),
     )
     _install_unit(snapshot, scheduler())
+    if (
+        not disabled
+        and isinstance(snapshot, crony.model.Job)
+        and crony.unit.is_daemon(snapshot.timing)
+    ):
+        # Re-enabling starts the daemon again, so it gets a full budget.
+        # Clear after the install for the same reason `apply_one` does:
+        # a disabled daemon someone triggered by hand is running, and
+        # the exit the install just caused would otherwise land behind
+        # the clear and spend an attempt.
+        clear_exit_history(snapshot.state_dir)
     return True
 
 

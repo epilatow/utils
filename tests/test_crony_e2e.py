@@ -25,9 +25,9 @@ alone modify -- the operator's real jobs. Each test tears its bundle
 down at fixture teardown, and the fixture also destroys the bundle
 before it runs, sweeping any leftovers from a previously killed run.
 
-A daemon job is restarted by the supervisor whenever it stops, so
-teardown sweeps the scheduler directly after `crony destroy` rather than
-trusting that call alone.
+A daemon job is restarted by the supervisor while its retry budget
+remains, so teardown sweeps the scheduler directly after `crony destroy`
+rather than trusting that call alone.
 
 If a run is hard-killed (SIGKILL / power loss) before teardown, remove
 leftovers by hand:
@@ -46,7 +46,9 @@ platform's scheduler fails (it does not skip) -- an explicitly requested
 suite that silently passed would hide the missing coverage.
 """
 
+import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -266,8 +268,9 @@ class _CronyE2E:
         """Best-effort teardown of every unit in the reserved bundle.
 
         Falls back to the platform directly afterwards: a daemon is
-        restarted whenever it stops, so anything `crony destroy` failed
-        to reach would keep coming back rather than simply lingering."""
+        retried when it stops, so anything `crony destroy` failed to
+        reach would keep coming back rather than simply lingering until
+        it burned through its retry budget."""
         self.crony("destroy", "--all", "-b", E2E_BUNDLE, check=False)
         if _IS_LINUX:
             self.systemctl_user("daemon-reload")
@@ -580,13 +583,11 @@ class TestDaemonSupervision:
     """A daemon under the real supervisor: the rendered unit starts
     itself and is respawned when it exits, and disable / destroy stop it.
 
-    These assert on scheduler-observable state (the respawn counter, unit
-    registration) rather than on the job's command running. crony bakes
-    no CRONY_* overrides into a rendered unit, so a runner the scheduler
-    spawns reads the real state dir and exits before it reaches the
-    command -- which is itself a non-zero exit, so it exercises the
-    respawn path. The runner's own exit-code contract (which code means
-    restart, which means stay down) is unit-tested.
+    Most tests assert on scheduler-observable state (the respawn counter,
+    unit registration) rather than on the job's command running. crony
+    bakes no CRONY_* overrides into a production unit, so the retry-limit
+    test rewrites its isolated test unit with those values, reloads it,
+    and can then observe the runner's persistent state and status safely.
     """
 
     def _apply_daemon(self, e2e: _CronyE2E) -> None:
@@ -594,6 +595,68 @@ class TestDaemonSupervision:
         e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
         e2e.write_bundle('[job.d]\ncommand = "true"\ndaemon = true\n', ["d"])
         e2e.crony("apply", e2e.full("d"))
+
+    def _inject_isolated_env(self, e2e: _CronyE2E) -> None:
+        """Make this test's daemon runner see the throwaway state tree.
+
+        Production units intentionally do not inherit the CLI process's
+        CRONY_* overrides. This test-only rewrite lets the real scheduler
+        exercise the runner's persistent retry budget without reaching
+        the operator's actual crony state.
+        """
+        isolated = {
+            key: value
+            for key, value in e2e.env.items()
+            if key.startswith("CRONY_")
+        }
+        if _IS_DARWIN:
+            plist = e2e.darwin_plist("d")
+            raw = plistlib.loads(plist.read_bytes())
+            raw["EnvironmentVariables"] = {
+                **raw.get("EnvironmentVariables", {}),
+                **isolated,
+            }
+            plist.write_bytes(plistlib.dumps(raw))
+            label = e2e.darwin_label("d")
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                capture_output=True,
+                check=False,
+            )
+            # bootout returns before the label is gone, and bootstrap
+            # fails outright on one still loaded.
+            e2e.wait_until(
+                lambda: not e2e.launchctl_loaded(label),
+                timeout=30,
+                what=f"{label} to unload",
+            )
+            subprocess.run(
+                [
+                    "launchctl",
+                    "bootstrap",
+                    f"gui/{os.getuid()}",
+                    str(plist),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            return
+
+        service = e2e.unit_dir / f"crony-{e2e.full('d')}.service"
+
+        def quote(value: str) -> str:
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        env_lines = "".join(
+            f'Environment="{quote(key)}={quote(value)}"\n'
+            for key, value in sorted(isolated.items())
+        )
+        body = service.read_text()
+        service.write_text(
+            body.replace("[Service]\n", f"[Service]\n{env_lines}", 1)
+        )
+        e2e.systemctl_user("daemon-reload", check=True)
+        e2e.systemctl_user("restart", service.name, check=True)
 
     def _start_marker(self, e2e: _CronyE2E) -> str:
         """A value that changes every time the supervisor starts the
@@ -662,6 +725,42 @@ class TestDaemonSupervision:
             lambda: self._start_marker(e2e) not in ("", first),
             timeout=120,
             what="the supervisor to respawn the daemon",
+        )
+
+    def test_retry_limit_stops_and_trigger_rearms_it(
+        self, e2e: _CronyE2E
+    ) -> None:
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
+        e2e.write_bundle('[job.d]\ncommand = "exit 1"\ndaemon = true\n', ["d"])
+        e2e.crony("apply", e2e.full("d"))
+        self._inject_isolated_env(e2e)
+        retry_state = e2e.state_dir / E2E_BUNDLE / "d" / "exit-history.json"
+
+        def exhausted() -> bool:
+            try:
+                raw = json.loads(retry_state.read_text())
+                # DAEMON_RETRY_LIMIT + 1, spelled out: importing
+                # crony.config for one integer would pull tomlkit into
+                # this script's PEP 723 dep set.
+                return len(raw["runs"]) == 6
+            except OSError, json.JSONDecodeError, KeyError, TypeError:
+                return False
+
+        e2e.wait_until(
+            exhausted,
+            timeout=120,
+            what="the daemon to exhaust its retry budget",
+        )
+        assert e2e.status_status(e2e.full("d")) == "fail"
+        settled = self._start_marker(e2e)
+        time.sleep(4)
+        assert self._start_marker(e2e) == settled
+
+        e2e.crony("trigger", e2e.full("d"))
+        e2e.wait_until(
+            lambda: self._start_marker(e2e) not in ("", settled),
+            timeout=60,
+            what="trigger to restart the exhausted daemon",
         )
 
     def test_disable_stops_it(self, e2e: _CronyE2E) -> None:

@@ -9,7 +9,8 @@ Crony is a multi\-platform user\-level scheduled\-job manager.\&
 It supports jobs on macOS/darwin (via launchd) and linux (via systemd).\&
 It reads one or more TOML config bundles and can deploy the corresponding platform units.\&
 It runs jobs through a uniform shim, which provides consistent logging, execution gates, timeouts, environment management, etc.\&
-Jobs can be grouped, and groups or jobs run on a schedule; a job can instead be a daemon, which runs continuously and is restarted whenever it stops.\&
+Jobs can be grouped, and groups or jobs run on a schedule; a job can instead be a daemon, which runs continuously and gets five automatic restarts when it stops prematurely.\&
+An exhausted daemon stays loaded but stopped until the next login, \(gatrigger\(ga, \(gaapply\(ga, or \(gaenable\(ga starts a fresh retry budget.\&
 Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gatrigger\(ga subcommand).\&
 Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
 .PP
@@ -108,6 +109,7 @@ Print one freshly\-minted UUID.\&
 \f[B]apply\f[R] [\-v] [\-b BUNDLE] [job ...]\&
 Render and activate platform units to match config.\&
 With no job arguments this is a full sync (install missing, fix drift, remove orphans); with names it surgically updates just those entries.\&
+A daemon left stopped by an exhausted retry budget or a declined gate is restarted with a fresh budget, reported as \(garearmed\(ga.\&
 .RS
 .TP
 \f[CR]\-v, \-\-verbose\f[R]
@@ -126,6 +128,7 @@ Combinable with \-b/\-\-bundle; mutually exclusive with positional names and \-\
 .TP
 \f[B]enable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
 Re\-arm the named jobs\(aq schedules (clear the operator\-disable).\&
+Enabling an already\-enabled daemon restarts one that an exhausted retry budget or a declined gate left stopped.\&
 Requires a target: job(s) or \-\-all.\&
 .TP
 \f[B]disable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
@@ -135,6 +138,7 @@ Requires a target: job(s) or \-\-all.\&
 .TP
 \f[B]trigger\f[R] [\-\-all] [\-b BUNDLE] [\-w] [\-\-trigger\-timeout TRIGGER_TIMEOUT] [job ...]\&
 Ask the platform scheduler to fire the named jobs now, via the same path a scheduled fire uses.\&
+Starting a stopped daemon this way gives it a fresh retry budget.\&
 Requires a target: job(s) or \-\-all.\&
 .RS
 .TP
@@ -331,8 +335,10 @@ It runs only when run manually via the \(gatrigger\(ga subcommand.\&
 .TP
 \f[I]daemon\f[R]
 A job (daemon = true) that runs continuously rather than at scheduled times.\&
-It starts at login and is restarted whenever its command exits.\&
-If its execution gate fails it stays stopped until the next login, \(gaapply\(ga, or \(gatrigger\(ga.\&
+It starts at login and gets five automatic restarts when its command exits prematurely.\&
+After exhausting them it reports fail and stays stopped until the next login, \(gaapply\(ga, \(gaenable\(ga, or \(gatrigger\(ga.\&
+Five minutes of continuous runtime resets the retry budget.\&
+If its execution gate fails it stays stopped without consuming retries.\&
 .TP
 \f[I]disabled\f[R]
 A job that has been disabled via the \(gadisable\(ga subcommand; it will not be run via any schedule.\&
@@ -346,7 +352,7 @@ For a job group: the group got every child it was asked to run running (a disabl
 .TP
 \f[I]fail\f[R]
 Jobs and groups.\&
-The job\(aqs last run failed (exited with a non\-zero status).\&
+The job\(aqs last run failed (exited with a non\-zero status), or was a daemon that used up its restart budget \-\- one crony has stopped keeping alive reads as failed even if its command exited zero.\&
 For a job group: the group could not fire one of its children \-\- that child\(aqs unit or snapshot is missing on this host, or the scheduler refused to fire it.\&
 .TP
 \f[I]timeout\f[R]
