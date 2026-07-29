@@ -9049,15 +9049,24 @@ class TestDaemonLifecycle:
         assert not crony_runtime.daemon_retries_exhausted(sd)
         assert crony_runtime.read_exit_history(sd).runs == []
 
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_reapply_reinstalls_an_unloaded_exhausted_daemon(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
-        # A daemon the scheduler has no record of is broken, not resting.
-        # `unit_armed` tracks loadedness for a daemon on both backends
-        # and is a compared field, so the snapshots differ and apply
-        # reinstalls -- the recovery that actually reloads it. Rearming
-        # instead would kickstart a label the scheduler cannot resolve.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        # A daemon the scheduler has no record of is broken, not
+        # resting, and re-apply is the documented recovery -- it is what
+        # reinstalls and reloads the unit.
+        #
+        # Reaching that recovery depends on the daemon comparing unequal
+        # to its pending node, which it does because `unit_armed` is a
+        # compared field and, for a daemon, tracks loadedness (neither
+        # backend installs a separate arming unit for one). Both
+        # backends are pinned because that is a per-backend property of
+        # `schedule_armed`. Were either to stop tracking loadedness the
+        # snapshots would match, apply would report `unchanged`, and the
+        # broken daemon would stay down through every subsequent apply --
+        # the recovery silently lost rather than loudly failing.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         self._daemon_cfg(h)
         h.apply("d")
         sd = h.state_dir("d")
@@ -9065,19 +9074,34 @@ class TestDaemonLifecycle:
             crony_runtime.record_daemon_exit(
                 sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
             )
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        if platform == "linux":
+            monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        else:
+            monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
+        h.calls.clear()
 
+        # The verdict alone would pass for an apply that reported
+        # `updated` without touching the scheduler, so assert the reload
+        # that makes it a recovery.
         assert h.apply("d") == "updated"
+        if platform == "linux":
+            # `restart`, not `start`: the latter is the rearm's own verb,
+            # which is the thing this is distinguishing a reinstall from.
+            assert any("restart" in c for c in h.calls)
+        else:
+            assert any("bootstrap" in c for c in h.calls)
 
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_enable_does_not_rearm_an_unloaded_daemon(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
         # `enable` decides from the operator-disable flag alone -- it
         # compares no snapshot fields -- so it is the path that can reach
         # a rearm for a unit the scheduler has lost. Starting one by name
         # would fail the scheduler call and abort an `enable --all`
-        # batch partway.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        # batch partway. Both backends, because the guard reads each
+        # one's own `is_loaded` probe.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         self._daemon_cfg(h)
         h.apply("d")
         sd = h.state_dir("d")
@@ -9085,11 +9109,14 @@ class TestDaemonLifecycle:
             crony_runtime.record_daemon_exit(
                 sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
             )
-        monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        if platform == "linux":
+            monkeypatch.setattr(systemd, "_is_enabled", lambda _u: "")
+        else:
+            monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
         h.calls.clear()
 
         crony_commands.do_enable(jobs=["d"], bundle=None)
-        assert not any("start" in c for c in h.calls)
+        assert not any("start" in c or "kickstart" in c for c in h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
     def test_enable_reports_a_rearm_as_such(
@@ -9109,13 +9136,15 @@ class TestDaemonLifecycle:
             crony_commands.do_enable(jobs=["d"], bundle=None)
         assert f"{h.full('d')}: rearmed" in caplog.text
 
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_enable_of_a_loaded_daemon_missing_its_unit_file_refuses(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
         # The scheduler still has the label, but the file a fire would
         # read is gone. crony says so rather than letting a raw
-        # scheduler error out of the enable path.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        # scheduler error out of the enable path. Both backends, because
+        # each resolves the unit path its own way.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         self._daemon_cfg(h)
         h.apply("d")
         sd = h.state_dir("d")
@@ -9123,7 +9152,7 @@ class TestDaemonLifecycle:
             crony_runtime.record_daemon_exit(
                 sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
             )
-        self._unit(h, "linux").unlink()
+        self._unit(h, platform).unlink()
 
         with pytest.raises(UnitNotInstalledError):
             crony_commands.do_enable(jobs=["d"], bundle=None)
