@@ -2570,6 +2570,76 @@ class TestBundleLoading:
         # The colliding dropin is referenced in the error.
         assert any("default.toml" in r.message for r in caplog.records)
 
+    def test_symlinked_candidates_stay_distinct_bundles(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Two candidate files may point at one real file -- a
+        # symlink-managed config tree does exactly that. They are still
+        # two candidates supplying two bundles: naming them by what they
+        # resolve to would collapse them and drop the second as a name
+        # collision, taking its jobs out of the config view.
+        cfg_file, dropin = self._setup(tmp_path, monkeypatch)
+        real = tmp_path / "real.toml"
+        real.write_text(
+            _uuid_toml('[job.j]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        cfg_file.unlink(missing_ok=True)
+        cfg_file.symlink_to(real)
+        (dropin / "main.toml").symlink_to(real)
+
+        bundles = TomlConfig.load_all()
+        assert sorted(b.name for b in bundles.bundles) == ["default", "main"]
+        assert bundles.errored_bundles == {}
+
+    def test_every_failure_message_carries_its_own_path(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # Three display sites print these messages verbatim rather than
+        # prefixing the source, so a message that leads with anything
+        # else renders as an anonymous complaint in a column of paths.
+        # One case per construction site: bad filename, name collision,
+        # unparseable TOML, and a bundle-level validation failure.
+        cfg_file, dropin = self._setup(tmp_path, monkeypatch)
+        # Valid, so it claims `default` and the drop-in below collides;
+        # an invalid config.toml would leave the name free and that
+        # writer unexercised.
+        cfg_file.write_text(
+            _uuid_toml('[job.j]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (dropin / "default.toml").write_text(
+            _uuid_toml('[job.k]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (dropin / "broken.toml").write_text(
+            "this is not toml [[[\n", encoding="utf-8"
+        )
+        (dropin / "not a bundle name.toml").write_text(
+            _uuid_toml('[job.m]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (dropin / "dup.toml").write_text(
+            _uuid_toml(
+                '[job.x]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.x]\njobs = ["x"]\nschedule = "daily"\n'
+            ),
+            encoding="utf-8",
+        )
+        bundles = TomlConfig.load_all()
+        # Exactly the four failures the fixture builds -- a count that
+        # only floors would let a writer stop recording unnoticed.
+        assert sorted(Path(s).name for s in bundles.errored_bundles) == [
+            "broken.toml",
+            "default.toml",
+            "dup.toml",
+            "not a bundle name.toml",
+        ]
+        for src, msg in bundles.errored_bundles.items():
+            assert msg.startswith(f"{src}: "), (
+                f"{src} does not lead its own message: {msg!r}"
+            )
+
 
 class TestBundleNamespacing:
     """Job names from different bundles get distinct namespaced

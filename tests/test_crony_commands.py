@@ -4620,6 +4620,34 @@ class TestStatusReport:
             "  default.leaf",
         ]
 
+    def test_header_lists_bundles_that_failed_to_load(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Entries from a bundle that did not load cannot appear in the
+        # table, so the header is the only place their absence is
+        # explained. Each line is the recorded message verbatim, which
+        # leads with its own path.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        broken = h.cfg_dropin / "broken.toml"
+        broken.write_text("this is not toml [[[\n", encoding="utf-8")
+
+        crony_commands.do_status(
+            jobs=[],
+            cols=None,
+            show_masked=False,
+            bundle=None,
+            config_current=False,
+            config_pending=False,
+            exclude_healthy=False,
+        )
+        out = capsys.readouterr().out
+        assert "bundle parse failures" in out
+        assert f"  {broken}: TOML parse error:" in out
+
     def test_kind_column_shows_job_or_group(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
@@ -5573,6 +5601,139 @@ class TestValidate:
         out = capsys.readouterr().out
         assert "undefined name" in out
         assert "errored=1" in out
+
+    def test_healthy_config_reports_no_rejected_count(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        crony_commands.do_validate(bundle=None, file=None)
+        out = capsys.readouterr().out
+        assert "bundles loaded: 1\n" in out
+        assert "rejected=" not in out
+
+    def test_unparseable_bundle_is_reported(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The other failed-bundle tests both trip a name collision;
+        # this is the parse-error construction site.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (h.cfg_dropin / "broken.toml").write_text(
+            "this is not toml [[[\n", encoding="utf-8"
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "TOML parse error" in out
+        assert "bundles loaded: 1, rejected=1" in out
+
+    def test_warns_on_a_bundle_that_failed_to_load(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # A rule that aborts the whole bundle leaves it out of
+        # `bundles`, so the per-entity sweep never sees it. Reporting
+        # only what loaded would make the loudest config errors the one
+        # class validate stays quiet about -- and a CI gate would pass.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.a]\njobs = ["a"]\nschedule = "daily"\n',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "name collision" in out
+        assert "bundles loaded: 0, rejected=1" in out
+
+    def test_scoped_run_reports_a_file_contending_for_its_name(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # `--bundle` cannot name a file that failed to load -- only
+        # loaded bundles resolve. What it can reach is the file that
+        # lost a fight for this bundle's name: that failure belongs in
+        # this bundle's scoped report, since it is why the name resolves
+        # to the file it does.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (h.cfg_dropin / "default.toml").write_text(
+            _uuid_toml('[job.other]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle="default", file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        out = capsys.readouterr().out
+        assert "collides with already-loaded bundle" in out
+        # The path appears once -- the message carries its own.
+        assert out.count("default.toml:") == 1
+
+    def test_scoped_run_reports_the_config_file_itself_failing(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The `default` name can be supplied by a drop-in when
+        # config.toml itself fails, which is the one shape that reaches
+        # the CONFIG_FILE branch of the name derivation.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.a]\njobs = ["a"]\nschedule = "daily"\n'
+            ),
+            encoding="utf-8",
+        )
+        (h.cfg_dropin / "default.toml").write_text(
+            _uuid_toml('[job.other]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle="default", file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        assert "name collision" in capsys.readouterr().out
+
+    def test_bundle_filter_excludes_another_bundles_failure(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # Scoping to a healthy bundle must not report a sibling's
+        # load failure, which would fail a CI gate for a file the
+        # caller deliberately narrowed away from. An errored bundle has
+        # no parsed name, so the match is on the source path.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.good]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (h.cfg_dropin / "broken.toml").write_text(
+            _uuid_toml(
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.a]\njobs = ["a"]\nschedule = "daily"\n',
+            ),
+            encoding="utf-8",
+        )
+        crony_commands.do_validate(bundle="default", file=None)
+        out = capsys.readouterr().out
+        assert "name collision" not in out
+        assert out.rstrip().endswith("ok")
+
+        # Unscoped, the same failure is reported.
+        with pytest.raises(SystemExit) as exc:
+            crony_commands.do_validate(bundle=None, file=None)
+        assert exc.value.code == int(ExitCode.WARNING)
+        assert "name collision" in capsys.readouterr().out
 
     def test_warns_on_errored_target(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any

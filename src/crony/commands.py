@@ -377,19 +377,12 @@ def _bundle_files_for_update(
     """Enumerate the (bundle_name, path) pairs that `config update`
     should scan, honoring `--bundle` scoping.
 
-    Mirrors `TomlConfig.load_all` so the same files reachable to
+    Shares `TomlConfig.load_all`'s enumerator so the same files reachable to
     apply are reachable to update. Returns paths even when the file is
     syntactically broken -- the caller surfaces parse failures
     per-file rather than aborting the whole pass.
     """
-    candidates: list[tuple[str, Path]] = []
-    if crony.paths.CONFIG_FILE.exists():
-        candidates.append(
-            (crony.config.DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE)
-        )
-    if crony.paths.CONFIG_DROPIN_DIR.exists():
-        for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")):
-            candidates.append((path.stem, path))
+    candidates = crony.config.bundle_candidates()
     if bundle is not None:
         candidates = [
             (name, path) for (name, path) in candidates if name == bundle
@@ -2380,8 +2373,8 @@ def do_status(
     # whose bundle didn't load show up as orphans.
     if bundles.errored_bundles:
         print("bundle parse failures (config-side entries not loaded):")
-        for src, msg in bundles.errored_bundles.items():
-            print(f"  {src}: {msg}")
+        for msg in bundles.errored_bundles.values():
+            print(f"  {msg}")
         print()
 
     full_names: list[str]
@@ -3255,6 +3248,11 @@ def _validate_file(path: Path) -> None:
     """
     if not path.exists():
         raise crony.errors.ConfigError(f"config not found: {path}")
+    # The caller typed this path, so it may be any spelling of the
+    # config file -- relative, symlinked, `~`-expanded. Resolve before
+    # asking whether it is the one, which is a different question from
+    # `bundle_name_for_path`'s: that one names paths the loader
+    # produced and compares them literally.
     if path.resolve() == crony.paths.CONFIG_FILE.resolve():
         name = crony.config.DEFAULT_BUNDLE_NAME
     else:
@@ -3318,25 +3316,35 @@ def _legacy_platform_target_warning(names: set[str]) -> str:
 
 
 def do_validate(bundle: str | None, file: str | None) -> None:
-    """Lint configs; report linger status and broken secret files.
+    """Lint configs: config faults, linger status, broken secret files.
 
     TomlConfig.load_all already enforces per-bundle structural rules
-    and isolates failed bundles. This subcommand surfaces linger /
-    per-bundle warnings as informational output and exits WARNING
-    (1) when any are present, CONFIG (3) when no bundles load. A bundle
-    still using a deprecated-but-supported spelling draws a deprecation
-    warning: one naming its legacy underscore keys (the dash spelling is
-    canonical), and one for the flat `[target.<platform>]` target
-    section (the nested `[target.platform.<platform>]` form is
-    canonical).
-    `validate` looks only at the parsed config -- it never inspects
-    crony's applied / on-disk state. (Use `crony status` or
-    `crony destroy --orphans` to find and clean installed remnants
-    no config selects.)
+    and isolates the bundles that fail them. This subcommand reports
+    those failed bundles, the per-entity ones inside the bundles that
+    loaded, and linger / secret-file warnings, and exits WARNING (1)
+    when there is anything to report -- so a CI gate running it fails
+    on a config fault of either shape. (`--file` mode instead raises,
+    exiting CONFIG; see `_validate_file`.)
+
+    A bundle still using a deprecated-but-supported spelling draws a
+    deprecation warning: one naming its legacy underscore keys (the
+    dash spelling is canonical), and one for the flat
+    `[target.<platform>]` target section (the nested
+    `[target.platform.<platform>]` form is canonical).
+
+    `validate` reports only config faults -- it never reports installed
+    remnants, though it does read on-disk state along the way (the
+    linger and keep-awake checks below). Use `crony status` or
+    `crony destroy --orphans` to find and clean units no config
+    selects.
 
     With --bundle <name>, restricts the per-bundle warnings to just
-    that bundle. The host-wide linger-status check only runs in the
-    unfiltered case -- it's about the whole-host picture, not any
+    that bundle. A name only resolves if some file supplied it, so
+    scoping to a bundle whose own file failed to load reports it as
+    unknown; the failure itself is still reported by an unscoped run.
+
+    The host-wide checks -- linger status and keep-awake -- only run in
+    the unfiltered case: they are about the whole-host picture, not any
     one bundle.
 
     With --file <path> (mutually exclusive with --bundle), validates
@@ -3364,6 +3372,19 @@ def do_validate(bundle: str | None, file: str | None) -> None:
         if bundle is not None
         else list(bundles.bundles)
     )
+    # A bundle that failed outright is absent from `bundles.bundles`, so
+    # the per-entity sweep below never reaches it. `--bundle` cannot
+    # name such a file (`require_known` accepts only loaded bundles);
+    # the filter is for the file that contended for a loaded bundle's
+    # name, which belongs in that bundle's scoped report. Each message
+    # already carries its own path.
+    rejected_srcs = [
+        src
+        for src in sorted(bundles.errored_bundles)
+        if bundle is None
+        or crony.config.bundle_name_for_path(Path(src)) == bundle
+    ]
+    warnings.extend(bundles.errored_bundles[src] for src in rejected_srcs)
     for b in target_bundles:
         # Per-entity validation failures (errored jobs / groups /
         # targets) have to flip the validate exit code -- a CI
@@ -3395,7 +3416,10 @@ def do_validate(bundle: str | None, file: str | None) -> None:
             )
             warnings.append(f"{b.source}: {plat_warn}")
 
-    print(f"bundles loaded: {len(target_bundles)}")
+    rejected_suffix = (
+        f", rejected={len(rejected_srcs)}" if rejected_srcs else ""
+    )
+    print(f"bundles loaded: {len(target_bundles)}{rejected_suffix}")
     for b in target_bundles:
         config = b.config
         errored = (

@@ -834,7 +834,7 @@ class TomlBundleConfig:
             raw = tomlkit.loads(path.read_text(encoding="utf-8"))
         except tomlkit.exceptions.ParseError as e:
             raise crony.errors.ConfigError(
-                f"TOML parse error in {path}: {e}"
+                f"{path}: TOML parse error: {e}"
             ) from e
         config = cls._from_raw(raw)
         _demote_duplicate_uuids(config, DEFAULT_BUNDLE_NAME)
@@ -1193,7 +1193,7 @@ class TomlBundle:
             raw = tomlkit.loads(path.read_text(encoding="utf-8"))
         except tomlkit.exceptions.ParseError as e:
             raise crony.errors.ConfigError(
-                f"TOML parse error in {path}: {e}"
+                f"{path}: TOML parse error: {e}"
             ) from e
         try:
             config = TomlBundleConfig._from_raw(raw, bundle_name=name)
@@ -1217,16 +1217,62 @@ class TomlBundle:
         return cls(name=name, source=path, config=config)
 
 
+def bundle_candidates() -> list[tuple[str, Path]]:
+    """Every config file that could supply a bundle, in load order.
+
+    `config.toml` first, then `config/*.toml` lex-sorted. Whether each
+    one parses is the caller's problem; this answers only which files
+    are candidates and what each would be called. The single enumerator,
+    so a loader and a rewriter cannot disagree about what a bundle is.
+    """
+    paths: list[Path] = []
+    if crony.paths.CONFIG_FILE.exists():
+        paths.append(crony.paths.CONFIG_FILE)
+    if crony.paths.CONFIG_DROPIN_DIR.exists():
+        paths.extend(sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")))
+    return [(bundle_name_for_path(path), path) for path in paths]
+
+
+def bundle_name_for_path(path: Path) -> str:
+    """The bundle name a config file supplies.
+
+    `config.toml` is the `default` bundle; a drop-in under `config/` is
+    named after its filename stem. `bundle_candidates` names each
+    candidate through here, and a consumer holding only a path -- an
+    errored bundle is keyed by one, having never parsed far enough to
+    have a name -- inverts it the same way.
+
+    The comparison is literal, against the configured path rather than
+    what it resolves to. Callers pass a path this module produced, so
+    there is nothing to normalize; resolving would instead conflate two
+    candidates that happen to symlink to one file, and the loader would
+    drop the second as a name collision. Asking whether some arbitrary
+    path denotes the config file is a different question, and a caller
+    holding user-supplied input resolves before deciding.
+
+    Names are not guaranteed distinct: point the drop-in dir at the
+    directory holding the config file and it is enumerated twice, once
+    under each rule. The loader rejects the second as a collision,
+    which is the honest answer for a layout that names one file twice.
+    """
+    if path == crony.paths.CONFIG_FILE:
+        return DEFAULT_BUNDLE_NAME
+    return path.stem
+
+
 @dataclass
 class TomlConfig:
     """All loaded bundles, keyed by bundle name. Order is the load
     order (config.toml first, then config/*.toml lex-sorted).
 
-    `errored_bundles` records per-file parse / validation
-    failures so a config that's broken in one bundle doesn't
-    block read-side subcommands (`status`, `destroy`, `logs`)
-    from operating on the rest. Surfaced in `status`'s header so
-    the operator notices.
+    `errored_bundles` records per-file parse / validation failures
+    (source path -> message) so a config that's broken in one bundle
+    doesn't block read-side subcommands (`status`, `destroy`, `logs`)
+    from operating on the rest.
+
+    Every message leads with its own source path. Readers print it
+    verbatim rather than prefixing one -- which is what doubled it
+    before -- so a new writer here owes the same shape.
     """
 
     bundles: list[TomlBundle] = field(default_factory=list)
@@ -1255,14 +1301,7 @@ class TomlConfig:
         bundles = cls()
         seen_names: set[str] = set()
 
-        candidates: list[tuple[str, Path]] = []
-        if crony.paths.CONFIG_FILE.exists():
-            candidates.append((DEFAULT_BUNDLE_NAME, crony.paths.CONFIG_FILE))
-        if crony.paths.CONFIG_DROPIN_DIR.exists():
-            for path in sorted(crony.paths.CONFIG_DROPIN_DIR.glob("*.toml")):
-                candidates.append((path.stem, path))
-
-        for bundle_name, path in candidates:
+        for bundle_name, path in bundle_candidates():
             try:
                 validate_bundle_name(bundle_name, str(path))
             except crony.errors.ConfigError as e:
@@ -1270,7 +1309,7 @@ class TomlConfig:
                 continue
             if bundle_name in seen_names:
                 bundles.errored_bundles[str(path)] = (
-                    f"bundle name {bundle_name!r} collides with "
+                    f"{path}: bundle name {bundle_name!r} collides with "
                     f"already-loaded bundle; this file will not load"
                 )
                 continue
@@ -1282,8 +1321,8 @@ class TomlConfig:
             bundles.bundles.append(bundle)
             seen_names.add(bundle_name)
 
-        for src, msg in bundles.errored_bundles.items():
-            logger.error("%s: %s", src, msg)
+        for msg in bundles.errored_bundles.values():
+            logger.error("%s", msg)
         return bundles
 
     def require_known(self, bundle: str | None) -> None:

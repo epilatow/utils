@@ -104,8 +104,11 @@ instead of config.toml.
 
 ### `config validate [-b BUNDLE | --file PATH]`
 
-Lint config; report orphans, linger, etc. With --bundle, cross-host checks
-(orphans, linger) are skipped.
+Lint config; report faults, linger, etc. Exits non-zero for a bundle that
+failed to load as well as for a bad entry inside one that did, so it works as
+a CI gate. Reports only config faults, never installed remnants -- use
+`crony status` or `crony destroy --orphans` for units no config selects. With
+--bundle, the host-wide checks (linger, keep-awake) are skipped.
 
 - **`--file PATH`**\
   Structurally validate a single TOML file as a bundle (named after its stem,

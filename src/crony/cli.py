@@ -381,10 +381,15 @@ def _build_parser() -> StrictArgumentParser:
 
     p_config_validate = config_subparsers.add_parser(
         "validate",
-        help="Lint config; report orphans, linger, etc.",
+        help="Lint config; report faults, linger, etc.",
         description=(
-            "Lint config; report orphans, linger, etc. With --bundle, "
-            "cross-host checks (orphans, linger) are skipped."
+            "Lint config; report faults, linger, etc. Exits non-zero for "
+            "a bundle that failed to load as well as for a bad entry "
+            "inside one that did, so it works as a CI gate. Reports only "
+            "config faults, never installed remnants -- use `crony "
+            "status` or `crony destroy --orphans` for units no config "
+            "selects. With --bundle, the host-wide checks (linger, "
+            "keep-awake) are skipped."
         ),
     )
     p_config_validate_scope = p_config_validate.add_mutually_exclusive_group()

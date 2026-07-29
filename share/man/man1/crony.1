@@ -89,8 +89,10 @@ Overwrite an existing config file.\&
 .RE
 .TP
 \f[B]config validate\f[R] [\-b BUNDLE | \-\-file PATH]
-Lint config; report orphans, linger, etc.\&
-With \-\-bundle, cross\-host checks (orphans, linger) are skipped.\&
+Lint config; report faults, linger, etc.\&
+Exits non\-zero for a bundle that failed to load as well as for a bad entry inside one that did, so it works as a CI gate.\&
+Reports only config faults, never installed remnants \-\- use \(gacrony status\(ga or \(gacrony destroy \-\-orphans\(ga for units no config selects.\&
+With \-\-bundle, the host\-wide checks (linger, keep\-awake) are skipped.\&
 .RS
 .TP
 \f[CR]\-\-file PATH\f[R]
