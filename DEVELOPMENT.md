@@ -109,7 +109,9 @@ This repo is a personal-utilities collection. Top-level structure:
   ```
 
   A file without it is still discovered and still reports a passing phase --
-  having run nothing -- so `test_run_all.py` gates its presence (see Testing).
+  having run nothing -- so `test_run_all.py` gates its presence, and gates
+  that it is last in the file so the end of the source reads as the end of the
+  tests (see Testing).
 
 - `Applications/` -- macOS app bundles built and consumed by some of the
   utilities. Crony.app is a Mach-O wrapper that lets a Python script (which
@@ -165,7 +167,10 @@ gated by platform checks.
   (`TestEveryTestFileRunsItsTests`), walking `run_all`'s own discovery list so
   a new test file can't silently skip its tests. The failure it prevents is
   invisible by construction: `run_all` runs each file as a subprocess, so one
-  that never invokes pytest exits zero and reports a passing phase.
+  that never invokes pytest exits zero and reports a passing phase. It also
+  gates that the block is last in its file -- code after it still runs, since
+  pytest re-imports the module to collect it, but it reads as the end of the
+  file and splits where the next class should go.
 - `--help` width gate: every utility's `--help` (and every subcommand's) must
   fit 78 columns at an 80-column terminal, and every subcommand group must set
   `metavar="<command>"`. A utility opts in by subclassing

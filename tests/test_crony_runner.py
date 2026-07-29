@@ -3795,12 +3795,6 @@ class TestDoJitter:
             crony_runner.do_jitter("not-a-ref", self._NAME)
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestRunDaemon:
     """A daemon's exit code is the whole channel to the supervisor:
     non-zero asks for a restart, zero leaves it down. The recorded
@@ -4031,3 +4025,9 @@ class TestRunDaemon:
         sd.mkdir(parents=True, exist_ok=True)
         with crony_runtime.acquire_lock(sd / "run.lock"):
             assert crony_runner._run_job(snap) == 0
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

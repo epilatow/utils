@@ -437,6 +437,23 @@ class TestEveryTestFileRunsItsTests:
             f"conftest.run_tests"
         )
 
+    def test_the_block_is_the_last_thing_in_every_file(self) -> None:
+        # A block with code after it still runs every test, because
+        # pytest re-imports the file to collect it. It just reads as the
+        # end of the file to whoever opens it next, and decides which
+        # side of the divide their new class lands on.
+        trailing = {}
+        for path in ra.discover_test_files(ra.TESTS_DIR):
+            block = self._main_block(path.read_text(encoding="utf-8"))
+            after = block.split("run_tests(__file__", 1)[-1]
+            rest = after.split("\n", 1)[1] if "\n" in after else ""
+            if rest.strip():
+                trailing[path.name] = rest.strip().splitlines()[0]
+        assert trailing == {}, (
+            f"test files with code after their `__main__` block: "
+            f"{trailing} -- move the block to the end of the file"
+        )
+
 
 if __name__ == "__main__":
     from conftest import run_tests

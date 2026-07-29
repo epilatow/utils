@@ -8792,12 +8792,6 @@ class TestStatusColor:
         assert crony_commands._color_supported() is False
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestDaemonLifecycle:
     """A daemon holds its run lock for as long as it is up, so the
     lifecycle verbs that consult the lock or re-render the unit need to
@@ -9484,3 +9478,9 @@ class TestDaemonLifecycle:
             )
         assert any("start" in c for c in h.calls)
         assert not crony_runtime.user_trigger_flag_path(sd).exists()
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

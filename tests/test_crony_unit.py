@@ -267,12 +267,6 @@ class TestUnitSpec:
         assert spec.jitter.offset.total_seconds == 90
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestDaemonTiming:
     """The continuous firing mode: its own Timing variant, arming no
     timer, and its supervision carrier on the UnitSpec."""
@@ -304,3 +298,9 @@ class TestDaemonTiming:
         )
         # Timing alone never implies the carrier; the model sets it.
         assert spec.daemon is None
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

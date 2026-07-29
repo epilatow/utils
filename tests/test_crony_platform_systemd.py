@@ -781,12 +781,6 @@ class TestSystemdDefaultUnitDir:
         )
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestSystemdDaemon:
     """A daemon renders a self-starting, restarting `.service` and no
     `.timer`; disabling it drops the boot wiring and stops it."""
@@ -896,3 +890,9 @@ class TestSystemdDaemon:
         # And nothing re-arms it: an `enable` here would restore the boot
         # symlink the disable just dropped.
         assert not any("enable" in c for c in calls)
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

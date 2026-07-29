@@ -1073,12 +1073,6 @@ class TestExitHistory:
         assert h.successes_in_window(2) == 0
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestDaemonSnapshot:
     """The daemon mode round-trips through snapshot.json, and the
     supervision carrier survives the timing-stripping that disabling
@@ -1137,3 +1131,9 @@ class TestDaemonSnapshot:
         snap = self._renderable()
         assert snap.timeout == 0
         assert "_run-guard" not in " ".join(snap.unit_spec().cmd)
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

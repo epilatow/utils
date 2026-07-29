@@ -2471,12 +2471,6 @@ class TestUserTriggerFlagAge:
         )
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestDaemonJobStatus:
     """A daemon's STATUS cell is about whether it is up. A disabled one
     reports `disabled` rather than the signal death that stopping it
@@ -2568,3 +2562,9 @@ class TestDestroyRunSettle:
         started = time.monotonic()
         crony_runtime._await_run_finished(sd)
         assert time.monotonic() - started < 5
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

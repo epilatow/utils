@@ -704,12 +704,6 @@ class TestLaunchdJitter:
         assert booted == [f"gui/{os.getuid()}/org.crony.default.brew.jitter"]
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestLaunchdDaemon:
     """A daemon plist starts at load and is respawned when its command
     exits non-zero; disabling it renders the plist inert."""
@@ -747,3 +741,9 @@ class TestLaunchdDaemon:
         assert data["RunAtLoad"] is False
         assert data["KeepAlive"] is False
         assert "ThrottleInterval" not in data
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)

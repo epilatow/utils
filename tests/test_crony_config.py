@@ -3111,12 +3111,6 @@ class TestPolicyFloors:
         assert _min_interval_seconds() == 60
 
 
-if __name__ == "__main__":
-    from conftest import run_tests
-
-    run_tests(__file__, _script_path, REPO_ROOT)
-
-
 class TestParseDaemon:
     """`daemon = true` is a firing mode of its own, mutually exclusive
     with the others, and rejects the keys that make no sense for a
@@ -3292,3 +3286,9 @@ class TestDaemonRestartSeconds:
         # override; a non-integer falls back to the default.
         monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", bad)
         assert crony_config.daemon_restart_seconds() >= 1
+
+
+if __name__ == "__main__":
+    from conftest import run_tests
+
+    run_tests(__file__, _script_path, REPO_ROOT)
