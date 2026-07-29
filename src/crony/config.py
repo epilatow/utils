@@ -2610,11 +2610,12 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
 
     The rest raise and abort the whole bundle: name collisions across
     `[job.*]` / `[job-group.*]` and their dotted-prefix form,
-    `[defaults]` notify_channels references, and a group member that
-    carries its own `schedule` / `interval`. The last is attributable to
-    one group and could have been demoted; it is not, because demoting
-    would answer a config that describes the wrong thing by quietly
-    describing something else.
+    `[defaults]` notify_channels references, and a group member whose
+    own firing mode is incompatible with being dispatched by a group
+    (its own `schedule` / `interval`, or `daemon`). Those last are
+    attributable to one group and could have been demoted; they are
+    not, because demoting would answer a config that describes the
+    wrong thing by quietly describing something else.
 
     Errored entries participate in name-resolution so other groups
     / targets that reference them don't ALSO fail with
@@ -2656,15 +2657,19 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             f"dotted-prefix of another"
         )
 
-    # A group member carries no schedule of its own: under a scheduled
-    # group that is two firing sources for one entry. Flat rather than
-    # conditional on the parent, so adding a schedule to a group cannot
-    # silently start double-firing what it dispatches. Rejects the
-    # bundle rather than demoting the group -- the graph described
-    # cannot be built, and demoting would build a different one -- and
-    # decides it from the config alone, so a shared config fails
-    # identically wherever it lands.
+    # What a member may declare about its own firing mode. It carries
+    # no schedule: under a scheduled group that is two firing sources
+    # for one entry. Flat rather than conditional on the parent, so
+    # adding a schedule to a group cannot silently start double-firing
+    # what it dispatches. Nor is it a daemon: a group waits for each
+    # child in turn and a daemon never finishes.
+    #
+    # Both reject the bundle rather than demoting the group -- the
+    # graph described cannot be built, and demoting would build a
+    # different one -- and decide it from the config alone, so a shared
+    # config fails identically wherever it lands.
     scheduled_members: list[str] = []
+    daemon_members: list[str] = []
     for gname, group in config.job_groups.items():
         for child in group.jobs:
             # None for an undefined name, and for one demoted by a
@@ -2674,20 +2679,30 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
             child_node: TomlJob | TomlJobGroup | None = config.jobs.get(child)
             if child_node is None:
                 child_node = config.job_groups.get(child)
-            if child_node is not None and crony.unit.is_scheduled(
-                child_node.timing
-            ):
-                scheduled_members.append(f"[job-group.{gname}] -> {child!r}")
+            if child_node is None:
+                continue
+            where = f"[job-group.{gname}] -> {child!r}"
+            if crony.unit.is_scheduled(child_node.timing):
+                scheduled_members.append(where)
+            elif crony.unit.is_daemon(child_node.timing):
+                daemon_members.append(where)
+    # Every offender at once, like the collision checks above: a config
+    # with several should take one round trip to fix, not one per
+    # member.
     if scheduled_members:
-        # Every offender at once, like the collision checks above: a
-        # config with several should take one round trip to fix, not
-        # one per member.
         raise crony.errors.ConfigError(
             f"group members with a schedule of their own "
             f"({', '.join(scheduled_members)}); a member is fired by "
             f"its group and carries no schedule -- one that does would "
             f"run twice under a scheduled group. Remove the schedule / "
             f"interval, or drop the member from the group"
+        )
+    if daemon_members:
+        raise crony.errors.ConfigError(
+            f"group members that are daemons "
+            f"({', '.join(daemon_members)}); a group waits for each "
+            f"child to finish and a daemon never does, so the group "
+            f"would never complete. Drop the member from the group"
         )
 
     # Group children must reference a defined job or group. A bad
@@ -2702,16 +2717,6 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 bad_group[gname] = (
                     f"[job-group.{gname}]: 'jobs' references "
                     f"undefined name {child!r}"
-                )
-                break
-            # A group runs each child to completion before the next, so
-            # a member that never exits would stall the group forever.
-            child_job = config.jobs.get(child)
-            if child_job is not None and crony.unit.is_daemon(child_job.timing):
-                bad_group[gname] = (
-                    f"[job-group.{gname}]: 'jobs' references daemon "
-                    f"{child!r}; a group waits for each child to finish, "
-                    f"and a daemon never does"
                 )
                 break
     for gname, msg in bad_group.items():

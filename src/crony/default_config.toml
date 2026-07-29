@@ -301,9 +301,10 @@
 # quietly start double-firing what it dispatches.
 #
 # A group runs each child to completion before the next, so neither a
-# group itself nor any of its members may be a daemon: `daemon = true`
-# here, or a `jobs` entry naming one, is a config error. That one
-# demotes just the group; the rest of the file still loads.
+# group itself nor any of its members may be a daemon. `daemon = true`
+# here is a config error that demotes just the group; the rest of the
+# file still loads. A `jobs` entry naming a daemon, like the schedule
+# rule above, fails the whole bundle.
 
 #[job-group.daily-updates]
 #uuid      = "11223344-5566-7788-99aa-bbccddeeff00"

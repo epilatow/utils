@@ -1006,6 +1006,45 @@ class TestValidateConfig:
                 }
             )
 
+    def test_daemon_group_member_rejected(self) -> None:
+        # A group waits for each child to finish and a daemon never
+        # does, so the group would stall there and never reach the rest.
+        with pytest.raises(ConfigError, match="are daemons"):
+            _parse(
+                {
+                    "job": {"d": _grouped_job(daemon=True)},
+                    "job-group": {"g": {"jobs": ["d"], "schedule": "daily"}},
+                }
+            )
+
+    def test_a_daemon_member_outranks_an_undefined_one(self) -> None:
+        # Both faults in one group: the reject runs ahead of the
+        # undefined-name demotion, so the bundle fails rather than the
+        # group being demoted for the typo.
+        with pytest.raises(ConfigError, match="are daemons"):
+            _parse(
+                {
+                    "job": {"d": _grouped_job(daemon=True)},
+                    "job-group": {
+                        "g": {"jobs": ["nope", "d"], "schedule": "daily"}
+                    },
+                }
+            )
+
+    def test_daemon_in_a_transit_sub_group_rejected(self) -> None:
+        # Membership is what matters, not how far from the scheduled
+        # root the daemon sits.
+        with pytest.raises(ConfigError, match="are daemons"):
+            _parse(
+                {
+                    "job": {"d": _grouped_job(daemon=True)},
+                    "job-group": {
+                        "inner": {"jobs": ["d"]},
+                        "outer": {"jobs": ["inner"], "schedule": "daily"},
+                    },
+                }
+            )
+
     def test_on_demand_group_member_with_a_schedule_rejected(self) -> None:
         # Same rule, and this group can never fire on a timer at all.
         with pytest.raises(ConfigError, match="schedule of their own"):
@@ -3393,16 +3432,6 @@ class TestParseDaemon:
             "d",
             "not valid on a daemon",
         )
-
-    def test_cannot_be_a_group_member(self) -> None:
-        cfg = _parse(
-            {
-                "job": {"d": self._daemon()},
-                "job-group": {"g": {"jobs": ["d"], "schedule": "daily"}},
-            }
-        )
-        assert "g" in cfg.errored_job_groups
-        assert "daemon" in cfg.errored_job_groups["g"]
 
     def test_timeout_resolves_uncapped(self) -> None:
         # Uncapped regardless of the [defaults] cascade: a wallclock cap
