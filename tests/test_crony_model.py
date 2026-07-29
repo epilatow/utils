@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from conftest_crony import (  # noqa: E402
     _assert_errored_job,
     _assert_errored_job_group,
+    _grouped_job,
     _isolate_home,  # noqa: F401
     _job,
     _parse,
@@ -357,7 +358,7 @@ class TestJobFlagsBacking:
         cfg = _parse(
             {
                 "defaults": {"flags": ["keep-awake"]},
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
             }
         )
@@ -432,7 +433,7 @@ class TestFdaWrapperField:
         group = _resolve_snapshot_for(
             _parse(
                 {
-                    "job": {"a": _job()},
+                    "job": {"a": _grouped_job()},
                     "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
                 }
             ),
@@ -455,7 +456,7 @@ class TestSharedSnapshotSurface:
 
     def _group_snap(self) -> Any:
         raw = {
-            "job": {"a": _job()},
+            "job": {"a": _grouped_job()},
             "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
         }
         return _resolve_snapshot_for(_parse(raw), "g")
@@ -641,7 +642,7 @@ class TestJobFromRefAndFullName:
 
     def test_nodes_returns_jobs_then_groups(self) -> None:
         raw = {
-            "job": {"a": _job()},
+            "job": {"a": _grouped_job()},
             "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
         }
         cfg = _parse(raw)
@@ -813,7 +814,7 @@ class TestSnapshotFieldSync:
     def _maximal_group_dict(self) -> dict[str, Any]:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -861,7 +862,7 @@ class TestSnapshotIdentityRehydration:
     def _group_dict(self) -> dict[str, Any]:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
             }
         )
@@ -893,7 +894,7 @@ class TestGroupChildRefs:
     def _group_dict(self) -> dict[str, Any]:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
             }
         )

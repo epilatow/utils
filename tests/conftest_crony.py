@@ -188,6 +188,17 @@ def _job(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _grouped_job(**overrides: Any) -> dict[str, Any]:
+    """Build a minimal job body for use as a `[job-group.*]` member.
+
+    Same as `_job` minus the schedule: a member carrying one has two
+    firing sources and is a config error, so a fixture that groups a
+    job has to build it without."""
+    base: dict[str, Any] = {"command": "true"}
+    base.update(overrides)
+    return base
+
+
 def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
     """Stamp a fresh UUID on every job/group in a test config that
     lacks one. Returns `raw` for chaining.

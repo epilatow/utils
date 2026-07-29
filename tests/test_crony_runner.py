@@ -1487,12 +1487,10 @@ class TestRunGroup:
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 5,
                     },
                     "b": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 5,
                     },
                 },
@@ -1558,7 +1556,6 @@ class TestRunGroup:
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 5,
                     }
                 },
@@ -1589,7 +1586,6 @@ class TestRunGroup:
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 0,
                     },
                 },
@@ -1732,7 +1728,6 @@ class TestRunGroupInteractive:
                 "job": {
                     "iv": {
                         "command": "true",
-                        "schedule": "daily",
                         "interactive": True,
                     },
                     "regular": {"command": "true"},
@@ -1790,7 +1785,6 @@ class TestRunGroupInteractive:
                 "job": {
                     "iv": {
                         "command": "true",
-                        "schedule": "daily",
                         "interactive": True,
                         # Big timeout that would inflate the
                         # group's budget if not skipped.
@@ -1829,7 +1823,6 @@ class TestRunGroupInteractive:
                 "job": {
                     "iv": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 10_000,
                     },
                     "regular": {
@@ -1885,7 +1878,6 @@ class TestRunGroupInteractive:
                 "job": {
                     "j": {
                         "command": "true",
-                        "schedule": "daily",
                         "job_timeout_sec": 100,
                     },
                 },

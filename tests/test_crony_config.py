@@ -25,6 +25,7 @@ from conftest_crony import (  # noqa: E402
     _assert_errored_platform_target,
     _bundle_set,
     _email_block,
+    _grouped_job,
     _inject_uuids,
     _isolate_home,  # noqa: F401
     _job,
@@ -765,7 +766,7 @@ class TestDuplicateUuidInBundle:
         bundle = self._write_and_load(
             tmp_path,
             f'[job.a]\nuuid = "{self.GOOD}"\n'
-            'command = "true"\nschedule = "daily"\n\n'
+            'command = "true"\n\n'
             f'[job-group.g]\nuuid = "{self.GOOD}"\n'
             'jobs = ["a"]\nschedule = "daily"\n',
         )
@@ -938,6 +939,110 @@ class TestValidateConfig:
                 }
             )
 
+    def test_group_member_with_its_own_schedule_rejected(self) -> None:
+        # The member would fire on its own timer and again when the
+        # group dispatches it -- two firing sources for one job.
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+                }
+            )
+
+    def test_group_member_with_its_own_interval_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _grouped_job(interval="1h")},
+                    "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+                }
+            )
+
+    def test_scheduled_sub_group_member_rejected(self) -> None:
+        # A sub-group is a member like any other: scheduled, it fires
+        # itself as well as being dispatched by its parent.
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _grouped_job()},
+                    "job-group": {
+                        "inner": {"jobs": ["a"], "schedule": "daily"},
+                        "outer": {"jobs": ["inner"], "schedule": "daily"},
+                    },
+                }
+            )
+
+    def test_a_scheduled_member_outranks_an_undefined_one(self) -> None:
+        # Both faults sit in the same group. The reject runs first, so
+        # the bundle fails rather than the group being demoted for the
+        # undefined name -- a config with a double-fire in it does not
+        # get to load because it also has a typo.
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "job-group": {
+                        "g": {"jobs": ["nope", "a"], "schedule": "daily"}
+                    },
+                }
+            )
+
+    def test_transit_group_member_with_a_schedule_rejected(self) -> None:
+        # The flat rule: a member declares no schedule even under a
+        # group that fires on no timer of its own. Narrowing the guard
+        # to scheduled groups would leave every other case here green
+        # while deleting the property the rule exists for -- adding a
+        # schedule to this group later must not silently start
+        # double-firing what it dispatches.
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "job-group": {
+                        "inner": {"jobs": ["a"]},
+                        "outer": {"jobs": ["inner"], "schedule": "daily"},
+                    },
+                }
+            )
+
+    def test_on_demand_group_member_with_a_schedule_rejected(self) -> None:
+        # Same rule, and this group can never fire on a timer at all.
+        with pytest.raises(ConfigError, match="schedule of their own"):
+            _parse(
+                {
+                    "job": {"a": _job()},
+                    "job-group": {
+                        "g": {"jobs": ["a"], "on-demand": True},
+                    },
+                }
+            )
+
+    def test_an_errored_member_is_not_judged(self) -> None:
+        # A member demoted by its own parse failure is absent from
+        # `jobs`, so there is no timing to read. It must not raise on
+        # the strength of a field nobody could inspect.
+        cfg = _parse(
+            {
+                "job": {"a": _job(surprise="boom")},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            }
+        )
+        assert "a" in cfg.errored_jobs
+        assert "g" in cfg.job_groups
+
+    def test_on_demand_group_member_allowed(self) -> None:
+        # `on-demand` arms no timer, so it is not a second firing
+        # source -- the group remains the only thing that starts it
+        # automatically, and `crony trigger` still reaches it by hand.
+        cfg = _parse(
+            {
+                "job": {"a": _grouped_job(**{"on-demand": True})},
+                "job-group": {"g": {"jobs": ["a"], "schedule": "daily"}},
+            }
+        )
+        assert "g" in cfg.job_groups
+
     def test_dotted_prefix_name_collision(self) -> None:
         # `foo` is a dotted-prefix of `foo.bar`, so their unit files
         # would overlap once a backend suffixes a companion unit.
@@ -948,7 +1053,7 @@ class TestValidateConfig:
         with pytest.raises(ConfigError, match="dotted-prefix"):
             _parse(
                 {
-                    "job": {"foo": _job()},
+                    "job": {"foo": _grouped_job()},
                     "job-group": {
                         "foo.bar": {"jobs": ["foo"], "schedule": "daily"}
                     },
@@ -1017,7 +1122,6 @@ class TestValidateConfig:
                 "job": {
                     "iv": {
                         "command": "true",
-                        "schedule": "daily",
                         "interactive": True,
                     }
                 },
@@ -1067,12 +1171,18 @@ class TestValidateConfig:
         )
 
     def test_chain_cycle_rejected(self) -> None:
+        # The cycle sits below the scheduled root rather than through
+        # it: g1 is the entry point the target selects and carries the
+        # schedule, while g2 and g3 are transit groups referring to each
+        # other. A cycle through g1 itself would make g1 a member
+        # carrying its own schedule, which is rejected before the walk.
         _assert_errored_platform_target(
             {
                 "job": {"a": {"command": "true"}},
                 "job-group": {
                     "g1": {"jobs": ["g2"], "schedule": "daily"},
-                    "g2": {"jobs": ["g1"]},
+                    "g2": {"jobs": ["g3"]},
+                    "g3": {"jobs": ["g2"]},
                 },
                 "target": {"darwin": {"jobs": ["g1"]}},
             },
@@ -1084,12 +1194,15 @@ class TestValidateConfig:
         # Target lists both group G and job A directly; G also lists
         # A. Within this target's subtree A has two parents, so the
         # platform schedulers would dispatch A twice per fire.
+        # `on-demand` gives A a firing point without a timer, so the
+        # target's direct selection of it is not itself an error and
+        # the multi-parent check is what this reaches.
         _assert_errored_platform_target(
             {
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "*-*-* 03:00",
+                        "on-demand": True,
                     },
                 },
                 "job-group": {
@@ -1109,7 +1222,6 @@ class TestValidateConfig:
                 "job": {
                     "a": {
                         "command": "true",
-                        "schedule": "*-*-* 03:00",
                     },
                 },
                 "job-group": {
@@ -2118,7 +2230,7 @@ class TestSelectionFilters:
         monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2137,7 +2249,7 @@ class TestSelectionFilters:
     def test_group_hosts_filter(self, monkeypatch: Any) -> None:
         cfg = self._cfg(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2190,7 +2302,7 @@ class TestSelectionFilters:
     def test_group_hosts_filter_negated(self, monkeypatch: Any) -> None:
         cfg = self._cfg(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2228,8 +2340,8 @@ class TestSelectionFilters:
         cfg = self._cfg(
             {
                 "job": {
-                    "a": _job(hosts=["other"]),
-                    "b": _job(platforms=["darwin"]),
+                    "a": _grouped_job(hosts=["other"]),
+                    "b": _grouped_job(platforms=["darwin"]),
                 },
                 "job-group": {
                     "g": {"jobs": ["a", "b"], "schedule": "daily"},
@@ -2256,9 +2368,9 @@ class TestSelectionFilters:
         monkeypatch.setattr(crony_platform, "current_platform", lambda: "linux")
         cfg = self._cfg(
             {
-                "job": {"a": _job(hosts=["other"])},
+                "job": {"a": _grouped_job(hosts=["other"])},
                 "job-group": {
-                    "g": {"jobs": ["a"], "schedule": "daily"},
+                    "g": {"jobs": ["a"]},
                     "p": {"jobs": ["g"], "schedule": "daily"},
                 },
                 "target": {"linux": {"jobs": ["p"]}},
@@ -2284,8 +2396,8 @@ class TestSelectionFilters:
         cfg = self._cfg(
             {
                 "job": {
-                    "a": _job(),
-                    "b": _job(hosts=["other"]),
+                    "a": _grouped_job(),
+                    "b": _grouped_job(hosts=["other"]),
                 },
                 "job-group": {
                     "g": {"jobs": ["a", "b"], "schedule": "daily"},
@@ -2923,7 +3035,7 @@ class TestFlagsAtDefaultsAndGroup:
     def test_group_scalar_flag_key(self) -> None:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2942,7 +3054,7 @@ class TestFlagsAtDefaultsAndGroup:
     def test_group_scalar_and_flag_conflict(self) -> None:
         _assert_errored_job_group(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2959,7 +3071,7 @@ class TestFlagsAtDefaultsAndGroup:
     def test_group_flags_stored(self) -> None:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -2977,7 +3089,7 @@ class TestFlagsAtDefaultsAndGroup:
     def test_group_unknown_flag_rejected(self) -> None:
         _assert_errored_job_group(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -3020,7 +3132,7 @@ class TestFlagsCascade:
             monkeypatch,
             {
                 "defaults": {"flags": ["keep-awake"]},
-                "job": {"a": _job(flags=["keep-awake"])},
+                "job": {"a": _grouped_job(flags=["keep-awake"])},
                 "job-group": {
                     "g": {
                         "jobs": ["a"],
@@ -3041,7 +3153,7 @@ class TestFlagsCascade:
         flags = self._resolve(
             monkeypatch,
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {
                     "outer": {
                         "jobs": ["inner"],
@@ -3212,7 +3324,7 @@ class TestParseDaemon:
     def test_rejected_on_a_group(self) -> None:
         cfg = _parse(
             {
-                "job": {"a": _job()},
+                "job": {"a": _grouped_job()},
                 "job-group": {"g": {"jobs": ["a"], "daemon": True}},
             }
         )

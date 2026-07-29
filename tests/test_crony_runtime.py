@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from conftest_crony import (  # noqa: E402
     _ApplyHarness,
+    _grouped_job,
     _isolate_home,  # noqa: F401
     _job,
     _parse,
@@ -375,7 +376,7 @@ class TestPerEntityConfigErrors:
     def test_sibling_groups_survive_bad_group(self) -> None:
         cfg = _parse(
             {
-                "job": {"a": _job(), "b": _job()},
+                "job": {"a": _grouped_job(), "b": _grouped_job()},
                 "job-group": {
                     "ok": {"jobs": ["a"], "schedule": "daily"},
                     "bad": {
@@ -394,8 +395,8 @@ class TestPerEntityConfigErrors:
         # The group is well-formed; only its referenced leaf has a
         # parse error. The parent group is treated as valid; chain
         # validation stops at the errored leaf without raising
-        # "would never fire", since the errored leaf might have had
-        # a schedule if it had parsed.
+        # "would never fire": the leaf's own fields are unavailable, so
+        # nothing can be concluded about how it would have fired.
         cfg = _parse(
             {
                 "job": {"bad": _job(surprise="boom")},

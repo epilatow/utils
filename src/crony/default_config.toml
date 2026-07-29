@@ -211,9 +211,14 @@
 #args     = ["~/utils"]               # `~` and `$VAR` expanded
 #interval = "30min"                   # 30 min after each completion
 
-# Group-only job: no schedule, only fires via [job-group.*].
+# Group-only jobs: no schedule, they only fire via [job-group.*].
+# A member must be schedule-less -- see the group section below.
 #[job.uv-update]
 #command = "uv self update && uv tool upgrade --all"
+#gate    = "command -v uv"
+
+#[job.prune-caches]
+#command = "uv cache prune"
 #gate    = "command -v uv"
 
 # Trigger-only (on-demand) job: no schedule and no scheduled parent, so
@@ -260,8 +265,9 @@
 # Interactive needs the macOS dialog, so the job runs only on
 # darwin -- a non-darwin host silently skips it (and an explicit
 # non-darwin `platforms` just never selects). May live in a
-# [job-group.*]; the group dispatches it async (no wait) and the
-# child's interactive wait runs independently of the group's deadline.
+# [job-group.*] -- dropping the `schedule` below, as any member does;
+# the group dispatches it async (no wait) and the child's interactive
+# wait runs independently of the group's deadline.
 #[job.weekly-prompt]
 #command            = "/usr/local/bin/some-interactive-task"
 #schedule           = "Sun *-*-* 12:00"  # weekly at noon
@@ -282,23 +288,36 @@
 # entry (`on-demand = true`, valid on a group too), or a daemon
 # (`daemon = true`, jobs only) -- or validation rejects it. An on-demand
 # group is triggered as a unit via `crony trigger <group>`, dispatching
-# its children on demand.
+# its children on demand; its members are still members, so they follow
+# the rules below whether or not the group itself ever fires on a timer.
+#
+# A member carries no schedule of its own. The group is what fires it,
+# so a member with a `schedule` / `interval` under a scheduled group
+# would run twice per period -- once on its own timer and once when the
+# group dispatches it. `jobs` naming such a job is rejected, and the
+# whole bundle fails to load, not just the group: give the schedule to
+# the group, not the member. The rule does not bend for a group that
+# has no schedule today, so that giving one a schedule later cannot
+# quietly start double-firing what it dispatches.
 #
 # A group runs each child to completion before the next, so neither a
 # group itself nor any of its members may be a daemon: `daemon = true`
-# here, or a `jobs` entry naming one, is a config error.
+# here, or a `jobs` entry naming one, is a config error. That one
+# demotes just the group; the rest of the file still loads.
 
 #[job-group.daily-updates]
 #uuid      = "11223344-5566-7788-99aa-bbccddeeff00"
 #schedule  = "*-*-* 03:00"
-#jobs      = ["brew-update", "uv-update", "git-pull-utils"]
+#jobs      = ["uv-update", "prune-caches"]
 # Optional filters, same forms as on jobs (`!` negation on hosts too):
 #platforms = ["darwin"]
 #hosts     = ["mymac"]
 
-# Nested group: this one has no schedule of its own; it fires only
-# when the daily-updates group above (or some other scheduled
-# parent) dispatches it.
+# Nested group: no schedule of its own, so it fires only when a
+# scheduled parent lists it in `jobs` and dispatches it. Nothing above
+# does, so uncommented it never fires -- add it to a scheduled group's
+# `jobs` to use it. Not alongside `uv-update` itself, though: within
+# one target's subtree a name may have only one parent.
 #[job-group.uv-updates]
 #jobs = ["uv-update"]
 

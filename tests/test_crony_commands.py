@@ -4654,7 +4654,7 @@ class TestStatusReport:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
-                "job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}},
+                "job": {"j": {"command": "true"}},
                 "job-group": {"g": {"jobs": ["j"], "schedule": "*-*-* 04:00"}},
             },
             default_target_jobs=["g"],
@@ -5704,6 +5704,34 @@ class TestValidate:
             crony_commands.do_validate(bundle="default", file=None)
         assert exc.value.code == int(ExitCode.WARNING)
         assert "name collision" in capsys.readouterr().out
+
+    def test_a_scheduled_group_member_fails_only_its_own_bundle(
+        self, tmp_path: Path, monkeypatch: Any, capsys: Any
+    ) -> None:
+        # The rejection is bundle-wide -- the healthy job beside it in
+        # the same file goes down too -- but it stops at the file
+        # boundary, so an unrelated bundle keeps loading and the
+        # deployed entities it describes stay addressable.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.cfg_file.write_text(
+            _uuid_toml('[job.healthy]\ncommand = "true"\nschedule = "daily"\n'),
+            encoding="utf-8",
+        )
+        (h.cfg_dropin / "twofire.toml").write_text(
+            _uuid_toml(
+                '[job.fine]\ncommand = "true"\nschedule = "daily"\n'
+                '[job.a]\ncommand = "true"\nschedule = "daily"\n'
+                '[job-group.g]\njobs = ["a"]\nschedule = "daily"\n'
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit):
+            crony_commands.do_validate(bundle=None, file=None)
+        out = capsys.readouterr().out
+        assert "schedule of their own" in out
+        # The healthy bundle loaded; the broken one contributed nothing,
+        # including the job in it that was fine on its own.
+        assert "bundles loaded: 1, rejected=1" in out
 
     def test_bundle_filter_excludes_another_bundles_failure(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
