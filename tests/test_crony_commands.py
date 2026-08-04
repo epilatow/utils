@@ -40,6 +40,9 @@ from conftest_crony import (  # noqa: E402
     _parse,
     _RunnerHarness,
     _uuid_toml,
+    record_subprocess_calls,
+    touched_the_scheduler,
+    triggered_a_unit,
 )
 
 from crony import cli as crony_cli  # noqa: E402
@@ -403,8 +406,8 @@ class TestApplyDarwin:
         h.calls.clear()
         result = h.apply("j")
         assert result == "unchanged"
-        # No further launchctl invocations on no-op apply
-        assert all(c[0] != "launchctl" for c in h.calls)
+        # A no-op apply reaches no scheduler at all
+        assert not touched_the_scheduler(h.calls)
 
     def test_drift_triggers_update(
         self, tmp_path: Path, monkeypatch: Any
@@ -588,7 +591,7 @@ class TestApplySelfUpdate:
         # remains internally consistent. A later apply does the full
         # update via the drift path.
         assert plist_path.read_text() == before
-        assert all(c[0] != "launchctl" for c in h.calls)
+        assert not touched_the_scheduler(h.calls)
         snap = json.loads((h.state_dir("j") / "snapshot.json").read_text())
         assert snap["schedule"] == "*-*-* 03:00"
 
@@ -616,7 +619,7 @@ class TestApplySelfUpdate:
         result = h.apply("j")
         assert result == "updated"
         assert plist_path.read_text() == before
-        assert all(c[0] != "launchctl" for c in h.calls)
+        assert not touched_the_scheduler(h.calls)
         snap = json.loads((h.state_dir("j") / "snapshot.json").read_text())
         assert snap["command"] == "false"
 
@@ -755,8 +758,7 @@ class TestApplyRenameRetire:
         # name, and the snapshot still describes the old one.
         assert old_unit.read_text() == before
         assert not self._unit(h, platform, "k").exists()
-        scheduler_bin = "launchctl" if platform == "darwin" else "systemctl"
-        assert all(c[0] != scheduler_bin for c in h.calls)
+        assert not touched_the_scheduler(h.calls)
         snap = json.loads((sd / "snapshot.json").read_text())
         assert snap["name"] == h.full("j")
 
@@ -9003,6 +9005,52 @@ class TestStatusColor:
         assert crony_commands._color_supported() is False
 
 
+class TestSchedulerCallPredicates:
+    """The predicates the daemon and apply tests ask about recorded
+    calls -- driven through each backend's real `trigger`, since the
+    verbs and binaries they know are the ones those backends emit.
+
+    Both are read almost entirely in negative assertions, which is the
+    direction that fails silently: a predicate that answered False for
+    everything would satisfy every caller. Pinning the True direction
+    here is what stops that."""
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_sees_each_backends_trigger(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        calls = record_subprocess_calls(monkeypatch)
+        crony_platform.get_scheduler(platform, tmp_path).trigger("default.j")
+        assert calls, "the backend issued no call to inspect"
+        assert triggered_a_unit(calls)
+        assert touched_the_scheduler(calls)
+
+    def test_launchd_trigger_carries_no_bare_start(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The fact the helper exists for: launchd spells it `kickstart`,
+        # so an assertion naming only `start` reads a real fire as no
+        # fire at all -- these are argv lists, matched element-wise.
+        calls = record_subprocess_calls(monkeypatch)
+        crony_platform.get_scheduler("darwin", tmp_path).trigger("default.j")
+        assert calls
+        assert all("start" not in argv for argv in calls)
+
+    def test_does_not_match_a_reinstall(self) -> None:
+        # `activate` is the reinstall path, which the apply tests
+        # distinguish from a fire; neither backend's spelling of it
+        # counts here. Literals rather than a driven `activate`, which
+        # would need a whole UnitSpec -- so unlike the fire direction
+        # above, this would not notice a backend changing its verb.
+        assert not triggered_a_unit([["systemctl", "--user", "restart", "u"]])
+        assert not triggered_a_unit(
+            [["launchctl", "bootstrap", "gui/501", "p"]]
+        )
+
+    def test_no_calls_is_no_trigger(self) -> None:
+        assert not triggered_a_unit([])
+
+
 class TestDaemonLifecycle:
     """A daemon holds its run lock for as long as it is up, so the
     lifecycle verbs that consult the lock or re-render the unit need to
@@ -9142,7 +9190,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
 
         assert h.apply("d") == "unchanged"
-        assert not any("start" in c for c in h.calls)
+        assert not triggered_a_unit(h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
     def test_enable_rearms_exhausted_enabled_daemon(
@@ -9327,7 +9375,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
 
         crony_commands.do_enable(jobs=["d"], bundle=None)
-        assert not any("start" in c or "kickstart" in c for c in h.calls)
+        assert not triggered_a_unit(h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
     def test_enable_reports_a_rearm_as_such(
@@ -9560,7 +9608,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
         assert h.apply("d") == "deferred"
         assert service.read_text() == before
-        assert all(c[0] != "systemctl" for c in h.calls)
+        assert not touched_the_scheduler(h.calls)
 
     def test_defers_a_daemons_apply_of_itself_leaving_the_mode(
         self, tmp_path: Path, monkeypatch: Any
@@ -9591,7 +9639,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
         assert h.apply("d") == "deferred"
         assert service.read_text() == before
-        assert all(c[0] != "systemctl" for c in h.calls)
+        assert not touched_the_scheduler(h.calls)
 
     def test_renaming_a_running_daemon_is_not_deferred(
         self, tmp_path: Path, monkeypatch: Any
@@ -9672,7 +9720,7 @@ class TestDaemonLifecycle:
             crony_commands.do_trigger(
                 jobs=[], wait=True, trigger_timeout=None, bundle=None
             )
-        assert not any("start" in c for c in h.calls)
+        assert not triggered_a_unit(h.calls)
 
     def test_trigger_wait_rejects_a_daemon(
         self, tmp_path: Path, monkeypatch: Any
@@ -9697,7 +9745,7 @@ class TestDaemonLifecycle:
         crony_commands.do_trigger(
             jobs=["d"], wait=False, trigger_timeout=None, bundle=None
         )
-        assert any("start" in c for c in h.calls)
+        assert triggered_a_unit(h.calls)
         assert crony_runtime.user_trigger_flag_path(h.state_dir("d")).is_file()
 
     def test_trigger_of_a_running_daemon_writes_no_sentinel(
@@ -9716,7 +9764,7 @@ class TestDaemonLifecycle:
             crony_commands.do_trigger(
                 jobs=["d"], wait=False, trigger_timeout=None, bundle=None
             )
-        assert any("start" in c for c in h.calls)
+        assert triggered_a_unit(h.calls)
         assert not crony_runtime.user_trigger_flag_path(sd).exists()
 
 

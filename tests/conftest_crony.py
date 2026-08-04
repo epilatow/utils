@@ -199,6 +199,59 @@ def _grouped_job(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+# How each backend spells "fire this unit now": systemd `start`,
+# launchd `kickstart`. Not the reinstall verbs -- systemd's `restart`
+# and launchd's `bootstrap` do start a unit, but they are `activate`,
+# which the apply tests distinguish from a fire.
+_TRIGGER_VERBS = frozenset({"start", "kickstart"})
+
+
+def triggered_a_unit(calls: list[list[str]]) -> bool:
+    """Whether any recorded subprocess call fired a unit.
+
+    Argv is matched element-wise, so a check naming one backend's verb
+    matches nothing on the other rather than failing -- harmless in a
+    positive assertion, silently fatal in a negative one. Both verbs
+    live here so a caller cannot get only half of them.
+    """
+    return any(_TRIGGER_VERBS & set(argv) for argv in calls)
+
+
+# The binary each backend drives. Same element-wise trap as the verbs:
+# a negative assertion naming one platform's binary passes by matching
+# nothing on the other.
+_SCHEDULER_BINS = frozenset({"systemctl", "launchctl"})
+
+
+def touched_the_scheduler(calls: list[list[str]]) -> bool:
+    """Whether any recorded subprocess call drove a scheduler binary.
+
+    Broader than `triggered_a_unit` -- any `systemctl` / `launchctl`
+    counts, not just a fire -- and the question a test asks when the
+    answer should be that crony left the scheduler alone. Not every
+    subprocess a backend runs: `plutil`, which launchd's activate calls
+    to check a plist, is not a scheduler.
+    """
+    return any(argv and argv[0] in _SCHEDULER_BINS for argv in calls)
+
+
+def record_subprocess_calls(monkeypatch: Any) -> list[list[str]]:
+    """Patch `subprocess.run` and collect the argv of every call.
+
+    For a test driving a backend directly. `_ApplyHarness` records the
+    same way while also building a config tree and stubbing scheduler
+    state; reach for this when the backend is all that is wanted.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args[0] if args else kwargs.get("args", [])))
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
 def _inject_uuids(raw: dict[str, Any]) -> dict[str, Any]:
     """Stamp a fresh UUID on every job/group in a test config that
     lacks one. Returns `raw` for chaining.
