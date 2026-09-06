@@ -9,7 +9,7 @@
 
 import argparse
 import datetime as dt
-import glob
+import fnmatch
 import hashlib
 import json
 import locale
@@ -18,6 +18,7 @@ import platform as platform  # noqa: PLC0414  re-exported for tests
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -143,6 +144,23 @@ class NotFoundError(SecureArchiverError):
     """Raised when a required file or path is not found."""
 
     exit_code = ExitCode.NOT_FOUND
+
+
+class UnreadableError(SecureArchiverError):
+    """
+    Raised when a path is there but the OS will not let it be read.
+
+    Deliberately carries the base class's general error code rather than
+    a code of its own: a refusal is a runtime failure of the machine the
+    tool is running on, not a statement about the config, and nothing
+    downstream can act on it more specifically than that.
+    """
+
+
+# The two ways an include entry fails to resolve: the path is not there,
+# or the OS refused it. Both are collected per entry so one attempt can
+# report every entry that failed.
+type IncludeResolutionError = NotFoundError | UnreadableError
 
 
 class SubprocessError(subprocess.CalledProcessError, SecureArchiverError):
@@ -520,33 +538,330 @@ def load_config(path: Path | None) -> Config:
     return Config.from_dict(cfg_dict, config_path)
 
 
-def ensure_out_dir_exists_writable(out_dir: Path) -> None:
+def ensure_out_dir_usable(out_dir: Path) -> None:
+    """
+    Fail early unless `output_dir` is a directory that can be both
+    written and listed.
+
+    Reading it is as load-bearing as writing it: what gets published and
+    what gets pruned are both decided from the revisions already there.
+    """
     require(out_dir.exists(), f"output_dir does not exist: {out_dir}")
     require(out_dir.is_dir(), f"output_dir is not a directory: {out_dir}")
     require(
         os.access(out_dir, os.W_OK), f"output_dir is not writable: {out_dir}"
     )
+    # Publishing decides what to write by reading what is already there,
+    # so a write-only output directory is not enough to run against.
+    require(
+        os.access(out_dir, os.R_OK), f"output_dir is not readable: {out_dir}"
+    )
+
+
+# Characters that make a path component a glob pattern rather than a
+# literal name.
+_GLOB_MAGIC_RE = re.compile(r"[*?\[]")
+
+
+def unreadable_error(path: Path | str, err: OSError) -> UnreadableError:
+    """An UnreadableError naming a path the OS refused, and why."""
+    return UnreadableError(
+        f"Cannot read {path}: {err.strerror} (errno {err.errno})"
+    )
+
+
+def path_lstat(path: Path) -> os.stat_result | None:
+    """
+    `path`'s own stat -- not its target's -- or None if nothing is there.
+
+    `Path.exists` and friends answer False for a path the OS refused
+    exactly as they do for one that is absent. That conflation is what
+    this module exists to remove, so the refusal is raised instead.
+    """
+    try:
+        return os.lstat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return None
+    except OSError as e:
+        raise unreadable_error(path, e) from e
+
+
+def path_stat(path: Path) -> os.stat_result | None:
+    """
+    `path`'s stat with symlinks followed, or None if it resolves to
+    nothing -- a broken symlink included, which is absence, not refusal.
+    """
+    try:
+        return os.stat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return None
+    except OSError as e:
+        raise unreadable_error(path, e) from e
+
+
+def path_is_dir(path: Path) -> bool:
+    """Whether `path` resolves to a directory, raising on a refusal."""
+    info = path_stat(path)
+    return info is not None and stat.S_ISDIR(info.st_mode)
+
+
+def path_is_file(path: Path) -> bool:
+    """Whether `path` resolves to a regular file, raising on a refusal."""
+    info = path_stat(path)
+    return info is not None and stat.S_ISREG(info.st_mode)
+
+
+def expand_path_vars(pattern: str) -> str:
+    """Expand environment variables and ~ in a configured path."""
+    return os.path.expandvars(os.path.expanduser(pattern))
+
+
+def pattern_scan_root(expanded_pattern: str) -> Path:
+    """
+    The directory whose listing decides what `expanded_pattern` matches.
+
+    For a pattern carrying glob metacharacters this is its deepest
+    ancestor holding none of them (`/a/b/*.pdf` -> `/a/b`); for a literal
+    path it is the parent (`/a/b/c` -> `/a/b`). Either way it is the
+    directory that has to be read for a match to be found, so it is the
+    one worth probing when a pattern comes back empty.
+    """
+    base, parts = split_pattern(expanded_pattern)
+    if parts:
+        return base
+    # A wholly literal pattern is its own base, and what gets read to
+    # find it is the directory holding it.
+    return base.parent
+
+
+def count_dir_entries(directory: Path) -> int:
+    """
+    How many entries `directory` holds, raising if it cannot be listed.
+
+    Callers use the count as evidence that a directory really is empty of
+    what they wanted. The two ways it can fail get different exceptions
+    because they need different responses: a directory that is not there
+    is a path to correct, while one the OS refuses is a machine to
+    repair.
+    """
+    try:
+        return len(os.listdir(directory))
+    except (FileNotFoundError, NotADirectoryError) as e:
+        raise NotFoundError(f"Directory does not exist: {directory}") from e
+    except OSError as e:
+        raise unreadable_error(directory, e) from e
+
+
+def scan_dir(
+    directory: Path, *, missing_ok: bool = True
+) -> list[os.DirEntry[str]]:
+    """
+    The entries of `directory`, raising if the OS refuses to list it.
+
+    While matching, an absent directory (or a path component that turns
+    out not to be one) is not a refusal -- it holds nothing, which is a
+    non-match, so it yields no entries. Callers that already know the
+    directory matched pass `missing_ok=False`, where absence means it
+    went away underneath the run and is worth reporting. Every other
+    error is a directory the caller needed and could not have.
+    """
+    try:
+        with os.scandir(directory) as it:
+            return list(it)
+    except (FileNotFoundError, NotADirectoryError) as e:
+        if missing_ok:
+            return []
+        raise NotFoundError(f"Directory does not exist: {directory}") from e
+    except OSError as e:
+        raise unreadable_error(directory, e) from e
+
+
+def entry_is_dir(entry: os.DirEntry[str]) -> bool:
+    """
+    Whether `entry` is a directory, following symlinks.
+
+    The lstat behind this can fail on its own -- a symlink cycle reports
+    ELOOP here, a failing mount reports EIO -- and such an entry is
+    reported rather than quietly treated as a file, which would drop
+    whatever it holds from the archive.
+    """
+    try:
+        return entry.is_dir()
+    except OSError as e:
+        raise unreadable_error(entry.path, e) from e
+
+
+def split_pattern(expanded_pattern: str) -> tuple[Path, tuple[str, ...]]:
+    """
+    A pattern as the literal directory to start from plus the components
+    still to match.
+
+    Splitting through `Path` is what normalises `//` and `.` away, so the
+    walk builds candidate paths the same way whatever form the configured
+    path took.
+    """
+    parts = Path(expanded_pattern).parts
+    literal: list[str] = []
+    for part in parts:
+        if _GLOB_MAGIC_RE.search(part):
+            break
+        literal.append(part)
+    base = Path(*literal) if literal else Path(".")
+    return base, parts[len(literal) :]
+
+
+def match_components(
+    base: Path,
+    parts: tuple[str, ...],
+    *,
+    dirs_only: bool,
+    self_match: bool = True,
+) -> Iterable[Path]:
+    """
+    Paths under `base` matching `parts`, one pattern component at a time.
+
+    Descending component by component is what keeps the search honest
+    about which directories it needs: it only reads a directory that a
+    component actually selected, so an unreadable directory elsewhere in
+    the tree is neither read nor reported. `glob` cannot make that
+    promise the other way round -- it reads the same directories but
+    discards the errors -- which is the whole reason the walk lives here.
+
+    `self_match` carries whether `base` may match a trailing `**` on its
+    own. Callers descending into a directory the pattern selected leave
+    it set; the top of a pattern that names no directory to start from
+    clears it, since `**` alone does not match the working directory.
+    """
+    head, rest = parts[0], parts[1:]
+
+    if head == "**":
+        # `**` matches zero or more directories, so the base itself is a
+        # candidate before anything below it is considered -- but only
+        # when it is a directory that exists, or a pattern would report a
+        # match against a tree that is not there.
+        if rest:
+            yield from match_components(
+                base, rest, dirs_only=dirs_only, self_match=self_match
+            )
+        elif self_match and path_is_dir(base):
+            yield base
+        for entry in scan_dir(base):
+            if entry.name.startswith("."):
+                continue
+            if entry_is_dir(entry):
+                yield from match_components(
+                    Path(entry.path), parts, dirs_only=dirs_only
+                )
+            elif not rest and not dirs_only:
+                yield Path(entry.path)
+        return
+
+    if _GLOB_MAGIC_RE.search(head):
+        # A leading dot is matched only by a component that opens with
+        # one, which is the rule `glob` applies per component.
+        hidden_wanted = head.startswith(".")
+        for entry in scan_dir(base):
+            if entry.name.startswith(".") and not hidden_wanted:
+                continue
+            if not fnmatch.fnmatchcase(entry.name, head):
+                continue
+            child = Path(entry.path)
+            if rest:
+                if entry_is_dir(entry):
+                    yield from match_components(
+                        child, rest, dirs_only=dirs_only
+                    )
+            elif not dirs_only or entry_is_dir(entry):
+                yield child
+        return
+
+    child = base / head
+    if rest:
+        yield from match_components(child, rest, dirs_only=dirs_only)
+    elif path_lstat(child) is not None and (
+        not dirs_only or path_is_dir(child)
+    ):
+        yield child
+
+
+def glob_matches(expanded_pattern: str) -> list[Path]:
+    """
+    The paths `expanded_pattern` matches, raising on a directory the
+    match needed and the OS refused.
+
+    `glob` discards every OSError its directory scans raise, so an
+    unreadable subtree subtracts from its result silently. Matching is
+    done here instead to keep those errors, following `glob`'s rules
+    otherwise: a trailing separator restricts the match to directories,
+    hidden names need a component that opens with a dot, and directory
+    symlinks are followed. Two divergences are deliberate. A symlink
+    cycle is reported, where `glob` yields one duplicate match per level
+    until symlink resolution gives up with ELOOP; and a path several
+    routes through a pattern can reach is returned once, where `glob`
+    returns it once per route.
+    """
+    if not _GLOB_MAGIC_RE.search(expanded_pattern):
+        # A literal path names a single candidate. Its parent is the
+        # only listing involved, and callers probe that themselves.
+        literal = Path(expanded_pattern)
+        if path_lstat(literal) is None:
+            return []
+        if expanded_pattern.endswith("/") and not path_is_dir(literal):
+            return []
+        return [literal]
+
+    base, parts = split_pattern(expanded_pattern)
+    dirs_only = expanded_pattern.endswith("/")
+    # A trailing `**` matches the directory the search starts from, but
+    # only when the pattern named one: `glob` matches nothing for a bare
+    # `**`, rather than matching the working directory.
+    names_base = bool(os.path.dirname(expanded_pattern.rstrip("/")))
+    seen: set[Path] = set()
+    matches: list[Path] = []
+    for match in match_components(
+        base, parts, dirs_only=dirs_only, self_match=names_base
+    ):
+        if match not in seen:
+            seen.add(match)
+            matches.append(match)
+    return matches
 
 
 def expand_pattern(pattern: str) -> list[Path]:
     """
-    Expand env vars + ~ and then glob. Returns Paths.
-    We pass recursive=True to support ** patterns.
+    Expand env vars + ~ and then match. Returns Paths.
+    ** patterns are supported.
+
+    Raises UnreadableError if the OS refuses a path the match had to
+    read, so an empty result means the tree it could read genuinely
+    holds nothing matching.
     """
-    p = os.path.expandvars(os.path.expanduser(pattern))
-    matches = glob.glob(p, recursive=True)
-    return [Path(m) for m in matches]
+    return glob_matches(expand_path_vars(pattern))
 
 
 def iter_files_in_dir(dirpath: Path, recurse: bool) -> Iterable[Path]:
+    """
+    The files under `dirpath`: direct children, or the whole tree when
+    `recurse` is set.
+
+    A directory that cannot be read raises rather than contributing
+    nothing, so an archive is never quietly built from a subset of what
+    was asked for.
+    """
     if recurse:
-        for p in dirpath.rglob("*"):
-            if p.is_file():
-                yield p
+
+        def on_error(err: OSError) -> None:
+            raise unreadable_error(err.filename or dirpath, err) from err
+
+        for parent, _dirs, names in os.walk(dirpath, onerror=on_error):
+            for name in names:
+                p = Path(parent) / name
+                if path_is_file(p):
+                    yield p
     else:
-        # Only direct child files
-        for p in dirpath.iterdir():
-            if p.is_file():
+        for entry in scan_dir(dirpath, missing_ok=False):
+            p = Path(entry.path)
+            if path_is_file(p):
                 yield p
 
 
@@ -567,8 +882,8 @@ def stage_flat_copy(
         subdir = staging_dir
 
     for src in sources:
-        require(src.exists(), f"Source does not exist: {src}")
-        require(src.is_file(), f"Expected file but got non-file: {src}")
+        require(path_lstat(src) is not None, f"Source does not exist: {src}")
+        require(path_is_file(src), f"Expected file but got non-file: {src}")
 
         name = src.name
         # Use full relative path for collision detection
@@ -646,7 +961,10 @@ def write_manifest(staging_dir: Path, manifest: dict[str, Any]) -> None:
 def extract_manifest_from_archive(
     archive_path: Path, password: str
 ) -> dict[str, Any] | None:
-    if not archive_path.exists():
+    # None means "no previous manifest to compare against", which
+    # publishes a fresh revision. Only genuine absence may say that: a
+    # stat the OS refused would republish on every run instead.
+    if path_lstat(archive_path) is None:
         return None
 
     with tempfile.TemporaryDirectory() as td:
@@ -715,9 +1033,17 @@ def timestamp_now() -> str:
 
 
 def list_archives(out_dir: Path, archive_name: str) -> list[Path]:
-    """List all timestamped archives for a given name, sorted by time."""
+    """
+    List all timestamped archives for a given name, sorted by time.
+
+    The directory is read rather than globbed because an empty answer
+    decides whether a revision is published and what gets pruned: a
+    listing the OS refused would read as "no revisions yet", republish
+    unconditionally and prune nothing.
+    """
     archives = []
-    for p in out_dir.glob(f"{archive_name}.*.7z"):
+    for entry in scan_dir(out_dir, missing_ok=False):
+        p = Path(entry.path)
         parts = p.name.split(".")
         if (
             len(parts) == 3
@@ -914,8 +1240,16 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> list[Path]:
     """
     matches = expand_pattern(entry.path)
     if not matches:
+        # Nothing matched is two different faults wearing one face: a
+        # pattern that no longer names anything (fix the config) and a
+        # directory the OS would not hand over (fix the storage). Read
+        # the root here, where the error survives, and say which.
+        root = pattern_scan_root(expand_path_vars(entry.path))
+        entries = count_dir_entries(root)
+        plural = "entry" if entries == 1 else "entries"
         raise NotFoundError(
-            f"No matches for include path pattern: {entry.path}"
+            f"No files matched include path pattern: {entry.path} "
+            f"(directory {root} is readable, {entries} {plural})"
         )
 
     if entry.latest:
@@ -924,9 +1258,9 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> list[Path]:
 
     sources: list[Path] = []
     for m in matches:
-        if m.is_file():
+        if path_is_file(m):
             sources.append(m)
-        elif m.is_dir():
+        elif path_is_dir(m):
             sources.extend(list(iter_files_in_dir(m, recurse=entry.recurse)))
         else:
             raise NotFoundError(
@@ -940,6 +1274,52 @@ def include_entry_to_sources(entry: PathIncludeEntry) -> list[Path]:
         )
 
     return sources
+
+
+def resolve_path_includes(
+    include: Sequence[IncludeEntry],
+) -> dict[int, list[Path]]:
+    """
+    Resolve every filesystem include entry, keyed by position in `include`.
+
+    Resolution runs to completion before any failure is reported, so one
+    attempt names every entry in this archive that could not be resolved.
+    Stopping at the first hides the rest until the next attempt, which for
+    a scheduled job is a whole cycle away per broken entry.
+
+    Each failure is reported against the `include[i]` position config
+    validation already names, since a directory-level error otherwise
+    names only the directory and not the entry that asked for it.
+    """
+    resolved: dict[int, list[Path]] = {}
+    failures: list[tuple[int, IncludeResolutionError]] = []
+
+    for index, entry in enumerate(include):
+        if not isinstance(entry, PathIncludeEntry):
+            continue
+        try:
+            resolved[index] = include_entry_to_sources(entry)
+        except (NotFoundError, UnreadableError) as e:
+            failures.append((index, e))
+
+    if len(failures) == 1:
+        index, failure = failures[0]
+        raise type(failure)(f"include[{index}]: {failure}") from failure
+    if failures:
+        detail = "\n".join(f"  - include[{i}]: {e}" for i, e in failures)
+        # A batch mixing both faults is reported as the more severe one:
+        # a refusal has to be repaired before the run can say anything
+        # about whether the remaining paths are right.
+        combined = (
+            UnreadableError
+            if any(isinstance(e, UnreadableError) for _, e in failures)
+            else NotFoundError
+        )
+        raise combined(
+            f"{len(failures)} include entries could not be resolved:\n{detail}"
+        ) from failures[0][1]
+
+    return resolved
 
 
 def build_staging_for_archive(
@@ -957,10 +1337,14 @@ def build_staging_for_archive(
     Collision detection uses full relative paths (dir/filename).
     Returns staged filenames (excluding manifest.json).
     """
+    # Resolve the filesystem entries first so an archive with an
+    # unusable include fails before any 1Password fetch or file copy.
+    resolved = resolve_path_includes(archive_cfg.include)
+
     seen: set[str] = set()
     staged_names: list[str] = []
 
-    for entry in archive_cfg.include:
+    for index, entry in enumerate(archive_cfg.include):
         if isinstance(entry, OpRefIncludeEntry):
             staged_names.append(
                 stage_op_ref(
@@ -972,9 +1356,11 @@ def build_staging_for_archive(
                 )
             )
         elif isinstance(entry, PathIncludeEntry):
-            sources = include_entry_to_sources(entry)
             staged_names += stage_flat_copy(
-                staging_dir, sources, seen_names=seen, target_dir=entry.dir
+                staging_dir,
+                resolved[index],
+                seen_names=seen,
+                target_dir=entry.dir,
             )
 
     return staged_names
@@ -1423,7 +1809,7 @@ def do_update(
     keep_revisions = cfg.general.keep_revisions
 
     # Fail-fast: output dir must exist and be writable BEFORE doing work
-    ensure_out_dir_exists_writable(out_dir)
+    ensure_out_dir_usable(out_dir)
 
     # Write README.txt if configured
     if cfg.general.readme:
@@ -1438,13 +1824,15 @@ def do_update(
         op_password_uri = archive_cfg.op_password
         description = archive_cfg.description
 
-        password = op_read(op_password_uri)
-
         eprint(f"=== {archive_name} ===")
 
         with tempfile.TemporaryDirectory() as td:
             staging_dir = Path(td)
             staged = build_staging_for_archive(archive_cfg, staging_dir)
+
+            # Staging first, so a password is fetched only for an
+            # archive that can actually be built.
+            password = op_read(op_password_uri)
 
             published_any |= publish(
                 archive_name=archive_name,

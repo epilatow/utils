@@ -27,8 +27,9 @@
 #     `tests/test_prettier.py` reaches prettier the same way.
 #   - git: uv builds the repo-shared gate from its `git+https://` source
 #     (see pyproject.toml), so git must be present to resolve deps.
-#   - a non-root user: test_secure_archiver asserts a 0o555 dir is "not
-#     writable", which root bypasses -- so the suite runs as `tester`.
+#   - a non-root user: test_secure_archiver asserts on permission
+#     denials -- a 0o555 dir is "not writable", a 0o000 one cannot be
+#     read -- which root bypasses, so the suite runs as `tester`.
 #
 # The container boots systemd as PID 1 (needs --privileged + the cgroup
 # mount), then starts a lingering user manager for `tester` so the crony

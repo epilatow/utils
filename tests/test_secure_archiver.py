@@ -138,6 +138,413 @@ class TestFilePatternExpansion:
         # Result should be absolute paths starting from home
         assert all(p.is_absolute() for p in result)
 
+    def test_expand_skips_hidden_names(self, tmp_path: Path) -> None:
+        """Test a leading-dot name is not matched by a bare wildcard."""
+        (tmp_path / "shown.txt").write_text("s")
+        (tmp_path / ".hidden.txt").write_text("h")
+
+        result = sa.expand_pattern(str(tmp_path / "*.txt"))
+        assert result == [tmp_path / "shown.txt"]
+
+    def test_expand_skips_hidden_dirs_when_recursive(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a recursive match does not descend into hidden dirs."""
+        shown = tmp_path / "shown"
+        shown.mkdir()
+        (shown / "a.txt").write_text("a")
+        hidden = tmp_path / ".hidden"
+        hidden.mkdir()
+        (hidden / "b.txt").write_text("b")
+
+        result = sa.expand_pattern(str(tmp_path / "**/*.txt"))
+        assert result == [shown / "a.txt"]
+
+    def test_expand_unreadable_subtree_raises(self, tmp_path: Path) -> None:
+        """Test a recursive match raises on a subtree it cannot read.
+
+        The failure this guards is silent subtraction: the unreadable
+        subtree would otherwise drop out of the result and publish a
+        revision missing its files, indistinguishable from an edit.
+        """
+        readable = tmp_path / "ok"
+        readable.mkdir()
+        (readable / "a.pdf").write_text("a")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "b.pdf").write_text("b")
+        locked.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.expand_pattern(str(tmp_path / "**/*.pdf"))
+        finally:
+            locked.chmod(0o755)
+
+    def test_expand_unreadable_mid_level_raises(self, tmp_path: Path) -> None:
+        """Test a multi-level match raises below its scan root."""
+        car = tmp_path / "car"
+        car.mkdir()
+        (car / "title.pdf").write_text("t")
+        car.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.expand_pattern(str(tmp_path / "*/*.pdf"))
+        finally:
+            car.chmod(0o755)
+
+    def test_expand_ignores_unreadable_dir_off_the_path(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a directory no component selects is never read.
+
+        Reporting one would fail an archive over a directory that could
+        not have held a match, which is a worse fault than the silence
+        it replaced.
+        """
+        wanted = tmp_path / "abc"
+        wanted.mkdir()
+        (wanted / "title.pdf").write_text("t")
+        unrelated = tmp_path / "zzz"
+        unrelated.mkdir()
+        unrelated.chmod(0o000)
+
+        try:
+            result = sa.expand_pattern(str(tmp_path / "a*/*.pdf"))
+        finally:
+            unrelated.chmod(0o755)
+
+        assert result == [wanted / "title.pdf"]
+
+    def test_expand_unreadable_dir_before_literal_leaf_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a literal leaf under a magic component cannot go silent.
+
+        Resolving the leaf is a stat, and the stat fails for every name
+        inside a directory the OS refuses. Answering "not there" to that
+        would drop the subtree from the archive without a word.
+        """
+        for name in ("car", "house"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "title.pdf").write_text("t")
+        (tmp_path / "car").chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.expand_pattern(str(tmp_path / "*/title.pdf"))
+        finally:
+            (tmp_path / "car").chmod(0o755)
+
+    def test_expand_unreadable_dir_before_literal_dir_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Test the dirs-only shape of the same case also raises."""
+        for name in ("alpha", "beta"):
+            (tmp_path / name / "invoices").mkdir(parents=True)
+        (tmp_path / "alpha").chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.expand_pattern(f"{tmp_path}/*/invoices/")
+        finally:
+            (tmp_path / "alpha").chmod(0o755)
+
+    def test_expand_missing_intermediate_is_not_an_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a matched directory lacking the next component is skipped."""
+        has = tmp_path / "has" / "sub"
+        has.mkdir(parents=True)
+        (has / "a.pdf").write_text("a")
+        (tmp_path / "lacks").mkdir()
+
+        result = sa.expand_pattern(str(tmp_path / "*/sub/*.pdf"))
+        assert result == [has / "a.pdf"]
+
+    def test_expand_redundant_separator_still_matches(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a doubled separator does not silently match nothing."""
+        (tmp_path / "a.pdf").write_text("a")
+
+        assert sa.expand_pattern(f"{tmp_path}//*.pdf") == [tmp_path / "a.pdf"]
+
+    def test_expand_recursive_on_missing_base_matches_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a `**` pattern does not match a base that is not there.
+
+        A trailing `**` matches the directory it starts from, which
+        would otherwise report a match against a tree that does not
+        exist and rob the caller of the missing-directory diagnosis.
+        """
+        missing = tmp_path / "gone"
+
+        assert sa.expand_pattern(str(missing / "**")) == []
+        with pytest.raises(sa.NotFoundError) as excinfo:
+            sa.include_entry_to_sources(
+                sa.PathIncludeEntry(path=str(missing / "**"))
+            )
+        assert f"Directory does not exist: {missing}" in str(excinfo.value)
+
+    def test_expand_deduplicates_multiply_reachable_paths(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a path several routes can reach is returned once.
+
+        `glob` returns it once per route, which staging would reject as
+        a name collision.
+        """
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "z.pdf").write_text("z")
+
+        result = sa.expand_pattern(str(tmp_path / "**/**/*.pdf"))
+        assert result == [nested / "z.pdf"]
+
+    def test_expand_bare_recursive_is_not_the_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test a pattern of nothing but `**` does not match the cwd."""
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "f.pdf").write_text("f")
+        monkeypatch.chdir(tmp_path)
+
+        assert Path(".") not in sa.expand_pattern("**")
+
+    def test_expand_symlink_cycle_raises(self, tmp_path: Path) -> None:
+        """Test a directory symlink cycle is reported, not walked forever.
+
+        One of two places the match deliberately parts from `glob`, which
+        yields the same file once per level until the OS refuses the path
+        length.
+        """
+        real = tmp_path / "a"
+        real.mkdir()
+        (real / "f.pdf").write_text("f")
+        (real / "loop").symlink_to(real)
+
+        with pytest.raises(sa.UnreadableError, match="Cannot read"):
+            sa.expand_pattern(str(tmp_path / "**/*.pdf"))
+
+    def test_expand_multi_level_pattern(self, tmp_path: Path) -> None:
+        """Test a magic component below the scan root still matches."""
+        car = tmp_path / "car"
+        car.mkdir()
+        (car / "title.pdf").write_text("t")
+        (car / "other.txt").write_text("o")
+        (tmp_path / "top.pdf").write_text("x")
+
+        result = sa.expand_pattern(str(tmp_path / "*/*.pdf"))
+        assert result == [car / "title.pdf"]
+
+    def test_expand_reaches_explicitly_named_hidden_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a pattern naming a hidden component still descends."""
+        hidden = tmp_path / "a" / ".secret"
+        hidden.mkdir(parents=True)
+        (hidden / "k.pdf").write_text("k")
+
+        result = sa.expand_pattern(str(tmp_path / "*/.secret/*.pdf"))
+        assert result == [hidden / "k.pdf"]
+
+    # Pattern shapes the equivalence below is asserted over. `glob` is the
+    # reference for matching; only its error handling is being replaced.
+    GLOB_EQUIVALENCE_PATTERNS: ClassVar[list[str]] = [
+        "*.pdf",
+        "*",
+        "**/*.pdf",
+        "**",
+        "a/*.pdf",
+        "*/*.pdf",
+        "*/*/*.pdf",
+        "[at]*.pdf",
+        "?op.pdf",
+        "a/**/*.pdf",
+        "*/",
+        "**/",
+        "dir.*",
+        "nope*.pdf",
+        "**/*",
+        "*/b/*.pdf",
+        "**/**/*.pdf",
+        "a/b/**",
+        "*/*/",
+        "[!a]*",
+        ".*",
+        ".hid/*",
+        "a/b/.*",
+        "*/.hid2/*",
+        "**/.x/*",
+        "e */*.pdf",
+        "**/c/*",
+        "./*.pdf",
+        "a/./*.pdf",
+        "/a/*.pdf",
+        "a//*.pdf",
+        "a/b/../*.pdf",
+        "a/",
+        "top.pdf/",
+        "*/.hid/[.]x.pdf",
+        "**/.hid/[.]x.pdf",
+        ".hid/[.]x.pdf",
+        ".hid/.*",
+        "nodir/*.pdf",
+        "a/nodir/*.pdf",
+        "*/nodir/*.pdf",
+        "nodir/**",
+        "nodir/**/",
+        "**/**",
+        "top.pdf/**",
+        "a/**/",
+        "*/**",
+    ]
+
+    def test_matches_glob_exactly(self, tmp_path: Path) -> None:
+        """Test the matcher selects the same paths as `glob` does.
+
+        Matching is reimplemented only to keep the OSErrors `glob`
+        discards, so which paths are selected has to stay `glob`'s
+        answer. Sets are compared because the two deliberately differ on
+        multiplicity: a pattern with two `**` components makes `glob`
+        emit a path once per way of reaching it, which staging would
+        then reject as a collision.
+        """
+        import glob as glob_module
+
+        for d in ["a/b/c", ".hid", "a/.hid2", "dir.pdf", "e f", "a/b/.x"]:
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+        for f in [
+            "top.pdf",
+            "top.txt",
+            ".dot.pdf",
+            "a/x.pdf",
+            "a/y.txt",
+            "a/b/z.pdf",
+            "a/b/c/deep.pdf",
+            ".hid/h.pdf",
+            ".hid/.x.pdf",
+            "a/.hid2/h2.pdf",
+            "e f/g.pdf",
+            "a/b/.x/hid.pdf",
+        ]:
+            (tmp_path / f).write_text("x")
+        (tmp_path / "link_to_a").symlink_to(tmp_path / "a")
+        (tmp_path / "broken_link").symlink_to(tmp_path / "missing")
+
+        for pattern in self.GLOB_EQUIVALENCE_PATTERNS:
+            # Joined as text, not through `Path`, which would normalise
+            # away the `.` and `//` shapes these patterns exist to cover.
+            full = f"{tmp_path}/{pattern}"
+            expected = sorted(
+                {Path(m) for m in glob_module.glob(full, recursive=True)}
+            )
+            assert sorted(set(sa.expand_pattern(full))) == expected, pattern
+
+
+class TestPatternScanRoot:
+    """Test which directory a pattern's matches are read from."""
+
+    def test_root_of_glob_pattern(self) -> None:
+        """Deepest ancestor free of glob metacharacters."""
+        assert sa.pattern_scan_root("/a/b/*_stmt.pdf") == Path("/a/b")
+
+    def test_root_of_multi_level_glob(self) -> None:
+        """Magic in a middle component stops the walk there."""
+        assert sa.pattern_scan_root("/a/b/*/c*.pdf") == Path("/a/b")
+
+    def test_root_of_recursive_glob(self) -> None:
+        """A ** component is magic like any other."""
+        assert sa.pattern_scan_root("/a/b/**/c.pdf") == Path("/a/b")
+
+    def test_root_of_character_class(self) -> None:
+        """A [...] class marks its component as a pattern."""
+        assert sa.pattern_scan_root("/a/b/f[0-9].pdf") == Path("/a/b")
+
+    def test_root_of_literal_path_is_parent(self) -> None:
+        """A literal path is found by reading its parent."""
+        assert sa.pattern_scan_root("/a/b/c") == Path("/a/b")
+
+    def test_root_of_bare_name_is_cwd(self) -> None:
+        """A relative bare name is found by reading the cwd."""
+        assert sa.pattern_scan_root("c.pdf") == Path(".")
+
+    def test_root_of_bare_pattern_is_cwd(self) -> None:
+        """A relative bare pattern is matched against the cwd."""
+        assert sa.pattern_scan_root("*.pdf") == Path(".")
+
+
+class TestSplitPattern:
+    """Test the literal start point a pattern's search descends from."""
+
+    def test_splits_at_first_magic_component(self) -> None:
+        """The literal run becomes the base, the rest stays to match."""
+        assert sa.split_pattern("/a/b/*.pdf") == (Path("/a/b"), ("*.pdf",))
+
+    def test_keeps_components_below_magic(self) -> None:
+        """Components after the first magic one are all still to match."""
+        assert sa.split_pattern("/a/*/c/*.pdf") == (
+            Path("/a"),
+            ("*", "c", "*.pdf"),
+        )
+
+    def test_normalizes_redundant_separators(self) -> None:
+        """A doubled separator does not change the split.
+
+        Path expansion can produce one whenever a configured value ends
+        in a separator, and the search must not care.
+        """
+        assert sa.split_pattern("/a//b/*.pdf") == (Path("/a/b"), ("*.pdf",))
+
+    def test_normalizes_dot_components(self) -> None:
+        """A `.` component is dropped rather than searched for."""
+        assert sa.split_pattern("/a/./b/*.pdf") == (Path("/a/b"), ("*.pdf",))
+
+    def test_literal_pattern_has_nothing_left(self) -> None:
+        """A pattern with no magic is entirely its own base."""
+        assert sa.split_pattern("/a/b/c") == (Path("/a/b/c"), ())
+
+
+class TestDirEntryCount:
+    """Test the directory readability probe."""
+
+    def test_counts_entries(self, tmp_path: Path) -> None:
+        """Test counting a readable directory's entries."""
+        (tmp_path / "a.txt").write_text("a")
+        (tmp_path / "b.txt").write_text("b")
+        (tmp_path / "sub").mkdir()
+
+        assert sa.count_dir_entries(tmp_path) == 3
+
+    def test_counts_empty_directory(self, tmp_path: Path) -> None:
+        """Test an empty directory counts zero rather than raising."""
+        assert sa.count_dir_entries(tmp_path) == 0
+
+    def test_missing_directory_raises(self, tmp_path: Path) -> None:
+        """Test a missing directory raises rather than counting zero.
+
+        Absence is a path to correct, so it is reported as not found
+        rather than as storage the machine refused.
+        """
+        with pytest.raises(sa.NotFoundError, match="does not exist"):
+            sa.count_dir_entries(tmp_path / "nope")
+
+    def test_unreadable_directory_raises(self, tmp_path: Path) -> None:
+        """Test an unreadable directory raises rather than counting zero."""
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "file.txt").write_text("content")
+        locked.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.count_dir_entries(locked)
+        finally:
+            locked.chmod(0o755)
+
 
 class TestDirectoryIteration:
     """Test directory iteration with recursion options."""
@@ -172,6 +579,33 @@ class TestDirectoryIteration:
         result = list(sa.iter_files_in_dir(tmp_path, recurse=False))
         assert len(result) == 1
         assert result[0].name == "file.txt"
+
+    def test_iter_files_unreadable_dir_raises(self, tmp_path: Path) -> None:
+        """Test an unreadable directory raises rather than yielding none."""
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "file.txt").write_text("1")
+        locked.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                list(sa.iter_files_in_dir(locked, recurse=False))
+        finally:
+            locked.chmod(0o755)
+
+    def test_iter_files_unreadable_subtree_raises(self, tmp_path: Path) -> None:
+        """Test a recursive walk raises on a subtree it cannot read."""
+        (tmp_path / "file1.txt").write_text("1")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "nested.txt").write_text("n")
+        locked.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                list(sa.iter_files_in_dir(tmp_path, recurse=True))
+        finally:
+            locked.chmod(0o755)
 
 
 class TestFileStaging:
@@ -439,11 +873,80 @@ class TestIncludeEntryProcessing:
         assert result[0].name == "zzz.txt"
 
     def test_include_no_matches_raises_error(self, tmp_path: Path) -> None:
-        """Test error when pattern matches nothing."""
+        """Test error when pattern matches nothing in a readable dir."""
+        (tmp_path / "other.pdf").write_text("p")
         entry = sa.PathIncludeEntry(path=str(tmp_path / "nonexistent*.txt"))
 
-        with pytest.raises(sa.NotFoundError, match="No matches"):
+        with pytest.raises(sa.NotFoundError) as excinfo:
             sa.include_entry_to_sources(entry)
+
+        # The readable-and-empty case must be distinguishable from a
+        # directory the OS refused, so it reports what it verified.
+        message = str(excinfo.value)
+        assert "No files matched" in message
+        assert f"directory {tmp_path} is readable, 1 entry)" in message
+
+    def test_include_unreadable_dir_raises_error(self, tmp_path: Path) -> None:
+        """Test an unreadable directory is not reported as no matches."""
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "a.txt").write_text("a")
+        locked.chmod(0o000)
+
+        entry = sa.PathIncludeEntry(path=str(locked / "*.txt"))
+
+        try:
+            with pytest.raises(sa.UnreadableError) as excinfo:
+                sa.include_entry_to_sources(entry)
+        finally:
+            locked.chmod(0o755)
+
+        message = str(excinfo.value)
+        assert f"Cannot read {locked}" in message
+        assert "No files matched" not in message
+
+    def test_include_missing_dir_raises_error(self, tmp_path: Path) -> None:
+        """Test a missing parent directory reports itself, not the glob.
+
+        A path that is not there is the config's problem, so it is a
+        not-found rather than the general error a refusal raises.
+        """
+        missing = tmp_path / "gone"
+        entry = sa.PathIncludeEntry(path=str(missing / "*.txt"))
+
+        with pytest.raises(sa.NotFoundError) as excinfo:
+            sa.include_entry_to_sources(entry)
+
+        assert f"Directory does not exist: {missing}" in str(excinfo.value)
+
+    def test_include_refused_match_is_not_reported_as_neither(
+        self, tmp_path: Path
+    ) -> None:
+        """Test a match the OS refuses is reported as a refusal.
+
+        Sorting a match into file or directory is two stats, and both
+        fail for a symlink whose target sits under a refused directory.
+        Falling through to "neither file nor directory" would blame the
+        path for what the machine did.
+        """
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "target.txt").write_text("t")
+        link = tmp_path / "link.txt"
+        link.symlink_to(locked / "target.txt")
+        locked.chmod(0o000)
+
+        entry = sa.PathIncludeEntry(path=str(link))
+
+        try:
+            with pytest.raises(sa.UnreadableError) as excinfo:
+                sa.include_entry_to_sources(entry)
+        finally:
+            locked.chmod(0o755)
+
+        message = str(excinfo.value)
+        assert "Cannot read" in message
+        assert "neither file nor directory" not in message
 
     def test_include_zero_files_raises_error(self, tmp_path: Path) -> None:
         """Test error when match results in zero files."""
@@ -468,6 +971,95 @@ class TestIncludeEntryProcessing:
         result = sa.include_entry_to_sources(entry)
 
         assert len(result) == 2
+
+
+class TestResolvePathIncludes:
+    """Test batch resolution of an archive's filesystem includes."""
+
+    def test_resolves_keyed_by_position(self, tmp_path: Path) -> None:
+        """Test resolved sources are keyed by include position."""
+        (tmp_path / "a.txt").write_text("a")
+
+        include: list[sa.IncludeEntry] = [
+            sa.OpRefIncludeEntry(
+                op_ref="op://vault/item/field", filename="note.txt"
+            ),
+            sa.PathIncludeEntry(path=str(tmp_path / "*.txt")),
+        ]
+
+        resolved = sa.resolve_path_includes(include)
+
+        # Only the path entry resolves, under its own index.
+        assert list(resolved) == [1]
+        assert resolved[1] == [tmp_path / "a.txt"]
+
+    def test_single_failure_reported_alone(self, tmp_path: Path) -> None:
+        """Test a lone failure reports its own message unwrapped."""
+        include: list[sa.IncludeEntry] = [
+            sa.PathIncludeEntry(path=str(tmp_path / "nope*.txt")),
+        ]
+
+        with pytest.raises(sa.NotFoundError) as excinfo:
+            sa.resolve_path_includes(include)
+
+        message = str(excinfo.value)
+        assert message.startswith("include[0]: No files matched")
+        assert "could not be resolved" not in message
+        # The OS error that decided the outcome stays reachable.
+        assert excinfo.value.__cause__ is not None
+
+    def test_every_failure_reported(self, tmp_path: Path) -> None:
+        """Test resolution continues past a failure and reports them all."""
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.txt").write_text("a")
+        missing = tmp_path / "gone"
+
+        include: list[sa.IncludeEntry] = [
+            sa.PathIncludeEntry(path=str(tmp_path / "nope*.txt")),
+            sa.PathIncludeEntry(path=str(good / "*.txt")),
+            sa.PathIncludeEntry(path=str(missing / "*.txt")),
+        ]
+
+        with pytest.raises(sa.NotFoundError) as excinfo:
+            sa.resolve_path_includes(include)
+
+        message = str(excinfo.value)
+        assert "2 include entries could not be resolved" in message
+        # Each failure names the include position that asked for it, so a
+        # directory-level error is traceable back to its config entry.
+        assert "- include[0]: No files matched" in message
+        assert "- include[2]: Directory does not exist" in message
+        assert str(missing) in message
+
+    @patch("secure_archiver.op_read", autospec=True)
+    @patch("secure_archiver.stage_op_ref", autospec=True)
+    def test_staging_resolves_before_fetching(
+        self,
+        mock_stage_op_ref: MagicMock,
+        mock_op_read: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test a bad include fails before any 1Password fetch."""
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        archive_cfg = sa.ArchiveConfig(
+            op_password="op://vault/item/password",
+            description="Test archive",
+            include=[
+                sa.OpRefIncludeEntry(
+                    op_ref="op://vault/item/field", filename="note.txt"
+                ),
+                sa.PathIncludeEntry(path=str(tmp_path / "nope*.txt")),
+            ],
+        )
+
+        with pytest.raises(sa.NotFoundError, match="No files matched"):
+            sa.build_staging_for_archive(archive_cfg, staging)
+
+        mock_stage_op_ref.assert_not_called()
+        mock_op_read.assert_not_called()
 
 
 class TestManifestGeneration:
@@ -741,6 +1333,29 @@ class TestArchiveIntegration:
         assert result[0].name == f"{archive_name}.20250101_120000.7z"
         assert result[1].name == f"{archive_name}.20250102_120000.7z"
         assert result[2].name == f"{archive_name}.20250103_120000.7z"
+
+    def test_list_archives_unreadable_dir_raises(self, tmp_path: Path) -> None:
+        """Test an unreadable output directory is not read as empty.
+
+        An empty listing decides that nothing has been published yet,
+        which would republish unconditionally and prune nothing -- so
+        the refusal has to surface instead.
+        """
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "test.20250101_120000.7z").write_text("1")
+        out_dir.chmod(0o000)
+
+        try:
+            with pytest.raises(sa.UnreadableError, match="Cannot read"):
+                sa.list_archives(out_dir, "test")
+        finally:
+            out_dir.chmod(0o755)
+
+    def test_list_archives_missing_dir_raises(self, tmp_path: Path) -> None:
+        """Test a vanished output directory is not read as empty."""
+        with pytest.raises(sa.NotFoundError, match="does not exist"):
+            sa.list_archives(tmp_path / "gone", "test")
 
 
 class TestArchiveCreationAndExtraction:
@@ -1116,19 +1731,17 @@ class TestPublish:
 class TestOutputDirValidation:
     """Test output directory validation."""
 
-    def test_ensure_out_dir_exists_writable_success(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ensure_out_dir_usable_success(self, tmp_path: Path) -> None:
         """Test validation passes for valid directory."""
         # Should not raise
-        sa.ensure_out_dir_exists_writable(tmp_path)
+        sa.ensure_out_dir_usable(tmp_path)
 
     def test_ensure_out_dir_not_exist(self, tmp_path: Path) -> None:
         """Test error when output dir doesn't exist."""
         nonexistent = tmp_path / "nonexistent"
 
         with pytest.raises(sa.ConfigError, match="does not exist"):
-            sa.ensure_out_dir_exists_writable(nonexistent)
+            sa.ensure_out_dir_usable(nonexistent)
 
     def test_ensure_out_dir_not_directory(self, tmp_path: Path) -> None:
         """Test error when output dir is a file."""
@@ -1136,7 +1749,7 @@ class TestOutputDirValidation:
         not_dir.write_text("content")
 
         with pytest.raises(sa.ConfigError, match="not a directory"):
-            sa.ensure_out_dir_exists_writable(not_dir)
+            sa.ensure_out_dir_usable(not_dir)
 
     def test_ensure_out_dir_not_writable(self, tmp_path: Path) -> None:
         """Test error when output dir is not writable."""
@@ -1146,10 +1759,27 @@ class TestOutputDirValidation:
 
         try:
             with pytest.raises(sa.ConfigError, match="not writable"):
-                sa.ensure_out_dir_exists_writable(readonly)
+                sa.ensure_out_dir_usable(readonly)
         finally:
             # Restore permissions for cleanup
             readonly.chmod(0o755)
+
+    def test_ensure_out_dir_not_readable(self, tmp_path: Path) -> None:
+        """Test error when output dir cannot be listed.
+
+        Deciding what to publish means reading what is already there, so
+        a write-only directory is rejected up front rather than looking
+        like one holding no revisions.
+        """
+        writeonly = tmp_path / "writeonly"
+        writeonly.mkdir()
+        writeonly.chmod(0o333)
+
+        try:
+            with pytest.raises(sa.ConfigError, match="not readable"):
+                sa.ensure_out_dir_usable(writeonly)
+        finally:
+            writeonly.chmod(0o755)
 
 
 class TestCommandExecution:
@@ -1376,6 +2006,44 @@ include = [
         assert (extract_dir / "file1.txt").read_text() == "content1"
         assert (extract_dir / "file2.txt").read_text() == "content2"
         assert (extract_dir / "manifest.json").exists()
+
+    # The tool probe runs before any include work and would fail the
+    # test on a host without `op` / `7zz`; what is under test is the
+    # ordering after it.
+    @patch("secure_archiver.ensure_tools", autospec=True)
+    @patch("secure_archiver.op_read", autospec=True)
+    def test_run_update_bad_include_never_reads_1password(
+        self,
+        mock_op_read: MagicMock,
+        _mock_ensure_tools: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test an unresolvable include stops the run before `op read`.
+
+        The archive password is read per archive, so an include fault
+        found only during staging would still have prompted 1Password
+        for an archive that cannot be built.
+        """
+        out_dir = tmp_path / "output"
+        out_dir.mkdir()
+
+        config_file = tmp_path / "test_config.toml"
+        config_file.write_text(f"""
+[general]
+output_dir = "{out_dir}"
+
+[archive.TestArchive]
+op_password = "op://vault/item/password"
+description = "Test archive description"
+include = [
+    {{ path = "{tmp_path}/nothing*.txt" }},
+]
+""")
+
+        with pytest.raises(sa.NotFoundError, match="No files matched"):
+            sa.do_update(config_file, dry_run=False, force_update=False)
+
+        mock_op_read.assert_not_called()
 
 
 class TestArchiveReadme:
@@ -2188,6 +2856,21 @@ class TestGeneralConfigReadme:
         }
         with pytest.raises(sa.ConfigError, match="readme must be a string"):
             sa.Config.from_dict(cfg_dict, tmp_path / "test.toml")
+
+
+class TestUnreadableExitCode:
+    """Test what a refused path exits with."""
+
+    def test_unreadable_uses_the_general_error_code(self) -> None:
+        """Test a refusal exits as a general error, not as not-found.
+
+        "File not found" would mislabel a permission or I/O refusal for
+        anything reading the exit status, and there is nothing more
+        specific such a reader could do about it anyway.
+        """
+        assert sa.UnreadableError.exit_code == sa.ExitCode.ERROR
+        # Carried by inheritance, so it cannot drift from the base.
+        assert "exit_code" not in sa.UnreadableError.__dict__
 
 
 class TestExceptionHierarchy(ExceptionHierarchyBase):

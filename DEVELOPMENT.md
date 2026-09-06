@@ -365,7 +365,7 @@ gated by platform checks.
   verify test), borg (the borgadm e2e suite), the pinned pandoc (the
   `test_render_docs` man-page gate, via `scripts/pandoc install`), and git (uv
   builds the repo-shared gate from a git source) -- and runs as a non-root
-  user (the secure_archiver permission test); the script header maps each dep
+  user (the secure_archiver permission tests); the script header maps each dep
   to the test that needs it. Booting systemd needs `--privileged` and the
   cgroup mount, so the container is more heavyweight than a plain `bash` one.
   It tests the committed HEAD, not the working tree.
