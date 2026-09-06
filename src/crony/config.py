@@ -574,13 +574,14 @@ class TomlJobGroup:
 
     Groups also don't carry `job-timeout-sec` -- timeouts are a
     per-leaf-job concern. A group's effective deadline is
-    auto-computed from its children (`resolved_group_timeout_sec`,
-    1.05 * sum of children's effective timeouts) and is not a
-    user-facing knob: it acts as defense-in-depth so each child
-    can hit its own per-job timeout before the parent's
-    cumulative deadline fires. A child that is itself uncapped
-    (`job-timeout-sec = 0`) makes the group uncapped too -- there is
-    no finite cumulative deadline that could bound it.
+    auto-computed from its children (`resolved_group_timeout_sec`:
+    1.05 * the sum of their effective timeouts, with a fixed dispatch
+    allowance standing in for each interactive child the group only
+    fires and never waits on) and is not a user-facing knob: it acts
+    as defense-in-depth so each child can hit its own per-job timeout
+    before the parent's cumulative deadline fires. A child that is
+    itself uncapped (`job-timeout-sec = 0`) makes the group uncapped
+    too -- there is no finite cumulative deadline that could bound it.
 
     `platforms` / `hosts` work the same way as on TomlJob: empty
     means "applies everywhere", non-empty restricts selection.
@@ -1106,9 +1107,11 @@ class TomlBundleConfig:
     ) -> int:
         """Auto-computed effective timeout for a group.
 
-        Returns 1.05 * sum of children's effective timeouts (jobs use
-        `resolved_job_timeout_sec`; sub-groups recurse into the same
-        computation). Floor at 1 second. Returns 0 ("no cap") if any
+        Returns 1.05 * the sum of what the group may spend on each
+        child: a job's effective timeout (`resolved_job_timeout_sec`),
+        a sub-group's own result of this computation, or the fixed
+        dispatch allowance (`_GROUP_DISPATCH_ALLOWANCE_SEC`) for an
+        interactive child. Floor at 1 second. Returns 0 ("no cap") if any
         selected, non-interactive child is itself uncapped
         (`job-timeout-sec = 0`, or a sub-group that resolved to 0) --
         an uncapped child can't be bounded by a finite cumulative
@@ -1122,9 +1125,12 @@ class TomlBundleConfig:
         filter excludes them or empty-group cascade demoted them) --
         the parent won't trigger them here, so the budget shouldn't
         reserve their time either. Interactive children (by their
-        resolved flags -- explicit or inherited) also contribute zero:
-        the group fires them async (no wait), so their `job-timeout-sec`
-        doesn't bound any actual wait inside `_run_group`.
+        resolved flags -- explicit or inherited) contribute the dispatch
+        allowance rather than their `job-timeout-sec`: the group fires
+        them async (no wait), so their timeout bounds no wait inside
+        `_run_group`, but the dispatch itself takes time -- and for a
+        group whose children are all interactive it is the only time
+        there is.
         """
         # Resolve the flag cascade once for the whole tree, then thread
         # it through the recursion. It is resolved from config rather
@@ -1148,6 +1154,7 @@ class TomlBundleConfig:
                 continue
             if child in self.jobs:
                 if JobFlags.INTERACTIVE in flag_map.get(child, JobFlags(0)):
+                    total += _GROUP_DISPATCH_ALLOWANCE_SEC
                     continue
                 child_timeout = self.resolved_job_timeout_sec(self.jobs[child])
             else:
@@ -2974,3 +2981,15 @@ def _mask_reason(
 # budget left to fire the siblings behind it. Compounds with nesting
 # depth, by design.
 _GROUP_TIMEOUT_PADDING: float = 1.05
+
+# Budget a group reserves for each interactive child. The group only
+# dispatches such a child -- one scheduler call, then on to the next --
+# so the child's own `job-timeout-sec` bounds no wait of the group's.
+# But the dispatch is not free, and a group whose children are all
+# interactive would otherwise have a budget of nothing. That budget is
+# also the cap the timeout guard enforces from the moment it spawns the
+# runner, so it has to cover the runner's own startup as well. Sized
+# well above what a dispatch takes (a fraction of a second), because the
+# scheduler call is unbounded and the runner's startup on a host that is
+# waking up is not.
+_GROUP_DISPATCH_ALLOWANCE_SEC: int = 30

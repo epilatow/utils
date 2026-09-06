@@ -1776,7 +1776,7 @@ class TestRunGroupInteractive:
         assert iv_rec["exit_code"] == 0
         assert rec["exit_class"] == "ok"
 
-    def test_group_budget_excludes_interactive_children(
+    def test_group_budget_excludes_interactive_child_timeouts(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -1806,11 +1806,12 @@ class TestRunGroupInteractive:
         )
         target = cfg.resolve_target("test-host", "darwin")
         budget = cfg.resolved_group_timeout_sec(target, "g")
-        # Only the non-interactive child contributes:
-        # 1.05 * 100 == 105.
-        assert budget == 105
+        # The interactive child contributes the fixed dispatch
+        # allowance (30), not its own timeout; the regular child its
+        # timeout: 1.05 * (100 + 30) == 136.
+        assert budget == 136
 
-    def test_group_budget_excludes_inherited_interactive_children(
+    def test_group_budget_excludes_inherited_interactive_child_timeouts(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A child interactive only via an inherited flag (here from
@@ -1838,9 +1839,88 @@ class TestRunGroupInteractive:
             default_target_jobs=["g"],
         )
         target = cfg.resolve_target("test-host", "darwin")
-        # iv is interactive via the defaults flag -> excluded; only
-        # regular (which overrides it off, 100) contributes: 1.05 * 100.
-        assert cfg.resolved_group_timeout_sec(target, "g") == 105
+        # iv is interactive via the defaults flag -> its 10_000 is
+        # replaced by the dispatch allowance (30); regular (which
+        # overrides it off, 100) contributes its timeout:
+        # 1.05 * (100 + 30) == 136.
+        assert cfg.resolved_group_timeout_sec(target, "g") == 136
+
+    def test_group_budget_reserves_dispatch_for_interactive_child(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A group whose only child is interactive waits on nothing, but
+        # it still has to start up and dispatch that child, and its
+        # budget is the cap the guard enforces on the whole run. It
+        # reserves the dispatch allowance (30) for that child rather
+        # than falling to the 1-second floor: 1.05 * 30 == 31.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "interactive": True,
+                        "job_timeout_sec": 10_000,
+                    },
+                },
+                "job-group": {
+                    "g": {"jobs": ["iv"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        target = cfg.resolve_target("test-host", "darwin")
+        assert cfg.resolved_group_timeout_sec(target, "g") == 31
+
+    def test_group_budget_uncapped_interactive_child_does_not_uncap(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # An interactive child's own timeout never reaches the budget,
+        # so an uncapped one (job_timeout_sec = 0) cannot uncap the
+        # group the way an uncapped waited-on child does. It still
+        # contributes the dispatch allowance: 1.05 * 30 == 31.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": "true",
+                        "interactive": True,
+                        "job_timeout_sec": 0,
+                    },
+                },
+                "job-group": {
+                    "g": {"jobs": ["iv"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["g"],
+        )
+        target = cfg.resolve_target("test-host", "darwin")
+        assert cfg.resolved_group_timeout_sec(target, "g") == 31
+
+    def test_group_budget_dispatch_allowance_propagates_through_subgroup(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A sub-group made only of interactive children carries the
+        # allowance up to its parent like any other child budget, with
+        # the padding compounding per level: leaf 1.05 * 30 == 31,
+        # root 1.05 * 31 == 32.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {"command": "true", "interactive": True},
+                },
+                "job-group": {
+                    "leaf": {"jobs": ["iv"]},
+                    "root": {"jobs": ["leaf"], "schedule": "daily"},
+                },
+            },
+            default_target_jobs=["root"],
+        )
+        target = cfg.resolve_target("test-host", "darwin")
+        assert cfg.resolved_group_timeout_sec(target, "leaf") == 31
+        assert cfg.resolved_group_timeout_sec(target, "root") == 32
 
     def test_group_budget_zero_when_child_uncapped(
         self, tmp_path: Path, monkeypatch: Any

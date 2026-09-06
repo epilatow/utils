@@ -932,10 +932,10 @@ class JobGroup(_JobCommon):
     time so a rename in config doesn't flip the parent's snapshot
     (the snapshot persists only the uuids -- the bundle is the
     parent's). The inherited `timeout` holds the cumulative deadline
-    (`1.05 x` the sum of the children's own caps) computed once at apply
-    time; the group runner enforces it and the guard backstops it. 0 means
-    no cap (some child is uncapped); the group runner treats it as an
-    infinite deadline.
+    the bundle config derives (`resolved_group_timeout_sec`), computed
+    once at apply time; the group runner enforces it and the guard
+    backstops it. 0 means no cap (some child is uncapped); the group
+    runner treats it as an infinite deadline.
     """
 
     children: list[crony.unit.EntityRef]
