@@ -291,6 +291,32 @@ def _exec_command(
     return _ExitOutcome(rc=rc, signal=None), timed_out
 
 
+def _signal_label(sig: int) -> str:
+    """`SIGTERM (15)` for a signal number this platform names, else
+    `signal 15`: a wait status can carry one `signal.Signals` does not
+    define here."""
+    try:
+        return f"{signal.Signals(sig).name} ({sig})"
+    except ValueError:
+        return f"signal {sig}"
+
+
+def _write_crony_line(log_file: IO[bytes], log_path: Path, text: str) -> None:
+    """Append `crony: <text>` to the run log as crony's own line. When
+    the log's last byte is not a newline -- a killed command's output is
+    cut off wherever the kill caught it -- start a fresh line first, so
+    the note is not glued onto the tail of the command's output.
+    `log_file` is the append-mode handle the command wrote through, open
+    for writing only, so that last byte is read back through `log_path`.
+    """
+    lead = b""
+    with open(log_path, "rb") as reader:
+        if reader.seek(0, os.SEEK_END) > 0:
+            reader.seek(-1, os.SEEK_END)
+            lead = b"" if reader.read(1) == b"\n" else b"\n"
+    log_file.write(lead + f"crony: {text}\n".encode())
+
+
 def _arm_guard() -> None:
     """Signal the guard that the command has started, so it clocks its cap
     from now rather than from the runner's launch. The guard published its
@@ -709,10 +735,27 @@ def _run_job(snap: crony.model.Job) -> int:
                     exit_code: int | None = None
                     sig = None
                     surfaced_rc = int(crony.errors.ExitCode.TIMEOUT)
+                    # Say so in the log too. A killed command's output just
+                    # stops, which is also what a command that printed
+                    # nothing looks like; the `crony:` prefix marks the
+                    # line as crony's rather than the command's.
+                    _write_crony_line(
+                        log_file,
+                        log_path,
+                        f"command exceeded the {snap.timeout}s timeout and "
+                        f"was killed",
+                    )
                 elif sig is not None:
                     exit_class = crony.model.ExitClass.SIGNAL
                     exit_code = None
                     surfaced_rc = 128 + sig
+                    # Same for any other signal death, the usual cause
+                    # being a stop the scheduler relayed through the guard.
+                    _write_crony_line(
+                        log_file,
+                        log_path,
+                        f"command was killed by {_signal_label(sig)}",
+                    )
                 elif rc == 0 or rc in snap.success_exit_codes:
                     # A code the job declares as success (exit 0, or
                     # a configured non-zero like borg's warning exit

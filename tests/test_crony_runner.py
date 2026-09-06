@@ -2363,29 +2363,6 @@ class TestKeepAwake:
             "true",
         ]
 
-    def test_run_job_records_timeout_when_guard_signals(
-        self, tmp_path: Path, monkeypatch: Any
-    ) -> None:
-        # _exec_command reporting timed_out=True (the guard's SIGUSR1
-        # hint) is recorded as a timeout, not as the signal death that
-        # actually stopped the command.
-        h = _RunnerHarness(tmp_path, monkeypatch)
-
-        def fake_exec(*_args: object, **_kwargs: object) -> Any:
-            return crony_runner._ExitOutcome(rc=0, signal=15), True
-
-        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
-        cfg = h.config(
-            {"job": {"j": {"command": "true", "schedule": "daily"}}},
-            default_target_jobs=["j"],
-        )
-        snap = h.snap(cfg, "j")
-        assert crony_runner._run_job(snap) == int(ExitCode.TIMEOUT)
-        rec = json.loads(
-            (snap.state_dir / "last-run.json").read_text(encoding="utf-8")
-        )
-        assert rec["exit_class"] == "timeout"
-
     def test_arm_guard_signals_the_guard_pid(self, monkeypatch: Any) -> None:
         # With a guard present (its pid in the env), arming signals exactly
         # that pid SIGUSR1 -- the runner telling the guard the command has
@@ -2458,6 +2435,123 @@ class TestKeepAwake:
         assert crony_runner._run_job(h.snap(cfg, "j")) == 0
         log = (h.state_dir("j") / "run.log").read_text(encoding="utf-8")
         assert "caffeinate not found" in log
+
+
+class TestRunJobKilled:
+    """What `_run_job` records and logs when the command did not exit on
+    its own: the guard's timeout kill, and any other signal death. The
+    log gets a `crony:` line for either, so a run that went quiet is not
+    mistaken for a command that printed nothing.
+    """
+
+    def test_run_job_records_timeout_when_guard_signals(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # _exec_command reporting timed_out=True (the guard's SIGUSR1
+        # hint) is recorded as a timeout, not as the signal death that
+        # actually stopped the command.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+
+        def fake_exec(*_args: object, **_kwargs: object) -> Any:
+            return crony_runner._ExitOutcome(rc=0, signal=15), True
+
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert crony_runner._run_job(snap) == int(ExitCode.TIMEOUT)
+        rec = json.loads(
+            (snap.state_dir / "last-run.json").read_text(encoding="utf-8")
+        )
+        assert rec["exit_class"] == "timeout"
+        # The log says crony killed it, naming the cap, so a run that
+        # ended in silence is not mistaken for one that printed nothing.
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert (
+            "crony: command exceeded the 1800s timeout and was killed\n" in log
+        )
+
+    def test_run_job_logs_a_signal_death(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A signal death with no timeout hint (a scheduler stop relayed by
+        # the guard, or anything else that signaled the command) is named
+        # in the log the same way, as crony's own line.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+
+        def fake_exec(*_args: object, **_kwargs: object) -> Any:
+            return crony_runner._ExitOutcome(rc=0, signal=15), False
+
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert crony_runner._run_job(snap) == 128 + 15
+        rec = json.loads(
+            (snap.state_dir / "last-run.json").read_text(encoding="utf-8")
+        )
+        assert rec["exit_class"] == "signal"
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "crony: command was killed by SIGTERM (15)\n" in log
+
+    def test_run_job_crony_line_starts_fresh_after_partial_output(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A kill catches the command wherever it was, often mid-line. The
+        # crony line still starts on a line of its own -- and adds no
+        # blank line when the output did end with a newline.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        tail = {"bytes": b"progress 42%"}
+
+        def fake_exec(*_args: object, **kwargs: Any) -> Any:
+            kwargs["log_file"].write(tail["bytes"])
+            return crony_runner._ExitOutcome(rc=0, signal=15), True
+
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        crony_runner._run_job(snap)
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "progress 42%\ncrony: command exceeded" in log
+
+        tail["bytes"] = b"done\n"
+        crony_runner._run_job(snap)
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "done\ncrony: command exceeded" in log
+        assert "done\n\ncrony:" not in log
+
+    def test_run_job_ok_writes_no_crony_line(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A clean exit gets no verdict line: the log of a healthy run is
+        # the header, the exec line, and the command's own output.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+
+        def fake_exec(*_args: object, **_kwargs: object) -> Any:
+            return crony_runner._ExitOutcome(rc=0, signal=None), False
+
+        monkeypatch.setattr(crony_runner, "_exec_command", fake_exec)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert crony_runner._run_job(snap) == 0
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "crony:" not in log
+
+    def test_signal_label_names_known_signals_only(self) -> None:
+        assert crony_runner._signal_label(15) == "SIGTERM (15)"
+        assert crony_runner._signal_label(9) == "SIGKILL (9)"
+        # A number the platform does not name still renders.
+        assert crony_runner._signal_label(250) == "signal 250"
 
 
 class TestFullDiskAccess:
