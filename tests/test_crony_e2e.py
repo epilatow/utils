@@ -282,6 +282,45 @@ class _CronyE2E:
                 return toks[1:]
         return None
 
+    def unit_running(self, short: str) -> bool:
+        """Whether the scheduler still counts `short`'s service as running,
+        and so has no exit to report for the launch yet -- the same states
+        the platform backend skips when it collects last exits, since that
+        is what status reconciles against the run's own record."""
+        if _IS_LINUX:
+            state = self.systemctl_user(
+                "is-active", f"crony-{self.full(short)}.service"
+            ).stdout.strip()
+            return state in ("active", "activating", "reloading")
+        listed = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, check=False
+        ).stdout
+        for line in listed.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[2] == self.darwin_label(short):
+                return parts[0].strip() not in ("-", "")
+        return False
+
+    def wait_for_recorded_status(self, full_name: str, want: str) -> None:
+        """Wait for `full_name`'s STATUS to read `want`, failing if it reads
+        `crashed` on the way. `crashed` is the verdict for a launch that
+        ended without a matching record, so a test waiting on an outcome
+        the run records must never see it -- not even before settling."""
+        seen: list[str | None] = []
+
+        def reached() -> bool:
+            cells = self.status_cells(full_name, "status")
+            seen.append(cells[0] if cells else None)
+            return seen[-1] == want
+
+        try:
+            self.wait_until(
+                reached, timeout=60, what=f"{full_name} to read {want}"
+            )
+        except AssertionError as e:
+            raise AssertionError(f"{e}; status went {seen}") from None
+        assert "crashed" not in seen, seen
+
     def inject_isolated_env(self, short: str, *, restart: bool) -> None:
         """Make the runner the scheduler spawns for `short` see this test's
         throwaway state tree, and reload its unit so the change takes.
@@ -892,20 +931,7 @@ class TestStopBeforeCommand:
     def _assert_stop_recorded(self, e2e: _CronyE2E, sd: Path) -> None:
         """Wait for status to read the stopped run `canceled`, failing if
         it ever reads `crashed` on the way, and check the record."""
-        seen: list[str | None] = []
-
-        def canceled() -> bool:
-            cells = e2e.status_cells(e2e.full("probe"), "status")
-            seen.append(cells[0] if cells else None)
-            return seen[-1] == "canceled"
-
-        try:
-            e2e.wait_until(
-                canceled, timeout=60, what="the stopped run to read canceled"
-            )
-        except AssertionError as e:
-            raise AssertionError(f"{e}; status went {seen}") from None
-        assert "crashed" not in seen, seen
+        e2e.wait_for_recorded_status(e2e.full("probe"), "canceled")
         rec = json.loads((sd / "last-run.json").read_text())
         assert rec["exit_class"] == "canceled"
         assert rec["signal"] == 15
@@ -943,6 +969,67 @@ class TestStopBeforeCommand:
             "stop", f"crony-{e2e.full('probe')}.service", check=True
         )
         self._assert_stop_recorded(e2e, sd)
+
+
+class TestStopOutlivedByTheRun:
+    """A capped run that outlives a scheduler stop and exits on its own --
+    here a command that traps the stop and exits 0 -- reads `ok`, never
+    `crashed`. The scheduler records the guard's exit as the launch's, so
+    the guard has to report the exit the run itself recorded rather than
+    the stop.
+
+    The stop has to leave the scheduler's record of the exit in place:
+    `launchctl kill` on launchd (a bootout would clear it) and `systemctl
+    stop` on systemd. Like `TestStopBeforeCommand`, the unit carries the
+    CRONY_* overrides so the run records into this test's state tree.
+    """
+
+    def test_trapped_stop_reads_ok(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(
+            "[job.probe]\n"
+            'command = \'trap "exit 0" TERM; echo started; '
+            "while :; do sleep 0.2; done'\n"
+            'schedule = "*-*-* 03:00"\n'
+            # Well clear of the waits below, so a stop that fails to land
+            # fails there rather than racing the cap into a timeout.
+            "job-timeout-sec = 300\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=False)
+        sd = e2e.state_dir / E2E_BUNDLE / "probe"
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: "started\n" in _read_text(sd / "run.log"),
+            timeout=60,
+            what="the triggered command to start",
+        )
+        if _IS_DARWIN:
+            subprocess.run(
+                [
+                    "launchctl",
+                    "kill",
+                    "SIGTERM",
+                    f"gui/{os.getuid()}/{e2e.darwin_label('probe')}",
+                ],
+                capture_output=True,
+                check=True,
+            )
+        else:
+            e2e.systemctl_user(
+                "stop", f"crony-{e2e.full('probe')}.service", check=True
+            )
+        # Status can read `ok` from the record alone before the scheduler
+        # has the launch's exit to hold against it; judge only after.
+        e2e.wait_until(
+            lambda: not e2e.unit_running("probe"),
+            timeout=60,
+            what="the stopped unit to exit",
+        )
+        e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["exit_class"] == "ok"
+        assert rec["process_exit"] == 0
 
 
 def _read_text(path: Path) -> str:

@@ -1005,8 +1005,9 @@ def _record_pre_command_stop(
 ) -> int:
     """Record a job run stopped by `signum` before its command started,
     and return the exit code the runner surfaces for it: 128 + `signum`,
-    the code a stopped guard exits with and a signal-killed command
-    surfaces, so the scheduler's view of the launch agrees with the record.
+    as for a signal-killed command. The runner exits the launch with it
+    (through any guard, which passes a run's own exit through), so the
+    scheduler's view of the launch agrees with the record.
 
     The run is `canceled` -- it never got to its command -- with the
     signal that stopped it and whatever gate result it had reached. It
@@ -1520,6 +1521,38 @@ def trigger_unit(
             )
 
 
+def _read_last_run(last_run_path: Path) -> dict[str, Any] | None:
+    """The last-run record on disk, whoever's run wrote it. None when it
+    is absent or unreadable."""
+    try:
+        parsed = json.loads(last_run_path.read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError:
+        return None
+    rec: dict[str, Any] | None = parsed if isinstance(parsed, dict) else None
+    return rec
+
+
+def _record_written_by(
+    last_run_path: Path, runner_pid: int
+) -> dict[str, Any] | None:
+    """The record `runner_pid` wrote, or None if it wrote none.
+
+    A runner records the pid it launched with, so this identifies its
+    result regardless of when the run ended. That is what `ended_at`
+    cannot do for a run that was already in flight when a waiter fired:
+    the platform coalesces the fire into that run, the waiter attaches to
+    it and waits it out, and it is the run it was promised -- but it may
+    well have ended before it ever asked, and a record is written after
+    its `ended_at` is stamped (a slow notify dispatch sits between them).
+    It is also how the guard tells a record its own run wrote from the one
+    an earlier launch left behind (`_run_recorded`).
+    """
+    rec = _read_last_run(last_run_path)
+    if rec is None or rec.get("pid") != runner_pid:
+        return None
+    return rec
+
+
 def trigger_unit_sync(
     full_name: str,
     *,
@@ -1615,19 +1648,6 @@ def trigger_unit_sync(
 
     started_at = time.monotonic()
 
-    def _read_record() -> dict[str, Any] | None:
-        """The last-run record on disk, whoever's run it is."""
-        if not last_run_path.exists():
-            return None
-        try:
-            parsed = json.loads(last_run_path.read_text(encoding="utf-8"))
-        except OSError, json.JSONDecodeError:
-            return None
-        rec: dict[str, Any] | None = (
-            parsed if isinstance(parsed, dict) else None
-        )
-        return rec
-
     def _fresh_record() -> dict[str, Any] | None:
         """This dispatch's completed record, or None if none has landed.
 
@@ -1636,7 +1656,7 @@ def trigger_unit_sync(
         here. `ended_at` must be at or after the pre-trigger timestamp:
         an older record belongs to some earlier run, not to ours.
         """
-        rec = _read_record()
+        rec = _read_last_run(last_run_path)
         if rec is None:
             return None
         ended_at = rec.get("ended_at")
@@ -1647,22 +1667,6 @@ def trigger_unit_sync(
         except ValueError:
             return None
         return rec if ended_dt >= pre_trigger_dt else None
-
-    def _record_written_by(runner_pid: int) -> dict[str, Any] | None:
-        """The record `runner_pid` wrote, or None if it wrote none.
-
-        A runner records the pid it launched with, so this identifies its
-        result regardless of when the run ended. That is what `ended_at`
-        cannot do for a run that was already in flight when we fired: the
-        platform coalesces the fire into that run, we attach to it and
-        wait it out, and it is the run we were promised -- but it may well
-        have ended before we ever asked, and a record is written after its
-        `ended_at` is stamped (a slow notify dispatch sits between them).
-        """
-        rec = _read_record()
-        if rec is None or rec.get("pid") != runner_pid:
-            return None
-        return rec
 
     def _live_runner_pid() -> int | None:
         """The pid of a live runner holding this job's lock, else None.
@@ -1723,7 +1727,9 @@ def trigger_unit_sync(
             # already in flight when we fired is the run we attached to
             # and waited out, so its result is ours to return even though
             # it ended before we asked for it.
-            rec = _fresh_record() or _record_written_by(saw_runner)
+            rec = _fresh_record() or _record_written_by(
+                last_run_path, saw_runner
+            )
             if rec is not None:
                 return rec
             raise crony.errors.RunnerCrashed(
@@ -1845,9 +1851,11 @@ _REAP_POLL_SEC = 0.1
 def _guard_state_dir(argv: list[str]) -> Path | None:
     """The guarded run's state dir, from the ref at the tail of `argv`.
 
-    Used only to drop a killed-flag on a timeout SIGKILL; None when the
-    ref does not parse, so the guard skips the flag rather than failing
-    the kill.
+    The guard reads the run's pid and record there to tell what became of
+    it (`_run_recorded`), and drops a killed-flag there on a timeout
+    SIGKILL. None when the ref does not parse: the guard then kills and
+    reports on what it can see itself rather than failing the kill, so
+    such a run is never credited with a record and never flagged.
     """
     if not argv:
         return None
@@ -1858,14 +1866,19 @@ def _guard_state_dir(argv: list[str]) -> Path | None:
 
 
 def _read_runner_pid(sd: Path | None) -> int | None:
-    """The runner's own pid from `sd/run.pid`, the target for the timeout
-    hint. The session leader (`proc.pid`) is the intervening `uv run`
-    process, not the runner, so a single-process signal has to go here
-    instead. None when the state dir or file is absent or unparsable. The
-    file persists across runs, so a runner that timed out before writing
-    its own pid would yield a prior run's -- the caller confirms the pid
-    is a live member of this run's group (`_in_process_group`) before
-    signalling it."""
+    """The runner's own pid from `sd/run.pid`. None when the state dir or
+    file is absent or unparsable.
+
+    It is the target for the timeout hint -- the session leader
+    (`proc.pid`) is the intervening `uv run` process, not the runner, so a
+    single-process signal has to go here instead -- and the identity a
+    record has to carry to be this run's (`_run_recorded`).
+
+    The file persists across runs, so a runner that died before writing
+    its own pid leaves a prior run's here. Each caller settles that for
+    itself: the hint confirms the pid is a live member of this run's group
+    (`_in_process_group`) before signalling it, and the record check
+    compares it against what the file held before the run started."""
     if sd is None:
         return None
     try:
@@ -1905,12 +1918,32 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
+def _run_recorded(sd: Path | None, launch_pid: int | None) -> bool:
+    """Whether the run the guard launched wrote a record of its own.
+
+    The runner publishes its pid in run.pid and stamps that same pid on the
+    record it writes at exit, so the two agreeing is what says the run
+    recorded -- the agreement status itself reconciles (`runtime._crashed`).
+    `launch_pid` is what run.pid held before the run started: run.pid
+    persists across runs, so a file still holding it belongs to an earlier
+    launch, not this one. A run with no state dir to read (`sd` None,
+    an unparsable ref) can never be shown to have recorded.
+    """
+    if sd is None:
+        return False
+    runner_pid = _read_runner_pid(sd)
+    if runner_pid is None or runner_pid == launch_pid:
+        return False
+    return _record_written_by(sd / "last-run.json", runner_pid) is not None
+
+
 def _reap_session(
     proc: subprocess.Popen[bytes],
     pgid: int,
     sd: Path | None,
     *,
     timed_out: bool,
+    launch_pid: int | None,
 ) -> None:
     """Wait the grace for the whole session to drain on the signal it was
     just sent, then SIGKILL anything still in it -- a runner that will not
@@ -1918,9 +1951,9 @@ def _reap_session(
     the kill (the runner's exit alone is not proof the session is gone: a
     descendant that traps the signal outlives the runner that records and
     exits). `proc.poll()` reaps the runner's `uv` as it exits so a zombie
-    leader does not keep the group looking alive. On a timeout kill where
-    the runner itself had to be SIGKILLed before it could record, drop the
-    killed-flag so status still reads the run as a timeout.
+    leader does not keep the group looking alive. On a timeout kill that
+    reaped a run which never recorded, drop the killed-flag so status still
+    reads the run as a timeout rather than a bare crash.
     """
     deadline = time.monotonic() + _KILL_GRACE_SEC
     while time.monotonic() < deadline:
@@ -1929,13 +1962,43 @@ def _reap_session(
             break
         time.sleep(_REAP_POLL_SEC)
     if _group_alive(pgid):
-        runner_recorded = proc.poll() is not None
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, signal.SIGKILL)
-        if timed_out and not runner_recorded and sd is not None:
+        if timed_out and sd is not None and not _run_recorded(sd, launch_pid):
             with contextlib.suppress(OSError):
                 (sd / "killed.flag").write_text("timeout\n", encoding="utf-8")
     proc.wait()
+
+
+def _killed_run_exit(
+    proc: subprocess.Popen[bytes], verdict: int, *, recorded: bool
+) -> int:
+    """The code the guard exits with once `_reap_session` has reaped a run
+    it stopped or timed out.
+
+    The scheduler records the guard's exit as the launch's, and status
+    reads a mismatch with the recorded `process_exit` as a crash. So a run
+    that recorded an outcome has its own exit code passed through: that code
+    is the one it recorded -- the stop or timeout it took, or an outcome
+    decided before the signal arrived (a gated skip, a command that trapped
+    the stop and exited 0, a group that finished inside the grace). A run
+    that recorded nothing leaves the guard's own `verdict` to speak for the
+    launch, which is all status will have of it.
+
+    The exit code alone cannot stand in for that: the runner runs under
+    `uv`, which reports a signal-killed runner as an ordinary exit of
+    128 + the signal rather than dying itself, so a killed run and one that
+    chose that code are indistinguishable by code.
+
+    A leader that did die on a signal (`rc < 0`) -- the grace's SIGKILL
+    reaching `uv` itself -- leaves no code to pass on and means the run was
+    still going, so the verdict stands there whatever is on disk. `rc` is
+    never None: `_reap_session` waits the leader out before this runs.
+    """
+    rc = proc.returncode
+    if not recorded or rc is None or rc < 0:
+        return verdict
+    return rc
 
 
 def do_run_guard(cap: int, argv: list[str]) -> None:
@@ -1967,6 +2030,11 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
       hint, so the runner records a stop: `canceled` when its command had
       not started yet, else the command's plain signal death; no flag.
 
+    Either way the guard then exits with the run's own exit code when the
+    run recorded an outcome, and with the timeout code or 128 + the stop
+    signal when it recorded none (`_killed_run_exit`). A run that meets
+    neither a timeout nor a stop passes its code straight through.
+
     Because the runner survives the SIGTERM to record and then exits, its
     exit is the signal that the session is dead; the guard waits on the
     runner throughout -- no process-group polling.
@@ -1980,6 +2048,10 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     if interactive:
         argv = argv[1:]
     sd = _guard_state_dir(argv)
+    # What run.pid held before this run started. run.pid persists across
+    # runs, so it is the only way to tell a pid this run published from the
+    # leftover of an earlier one (`_run_recorded`).
+    launch_pid = _read_runner_pid(sd)
     pgid: int | None = None
     stop_signum: int | None = None
     deadline: float | None = None
@@ -2022,8 +2094,16 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
         if stop_signum is not None:
             # The stop was already relayed into the session; escalate to
             # SIGKILL if it does not die. Not a timeout: no hint, no flag.
-            _reap_session(proc, pgid, sd, timed_out=False)
-            raise SystemExit(128 + stop_signum)
+            _reap_session(
+                proc, pgid, sd, timed_out=False, launch_pid=launch_pid
+            )
+            raise SystemExit(
+                _killed_run_exit(
+                    proc,
+                    128 + stop_signum,
+                    recorded=_run_recorded(sd, launch_pid),
+                )
+            )
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
             runner_pid = _read_runner_pid(sd)
@@ -2033,8 +2113,14 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             time.sleep(_TIMEOUT_HINT_SETTLE_SEC)
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signal.SIGTERM)
-            _reap_session(proc, pgid, sd, timed_out=True)
-            raise SystemExit(int(crony.errors.ExitCode.TIMEOUT))
+            _reap_session(proc, pgid, sd, timed_out=True, launch_pid=launch_pid)
+            raise SystemExit(
+                _killed_run_exit(
+                    proc,
+                    int(crony.errors.ExitCode.TIMEOUT),
+                    recorded=_run_recorded(sd, launch_pid),
+                )
+            )
         wait_for = (
             _GUARD_POLL_SEC
             if remaining is None
@@ -2048,8 +2134,16 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             # A stop landed while we were waiting and its relay already let
             # the runner exit; still reap the session so a descendant that
             # ignored the relayed signal does not outlive the guard.
-            _reap_session(proc, pgid, sd, timed_out=False)
-            raise SystemExit(128 + stop_signum)
+            _reap_session(
+                proc, pgid, sd, timed_out=False, launch_pid=launch_pid
+            )
+            raise SystemExit(
+                _killed_run_exit(
+                    proc,
+                    128 + stop_signum,
+                    recorded=_run_recorded(sd, launch_pid),
+                )
+            )
         raise SystemExit(rc if rc >= 0 else 128 - rc)
 
 

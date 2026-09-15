@@ -4034,8 +4034,8 @@ class TestRunJobInteractive:
         assert not (sd / "user-trigger.flag").exists()
 
 
-def _run_guard_in_child(cap: int, argv: list[str]) -> int:
-    """Run `do_run_guard` in a forked child and return its exit code.
+def _fork_guard(cap: int, argv: list[str]) -> int:
+    """Start `do_run_guard` in a forked child and return its pid.
 
     Forking isolates the guard's signal-handler installation from the
     pytest process, which would otherwise inherit the SIGTERM/SIGINT/
@@ -4049,13 +4049,78 @@ def _run_guard_in_child(cap: int, argv: list[str]) -> int:
             code = exc.code if isinstance(exc.code, int) else 0
             os._exit(code)
         os._exit(0)
+    return pid
+
+
+def _run_guard_in_child(cap: int, argv: list[str]) -> int:
+    """Run a forked `do_run_guard` to completion and return its exit
+    code."""
+    _, status = os.waitpid(_fork_guard(cap, argv), 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def _stop_guard_in_child(argv: list[str], ready: Path, sig: int) -> int:
+    """Run a forked `do_run_guard`, send it `sig` once the run has created
+    `ready`, and return the guard's exit code. The cap is well beyond the
+    test, so the stop is the only thing that ends the run early."""
+    pid = _fork_guard(300, argv)
+    for _ in range(50):
+        if ready.exists():
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        pytest.fail(f"the run never created {ready}")
+    os.kill(pid, sig)
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status)
 
 
+def _guard_state_dir(
+    tmp_path: Path, monkeypatch: Any, *, prior_run_pid: int | None = None
+) -> tuple[Path, str]:
+    """A state dir for a guarded run, and the `<bundle>:<uuid>` ref that
+    addresses it -- what the guard resolves the dir from, at the tail of
+    its argv.
+
+    `prior_run_pid` seeds the run.pid and record an earlier run left
+    behind: both persist, so every run after an entity's first starts with
+    a pair already agreeing on some other launch's pid.
+    """
+    monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
+    uid = "11111111-2222-3333-4444-555555555555"
+    sd = tmp_path / "default" / uid
+    sd.mkdir(parents=True)
+    if prior_run_pid is not None:
+        (sd / "run.pid").write_text(f"{prior_run_pid}\n", encoding="utf-8")
+        (sd / "last-run.json").write_text(
+            json.dumps({"pid": prior_run_pid, "process_exit": 143}),
+            encoding="utf-8",
+        )
+    return sd, f"default:{uid}"
+
+
+def _publish_pid_sh(sd: Path) -> str:
+    """Shell that publishes the runner pid to run.pid, as a runner does at
+    lock acquisition."""
+    return f"echo $$ > {sd / 'run.pid'}; "
+
+
+def _record_run_sh(sd: Path) -> str:
+    """Shell defining `record <process_exit>`: it writes the last-run
+    record a runner writes as it exits, carrying the runner's own pid."""
+    return (
+        "record() { "
+        f'printf \'{{"pid": %s, "process_exit": %s}}\' "$$" "$1" '
+        f"> {sd / 'last-run.json'}; }}; "
+    )
+
+
 class TestDoRunGuard:
-    """The timeout guard: propagate a normal exit, and kill the whole run
-    group (not just the direct child) on overrun."""
+    """The timeout guard: propagate a normal exit, kill the whole run
+    group (not just the direct child) on overrun or a relayed stop, and
+    report the run's own exit when it outlives that signal."""
 
     def test_propagates_success(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 0"]) == 0
@@ -4143,20 +4208,8 @@ class TestDoRunGuard:
             "-c",
             f"sleep 30 & echo $! > {pidfile}; touch {ready}; wait",
         ]
-        pid = os.fork()
-        if pid == 0:
-            try:
-                crony_runner.do_run_guard(300, argv)
-            except SystemExit as exc:
-                os._exit(exc.code if isinstance(exc.code, int) else 0)
-            os._exit(0)
-        for _ in range(50):
-            if ready.exists():
-                break
-            time.sleep(0.1)
+        _stop_guard_in_child(argv, ready, signal.SIGTERM)
         gc_pid = int(pidfile.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
-        os.waitpid(pid, 0)
         for _ in range(50):
             try:
                 os.kill(gc_pid, 0)
@@ -4165,6 +4218,53 @@ class TestDoRunGuard:
             time.sleep(0.1)
         else:
             pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
+
+    @pytest.mark.parametrize("code", [0, 3])
+    def test_stop_passes_through_the_exit_a_run_recorded(
+        self, tmp_path: Path, monkeypatch: Any, code: int
+    ) -> None:
+        # A run that outlives the relayed stop and records an outcome -- a
+        # command that trapped the stop, a runner that had already decided
+        # its outcome -- exits with the code it recorded, so the guard
+        # reports that rather than the stop the scheduler would otherwise
+        # hold against the record.
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        ready = tmp_path / "ready"
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                _publish_pid_sh(sd)
+                + _record_run_sh(sd)
+                + f"trap 'record {code}; exit {code}' TERM; touch {ready}; "
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _stop_guard_in_child(argv, ready, signal.SIGTERM) == code
+
+    def test_stop_reports_the_signal_for_a_run_that_recorded_nothing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A run killed by the relayed stop records nothing, so the guard's
+        # own verdict is all the scheduler gets -- and `uv` reporting the
+        # runner's signal death as an ordinary 128 + signal exit cannot be
+        # told from a run that chose that code, so the code is not passed
+        # through.
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        ready = tmp_path / "ready"
+        argv = [
+            "/bin/sh",
+            "-c",
+            _publish_pid_sh(sd) + f"touch {ready}; exec sleep 30",
+            "_",
+            ref,
+        ]
+        assert (
+            _stop_guard_in_child(argv, ready, signal.SIGTERM)
+            == 128 + signal.SIGTERM
+        )
 
     def test_timeout_delivers_sigusr1_hint(
         self, tmp_path: Path, monkeypatch: Any
@@ -4179,24 +4279,125 @@ class TestDoRunGuard:
         # to fire before the SIGTERM. The real Python runner handles the
         # signal immediately, so this deferral is the shell's alone.
         monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 1.0)
-        monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
-        uid = "11111111-2222-3333-4444-555555555555"
-        sd = tmp_path / "default" / uid
-        sd.mkdir(parents=True)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         marker = tmp_path / "got-usr1"
         argv = [
             "/bin/sh",
             "-c",
             (
-                f"echo $$ > {sd / 'run.pid'}; "
-                f'trap "touch {marker}; exit 7" USR1; '
-                "while :; do sleep 0.1; done"
+                _publish_pid_sh(sd)
+                + f'trap "touch {marker}; exit 7" USR1; '
+                + "while :; do sleep 0.1; done"
             ),
             "_",
-            f"default:{uid}",
+            ref,
         ]
+        # The trap exits 7 without recording, so the timeout verdict stands.
         assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
         assert marker.is_file()
+
+    def test_timeout_passes_through_the_exit_a_run_recorded(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A run that records on its way out of a timeout kill -- what the
+        # runner does with the hint -- exits with the code it recorded, and
+        # that is what the scheduler must see.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 1.0)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                _publish_pid_sh(sd)
+                + _record_run_sh(sd)
+                + "trap 'record 0; exit 0' USR1; "
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _run_guard_in_child(1, argv) == 0
+
+    def test_timeout_reports_timeout_for_a_run_uv_reports_as_exited(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The guard's child is `uv run`, which forwards the kill and then
+        # reports the runner's signal death as an ordinary exit of
+        # 128 + signal rather than dying itself. Such a run recorded
+        # nothing, so the timeout verdict has to survive that exit code --
+        # otherwise status reconciles the launch against the previous run's
+        # record and shows its stale outcome.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                _publish_pid_sh(sd)
+                # Ignore the hint, as a runner whose SIGUSR1 handling is
+                # not yet in place does; the kill is what ends this run.
+                + 'trap "" USR1; '
+                + f'trap "exit {128 + signal.SIGTERM}" TERM; '
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+
+    def test_timeout_ignores_a_record_this_run_did_not_write(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # run.pid and the record both outlive the run that wrote them, so
+        # every run after the first starts with a pair agreeing on an
+        # earlier launch's pid. A run killed before publishing a pid of its
+        # own must not be credited with that record -- its exit would then
+        # read as an outcome it never recorded.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch, prior_run_pid=999999)
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                # Publishes no pid, and reports the exit `uv` reports for a
+                # runner killed by the guard -- which is the code the
+                # seeded record carries.
+                'trap "" USR1; '
+                + f'trap "exit {128 + signal.SIGTERM}" TERM; '
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        assert crony_runtime.read_pid_file(sd / "run.pid") == 999999
+
+    def test_timeout_sigkill_flags_a_run_its_leader_outlived(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The leader is `uv`, which reports a killed runner's signal death
+        # as an ordinary exit rather than dying with it, so its having
+        # exited says nothing about whether the run recorded. Here it exits
+        # that way, a descendant survives the grace, and nothing was
+        # recorded: the flag is what tells status this was a timeout.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                _publish_pid_sh(sd)
+                + "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
+                + 'trap "" USR1; '
+                + f'trap "exit {128 + signal.SIGTERM}" TERM; '
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        assert (sd / "killed.flag").is_file()
 
     def test_timeout_sigkill_writes_killed_flag(
         self, tmp_path: Path, monkeypatch: Any
@@ -4206,22 +4407,47 @@ class TestDoRunGuard:
         # so status can read the SIGKILLed, never-recorded run as a timeout.
         monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
         monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
-        monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
-        uid = "12345678-9abc-def0-1234-56789abcdef0"
-        sd = tmp_path / "default" / uid
-        sd.mkdir(parents=True)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
             "/bin/sh",
             "-c",
             (
-                f"echo $$ > {sd / 'run.pid'}; "
-                'trap "" TERM USR1; while true; do sleep 1; done'
+                _publish_pid_sh(sd)
+                + 'trap "" TERM USR1; while true; do sleep 1; done'
             ),
             "_",
-            f"default:{uid}",
+            ref,
         ]
         assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
         assert (sd / "killed.flag").is_file()
+
+    def test_timeout_sigkill_leaves_no_flag_for_a_recorded_run(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The flag names a run that never recorded. A run whose runner
+        # recorded and exited, leaving only a signal-ignoring descendant for
+        # the SIGKILL to reap, has its own record to report -- flagging it a
+        # timeout would overrule that record.
+        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                _publish_pid_sh(sd)
+                + _record_run_sh(sd)
+                + "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
+                + 'trap "" USR1; '
+                + f"trap 'record {int(ExitCode.TIMEOUT)}; "
+                + f"exit {int(ExitCode.TIMEOUT)}' TERM; "
+                + "while :; do sleep 0.1; done"
+            ),
+            "_",
+            ref,
+        ]
+        assert _run_guard_in_child(1, argv) == int(ExitCode.TIMEOUT)
+        assert not (sd / "killed.flag").exists()
 
     def test_interactive_does_not_time_out_before_arm(self) -> None:
         # An interactive guard leaves the pre-command wait unbounded: with
