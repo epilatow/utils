@@ -10,6 +10,7 @@ Comprehensive unit tests for secure_archiver
 """
 
 import json
+import subprocess
 import sys
 import tomllib
 import uuid
@@ -1843,6 +1844,146 @@ class TestCommandExecution:
             sa.stage_op_ref(
                 tmp_path, "test.txt", "op://vault/item", seen_names=seen
             )
+
+
+# The two forms the 1Password CLI reports a client-setup timeout in, and
+# the forms it reports an unanswered and a dismissed authorization prompt
+# in -- failures that must not be retried.
+_OP_DEADLINE_STDERR = (
+    "[ERROR] 2026/09/14 18:52:01 could not read secret 'op://v/i/f': "
+    "error initializing client: read: context deadline exceeded\n"
+)
+_OP_CONNECT_STDERR = (
+    "[ERROR] 2026/09/14 18:52:01 error initializing client: "
+    "connecting to desktop app: connecting to desktop app timed out\n"
+)
+_OP_AUTH_TIMEOUT_STDERR = (
+    "[ERROR] 2026/09/14 22:58:40 could not read secret 'op://v/i/f': "
+    "error initializing client: authorization timeout\n"
+)
+_OP_AUTH_DISMISSED_STDERR = (
+    "[ERROR] 2026/09/14 22:58:40 could not read secret 'op://v/i/f': "
+    "error initializing client: authorization prompt dismissed, "
+    "please try again\n"
+)
+_OP_NOT_RETRIED_STDERRS = [
+    _OP_AUTH_TIMEOUT_STDERR,
+    _OP_AUTH_DISMISSED_STDERR,
+    "[ERROR] error initializing client: authorization timed out\n",
+    "[ERROR] could not read secret 'op://v/i/f': item not found\n",
+]
+
+
+def _op_failure(stderr: str, stdout: str = "") -> sa.SubprocessError:
+    return sa.SubprocessError(1, ["op", "read", "op://v/i/f"], stdout, stderr)
+
+
+def _op_success(stdout: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["op"], 0, stdout, "")
+
+
+class TestRunOp:
+    """Test the retrying 1Password CLI runner."""
+
+    @pytest.mark.parametrize(
+        ("stderr", "expected"),
+        [
+            (_OP_DEADLINE_STDERR, True),
+            (_OP_CONNECT_STDERR, True),
+            *((stderr, False) for stderr in _OP_NOT_RETRIED_STDERRS),
+            ("read: context deadline exceeded\n", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_client_timeout_detection(
+        self, stderr: str | None, expected: bool
+    ) -> None:
+        """Test only a client-setup timeout counts as a stall."""
+        assert sa.op_client_timed_out(stderr) is expected
+
+    @pytest.mark.parametrize(
+        "stderr", [_OP_DEADLINE_STDERR, _OP_CONNECT_STDERR]
+    )
+    @patch("secure_archiver.time.sleep", autospec=True)
+    @patch("secure_archiver.run_cmd", autospec=True)
+    def test_retries_client_timeout(
+        self,
+        mock_run_cmd: MagicMock,
+        mock_sleep: MagicMock,
+        stderr: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Test a client-setup timeout is retried and then succeeds."""
+        mock_run_cmd.side_effect = [_op_failure(stderr), _op_success("v\n")]
+
+        result = sa.run_op(["read", "op://v/i/f"])
+
+        assert result.stdout == "v\n"
+        assert mock_run_cmd.call_count == 2
+        mock_sleep.assert_called_once_with(sa._OP_RETRY_DELAY_SECONDS)
+        err = capsys.readouterr().err
+        assert f"(attempt 1/{sa._OP_ATTEMPTS})" in err
+        assert "error initializing client" in err
+
+    @pytest.mark.parametrize("stderr", _OP_NOT_RETRIED_STDERRS)
+    @patch("secure_archiver.time.sleep", autospec=True)
+    @patch("secure_archiver.run_cmd", autospec=True)
+    def test_other_failure_raises_at_once(
+        self, mock_run_cmd: MagicMock, mock_sleep: MagicMock, stderr: str
+    ) -> None:
+        """Test a failure that is not a client-setup timeout is not retried."""
+        mock_run_cmd.side_effect = [_op_failure(stderr), _op_success("v\n")]
+
+        with pytest.raises(sa.SubprocessError) as excinfo:
+            sa.run_op(["read", "op://v/i/f"])
+
+        assert excinfo.value.stderr == stderr
+        assert mock_run_cmd.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("secure_archiver.time.sleep", autospec=True)
+    @patch("secure_archiver.run_cmd", autospec=True)
+    def test_gives_up_after_last_attempt(
+        self,
+        mock_run_cmd: MagicMock,
+        mock_sleep: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Test a timeout on every attempt raises after the last one."""
+        mock_run_cmd.side_effect = _op_failure(_OP_DEADLINE_STDERR)
+
+        with pytest.raises(sa.SubprocessError, match="context deadline"):
+            sa.run_op(["read", "op://v/i/f"])
+
+        assert mock_run_cmd.call_count == sa._OP_ATTEMPTS
+        assert mock_sleep.call_count == sa._OP_ATTEMPTS - 1
+        err = capsys.readouterr().err
+        assert err.count("retrying in") == sa._OP_ATTEMPTS - 1
+
+    @pytest.mark.parametrize(
+        "stderr", [_OP_DEADLINE_STDERR, _OP_AUTH_TIMEOUT_STDERR]
+    )
+    @patch("secure_archiver.time.sleep", autospec=True)
+    @patch("secure_archiver.run_cmd", autospec=True)
+    def test_error_never_carries_stdout(
+        self,
+        mock_run_cmd: MagicMock,
+        _mock_sleep: MagicMock,
+        stderr: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Test stdout is dropped from the raised error and retry notes."""
+        mock_run_cmd.side_effect = _op_failure(stderr, stdout="SECRET-OUT")
+
+        with pytest.raises(sa.SubprocessError) as excinfo:
+            sa.run_op(["read", "op://v/i/f"])
+
+        assert excinfo.value.stdout is None
+        assert "SECRET-OUT" not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        assert "SECRET-OUT" not in capsys.readouterr().err
 
 
 class TestUtilityFunctions:

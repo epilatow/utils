@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import tomllib
 import uuid
 from collections.abc import Callable, Iterable, Sequence
@@ -466,8 +467,64 @@ def ensure_tools() -> None:
             raise RuntimeError(f"Required tool not found in PATH: {tool}")
 
 
+# Setting up the `op` client -- its connection to the 1Password app,
+# where the CLI uses one -- occasionally stalls past the CLI's own short
+# deadline even while the other end is answering; the same call made
+# again moments later goes through.
+_OP_ATTEMPTS = 3
+_OP_RETRY_DELAY_SECONDS = 2
+
+
+def op_client_timed_out(stderr: str | None) -> bool:
+    """
+    Whether an `op` failure is the CLI timing out while setting up its
+    client.
+
+    Matches the two forms the CLI reports that timeout in: a deadline
+    exceeded mid-setup, and a connection to the desktop app that timed
+    out. Every other failure -- an unknown reference, a dismissed or
+    unanswered authorization prompt -- is a real answer, not a stall.
+    """
+    if not stderr or "error initializing client" not in stderr:
+        return False
+    return (
+        "context deadline exceeded" in stderr
+        or "connecting to desktop app timed out" in stderr
+    )
+
+
+def run_op(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """
+    Run `op` with `args`, retrying a client-setup timeout.
+
+    Up to _OP_ATTEMPTS attempts, _OP_RETRY_DELAY_SECONDS apart, each
+    retry noted on stderr; any other failure raises on its first
+    attempt. A raised SubprocessError never carries the command's
+    stdout, which for `op` is secret material, and has no chained or
+    context exception that does.
+    """
+    cmd = ["op", *args]
+    attempt = 1
+    while True:
+        try:
+            return run_cmd(cmd)
+        except SubprocessError as e:
+            error = SubprocessError(e.returncode, e.cmd, None, e.stderr)
+        # Raised here rather than inside the except block, which would
+        # leave the stdout-carrying error attached as __context__.
+        if attempt >= _OP_ATTEMPTS or not op_client_timed_out(error.stderr):
+            raise error
+        eprint(
+            "1Password CLI timed out setting up its client "
+            f"(attempt {attempt}/{_OP_ATTEMPTS}); retrying in "
+            f"{_OP_RETRY_DELAY_SECONDS}s:\n{error}"
+        )
+        time.sleep(_OP_RETRY_DELAY_SECONDS)
+        attempt += 1
+
+
 def op_read(secret_ref: str) -> str:
-    cp = run_cmd(["op", "read", secret_ref])
+    cp = run_op(["read", secret_ref])
     return cp.stdout.rstrip("\n")
 
 
