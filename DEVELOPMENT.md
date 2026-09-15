@@ -336,13 +336,14 @@ gated by platform checks.
   (the supervisor's restart backoff), so a restart lands in seconds instead of
   the 30s production default. It is baked into the rendered unit, so it must
   stay set for the whole test -- including any `crony status` call, which
-  would otherwise report drift. The retry-budget test needs one thing the env
-  seams cannot give it: a unit the *scheduler* spawns reads the operator's
-  real state tree, because a rendered unit deliberately does not inherit the
-  CLI process's `CRONY_*` overrides. It rewrites the installed unit to carry
-  those overrides and reloads it, so the scheduler-spawned runner keeps its
-  persistent state inside the throwaway namespace. That rewrite is drift, so
-  such a test cannot also assert on the CONFIG column.
+  would otherwise report drift. The retry-budget test, and the tests that stop
+  a triggered run in its gate and check it reads `canceled`, need one thing
+  the env seams cannot give them: a unit the *scheduler* spawns reads the
+  operator's real state tree, because a rendered unit deliberately does not
+  inherit the CLI process's `CRONY_*` overrides. They rewrite the installed
+  unit to carry those overrides and reload it, so the scheduler-spawned runner
+  keeps its persistent state inside the throwaway namespace. That rewrite is
+  drift, so such a test cannot also assert on the CONFIG column.
 
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm

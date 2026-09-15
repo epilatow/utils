@@ -1498,7 +1498,9 @@ class JobStatus(_DescribedStrEnum):
         ExitClass.CANCELED,
         (
             "Jobs and groups. A run canceled or skipped before its command "
-            "ran -- for an interactive job, one the user declined."
+            "ran -- for an interactive job, one the user declined. A job "
+            "stopped before its command started (its unit stopped or "
+            "reloaded during its gate or interactive wait) is canceled too."
         ),
     )
     CRASHED = (
@@ -1715,7 +1717,10 @@ class _CommonRunResult:
 class JobRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed job run. Its
     `process_exit` is 0 for ok / gated / canceled, the job's own code
-    for fail, the timeout code, or 128+sig for a signal-killed child.
+    for fail, the timeout code, or 128+sig for a signal-killed child. A
+    run stopped by a signal before its command started is `canceled` too,
+    but carries that signal and a `process_exit` of 128+sig, with no
+    `exit_code`.
 
     A daemon's `process_exit` is instead what the supervisor is being
     told to do, so an ok run carries `ExitCode.DAEMON_EXITED` (restart

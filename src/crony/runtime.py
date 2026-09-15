@@ -168,9 +168,13 @@ def _crashed(
     unit_last_exit: crony.platform.UnitLastExit | None,
 ) -> bool:
     """True when a launch ended without recording its own result --
-    killed by a signal (OOM, jetsam, a manual kill, macOS
-    OS_REASON_CODESIGNING, launchd unloading the unit) or exited before
-    the runner wrote `last-run.json`. Two independent signals:
+    killed by a signal the runner does not outlive (OOM, jetsam, a
+    SIGKILL, macOS OS_REASON_CODESIGNING, a stop that reached it before
+    its stop handling was in place, or a stopped run SIGKILLed for
+    overrunning its grace) or exited before the runner wrote
+    `last-run.json`. A stop the runner does outlive -- launchd unloading
+    the unit, a manual stop -- it records like any other outcome. Two
+    independent signals:
 
     - run.pid naming a different pid than the last record wrote: the
       last-started launch reached launch (wrote run.pid) but never wrote

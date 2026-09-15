@@ -7,17 +7,22 @@
 
 """Unit tests for crony.runner."""
 
+import dataclasses
 import datetime
 import json
 import math
 import os
+import shlex
 import signal
+import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -2554,6 +2559,378 @@ class TestRunJobKilled:
         assert crony_runner._signal_label(250) == "signal 250"
 
 
+_STOPS = pytest.mark.parametrize(
+    "sig",
+    [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
+    ids=lambda s: s.name,
+)
+
+
+class TestRunJobStoppedBeforeCommand:
+    """A stop signal that reaches the runner before its command starts --
+    a scheduler stopping or reloading the unit while the run sits in its
+    gate or interactive wait -- is recorded as a `canceled` run carrying
+    the signal, not left to kill the runner unrecorded (which status reads
+    as `crashed`). Once the run is decided, a stop is absorbed so the
+    decided outcome is what gets recorded.
+
+    These deliver real signals to the test process; the autouse
+    signal-isolation fixture restores the dispositions afterwards.
+    """
+
+    def _interactive(
+        self, h: _RunnerHarness, command: str = "true", **body: Any
+    ) -> tuple[Any, Any]:
+        cfg = h.config(
+            {
+                "job": {
+                    "iv": {
+                        "command": command,
+                        "schedule": "daily",
+                        "interactive": True,
+                        **body,
+                    }
+                }
+            },
+            default_target_jobs=["iv"],
+        )
+        return cfg, h.snap(cfg, "iv")
+
+    def _assert_stopped(self, snap: Any, sig: int) -> dict[str, Any]:
+        sd = snap.state_dir
+        rec: dict[str, Any] = json.loads(
+            (sd / "last-run.json").read_text(encoding="utf-8")
+        )
+        assert rec["exit_class"] == "canceled"
+        assert rec["signal"] == sig
+        assert rec["exit_code"] is None
+        assert rec["process_exit"] == 128 + sig
+        assert rec["notifications"] == {}
+        # The pid half of status's crash check: the record and run.pid
+        # name the same launch.
+        assert rec["pid"] == os.getpid()
+        assert int((sd / "run.pid").read_text(encoding="utf-8")) == os.getpid()
+        log = (sd / "run.log").read_text(encoding="utf-8")
+        label = crony_runner._signal_label(sig)
+        assert f"crony: run stopped by {label} before its command ran\n" in log
+        return rec
+
+    @_STOPS
+    def test_stop_in_interactive_wait_records_canceled(
+        self, tmp_path: Path, monkeypatch: Any, sig: signal.Signals
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        sentinel = tmp_path / "exec-sentinel"
+        _cfg, snap = self._interactive(h, command=f"touch {sentinel}")
+        pid_path = snap.state_dir / "run.pid"
+        pending_during_wait: list[bool] = []
+        pid_mtime_during_wait: list[int] = []
+
+        def _stopped_mid_wait(_snap: Any, _log_file: Any) -> str:
+            pending_during_wait.append(
+                (snap.state_dir / "pending.flag").exists()
+            )
+            pid_mtime_during_wait.append(pid_path.stat().st_mtime_ns)
+            signal.raise_signal(sig)
+            # Only reached if the stop failed to unwind the wait.
+            time.sleep(5)
+            return "run"
+
+        monkeypatch.setattr(
+            crony_runner, "_interactive_wait_and_prompt", _stopped_mid_wait
+        )
+        assert crony_runner._run_job(snap) == 128 + sig
+        rec = self._assert_stopped(snap, sig)
+        assert rec["gate"] == "none"
+        assert pending_during_wait == [True]
+        assert not (snap.state_dir / "pending.flag").exists()
+        assert not sentinel.exists()
+        # run.pid already named this launch, so recording the stop left it
+        # untouched: its mtime is what status reads as the run's start.
+        assert pid_mtime_during_wait == [pid_path.stat().st_mtime_ns]
+
+    def test_stop_after_the_gate_passed_records_the_gate(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        _cfg, snap = self._interactive(h, gate="true")
+
+        def _stopped_mid_wait(_snap: Any, _log_file: Any) -> str:
+            signal.raise_signal(signal.SIGTERM)
+            time.sleep(5)
+            return "run"
+
+        monkeypatch.setattr(
+            crony_runner, "_interactive_wait_and_prompt", _stopped_mid_wait
+        )
+        assert crony_runner._run_job(snap) == 128 + signal.SIGTERM
+        rec = self._assert_stopped(snap, signal.SIGTERM)
+        assert rec["gate"] == "passed"
+
+    def test_stop_interrupts_the_interactive_delay_sleep(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The real wait loop, parked in the real delay sleep after a
+        # "Delay Job" click, with the stop arriving from outside mid-sleep.
+        # The sleep has to be cut short: resumed (a handler that does not
+        # raise), it would leave the runner to be SIGKILLed mid-wait. A
+        # short delay bounds a regression, which would then re-prompt.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        sentinel = tmp_path / "exec-sentinel"
+        _cfg, snap = self._interactive(h, command=f"touch {sentinel}")
+        snap = dataclasses.replace(snap, interactive_delay_sec=3)
+        choices = ["delay", "cancel"]
+        prompts: list[str] = []
+
+        def _dialog(_name: str, _message: str) -> str:
+            prompts.append(choices[len(prompts)])
+            return prompts[-1]
+
+        # Directed at the main thread, as a stop reaches the single-threaded
+        # runner, so the signal interrupts that thread's sleep. Armed only
+        # once the delay has begun, so it cannot land before the runner's
+        # stop handling is in place or before the sleep it is meant to cut.
+        stoppers: list[threading.Timer] = []
+        real_delay = crony_runner._delay_or_bypass
+
+        def _delay_then_stop(delay_sec: int, **kwargs: Any) -> bool:
+            stopper = threading.Timer(
+                0.2,
+                signal.pthread_kill,
+                (threading.main_thread().ident, signal.SIGTERM),
+            )
+            stoppers.append(stopper)
+            stopper.start()
+            return real_delay(delay_sec, **kwargs)
+
+        monkeypatch.setattr(
+            crony_runner, "_wait_for_user_active", lambda *_a, **_k: True
+        )
+        monkeypatch.setattr(crony_runner, "_show_interactive_dialog", _dialog)
+        monkeypatch.setattr(crony_runner, "_delay_or_bypass", _delay_then_stop)
+        try:
+            assert crony_runner._run_job(snap) == 128 + signal.SIGTERM
+        finally:
+            for stopper in stoppers:
+                stopper.join()
+        self._assert_stopped(snap, signal.SIGTERM)
+        assert prompts == ["delay"], "the delay ran out instead of stopping"
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "interactive: delaying for 3s\n" in log
+        assert not sentinel.exists()
+
+    def test_stop_during_gate_records_canceled_not_gated(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The gate signals its parent -- the runner, here the test process
+        # -- and then outlasts the stop, so the runner must stop waiting on
+        # it rather than wait out its result.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        sentinel = tmp_path / "exec-sentinel"
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": f"touch {sentinel}",
+                        "gate": "kill -TERM $PPID; sleep 5",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        snap = h.snap(cfg, "g")
+        started = time.monotonic()
+        assert crony_runner._run_job(snap) == 128 + signal.SIGTERM
+        assert time.monotonic() - started < 5, "waited out the stopped gate"
+        rec = self._assert_stopped(snap, signal.SIGTERM)
+        assert rec["gate"] == "none"
+        assert not sentinel.exists()
+
+    def test_stopped_daemon_spends_no_retry(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A daemon stopped in its gate never ran its command, so the stop is
+        # not one of the premature exits its retry budget counts: the budget
+        # it had is left as it was.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "d": {
+                        "command": "true",
+                        "gate": "kill -TERM $PPID; sleep 5",
+                        "daemon": True,
+                    }
+                }
+            },
+            default_target_jobs=["d"],
+        )
+        snap = h.snap(cfg, "d")
+        snap.state_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(2):
+            crony_runtime.record_daemon_exit(
+                snap.state_dir, 1, ExitClass.FAIL, f"t{i}"
+            )
+        before = crony_runtime.read_exit_history(snap.state_dir).runs
+        assert len(before) == 2
+        assert crony_runner._run_job(snap) == 128 + signal.SIGTERM
+        self._assert_stopped(snap, signal.SIGTERM)
+        assert crony_runtime.read_exit_history(snap.state_dir).runs == before
+
+    def test_stop_while_recording_a_gated_skip_is_absorbed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": "true",
+                        "gate": "false",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        snap = h.snap(cfg, "g")
+        observed = self._stop_at_record_write(monkeypatch)
+        assert crony_runner._run_job(snap) == 0
+        assert observed == [signal.SIG_IGN]
+        rec = h.last_run("g")
+        assert rec["exit_class"] == "gated"
+        assert rec["signal"] is None
+
+    def test_stop_while_recording_a_declined_run_is_absorbed(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        _cfg, snap = self._interactive(h)
+        monkeypatch.setattr(
+            crony_runner,
+            "_interactive_wait_and_prompt",
+            lambda _snap, _log_file: "cancel",
+        )
+        observed = self._stop_at_record_write(monkeypatch)
+        assert crony_runner._run_job(snap) == 0
+        assert observed == [signal.SIG_IGN]
+        rec = h.last_run("iv")
+        assert rec["exit_class"] == "canceled"
+        assert rec["signal"] is None
+        assert rec["exit_code"] == 0
+
+    def _stop_at_record_write(self, monkeypatch: Any) -> list[Any]:
+        """Stop the runner just as it writes its record, noting the
+        SIGTERM disposition at that moment (every stop signal must be
+        ignored alike, so it checks all of them agree)."""
+        real_write = crony_runtime.write_last_run
+        observed: list[Any] = []
+
+        def _stop_then_write(path: Path, payload: dict[str, Any]) -> None:
+            dispositions = {
+                signal.getsignal(s) for s in crony_runner._STOP_SIGNALS
+            }
+            assert len(dispositions) == 1
+            observed.append(dispositions.pop())
+            signal.raise_signal(signal.SIGTERM)
+            real_write(path, payload)
+
+        monkeypatch.setattr(crony_runtime, "write_last_run", _stop_then_write)
+        return observed
+
+    def test_stop_during_command_spawn_reaches_the_command(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A stop landing while the command is being started is no longer
+        # the runner's to raise on -- the command may already be running --
+        # nor can it be dropped, since a command that started too late to
+        # receive it would run on until the scheduler's SIGKILL. It reaches
+        # the command, and the outcome is the command's.
+        monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)
+        real_popen = subprocess.Popen
+
+        def _spawn_then_stop(
+            *args: Any, **kwargs: Any
+        ) -> subprocess.Popen[bytes]:
+            proc = real_popen(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return proc
+
+        crony_runner._raise_on_stop()
+        log_path = tmp_path / "run.log"
+        with (
+            open(log_path, "ab", buffering=0) as log_file,
+            mock.patch.object(
+                subprocess,
+                "Popen",
+                autospec=True,
+                side_effect=_spawn_then_stop,
+            ) as popen,
+        ):
+            outcome, timed_out = crony_runner._exec_command(
+                ["sleep", "5"], env=dict(os.environ), log_file=log_file
+            )
+        popen.assert_called_once()
+        assert outcome == crony_runner._ExitOutcome(rc=0, signal=signal.SIGTERM)
+        assert timed_out is False
+
+    def test_command_starts_with_default_stop_dispositions(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # The runner's own stop handling must not leak into the command:
+        # it has to die on a stop like any process that never asked
+        # otherwise. The command reports what it inherited.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        probe = (
+            "import signal; "
+            "print('dispositions:', "
+            "[signal.getsignal(s) == signal.SIG_DFL "
+            "for s in (signal.SIGTERM, signal.SIGHUP)], "
+            "signal.getsignal(signal.SIGINT) is signal.default_int_handler)"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(probe)}"
+        cfg = h.config(
+            {"job": {"j": {"command": command, "schedule": "daily"}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert crony_runner._run_job(snap) == 0
+        log = (snap.state_dir / "run.log").read_text(encoding="utf-8")
+        assert "dispositions: [True, True] True\n" in log
+
+    def test_precondition_leaves_the_runner_passive_to_stops(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A precondition raised mid-run still has its record to write, in
+        # `do_run`, after `_run_job` has unwound: a stop then must not
+        # raise past that write.
+        h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
+        monkeypatch.setattr(
+            crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
+        )
+        monkeypatch.setattr(
+            crony_fda, "grant_instructions", lambda: "grant me FDA"
+        )
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "schedule": "daily",
+                        "flags": ["full-disk-access"],
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        with pytest.raises(PreconditionError, match="grant me FDA"):
+            crony_runner._run_job(h.snap(cfg, "j"))
+        assert {s: signal.getsignal(s) for s in crony_runner._STOP_SIGNALS} == {
+            s: signal.SIG_IGN for s in crony_runner._STOP_SIGNALS
+        }
+
+
 class TestFullDiskAccess:
     """A full-disk-access job's command is routed through the host FDA
     wrapper at fire time (Crony.app on darwin), inside any keep-awake
@@ -2794,6 +3171,21 @@ class TestTriggerExitCode:
         # code is derived as the shell's 128 + signal-number convention.
         rec = {"exit_class": "signal", "signal": 9}
         assert crony_runner.trigger_exit_code(rec) == 128 + 9
+
+    def test_run_stopped_before_its_command_exits_128_plus_signal(
+        self,
+    ) -> None:
+        # A job stopped before its command ran is `canceled`, but it did
+        # not complete: it carries the stopping signal and no exit_code, and
+        # the wait reports the same 128 + signal the runner exited with.
+        rec = {"exit_class": "canceled", "exit_code": None, "signal": 15}
+        assert crony_runner.trigger_exit_code(rec) == 128 + 15
+
+    def test_declined_run_still_exits_zero(self) -> None:
+        # A run the user declined records its own exit_code 0 and no
+        # signal, so the stop mapping above does not reach it.
+        rec = {"exit_class": "canceled", "exit_code": 0, "signal": None}
+        assert crony_runner.trigger_exit_code(rec) == 0
 
     def test_signal_without_a_number_falls_back_to_error(self) -> None:
         # A signal class with no recorded number (a partial record) has

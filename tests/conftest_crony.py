@@ -164,10 +164,11 @@ def _isolate_home(tmp_path: Path, monkeypatch: Any) -> None:
 @pytest.fixture(autouse=True)
 def _isolate_signal_state() -> Any:
     """Restore the signal dispositions the runner touches around each
-    test. The runner installs its SIG_IGN passivity once and never
-    restores it (it exits after a run, so production has no teardown); an
-    in-process `_run_job` / `_run_group` / `_ignore_signals` call would
-    otherwise leak SIG_IGN into later tests. Snapshot and put them back."""
+    test. The runner installs its stop handling -- the pre-command raising
+    handler, then SIG_IGN passivity -- and never restores it (it exits
+    after a run, so production has no teardown); an in-process `_run_job`
+    / `_run_group` / `_ignore_signals` call would otherwise leak either
+    into later tests. Snapshot and put them back."""
     sigs = (
         signal.SIGTERM,
         signal.SIGINT,

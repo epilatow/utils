@@ -264,6 +264,92 @@ class _CronyE2E:
         row = self._status_row(full_name)
         return row[3] if row and len(row) > 3 else None
 
+    def status_cells(self, full_name: str, *cols: str) -> list[str] | None:
+        """`full_name`'s cells for exactly `cols`, or None when the entry
+        has no row. For cells the default columns cannot split reliably
+        (an OnCalendar SCHEDULE holds a space)."""
+        out = self.crony(
+            "status",
+            "-b",
+            E2E_BUNDLE,
+            "--cols",
+            ",".join(("job-or-uuid", *cols)),
+            check=False,
+        ).stdout
+        for line in out.splitlines():
+            toks = line.split()
+            if toks and toks[0] == full_name:
+                return toks[1:]
+        return None
+
+    def inject_isolated_env(self, short: str, *, restart: bool) -> None:
+        """Make the runner the scheduler spawns for `short` see this test's
+        throwaway state tree, and reload its unit so the change takes.
+
+        Production units intentionally do not inherit the CLI process's
+        CRONY_* overrides. This test-only rewrite lets the real scheduler
+        exercise the runner's persistent state without reaching the
+        operator's actual crony state. It is drift, so a test using it
+        cannot also assert on the CONFIG column. `restart` also restarts
+        the systemd service, for a daemon whose running instance has to
+        pick the change up; launchd's reload starts a unit that starts at
+        load and leaves a scheduled one waiting for its fire either way.
+        """
+        isolated = {
+            key: value
+            for key, value in self.env.items()
+            if key.startswith("CRONY_")
+        }
+        if _IS_DARWIN:
+            plist = self.darwin_plist(short)
+            raw = plistlib.loads(plist.read_bytes())
+            raw["EnvironmentVariables"] = {
+                **raw.get("EnvironmentVariables", {}),
+                **isolated,
+            }
+            plist.write_bytes(plistlib.dumps(raw))
+            label = self.darwin_label(short)
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                capture_output=True,
+                check=False,
+            )
+            # bootout returns before the label is gone, and bootstrap
+            # fails outright on one still loaded.
+            self.wait_until(
+                lambda: not self.launchctl_loaded(label),
+                timeout=30,
+                what=f"{label} to unload",
+            )
+            subprocess.run(
+                [
+                    "launchctl",
+                    "bootstrap",
+                    f"gui/{os.getuid()}",
+                    str(plist),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            return
+
+        service = self.unit_dir / f"crony-{self.full(short)}.service"
+
+        def quote(value: str) -> str:
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        env_lines = "".join(
+            f'Environment="{quote(key)}={quote(value)}"\n'
+            for key, value in sorted(isolated.items())
+        )
+        body = service.read_text()
+        service.write_text(
+            body.replace("[Service]\n", f"[Service]\n{env_lines}", 1)
+        )
+        self.systemctl_user("daemon-reload", check=True)
+        if restart:
+            self.systemctl_user("restart", service.name, check=True)
+
     def destroy_bundle(self) -> None:
         """Best-effort teardown of every unit in the reserved bundle.
 
@@ -596,68 +682,6 @@ class TestDaemonSupervision:
         e2e.write_bundle('[job.d]\ncommand = "true"\ndaemon = true\n', ["d"])
         e2e.crony("apply", e2e.full("d"))
 
-    def _inject_isolated_env(self, e2e: _CronyE2E) -> None:
-        """Make this test's daemon runner see the throwaway state tree.
-
-        Production units intentionally do not inherit the CLI process's
-        CRONY_* overrides. This test-only rewrite lets the real scheduler
-        exercise the runner's persistent retry budget without reaching
-        the operator's actual crony state.
-        """
-        isolated = {
-            key: value
-            for key, value in e2e.env.items()
-            if key.startswith("CRONY_")
-        }
-        if _IS_DARWIN:
-            plist = e2e.darwin_plist("d")
-            raw = plistlib.loads(plist.read_bytes())
-            raw["EnvironmentVariables"] = {
-                **raw.get("EnvironmentVariables", {}),
-                **isolated,
-            }
-            plist.write_bytes(plistlib.dumps(raw))
-            label = e2e.darwin_label("d")
-            subprocess.run(
-                ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-                capture_output=True,
-                check=False,
-            )
-            # bootout returns before the label is gone, and bootstrap
-            # fails outright on one still loaded.
-            e2e.wait_until(
-                lambda: not e2e.launchctl_loaded(label),
-                timeout=30,
-                what=f"{label} to unload",
-            )
-            subprocess.run(
-                [
-                    "launchctl",
-                    "bootstrap",
-                    f"gui/{os.getuid()}",
-                    str(plist),
-                ],
-                capture_output=True,
-                check=True,
-            )
-            return
-
-        service = e2e.unit_dir / f"crony-{e2e.full('d')}.service"
-
-        def quote(value: str) -> str:
-            return value.replace("\\", "\\\\").replace('"', '\\"')
-
-        env_lines = "".join(
-            f'Environment="{quote(key)}={quote(value)}"\n'
-            for key, value in sorted(isolated.items())
-        )
-        body = service.read_text()
-        service.write_text(
-            body.replace("[Service]\n", f"[Service]\n{env_lines}", 1)
-        )
-        e2e.systemctl_user("daemon-reload", check=True)
-        e2e.systemctl_user("restart", service.name, check=True)
-
     def _start_marker(self, e2e: _CronyE2E) -> str:
         """A value that changes every time the supervisor starts the
         unit, or `""` when it has never started.
@@ -733,7 +757,7 @@ class TestDaemonSupervision:
         e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
         e2e.write_bundle('[job.d]\ncommand = "exit 1"\ndaemon = true\n', ["d"])
         e2e.crony("apply", e2e.full("d"))
-        self._inject_isolated_env(e2e)
+        e2e.inject_isolated_env("d", restart=True)
         retry_state = e2e.state_dir / E2E_BUNDLE / "d" / "exit-history.json"
 
         def exhausted() -> bool:
@@ -821,6 +845,112 @@ class TestDaemonSupervision:
             timeout=60,
             what="the destroyed daemon to stop",
         )
+
+
+_CAPS = pytest.mark.parametrize("timeout", [60, 0], ids=["capped", "uncapped"])
+
+
+class TestStopBeforeCommand:
+    """A run the scheduler stops before its command starts reads
+    `canceled`, never `crashed`: the runner records the stop instead of
+    dying on it.
+
+    The gate stands in for every pre-command wait -- an interactive job's
+    idle detection and approval dialog cannot be driven here; the unit
+    tests cover that loop. Each case runs capped, where the guard relays
+    the stop into the run's session, and uncapped, where no guard stands
+    between the scheduler and uv and the runner -- which is what shows
+    uv letting the runner finish its record before the unit is reaped.
+
+    The runner the scheduler spawns has to record into this test's
+    throwaway state tree, so the unit is rewritten to carry the CRONY_*
+    overrides (see `inject_isolated_env`).
+    """
+
+    def _start_gated_run(self, e2e: _CronyE2E, timeout: int) -> Path:
+        """Apply and trigger a job whose gate outlasts the test's stop,
+        returning its state dir once the run is sitting in that gate."""
+        e2e.write_bundle(
+            "[job.probe]\n"
+            'command = "true"\n'
+            'gate = "sleep 20"\n'
+            'schedule = "*-*-* 03:00"\n'
+            f"job-timeout-sec = {timeout}\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=False)
+        sd = e2e.state_dir / E2E_BUNDLE / "probe"
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: "gate: " in _read_text(sd / "run.log"),
+            timeout=60,
+            what="the triggered run to reach its gate",
+        )
+        return sd
+
+    def _assert_stop_recorded(self, e2e: _CronyE2E, sd: Path) -> None:
+        """Wait for status to read the stopped run `canceled`, failing if
+        it ever reads `crashed` on the way, and check the record."""
+        seen: list[str | None] = []
+
+        def canceled() -> bool:
+            cells = e2e.status_cells(e2e.full("probe"), "status")
+            seen.append(cells[0] if cells else None)
+            return seen[-1] == "canceled"
+
+        try:
+            e2e.wait_until(
+                canceled, timeout=60, what="the stopped run to read canceled"
+            )
+        except AssertionError as e:
+            raise AssertionError(f"{e}; status went {seen}") from None
+        assert "crashed" not in seen, seen
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["exit_class"] == "canceled"
+        assert rec["signal"] == 15
+        assert rec["process_exit"] == 128 + 15
+        assert rec["gate"] == "none"
+        assert (
+            "crony: run stopped by SIGTERM (15) before its command ran\n"
+            in _read_text(sd / "run.log")
+        )
+
+    @_CAPS
+    @pytest.mark.skipif(
+        not _IS_DARWIN,
+        reason="only launchd's reload on disable stops a running unit",
+    )
+    def test_disable_during_gate_reads_canceled(
+        self, e2e: _CronyE2E, timeout: int
+    ) -> None:
+        # Disabling reloads the unit, and launchd's reload stops the run
+        # in flight.
+        sd = self._start_gated_run(e2e, timeout)
+        e2e.crony("disable", e2e.full("probe"))
+        self._assert_stop_recorded(e2e, sd)
+        assert e2e.status_cells(e2e.full("probe"), "schedule") == ["disabled"]
+
+    @_CAPS
+    @pytest.mark.skipif(not _IS_LINUX, reason="systemd service stop")
+    def test_service_stop_during_gate_reads_canceled(
+        self, e2e: _CronyE2E, timeout: int
+    ) -> None:
+        # systemd signals the service's whole cgroup at once: uv, any
+        # guard, the runner, and the gate alike.
+        sd = self._start_gated_run(e2e, timeout)
+        e2e.systemctl_user(
+            "stop", f"crony-{e2e.full('probe')}.service", check=True
+        )
+        self._assert_stop_recorded(e2e, sd)
+
+
+def _read_text(path: Path) -> str:
+    """`path`'s text, or "" while it does not exist yet."""
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ""
 
 
 if __name__ == "__main__":

@@ -376,7 +376,9 @@ Send a synthetic failure notification.
   considered as a job failure.
 - **`canceled`**\
   Jobs and groups. A run canceled or skipped before its command ran -- for an
-  interactive job, one the user declined.
+  interactive job, one the user declined. A job stopped before its command
+  started (its unit stopped or reloaded during its gate or interactive wait)
+  is canceled too.
 - **`crashed`**\
   Jobs and groups. The scheduler failed to launch the job or group, or it was
   killed/crashed before it could save its exit status to disk.

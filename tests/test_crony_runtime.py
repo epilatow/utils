@@ -2213,6 +2213,21 @@ class TestCrashedSignal:
             is False
         )
 
+    def test_recorded_pre_command_stop_is_not_crashed(self) -> None:
+        # A run stopped before its command ran records its own pid and the
+        # 128 + signal it exited with, which is what the scheduler saw, so
+        # neither half of the check fires and the entry reads `canceled`.
+        assert (
+            crony_runtime._derive_job_status(
+                False,
+                False,
+                7397,
+                self._last("canceled", 128 + 15, pid=7397),
+                crony_platform.UnitLastExit(exit_status=128 + 15),
+            )
+            == crony_model.JobStatus.CANCELED
+        )
+
     def test_clean_exit_is_not_crashed(self) -> None:
         assert (
             self._crashed(
