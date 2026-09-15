@@ -10,13 +10,15 @@ Comprehensive unit tests for secure_archiver
 """
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from conftest import (
@@ -763,14 +765,14 @@ class TestStageOpRefWithDir:
         staging.mkdir()
 
         seen: set[str] = set()
-        with patch.object(sa, "op_read", return_value="secret content\n"):
-            result = sa.stage_op_ref(
-                staging,
-                "secret.txt",
-                "op://vault/item/field",
-                seen_names=seen,
-                target_dir="secrets",
-            )
+        result = sa.stage_op_ref(
+            staging,
+            "secret.txt",
+            "op://vault/item/field",
+            content="secret content\n",
+            seen_names=seen,
+            target_dir="secrets",
+        )
 
         assert result == "secrets/secret.txt"
         assert "secrets/secret.txt" in seen
@@ -786,23 +788,22 @@ class TestStageOpRefWithDir:
         staging.mkdir()
 
         seen: set[str] = set()
-        with patch.object(sa, "op_read", return_value="content1\n"):
-            sa.stage_op_ref(
-                staging,
-                "secret.txt",
-                "op://vault/item1/field",
-                seen_names=seen,
-                target_dir="dir1",
-            )
-
-        with patch.object(sa, "op_read", return_value="content2\n"):
-            sa.stage_op_ref(
-                staging,
-                "secret.txt",
-                "op://vault/item2/field",
-                seen_names=seen,
-                target_dir="dir2",
-            )
+        sa.stage_op_ref(
+            staging,
+            "secret.txt",
+            "op://vault/item1/field",
+            content="content1\n",
+            seen_names=seen,
+            target_dir="dir1",
+        )
+        sa.stage_op_ref(
+            staging,
+            "secret.txt",
+            "op://vault/item2/field",
+            content="content2\n",
+            seen_names=seen,
+            target_dir="dir2",
+        )
 
         assert (staging / "dir1" / "secret.txt").exists()
         assert (staging / "dir2" / "secret.txt").exists()
@@ -1033,35 +1034,6 @@ class TestResolvePathIncludes:
         assert "- include[2]: Directory does not exist" in message
         assert str(missing) in message
 
-    @patch("secure_archiver.op_read", autospec=True)
-    @patch("secure_archiver.stage_op_ref", autospec=True)
-    def test_staging_resolves_before_fetching(
-        self,
-        mock_stage_op_ref: MagicMock,
-        mock_op_read: MagicMock,
-        tmp_path: Path,
-    ) -> None:
-        """Test a bad include fails before any 1Password fetch."""
-        staging = tmp_path / "staging"
-        staging.mkdir()
-
-        archive_cfg = sa.ArchiveConfig(
-            op_password="op://vault/item/password",
-            description="Test archive",
-            include=[
-                sa.OpRefIncludeEntry(
-                    op_ref="op://vault/item/field", filename="note.txt"
-                ),
-                sa.PathIncludeEntry(path=str(tmp_path / "nope*.txt")),
-            ],
-        )
-
-        with pytest.raises(sa.NotFoundError, match="No files matched"):
-            sa.build_staging_for_archive(archive_cfg, staging)
-
-        mock_stage_op_ref.assert_not_called()
-        mock_op_read.assert_not_called()
-
 
 class TestManifestGeneration:
     """Test manifest creation and validation."""
@@ -1115,13 +1087,22 @@ class TestManifestGeneration:
         assert mode == 0o600
 
 
+def _build_staging(
+    archive_cfg: sa.ArchiveConfig, staging: Path, op_values: dict[str, str]
+) -> list[str]:
+    """Stage an archive the way do_update does, with 1Password values given."""
+    return sa.build_staging_for_archive(
+        archive_cfg,
+        staging,
+        resolved=sa.resolve_path_includes(archive_cfg.include),
+        op_values=op_values,
+    )
+
+
 class TestArchiveIntegration:
     """Integration tests for full archive workflow."""
 
-    @patch("secure_archiver.op_read", autospec=True)
-    def test_build_staging_for_archive(
-        self, mock_op_read: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_build_staging_for_archive(self, tmp_path: Path) -> None:
         """Test building staging directory for archive."""
         # Setup test files
         src_dir = tmp_path / "src"
@@ -1131,9 +1112,6 @@ class TestArchiveIntegration:
 
         staging = tmp_path / "staging"
         staging.mkdir()
-
-        # Mock op_read for op_ref entries
-        mock_op_read.return_value = "note content"
 
         archive_cfg = sa.ArchiveConfig(
             op_password="op://vault/item/password",
@@ -1146,7 +1124,9 @@ class TestArchiveIntegration:
             ],
         )
 
-        result = sa.build_staging_for_archive(archive_cfg, staging)
+        result = _build_staging(
+            archive_cfg, staging, {"op://vault/item/field": "note content"}
+        )
 
         # Should have 2 included files + 1 op_ref entry
         assert len(result) == 3
@@ -1160,16 +1140,12 @@ class TestArchiveIntegration:
         assert (staging / "note.txt").exists()
         assert (staging / "note.txt").read_text() == "note content\n"
 
-    @patch("secure_archiver.op_read", autospec=True)
     def test_build_staging_normalizes_line_endings(
-        self, mock_op_read: MagicMock, tmp_path: Path
+        self, tmp_path: Path
     ) -> None:
         """Test that op_ref entries normalize line endings."""
         staging = tmp_path / "staging"
         staging.mkdir()
-
-        # Mock op_read with Windows line endings
-        mock_op_read.return_value = "line1\r\nline2\r\nline3"
 
         archive_cfg = sa.ArchiveConfig(
             op_password="op://vault/item/password",
@@ -1181,16 +1157,17 @@ class TestArchiveIntegration:
             ],
         )
 
-        sa.build_staging_for_archive(archive_cfg, staging)
+        _build_staging(
+            archive_cfg,
+            staging,
+            {"op://vault/item/field": "line1\r\nline2\r\nline3"},
+        )
 
         content = (staging / "note.txt").read_text()
         assert "\r" not in content
         assert content == "line1\nline2\nline3\n"
 
-    @patch("secure_archiver.op_read", autospec=True)
-    def test_build_staging_with_dir_parameter(
-        self, mock_op_read: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_build_staging_with_dir_parameter(self, tmp_path: Path) -> None:
         """Test building staging with files in subdirectories."""
         # Setup test files
         src_dir = tmp_path / "src"
@@ -1200,9 +1177,6 @@ class TestArchiveIntegration:
 
         staging = tmp_path / "staging"
         staging.mkdir()
-
-        # Mock op_read for op_ref entries
-        mock_op_read.return_value = "secret content"
 
         archive_cfg = sa.ArchiveConfig(
             op_password="op://vault/item/password",
@@ -1223,7 +1197,9 @@ class TestArchiveIntegration:
             ],
         )
 
-        result = sa.build_staging_for_archive(archive_cfg, staging)
+        result = _build_staging(
+            archive_cfg, staging, {"op://vault/item/field": "secret content"}
+        )
 
         # Should have all files with correct paths
         assert len(result) == 3
@@ -1236,9 +1212,8 @@ class TestArchiveIntegration:
         assert (staging / "documents" / "doc2.txt").exists()
         assert (staging / "secrets" / "secret.txt").exists()
 
-    @patch("secure_archiver.op_read", autospec=True)
     def test_build_staging_multiple_files_same_dir(
-        self, mock_op_read: MagicMock, tmp_path: Path
+        self, tmp_path: Path
     ) -> None:
         """Test that multiple entries can use the same dir."""
         src_dir = tmp_path / "src"
@@ -1248,8 +1223,6 @@ class TestArchiveIntegration:
 
         staging = tmp_path / "staging"
         staging.mkdir()
-
-        mock_op_read.return_value = "op content"
 
         archive_cfg = sa.ArchiveConfig(
             op_password="op://vault/item/password",
@@ -1269,7 +1242,9 @@ class TestArchiveIntegration:
             ],
         )
 
-        result = sa.build_staging_for_archive(archive_cfg, staging)
+        result = _build_staging(
+            archive_cfg, staging, {"op://vault/item/field": "op content"}
+        )
 
         assert len(result) == 3
         assert "shared/file1.txt" in result
@@ -1804,45 +1779,36 @@ class TestCommandExecution:
 
         assert result.returncode != 0
 
-    @patch("secure_archiver.run_cmd", autospec=True)
-    def test_op_read(self, mock_run_cmd: MagicMock) -> None:
-        """Test reading from 1Password."""
-        mock_run_cmd.return_value = MagicMock(
-            stdout="secret_value\n", returncode=0
-        )
+    def test_run_cmd_feeds_stdin_text(self) -> None:
+        """Test stdin_text is piped to the command's stdin."""
+        result = sa.run_cmd(["cat"], stdin_text="from stdin")
 
-        result = sa.op_read("op://vault/item/field")
+        assert result.stdout == "from stdin"
 
-        assert result == "secret_value"
-        assert mock_run_cmd.called
-        cmd = mock_run_cmd.call_args[0][0]
-        assert cmd[0] == "op"
-        assert cmd[1] == "read"
-
-    @patch("secure_archiver.op_read", autospec=True)
-    def test_stage_op_ref_empty_content_raises(
-        self, mock_op_read: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_stage_op_ref_empty_content_raises(self, tmp_path: Path) -> None:
         """Test stage_op_ref raises ConfigError on empty content."""
-        mock_op_read.return_value = ""
         seen: set[str] = set()
 
         with pytest.raises(sa.ConfigError, match="empty content"):
             sa.stage_op_ref(
-                tmp_path, "test.txt", "op://vault/item", seen_names=seen
+                tmp_path,
+                "test.txt",
+                "op://vault/item",
+                content="",
+                seen_names=seen,
             )
 
-    @patch("secure_archiver.op_read", autospec=True)
-    def test_stage_op_ref_whitespace_only_raises(
-        self, mock_op_read: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_stage_op_ref_whitespace_only_raises(self, tmp_path: Path) -> None:
         """Test stage_op_ref raises ConfigError on whitespace-only content."""
-        mock_op_read.return_value = "   \n\t\n   "
         seen: set[str] = set()
 
         with pytest.raises(sa.ConfigError, match="empty content"):
             sa.stage_op_ref(
-                tmp_path, "test.txt", "op://vault/item", seen_names=seen
+                tmp_path,
+                "test.txt",
+                "op://vault/item",
+                content="   \n\t\n   ",
+                seen_names=seen,
             )
 
 
@@ -1985,6 +1951,205 @@ class TestRunOp:
         assert excinfo.value.__context__ is None
         assert "SECRET-OUT" not in capsys.readouterr().err
 
+    @patch("secure_archiver.time.sleep", autospec=True)
+    @patch("secure_archiver.run_cmd", autospec=True)
+    def test_pipes_stdin_text_to_every_attempt(
+        self, mock_run_cmd: MagicMock, _mock_sleep: MagicMock
+    ) -> None:
+        """Test a retried command is piped the same stdin as the first try."""
+        mock_run_cmd.side_effect = [
+            _op_failure(_OP_DEADLINE_STDERR),
+            _op_success("out"),
+        ]
+
+        sa.run_op(["inject"], stdin_text="template")
+
+        assert mock_run_cmd.call_args_list == [
+            call(["op", "inject"], stdin_text="template"),
+            call(["op", "inject"], stdin_text="template"),
+        ]
+
+
+# Matches each enclosed reference in a template handed to `op inject`.
+_INJECT_REF = re.compile(r"\{\{ (.+?) \}\}")
+
+
+class _FakeInject:
+    """
+    A run_op stand-in that substitutes like `op inject`: each enclosed
+    reference in the template piped to its stdin replaced by its value,
+    with the trailing newline the real command adds. Records every
+    template it was piped.
+    """
+
+    def __init__(self, values: dict[str, str], *, trailing: str = "\n"):
+        self.values = values
+        self.trailing = trailing
+        self.templates: list[str] = []
+
+    def __call__(
+        self, args: list[str], *, stdin_text: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        # The template reaches `op` only on its stdin, never as a file.
+        assert args == ["inject"]
+        assert stdin_text is not None
+        self.templates.append(stdin_text)
+        out = _INJECT_REF.sub(lambda m: self.values[m.group(1)], stdin_text)
+        return _op_success(out + self.trailing)
+
+
+class TestOpReadRefs:
+    """Test reading many 1Password references with one `op inject`."""
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_reads_every_ref_in_one_call(self, mock_run_op: MagicMock) -> None:
+        """Test all references resolve from a single `op inject`."""
+        values = {
+            "op://Vault/Item One/password": "pw",
+            "op://Vault/abc123/Security/one-time password?attribute=otp": "1",
+        }
+        fake = _FakeInject(values)
+        mock_run_op.side_effect = fake
+
+        assert sa.op_read_refs(list(values)) == values
+        mock_run_op.assert_called_once()
+        [template] = fake.templates
+        for ref in values:
+            assert template.count(f"{{{{ {ref} }}}}") == 1
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_duplicate_refs_are_read_once(self, mock_run_op: MagicMock) -> None:
+        """Test a reference listed twice appears once in the template."""
+        fake = _FakeInject({"op://v/i/pw": "pw"})
+        mock_run_op.side_effect = fake
+
+        result = sa.op_read_refs(["op://v/i/pw", "op://v/i/pw"])
+
+        assert result == {"op://v/i/pw": "pw"}
+        assert fake.templates[0].count("{{ op://v/i/pw }}") == 1
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("line1\nline2\n\n", "line1\nline2"),
+            ("  indented\r\nwindows\r\n", "  indented\r\nwindows\r"),
+            ("{{ op://v/i/other }}", "{{ op://v/i/other }}"),
+            ("<<secure-archiver:0:1>>", "<<secure-archiver:0:1>>"),
+            ("", ""),
+        ],
+    )
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_values_come_back_verbatim(
+        self, mock_run_op: MagicMock, value: str, expected: str
+    ) -> None:
+        """Test values keep their content, less trailing newlines."""
+        refs = ["op://v/i/before", "op://v/i/value", "op://v/i/after"]
+        mock_run_op.side_effect = _FakeInject(
+            {refs[0]: "a", refs[1]: value, refs[2]: "b"}
+        )
+
+        assert sa.op_read_refs(refs) == {
+            refs[0]: "a",
+            refs[1]: expected,
+            refs[2]: "b",
+        }
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_output_without_trailing_newline(
+        self, mock_run_op: MagicMock
+    ) -> None:
+        """Test output is accepted whether or not it ends in a newline."""
+        mock_run_op.side_effect = _FakeInject({"op://v/i/f": "x"}, trailing="")
+
+        assert sa.op_read_refs(["op://v/i/f"]) == {"op://v/i/f": "x"}
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_markers_differ_per_call(self, mock_run_op: MagicMock) -> None:
+        """Test each call frames its references with a fresh nonce."""
+        fake = _FakeInject({"op://v/i/f": "x"})
+        mock_run_op.side_effect = fake
+
+        sa.op_read_refs(["op://v/i/f"])
+        sa.op_read_refs(["op://v/i/f"])
+
+        first, second = fake.templates
+        assert first != second
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_op_failure_names_the_references(
+        self, mock_run_op: MagicMock
+    ) -> None:
+        """Test a failing `op inject` says which references it was reading."""
+        stderr = "[ERROR] parsing error at 1:24: invalid character: (\n"
+        mock_run_op.side_effect = sa.SubprocessError(
+            1, ["op", "inject"], None, stderr
+        )
+
+        with pytest.raises(sa.SubprocessError) as excinfo:
+            sa.op_read_refs(["op://v/i/a", "op://v/i/b"])
+
+        message = str(excinfo.value)
+        assert "op inject, reading:\n  - op://v/i/a\n  - op://v/i/b" in message
+        assert stderr.strip() in message
+        assert excinfo.value.stdout is None
+        assert excinfo.value.exit_code == sa.ExitCode.SUBPROCESS
+
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_no_refs_never_calls_op(self, mock_run_op: MagicMock) -> None:
+        """Test an empty reference list reads nothing."""
+        assert sa.op_read_refs([]) == {}
+        mock_run_op.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "mangle",
+        [
+            pytest.param(lambda out, m: out[: out.rindex(m[-1])], id="cut"),
+            pytest.param(lambda out, _m: "junk" + out, id="leading"),
+            pytest.param(lambda out, _m: out + "junk", id="trailing"),
+            pytest.param(lambda out, _m: out + "\n", id="extra-newline"),
+            pytest.param(
+                lambda out, m: out.replace(m[1], m[1] + "SECRET-A" + m[1]),
+                id="duplicated-marker",
+            ),
+            pytest.param(
+                lambda out, m: (
+                    out.replace(m[0], "@0@")
+                    .replace(m[1], m[0])
+                    .replace("@0@", m[1])
+                ),
+                id="reordered",
+            ),
+        ],
+    )
+    @patch("secure_archiver.run_op", autospec=True)
+    def test_unexpected_output_raises_without_echoing(
+        self,
+        mock_run_op: MagicMock,
+        mangle: Callable[[str, list[str]], str],
+    ) -> None:
+        """Test malformed output fails, naming references but no values."""
+        refs = ["op://v/i/a", "op://v/i/b"]
+        honest = _FakeInject({refs[0]: "SECRET-A", refs[1]: "SECRET-B"})
+
+        def run(
+            args: list[str], *, stdin_text: str | None = None
+        ) -> subprocess.CompletedProcess[str]:
+            out = honest(args, stdin_text=stdin_text).stdout
+            markers = re.findall(
+                r"<<secure-archiver:[0-9a-f]+:\d+>>", honest.templates[-1]
+            )
+            return _op_success(mangle(out, markers))
+
+        mock_run_op.side_effect = run
+
+        with pytest.raises(sa.SecureArchiverError) as excinfo:
+            sa.op_read_refs(refs)
+
+        message = str(excinfo.value)
+        assert "op://v/i/a" in message
+        assert "op://v/i/b" in message
+        assert "SECRET" not in message
+
 
 class TestUtilityFunctions:
     """Test utility and helper functions."""
@@ -2076,9 +2241,9 @@ include = [{ path = "~/Documents" }]
 class TestRunUpdate:
     """Test run_update orchestration function."""
 
-    @patch("secure_archiver.op_read", autospec=True)
+    @patch("secure_archiver.op_read_refs", autospec=True)
     def test_run_update_creates_archives(
-        self, mock_op_read: MagicMock, tmp_path: Path
+        self, mock_op_read_refs: MagicMock, tmp_path: Path
     ) -> None:
         """Test that run_update creates archives from config."""
         import shutil
@@ -2086,8 +2251,10 @@ class TestRunUpdate:
         if shutil.which("7zz") is None:
             pytest.skip("7zz not available")
 
-        # Mock op_read to return a test password
-        mock_op_read.return_value = "test_password"
+        # Every 1Password reference reads as the test password
+        mock_op_read_refs.side_effect = lambda refs: dict.fromkeys(
+            refs, "test_password"
+        )
 
         # Create source files to archive
         src_dir = tmp_path / "source"
@@ -2152,18 +2319,19 @@ include = [
     # test on a host without `op` / `7zz`; what is under test is the
     # ordering after it.
     @patch("secure_archiver.ensure_tools", autospec=True)
-    @patch("secure_archiver.op_read", autospec=True)
+    @patch("secure_archiver.op_read_refs", autospec=True)
     def test_run_update_bad_include_never_reads_1password(
         self,
-        mock_op_read: MagicMock,
+        mock_op_read_refs: MagicMock,
         _mock_ensure_tools: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Test an unresolvable include stops the run before `op read`.
+        """Test an unresolvable include stops the run before 1Password.
 
-        The archive password is read per archive, so an include fault
-        found only during staging would still have prompted 1Password
-        for an archive that cannot be built.
+        An archive's secrets, password included, are all read before its
+        files are staged, so an include fault found only during staging
+        would already have prompted 1Password for an archive that cannot
+        be built -- even one whose op_ref entry comes first.
         """
         out_dir = tmp_path / "output"
         out_dir.mkdir()
@@ -2177,6 +2345,7 @@ output_dir = "{out_dir}"
 op_password = "op://vault/item/password"
 description = "Test archive description"
 include = [
+    {{ op_ref = "op://vault/item/field", filename = "note.txt" }},
     {{ path = "{tmp_path}/nothing*.txt" }},
 ]
 """)
@@ -2184,7 +2353,79 @@ include = [
         with pytest.raises(sa.NotFoundError, match="No files matched"):
             sa.do_update(config_file, dry_run=False, force_update=False)
 
-        mock_op_read.assert_not_called()
+        mock_op_read_refs.assert_not_called()
+
+    @patch("secure_archiver.publish", autospec=True)
+    @patch("secure_archiver.ensure_tools", autospec=True)
+    @patch("secure_archiver.op_read_refs", autospec=True)
+    def test_run_update_reads_each_archive_in_one_call(
+        self,
+        mock_op_read_refs: MagicMock,
+        _mock_ensure_tools: MagicMock,
+        mock_publish: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test each archive's secrets come from one read, then staged."""
+        src = tmp_path / "file.txt"
+        src.write_text("file content")
+        out_dir = tmp_path / "output"
+        out_dir.mkdir()
+
+        config_file = tmp_path / "test_config.toml"
+        config_file.write_text(f"""
+[general]
+output_dir = "{out_dir}"
+
+[archive.A]
+op_password = "op://v/a/password"
+description = "Archive A"
+include = [
+    {{ op_ref = "op://v/a/one", filename = "one.txt" }},
+    {{ path = "{src}" }},
+    {{ op_ref = "op://v/a/two", filename = "two.txt", dir = "sub" }},
+]
+
+[archive.B]
+op_password = "op://v/b/password"
+description = "Archive B"
+include = [{{ path = "{src}" }}]
+""")
+        mock_op_read_refs.side_effect = lambda refs: {
+            ref: f"value of {ref}" for ref in refs
+        }
+
+        published: dict[str, tuple[str, dict[str, str]]] = {}
+
+        def record(**kwargs: Any) -> bool:
+            staging_dir: Path = kwargs["staging_dir"]
+            published[kwargs["archive_name"]] = (
+                kwargs["password"],
+                {
+                    name: (staging_dir / name).read_text()
+                    for name in kwargs["staged_names"]
+                },
+            )
+            return False
+
+        mock_publish.side_effect = record
+
+        sa.do_update(config_file, dry_run=False, force_update=False)
+
+        assert mock_op_read_refs.call_args_list == [
+            call(["op://v/a/one", "op://v/a/two", "op://v/a/password"]),
+            call(["op://v/b/password"]),
+        ]
+        assert published == {
+            "A": (
+                "value of op://v/a/password",
+                {
+                    "one.txt": "value of op://v/a/one\n",
+                    "file.txt": "file content",
+                    "sub/two.txt": "value of op://v/a/two\n",
+                },
+            ),
+            "B": ("value of op://v/b/password", {"file.txt": "file content"}),
+        }
 
 
 class TestArchiveReadme:
@@ -2248,9 +2489,9 @@ class TestArchiveReadme:
                 description="New description",
             )
 
-    @patch("secure_archiver.op_read", autospec=True)
+    @patch("secure_archiver.op_read_refs", autospec=True)
     def test_run_update_creates_readme(
-        self, mock_op_read: MagicMock, tmp_path: Path
+        self, mock_op_read_refs: MagicMock, tmp_path: Path
     ) -> None:
         """Test that run_update creates readme alongside archive."""
         import shutil
@@ -2258,7 +2499,9 @@ class TestArchiveReadme:
         if shutil.which("7zz") is None:
             pytest.skip("7zz not available")
 
-        mock_op_read.return_value = "test_password"
+        mock_op_read_refs.side_effect = lambda refs: dict.fromkeys(
+            refs, "test_password"
+        )
 
         # Create source files
         src_dir = tmp_path / "source"
@@ -2606,6 +2849,74 @@ include = [{ op_ref = "", filename = "test.txt" }]
 """)
         with pytest.raises(sa.ConfigError):
             sa.do_config_validate(config_file)
+
+    @staticmethod
+    def _write_refs_config(config_file: Path, field: str, ref: str) -> None:
+        """Write a config using `ref` as `field`, the other field valid."""
+        password = ref if field == "op_password" else "op://vault/item/pw"
+        op_ref = ref if field == "op_ref" else "op://vault/item/notes"
+        config_file.write_text(f"""
+[general]
+output_dir = "~/archives"
+
+[archive.Test]
+op_password = {json.dumps(password)}
+description = "Test archive"
+include = [{{ op_ref = {json.dumps(op_ref)}, filename = "test.txt" }}]
+""")
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            # What the `op inject` template language would interpret.
+            '"op://vault/item/field"',
+            "op://vault/$ITEM/field",
+            "op://vault/${ITEM}/field",
+            "op://vault/{item}/field",
+            "op://vault/item/field }}",
+            "op://vault/item/field\nop://vault/item/other",
+            " op://vault/item/field",
+            "op://vault/item/field\t",
+            # Outside 1Password's reference syntax altogether.
+            "vault/item/field",
+            "op://vault/item",
+            "op://vault/item/section/field/extra",
+            "op://vault/Ed's item/field",
+            "op://vault/item/field?attribute=otp&x=y",
+            f"op://vault/it{chr(0xE9)}m/field",
+        ],
+    )
+    @pytest.mark.parametrize("field", ["op_password", "op_ref"])
+    def test_invalid_op_reference(
+        self, tmp_path: Path, field: str, ref: str
+    ) -> None:
+        """Test a reference outside the secret-reference syntax is refused."""
+        config_file = tmp_path / "invalid.toml"
+        self._write_refs_config(config_file, field, ref)
+
+        with pytest.raises(
+            sa.ConfigError, match=rf"{field} must be a secret reference"
+        ):
+            sa.do_config_validate(config_file)
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "op://Vault/Estate Item - Drive/password",
+            "op://Private/abc123def/Security/one-time password?attribute=otp",
+            "op://dev_vault/ssh.key/private key?ssh-format=openssh",
+            "op://Vault/Item/file.txt",
+        ],
+    )
+    @pytest.mark.parametrize("field", ["op_password", "op_ref"])
+    def test_valid_op_reference(
+        self, tmp_path: Path, field: str, ref: str
+    ) -> None:
+        """Test documented reference shapes stay valid."""
+        config_file = tmp_path / "valid.toml"
+        self._write_refs_config(config_file, field, ref)
+
+        sa.do_config_validate(config_file)  # Should not raise
 
     def test_empty_filename(self, tmp_path: Path) -> None:
         """Test that empty filename in include entry is caught."""

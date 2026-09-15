@@ -16,6 +16,7 @@ import locale
 import os
 import platform as platform  # noqa: PLC0414  re-exported for tests
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -26,7 +27,7 @@ import textwrap
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,32 @@ class SubprocessError(subprocess.CalledProcessError, SecureArchiverError):
 # CONFIG DATACLASSES
 # =============================================================================
 
+# Every reference is read by substituting it into an `op inject`
+# template (see op_read_refs), and the template language gives meaning to
+# more than references: braces delimit substitutions, a quoted string is
+# substituted as literal text, `$NAME` expands an environment variable,
+# and padding is trimmed. So a reference is held to 1Password's own
+# documented syntax -- op://vault/item/[section/]field, names of letters,
+# digits, spaces, '-', '_' and '.', and one optional ?name=value query --
+# which `op read` enforces too. Nothing a working reference needs is
+# refused (an item or field with any other name is referred to by its
+# ID), and nothing the template language would interpret gets through.
+_OP_REF_PATTERN = re.compile(
+    r"op://[A-Za-z0-9 _.-]+(?:/[A-Za-z0-9 _.-]+){2,3}"
+    r"(?:\?[A-Za-z0-9_-]+=[A-Za-z0-9_-]+)?"
+)
+_OP_REF_RULE = (
+    "must be a secret reference of the form "
+    "op://vault/item/[section/]field[?name=value], its names only letters, "
+    "digits, spaces, '-', '_' and '.' (refer to an item or field by its ID "
+    "otherwise), with no surrounding whitespace"
+)
+
+
+def op_ref_is_valid(ref: str) -> bool:
+    """Whether `ref` is a secret reference `op_read_refs` can read."""
+    return ref == ref.strip() and _OP_REF_PATTERN.fullmatch(ref) is not None
+
 
 @dataclass
 class GeneralConfig:
@@ -293,6 +320,9 @@ class OpRefIncludeEntry:
         if not isinstance(op_ref_val, str) or op_ref_val.strip() == "":
             errors.append(f"{prefix} op_ref must be a non-empty string")
             return None
+        if not op_ref_is_valid(op_ref_val):
+            errors.append(f"{prefix} op_ref {_OP_REF_RULE}")
+            return None
 
         filename_val = d.get("filename")
         if not isinstance(filename_val, str) or filename_val.strip() == "":
@@ -330,6 +360,8 @@ class ArchiveConfig:
         op_password = d.get("op_password", "")
         if not isinstance(op_password, str) or op_password.strip() == "":
             errors.append(f"{prefix} op_password is required")
+        elif not op_ref_is_valid(op_password):
+            errors.append(f"{prefix} op_password {_OP_REF_RULE}")
 
         description = d.get("description", "")
         if not isinstance(description, str) or description.strip() == "":
@@ -382,6 +414,14 @@ class ArchiveConfig:
             description=description,
             include=include,
         )
+
+    def op_refs(self) -> list[str]:
+        """Every 1Password reference the archive reads, password last."""
+        refs = [
+            e.op_ref for e in self.include if isinstance(e, OpRefIncludeEntry)
+        ]
+        refs.append(self.op_password)
+        return refs
 
 
 @dataclass
@@ -447,6 +487,7 @@ def run_cmd(
     cwd: Path | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    stdin_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -456,6 +497,7 @@ def run_cmd(
             text=True,
             check=check,
             env=env,
+            input=stdin_text,
         )
     except subprocess.CalledProcessError as e:
         raise SubprocessError(e.returncode, e.cmd, e.output, e.stderr) from e
@@ -493,9 +535,12 @@ def op_client_timed_out(stderr: str | None) -> bool:
     )
 
 
-def run_op(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def run_op(
+    args: Sequence[str], *, stdin_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """
-    Run `op` with `args`, retrying a client-setup timeout.
+    Run `op` with `args` (and `stdin_text` piped to its stdin), retrying
+    a client-setup timeout.
 
     Up to _OP_ATTEMPTS attempts, _OP_RETRY_DELAY_SECONDS apart, each
     retry noted on stderr; any other failure raises on its first
@@ -507,7 +552,7 @@ def run_op(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     attempt = 1
     while True:
         try:
-            return run_cmd(cmd)
+            return run_cmd(cmd, stdin_text=stdin_text)
         except SubprocessError as e:
             error = SubprocessError(e.returncode, e.cmd, None, e.stderr)
         # Raised here rather than inside the except block, which would
@@ -523,9 +568,66 @@ def run_op(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         attempt += 1
 
 
-def op_read(secret_ref: str) -> str:
-    cp = run_op(["read", secret_ref])
-    return cp.stdout.rstrip("\n")
+def op_read_refs(refs: Sequence[str]) -> dict[str, str]:
+    """
+    Read every 1Password reference in `refs` with one `op` call.
+
+    Each `op` call is a fresh connection to the 1Password app, the step
+    that occasionally stalls, so the references share one `op inject`
+    rather than taking an `op read` each. Every reference is substituted
+    between markers carrying a random per-call nonce, which a value
+    cannot contain by accident, so the output splits back into values
+    exactly whatever characters they hold. A value is what `op read`
+    prints for its reference, trailing newlines stripped. The template
+    is piped to `op` and the values read back from its stdout, so
+    neither is ever written to disk.
+
+    `refs` must satisfy op_ref_is_valid, which keeps them to references
+    the template language substitutes rather than interprets. A failure
+    names every reference in the call, and output that is not the
+    template with each reference substituted raises without quoting any
+    of it, since it may hold secrets.
+    """
+    unique = list(dict.fromkeys(refs))
+    if not unique:
+        return {}
+    listed = "\n".join(f"  - {ref}" for ref in unique)
+
+    nonce = secrets.token_hex(16)
+    markers = [
+        f"<<secure-archiver:{nonce}:{i}>>" for i in range(len(unique) + 1)
+    ]
+    template = "".join(
+        f"{markers[i]}{{{{ {ref} }}}}" for i, ref in enumerate(unique)
+    )
+    template += markers[-1]
+
+    try:
+        cp = run_op(["inject"], stdin_text=template)
+    except SubprocessError as e:
+        # `op` locates a bad reference by its position in a template the
+        # user never sees, so name the references instead.
+        raise SubprocessError(
+            e.returncode, f"op inject, reading:\n{listed}", None, e.stderr
+        ) from None
+
+    # `op inject` ends its output with a newline of its own.
+    body = cp.stdout.removesuffix("\n")
+    starts = [body.find(marker) for marker in markers]
+    if (
+        starts[0] != 0
+        or not body.endswith(markers[-1])
+        or any(body.count(marker) != 1 for marker in markers)
+        or starts != sorted(starts)
+    ):
+        raise SecureArchiverError(
+            f"Unexpected output from `op inject` reading:\n{listed}"
+        )
+
+    return {
+        ref: body[starts[i] + len(markers[i]) : starts[i + 1]].rstrip("\n")
+        for i, ref in enumerate(unique)
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -963,17 +1065,17 @@ def stage_op_ref(
     filename: str,
     op_ref: str,
     *,
+    content: str,
     seen_names: set[str],
     target_dir: str | None = None,
 ) -> str:
-    """Stage a file by fetching its content from 1Password."""
+    """Stage `content`, read from 1Password reference `op_ref`, as a file."""
     # Use full relative path for collision detection
     rel_path = f"{target_dir}/{filename}" if target_dir else filename
     if rel_path in seen_names:
         raise CollisionError(f"Name collision while staging: {rel_path}")
     seen_names.add(rel_path)
 
-    content = op_read(op_ref)
     if not content.strip():
         raise ConfigError(f"1Password returned empty content for: {op_ref}")
     content = content.replace("\r\n", "\n").replace("\r", "\n")
@@ -1382,22 +1484,23 @@ def resolve_path_includes(
 def build_staging_for_archive(
     archive_cfg: ArchiveConfig,
     staging_dir: Path,
+    *,
+    resolved: Mapping[int, list[Path]],
+    op_values: Mapping[str, str],
 ) -> list[str]:
     """
     Stage files for an archive based on the include config.
 
     Each include entry is either:
-      - PathIncludeEntry - files from filesystem
-      - OpRefIncludeEntry - content fetched from 1Password
+      - PathIncludeEntry - files from filesystem, taken from `resolved`
+        (resolve_path_includes of the archive's include list)
+      - OpRefIncludeEntry - content read from 1Password, taken from
+        `op_values` (op_read_refs of the archive's op_refs)
 
     Files can be placed in subdirectories using the optional 'dir' parameter.
     Collision detection uses full relative paths (dir/filename).
     Returns staged filenames (excluding manifest.json).
     """
-    # Resolve the filesystem entries first so an archive with an
-    # unusable include fails before any 1Password fetch or file copy.
-    resolved = resolve_path_includes(archive_cfg.include)
-
     seen: set[str] = set()
     staged_names: list[str] = []
 
@@ -1408,6 +1511,7 @@ def build_staging_for_archive(
                     staging_dir,
                     entry.filename,
                     entry.op_ref,
+                    content=op_values[entry.op_ref],
                     seen_names=seen,
                     target_dir=entry.dir,
                 )
@@ -1883,18 +1987,25 @@ def do_update(
 
         eprint(f"=== {archive_name} ===")
 
+        # Include paths resolve before 1Password is read, so an archive
+        # whose files cannot be found never reads its secrets. The rest
+        # of the archive's secrets come with its password in one read.
+        resolved = resolve_path_includes(archive_cfg.include)
+        op_values = op_read_refs(archive_cfg.op_refs())
+
         with tempfile.TemporaryDirectory() as td:
             staging_dir = Path(td)
-            staged = build_staging_for_archive(archive_cfg, staging_dir)
-
-            # Staging first, so a password is fetched only for an
-            # archive that can actually be built.
-            password = op_read(op_password_uri)
+            staged = build_staging_for_archive(
+                archive_cfg,
+                staging_dir,
+                resolved=resolved,
+                op_values=op_values,
+            )
 
             published_any |= publish(
                 archive_name=archive_name,
                 out_dir=out_dir,
-                password=password,
+                password=op_values[op_password_uri],
                 staging_dir=staging_dir,
                 staged_names=staged,
                 timestamp=ts,
