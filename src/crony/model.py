@@ -1481,10 +1481,11 @@ class JobStatus(_DescribedStrEnum):
         ExitClass.TIMEOUT,
         (
             "Jobs and groups. The job was killed after exceeding its "
-            "wallclock execution timeout. For a job group: the group ran out "
-            "of time on a child before it ever saw it running -- its "
-            "cumulative budget was spent, or the scheduler never started the "
-            "child."
+            "wallclock execution timeout -- which a job that is not "
+            "interactive can do in its gate, before its command starts. "
+            "For a job group: the group ran out of time on a child before "
+            "it ever saw it running -- its cumulative budget was spent, or "
+            "the scheduler never started the child."
         ),
     )
     GATED = (
@@ -1720,7 +1721,9 @@ class JobRunResult(_CommonRunResult):
     for fail, the timeout code, or 128+sig for a signal-killed child. A
     run stopped by a signal before its command started is `canceled` too,
     but carries that signal and a `process_exit` of 128+sig, with no
-    `exit_code`.
+    `exit_code`. One that ran out its cap that early is an ordinary
+    `timeout` -- the timeout code, and neither an `exit_code` nor a
+    `signal`, since no command of its own ever ran.
 
     A daemon's `process_exit` is instead what the supervisor is being
     told to do, so an ok run carries `ExitCode.DAEMON_EXITED` (restart

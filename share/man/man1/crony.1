@@ -265,7 +265,7 @@ Each is named the way that field is known \-\- the config\-file knob, a capabili
 .TP
 \f[I]timeout\f[R]
 Job wallclock cap: \(ga<n>s\(ga.\&
-The job will be killed if its wallclock execution time exceeds this cap.\&
+The job will be killed if its wallclock execution time exceeds this cap \-\- for a job that is not interactive, counted from launch, so its gate counts too.\&
 May be \(ganone\(ga for uncapped jobs.\&
 .TP
 \f[I]unit\-config\-1\f[R]
@@ -359,7 +359,7 @@ For a job group: the group could not fire one of its children \-\- that child\(a
 .TP
 \f[I]timeout\f[R]
 Jobs and groups.\&
-The job was killed after exceeding its wallclock execution timeout.\&
+The job was killed after exceeding its wallclock execution timeout \-\- which a job that is not interactive can do in its gate, before its command starts.\&
 For a job group: the group ran out of time on a child before it ever saw it running \-\- its cumulative budget was spent, or the scheduler never started the child.\&
 .TP
 \f[I]gated\f[R]

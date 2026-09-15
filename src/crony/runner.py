@@ -231,10 +231,17 @@ class _ExitOutcome(NamedTuple):
 # otherwise ignores them so it survives to record its outcome; the
 # command, which keeps the default dispositions, still dies on them.
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# Every signal the guard sends a run: the stops it relays, plus the SIGUSR1
+# hint it sends the runner alone just before it kills a run for its
+# timeout. A runner handles the hint alongside the stops, and like them it
+# must never die on the hint's default (terminate) disposition.
+_GUARD_SIGNALS = (*_STOP_SIGNALS, signal.SIGUSR1)
 
 
 class _StopRequested(BaseException):
-    """A stop signal reached a job runner before its command started.
+    """A job runner was stopped before its command started: by a stop
+    signal, or by the guard's timeout hint (`timed_out`), which stops a run
+    that has used up its cap.
 
     A BaseException, like KeyboardInterrupt, so no `except Exception`
     on the way from the interrupted wait to `_run_job` can swallow it."""
@@ -242,6 +249,10 @@ class _StopRequested(BaseException):
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
         self.signum = signum
+
+    @property
+    def timed_out(self) -> bool:
+        return self.signum == signal.SIGUSR1
 
 
 def _ignore_signals(sigs: tuple[int, ...]) -> None:
@@ -256,24 +267,26 @@ def _ignore_signals(sigs: tuple[int, ...]) -> None:
 
 
 def _raise_on_stop() -> None:
-    """Install the job runner's pre-command stop handler: a stop signal
-    raises `_StopRequested`, so `_run_job` records the run as stopped
-    before its command ran instead of the runner dying unrecorded.
+    """Install the job runner's pre-command stop handler: a stop signal or
+    the guard's timeout hint raises `_StopRequested`, so `_run_job` records
+    the run as stopped, or timed out, before its command ran instead of
+    the runner dying unrecorded.
 
     Raising, rather than setting a flag, is what makes the pre-command
     waits interruptible: a handler that returns lets an interrupted
     `time.sleep` resume (PEP 475), leaving the runner to be SIGKILLed
     mid-wait, while a raise unwinds the sleep, a gate still running, or
     the approval dialog (`subprocess.run` kills its child on the way out).
-    The handler ignores every stop signal before it raises, so a second
-    one cannot interrupt the record the first is unwinding to. Like
-    `_ignore_signals`, it is never restored."""
+    The handler ignores every guard signal before it raises, so the next
+    one -- the SIGTERM that follows the hint, or a second stop -- cannot
+    interrupt the record the first is unwinding to. Like `_ignore_signals`,
+    it is never restored."""
 
     def _on_stop(signum: int, _frame: object) -> None:
-        _ignore_signals(_STOP_SIGNALS)
+        _ignore_signals(_GUARD_SIGNALS)
         raise _StopRequested(signum)
 
-    for s in _STOP_SIGNALS:
+    for s in _GUARD_SIGNALS:
         signal.signal(s, _on_stop)
 
 
@@ -291,26 +304,28 @@ def _exec_command(
     on, a stop is the command's to die on and the runner's to record.
 
     The handoff brackets the spawn. Just before it, the raising handler
-    gives way to one that only notes the stop, so a stop landing while
-    the command is being started neither abandons a command that may
-    already be running nor reaches the command as an inherited SIG_IGN (a
-    Python-level handler resets to the default at exec; SIG_IGN would
-    not). Just after it, the runner installs its own dispositions:
+    gives way to ones that only note what arrived, so a stop or timeout
+    hint landing while the command is being started neither abandons a
+    command that may already be running nor reaches the command as an
+    inherited SIG_IGN (a Python-level handler resets to the default at
+    exec; SIG_IGN would not). From then on:
 
-    - SIGTERM / SIGINT / SIGHUP are ignored, so the stop signal the guard
-      relays into the session does not take the runner down before it
-      records; the command, unaffected, still dies on it. A stop the
-      runner noted during the spawn is passed on to the command, which
-      may have started too late to receive it.
     - SIGUSR1 sets a flag. The guard sends it to the runner just before
       the SIGTERM that kills a timed-out run, so a returned ``True`` means
       "killed for exceeding the timeout" -- the caller records TIMEOUT
       rather than a plain signal death.
+    - Just after the spawn, SIGTERM / SIGINT / SIGHUP are ignored, so the
+      stop signal the guard relays into the session does not take the
+      runner down before it records; the command, unaffected, still dies
+      on it. A stop the runner noted during the spawn is passed on to the
+      command, which may have started too late to receive it.
 
     With the command running and those handlers in place, it signals the
-    guard to arm the cap from this moment (`_arm_guard`), so the runner's
-    pre-command setup and an interactive job's approval wait do not count
-    against it. An uncapped run has no guard to arm.
+    guard to arm the cap from this moment (`_arm_guard`), which is what
+    keeps an interactive job's approval wait from counting against it. A
+    non-interactive run is armed at its launch instead, so there the arm is
+    a no-op and everything before the command counts. An uncapped run has
+    no guard to arm.
 
     Returns the command's outcome and that timed-out flag.
     """
@@ -327,6 +342,7 @@ def _exec_command(
 
     for s in _STOP_SIGNALS:
         signal.signal(s, _note_stop)
+    signal.signal(signal.SIGUSR1, _note_timeout)
     proc = subprocess.Popen(
         argv,
         stdout=log_file,
@@ -336,7 +352,6 @@ def _exec_command(
     _ignore_signals(_STOP_SIGNALS)
     if spawn_stop is not None:
         proc.send_signal(spawn_stop)
-    signal.signal(signal.SIGUSR1, _note_timeout)
     _arm_guard()
     rc = proc.wait()
     if rc < 0:
@@ -586,10 +601,12 @@ def _run_job(snap: crony.model.Job) -> int:
     the runner unrecorded. Until the command is spawned, a stop ends the
     run where it stands -- mid-gate, mid-approval-wait -- and records it
     `canceled`, returning 128 + the signal (`_record_pre_command_stop`).
-    Once the run's outcome is decided (the command spawned, the gate
-    failed, the user declined, a precondition canceled it), a stop is
-    absorbed so that outcome is recorded; a running command dies on the
-    stop itself (`_exec_command`).
+    The guard's timeout hint does the same but records `timeout`, returning
+    ExitCode.TIMEOUT and notifying like a command that timed out. Once the
+    run's outcome is decided (the command spawned, the gate failed, the
+    user declined, a precondition canceled it), either is absorbed so that
+    outcome is recorded; a running command dies on the stop itself
+    (`_exec_command`).
 
     For a daemon the code is instead a message to the supervisor about
     whether to restart: ExitCode.DAEMON_EXITED when the command exited
@@ -603,11 +620,9 @@ def _run_job(snap: crony.model.Job) -> int:
     sd = snap.state_dir
     sd.mkdir(parents=True, exist_ok=True)
     lock_path = sd / "run.lock"
+    # Two paths, deliberately: this one to write, `snap.log_path` to
+    # record. See `_JobCommon.log_path` for which is reported and when.
     log_path = snap.log_path_resolved
-    # Two paths, deliberately: one to write, one to record. See
-    # `_JobCommon.log_path` for which is reported and when.
-    reported_log_path = snap.log_path
-    last_run_path = sd / "last-run.json"
     pid_path = sd / "run.pid"
 
     # A daemon's exit codes mean something different to the supervisor;
@@ -653,8 +668,6 @@ def _run_job(snap: crony.model.Job) -> int:
     env[crony.runtime.RUNNING_REF_ENV] = str(snap.entity_ref)
     started = time.time()
     started_iso = crony.runtime.now_iso()
-    host = crony.platform.current_host()
-    platform = crony.platform.current_platform()
 
     # The gate's result once it has one; a run stopped before then records
     # no gate.
@@ -664,10 +677,11 @@ def _run_job(snap: crony.model.Job) -> int:
             # The surrounding result-recording block closes this in finally.
             log_file = open(log_path, "ab", buffering=0)  # noqa: SIM115
             try:
-                # From here until the command is spawned, a stop signal is
-                # recorded as a stopped run (the `_StopRequested` arm
-                # below). Installed before run.pid is written, so a launch
-                # that publishes its pid records its end.
+                # From here until the command is spawned, a stop signal or
+                # the guard's timeout hint ends the run with a record (the
+                # `_StopRequested` arm below). Installed before run.pid is
+                # written, so a launch that publishes its pid records its
+                # end.
                 _raise_on_stop()
                 # Publish our pid for waiters (parent groups, `crony
                 # trigger --wait`) to watch for exit, and leave it in place
@@ -714,11 +728,12 @@ def _run_job(snap: crony.model.Job) -> int:
                     )
 
                     if gate == crony.model.GateResult.FAILED:
-                        # The run is decided; a stop from here on must not
-                        # turn the skip into a stop, or cut its record
-                        # short. Absorb it, as a running command's runner
-                        # does, and record the skip.
-                        _ignore_signals(_STOP_SIGNALS)
+                        # The run is decided; a stop or timeout hint from
+                        # here on must not turn the skip into something
+                        # else, or cut its record short. Absorb it, as a
+                        # running command's runner does, and record the
+                        # skip.
+                        _ignore_signals(_GUARD_SIGNALS)
                         if is_daemon:
                             # A gate is an external precondition, not a
                             # crashing command. It stops immediately and
@@ -729,8 +744,8 @@ def _run_job(snap: crony.model.Job) -> int:
                             (f"gate exited {gate_rc}: skipping job\n").encode()
                         )
                         result = crony.model.JobRunResult(
-                            host=host,
-                            platform=platform,
+                            host=crony.platform.current_host(),
+                            platform=crony.platform.current_platform(),
                             started_at=started_iso,
                             ended_at=crony.runtime.now_iso(),
                             duration_sec=time.time() - started,
@@ -739,11 +754,11 @@ def _run_job(snap: crony.model.Job) -> int:
                             signal=None,
                             process_exit=0,
                             gate=gate,
-                            log_path=str(reported_log_path),
+                            log_path=str(snap.log_path),
                             notifications={},
                         )
                         crony.runtime.write_last_run(
-                            last_run_path, dataclasses.asdict(result)
+                            sd / "last-run.json", dataclasses.asdict(result)
                         )
                         return 0
 
@@ -758,11 +773,11 @@ def _run_job(snap: crony.model.Job) -> int:
                     argv = _full_disk_access_argv(_command_argv(snap), snap)
                 except crony.errors.PreconditionError:
                     # Decided too: `do_run` records the cancel once this
-                    # unwinds, so a stop from here on is absorbed rather
-                    # than raised past that record. Disarmed inside this
-                    # `try`, so a stop landing first is still caught below
-                    # and recorded as one.
-                    _ignore_signals(_STOP_SIGNALS)
+                    # unwinds, so a stop or timeout hint from here on is
+                    # absorbed rather than raised past that record.
+                    # Disarmed inside this `try`, so one landing first is
+                    # still caught below and recorded.
+                    _ignore_signals(_GUARD_SIGNALS)
                     raise
 
                 if snap.interactive:
@@ -782,11 +797,11 @@ def _run_job(snap: crony.model.Job) -> int:
                             pending_flag.unlink(missing_ok=True)
                         if choice == _InteractiveChoice.CANCEL:
                             # Decided, like the gated skip above: absorb a
-                            # stop and record the decline.
-                            _ignore_signals(_STOP_SIGNALS)
+                            # stop or timeout hint and record the decline.
+                            _ignore_signals(_GUARD_SIGNALS)
                             result = crony.model.JobRunResult(
-                                host=host,
-                                platform=platform,
+                                host=crony.platform.current_host(),
+                                platform=crony.platform.current_platform(),
                                 started_at=started_iso,
                                 ended_at=crony.runtime.now_iso(),
                                 duration_sec=time.time() - started,
@@ -795,11 +810,11 @@ def _run_job(snap: crony.model.Job) -> int:
                                 signal=None,
                                 process_exit=0,
                                 gate=gate,
-                                log_path=str(reported_log_path),
+                                log_path=str(snap.log_path),
                                 notifications={},
                             )
                             crony.runtime.write_last_run(
-                                last_run_path, dataclasses.asdict(result)
+                                sd / "last-run.json", dataclasses.asdict(result)
                             )
                             return 0
 
@@ -862,113 +877,46 @@ def _run_job(snap: crony.model.Job) -> int:
                     exit_code = rc
                     surfaced_rc = rc
 
-                duration_sec = time.time() - started
-                ended_at = crony.runtime.now_iso()
-                if is_daemon:
-                    retry_history = crony.runtime.record_daemon_exit(
-                        sd, duration_sec, exit_class, ended_at
-                    )
-                    premature_exits = len(retry_history.runs)
-                    if premature_exits > crony.config.DAEMON_RETRY_LIMIT:
-                        # Scheduler-facing success is the portable
-                        # "stop automatically restarting" signal for
-                        # launchd SuccessfulExit=false and systemd
-                        # Restart=on-failure. Preserve the command's
-                        # actual exit_code, but a cleanly exiting
-                        # continuous service is still unhealthy once
-                        # crony gives up on keeping it alive.
-                        surfaced_rc = 0
-                        if exit_class == crony.model.ExitClass.OK:
-                            exit_class = crony.model.ExitClass.FAIL
-                        log_file.write(
-                            (
-                                "daemon: retry limit reached after "
-                                f"{premature_exits} premature exits; "
-                                "leaving stopped (the next login, or "
-                                "crony trigger / apply / enable, "
-                                "retries it)\n"
-                            ).encode()
-                        )
-                    else:
-                        log_file.write(
-                            (
-                                "daemon: requesting automatic retry "
-                                f"{premature_exits} of "
-                                f"{crony.config.DAEMON_RETRY_LIMIT}\n"
-                            ).encode()
-                        )
-
-                # Pre-populate per-channel slots with sent=False so
-                # the dispatcher can update each entry in place. Order
-                # is preserved (Python dict insertion order) so the
-                # JSON record reflects the configured channel order.
-                notifications: dict[str, crony.model.NotificationResult] = {
-                    ch: crony.model.NotificationResult(sent=False)
-                    for ch in notify_channels
-                }
-                result = crony.model.JobRunResult(
-                    host=host,
-                    platform=platform,
-                    started_at=started_iso,
-                    ended_at=ended_at,
-                    duration_sec=duration_sec,
-                    exit_class=exit_class,
-                    exit_code=exit_code,
-                    signal=sig,
-                    process_exit=surfaced_rc,
+                return _record_outcome(
+                    snap,
+                    log_file,
+                    _RunOutcome(exit_class, exit_code, sig, surfaced_rc),
                     gate=gate,
-                    log_path=str(reported_log_path),
-                    notifications=notifications,
+                    started=started,
+                    started_iso=started_iso,
+                    notify_channels=notify_channels,
+                    notify_defaults=notify_defaults,
+                    success_ratio=success_ratio,
                 )
-
-                # Maintain the exit-history window only when the ratio
-                # can actually suppress (N > 1); a 1/1 job keeps the
-                # original notify-on-every-failure path with no new
-                # on-disk state. The append is unconditional on
-                # completion -- OK runs are the successes the window
-                # needs, and it must not depend on notify_channels, or
-                # toggling channels would punch gaps in the window.
-                if success_ratio.n > 1:
-                    history = crony.runtime.append_exit_history(
-                        sd, exit_class, result.ended_at
-                    )
-                    successes = history.successes_in_window(success_ratio.n)
-                else:
-                    successes = None
-
-                should_dispatch = (
-                    exit_class != crony.model.ExitClass.OK
-                    and bool(notify_channels)
-                )
-                if (
-                    should_dispatch
-                    and successes is not None
-                    and successes >= success_ratio.k
-                ):
-                    should_dispatch = False
-                    result.notify_suppressed = True
-                    log_file.write(
-                        f"notify: suppressed by notify-success-ratio "
-                        f"{success_ratio}\n".encode()
-                    )
-
-                if should_dispatch:
-                    log_text = ""
-                    try:
-                        log_text = log_path.read_text(
-                            encoding="utf-8", errors="replace"
-                        )[-200_000:]
-                    except OSError:
-                        pass
-                    crony.notify.dispatch_notify(
-                        result, full_name, log_text, notify_defaults
-                    )
-
-                crony.runtime.write_last_run(
-                    last_run_path, dataclasses.asdict(result)
-                )
-                return surfaced_rc
             except _StopRequested as stop:
+                if stop.timed_out:
+                    # The run used up its cap before its command started (a
+                    # non-interactive run is clocked from launch, gate
+                    # included). A timeout is a failure of the run, so it is
+                    # finished like a command that timed out.
+                    _reclaim_interrupted_launch(sd)
+                    _write_crony_line(
+                        log_file,
+                        log_path,
+                        f"run exceeded the {snap.timeout}s timeout before "
+                        f"its command ran",
+                    )
+                    return _record_outcome(
+                        snap,
+                        log_file,
+                        _RunOutcome(
+                            crony.model.ExitClass.TIMEOUT,
+                            None,
+                            None,
+                            int(crony.errors.ExitCode.TIMEOUT),
+                        ),
+                        gate=gate,
+                        started=started,
+                        started_iso=started_iso,
+                        notify_channels=notify_channels,
+                        notify_defaults=notify_defaults,
+                        success_ratio=success_ratio,
+                    )
                 return _record_pre_command_stop(
                     snap,
                     log_file,
@@ -994,6 +942,158 @@ def _run_job(snap: crony.model.Job) -> int:
         return int(crony.errors.ExitCode.LOCK_BUSY)
 
 
+class _RunOutcome(NamedTuple):
+    """How a job run ended, as its record states it: the class, the
+    command's own exit code and the signal that killed it (each None where
+    it does not apply), and the code the runner surfaces to the scheduler
+    for the launch."""
+
+    exit_class: crony.model.ExitClass
+    exit_code: int | None
+    signal: int | None
+    surfaced_rc: int
+
+
+def _record_outcome(
+    snap: crony.model.Job,
+    log_file: IO[bytes],
+    outcome: _RunOutcome,
+    *,
+    gate: crony.model.GateResult,
+    started: float,
+    started_iso: str,
+    notify_channels: list[str],
+    notify_defaults: crony.config.Defaults,
+    success_ratio: crony.config.SuccessRatio,
+) -> int:
+    """Finish a job run that has an outcome of its own -- the command's, or
+    a timeout before the command started: charge a daemon's retry budget,
+    maintain the notify-success-ratio window, dispatch failure
+    notifications, and write the record. Returns the code the runner
+    surfaces, which exhausting a daemon's budget can override (as it can
+    the class) from what `outcome` says.
+    """
+    full_name = str(snap.entity_name)
+    sd = snap.state_dir
+    log_path = snap.log_path_resolved
+    exit_class, exit_code, sig, surfaced_rc = outcome
+    duration_sec = time.time() - started
+    ended_at = crony.runtime.now_iso()
+    if crony.unit.is_daemon(snap.timing):
+        retry_history = crony.runtime.record_daemon_exit(
+            sd, duration_sec, exit_class, ended_at
+        )
+        premature_exits = len(retry_history.runs)
+        if premature_exits > crony.config.DAEMON_RETRY_LIMIT:
+            # Scheduler-facing success is the portable "stop automatically
+            # restarting" signal for launchd SuccessfulExit=false and systemd
+            # Restart=on-failure. Preserve the command's actual exit_code, but
+            # a cleanly exiting continuous service is still unhealthy once
+            # crony gives up on keeping it alive.
+            surfaced_rc = 0
+            if exit_class == crony.model.ExitClass.OK:
+                exit_class = crony.model.ExitClass.FAIL
+            log_file.write(
+                (
+                    "daemon: retry limit reached after "
+                    f"{premature_exits} premature exits; "
+                    "leaving stopped (the next login, or "
+                    "crony trigger / apply / enable, "
+                    "retries it)\n"
+                ).encode()
+            )
+        else:
+            log_file.write(
+                (
+                    "daemon: requesting automatic retry "
+                    f"{premature_exits} of "
+                    f"{crony.config.DAEMON_RETRY_LIMIT}\n"
+                ).encode()
+            )
+
+    # Pre-populate per-channel slots with sent=False so the dispatcher can
+    # update each entry in place. Order is preserved (Python dict insertion
+    # order) so the JSON record reflects the configured channel order.
+    notifications: dict[str, crony.model.NotificationResult] = {
+        ch: crony.model.NotificationResult(sent=False) for ch in notify_channels
+    }
+    result = crony.model.JobRunResult(
+        host=crony.platform.current_host(),
+        platform=crony.platform.current_platform(),
+        started_at=started_iso,
+        ended_at=ended_at,
+        duration_sec=duration_sec,
+        exit_class=exit_class,
+        exit_code=exit_code,
+        signal=sig,
+        process_exit=surfaced_rc,
+        gate=gate,
+        log_path=str(snap.log_path),
+        notifications=notifications,
+    )
+
+    # Maintain the exit-history window only when the ratio can actually
+    # suppress (N > 1); a 1/1 job keeps the original notify-on-every-failure
+    # path with no new on-disk state. The append is unconditional on
+    # completion -- OK runs are the successes the window needs, and it must
+    # not depend on notify_channels, or toggling channels would punch gaps in
+    # the window.
+    if success_ratio.n > 1:
+        history = crony.runtime.append_exit_history(
+            sd, exit_class, result.ended_at
+        )
+        successes = history.successes_in_window(success_ratio.n)
+    else:
+        successes = None
+
+    should_dispatch = exit_class != crony.model.ExitClass.OK and bool(
+        notify_channels
+    )
+    if (
+        should_dispatch
+        and successes is not None
+        and successes >= success_ratio.k
+    ):
+        should_dispatch = False
+        result.notify_suppressed = True
+        log_file.write(
+            f"notify: suppressed by notify-success-ratio "
+            f"{success_ratio}\n".encode()
+        )
+
+    if should_dispatch:
+        log_text = ""
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")[
+                -200_000:
+            ]
+        except OSError:
+            pass
+        crony.notify.dispatch_notify(
+            result, full_name, log_text, notify_defaults
+        )
+
+    crony.runtime.write_last_run(
+        sd / "last-run.json", dataclasses.asdict(result)
+    )
+    return surfaced_rc
+
+
+def _reclaim_interrupted_launch(sd: Path) -> None:
+    """Put a launch's run state right for recording a run that a stop or
+    timeout interrupted before its command started."""
+    # The signal may have landed before this launch published run.pid; the
+    # record's pid has to match it, or status reads the launch as one that
+    # never recorded. Only then: rewriting it would restamp its mtime, which
+    # status reads as when the run started.
+    pid_path = sd / "run.pid"
+    if crony.runtime.read_pid_file(pid_path) != os.getpid():
+        pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    # The interactive wait removes this on its way out, but the signal can
+    # land in that cleanup too.
+    (sd / "pending.flag").unlink(missing_ok=True)
+
+
 def _record_pre_command_stop(
     snap: crony.model.Job,
     log_file: IO[bytes],
@@ -1013,20 +1113,11 @@ def _record_pre_command_stop(
     signal that stopped it and whatever gate result it had reached. It
     dispatches no notification and adds nothing to the exit history: a
     stop is neither an outcome of the command nor a daemon exiting on its
-    own. Runs with every stop signal already ignored (`_raise_on_stop`
-    disarms before raising), so a further stop cannot cut the record short.
+    own. Runs with every guard signal already ignored (`_raise_on_stop`
+    disarms before raising), so a further one cannot cut the record short.
     """
     sd = snap.state_dir
-    # The stop may have landed before this launch published run.pid; the
-    # record's pid has to match it, or status reads the launch as one that
-    # never recorded. Only then: rewriting it would restamp its mtime, which
-    # status reads as when the run started.
-    pid_path = sd / "run.pid"
-    if crony.runtime.read_pid_file(pid_path) != os.getpid():
-        pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    # The interactive wait removes this on its way out, but the stop can
-    # land in that cleanup too.
-    (sd / "pending.flag").unlink(missing_ok=True)
+    _reclaim_interrupted_launch(sd)
     _write_crony_line(
         log_file,
         snap.log_path_resolved,
@@ -1187,7 +1278,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
             # (the SIGUSR1 hint too, or a default disposition would kill
             # it) -- a normal timeout self-records, a wedged one rides to
             # the guard's SIGKILL and reads as a timeout via the flag.
-            _ignore_signals((*_STOP_SIGNALS, signal.SIGUSR1))
+            _ignore_signals(_GUARD_SIGNALS)
             try:
                 # Resolve each child ref to its current full name via
                 # the child's own snapshot. A None resolution means the

@@ -1529,8 +1529,9 @@ _STATUS_COLUMNS: tuple[_StatusColumn, ...] = (
         _StatusCols.TIMEOUT,
         "TIMEOUT",
         "Job wallclock cap: `<n>s`. The job will be killed if its "
-        "wallclock execution time exceeds this cap. May be `none` for "
-        "uncapped jobs.",
+        "wallclock execution time exceeds this cap -- for a job that is not "
+        "interactive, counted from launch, so its gate counts too. May be "
+        "`none` for uncapped jobs.",
     ),
     _StatusColumn(
         _StatusCols.PRIORITY,

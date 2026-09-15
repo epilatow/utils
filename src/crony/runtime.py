@@ -48,9 +48,10 @@ RUNNING_REF_ENV = "CRONY_RUNNING_REF"
 
 # The guard publishes its own pid here for the runner it spawns, so the
 # runner can signal the guard SIGUSR1 the instant it starts the command
-# (the guard arms its wallclock cap on that signal, excluding the runner's
-# pre-command setup / interactive wait from the cap). Absent when a run has
-# no guard (an uncapped entry), in which case the runner arms nothing.
+# (an interactive run's guard arms its wallclock cap on that signal,
+# excluding the approval wait from the cap; any other run is armed at
+# launch and the signal changes nothing). Absent when a run has no guard
+# (an uncapped entry), in which case the runner arms nothing.
 GUARD_PID_ENV = "CRONY_GUARD_PID"
 
 

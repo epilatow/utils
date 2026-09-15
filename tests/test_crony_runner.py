@@ -2571,8 +2571,9 @@ class TestRunJobStoppedBeforeCommand:
     a scheduler stopping or reloading the unit while the run sits in its
     gate or interactive wait -- is recorded as a `canceled` run carrying
     the signal, not left to kill the runner unrecorded (which status reads
-    as `crashed`). Once the run is decided, a stop is absorbed so the
-    decided outcome is what gets recorded.
+    as `crashed`). The guard's timeout hint arriving that early is recorded
+    the same way, as a `timeout`. Once the run is decided, either is
+    absorbed so the decided outcome is what gets recorded.
 
     These deliver real signals to the test process; the autouse
     signal-isolation fixture restores the dispositions afterwards.
@@ -2821,23 +2822,116 @@ class TestRunJobStoppedBeforeCommand:
         assert rec["exit_code"] == 0
 
     def _stop_at_record_write(self, monkeypatch: Any) -> list[Any]:
-        """Stop the runner just as it writes its record, noting the
-        SIGTERM disposition at that moment (every stop signal must be
-        ignored alike, so it checks all of them agree)."""
+        """Send the runner the guard's timeout hint and a stop just as it
+        writes its record, noting the disposition every guard signal had at
+        that moment (they must all be ignored alike, so it checks they
+        agree)."""
         real_write = crony_runtime.write_last_run
         observed: list[Any] = []
 
         def _stop_then_write(path: Path, payload: dict[str, Any]) -> None:
             dispositions = {
-                signal.getsignal(s) for s in crony_runner._STOP_SIGNALS
+                signal.getsignal(s) for s in crony_runner._GUARD_SIGNALS
             }
             assert len(dispositions) == 1
             observed.append(dispositions.pop())
+            signal.raise_signal(signal.SIGUSR1)
             signal.raise_signal(signal.SIGTERM)
             real_write(path, payload)
 
         monkeypatch.setattr(crony_runtime, "write_last_run", _stop_then_write)
         return observed
+
+    def test_timeout_hint_during_gate_records_a_timeout(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A capped run is clocked from launch, so a gate can use up the cap
+        # before the command starts. The guard's hint then ends the run as a
+        # timeout -- a failure, notified and counted in the success-ratio
+        # window like a command that timed out -- instead of the hint's
+        # default disposition killing the runner unrecorded.
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        sentinel = tmp_path / "exec-sentinel"
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "command": f"touch {sentinel}",
+                        "gate": "kill -USR1 $PPID; sleep 5",
+                        "schedule": "daily",
+                        "notify_channels": ["dialog-popup"],
+                        # Keeps a history window (N > 1) yet notifies on the
+                        # first failure, so both can be seen from one run.
+                        "notify_success_ratio": "2/2",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        dispatched: list[Any] = []
+        monkeypatch.setattr(
+            crony_notify,
+            "dispatch_notify",
+            lambda result, *_a, **_k: dispatched.append(result),
+        )
+        snap = h.snap(cfg, "g")
+        started = time.monotonic()
+        assert crony_runner._run_job(snap) == int(ExitCode.TIMEOUT)
+        assert time.monotonic() - started < 5, "waited out the timed-out gate"
+        sd = snap.state_dir
+        rec = h.last_run("g")
+        assert rec["exit_class"] == "timeout"
+        assert rec["exit_code"] is None
+        assert rec["signal"] is None
+        assert rec["process_exit"] == int(ExitCode.TIMEOUT)
+        assert rec["gate"] == "none"
+        assert rec["pid"] == os.getpid()
+        assert int((sd / "run.pid").read_text(encoding="utf-8")) == os.getpid()
+        log = (sd / "run.log").read_text(encoding="utf-8")
+        assert (
+            f"crony: run exceeded the {snap.timeout}s timeout before its "
+            f"command ran\n" in log
+        )
+        assert not sentinel.exists()
+        assert [r.exit_class for r in dispatched] == [ExitClass.TIMEOUT]
+        assert rec["notify_suppressed"] is False
+        history = json.loads((sd / "exit-history.json").read_text())
+        assert [e["exit_class"] for e in history["runs"]] == ["timeout"]
+
+    def test_timeout_hint_during_command_spawn_is_noted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A hint landing while the command is being started is no longer the
+        # runner's to raise on -- the command may already be running. It is
+        # noted, so the kill the guard follows it with is recorded as the
+        # timeout it is.
+        monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)
+        real_popen = subprocess.Popen
+
+        def _spawn_then_hint(
+            *args: Any, **kwargs: Any
+        ) -> subprocess.Popen[bytes]:
+            proc = real_popen(*args, **kwargs)
+            signal.raise_signal(signal.SIGUSR1)
+            return proc
+
+        crony_runner._raise_on_stop()
+        log_path = tmp_path / "run.log"
+        with (
+            open(log_path, "ab", buffering=0) as log_file,
+            mock.patch.object(
+                subprocess,
+                "Popen",
+                autospec=True,
+                side_effect=_spawn_then_hint,
+            ) as popen,
+        ):
+            outcome, timed_out = crony_runner._exec_command(
+                ["true"], env=dict(os.environ), log_file=log_file
+            )
+        popen.assert_called_once()
+        assert outcome == crony_runner._ExitOutcome(rc=0, signal=None)
+        assert timed_out is True
 
     def test_stop_during_command_spawn_reaches_the_command(
         self, tmp_path: Path, monkeypatch: Any
@@ -2903,8 +2997,8 @@ class TestRunJobStoppedBeforeCommand:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A precondition raised mid-run still has its record to write, in
-        # `do_run`, after `_run_job` has unwound: a stop then must not
-        # raise past that write.
+        # `do_run`, after `_run_job` has unwound: a stop or timeout hint then
+        # must not raise past that write.
         h = _RunnerHarness(tmp_path, monkeypatch)  # platform -> darwin
         monkeypatch.setattr(
             crony_fda, "wrapper_state", lambda: FDAWrapper.MISSING_FDA_GRANT
@@ -2926,9 +3020,9 @@ class TestRunJobStoppedBeforeCommand:
         )
         with pytest.raises(PreconditionError, match="grant me FDA"):
             crony_runner._run_job(h.snap(cfg, "j"))
-        assert {s: signal.getsignal(s) for s in crony_runner._STOP_SIGNALS} == {
-            s: signal.SIG_IGN for s in crony_runner._STOP_SIGNALS
-        }
+        assert {
+            s: signal.getsignal(s) for s in crony_runner._GUARD_SIGNALS
+        } == {s: signal.SIG_IGN for s in crony_runner._GUARD_SIGNALS}
 
 
 class TestFullDiskAccess:

@@ -60,6 +60,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from crony.errors import ExitCode
 from crony.platform import current_platform
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -1030,6 +1031,54 @@ class TestStopOutlivedByTheRun:
         rec = json.loads((sd / "last-run.json").read_text())
         assert rec["exit_class"] == "ok"
         assert rec["process_exit"] == 0
+
+
+class TestTimeoutBeforeCommand:
+    """A capped run that uses up its cap before its command starts -- here
+    in a gate that outlasts it -- reads `timeout`, never `crashed`: the
+    guard's timeout hint reaches a runner that records it rather than dying
+    on it. The unit carries the CRONY_* overrides, as in
+    `TestStopBeforeCommand`.
+    """
+
+    def test_gate_outlasting_the_cap_reads_timeout(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # The cap leaves the runner room to start and publish its pid, which
+        # the guard needs before it can send the hint, even on a slow host;
+        # the gate then has to outlast the cap without reaching its own
+        # fixed 30s limit, which would record a gated skip instead.
+        e2e.write_bundle(
+            "[job.probe]\n"
+            'command = "true"\n'
+            'gate = "sleep 25"\n'
+            'schedule = "*-*-* 03:00"\n'
+            "job-timeout-sec = 15\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=False)
+        sd = e2e.state_dir / E2E_BUNDLE / "probe"
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: "gate: " in _read_text(sd / "run.log"),
+            timeout=60,
+            what="the triggered run to reach its gate",
+        )
+        e2e.wait_until(
+            lambda: not e2e.unit_running("probe"),
+            timeout=60,
+            what="the timed-out unit to exit",
+        )
+        e2e.wait_for_recorded_status(e2e.full("probe"), "timeout")
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["exit_class"] == "timeout"
+        assert rec["process_exit"] == int(ExitCode.TIMEOUT)
+        assert rec["gate"] == "none"
+        assert (
+            "crony: run exceeded the 15s timeout before its command ran\n"
+            in _read_text(sd / "run.log")
+        )
 
 
 def _read_text(path: Path) -> str:

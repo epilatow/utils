@@ -272,7 +272,8 @@ Send a synthetic failure notification.
   column, or its dash-spelled snapshot attribute.
 - **`timeout`**\
   Job wallclock cap: `<n>s`. The job will be killed if its wallclock execution
-  time exceeds this cap. May be `none` for uncapped jobs.
+  time exceeds this cap -- for a job that is not interactive, counted from
+  launch, so its gate counts too. May be `none` for uncapped jobs.
 - **`unit-config-1`**\
   Filesystem path of the platform config unit. Empty when no config unit
   exists on disk.
@@ -368,9 +369,10 @@ Send a synthetic failure notification.
   snapshot is missing on this host, or the scheduler refused to fire it.
 - **`timeout`**\
   Jobs and groups. The job was killed after exceeding its wallclock execution
-  timeout. For a job group: the group ran out of time on a child before it
-  ever saw it running -- its cumulative budget was spent, or the scheduler
-  never started the child.
+  timeout -- which a job that is not interactive can do in its gate, before
+  its command starts. For a job group: the group ran out of time on a child
+  before it ever saw it running -- its cumulative budget was spent, or the
+  scheduler never started the child.
 - **`gated`**\
   Jobs only. The job was skipped due to an execution gate. This is not
   considered as a job failure.
