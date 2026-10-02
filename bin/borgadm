@@ -593,21 +593,22 @@ def initialize_logger(
 
 @functools.cache
 def borg_cmd() -> list[str]:
+    """Find a Borg launcher usable from any backup working directory."""
 
     # Default to the version in PATH.
     if rv := shutil.which("borg"):
-        return [rv]
+        return [str(Path(rv).absolute())]
 
     # Explicitly search common dirs.
     path_search = [os.environ["HOME"] + "/.local/bin", "/opt/local/bin"]
     for i in path_search:
         rv = os.path.join(i, "borg")
         if os.path.exists(rv):
-            return [rv]
+            return [str(Path(rv).absolute())]
 
     # Run it via uvx if it's installed.
     if uvx := shutil.which("uvx"):
-        return [uvx, "-q", "--from", "borgbackup", "borg"]
+        return [str(Path(uvx).absolute()), "-q", "--from", "borgbackup", "borg"]
 
     raise BorgadmError("Can't find borg or uvx executables.")
 
@@ -1274,6 +1275,7 @@ def backup_set_paths(
     """
     Return sets of directories and files from BACKUP_SETS paths.
     Directories end in a "/", all other entries are considered files.
+    User-home prefixes are expanded, matching the paths passed to Borg.
     """
     cfg = get_cfg()
 
@@ -1283,8 +1285,12 @@ def backup_set_paths(
         if set_name is None or i == set_name
         for k in j["paths"]
     }
-    dirs: set[Path] = {Path(i) for i in paths if i.endswith("/")}
-    files: set[Path] = {Path(i) for i in paths if not i.endswith("/")}
+    dirs: set[Path] = {
+        Path(os.path.expanduser(i)) for i in paths if i.endswith("/")
+    }
+    files: set[Path] = {
+        Path(os.path.expanduser(i)) for i in paths if not i.endswith("/")
+    }
     return (dirs, files)
 
 
@@ -2129,8 +2135,20 @@ def do_compact(progress: bool) -> None:
     run_borg(borg_cmd() + args, repo_write=True, allow_output=progress)
 
 
-def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
+def do_create(
+    dry_run: bool, progress: bool, no_prune: bool, root: str | None
+) -> None:
     cfg = get_cfg()
+    backup_root = (
+        Path(root).expanduser() if root is not None else cfg.BACKUP_ROOT
+    ).resolve()
+    if not _is_remote_repo(cfg.BORG_REPO):
+        # Every operation in this create run, including automatic prune
+        # and compact, must use the original repository location regardless
+        # of its subprocess working directory.
+        cfg.BORG_REPO = str(
+            (cfg.BACKUP_ROOT / os.path.expanduser(cfg.BORG_REPO)).resolve()
+        )
     # do_create is the one subcommand that requires BACKUP_SETS to be
     # non-empty -- the others read whatever the repo already contains
     # via list_backups, which is config-set-name-agnostic.
@@ -2141,7 +2159,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         error: bool = False
         dirs, files = backup_set_paths(set_name)
         for d in dirs:
-            full_path = cfg.BACKUP_ROOT / d
+            full_path = backup_root / d
             if not os.path.isdir(full_path):
                 logger.error(
                     f"Missing backup dir (set: '{set_name}'): {full_path}"
@@ -2153,7 +2171,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
                 )
                 error = True
         for f in files:
-            full_path = cfg.BACKUP_ROOT / f
+            full_path = backup_root / f
             if os.path.isdir(full_path):
                 logger.error(
                     "Missing trailing slash for backup directory in config "
@@ -2187,7 +2205,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         # Backups can take a while, so re-run tests before each backup
         backup_set_tests(set_name)
         for path in cfg.BACKUP_MOUNTS:
-            full_path = cfg.BACKUP_ROOT / path
+            full_path = (backup_root / path).resolve()
             if not is_mountpoint(full_path):
                 raise BorgadmError(f"Missing backup mount: {full_path}")
         create_args = set_cfg.get("create_options", [])
@@ -2236,7 +2254,7 @@ def do_create(dry_run: bool, progress: bool, no_prune: bool) -> None:
         run_borg(
             cmd,
             repo_write=True,
-            cwd=cfg.BACKUP_ROOT,
+            cwd=backup_root,
             allow_output=progress,
         )
         logger.info(f"Create archive, finish: {archive}{dry})")
@@ -3331,6 +3349,22 @@ def args_parser() -> StrictArgumentParser:
     )
     create.add_argument(
         "--no-prune", action="store_true", help="Skip backup pruning"
+    )
+    add_argument_ext(
+        create,
+        "-R",
+        "--root",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Override BACKUP_ROOT for this backup (normally $HOME). "
+            "Relative backup-set paths and required mounts are resolved "
+            "from DIR; relative archive paths omit DIR. Config and credential "
+            "path resolution is unchanged (defaults remain under $HOME). "
+            "Relative DIR values are resolved from the current directory. "
+            "Relative local repository paths use the configured BACKUP_ROOT "
+            "for both creation and automatic pruning."
+        ),
     )
     add_dry_run(create)
     add_progress(create)

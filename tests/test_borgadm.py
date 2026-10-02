@@ -4223,14 +4223,236 @@ def _set_backup_sets(
     fixture.config_path.write_text("\n".join(rewritten) + "\n")
 
 
+class TestCreateRoot:
+    @pytest.mark.usefixtures("mock_cfg")
+    @pytest.mark.parametrize("executable", ["borg", "uvx"])
+    def test_relative_executable_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, executable: str
+    ) -> None:
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        program = tools / executable
+        program.write_text("#!/bin/sh\nprintf 'selected executable\\n'\n")
+        program.chmod(0o755)
+        source = tmp_path / "source"
+        source.mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PATH", "tools")
+        real_exists = os.path.exists
+        fallbacks = {
+            str(Path.home() / ".local/bin/borg"),
+            "/opt/local/bin/borg",
+        }
+
+        def exists(path: str) -> bool:
+            return path not in fallbacks and real_exists(path)
+
+        with patch.object(
+            ba.os.path, "exists", autospec=True, side_effect=exists
+        ):
+            command = ba.borg_cmd.__wrapped__()
+        result = ba.run_cmd(command + ["--version"], cwd=source)
+        assert result.stdout == "selected executable\n"
+
+    def test_tilde_sources_match_validation(
+        self, mock_cfg: Any, tmp_path: Path
+    ) -> None:
+        home = Path.home()
+        (home / "directory").mkdir()
+        (home / "directory" / "content").write_text("content")
+        (home / "file").write_text("content")
+        mock_cfg.BACKUP_SETS = {"set1": {"paths": ["~/directory/", "~/file"]}}
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_create(False, False, True, root=str(tmp_path))
+        assert run.call_args.args[0][-2:] == [
+            f"{home}/directory/",
+            str(home / "file"),
+        ]
+
+    @pytest.mark.parametrize(
+        "repository", ["ssh://user@host/./repo", "user@host:repo"]
+    )
+    def test_remote_repository_unchanged(
+        self, mock_cfg: Any, tmp_path: Path, repository: str
+    ) -> None:
+        (tmp_path / "foo").write_text("content")
+        mock_cfg.BORG_REPO = repository
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_create(False, False, True, root=str(tmp_path))
+        assert mock_cfg.BORG_REPO == repository
+        assert run.call_args.args[0][-2].startswith(f"{repository}::")
+
+    @pytest.mark.parametrize("override", [None, "~/source"])
+    def test_configured_root_and_tilde(
+        self, mock_cfg: Any, override: str | None
+    ) -> None:
+        root = Path.home() / "source"
+        root.mkdir()
+        (root / "foo").write_text("backup content")
+        mock_cfg.BACKUP_ROOT = root if override is None else root / "unused"
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_create(False, False, True, root=override)
+        assert run.call_args.kwargs["cwd"] == root
+
+    @pytest.mark.parametrize("flag", ["-R", "--root"])
+    def test_root_override(
+        self, flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = Path.home()
+        root = tmp_path / "source"
+        root.mkdir()
+        (root / "data").write_text("backup content")
+        config = home / ".borgadm"
+        config.write_text(
+            'BORG_REPO = repo\nBACKUP_SETS = {"s": {"paths": ["data"]}}\n'
+        )
+        monkeypatch.chdir(tmp_path)
+        args = vars(
+            ba.args_parser().parse_command(
+                ["create", flag, "source", "--no-prune"]
+            )
+        )
+        cfg = ba.Config(str(config), args)
+        assert cfg.BACKUP_ROOT == home
+        assert cfg.BORG_PASSPHRASE_FILE == home / ".borg_passphrase"
+        assert cfg.BORG_SSHKEY_FILE == home / ".ssh/id_borg.net"
+        assert args["config"] == config
+        with (
+            patch.object(ba, "get_cfg", autospec=True, return_value=cfg),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_create(False, False, True, root=args["root"])
+        assert run.call_args.kwargs["cwd"] == root
+        assert run.call_args.args[0][-1] == "data"
+        assert str(root) not in run.call_args.args[0]
+        assert run.call_args.args[0][-2].startswith(f"{home / 'repo'}::")
+
+    @pytest.mark.parametrize("root", ["source", "source/../source"])
+    @pytest.mark.parametrize("mount", ["mounted", "child/../mounted"])
+    def test_relative_root_mount(
+        self,
+        mock_cfg: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        root: str,
+        mount: str,
+    ) -> None:
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "foo").write_text("backup content")
+        mock_cfg.BACKUP_MOUNTS = [mount]
+        monkeypatch.chdir(tmp_path)
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+            patch.object(
+                ba.subprocess,
+                "check_output",
+                autospec=True,
+                return_value=f"device on {source / 'mounted'} type ext4 (rw)\n",
+            ),
+        ):
+            ba.do_create(False, False, True, root=root)
+        assert run.call_args.kwargs["cwd"] == source
+
+    def test_required_mount_uses_root(
+        self, mock_cfg: Any, tmp_path: Path
+    ) -> None:
+        (tmp_path / "foo").write_text("backup content")
+        mock_cfg.BACKUP_MOUNTS = ["mounted"]
+        with (
+            patch.object(
+                ba, "is_mountpoint", autospec=True, return_value=False
+            ) as mount,
+            pytest.raises(berr.BorgadmError, match="Missing backup mount"),
+        ):
+            ba.do_create(False, False, True, root=str(tmp_path))
+        mount.assert_called_once_with(tmp_path / "mounted")
+
+
 @pytest.mark.e2e
 class TestE2ECreate:
-    """E2E coverage for `borgadm create` archive naming.
+    """E2E coverage for `borgadm create` backup roots and archive naming.
 
     Pins the NofM-suffix scheme: each archive name carries a
     `_NofM` tail where M is the configured-set count and N is the
     1-based position of the set's name in sorted set-name order.
     """
+
+    @pytest.mark.parametrize("repository", ["repo", "~/repo", "absolute"])
+    @pytest.mark.parametrize("override", [False, True])
+    def test_create_pipeline_preserves_local_repository(
+        self,
+        borg_e2e: BorgE2EFixture,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        repository: str,
+        override: bool,
+    ) -> None:
+        original_repo = borg_e2e.repo_path
+        borg_e2e.repo_path = borg_e2e.home / "repo"
+        shutil.move(original_repo, borg_e2e.repo_path)
+        location = (
+            str(borg_e2e.repo_path) if repository == "absolute" else repository
+        )
+        config = (
+            borg_e2e.config_path.read_text()
+            .replace(f"BORG_REPO = {original_repo}", f"BORG_REPO = {location}")
+            .replace(
+                f"BACKUP_ROOT = {borg_e2e.backup_root}",
+                f"BACKUP_ROOT = {borg_e2e.home}",
+            )
+        )
+        borg_e2e.config_path.write_text(config)
+        for name in ("set-a", "set-b"):
+            shutil.copytree(borg_e2e.backup_root / name, borg_e2e.home / name)
+        partial = _archive_name("set-a", "20000101_000000", 1, 2)
+        borg_e2e.make_archive(partial)
+        caller = tmp_path / "caller"
+        caller.mkdir()
+        decoy = caller / "repo"
+        borg_e2e.borg("init", "--encryption=none", str(decoy))
+        borg_e2e.borg(
+            "create", f"{decoy}::{partial}", str(borg_e2e.backup_root)
+        )
+        monkeypatch.chdir(caller)
+        args = ["create"]
+        if override:
+            args += ["--root", str(borg_e2e.backup_root)]
+        borg_e2e.run(*args)
+        assert len(borg_e2e.archives()) == 2
+        assert partial not in borg_e2e.archives()
+        assert borg_e2e.borg(
+            "list", "--short", str(decoy)
+        ).stdout.splitlines() == [partial]
+        assert not (borg_e2e.backup_root / "repo").exists()
+
+    @pytest.mark.parametrize("flag", ["-R", "--root"])
+    def test_root_preserves_relative_archive_paths(
+        self, borg_e2e: BorgE2EFixture, tmp_path: Path, flag: str
+    ) -> None:
+        root = tmp_path / "alternate"
+        root.mkdir()
+        for name in ("set-a", "set-b"):
+            (root / name).mkdir()
+            (root / name / "from-root").write_text("alternate content")
+        borg_e2e.run("create", flag, str(root), "--no-prune")
+        for archive in borg_e2e.archives():
+            paths = borg_e2e.borg(
+                "list", "--short", f"{borg_e2e.repo_path}::{archive}"
+            ).stdout.splitlines()
+            name = _parse_archive_name(archive).group("set")
+            assert set(paths) == {name, f"{name}/from-root"}
 
     def test_create_produces_one_archive_per_set(
         self, borg_e2e: BorgE2EFixture

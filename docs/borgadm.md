@@ -212,13 +212,20 @@ valid, listing any errors. Does not connect to the repository.
 
 Delete the given archive, or the latest full backup set (--latest).
 
-### `create [--no-prune] [--dry-run] [--progress] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `create [--no-prune] [-R DIR] [--dry-run] [--progress] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Create a full backup, writing one archive per configured backup set, then
 prune old archives unless --no-prune is given.
 
 - **`--no-prune`**\
   Skip backup pruning
+- **`-R, --root DIR`**\
+  Override BACKUP_ROOT for this backup (normally $HOME). Relative backup-set
+  paths and required mounts are resolved from DIR; relative archive paths omit
+  DIR. Config and credential path resolution is unchanged (defaults remain
+  under $HOME). Relative DIR values are resolved from the current directory.
+  Relative local repository paths use the configured BACKUP_ROOT for both
+  creation and automatic pruning.
 
 ### `extract [--archive SELECTOR] [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir [patterns ...]`
 
