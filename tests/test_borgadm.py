@@ -587,12 +587,9 @@ class TestDelete:
     def test_delete_by_archive_name(self, mock_cfg: Any) -> None:
         """Test deleting a single archive by full name."""
         repo = mock_cfg.BORG_REPO
-        raw_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="home-set1-20250101_120000\n",
-            stderr="",
-        )
+        raw_result = {
+            name: "" for name in ("home-set1-20250101_120000\n").splitlines()
+        }
         with (
             patch.object(
                 ba,
@@ -629,12 +626,10 @@ class TestDelete:
     @pytest.mark.usefixtures("mock_cfg")
     def test_delete_by_archive_name_not_found(self) -> None:
         """Test deleting a nonexistent archive name exits with error."""
-        raw_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="other-archive-20250101_120000\n",
-            stderr="",
-        )
+        raw_result = {
+            name: ""
+            for name in ("other-archive-20250101_120000\n").splitlines()
+        }
         with (
             patch.object(
                 ba,
@@ -654,12 +649,9 @@ class TestDelete:
     def test_delete_dry_run(self, mock_cfg: Any) -> None:
         """Test that --dry-run passes --dry-run to borg."""
         repo = mock_cfg.BORG_REPO
-        raw_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="home-set1-20250101_120000\n",
-            stderr="",
-        )
+        raw_result = {
+            name: "" for name in ("home-set1-20250101_120000\n").splitlines()
+        }
         with (
             patch.object(
                 ba,
@@ -696,12 +688,9 @@ class TestDelete:
     def test_delete_progress(self, mock_cfg: Any) -> None:
         """Test that --progress passes --progress to borg."""
         repo = mock_cfg.BORG_REPO
-        raw_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="home-set1-20250101_120000\n",
-            stderr="",
-        )
+        raw_result = {
+            name: "" for name in ("home-set1-20250101_120000\n").splitlines()
+        }
         with (
             patch.object(
                 ba,
@@ -909,6 +898,9 @@ class TestList:
                 autospec=True,
                 return_value=unknown,
             ),
+            patch.object(
+                ba, "list_backups_raw", autospec=True, return_value={}
+            ),
             caplog.at_level(logging.INFO),
         ):
             ba.do_list(
@@ -1004,13 +996,8 @@ class TestListUnknownArchives:
     """
 
     @staticmethod
-    def _make_raw(lines: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=["borg", "list"],
-            returncode=0,
-            stdout="\n".join(lines) + "\n" if lines else "",
-            stderr="",
-        )
+    def _make_raw(lines: list[str]) -> dict[str, str]:
+        return dict.fromkeys(lines, "")
 
     def _run(self, lines: list[str]) -> list[str]:
         # list_backups_raw is functools.cache-d, so clear before each
@@ -1725,6 +1712,13 @@ class TestLogs:
 class TestCheck:
     """Test check subcommands."""
 
+    @pytest.fixture
+    def _empty_listing(self) -> Iterator[None]:
+        with patch.object(
+            ba, "list_backups_raw", autospec=True, return_value={}
+        ):
+            yield
+
     @staticmethod
     def _check_subcommands() -> set[str]:
         """Discover check subcommands from the parser."""
@@ -1887,8 +1881,13 @@ class TestCheck:
     def test_check_archives_by_name(self, mock_cfg: Any) -> None:
         """check archives <names> verifies existence then checks each."""
         repo = mock_cfg.BORG_REPO
-        raw = Mock()
-        raw.stdout = "home-fuse-20250101_120000\nhome-local-20250101_120000\n"
+
+        raw = {
+            name: ""
+            for name in (
+                "home-fuse-20250101_120000\nhome-local-20250101_120000\n"
+            ).splitlines()
+        }
         with (
             patch.object(
                 ba, "list_backups_raw", autospec=True, return_value=raw
@@ -1968,8 +1967,10 @@ class TestCheck:
     @pytest.mark.usefixtures("mock_cfg")
     def test_check_archives_unknown_name_errors(self) -> None:
         """An unknown archive name fails before any borg check runs."""
-        raw = Mock()
-        raw.stdout = "home-fuse-20250101_120000\n"
+
+        raw = {
+            name: "" for name in ("home-fuse-20250101_120000\n").splitlines()
+        }
         with (
             patch.object(
                 ba, "list_backups_raw", autospec=True, return_value=raw
@@ -2010,6 +2011,7 @@ class TestCheck:
         assert args.command == f"check {mode}"
 
     @pytest.mark.usefixtures("mock_cfg")
+    @pytest.mark.usefixtures("_empty_listing")
     def test_check_prune_partial_archives(self) -> None:
         """Test check prune fails on partial archives."""
 
@@ -2034,6 +2036,7 @@ class TestCheck:
         ):
             ba.do_check_prune(bypass_lock=False)
 
+    @pytest.mark.usefixtures("_empty_listing")
     def test_check_prune_unpruned_backups(self, mock_cfg: Any) -> None:
         """Test check prune fails when old backups need pruning."""
         mock_cfg.PRUNE_KEEP_HOURLY = 1
@@ -2065,6 +2068,7 @@ class TestCheck:
         ):
             ba.do_check_prune(bypass_lock=False)
 
+    @pytest.mark.usefixtures("_empty_listing")
     def test_check_prune_ok(self, mock_cfg: Any) -> None:
         """Test check prune succeeds when no pruning needed."""
         mock_cfg.PRUNE_KEEP_HOURLY = 24
@@ -2154,10 +2158,13 @@ class TestSelectedBackup:
     def test_archive_name_selects_single_archive(self) -> None:
         """A full archive name resolves to just that archive, with the
         timestamp parsed from its name."""
-        raw = Mock()
-        raw.stdout = (
-            "home-set1-20250101_120000_1of2\nhome-set2-20250101_120000_2of2\n"
-        )
+
+        raw = {
+            name: ""
+            for name in (
+                "home-set1-20250101_120000_1of2\nhome-set2-20250101_120000_2of2\n"
+            ).splitlines()
+        }
         with patch.object(
             ba, "list_backups_raw", autospec=True, return_value=raw
         ):
@@ -2171,8 +2178,8 @@ class TestSelectedBackup:
         """A name that exists but is not a borgadm archive (no derivable
         timestamp) is rejected -- extract/rsync reconstruct a
         borgadm-managed backup."""
-        raw = Mock()
-        raw.stdout = "someone-elses-archive\n"
+
+        raw = {name: "" for name in ("someone-elses-archive\n").splitlines()}
         with (
             patch.object(
                 ba, "list_backups_raw", autospec=True, return_value=raw
@@ -2732,8 +2739,11 @@ class TestRsyncMountCleanup:
         its parsed timestamp in the .ts sidecar rather than the latest."""
         target = tmp_path / "borg-rsync"
         target.mkdir()
-        raw = Mock()
-        raw.stdout = "home-set1-20260101_000000_1of1\n"
+
+        raw = {
+            name: ""
+            for name in ("home-set1-20260101_000000_1of1\n").splitlines()
+        }
         with (
             patch.object(ba.platform, "system", return_value="Linux"),
             patch.object(ba, "check_sudo", autospec=True, return_value=True),
@@ -4587,6 +4597,581 @@ class TestE2ECreate:
             _parse_archive_name(name).group("ts") for name in archives
         }
         assert len(timestamps) == 2
+
+
+class TestArchiveListing:
+    """Consumers share names and comments until a repository mutation."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_snapshot(self) -> Iterator[None]:
+        ba.list_backups_raw.cache_clear()
+        yield
+        ba.list_backups_raw.cache_clear()
+
+    def test_consumers_share_one_listing(self, mock_cfg: ba.Config) -> None:
+        ts = "20000101_120000"
+        name = _archive_name("set-a", ts, 1, 1, mock_cfg.BACKUP_NAME)
+        listing = json.dumps(
+            {"archives": [{"name": name, "comment": "tags=keep-History;"}]}
+        )
+        with patch.object(
+            ba,
+            "run_borg",
+            autospec=True,
+            return_value=subprocess.CompletedProcess([], 0, listing),
+        ) as run:
+            full = ba.list_backups()
+            assert ba.list_backups(partial=True) == {}
+            assert ba.list_unknown_archives() == []
+            assert ba._resolve_archives([name]) == [name]
+            assert ba._retention_tags(full)[ts] == "keep-History"
+            run.assert_called_once_with(
+                ba.borg_cmd()
+                + [
+                    "list",
+                    "--json",
+                    "--format",
+                    "{comment}",
+                    mock_cfg.BORG_REPO,
+                ],
+                repo_write=False,
+                bypass_lock=False,
+            )
+
+    @pytest.mark.parametrize("by_timestamp", [True, False])
+    def test_keep_only_lists_once(
+        self, mock_cfg: ba.Config, by_timestamp: bool
+    ) -> None:
+        ts = "20000101_120000"
+        name = _archive_name("set-a", ts, 1, 1, mock_cfg.BACKUP_NAME)
+        listing = json.dumps({"archives": [{"name": name, "comment": ""}]})
+        with patch.object(
+            ba,
+            "run_borg",
+            autospec=True,
+            return_value=subprocess.CompletedProcess([], 0, listing),
+        ) as run:
+            ba.do_keep_add(ts if by_timestamp else name, "History")
+        assert len(run.call_args_list) == 2
+        assert run.call_args_list[0].args[0][len(ba.borg_cmd())] == "list"
+        assert run.call_args_list[1].args[0][len(ba.borg_cmd())] == "recreate"
+
+    def test_prune_plans_all_cleanup_from_one_listing(
+        self, mock_cfg: ba.Config
+    ) -> None:
+        name = _archive_name(
+            "set-a", "20000101_120000", 1, 2, mock_cfg.BACKUP_NAME
+        )
+        unknown = f"{mock_cfg.BACKUP_NAME}-unknown"
+        listing = json.dumps(
+            {"archives": [{"name": n, "comment": ""} for n in (name, unknown)]}
+        )
+        with patch.object(
+            ba,
+            "run_cmd",
+            autospec=True,
+            return_value=subprocess.CompletedProcess([], 0, listing),
+        ) as run:
+            ba.do_prune(False, False, True)
+        verbs = [c.args[0][len(ba.borg_cmd())] for c in run.call_args_list]
+        assert verbs == ["list", "delete", "delete", "compact"]
+
+    @pytest.mark.parametrize("verb", ["create", "delete", "recreate"])
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_writes_invalidate_names_and_comments(
+        self, mock_cfg: ba.Config, verb: str, failed: bool
+    ) -> None:
+        old = json.dumps({"archives": [{"name": "old", "comment": "old"}]})
+        new = json.dumps({"archives": [{"name": "new", "comment": "new"}]})
+        cmd = ba.borg_cmd() + [verb, mock_cfg.BORG_REPO]
+        with patch.object(
+            ba,
+            "run_cmd",
+            autospec=True,
+            side_effect=[
+                subprocess.CompletedProcess([], 0, old),
+                subprocess.CompletedProcess(
+                    cmd, 2 if failed else 0, "", "failure"
+                ),
+                subprocess.CompletedProcess([], 0, new),
+            ],
+        ) as run:
+            assert ba.list_backups_raw(False) == {"old": "old"}
+            if failed:
+                with pytest.raises(subprocess.CalledProcessError):
+                    ba.run_borg(cmd, repo_write=True)
+            else:
+                ba.run_borg(cmd, repo_write=True)
+            assert ba.list_backups_raw(False) == {"new": "new"}
+            assert run.call_count == 3
+
+
+class TestKeepTags:
+    """Comment preservation, command contracts, and ordered deletion."""
+
+    @pytest.mark.parametrize("value", ["a", "9", "Snapshot9", "A_b-c9"])
+    @pytest.mark.parametrize("op", [ba.KeepOp.ADD, ba.KeepOp.UPDATE])
+    def test_description_parses(self, value: str, op: ba.KeepOp) -> None:
+        args = ba.args_parser().parse_command(
+            ["keep", op.value, "20260101_120000", value]
+        )
+        assert args.description == value
+        assert args.command == f"keep {op.value}"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "_a",
+            "-a",
+            "a b",
+            "a\n",
+            "a]",
+            "a;",
+            "a,b",
+            "\N{LATIN SMALL LETTER E WITH ACUTE}",
+        ],
+    )
+    def test_invalid_description(self, value: str) -> None:
+        with pytest.raises(SystemExit) as error:
+            ba.args_parser().parse_command(
+                ["keep", "add", "20260101_120000", value]
+            )
+        assert error.value.code == 2
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["keep"],
+            ["keep", "add", "20260101_120000"],
+            ["keep", "remove"],
+            ["keep", "update", "20260101_120000"],
+            ["keep", "remove", "20260101_120000", "extra"],
+        ],
+    )
+    def test_missing_or_extra_arguments(self, args: list[str]) -> None:
+        with pytest.raises(SystemExit):
+            ba.args_parser().parse_command(args)
+
+    @pytest.mark.parametrize(
+        ("comment", "op", "description", "expected"),
+        [
+            ("", ba.KeepOp.ADD, "A9", "tags=keep-A9;"),
+            ("notes", ba.KeepOp.ADD, "A9", "notes\ntags=keep-A9;"),
+            (
+                "notes\ntags=future-X; trailing\n",
+                ba.KeepOp.ADD,
+                "A9",
+                "notes\ntags=future-X,keep-A9; trailing\n",
+            ),
+            (
+                "tags=keep-Old,future-X;",
+                ba.KeepOp.UPDATE,
+                "New",
+                "tags=future-X,keep-New;",
+            ),
+            (
+                "notes\ntags=future-X,keep-Old; trailing\n",
+                ba.KeepOp.REMOVE,
+                None,
+                "notes\ntags=future-X; trailing\n",
+            ),
+            ("tags=keep-Old;", ba.KeepOp.REMOVE, None, ""),
+            (
+                "Example: tags=keep-X;",
+                ba.KeepOp.ADD,
+                "Y",
+                "Example: tags=keep-X;\ntags=keep-Y;",
+            ),
+        ],
+    )
+    def test_edit_preserves_other_comment_content(
+        self,
+        comment: str,
+        op: ba.KeepOp,
+        description: str | None,
+        expected: str,
+    ) -> None:
+        assert ba._edit_keep_comment(comment, op, description) == expected
+
+    @pytest.mark.parametrize(
+        ("comment", "op"),
+        [
+            ("tags=keep-X;", ba.KeepOp.ADD),
+            ("notes", ba.KeepOp.REMOVE),
+            ("notes", ba.KeepOp.UPDATE),
+        ],
+    )
+    def test_invalid_transition(self, comment: str, op: ba.KeepOp) -> None:
+        with pytest.raises(berr.BorgadmError):
+            ba._edit_keep_comment(comment, op, "Y")
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "tags=",
+            "tags=;",
+            "tags=keep-;",
+            "tags=keep-_X;",
+            "tags=keep-X,keep-Y;",
+            "tags=keep-X;\ntags=future-X;",
+            "tags=bad tag;",
+        ],
+    )
+    def test_malformed_comment(self, comment: str) -> None:
+        with pytest.raises(berr.BorgadmError):
+            ba._comment_tags(comment)
+
+    def test_delete_orders_members_and_stops_on_failure(
+        self, mock_cfg: ba.Config
+    ) -> None:
+        names = [
+            _archive_name("a", "20260101_120000", n, 11, mock_cfg.BACKUP_NAME)
+            for n in (11, 2, 1)
+        ]
+        with (
+            patch.object(
+                ba,
+                "run_borg",
+                autospec=True,
+                side_effect=[
+                    subprocess.CompletedProcess([], 0),
+                    RuntimeError("delete failed"),
+                ],
+            ) as run,
+            pytest.raises(RuntimeError, match="delete failed"),
+        ):
+            ba._delete_archives(names, False, False)
+        assert [c.args[0][-1] for c in run.call_args_list] == [
+            names[2],
+            names[1],
+        ]
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_metadata_read_failure(self) -> None:
+        with (
+            patch.object(
+                ba,
+                "run_borg",
+                autospec=True,
+                return_value=subprocess.CompletedProcess(
+                    [], 0, '{"archives": [{"name": "x"}]}'
+                ),
+            ),
+            pytest.raises(
+                berr.BorgadmError, match="Cannot read archive listing"
+            ),
+        ):
+            ba.list_backups_raw(False)
+
+    def test_keep_does_not_change_gfs_choices(
+        self, mock_cfg: ba.Config
+    ) -> None:
+        timestamps = {"20000101_120000", "20260101_120000", "20260101_130000"}
+        mock_cfg.PRUNE_KEEP_HOURLY = 1
+        for unit in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+            setattr(mock_cfg, f"PRUNE_KEEP_{unit}", 0)
+        ordinary = ba.ts_to_keep(timestamps)
+        names = {
+            ts: _archive_name("set-a", ts, 1, 1, mock_cfg.BACKUP_NAME)
+            for ts in timestamps
+        }
+        backups = {
+            ts: [f"{mock_cfg.BORG_REPO}::{name}"] for ts, name in names.items()
+        }
+        result = ba._retention_tags(
+            backups, comments={names["20000101_120000"]: "tags=keep-History;"}
+        )
+        assert result["20000101_120000"] == "keep-History"
+        assert {
+            ts: tag for ts, tag in result.items() if ts != "20000101_120000"
+        } == ordinary
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_prune_metadata_failure_precedes_deletion(self) -> None:
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                side_effect=berr.BorgadmError("cannot read"),
+            ),
+            patch.object(ba, "_delete_archives", autospec=True) as delete,
+            pytest.raises(berr.BorgadmError, match="cannot read"),
+        ):
+            ba.do_prune(False, False, True)
+        delete.assert_not_called()
+
+    def test_duplicate_indices_are_not_a_complete_backup(
+        self, mock_cfg: ba.Config
+    ) -> None:
+        ts = "20260101_120000"
+        names = [
+            _archive_name(s, ts, 1, 1, mock_cfg.BACKUP_NAME)
+            for s in ("set-a", "set-b")
+        ]
+        with patch.object(
+            ba,
+            "list_backups_raw",
+            autospec=True,
+            return_value=dict.fromkeys(names, ""),
+        ):
+            assert ba.list_backups() == {}
+            with pytest.raises(berr.BorgadmError, match="complete backup"):
+                ba.do_keep_add(ts, "X")
+
+    def test_delete_timestamp_uses_numeric_order(
+        self, mock_cfg: ba.Config
+    ) -> None:
+        ts = "20260101_120000"
+        names = [
+            _archive_name(s, ts, n, 2, mock_cfg.BACKUP_NAME)
+            for s, n in (("a-first", 2), ("z-last", 1))
+        ]
+        with (
+            patch.object(
+                ba,
+                "list_backups_raw",
+                autospec=True,
+                return_value=dict.fromkeys(names, ""),
+            ),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_delete(ts, True, False, False)
+        assert [c.args[0][-1] for c in run.call_args_list] == [
+            names[1],
+            names[0],
+        ]
+        assert all("--dry-run" in c.args[0] for c in run.call_args_list)
+
+
+@pytest.mark.e2e
+class TestE2EKeep:
+    """Keep lifecycle against actual Borg archive comments and pruning."""
+
+    LOW_RETENTION: ClassVar[tuple[str, ...]] = tuple(
+        arg
+        for interval in ("hourly", "daily", "weekly", "monthly", "yearly")
+        for arg in (f"--keep-{interval}", "1" if interval == "hourly" else "0")
+    )
+
+    def test_lifecycle_preserves_whole_backup(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        borg_e2e.config_path.write_text(
+            borg_e2e.config_path.read_text()
+            + "\n".join(
+                f"PRUNE_KEEP_{unit.upper()} = {1 if unit == 'hourly' else 0}"
+                for unit in ("hourly", "daily", "weekly", "monthly", "yearly")
+            )
+            + "\n"
+        )
+        ts = "20000101_120000"
+        first = _archive_name("z-last", ts, 1, 2)
+        second = _archive_name("a-first", ts, 2, 2)
+        borg_e2e.make_archive(first)
+        borg_e2e.make_archive(second)
+        newer = {
+            _archive_name(s, "20260101_120000", n, 2)
+            for n, s in enumerate(("set-a", "set-b"), 1)
+        }
+        for name in newer:
+            borg_e2e.make_archive(name)
+        target = f"{borg_e2e.repo_path}::{first}"
+        comment = "--original notes {now} {unknown}\ntags=future-X; suffix\n"
+        encoded_comment = comment.replace("{", "{{").replace("}", "}}")
+        borg_e2e.borg("recreate", f"--comment={encoded_comment}", target)
+        before = json.loads(borg_e2e.borg("info", "--json", target).stdout)[
+            "archives"
+        ][0]
+        contents = borg_e2e.borg("list", "--short", target).stdout
+        borg_e2e.run("keep", "add", second, "Milestone9")
+        assert (
+            borg_e2e.run("keep", "add", ts, "Duplicate", check=False).returncode
+            != 0
+        )
+        after = json.loads(borg_e2e.borg("info", "--json", target).stdout)[
+            "archives"
+        ][0]
+        assert (
+            after["comment"] == "--original notes {now} {unknown}\n"
+            "tags=future-X,keep-Milestone9; suffix\n"
+        )
+        assert (after["name"], after["start"], after["end"]) == (
+            before["name"],
+            before["start"],
+            before["end"],
+        )
+        assert after["id"] != before["id"]
+        assert borg_e2e.borg("list", "--short", target).stdout == contents
+        second_info = json.loads(
+            borg_e2e.borg(
+                "info", "--json", f"{borg_e2e.repo_path}::{second}"
+            ).stdout
+        )["archives"][0]
+        assert second_info["comment"] == ""
+        listed = borg_e2e.run(
+            "list", "--full-names", *self.LOW_RETENTION
+        ).stdout
+        assert listed.count("(keep-Milestone9)") == 2
+        assert (
+            "keep-Milestone9"
+            not in borg_e2e.run("list", "--no-keep-tags").stdout
+        )
+        borg_e2e.run("check", "prune")
+        borg_e2e.run("prune", *self.LOW_RETENTION)
+        assert set(borg_e2e.archives()) == {first, second} | newer
+        borg_e2e.run("keep", "update", ts, "Updated_9")
+        borg_e2e.run("keep", "update", first, "Updated_9")
+        assert "(keep-Updated_9)" in borg_e2e.run("list").stdout
+        borg_e2e.run("keep", "remove", ts)
+        restored = json.loads(borg_e2e.borg("info", "--json", target).stdout)[
+            "archives"
+        ][0]
+        assert restored["comment"] == comment
+        for mode, args in (("remove", []), ("update", ["Missing"])):
+            result = borg_e2e.run("keep", mode, ts, *args, check=False)
+            assert result.returncode != 0
+            assert "does not have a keep tag" in result.stderr
+        assert borg_e2e.run("check", "prune", check=False).returncode != 0
+        borg_e2e.run("prune", "--dry-run", *self.LOW_RETENTION)
+        assert set(borg_e2e.archives()) == {first, second} | newer
+        borg_e2e.run("prune", *self.LOW_RETENTION)
+        assert set(borg_e2e.archives()) == newer
+
+    def test_partial_and_foreign_are_rejected(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        ts = "20000101_120000"
+        first = _archive_name("set-a", ts, 1, 2)
+        borg_e2e.make_archive(first)
+        borg_e2e.make_archive("foreign")
+        for selector in (ts, first, "foreign", "does-not-exist"):
+            for mode, args in (
+                ("add", ["X"]),
+                ("remove", []),
+                ("update", ["Y"]),
+            ):
+                assert (
+                    borg_e2e.run(
+                        "keep", mode, selector, *args, check=False
+                    ).returncode
+                    != 0
+                )
+        assert set(borg_e2e.archives()) == {first, "foreign"}
+
+    def test_literal_braces_in_archive_name(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        ts = "20000101_120000"
+        name = _archive_name("set{unknown}", ts, 1, 1)
+        encoded = name.replace("{", "{{").replace("}", "}}")
+        borg_e2e.borg(
+            "create",
+            f"{borg_e2e.repo_path}::{encoded}",
+            str(borg_e2e.backup_root),
+        )
+        borg_e2e.run("keep", "add", ts, "Literal")
+        rows = json.loads(
+            borg_e2e.borg(
+                "list",
+                "--json",
+                "--format",
+                "{comment}",
+                str(borg_e2e.repo_path),
+            ).stdout
+        )["archives"]
+        assert [(row["name"], row["comment"]) for row in rows] == [
+            (name, "tags=keep-Literal;")
+        ]
+        borg_e2e.run("keep", "remove", name)
+        rows = json.loads(
+            borg_e2e.borg(
+                "list",
+                "--json",
+                "--format",
+                "{comment}",
+                str(borg_e2e.repo_path),
+            ).stdout
+        )["archives"]
+        assert [(row["name"], row["comment"]) for row in rows] == [(name, "")]
+        borg_e2e.run("delete", ts)
+        assert borg_e2e.archives() == []
+
+    def test_create_prune_and_explicit_delete(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        ts = "20000101_120000"
+        names = [
+            _archive_name(s, ts, n, 2)
+            for n, s in enumerate(("set-a", "set-b"), 1)
+        ]
+        for name in names:
+            borg_e2e.make_archive(name)
+        borg_e2e.run("keep", "add", ts, "BeforeCreate")
+        borg_e2e.run("create", *self.LOW_RETENTION)
+        assert set(names).issubset(borg_e2e.archives())
+        assert len(borg_e2e.archives()) == 4
+        borg_e2e.run("delete", ts)
+        assert set(names).isdisjoint(borg_e2e.archives())
+        assert len(borg_e2e.archives()) == 2
+
+    def test_partial_with_stale_tag_is_cleaned(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        ts = "20000101_120000"
+        first = _archive_name("set-a", ts, 1, 2)
+        borg_e2e.make_archive(first)
+        borg_e2e.borg(
+            "recreate",
+            "--comment=tags=keep-Stale;",
+            f"{borg_e2e.repo_path}::{first}",
+        )
+        assert "(prune)" in borg_e2e.run("list").stdout
+        assert borg_e2e.run("check", "prune", check=False).returncode != 0
+        borg_e2e.run("prune")
+        assert borg_e2e.archives() == []
+
+    def test_unknown_keeps_and_recreate_recovery_survive_cleanup(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        unknown = "test-unknown"
+        temporary = (
+            _archive_name("set-a", "20000101_120000", 1, 1) + ".recreate"
+        )
+        borg_e2e.make_archive(unknown)
+        borg_e2e.make_archive(temporary)
+        borg_e2e.borg(
+            "recreate",
+            "--comment=tags=keep-Manual;",
+            f"{borg_e2e.repo_path}::{unknown}",
+        )
+        result = borg_e2e.run(
+            "prune", "--cleanup-unknown", *self.LOW_RETENTION, check=False
+        )
+        assert "Unknown archive with keep tag left" in result.stderr
+        assert set(borg_e2e.archives()) == {unknown, temporary}
+
+    @pytest.mark.parametrize(
+        "comment", ["tags=keep-X,keep-Y;", "tags=bad tag;"]
+    )
+    def test_bad_metadata_prevents_all_cleanup(
+        self, borg_e2e: BorgE2EFixture, comment: str
+    ) -> None:
+        name = _archive_name("set-a", "20000101_120000", 1, 1)
+        unknown = "test-unknown"
+        borg_e2e.make_archive(name)
+        borg_e2e.make_archive(unknown)
+        borg_e2e.borg(
+            "recreate", f"--comment={comment}", f"{borg_e2e.repo_path}::{name}"
+        )
+        assert (
+            borg_e2e.run(
+                "prune", "--cleanup-unknown", *self.LOW_RETENTION, check=False
+            ).returncode
+            != 0
+        )
+        assert set(borg_e2e.archives()) == {name, unknown}
 
 
 @pytest.mark.e2e

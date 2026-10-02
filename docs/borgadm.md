@@ -10,15 +10,16 @@ borgadm is a wrapper around borgbackup designed to manage backup sets, where a
 set is a group of separate borg backups (archives) created with different
 create options. It creates backups from the named sets, verifies repository
 and archive integrity, prunes old and partial archives by retention policy,
-and restores archives via extract or rsync. A passphrase- and SSH-key-based
+and restores archives via extract or rsync. Its keep commands protect selected
+complete backups from automatic pruning. A passphrase- and SSH-key-based
 workflow handles authentication to local and remote repositories, and it can
 schedule unattended backups and checks through crony(1) on macOS (launchd) and
 Linux (systemd).
 
 The sets are defined in the config file; each `create` run writes one archive
 per set, named {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM. The NofM suffix
-records a set's position so a timestamp is "full" only when every configured
-set is present and "partial" otherwise. The list, check, prune, and restore
+records a set's position so a timestamp is "full" only when every recorded
+member is present and "partial" otherwise. The list, check, prune, and restore
 subcommands operate on these timestamps, and prune can also clean up partial
 or unrecognized ("unknown") archives.
 
@@ -99,7 +100,7 @@ To schedule unattended backups and checks via crony(1) run:
   value for this run.
 - **`--latest`**\
   Restrict the operation to the latest full backup set (the newest timestamp
-  with every configured set present).
+  with every recorded member present).
 - **`--progress`**\
   Show borg's progress output while the operation runs.
 - **`--timestamp-messages`**\
@@ -172,7 +173,8 @@ archives, the latest full set (--latest), or every archive in the repository.
 
 ### `check prune [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
-Report any partial or unpruned archives left in the repository.
+Report any partial or unpruned archives left in the repository. Complete
+backups with explicit keep tags are not unpruned errors.
 
 - **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
@@ -245,7 +247,8 @@ selects a different one.
 ### `list [--latest] [--full-names] [--keep-tags | --no-keep-tags] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--include-partial | --no-include-partial | --only-partial] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 List backups grouped by timestamp, distinguishing full from partial sets and
-showing prune keep tags.
+showing prune keep tags. Explicit keep tags replace interval labels on
+complete backups.
 
 - **`--full-names`**\
   List full names of backups (instead of just timestamps)
@@ -258,6 +261,43 @@ showing prune keep tags.
   Only list partial
 - **`--bypass-lock`**\
   skip waiting for any locks (faster, but may race a concurrent backup)
+
+### `keep add [--config CONFIG] [--verbose] [--timestamp-messages] archive description`
+
+Add the keep tag on a complete backup. Select a YYYYMMDD_HHMMSS timestamp or
+any member's full archive name; only the 1ofN archive comment is changed. Add
+requires no existing keep tag; remove and update require one. Keep tags
+protect complete backups in addition to normal retention and appear instead of
+interval labels in list. They live in the first (1ofN) archive's comment as
+tags=keep-DESCRIPTION;. The tags field begins at the start of a comment or
+line; future tag types can share a comma-separated list in that field. Other
+comment text and tag types are preserved. Malformed or duplicate fields stop
+pruning before any deletion. Keep applies only to complete backups; partial
+backups are still cleaned up. Explicit delete can remove kept backups. Keep
+and prune use Borg's ordinary per-command locking; a concurrent prune may win
+a race with keep.
+
+- **`description`**\
+  One word matching `[A-Za-z0-9][A-Za-z0-9_-]*`
+
+### `keep remove [--config CONFIG] [--verbose] [--timestamp-messages] archive`
+
+Remove the keep tag on a complete backup. Select a YYYYMMDD_HHMMSS timestamp
+or any member's full archive name; only the 1ofN archive comment is changed.
+Add requires no existing keep tag; remove and update require one. Other
+comment text and tag types are preserved. Uses ordinary Borg locking; races
+with prune are accepted.
+
+### `keep update [--config CONFIG] [--verbose] [--timestamp-messages] archive description`
+
+Update the keep tag on a complete backup. Select a YYYYMMDD_HHMMSS timestamp
+or any member's full archive name; only the 1ofN archive comment is changed.
+Add requires no existing keep tag; remove and update require one. Other
+comment text and tag types are preserved. Uses ordinary Borg locking; races
+with prune are accepted.
+
+- **`description`**\
+  One word matching `[A-Za-z0-9][A-Za-z0-9_-]*`
 
 ### `logs [--config CONFIG] [--verbose] [--timestamp-messages]`
 
@@ -295,13 +335,17 @@ Repair both repository and archive metadata with borg check --repair; requires
 ### `prune [--dry-run] [--progress] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--cleanup-unknown] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Prune partial and aged-out archives according to the configured retention
-policy, optionally removing unknown archives.
+policy, optionally removing unknown archives. Complete backups with keep tags
+are retained in addition to the normal policy. Partial backups remain eligible
+for cleanup.
 
 - **`--cleanup-unknown`**\
   Delete archives whose names start with the configured BACKUP_NAME prefix but
   don't match the expected {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM
-  shape. Default: warn but leave in place. Either way, an unknown archive in
-  the repo causes list and prune to exit with the WARNING status.
+  shape. Unknown archives with keep tags are preserved. Borg checkpoint and
+  recreate recovery archives are excluded. Default: warn but leave in place.
+  Either way, an unknown archive in the repo causes list and prune to exit
+  with the WARNING status.
 
 ### `rsync [--archive SELECTOR] [--delete] [--dry-run] [--progress] [--bypass-lock] [--config CONFIG] [--verbose] [--timestamp-messages] target_dir`
 

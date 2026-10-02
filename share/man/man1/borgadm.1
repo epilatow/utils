@@ -7,10 +7,11 @@ borgadm \- manage borg backup repositories and scheduled backups
 .SH DESCRIPTION
 borgadm is a wrapper around borgbackup designed to manage backup sets, where a set is a group of separate borg backups (archives) created with different create options.\&
 It creates backups from the named sets, verifies repository and archive integrity, prunes old and partial archives by retention policy, and restores archives via extract or rsync.\&
+Its keep commands protect selected complete backups from automatic pruning.\&
 A passphrase\- and SSH\-key\-based workflow handles authentication to local and remote repositories, and it can schedule unattended backups and checks through crony(1) on macOS (launchd) and Linux (systemd).\&
 .PP
 The sets are defined in the config file; each \(gacreate\(ga run writes one archive per set, named {BACKUP_NAME}\-{set_name}\-YYYYMMDD_HHMMSS_NofM.\&
-The NofM suffix records a set\(aqs position so a timestamp is \(dqfull\(dq only when every configured set is present and \(dqpartial\(dq otherwise.\&
+The NofM suffix records a set\(aqs position so a timestamp is \(dqfull\(dq only when every recorded member is present and \(dqpartial\(dq otherwise.\&
 The list, check, prune, and restore subcommands operate on these timestamps, and prune can also clean up partial or unrecognized (\(dqunknown\(dq) archives.\&
 .PP
 Configuration lives in \(ti/.borgadm, an INI\-style file naming the repository, the backup sets, retention counts, credential file paths, and check thresholds.\&
@@ -83,7 +84,7 @@ Number of weekly backups to keep, overriding the PRUNE_KEEP_WEEKLY config value 
 Number of yearly backups to keep, overriding the PRUNE_KEEP_YEARLY config value for this run.\&
 .TP
 \f[CR]\-\-latest\f[R]
-Restrict the operation to the latest full backup set (the newest timestamp with every configured set present).\&
+Restrict the operation to the latest full backup set (the newest timestamp with every recorded member present).\&
 .TP
 \f[CR]\-\-progress\f[R]
 Show borg\(aqs progress output while the operation runs.\&
@@ -158,6 +159,7 @@ skip waiting for any locks (faster, but may race a concurrent backup)
 .TP
 \f[B]check prune\f[R] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Report any partial or unpruned archives left in the repository.\&
+Complete backups with explicit keep tags are not unpruned errors.\&
 .RS
 .TP
 \f[CR]\-\-bypass\-lock\f[R]
@@ -233,6 +235,7 @@ skip waiting for any locks (faster, but may race a concurrent backup)
 .TP
 \f[B]list\f[R] [\-\-latest] [\-\-full\-names] [\-\-keep\-tags | \-\-no\-keep\-tags] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-include\-partial | \-\-no\-include\-partial | \-\-only\-partial] [\-\-bypass\-lock] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 List backups grouped by timestamp, distinguishing full from partial sets and showing prune keep tags.\&
+Explicit keep tags replace interval labels on complete backups.\&
 .RS
 .TP
 \f[CR]\-\-full\-names\f[R]
@@ -249,6 +252,43 @@ Only list partial
 .TP
 \f[CR]\-\-bypass\-lock\f[R]
 skip waiting for any locks (faster, but may race a concurrent backup)
+.RE
+.TP
+\f[B]keep add\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] archive description
+Add the keep tag on a complete backup.\&
+Select a YYYYMMDD_HHMMSS timestamp or any member\(aqs full archive name; only the 1ofN archive comment is changed.\&
+Add requires no existing keep tag; remove and update require one.\&
+Keep tags protect complete backups in addition to normal retention and appear instead of interval labels in list.\&
+They live in the first (1ofN) archive\(aqs comment as tags=keep\-DESCRIPTION;.\&
+The tags field begins at the start of a comment or line; future tag types can share a comma\-separated list in that field.\&
+Other comment text and tag types are preserved.\&
+Malformed or duplicate fields stop pruning before any deletion.\&
+Keep applies only to complete backups; partial backups are still cleaned up.\&
+Explicit delete can remove kept backups.\&
+Keep and prune use Borg\(aqs ordinary per\-command locking; a concurrent prune may win a race with keep.\&
+.RS
+.TP
+\f[CR]description\f[R]
+One word matching \(ga[A\-Za\-z0\-9][A\-Za\-z0\-9_\-]*\(ga
+.RE
+.TP
+\f[B]keep remove\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] archive
+Remove the keep tag on a complete backup.\&
+Select a YYYYMMDD_HHMMSS timestamp or any member\(aqs full archive name; only the 1ofN archive comment is changed.\&
+Add requires no existing keep tag; remove and update require one.\&
+Other comment text and tag types are preserved.\&
+Uses ordinary Borg locking; races with prune are accepted.\&
+.TP
+\f[B]keep update\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages] archive description
+Update the keep tag on a complete backup.\&
+Select a YYYYMMDD_HHMMSS timestamp or any member\(aqs full archive name; only the 1ofN archive comment is changed.\&
+Add requires no existing keep tag; remove and update require one.\&
+Other comment text and tag types are preserved.\&
+Uses ordinary Borg locking; races with prune are accepted.\&
+.RS
+.TP
+\f[CR]description\f[R]
+One word matching \(ga[A\-Za\-z0\-9][A\-Za\-z0\-9_\-]*\(ga
 .RE
 .TP
 \f[B]logs\f[R] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
@@ -283,10 +323,14 @@ confirm you understand the risks of \-\-repair
 .TP
 \f[B]prune\f[R] [\-\-dry\-run] [\-\-progress] [\-\-keep\-hourly KEEP_HOURLY] [\-\-keep\-daily KEEP_DAILY] [\-\-keep\-weekly KEEP_WEEKLY] [\-\-keep\-monthly KEEP_MONTHLY] [\-\-keep\-yearly KEEP_YEARLY] [\-\-cleanup\-unknown] [\-\-config CONFIG] [\-\-verbose] [\-\-timestamp\-messages]
 Prune partial and aged\-out archives according to the configured retention policy, optionally removing unknown archives.\&
+Complete backups with keep tags are retained in addition to the normal policy.\&
+Partial backups remain eligible for cleanup.\&
 .RS
 .TP
 \f[CR]\-\-cleanup\-unknown\f[R]
 Delete archives whose names start with the configured BACKUP_NAME prefix but don\(aqt match the expected {BACKUP_NAME}\-{set_name}\-YYYYMMDD_HHMMSS_NofM shape.\&
+Unknown archives with keep tags are preserved.\&
+Borg checkpoint and recreate recovery archives are excluded.\&
 Default: warn but leave in place.\&
 Either way, an unknown archive in the repo causes list and prune to exit with the WARNING status.\&
 .RE

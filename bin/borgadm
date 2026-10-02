@@ -887,6 +887,10 @@ def run_borg(
     assert not (repo_write and bypass_lock), (
         f"repo-writing borg op must never bypass the lock: {shlex.join(cmd)}"
     )
+    if repo_write:
+        # A failed write may still change the repository, so invalidate
+        # the shared archive snapshot before attempting any mutation.
+        list_backups_raw.cache_clear()
 
     def with_flags(flags: list[str]) -> list[str]:
         # Lock flags go right after the borg subcommand verb -- the one
@@ -1005,14 +1009,92 @@ def load_passphrase() -> str:
 @functools.cache
 def list_backups_raw(
     bypass_lock: bool = False,
-) -> subprocess.CompletedProcess[Any]:
+) -> dict[str, str]:
+    """Cache one repository snapshot mapping archive names to comments."""
     cfg = get_cfg()
-
-    return run_borg(
-        borg_cmd() + ["list", "--short", cfg.BORG_REPO],
+    result = run_borg(
+        borg_cmd() + ["list", "--json", "--format", "{comment}", cfg.BORG_REPO],
         repo_write=False,
         bypass_lock=bypass_lock,
     )
+    try:
+        rows = json.loads(result.stdout)["archives"]
+        if not isinstance(rows, list):
+            raise TypeError("archives is not a list")
+        comments: dict[str, str] = {}
+        for row in rows:
+            name, comment = row["name"], row["comment"]
+            if not isinstance(name, str) or not isinstance(comment, str):
+                raise TypeError("invalid archive name or comment")
+            if name in comments:
+                raise ValueError(f"duplicate archive: {name}")
+            comments[name] = comment
+        return comments
+    except (ValueError, KeyError, TypeError) as e:
+        raise BorgadmError(f"Cannot read archive listing: {e}") from e
+
+
+def _description(value: str) -> str:
+    """Validate one ASCII description token for both CLI and stored tags."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", value) is None:
+        raise argparse.ArgumentTypeError(
+            "description must match [A-Za-z0-9][A-Za-z0-9_-]*"
+        )
+    return value
+
+
+def _comment_tags(comment: str) -> tuple[list[str], tuple[int, int] | None]:
+    """Parse the single line-start tags field, preserving its text span."""
+    starts = list(re.finditer(r"(?m)^tags=", comment))
+    if not starts:
+        return [], None
+    field = re.match(r"tags=([^;\r\n]*);", comment[starts[0].start() :])
+    if len(starts) != 1 or field is None:
+        raise BorgadmError("Malformed or duplicate archive tags field")
+    tags = field[1].split(",")
+    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", t) is None for t in tags):
+        raise BorgadmError("Malformed archive tag")
+    keeps = [t for t in tags if t.startswith("keep-")]
+    if len(keeps) > 1:
+        raise BorgadmError("Duplicate keep tags on archive")
+    if keeps:
+        try:
+            _description(keeps[0][len("keep-") :])
+        except argparse.ArgumentTypeError as e:
+            raise BorgadmError(f"Invalid keep tag: {keeps[0]}") from e
+    start = starts[0].start()
+    return tags, (start, start + field.end())
+
+
+class KeepOp(enum.Enum):
+    ADD = "add"
+    REMOVE = "remove"
+    UPDATE = "update"
+
+
+def _edit_keep_comment(
+    comment: str, op: KeepOp, description: str | None
+) -> str:
+    tags, span = _comment_tags(comment)
+    keep = next((t for t in tags if t.startswith("keep-")), None)
+    if op is KeepOp.ADD and keep is not None:
+        raise BorgadmError("Backup already has a keep tag")
+    if op is not KeepOp.ADD and keep is None:
+        raise BorgadmError("Backup does not have a keep tag")
+    if op is not KeepOp.REMOVE:
+        assert description is not None
+        _description(description)
+    new_tags = [t for t in tags if not t.startswith("keep-")]
+    if op is not KeepOp.REMOVE:
+        new_tags.append(f"keep-{description}")
+    field = f"tags={','.join(new_tags)};" if new_tags else ""
+    if span is None:
+        return (
+            comment
+            + ("\n" if comment and not comment.endswith("\n") else "")
+            + field
+        )
+    return comment[: span[0]] + field + comment[span[1] :]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1113,7 +1195,7 @@ def _archive_entries_are_complete(entries: list[_ArchiveName]) -> bool:
         return False
     (m,) = m_values
     n_values = {e.n for e in entries}
-    return n_values == set(range(1, m + 1))
+    return len(entries) == m and n_values == set(range(1, m + 1))
 
 
 def list_backups(
@@ -1123,11 +1205,11 @@ def list_backups(
 ) -> dict[str, list[str]]:
     cfg = get_cfg()
 
-    result = list_backups_raw(bypass_lock)
+    comments = list_backups_raw(bypass_lock)
 
     archives_by_ts: dict[str, list[_ArchiveName]] = {}
-    for line in result.stdout.strip().splitlines():
-        entry = _ArchiveName.from_str(cfg.BACKUP_NAME, line.strip())
+    for name in comments:
+        entry = _ArchiveName.from_str(cfg.BACKUP_NAME, name)
         if entry is None:
             continue
         archives_by_ts.setdefault(entry.timestamp, []).append(entry)
@@ -1145,15 +1227,15 @@ def list_backups(
     return rv
 
 
-# Matches borg's checkpoint archives -- intermediate state from
-# interrupted backups. borg prune cleans them up itself, so borgadm
-# leaves them alone rather than surface them as "unknown". The full
+# Matches Borg's checkpoint and recreate archives -- intermediate state
+# from interrupted operations. Borgadm leaves recovery metadata alone
+# rather than surface it as "unknown". The full
 # archive shape (timestamp + NofM) is required so a malformed name
 # like `{BACKUP_NAME}-foo.checkpoint` or a checkpoint of a
 # suffix-less archive still surfaces as unknown rather than getting
 # filtered.
 _BORG_CHECKPOINT_RE = re.compile(
-    r"-\d{8}_\d{6}_\d+of\d+\.checkpoint(?:\.\d+)?$"
+    r"-\d{8}_\d{6}_\d+of\d+\.(?:checkpoint(?:\.\d+)?|recreate)$"
 )
 
 
@@ -1163,15 +1245,14 @@ def list_unknown_archives(bypass_lock: bool = False) -> list[str]:
 
     "Looks like borgadm's own" = starts with f"{cfg.BACKUP_NAME}-".
     Names with a foreign prefix stay silent (a user may keep other
-    archives in the same repo). Names matching borg's `.checkpoint`
-    / `.checkpoint.N` shape are filtered out for the same reason.
+    archives in the same repo). Borg checkpoint and recreate temporary
+    archives are filtered out so cleanup cannot destroy recovery metadata.
     """
     cfg = get_cfg()
-    result = list_backups_raw(bypass_lock)
+    comments = list_backups_raw(bypass_lock)
     prefix = f"{cfg.BACKUP_NAME}-"
     unknown: list[str] = []
-    for line in result.stdout.strip().splitlines():
-        name = line.strip()
+    for name in comments:
         if not name.startswith(prefix):
             continue
         if _BORG_CHECKPOINT_RE.search(name):
@@ -1179,6 +1260,114 @@ def list_unknown_archives(bypass_lock: bool = False) -> list[str]:
         if _ArchiveName.from_str(cfg.BACKUP_NAME, name) is None:
             unknown.append(name)
     return sorted(unknown)
+
+
+def _retention_tags(
+    backups: dict[str, list[str]],
+    bypass_lock: bool = False,
+    comments: dict[str, str] | None = None,
+) -> OrderedDict[str, str]:
+    """Union ordinary GFS choices with keeps on complete backup markers."""
+    cfg = get_cfg()
+    if comments is None:
+        comments = list_backups_raw(bypass_lock)
+    keep_by_name: dict[str, str] = {}
+    for name, comment in comments.items():
+        if not name.startswith(
+            f"{cfg.BACKUP_NAME}-"
+        ) or _BORG_CHECKPOINT_RE.search(name):
+            continue
+        tags, _ = _comment_tags(comment)
+        keep = next((t for t in tags if t.startswith("keep-")), None)
+        if keep is not None:
+            entry = _ArchiveName.from_str(cfg.BACKUP_NAME, name)
+            if entry is not None and entry.n != 1:
+                raise BorgadmError(f"Keep tag on non-marker archive: {name}")
+            keep_by_name[name] = keep
+    result = ts_to_keep(set(backups))
+    for ts, archives in backups.items():
+        for archive in archives:
+            name = archive.removeprefix(f"{cfg.BORG_REPO}::")
+            if name in keep_by_name:
+                result[ts] = keep_by_name[name]
+    return collections.OrderedDict(
+        (ts, result[ts]) for ts in sorted(result, reverse=True)
+    )
+
+
+def _delete_archives(names: list[str], dry_run: bool, progress: bool) -> None:
+    """Delete selected members one at a time in numeric backup order."""
+    cfg = get_cfg()
+
+    def order(name: str) -> tuple[str, int, str]:
+        entry = _ArchiveName.from_str(cfg.BACKUP_NAME, name)
+        return (entry.timestamp, entry.n, name) if entry else (name, 0, name)
+
+    for name in sorted(names, key=order):
+        cmd = borg_cmd() + ["delete"]
+        cmd += ["--progress"] if progress else []
+        cmd.append("--dry-run" if dry_run else "--stats")
+        cmd += [cfg.BORG_REPO, name]
+        run_borg(cmd, repo_write=True, allow_output=progress or dry_run)
+
+
+def _do_keep(archive: str, description: str | None, op: KeepOp) -> None:
+    cfg = get_cfg()
+    names = _resolve_archives([archive])
+    parsed = [_ArchiveName.from_str(cfg.BACKUP_NAME, n) for n in names]
+    if not parsed or any(e is None for e in parsed):
+        raise BorgadmError(f"Not a borgadm backup: {archive}")
+    timestamps = {e.timestamp for e in parsed if e is not None}
+    if len(timestamps) != 1:
+        raise BorgadmError(f"Ambiguous backup: {archive}")
+    ts = next(iter(timestamps))
+    full = list_backups()
+    if ts not in full:
+        raise BorgadmError(f"Keep requires a complete backup: {ts}")
+    marker = next(
+        a
+        for a in full[ts]
+        if (
+            entry := _ArchiveName.from_str(
+                cfg.BACKUP_NAME, a.removeprefix(f"{cfg.BORG_REPO}::")
+            )
+        )
+        is not None
+        and entry.n == 1
+    )
+    name = marker.removeprefix(f"{cfg.BORG_REPO}::")
+    comments = list_backups_raw(False)
+    if name not in comments:
+        raise BorgadmError(f"Marker archive disappeared: {name}")
+    comment = _edit_keep_comment(comments[name], op, description)
+    if comment != comments[name]:
+        # Borg expands placeholders in --comment; existing text is literal.
+        borg_comment = comment.replace("{", "{{").replace("}", "}}")
+        # Keep the configured repository syntax, escaping only the name
+        # obtained from Borg's listing rather than a location template.
+        borg_name = name.replace("{", "{{").replace("}", "}}")
+        borg_target = f"{cfg.BORG_REPO}::{borg_name}"
+        try:
+            run_borg(
+                borg_cmd()
+                + ["recreate", f"--comment={borg_comment}", borg_target],
+                repo_write=True,
+            )
+        finally:
+            list_backups_raw.cache_clear()
+    logger.info(f"Keep {op.value}: {ts} ({name})")
+
+
+def do_keep_add(archive: str, description: str) -> None:
+    _do_keep(archive, description, KeepOp.ADD)
+
+
+def do_keep_remove(archive: str) -> None:
+    _do_keep(archive, None, KeepOp.REMOVE)
+
+
+def do_keep_update(archive: str, description: str) -> None:
+    _do_keep(archive, description, KeepOp.UPDATE)
 
 
 def is_mountpoint(path: Path) -> bool:
@@ -1993,9 +2182,7 @@ def _resolve_archives(
             ]
         else:
             if raw_names is None:
-                raw_names = (
-                    list_backups_raw(bypass_lock).stdout.strip().splitlines()
-                )
+                raw_names = list(list_backups_raw(bypass_lock))
             if selector not in raw_names:
                 raise BorgadmError(f"Archive not found: {selector}")
             resolved.append(selector)
@@ -2081,7 +2268,7 @@ def do_check_prune(bypass_lock: bool) -> None:
             problems.append(f"Partial archive(s): {', '.join(names)}")
 
     full_backups = list_backups(bypass_lock=bypass_lock)
-    ts_keep = ts_to_keep(set(full_backups.keys()))
+    ts_keep = _retention_tags(full_backups, bypass_lock)
     ts_prune = full_backups.keys() - ts_keep.keys()
     if ts_prune:
         pruning = sorted(ts_prune, reverse=True)
@@ -2291,15 +2478,7 @@ def do_delete(
         archives_to_delete = _resolve_archives([archive])
         logger.info(f"Deleting {len(archives_to_delete)} archive(s): {archive}")
 
-    cmd = borg_cmd() + ["delete"]
-    cmd += ["--progress"] if progress else []
-    if dry_run:
-        cmd.append("--dry-run")
-    else:
-        cmd.append("--stats")
-    cmd.append(cfg.BORG_REPO)
-    cmd += archives_to_delete
-    run_borg(cmd, repo_write=True, allow_output=progress or dry_run)
+    _delete_archives(archives_to_delete, dry_run, progress)
 
 
 def do_extract(
@@ -2461,7 +2640,7 @@ def do_list(
 
     ts_keep: OrderedDict[str, str] = collections.OrderedDict()
     if keep_tags:
-        ts_keep = ts_to_keep(set(full_backups.keys()))
+        ts_keep = _retention_tags(full_backups, bypass_lock)
 
     def get_keep_tag(ts: str) -> str:
         if not keep_tags:
@@ -2486,19 +2665,29 @@ def do_list(
 
 def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
     cfg = get_cfg()
+    comments = list_backups_raw(False)
+    archives = list_backups()
+    ts_keep = _retention_tags(archives, comments=comments)
+    partial_archives = [
+        a.removeprefix(f"{cfg.BORG_REPO}::")
+        for members in list_backups(partial=True).values()
+        for a in members
+    ]
 
     unknown = list_unknown_archives()
+    protected_unknown = [
+        n
+        for n in unknown
+        if any(
+            t.startswith("keep-") for t in _comment_tags(comments.get(n, ""))[0]
+        )
+    ]
+    for name in protected_unknown:
+        logger.warning(f"Unknown archive with keep tag left in repo: {name}")
+    unknown = [n for n in unknown if n not in protected_unknown]
     if unknown and cleanup_unknown:
         logger.info(f"Pruning unknown archives: {unknown}")
-        cmd = borg_cmd() + ["delete"]
-        cmd += ["--progress"] if progress else []
-        if dry_run:
-            cmd.append("--dry-run")
-        else:
-            cmd.append("--stats")
-        cmd.append(cfg.BORG_REPO)
-        cmd += unknown
-        run_borg(cmd, repo_write=True, allow_output=progress)
+        _delete_archives(unknown, dry_run, progress)
     elif unknown:
         for name in unknown:
             logger.warning(
@@ -2506,25 +2695,10 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
                 " (pass --cleanup-unknown to remove)"
             )
 
-    partial_archives = [
-        a.removeprefix(f"{cfg.BORG_REPO}::")
-        for archives in list_backups(partial=True).values()
-        for a in archives
-    ]
     if partial_archives:
         logger.info(f"Pruning partial archives: {partial_archives}")
-        cmd = borg_cmd() + ["delete"]
-        cmd += ["--progress"] if progress else []
-        if dry_run:
-            cmd.append("--dry-run")
-        else:
-            cmd.append("--stats")
-        cmd.append(cfg.BORG_REPO)
-        cmd += partial_archives
-        run_borg(cmd, repo_write=True, allow_output=progress)
+        _delete_archives(partial_archives, dry_run, progress)
 
-    archives = list_backups()
-    ts_keep = ts_to_keep(set(archives.keys()))
     ts_prune = archives.keys() - ts_keep.keys()
     prune_archives = [
         a.removeprefix(f"{cfg.BORG_REPO}::")
@@ -2537,15 +2711,7 @@ def do_prune(dry_run: bool, progress: bool, cleanup_unknown: bool) -> None:
     pruning = [f"{i}" for i in sorted(ts_prune, reverse=True)]
     logger.info(f"Pruning backups: {', '.join(pruning)}")
     if prune_archives:
-        cmd = borg_cmd() + ["delete"]
-        cmd += ["--progress"] if progress else []
-        if dry_run:
-            cmd.append("--dry-run")
-        else:
-            cmd.append("--stats")
-        cmd.append(cfg.BORG_REPO)
-        cmd += prune_archives
-        run_borg(cmd, repo_write=True, allow_output=progress)
+        _delete_archives(prune_archives, dry_run, progress)
 
     do_compact(progress)
 
@@ -2900,6 +3066,7 @@ where a set is a group of separate borg backups (archives) created with
 different create options. It creates backups from the named sets,
 verifies repository and archive integrity, prunes old and partial
 archives by retention policy, and restores archives via extract or rsync.
+Its keep commands protect selected complete backups from automatic pruning.
 A passphrase- and SSH-key-based workflow handles authentication to local
 and remote repositories, and it can schedule unattended backups and
 checks through crony(1) on macOS (launchd) and Linux (systemd).
@@ -2907,7 +3074,7 @@ checks through crony(1) on macOS (launchd) and Linux (systemd).
 The sets are defined in the config file; each `create` run writes one
 archive per set, named {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM. The
 NofM suffix records a set's position so a timestamp is "full" only when
-every configured set is present and "partial" otherwise. The list, check,
+every recorded member is present and "partial" otherwise. The list, check,
 prune, and restore subcommands operate on these timestamps, and prune can
 also clean up partial or unrecognized ("unknown") archives.
 
@@ -3081,7 +3248,7 @@ def args_parser() -> StrictArgumentParser:
             common=True,
             extended_help=(
                 "Restrict the operation to the latest full backup set "
-                "(the newest timestamp with every configured set present)."
+                "(the newest timestamp with every recorded member present)."
             ),
         )
 
@@ -3254,7 +3421,8 @@ def args_parser() -> StrictArgumentParser:
         "prune",
         help="Check for unpruned archives",
         description=(
-            "Report any partial or unpruned archives left in the repository."
+            "Report any partial or unpruned archives left in the repository. "
+            "Complete backups with explicit keep tags are not unpruned errors."
         ),
         formatter_class=DefaultsHelpFormatter,
     )
@@ -3399,7 +3567,8 @@ def args_parser() -> StrictArgumentParser:
         help="List backups",
         description=(
             "List backups grouped by timestamp, distinguishing full from "
-            "partial sets and showing prune keep tags."
+            "partial sets and showing prune keep tags. Explicit keep tags "
+            "replace interval labels on complete backups."
         ),
     )
     add_latest(list_cmd)
@@ -3431,6 +3600,54 @@ def args_parser() -> StrictArgumentParser:
         help="Only list partial",
     )
     add_bypass_lock(list_cmd)
+
+    keep_description = (
+        "Keep tags protect complete backups in addition to normal retention "
+        "and appear instead of interval labels in list. They live in the "
+        "first (1ofN) archive's comment as tags=keep-DESCRIPTION;. "
+        "The tags field begins at the start of a comment or line; future "
+        "tag types can share a comma-separated list in that field. Other "
+        "comment text and tag types are preserved. Malformed or duplicate "
+        "fields stop pruning before any deletion. Keep applies only to "
+        "complete backups; partial backups are still cleaned up. Explicit "
+        "delete can remove kept backups. Keep and prune use Borg's ordinary "
+        "per-command locking; a concurrent prune may win a race with keep."
+    )
+    keep = add_parser(
+        "keep",
+        help="Manage explicit backup keep tags",
+        description=keep_description,
+    )
+    keep_subparsers = keep.add_command_subparsers(metavar="<command>")
+    for op in KeepOp:
+        mode = op.value
+        sub = keep_subparsers.add_parser(
+            mode,
+            help=f"{mode.capitalize()} a backup's keep tag",
+            description=(
+                f"{mode.capitalize()} the keep tag on a complete backup. "
+                "Select a YYYYMMDD_HHMMSS timestamp or any member's full "
+                "archive name; only the 1ofN archive comment is changed. "
+                "Add requires no existing keep tag; remove and update "
+                "require one."
+                + (
+                    f" {keep_description}"
+                    if op is KeepOp.ADD
+                    else " Other comment text and tag types are preserved. "
+                    "Uses ordinary Borg locking; races with prune are accepted."
+                )
+            ),
+            formatter_class=DefaultsHelpFormatter,
+        )
+        sub.add_argument(
+            "archive", help="Full archive name or backup timestamp"
+        )
+        if op is not KeepOp.REMOVE:
+            sub.add_argument(
+                "description",
+                type=_description,
+                help="One word matching `[A-Za-z0-9][A-Za-z0-9_-]*`",
+            )
 
     add_parser(
         "logs",
@@ -3496,7 +3713,9 @@ def args_parser() -> StrictArgumentParser:
         help="Prune partial and old backups",
         description=(
             "Prune partial and aged-out archives according to the configured "
-            "retention policy, optionally removing unknown archives."
+            "retention policy, optionally removing unknown archives. "
+            "Complete backups with keep tags are retained in addition to "
+            "the normal policy. Partial backups remain eligible for cleanup."
         ),
     )
     add_dry_run(prune)
@@ -3509,6 +3728,8 @@ def args_parser() -> StrictArgumentParser:
             "Delete archives whose names start with the configured"
             " BACKUP_NAME prefix but don't match the expected"
             " {BACKUP_NAME}-{set_name}-YYYYMMDD_HHMMSS_NofM shape."
+            " Unknown archives with keep tags are preserved."
+            " Borg checkpoint and recreate recovery archives are excluded."
             " Default: warn but leave in place. Either way, an"
             " unknown archive in the repo causes list and prune to"
             " exit with the WARNING status."
@@ -3622,6 +3843,9 @@ COMMAND_CALLBACKS: dict[str, Callable[..., Any]] = {
     "delete": do_delete,
     "environment": do_environment,
     "extract": do_extract,
+    "keep add": do_keep_add,
+    "keep remove": do_keep_remove,
+    "keep update": do_keep_update,
     "list": do_list,
     "logs": do_logs,
     "prune": do_prune,

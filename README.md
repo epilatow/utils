@@ -32,10 +32,11 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   a set is a group of separate borg backups (archives) created with different
   create options. It creates backups from the named sets, verifies repository
   and archive integrity, prunes old and partial archives by retention policy,
-  and restores archives via extract or rsync. A passphrase- and SSH-key-based
-  workflow handles authentication to local and remote repositories, and it can
-  schedule unattended backups and checks through crony(1) on macOS (launchd)
-  and Linux (systemd).
+  and restores archives via extract or rsync. Its keep commands protect
+  selected complete backups from automatic pruning. A passphrase- and
+  SSH-key-based workflow handles authentication to local and remote
+  repositories, and it can schedule unattended backups and checks through
+  crony(1) on macOS (launchd) and Linux (systemd).
 - **[crony](docs/crony.md)**\
   Crony is a multi-platform user-level scheduled-job manager. It supports jobs
   on macOS/darwin (via launchd) and linux (via systemd). It reads one or more
