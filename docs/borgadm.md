@@ -214,13 +214,18 @@ valid, listing any errors. Does not connect to the repository.
 
 Delete the given archive, or the latest full backup set (--latest).
 
-### `create [--no-prune] [-R DIR] [--dry-run] [--progress] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--config CONFIG] [--verbose] [--timestamp-messages]`
+### `create [--no-prune] [--keep DESCRIPTION] [-R DIR] [--dry-run] [--progress] [--keep-hourly KEEP_HOURLY] [--keep-daily KEEP_DAILY] [--keep-weekly KEEP_WEEKLY] [--keep-monthly KEEP_MONTHLY] [--keep-yearly KEEP_YEARLY] [--config CONFIG] [--verbose] [--timestamp-messages]`
 
 Create a full backup, writing one archive per configured backup set, then
 prune old archives unless --no-prune is given.
 
 - **`--no-prune`**\
   Skip backup pruning
+- **`--keep DESCRIPTION`**\
+  Keep the new complete backup from automatic pruning, with a description
+  matching `[A-Za-z0-9][A-Za-z0-9_-]*`. Preserve configured comment text and
+  other tags. Partial backups remain eligible for cleanup; dry runs create no
+  tag.
 - **`-R, --root DIR`**\
   Override BACKUP_ROOT for this backup (normally $HOME). Relative backup-set
   paths and required mounts are resolved from DIR; relative archive paths omit

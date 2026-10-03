@@ -2322,8 +2322,31 @@ def do_compact(progress: bool) -> None:
     run_borg(borg_cmd() + args, repo_write=True, allow_output=progress)
 
 
+def _create_keep_options(options: list[str], description: str) -> list[str]:
+    """Merge a keep tag into the configured Borg create comment."""
+    remaining: list[str] = []
+    comment = ""
+    args = iter(options)
+    for arg in args:
+        if arg == "--comment":
+            try:
+                comment = next(args)
+            except StopIteration as e:
+                raise BorgadmError("Missing configured --comment value") from e
+        elif arg.startswith("--comment="):
+            comment = arg.removeprefix("--comment=")
+        else:
+            remaining.append(arg)
+    comment = _edit_keep_comment(comment, KeepOp.ADD, description)
+    return remaining + [f"--comment={comment}"]
+
+
 def do_create(
-    dry_run: bool, progress: bool, no_prune: bool, root: str | None
+    dry_run: bool,
+    progress: bool,
+    no_prune: bool,
+    root: str | None,
+    keep: str | None,
 ) -> None:
     cfg = get_cfg()
     backup_root = (
@@ -2386,6 +2409,15 @@ def do_create(
     # identical archive names regardless of how the user edits the
     # dict; reordering the dict literally cannot change archive names.
     sorted_set_names = sorted(cfg.BACKUP_SETS.keys())
+    options_by_set = {
+        name: list(cfg.BACKUP_SETS[name].get("create_options", []))
+        for name in sorted_set_names
+    }
+    if keep is not None:
+        first = sorted_set_names[0]
+        options_by_set[first] = _create_keep_options(
+            options_by_set[first], keep
+        )
     suffix_count = len(sorted_set_names)
     for suffix_pos, set_name in enumerate(sorted_set_names, start=1):
         set_cfg = cfg.BACKUP_SETS[set_name]
@@ -2395,7 +2427,7 @@ def do_create(
             full_path = (backup_root / path).resolve()
             if not is_mountpoint(full_path):
                 raise BorgadmError(f"Missing backup mount: {full_path}")
-        create_args = set_cfg.get("create_options", [])
+        create_args = options_by_set[set_name]
         create_args += ["--progress"] if progress else []
         create_args += ["--dry-run"] if dry_run else ["--stats"]
         excludes = list(set_cfg.get("excludes", []))
@@ -3517,6 +3549,18 @@ def args_parser() -> StrictArgumentParser:
     )
     create.add_argument(
         "--no-prune", action="store_true", help="Skip backup pruning"
+    )
+    create.add_argument(
+        "--keep",
+        metavar="DESCRIPTION",
+        type=_description,
+        default=None,
+        help=(
+            "Keep the new complete backup from automatic pruning, with a "
+            "description matching `[A-Za-z0-9][A-Za-z0-9_-]*`. Preserve "
+            "configured comment text and other tags. Partial backups remain "
+            "eligible for cleanup; dry runs create no tag."
+        ),
     )
     add_argument_ext(
         create,

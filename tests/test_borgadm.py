@@ -4276,7 +4276,7 @@ class TestCreateRoot:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as run,
         ):
-            ba.do_create(False, False, True, root=str(tmp_path))
+            ba.do_create(False, False, True, root=str(tmp_path), keep=None)
         assert run.call_args.args[0][-2:] == [
             f"{home}/directory/",
             str(home / "file"),
@@ -4294,7 +4294,7 @@ class TestCreateRoot:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as run,
         ):
-            ba.do_create(False, False, True, root=str(tmp_path))
+            ba.do_create(False, False, True, root=str(tmp_path), keep=None)
         assert mock_cfg.BORG_REPO == repository
         assert run.call_args.args[0][-2].startswith(f"{repository}::")
 
@@ -4310,7 +4310,7 @@ class TestCreateRoot:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as run,
         ):
-            ba.do_create(False, False, True, root=override)
+            ba.do_create(False, False, True, root=override, keep=None)
         assert run.call_args.kwargs["cwd"] == root
 
     @pytest.mark.parametrize("flag", ["-R", "--root"])
@@ -4341,7 +4341,7 @@ class TestCreateRoot:
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as run,
         ):
-            ba.do_create(False, False, True, root=args["root"])
+            ba.do_create(False, False, True, root=args["root"], keep=None)
         assert run.call_args.kwargs["cwd"] == root
         assert run.call_args.args[0][-1] == "data"
         assert str(root) not in run.call_args.args[0]
@@ -4372,7 +4372,7 @@ class TestCreateRoot:
                 return_value=f"device on {source / 'mounted'} type ext4 (rw)\n",
             ),
         ):
-            ba.do_create(False, False, True, root=root)
+            ba.do_create(False, False, True, root=root, keep=None)
         assert run.call_args.kwargs["cwd"] == source
 
     def test_required_mount_uses_root(
@@ -4386,8 +4386,148 @@ class TestCreateRoot:
             ) as mount,
             pytest.raises(berr.BorgadmError, match="Missing backup mount"),
         ):
-            ba.do_create(False, False, True, root=str(tmp_path))
+            ba.do_create(False, False, True, root=str(tmp_path), keep=None)
         mount.assert_called_once_with(tmp_path / "mounted")
+
+
+class TestCreateKeep:
+    @pytest.mark.parametrize("description", ["Snapshot9", "A_b-c9", "9"])
+    def test_parse(self, description: str) -> None:
+        args = ba.args_parser().parse_command(["create", "--keep", description])
+        assert args.keep == description
+
+    @pytest.mark.parametrize("description", ["", "a b", "_first", "bad;"])
+    def test_invalid_description(self, description: str) -> None:
+        with pytest.raises(SystemExit):
+            ba.args_parser().parse_command(["create", "--keep", description])
+
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [
+            ([], ["--comment=tags=keep-Milestone;"]),
+            (
+                ["--compression=lz4", "--comment", "notes {now}"],
+                [
+                    "--compression=lz4",
+                    "--comment=notes {now}\ntags=keep-Milestone;",
+                ],
+            ),
+            (
+                ["--comment=tags=future-X; trailing"],
+                ["--comment=tags=future-X,keep-Milestone; trailing"],
+            ),
+        ],
+    )
+    def test_preserves_configured_comment(
+        self, options: list[str], expected: list[str]
+    ) -> None:
+        original = options.copy()
+        assert ba._create_keep_options(options, "Milestone") == expected
+        assert options == original
+
+    @pytest.mark.parametrize(
+        "options", [["--comment"], ["--comment=tags=keep-Existing;"]]
+    )
+    def test_bad_configured_comment(self, options: list[str]) -> None:
+        with pytest.raises(berr.BorgadmError):
+            ba._create_keep_options(options, "Milestone")
+
+    def test_only_first_member_and_no_extra_borg_commands(
+        self, mock_cfg: ba.Config, tmp_path: Path
+    ) -> None:
+        (tmp_path / "foo").write_text("content")
+        mock_cfg.BACKUP_SETS = {
+            "z-last": {"paths": ["foo"]},
+            "a-first": {"paths": ["foo"]},
+        }
+        with patch.object(ba, "run_borg", autospec=True) as run:
+            ba.do_create(
+                False, False, True, root=str(tmp_path), keep="Milestone"
+            )
+        commands = [call.args[0] for call in run.call_args_list]
+        assert len(commands) == 2
+        assert all(cmd[len(ba.borg_cmd())] == "create" for cmd in commands)
+        assert "--comment=tags=keep-Milestone;" in commands[0]
+        assert not any(arg.startswith("--comment") for arg in commands[1])
+        assert mock_cfg.BACKUP_SETS["a-first"].get("create_options") is None
+
+
+@pytest.mark.e2e
+class TestE2ECreateKeep:
+    @staticmethod
+    def _configure(borg_e2e: BorgE2EFixture, fail_second: bool = False) -> None:
+        sets = {
+            "set-a": {
+                "paths": ["set-a/"],
+                "create_options": [
+                    "--comment=notes {{literal}}\ntags=future-X;"
+                ],
+            },
+            "set-b": {
+                "paths": ["set-b/"],
+                "create_options": (
+                    ["--invalid-create-option"]
+                    if fail_second
+                    else ["--comment=second"]
+                ),
+            },
+        }
+        lines = borg_e2e.config_path.read_text().splitlines()
+        borg_e2e.config_path.write_text(
+            "\n".join(
+                f"BACKUP_SETS = {json.dumps(sets)}"
+                if line.startswith("BACKUP_SETS =")
+                else line
+                for line in lines
+            )
+            + "\n"
+        )
+
+    @pytest.mark.parametrize("no_prune", [True, False])
+    def test_complete_keep(
+        self, borg_e2e: BorgE2EFixture, no_prune: bool
+    ) -> None:
+        self._configure(borg_e2e)
+        borg_e2e.run(
+            "create",
+            "--keep",
+            "Milestone9",
+            *(["--no-prune"] if no_prune else []),
+        )
+        rows = json.loads(
+            borg_e2e.borg(
+                "list",
+                "--json",
+                "--format",
+                "{comment}",
+                str(borg_e2e.repo_path),
+            ).stdout
+        )["archives"]
+        first = next(row for row in rows if row["name"].endswith("_1of2"))
+        second = next(row for row in rows if row["name"].endswith("_2of2"))
+        assert (
+            first["comment"]
+            == "notes {literal}\ntags=future-X,keep-Milestone9;"
+        )
+        assert second["comment"] == "second"
+        assert "(keep-Milestone9)" in borg_e2e.run("list").stdout
+        borg_e2e.run("check", "prune")
+
+    def test_dry_run(self, borg_e2e: BorgE2EFixture) -> None:
+        self._configure(borg_e2e)
+        borg_e2e.run("create", "--keep", "DryRun", "--dry-run", "--no-prune")
+        assert borg_e2e.archives() == []
+
+    def test_failed_set_remains_partial(self, borg_e2e: BorgE2EFixture) -> None:
+        self._configure(borg_e2e, fail_second=True)
+        assert (
+            borg_e2e.run("create", "--keep", "Partial", check=False).returncode
+            != 0
+        )
+        assert len(borg_e2e.archives()) == 1
+        assert "(keep-Partial)" not in borg_e2e.run("list").stdout
+        borg_e2e.run("prune")
+        assert borg_e2e.archives() == []
 
 
 @pytest.mark.e2e
