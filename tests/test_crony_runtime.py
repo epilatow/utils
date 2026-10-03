@@ -1176,8 +1176,8 @@ class TestPlatformUnitDiscovery:
 
 class TestExecPathStrings:
     """`model.exec_path_strings` recovers the absolute uv / crony
-    executable path strings baked into a unit's argv -- by name, not
-    position, and regardless of whether they still exist on disk
+    executable path strings baked into a unit's invocation prefix,
+    regardless of their filenames or whether they still exist on disk
     (rendering the normalized unit and checking the paths' existence on
     disk are separate concerns).
     """
@@ -1191,11 +1191,23 @@ class TestExecPathStrings:
             "/abs/crony",
         )
 
-    def test_finds_paths_regardless_of_position(self) -> None:
-        # The scan keys on the path name, not the argv position, so a
-        # wrapper that repeats uv / crony elsewhere still recovers them.
+    def test_unrelated_path_names_are_not_launchers(self) -> None:
         argv = ["/a/uv", "x", "/b/crony", "y", "z", "/a/uv"]
-        assert crony_model.exec_path_strings(argv) == ("/a/uv", "/b/crony")
+        assert crony_model.exec_path_strings(argv) == (None, None)
+
+    @pytest.mark.parametrize("timeout", [0, 120])
+    def test_recovers_launcher_aliases(self, timeout: int) -> None:
+        argv = crony_model._guarded_argv(
+            Path("/bin/uv-stable"),
+            Path("/bin/crony-stable"),
+            EntityRef("d", "u-test"),
+            timeout,
+            True,
+        )
+        assert crony_model.exec_path_strings(list(argv)) == (
+            "/bin/uv-stable",
+            "/bin/crony-stable",
+        )
 
     def test_recovers_even_when_absent_on_disk(self) -> None:
         # The strings are returned even for a baked path that's since been
@@ -1209,7 +1221,7 @@ class TestExecPathStrings:
 
     def test_none_for_missing_element(self) -> None:
         assert crony_model.exec_path_strings(["/abs/uv", "run", "x:y"]) == (
-            "/abs/uv",
+            None,
             None,
         )
         assert crony_model.exec_path_strings(["run", "x:y"]) == (None, None)
@@ -1218,8 +1230,8 @@ class TestExecPathStrings:
 class TestGuardedArgv:
     """`model._guarded_argv` wraps the base run in the timeout guard for a
     capped entry; an interactive entry carries a leading `--interactive`
-    marker, a non-interactive one does not. The path scan recovers uv /
-    crony from any guarded shape just as it does from the bare one."""
+    marker, a non-interactive one does not. The invocation prefix recovers
+    uv / crony from any guarded shape just as it does from the bare one."""
 
     _UV = Path("/abs/uv")
     _CRONY = Path("/abs/crony")
@@ -1618,8 +1630,8 @@ class TestUnitDriftDetection:
     ) -> None:
         # The baked uv / crony paths differ from the live ones but still
         # exist on disk (a binary that moved). The normalized unit renders
-        # with blank paths, so the install reads synced -- no needless
-        # re-apply for a cosmetic path change.
+        # with blank paths, so the install reads synced. An explicit apply
+        # can still refresh these paths to the selected live launchers.
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         alt = tmp_path / "moved"
         alt.mkdir()

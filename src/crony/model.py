@@ -252,14 +252,14 @@ def _guarded_argv(
 
 def exec_path_strings(argv: list[str]) -> tuple[str | None, str | None]:
     """The `(uv, crony)` executable path strings baked into a unit's run
-    argv, by name (an argument ending in `/uv` or `/crony`) rather than
-    position, so any run-command shape (bare or guard-wrapped) is
-    recovered. Either is None when the argv carries no such argument.
+    argv. Bare, guard-wrapped, and jitter commands all start with
+    `<uv> run --script <crony>`, regardless of launcher filenames.
+    Both are None when the argv does not carry that invocation prefix.
     Existence is the caller's concern; this returns the strings so they
     can be compared against disk even when the binary is gone."""
-    uv = next((a for a in argv if a.endswith("/uv")), None)
-    crony = next((a for a in argv if a.endswith("/crony")), None)
-    return uv, crony
+    if len(argv) >= 4 and argv[1:3] == ["run", "--script"]:
+        return argv[0], argv[3]
+    return None, None
 
 
 def _normalized_spec(

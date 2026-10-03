@@ -50,6 +50,8 @@ import json
 import os
 import plistlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -61,7 +63,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.errors import ExitCode
-from crony.platform import current_platform
+from crony.platform import current_platform, get_scheduler
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "bin" / "crony"
@@ -484,15 +486,10 @@ class TestApplyLifecycle:
     """Cross-platform: apply / status / destroy through the real
     scheduler on whichever backend the host runs.
 
-    These exercise crony's control plane, which runs in the test process
-    and so sees the isolated CRONY_* dirs. Job *execution* is not covered
-    here: the scheduler re-invokes `crony _run` in a fresh process that
-    does not inherit the test's env overrides, so a triggered job
-    resolves the real dirs, not the isolated ones -- there is no way to
-    observe an isolated run without baking the overrides into the unit
-    (which production does not do). The bug these suites exist to catch
-    is a schedule that never fires, asserted below off the live timer
-    state, not off a job actually running."""
+    Control-plane commands see the isolated CRONY_* dirs directly. Tests
+    that execute a job inject those overrides into the installed test unit
+    so the scheduler's fresh process uses the same isolated state. Timer
+    checks inspect the live scheduler state without waiting for a fire."""
 
     def test_apply_reports_synced(self, e2e: _CronyE2E) -> None:
         e2e.write_bundle(
@@ -512,6 +509,55 @@ class TestApplyLifecycle:
         e2e.crony("destroy", e2e.full("probe"))
         # Still in config, no longer deployed -> missing (not synced).
         assert e2e.status_config(e2e.full("probe")) == "missing"
+
+    def test_trigger_survives_launcher_symlink_retarget(
+        self,
+        e2e: _CronyE2E,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_uv = shutil.which("uv")
+        assert real_uv is not None
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for version in ("old", "new"):
+            directory = tmp_path / version
+            directory.mkdir()
+            (directory / "uv").symlink_to(real_uv)
+            (directory / "crony").symlink_to(CRONY_BIN)
+        uv = bin_dir / "uv"
+        crony = bin_dir / "crony"
+        uv.symlink_to(tmp_path / "old" / "uv")
+        crony.symlink_to(tmp_path / "old" / "crony")
+        monkeypatch.setattr(sys.modules[__name__], "CRONY_BIN", crony)
+        e2e.env["PATH"] = f"{bin_dir}:{e2e.env['PATH']}"
+        marker = tmp_path / "ran"
+        command = f"touch {shlex.quote(str(marker))}"
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\n"
+            'schedule = "*-*-* 03:00"\n',
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.status_config(e2e.full("probe")) == "synced"
+
+        argv = get_scheduler(_PLATFORM, e2e.unit_dir).installed_cmd(
+            e2e.full("probe")
+        )
+        assert argv is not None
+        assert str(uv) in argv
+        assert str(crony) in argv
+        for launcher in (uv, crony):
+            launcher.unlink()
+            launcher.symlink_to(tmp_path / "new" / launcher.name)
+            (tmp_path / "old" / launcher.name).unlink()
+        assert e2e.status_config(e2e.full("probe")) == "synced"
+        e2e.inject_isolated_env("probe", restart=False)
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_until(
+            marker.is_file, timeout=60, what="the retargeted launchers to run"
+        )
+        e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
 
 
 @pytest.mark.skipif(

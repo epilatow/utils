@@ -2067,6 +2067,73 @@ class TestKeepAwakeWarning:
         assert "inhibit-block-sleep" in capsys.readouterr().out
 
 
+class TestCronyExecutable:
+    """Keep launcher symlinks while selecting this checkout's runner."""
+
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_preserves_invoked_symlink(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
+    ) -> None:
+        launcher = tmp_path / "crony"
+        launcher.symlink_to(REPO_ROOT / "bin" / "crony")
+        monkeypatch.chdir(tmp_path)
+        argv0 = "crony" if relative else str(launcher)
+        monkeypatch.setattr(sys, "argv", [argv0, "apply"])
+        monkeypatch.setattr(crony_runtime.shutil, "which", lambda _name: None)
+        assert crony_runtime._crony_executable() == launcher
+
+    @pytest.mark.parametrize("argv", [[], ["crony"], [__file__]])
+    def test_module_caller_uses_matching_path_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        argv: list[str],
+    ) -> None:
+        launcher = tmp_path / "crony"
+        launcher.symlink_to(REPO_ROOT / "bin" / "crony")
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        assert crony_runtime._crony_executable() == launcher
+
+    def test_invoked_launcher_wins_over_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "invoked").mkdir()
+        invoked = tmp_path / "invoked" / "crony"
+        invoked.symlink_to(REPO_ROOT / "bin" / "crony")
+        path_crony = tmp_path / "crony"
+        path_crony.symlink_to(REPO_ROOT / "bin" / "crony")
+        monkeypatch.setattr(sys, "argv", [str(invoked)])
+        monkeypatch.setenv("PATH", str(tmp_path))
+        assert crony_runtime._crony_executable() == invoked
+
+    def test_preserves_invoked_launcher_alias(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        caller = tmp_path / "caller"
+        caller.symlink_to(REPO_ROOT / "bin" / "crony")
+        monkeypatch.setattr(sys, "argv", [str(caller)])
+        monkeypatch.setenv("PATH", "")
+        assert crony_runtime._crony_executable() == caller
+
+    def test_rejects_other_checkout_launchers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        foreign = tmp_path / "crony"
+        foreign.write_text("")
+        foreign.chmod(0o755)
+        monkeypatch.setattr(sys, "argv", [str(foreign)])
+        monkeypatch.setenv("PATH", str(tmp_path))
+        assert crony_runtime._crony_executable() == REPO_ROOT / "bin" / "crony"
+
+    def test_module_caller_without_launcher_uses_repository_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sys, "argv", [__file__])
+        monkeypatch.setenv("PATH", "")
+        assert crony_runtime._crony_executable() == REPO_ROOT / "bin" / "crony"
+
+
 class TestUvExecutable:
     """`_uv_executable` locates the uv binary baked into platform units.
 
@@ -2083,7 +2150,7 @@ class TestUvExecutable:
         monkeypatch.setattr(
             crony_runtime.shutil, "which", lambda _name: "/usr/bin/uv"
         )
-        assert crony_runtime._uv_executable() == uv.resolve()
+        assert crony_runtime._uv_executable() == uv.absolute()
 
     def test_falls_back_to_path_when_env_uv_missing_file(
         self, tmp_path: Path, monkeypatch: Any
@@ -2096,7 +2163,7 @@ class TestUvExecutable:
         monkeypatch.setattr(
             crony_runtime.shutil, "which", lambda _name: str(path_uv)
         )
-        assert crony_runtime._uv_executable() == path_uv.resolve()
+        assert crony_runtime._uv_executable() == path_uv.absolute()
 
     def test_falls_back_to_path_when_env_uv_unset(
         self, tmp_path: Path, monkeypatch: Any
@@ -2107,7 +2174,113 @@ class TestUvExecutable:
         monkeypatch.setattr(
             crony_runtime.shutil, "which", lambda _name: str(path_uv)
         )
-        assert crony_runtime._uv_executable() == path_uv.resolve()
+        assert crony_runtime._uv_executable() == path_uv.absolute()
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    @pytest.mark.parametrize(
+        ("from_env", "uv_name"),
+        [(True, "uv"), (True, "uv-stable"), (False, "uv")],
+        ids=["UV", "UV-alias", "PATH"],
+    )
+    @pytest.mark.parametrize(
+        "relative", [False, True], ids=["absolute", "relative"]
+    )
+    @pytest.mark.parametrize(
+        "existing", [False, True], ids=["fresh", "migrate"]
+    )
+    def test_applied_units_survive_launcher_symlink_retarget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        platform: str,
+        from_env: bool,
+        uv_name: str,
+        relative: bool,
+        existing: bool,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        old_uv = tmp_path / "uv-old"
+        new_uv = tmp_path / "uv-new"
+        for binary in (old_uv, new_uv):
+            binary.write_text("")
+            binary.chmod(0o755)
+        uv = bin_dir / uv_name
+        uv.symlink_to(old_uv)
+        old_repo = tmp_path / "repo-old"
+        new_repo = tmp_path / "repo-new"
+        for repo in (old_repo, new_repo):
+            (repo / "bin").mkdir(parents=True)
+            (repo / "bin" / "crony").write_text("")
+        crony_name = "crony-stable" if uv_name == "uv-stable" else "crony"
+        crony = bin_dir / crony_name
+        crony.symlink_to(old_repo / "bin" / "crony")
+        monkeypatch.setattr(crony_runtime, "_repo_root", lambda: old_repo)
+        monkeypatch.chdir(tmp_path)
+        lookup_dir = Path("bin") if relative else bin_dir
+        monkeypatch.setattr(sys, "argv", [str(lookup_dir / crony_name)])
+        if from_env:
+            monkeypatch.setenv("UV", str(lookup_dir / uv_name))
+            monkeypatch.setenv("PATH", "")
+        else:
+            monkeypatch.delenv("UV", raising=False)
+            monkeypatch.setenv("PATH", str(lookup_dir))
+        h.config(
+            {
+                "job": {"j": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["j"], "schedule": "daily"}},
+            },
+            default_target_jobs=["g"],
+        )
+        if existing:
+            with monkeypatch.context() as parent:
+                parent.setattr(crony_runtime, "_uv_executable", lambda: old_uv)
+                parent.setattr(
+                    crony_runtime,
+                    "_crony_executable",
+                    lambda: old_repo / "bin" / "crony",
+                )
+                crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+            config = crony_runtime.load_config()
+            for short in ("j", "g"):
+                ref = config.current.by_full_name[h.full(short)]
+                assert config.cfg_status(ref) == "synced"
+                if platform == "darwin":
+                    sched = crony_runtime.scheduler()
+                    before = sched.ondisk_units(h.full(short))
+                    with monkeypatch.context() as running:
+                        running.setenv(crony_runtime.RUNNING_REF_ENV, str(ref))
+                        assert h.apply(short) == "deferred"
+                    assert sched.ondisk_units(h.full(short)) == before
+                assert h.apply(short) == "updated"
+        else:
+            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        sched = crony_runtime.scheduler()
+        config = crony_runtime.load_config()
+        for short in ("j", "g"):
+            argv = sched.installed_cmd(h.full(short))
+            assert argv is not None
+            installed_uv, installed_crony = crony_model.exec_path_strings(argv)
+            assert installed_uv == str(uv)
+            assert installed_crony == str(crony)
+            assert str(old_uv) not in argv
+            assert str(old_repo / "bin" / "crony") not in argv
+            ref = config.current.by_full_name[h.full(short)]
+            assert config.cfg_status(ref) == "synced"
+            assert h.apply(short) == "unchanged"
+
+        uv.unlink()
+        uv.symlink_to(new_uv)
+        old_uv.unlink()
+        crony.unlink()
+        crony.symlink_to(new_repo / "bin" / "crony")
+        (old_repo / "bin" / "crony").unlink()
+        monkeypatch.setattr(crony_runtime, "_repo_root", lambda: new_repo)
+        config = crony_runtime.load_config()
+        for short in ("j", "g"):
+            ref = config.current.by_full_name[h.full(short)]
+            assert config.cfg_status(ref) == "synced"
 
     def test_errors_when_uv_not_found(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("UV", raising=False)

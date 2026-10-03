@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import shutil as shutil  # noqa: PLC0414  re-exported for tests
+import sys
 import time
 import uuid
 from collections.abc import Container, Iterator
@@ -1069,13 +1070,24 @@ def _repo_root() -> Path:
 def _crony_executable() -> Path:
     """Absolute path to bin/crony for re-invocation by groups.
 
-    Derives bin/crony from this package's location
-    (<repo>/src/crony/runtime.py -> <repo>/bin/crony) rather than
-    from `sys.argv[0]` so the subprocess re-invocation reaches the
-    right binary even when crony has been imported as a module (e.g.
-    by the test suite, where sys.argv[0] is pytest, not crony).
+    Preserve the invoked crony launcher or a matching PATH entry, including
+    symlinks. Only accept paths to this package's entry script so a
+    different checkout on PATH cannot supply its runner. Module callers
+    without a matching launcher fall back to this repository's bin/crony.
     """
-    return _repo_root() / "bin" / "crony"
+    entry = _repo_root() / "bin" / "crony"
+    candidates = [sys.argv[0]] if sys.argv else []
+    path = shutil.which("crony")
+    if path is not None:
+        candidates.append(path)
+    for candidate in candidates:
+        launcher = Path(candidate).absolute()
+        try:
+            if launcher.samefile(entry):
+                return launcher
+        except OSError:
+            continue
+    return entry
 
 
 def _uv_executable() -> Path:
@@ -1092,10 +1104,13 @@ def _uv_executable() -> Path:
     direct `python bin/crony`), and errors only when neither answers,
     since a misconfigured environment shouldn't silently render a unit
     that fails at run time.
+
+    Preserve symlinks in the absolute path so package managers can
+    retarget them during upgrades without invalidating installed units.
     """
     env_uv = os.environ.get("UV")
     if env_uv and Path(env_uv).is_file():
-        return Path(env_uv).resolve()
+        return Path(env_uv).absolute()
     path = shutil.which("uv")
     if path is None:
         raise crony.errors.PreconditionError(
@@ -1104,7 +1119,7 @@ def _uv_executable() -> Path:
             "Platform units bake uv's absolute path so the scheduler "
             "doesn't have to find it on its minimal PATH."
         )
-    return Path(path).resolve()
+    return Path(path).absolute()
 
 
 def _write_apply_state(
@@ -1279,7 +1294,11 @@ def apply_one(
     # unit leaves them unequal even when the other snapshot fields match,
     # and an otherwise-clean apply still re-renders the platform side.
     current_snapshot = config.current.job_from_ref(ref)
-    if current_snapshot == snapshot:
+    sched = scheduler()
+    # Status ignores executable path changes while the installed paths
+    # still exist. An explicit apply refreshes them to the selected live
+    # launchers, including stable symlinks that survive target replacement.
+    if current_snapshot == snapshot and not _units_changing(snapshot, sched):
         # The current node, not the pending one: they compare equal here
         # (the scheduler facts are `compare=False`), but only the current
         # one carries them.
@@ -1289,7 +1308,6 @@ def apply_one(
         return ApplyResult.UNCHANGED
     is_update = current_snapshot is not None
 
-    sched = scheduler()
     # A job whose own run is performing this apply cannot reload its own
     # unit on a scheduler where the reload terminates the running job
     # (launchd): doing so would kill this very process. If the unit would
