@@ -375,12 +375,14 @@ Send a synthetic failure notification.
   scheduler never started the child.
 - **`gated`**\
   Jobs only. The job was skipped due to an execution gate. This is not
-  considered as a job failure.
+  considered as a job failure. A declined gate skips the job even if its
+  command script is missing or not executable.
 - **`canceled`**\
   Jobs and groups. A run canceled or skipped before its command ran -- for an
-  interactive job, one the user declined. A job stopped before its command
-  started (its unit stopped or reloaded during its gate or interactive wait)
-  is canceled too.
+  interactive job, one the user declined. A job whose command script is
+  missing or not executable is canceled when its gate passes or it has no
+  gate. A job stopped before its command started (its unit stopped or reloaded
+  during its gate or interactive wait) is canceled too.
 - **`crashed`**\
   Jobs and groups. The scheduler failed to launch the job or group, or it was
   killed/crashed before it could save its exit status to disk.

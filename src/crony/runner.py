@@ -642,12 +642,6 @@ def _run_job(snap: crony.model.Job) -> int:
         )
         if user_triggered or crony.runtime.daemon_retries_exhausted(sd):
             crony.runtime.clear_exit_history(sd)
-    if snap.script is not None:
-        sp = Path(snap.script)
-        if not sp.exists():
-            raise crony.errors.PreconditionError(f"script not found: {sp}")
-        if not os.access(sp, os.X_OK):
-            raise crony.errors.PreconditionError(f"script not executable: {sp}")
     notify_channels, notify_defaults, success_ratio = (
         crony.notify.resolve_notify_at_runtime(full_name)
     )
@@ -764,7 +758,7 @@ def _run_job(snap: crony.model.Job) -> int:
                         )
                         return 0
 
-                # Build and FDA-wrap the command past the gate but before
+                # Validate and FDA-wrap the command past the gate but before
                 # the interactive prompt: a gated-skip job never reaches
                 # here (FDA is irrelevant when the command won't run),
                 # while a full-disk-access job whose wrapper is missing /
@@ -772,6 +766,16 @@ def _run_job(snap: crony.model.Job) -> int:
                 # for a run that can't proceed. keep-awake wraps this
                 # outermost at the exec site below.
                 try:
+                    if snap.script is not None:
+                        sp = Path(snap.script)
+                        if not sp.exists():
+                            raise crony.errors.PreconditionError(
+                                f"script not found: {sp}"
+                            )
+                        if not os.access(sp, os.X_OK):
+                            raise crony.errors.PreconditionError(
+                                f"script not executable: {sp}"
+                            )
                     argv = _full_disk_access_argv(_command_argv(snap), snap)
                 except crony.errors.PreconditionError:
                     # Decided too: `do_run` records the cancel once this
@@ -2336,10 +2340,8 @@ def do_run(ref: str) -> None:
         if isinstance(snap, crony.model.Job) and crony.unit.is_daemon(
             snap.timing
         ):
-            # _run_job raises without holding run.lock -- either before
-            # taking it (a missing script) or on the way out of the
-            # `with` that released it (an ungranted full-disk-access
-            # wrapper). Take it here so the count is serialized like
+            # _run_job unwinds its run.lock before raising a precondition
+            # failure. Take it here so the count is serialized like
             # every other one. Contention means a different instance is
             # live, so this launch is not that daemon's own exit and
             # does not spend an attempt.
@@ -2420,14 +2422,11 @@ def _record_precondition_cancel(
         # Normally do_run re-raises and cli maps the precondition code.
         # At daemon exhaustion it instead exits zero to stop supervisor
         # retries. Either way this is the code the scheduler records for
-        # the launch, so the exit-code half of the `crashed` check
-        # agrees. The pid half does not: this record carries no pid, so
-        # whenever `run.pid` exists the entry reconciles as `crashed`
-        # rather than showing the class recorded here. That covers a
-        # daemon whose earlier launch left a pid behind, and any
-        # precondition raised after the run took the lock and published
-        # one. Both classes are unhealthy, so the entry still surfaces.
+        # the launch, so the exit-code half of the `crashed` check agrees.
         "process_exit": process_exit,
+        # Match any run.pid published by this launch, so a recorded
+        # precondition failure is not mistaken for an unrecorded crash.
+        "pid": os.getpid(),
         "reason": str(exc),
     }
     crony.runtime.write_last_run(state_dir / "last-run.json", payload)

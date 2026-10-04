@@ -583,9 +583,10 @@ class TestRunJobBasics:
 
         with (
             crony_runtime.acquire_lock(sd / "run.lock"),
-            pytest.raises(PreconditionError, match="script not found"),
+            pytest.raises(SystemExit) as exc,
         ):
             crony_runner.do_run(ref)
+        assert exc.value.code == 0
         assert crony_runtime.read_exit_history(sd).runs == []
 
     def test_canceled_surfaces_in_status_column(
@@ -777,6 +778,138 @@ class TestSuccessExitCodes:
 
 
 class TestRunJobGate:
+    @pytest.mark.parametrize("script_exists", [False, True])
+    @pytest.mark.parametrize("daemon", [False, True])
+    @pytest.mark.parametrize("gate_script", [False, True])
+    def test_declined_gate_skips_unusable_command_script(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        script_exists: bool,
+        daemon: bool,
+        gate_script: bool,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        script = tmp_path / "command.sh"
+        if script_exists:
+            script.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            script.chmod(0o644)
+        gate_path = tmp_path / "gate.sh"
+        gate_path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        gate_path.chmod(0o755)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "script": str(script),
+                        **(
+                            {"gate-script": str(gate_path)}
+                            if gate_script
+                            else {"gate": "false"}
+                        ),
+                        **(
+                            {"daemon": True}
+                            if daemon
+                            else {"schedule": "daily"}
+                        ),
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "g")
+        with mock.patch.object(
+            crony_notify, "dispatch_notify", autospec=True
+        ) as notify:
+            with pytest.raises(SystemExit) as exc:
+                crony_runner.do_run(h.ref("g"))
+            notify.assert_not_called()
+        assert exc.value.code == 0
+        rec = h.last_run("g")
+        assert rec["exit_class"] == "gated"
+        assert rec["gate"] == "failed"
+        assert rec["process_exit"] == 0
+        sd = h.state_dir("g")
+        assert crony_runtime.read_exit_history(sd).runs == []
+        assert (
+            crony_runtime._read_runtime_state(sd, full_name=None).job_status
+            == "gated"
+        )
+        log = (sd / "run.log").read_text(encoding="utf-8")
+        assert "skipping job" in log
+        assert "exec:" not in log
+
+    @pytest.mark.parametrize("script_exists", [False, True])
+    @pytest.mark.parametrize("gate", [None, "true"])
+    def test_unusable_command_script_cancels_when_gate_allows_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        script_exists: bool,
+        gate: str | None,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        script = tmp_path / "command.sh"
+        if script_exists:
+            script.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            script.chmod(0o644)
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "script": str(script),
+                        **({"gate": gate} if gate is not None else {}),
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "g")
+        reason = (
+            "script not executable" if script_exists else "script not found"
+        )
+        with pytest.raises(PreconditionError, match=reason):
+            crony_runner.do_run(h.ref("g"))
+        rec = h.last_run("g")
+        assert rec["exit_class"] == "canceled"
+        assert rec["process_exit"] == int(ExitCode.PRECONDITION)
+        assert reason in rec["reason"]
+        assert (
+            crony_runtime._read_runtime_state(
+                h.state_dir("g"), full_name=None
+            ).job_status
+            == "canceled"
+        )
+
+    def test_gate_can_prepare_command_script(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        source = tmp_path / "source.sh"
+        source.write_text("#!/bin/sh\necho command-ran\n", encoding="utf-8")
+        source.chmod(0o755)
+        script = tmp_path / "command.sh"
+        cfg = h.config(
+            {
+                "job": {
+                    "g": {
+                        "script": str(script),
+                        "gate": f"cp {shlex.quote(str(source))} "
+                        f"{shlex.quote(str(script))}",
+                        "schedule": "daily",
+                    }
+                }
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "g")
+        with pytest.raises(SystemExit) as exc:
+            crony_runner.do_run(h.ref("g"))
+        assert exc.value.code == 0
+        assert h.last_run("g")["exit_class"] == "ok"
+        assert "command-ran" in (h.state_dir("g") / "run.log").read_text()
+
     def test_gate_pass_runs_command(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -3159,6 +3292,10 @@ class TestFullDiskAccess:
         rec = json.loads((sd / "last-run.json").read_text(encoding="utf-8"))
         assert rec["exit_class"] == "canceled"
         assert "CANCELED" in (sd / "run.log").read_text(encoding="utf-8")
+        assert (
+            crony_runtime._read_runtime_state(sd, full_name=None).job_status
+            == "canceled"
+        )
 
     def test_denied_grant_cancels_before_interactive_prompt(
         self, tmp_path: Path, monkeypatch: Any

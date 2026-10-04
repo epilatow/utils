@@ -366,10 +366,12 @@ For a job group: the group ran out of time on a child before it ever saw it runn
 Jobs only.\&
 The job was skipped due to an execution gate.\&
 This is not considered as a job failure.\&
+A declined gate skips the job even if its command script is missing or not executable.\&
 .TP
 \f[I]canceled\f[R]
 Jobs and groups.\&
 A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined.\&
+A job whose command script is missing or not executable is canceled when its gate passes or it has no gate.\&
 A job stopped before its command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too.\&
 .TP
 \f[I]crashed\f[R]
