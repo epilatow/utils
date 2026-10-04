@@ -20,6 +20,7 @@ import datetime
 import json
 import math
 import os
+import select
 import shlex
 import signal
 import string
@@ -1920,9 +1921,8 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
 # track -- it tracks the guard -- so nothing else reaps a session whose
 # command ignores the signal (and the runner outlives stop signals by
 # design, exiting only once it has recorded the run). So this grace, plus
-# whatever the guard sits out before it starts counting -- a poll
-# (`_GUARD_POLL_SEC`), or the hint settle when the stop lands during a
-# timeout kill (`_TIMEOUT_HINT_SETTLE_SEC`) -- MUST stay below every
+# the hint settle the guard sits out first when a stop lands during a
+# timeout kill (`_TIMEOUT_HINT_SETTLE_SEC`), MUST stay below every
 # scheduler's stop-to-kill timeout. Past that the scheduler stops waiting
 # and treats the unit as gone while the guard is still tearing the run
 # down: launchd drops the label, so a reload starts the replacement
@@ -1936,9 +1936,6 @@ _KILL_GRACE_SEC = 5
 # signals ordered), and the runner-vs-job race is cross-process anyway, so
 # this separates the hint from the kill.
 _TIMEOUT_HINT_SETTLE_SEC = 1.0
-# Poll granularity while the guard waits on the runner, so it can act on a
-# relayed stop between waits.
-_GUARD_POLL_SEC = 1.0
 # Poll granularity while the guard waits for the killed session to drain,
 # small so a clean teardown returns promptly (the common case).
 _REAP_POLL_SEC = 0.1
@@ -2097,6 +2094,24 @@ def _killed_run_exit(
     return rc
 
 
+def _await_wakeup(wake_r: int, timeout: float | None) -> None:
+    """Sleep until a signal the guard handles arrives, or until `timeout`
+    seconds pass (None for no limit), then empty the wakeup pipe.
+
+    `wake_r` is the read end of the pipe `signal.set_wakeup_fd` writes a
+    byte to for every signal that has a Python-level handler. Waiting on
+    that pipe is what lets the guard sleep with no timeout at all. A
+    signal alone does not end the wait -- an interrupted `select` is
+    resumed once the handler returns (PEP 475) -- but the byte it left
+    does. One that landed before the wait began has already left its byte,
+    so it is not missed either.
+    """
+    select.select([wake_r], [], [], timeout)
+    with contextlib.suppress(BlockingIOError):
+        while os.read(wake_r, 4096):
+            pass
+
+
 def do_run_guard(cap: int, argv: list[str]) -> None:
     """Enforce a run's wallclock timeout and own all its killing.
     Platform schedulers invoke this; not user-facing.
@@ -2139,9 +2154,13 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     the stop signal when it recorded none (`_killed_run_exit`). A run that
     meets neither passes its code straight through, swept or not.
 
-    Because the runner survives the SIGTERM to record and then exits, its
-    exit is the signal that the session is dead; the guard waits on the
-    runner throughout -- no process-group polling.
+    Between those events the guard sleeps. Everything it acts on reaches
+    it as a signal -- a stop, the runner's arm, the run ending -- so it
+    waits on its signal wakeup pipe (`_await_wakeup`), with a timeout only
+    while a deadline is armed, and wakes for nothing else. A run that
+    lasts for days costs it nothing in the meantime. Because the runner
+    survives the SIGTERM to record and then exits, its exit is the signal
+    that the session is dead; the guard waits on the runner throughout.
     """
     capped = cap > 0
     interactive = bool(argv) and argv[0] == "--interactive"
@@ -2174,6 +2193,18 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
         if capped and deadline is None:
             deadline = time.monotonic() + cap
 
+    def _on_child(_signum: int, _frame: object) -> None:
+        """The run ending only has to end the wait, which the wakeup pipe
+        does for any signal that has a handler. This is that handler, with
+        nothing of its own to do."""
+
+    # Every signal handled below also leaves a byte in this pipe, which is
+    # what the wait sleeps on. Set up before the handlers so no signal can
+    # be handled without waking it.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
     # Install before the spawn so a stop or an arm racing it runs the
     # handler rather than the default-terminate disposition -- which for
     # SIGUSR1 too would leave the guard dead with a new session starting.
@@ -2182,6 +2213,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, _on_stop)
     signal.signal(signal.SIGUSR1, _on_arm)
+    signal.signal(signal.SIGCHLD, _on_child)
     env = {**os.environ, crony.runtime.GUARD_PID_ENV: str(os.getpid())}
     proc = subprocess.Popen(argv, start_new_session=True, env=env)
     pgid = proc.pid
@@ -2223,17 +2255,14 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
                     recorded=_run_recorded(sd, launch_pid),
                 )
             )
-        wait_for = (
-            _GUARD_POLL_SEC
-            if remaining is None
-            else min(_GUARD_POLL_SEC, remaining)
-        )
-        try:
-            rc = proc.wait(timeout=wait_for)
-        except subprocess.TimeoutExpired:
+        rc = proc.poll()
+        if rc is None:
+            # Nothing to act on until the next signal, or the deadline
+            # where one is armed.
+            _await_wakeup(wake_r, remaining)
             continue
         if stop_signum is not None:
-            # A stop landed while we were waiting and its relay already let
+            # A stop landed after the check above and its relay already let
             # the runner exit; still reap the session so a descendant that
             # ignored the relayed signal does not outlive the guard.
             _reap_session(

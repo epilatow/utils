@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -4176,6 +4177,32 @@ def _stop_guard_in_child(
     return os.waitstatus_to_exitcode(status)
 
 
+def _record_guard_waits(
+    tmp_path: Path, monkeypatch: Any
+) -> Callable[[], list[float | None]]:
+    """Have a forked guard log the timeout of every wait it makes, and
+    return a reader for that log. The guard runs in a forked child, so
+    what it records has to come back through a file."""
+    log = tmp_path / "guard-waits"
+    log.write_text("", encoding="utf-8")
+    real_wait = crony_runner._await_wakeup
+
+    def logged_wait(wake_r: int, timeout: float | None) -> None:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"{json.dumps(timeout)}\n")
+        real_wait(wake_r, timeout)
+
+    monkeypatch.setattr(crony_runner, "_await_wakeup", logged_wait)
+
+    def read() -> list[float | None]:
+        return [
+            None if line == "null" else float(line)
+            for line in log.read_text(encoding="utf-8").splitlines()
+        ]
+
+    return read
+
+
 def _guard_state_dir(
     tmp_path: Path, monkeypatch: Any, *, prior_run_pid: int | None = None
 ) -> tuple[Path, str]:
@@ -4314,8 +4341,8 @@ class TestDoRunGuard:
         # A job runner signals its guard when its command starts, whatever
         # the cap. With no cap that signal must not start a clock -- one
         # armed zero seconds out would kill the run as it began. The run
-        # outlives the guard's poll (`_GUARD_POLL_SEC`), which is when a
-        # deadline armed by the signal would be acted on.
+        # keeps going after the signal, so there is something left for a
+        # deadline armed by it to kill.
         argv = [
             *marker,
             "/bin/sh",
@@ -4323,6 +4350,29 @@ class TestDoRunGuard:
             'kill -USR1 "$PPID"; sleep 2; exit 5',
         ]
         assert _run_guard_in_child(0, argv) == 5
+
+    def test_uncapped_wait_has_no_timeout(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # With no deadline there is nothing to wake for but a signal. A
+        # wait that timed out would be the guard polling for as long as
+        # the run lasts, which for a daemon is until it is stopped.
+        waits = _record_guard_waits(tmp_path, monkeypatch)
+        code = _run_guard_in_child(0, ["/bin/sh", "-c", "sleep 1; exit 5"])
+        assert code == 5
+        assert set(waits()) == {None}
+
+    def test_capped_wait_runs_to_the_deadline(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A capped run is woken for its deadline and for nothing sooner:
+        # each wait is the whole of the time left, not a slice to poll on.
+        waits = _record_guard_waits(tmp_path, monkeypatch)
+        code = _run_guard_in_child(60, ["/bin/sh", "-c", "sleep 1; exit 5"])
+        assert code == 5
+        recorded = waits()
+        assert recorded
+        assert all(t is not None and t > 50 for t in recorded)
 
     def test_overrun_is_killed_and_exits_timeout(self) -> None:
         start = time.monotonic()
@@ -4707,17 +4757,16 @@ class TestDoRunGuard:
 class TestStopTimeouts:
     """Every wait that follows a stop outlasts the guard's own teardown.
 
-    The guard gives a stopped run its kill grace, after whichever it may
-    sit out first: one poll before it notices the stop, or the hint settle
-    when the stop lands during a timeout kill. Anything waiting on that
-    stop -- launchd's own force-kill, a destroy waiting for the run's last
-    write -- has to be longer, or it acts while the run is still being
-    torn down. The waits live in modules the runner is built on, which
-    cannot import its grace, so nothing but this holds them in order."""
+    The guard gives a stopped run its kill grace from the moment the stop
+    arrives -- or, when it arrives during a timeout kill, once the hint
+    settle that kill opens with is over. Anything waiting on that stop --
+    launchd's own force-kill, a destroy waiting for the run's last write
+    -- has to be longer, or it acts while the run is still being torn
+    down. The waits live in modules the runner is built on, which cannot
+    import its grace, so nothing but this holds them in order."""
 
     _GUARD_STOP_SEC = (
-        max(crony_runner._GUARD_POLL_SEC, crony_runner._TIMEOUT_HINT_SETTLE_SEC)
-        + crony_runner._KILL_GRACE_SEC
+        crony_runner._TIMEOUT_HINT_SETTLE_SEC + crony_runner._KILL_GRACE_SEC
     )
 
     def test_launchd_exit_timeout_outlasts_the_guard(self) -> None:
@@ -4725,6 +4774,49 @@ class TestStopTimeouts:
 
     def test_destroy_wait_outlasts_the_guard(self) -> None:
         assert self._GUARD_STOP_SEC < crony_runtime._RUN_SETTLE_TIMEOUT_SEC
+
+
+class TestAwaitWakeup:
+    """The guard's wait: asleep until its wakeup pipe has something in it
+    or the timeout passes, and the pipe emptied either way."""
+
+    @pytest.fixture
+    def pipe(self) -> Iterator[tuple[int, int]]:
+        read_end, write_end = os.pipe()
+        os.set_blocking(read_end, False)
+        try:
+            yield read_end, write_end
+        finally:
+            os.close(read_end)
+            os.close(write_end)
+
+    def test_returns_at_the_timeout_when_nothing_arrives(
+        self, pipe: tuple[int, int]
+    ) -> None:
+        read_end, _write_end = pipe
+        start = time.monotonic()
+        crony_runner._await_wakeup(read_end, 0.2)
+        assert 0.2 <= time.monotonic() - start < 5
+
+    def test_returns_at_once_for_a_byte_already_waiting(
+        self, pipe: tuple[int, int]
+    ) -> None:
+        # A signal that landed before the wait began left its byte then,
+        # and must not be slept through.
+        read_end, write_end = pipe
+        os.write(write_end, b"\x0f")
+        start = time.monotonic()
+        crony_runner._await_wakeup(read_end, 30)
+        assert time.monotonic() - start < 5
+
+    def test_empties_the_pipe(self, pipe: tuple[int, int]) -> None:
+        # A byte left behind would end the next wait at once, and the one
+        # after: the guard would spin instead of sleep.
+        read_end, write_end = pipe
+        os.write(write_end, b"\x0f\x14")
+        crony_runner._await_wakeup(read_end, 30)
+        with pytest.raises(BlockingIOError):
+            os.read(read_end, 1)
 
 
 class _FakeScheduler:
