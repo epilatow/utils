@@ -70,6 +70,7 @@ from conftest_borgadm import mock_cfg as _mock_cfg_fixture  # noqa: E402, F401
 import borgadm.errors as berr  # noqa: E402
 import borgadm_cli as ba  # noqa: E402
 import crony.cli as crony_cli  # noqa: E402
+import crony.runner as crony_runner  # noqa: E402
 import crony.unit  # noqa: E402
 
 # The bin script under test, for run_tests' coverage module name and the
@@ -1237,7 +1238,6 @@ class TestAutomate(CronyAutomateBase):
         assert doc["defaults"]["priority"] == "high"
         assert doc["defaults"]["flags"] == ["keep-awake"]
         assert doc["defaults"]["job-timeout-sec"] == 0
-        assert doc["defaults"]["env"] == {"PATH": "$HOME/.local/bin:$PATH"}
         # Only create reads protected files, so it alone adds the
         # full-disk-access flag (composing with the inherited keep-awake);
         # the checks carry no own flags and inherit keep-awake.
@@ -1251,6 +1251,129 @@ class TestAutomate(CronyAutomateBase):
         # The bundle deploys on any host that applies it.
         assert set(doc["target"]) == {"all"}
         assert doc["target"]["all"]["jobs"] == self.JOB_OPS
+
+    @pytest.mark.parametrize("system", ["Darwin", "Linux"])
+    @pytest.mark.parametrize("relative_uv", [False, True])
+    @pytest.mark.parametrize(
+        "uv_directory", ["uv launchers", "uv $HOME ${PATH} $$ launchers"]
+    )
+    def test_apply_detects_launchers_and_jobs_find_uv(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        system: str,
+        relative_uv: bool,
+        uv_directory: str,
+    ) -> None:
+        uv_dir = tmp_path / uv_directory
+        uv_dir.mkdir()
+        uv_binary = tmp_path / "versioned-uv"
+        uv_binary.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        uv_binary.chmod(0o755)
+        (uv_dir / "uv").symlink_to(uv_binary)
+        bin_dir = tmp_path / "installed bin"
+        bin_dir.mkdir()
+        script = tmp_path / "source-borgadm"
+        script.write_text("#!/usr/bin/env uv\n")
+        script.chmod(0o755)
+        launcher = bin_dir / "borgadm"
+        launcher.symlink_to(script)
+        monkeypatch.chdir(tmp_path)
+        uv_entry = uv_dir.name if relative_uv else str(uv_dir)
+        monkeypatch.setenv("PATH", f"{bin_dir}:{uv_entry}:/usr/bin:/bin")
+        monkeypatch.setenv("UV", str(uv_binary))
+        monkeypatch.setattr(ba.platform, "system", lambda: system)
+        dropin = tmp_path / "dropin"
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
+        ba.do_automate_apply(
+            config_only=True,
+            include=[*self.JOB_OPS, "rsync"],
+            exclude=[],
+            rsync_dir=tmp_path / "restore target",
+            rsync_interval=None,
+        )
+        doc = tomllib.loads((dropin / "borgadm.toml").read_text())
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        runtime_env = crony_runner._runtime_env(doc["defaults"]["env"])
+        assert runtime_env["PATH"] == f"{uv_dir}:/usr/bin:/bin"
+        for job in doc["job"].values():
+            argv = shlex.split(job["command"])
+            assert argv[0] == str(launcher)
+            result = subprocess.run(
+                ["/bin/sh", "-c", job["command"]],
+                env=runtime_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.splitlines() == argv
+
+    @pytest.mark.parametrize("uv_directory", ["fallback", "fallback $HOME"])
+    def test_apply_falls_back_to_uv_environment_and_current_script(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        uv_directory: str,
+    ) -> None:
+        uv_dir = tmp_path / uv_directory
+        uv_dir.mkdir()
+        uv = uv_dir / "uv"
+        uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        uv.chmod(0o755)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setenv("UV", str(uv))
+        dropin = tmp_path / "dropin"
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
+        self.apply(config_only=True)
+        doc = tomllib.loads((dropin / "borgadm.toml").read_text())
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        runtime_env = crony_runner._runtime_env(doc["defaults"]["env"])
+        assert runtime_env["PATH"] == f"{uv_dir}:/usr/bin:/bin"
+        for job in doc["job"].values():
+            argv = shlex.split(job["command"])
+            assert argv[0] == str(Path(ba.__file__).resolve())
+            result = subprocess.run(
+                ["/bin/sh", "-c", job["command"]],
+                env=runtime_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.splitlines() == ["run", "--script", *argv]
+
+    @pytest.mark.parametrize(
+        "uv_kind", ["unset", "missing", "dir", "file", "renamed"]
+    )
+    def test_apply_without_executable_uv_preserves_bundle(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        uv_kind: str,
+    ) -> None:
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.delenv("UV", raising=False)
+        uv = tmp_path / ("uv-versioned" if uv_kind == "renamed" else "uv")
+        if uv_kind == "dir":
+            uv.mkdir()
+        elif uv_kind == "file":
+            uv.write_text("not executable\n")
+        elif uv_kind == "renamed":
+            uv.write_text("#!/bin/sh\nexit 0\n")
+            uv.chmod(0o755)
+        if uv_kind != "unset":
+            monkeypatch.setenv("UV", str(uv))
+        dropin = tmp_path / "dropin"
+        dropin.mkdir()
+        bundle = dropin / "borgadm.toml"
+        bundle.write_text("# existing bundle\n")
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(dropin))
+        with pytest.raises(berr.BorgadmError, match="uv not found"):
+            self.apply(config_only=False)
+        assert bundle.read_text() == "# existing bundle\n"
 
     def test_include_keeps_only_named_jobs(self, automate_env: Any) -> None:
         dropin, _mock_run = automate_env

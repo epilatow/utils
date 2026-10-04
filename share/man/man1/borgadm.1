@@ -101,6 +101,7 @@ Write borgadm\(aqs crony(1) bundle and deploy the scheduled backup\-creation and
 Passing neither \-\-include nor \-\-exclude reuses the bundle\(aqs recorded job selection.\&
 The opt\-in rsync verify job is selected with \-\-include rsync.\&
 On macOS the create job runs with Full Disk Access permissions.\&
+Jobs use borgadm from PATH when available, or this script otherwise, and their PATH includes uv\(aqs detected directory.\&
 .RS
 .TP
 \f[CR]\-\-config\-only\f[R]

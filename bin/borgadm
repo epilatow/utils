@@ -1603,10 +1603,40 @@ _CRONY = CronyAutomation(
 def _borgadm_script_path() -> str:
     """Return the path to borgadm itself, for a crony job's command.
 
-    Resolves symlinks so the command points at the real script in the
-    repo rather than a launcher symlink that could later move.
+    Prefer the launcher on PATH, made absolute without resolving symlinks
+    so an installed launcher can keep tracking the current checkout.
+    Fall back to this script when PATH has no borgadm.
     """
+    if path := shutil.which("borgadm"):
+        return str(Path(path).absolute())
     return str(Path(__file__).resolve())
+
+
+def _crony_job_path() -> str:
+    """Extend the scheduler's PATH with the directory containing uv.
+
+    Prefer the operator's PATH entry without resolving symlinks, which
+    preserves a package manager's stable launcher across upgrades. uv's
+    exported UV path is a fallback when PATH has no uv, provided its
+    executable is named uv as required by the shebang. Missing uv is an
+    error rather than installing jobs whose shebang cannot run. Escape
+    literal dollars in the directory for crony's environment template.
+    """
+    path = shutil.which("uv")
+    if path is None:
+        path = os.environ.get("UV")
+        if (
+            not path
+            or Path(path).name != "uv"
+            or not Path(path).is_file()
+            or not os.access(path, os.X_OK)
+        ):
+            raise BorgadmError(
+                "uv not found on PATH or via $UV; install it before "
+                "running `borgadm automate apply`."
+            )
+    directory = str(Path(path).absolute().parent).replace("$", "$$")
+    return f"{directory}{os.pathsep}$PATH"
 
 
 def _crony_path() -> str:
@@ -1842,9 +1872,8 @@ def _render_crony_bundle(
     identical for every job, so they live in `[defaults]` (no job
     overrides them) rather than being repeated per job. The defaults run
     all jobs un-throttled (`priority = high`), hold the machine awake
-    (`flags = ["keep-awake"]`), and extend PATH with ~/.local/bin
-    (`env`) so borgadm's `uv` shebang resolves under the scheduler's
-    minimal PATH. Only `create` reads protected user files, and only on
+    (`flags = ["keep-awake"]`), and use `_crony_job_path` for the shared
+    environment. Only `create` reads protected user files, and only on
     macOS does that need a grant, so on macOS it alone adds
     `full-disk-access` to its flags (composing with the inherited
     keep-awake) and crony routes it through Crony.app for the grant; on
@@ -1906,7 +1935,7 @@ def _render_crony_bundle(
             "job-timeout-sec": 0,
             "priority": "high",
             "flags": ["keep-awake"],
-            "env": {"PATH": "$HOME/.local/bin:$PATH"},
+            "env": {"PATH": _crony_job_path()},
         },
         "job": jobs,
         "target": {"all": {"jobs": [j.name for j in selected]}},
@@ -3320,7 +3349,9 @@ def args_parser() -> StrictArgumentParser:
             "systemd on Linux). Passing neither --include nor --exclude\n"
             "reuses the bundle's recorded job selection. The opt-in rsync\n"
             "verify job is selected with --include rsync. On macOS the\n"
-            "create job runs with Full Disk Access permissions."
+            "create job runs with Full Disk Access permissions.\n"
+            "Jobs use borgadm from PATH when available, or this script\n"
+            "otherwise, and their PATH includes uv's detected directory."
         ),
         epilog=_AUTOMATE_APPLY_EPILOG,
         formatter_class=RawDescriptionDefaultsHelpFormatter,
