@@ -237,6 +237,23 @@ def _add_all_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _guard_cap(value: str) -> int:
+    """argparse `type=` for `_run-guard`'s cap: whole seconds, where 0
+    asks for no cap. Nothing below 0 means anything, so a negative cap is
+    a rendering bug, rejected before the guard starts a run under it."""
+    try:
+        cap = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"invalid cap {value!r} (whole seconds, 0 for none)"
+        ) from e
+    if cap < 0:
+        raise argparse.ArgumentTypeError(
+            f"cap must be 0 (no cap) or more, got {cap}"
+        )
+    return cap
+
+
 def _validate_config_init(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
@@ -674,8 +691,8 @@ def _build_parser() -> StrictArgumentParser:
     p_guard = subparsers.add_parser(crony.model.GUARD_SUBCOMMAND)
     p_guard.add_argument(
         "cap",
-        type=int,
-        help="Wallclock cap in seconds (internal-only form).",
+        type=_guard_cap,
+        help="Wallclock cap in seconds, 0 for none (internal-only form).",
     )
     p_guard.add_argument(
         "argv",

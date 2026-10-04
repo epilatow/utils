@@ -171,7 +171,8 @@ class TestRunGuardDispatch:
     options.
     """
 
-    def test_dispatches_with_cap_and_inner_argv(self) -> None:
+    @pytest.mark.parametrize("cap", [180, 0], ids=["capped", "uncapped"])
+    def test_dispatches_with_cap_and_inner_argv(self, cap: int) -> None:
         mock_cb = MagicMock()
         inner = [
             "/abs/uv",
@@ -186,11 +187,29 @@ class TestRunGuardDispatch:
                 crony_cli._COMMAND_CALLBACKS,
                 {"_run-guard": mock_cb},
             ),
-            patch("sys.argv", ["prog", "_run-guard", "180", *inner]),
+            patch("sys.argv", ["prog", "_run-guard", str(cap), *inner]),
         ):
             result = crony_cli.cli()
         assert result == 0
-        mock_cb.assert_called_once_with(cap=180, argv=inner)
+        mock_cb.assert_called_once_with(cap=cap, argv=inner)
+
+    @pytest.mark.parametrize("cap", ["-5", "soon"], ids=["negative", "garbage"])
+    def test_rejects_a_cap_it_cannot_run_under(self, cap: str) -> None:
+        # 0 is the no-cap request and nothing below it means anything, so
+        # such a cap reaching the guard is a rendering bug. It is a usage
+        # error at the parser, before any run is started under it.
+        mock_cb = MagicMock()
+        with (
+            patch.dict(
+                crony_cli._COMMAND_CALLBACKS,
+                {"_run-guard": mock_cb},
+            ),
+            patch("sys.argv", ["prog", "_run-guard", cap, "/abs/uv", "run"]),
+            pytest.raises(SystemExit) as exc,
+        ):
+            crony_cli.cli()
+        assert exc.value.code == 2
+        mock_cb.assert_not_called()
 
 
 class TestRunLegacyAlias:

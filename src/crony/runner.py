@@ -2098,9 +2098,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
 
     Runs `argv` (a `crony _run <ref>` invocation, optionally led by an
     `--interactive` marker) in its own session and caps it at `cap`
-    seconds. `cap` is always positive: an uncapped entry is rendered
-    without the guard (`_guarded_argv`), so the guard never runs for one.
-    A non-interactive run is armed at launch: its setup is
+    seconds. A non-interactive run is armed at launch: its setup is
     bounded, so a runner wedged before the command is still killed at the
     cap. An interactive run is armed only when the runner signals that it
     has started the command (SIGUSR1 to the guard), leaving its unbounded
@@ -2109,6 +2107,11 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     harmless no-op. A group runner is always non-interactive (armed at
     launch) and sends none. The runner is otherwise passive -- it records
     and exits, emitting no signals of its own.
+
+    A `cap` of 0 is no cap, and none of that arming applies: the run is
+    armed neither at launch nor by the runner's signal, so it never times
+    out, and the guard is there only to stop it when the scheduler does.
+    The parser admits no cap below 0.
 
     The killing is the guard's, for the whole session:
 
@@ -2130,11 +2133,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     exit is the signal that the session is dead; the guard waits on the
     runner throughout -- no process-group polling.
     """
-    if cap <= 0:
-        raise crony.errors.UsageError(
-            f"crony _run-guard requires a positive cap, got {cap}; an "
-            f"uncapped entry is rendered without the guard"
-        )
+    capped = cap > 0
     interactive = bool(argv) and argv[0] == "--interactive"
     if interactive:
         argv = argv[1:]
@@ -2159,9 +2158,10 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
         # from here only if it is not already running: a non-interactive
         # run is armed at launch (below), so this is its no-op; an
         # interactive run is armed only here, once its unbounded approval
-        # wait is over. First arm wins.
+        # wait is over. First arm wins. An uncapped run has no cap to arm,
+        # so the signal leaves it without a deadline.
         nonlocal deadline
-        if deadline is None:
+        if capped and deadline is None:
             deadline = time.monotonic() + cap
 
     # Install before the spawn so a stop or an arm racing it runs the
@@ -2176,10 +2176,11 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     proc = subprocess.Popen(argv, start_new_session=True, env=env)
     pgid = proc.pid
 
-    # A non-interactive run is armed at launch, so a runner wedged before
-    # it can start the command is still killed at the cap. An interactive
-    # run waits unbounded until the arm signal.
-    if not interactive:
+    # A non-interactive capped run is armed at launch, so a runner wedged
+    # before it can start the command is still killed at the cap. An
+    # interactive run waits unbounded until the arm signal, and an uncapped
+    # one is never armed at all.
+    if capped and not interactive:
         deadline = time.monotonic() + cap
     while True:
         if stop_signum is not None:

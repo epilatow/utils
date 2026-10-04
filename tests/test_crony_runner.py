@@ -4153,11 +4153,14 @@ def _run_guard_in_child(cap: int, argv: list[str]) -> int:
     return os.waitstatus_to_exitcode(status)
 
 
-def _stop_guard_in_child(argv: list[str], ready: Path, sig: int) -> int:
+def _stop_guard_in_child(
+    argv: list[str], ready: Path, sig: int, cap: int = 300
+) -> int:
     """Run a forked `do_run_guard`, send it `sig` once the run has created
-    `ready`, and return the guard's exit code. The cap is well beyond the
-    test, so the stop is the only thing that ends the run early."""
-    pid = _fork_guard(300, argv)
+    `ready`, and return the guard's exit code. The default cap is well
+    beyond the test, so the stop is the only thing that ends the run
+    early."""
+    pid = _fork_guard(cap, argv)
     for _ in range(50):
         if ready.exists():
             break
@@ -4211,24 +4214,52 @@ def _record_run_sh(sd: Path) -> str:
     )
 
 
+_GUARD_CAPS = pytest.mark.parametrize(
+    "cap", [300, 0], ids=["capped", "uncapped"]
+)
+
+
 class TestDoRunGuard:
     """The timeout guard: propagate a normal exit, kill the whole run
     group (not just the direct child) on overrun or a relayed stop, and
-    report the run's own exit when it outlives that signal."""
+    report the run's own exit when it outlives that signal. A cap of 0
+    takes the timeout away and leaves the rest."""
 
     def test_propagates_success(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 0"]) == 0
 
-    def test_rejects_a_nonpositive_cap(self) -> None:
-        # The guard is only rendered for a capped entry; an uncapped one
-        # runs without it, so a cap <= 0 reaching the guard is a rendering
-        # bug, not a "no cap" request -- it fails loudly.
-        for bad in (0, -5):
-            with pytest.raises(UsageError):
-                crony_runner.do_run_guard(bad, ["/bin/sh", "-c", "true"])
-
     def test_propagates_nonzero_exit(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 7"]) == 7
+
+    def test_zero_cap_never_times_out(self) -> None:
+        # No cap means no deadline at all, not one of zero seconds: the
+        # run is left to finish and its own exit propagates.
+        start = time.monotonic()
+        code = _run_guard_in_child(0, ["/bin/sh", "-c", "sleep 2; exit 5"])
+        elapsed = time.monotonic() - start
+        assert code == 5
+        assert elapsed >= 2
+
+    @pytest.mark.parametrize(
+        "marker",
+        [[], ["--interactive"]],
+        ids=["non-interactive", "interactive"],
+    )
+    def test_zero_cap_is_not_armed_by_the_runner(
+        self, marker: list[str]
+    ) -> None:
+        # A job runner signals its guard when its command starts, whatever
+        # the cap. With no cap that signal must not start a clock -- one
+        # armed zero seconds out would kill the run as it began. The run
+        # outlives the guard's poll (`_GUARD_POLL_SEC`), which is when a
+        # deadline armed by the signal would be acted on.
+        argv = [
+            *marker,
+            "/bin/sh",
+            "-c",
+            'kill -USR1 "$PPID"; sleep 2; exit 5',
+        ]
+        assert _run_guard_in_child(0, argv) == 5
 
     def test_overrun_is_killed_and_exits_timeout(self) -> None:
         start = time.monotonic()
@@ -4292,9 +4323,14 @@ class TestDoRunGuard:
         else:
             pytest.fail(f"stubborn descendant {gc_pid} survived the sweep")
 
-    def test_forwards_sigterm_to_the_run(self, tmp_path: Path) -> None:
+    @_GUARD_CAPS
+    def test_forwards_sigterm_to_the_run(
+        self, tmp_path: Path, cap: int
+    ) -> None:
         # The guard is the scheduler-tracked process; a stop signal it
         # receives must reach the run that escaped into its own session.
+        # That holds with no cap too, where stopping the run is all the
+        # guard is there to do.
         pidfile = tmp_path / "grandchild.pid"
         ready = tmp_path / "ready"
         argv = [
@@ -4302,7 +4338,10 @@ class TestDoRunGuard:
             "-c",
             f"sleep 30 & echo $! > {pidfile}; touch {ready}; wait",
         ]
-        _stop_guard_in_child(argv, ready, signal.SIGTERM)
+        code = _stop_guard_in_child(argv, ready, signal.SIGTERM, cap)
+        # The stop is what ended it, not a deadline: a timeout kill would
+        # reap the grandchild as well, but report the timeout.
+        assert code == 128 + signal.SIGTERM
         gc_pid = int(pidfile.read_text().strip())
         for _ in range(50):
             try:
@@ -4312,6 +4351,36 @@ class TestDoRunGuard:
             time.sleep(0.1)
         else:
             pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
+
+    @_GUARD_CAPS
+    def test_stop_sigkills_a_run_that_ignores_it(
+        self, tmp_path: Path, monkeypatch: Any, cap: int
+    ) -> None:
+        # A run that ignores the relayed stop must not outlive it: the
+        # guard escalates to SIGKILL after the grace, and since such a run
+        # recorded nothing the stop signal is what the guard reports.
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        pidfile = tmp_path / "stubborn.pid"
+        ready = tmp_path / "ready"
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                f'trap "" TERM; echo $$ > {pidfile}; touch {ready}; '
+                f"while :; do sleep 0.2; done"
+            ),
+        ]
+        code = _stop_guard_in_child(argv, ready, signal.SIGTERM, cap)
+        assert code == 128 + signal.SIGTERM
+        run_pid = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(run_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"run {run_pid} survived the stop")
 
     @pytest.mark.parametrize("code", [0, 3])
     def test_stop_passes_through_the_exit_a_run_recorded(
