@@ -2385,7 +2385,8 @@ class TestKeepAwake:
     def test_arm_guard_is_a_noop_without_a_guard(
         self, monkeypatch: Any
     ) -> None:
-        # An uncapped run has no guard: nothing in the env, nothing signal.
+        # A runner started directly, with no guard above it, finds nothing
+        # in the env and signals nothing.
         calls: list[object] = []
         monkeypatch.setattr("crony.runner.os.kill", lambda *a: calls.append(a))
         monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)

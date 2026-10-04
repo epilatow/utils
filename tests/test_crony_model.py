@@ -1126,12 +1126,13 @@ class TestDaemonSnapshot:
         assert spec.timing is None
         assert spec.daemon is not None
 
-    def test_timeout_is_uncapped_so_no_guard_wraps_it(self) -> None:
-        # A daemon resolves uncapped, so the run command is the bare
-        # runner argv -- the timeout guard would otherwise kill it.
+    def test_timeout_is_uncapped_so_the_guard_sets_no_deadline(self) -> None:
+        # A daemon resolves uncapped. It still runs under the guard, which
+        # is what stops it, but with the no-cap value -- a deadline would
+        # kill a command that is meant to keep running.
         snap = self._renderable()
         assert snap.timeout == 0
-        assert "_run-guard" not in " ".join(snap.unit_spec().cmd)
+        assert snap.unit_spec().cmd[4:6] == ("_run-guard", "0")
 
 
 if __name__ == "__main__":

@@ -225,11 +225,12 @@ class _ExitOutcome(NamedTuple):
 
 
 # The scheduler-stop signals the guard relays into a run's session (and a
-# scheduler without the guard delivers directly). A runner that has taken
-# on its run does not die on these: a job runner turns one arriving before
-# its command starts into a recorded stop (`_raise_on_stop`), and a runner
-# otherwise ignores them so it survives to record its outcome; the
-# command, which keeps the default dispositions, still dies on them.
+# scheduler that signals a unit's whole process tree delivers directly as
+# well). A runner that has taken on its run does not die on these: a job
+# runner turns one arriving before its command starts into a recorded stop
+# (`_raise_on_stop`), and a runner otherwise ignores them so it survives to
+# record its outcome; the command, which keeps the default dispositions,
+# still dies on them.
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # Every signal the guard sends a run: the stops it relays, plus the SIGUSR1
 # hint it sends the runner alone just before it kills a run for its
@@ -325,7 +326,7 @@ def _exec_command(
     keeps an interactive job's approval wait from counting against it. A
     non-interactive run is armed at its launch instead, so there the arm is
     a no-op and everything before the command counts. An uncapped run has
-    no guard to arm.
+    no cap to arm, so its guard ignores the signal.
 
     Returns the command's outcome and that timed-out flag.
     """
@@ -388,7 +389,7 @@ def _write_crony_line(log_file: IO[bytes], log_path: Path, text: str) -> None:
 def _arm_guard() -> None:
     """Signal the guard that the command has started, so it clocks its cap
     from now rather than from the runner's launch. The guard published its
-    pid in GUARD_PID_ENV; an uncapped run has no guard and leaves it unset,
+    pid in GUARD_PID_ENV; a runner started without a guard finds it unset,
     so this is a no-op. Best-effort: a guard that has already exited
     (ProcessLookupError) or is not ours (PermissionError) is ignored -- a
     non-interactive guard's own initial cap still bounds a run whose arm

@@ -80,11 +80,14 @@ RUN_SUBCOMMAND = "_run"
 # re-renders them. Remove once no `run`-baked units remain on any host.
 RUN_SUBCOMMAND_LEGACY = "run"
 
-# Hidden crony subcommand that wraps a run in its wallclock timeout: it
-# launches the inner `crony _run` in its own session, arms the cap when the
-# runner signals the command has started, and on overrun kills that session
-# (a SIGUSR1 hint to the runner, then a SIGTERM -> grace -> SIGKILL
-# escalation). A leading `--interactive` in the wrapped argv tells it not to
+# Hidden crony subcommand every unit's run is wrapped in. It launches the
+# inner `crony _run` in its own session and owns that session's killing:
+# when the scheduler stops the unit it relays the stop and then SIGKILLs
+# whatever is left, when the run ends on its own it clears out what the
+# run left behind, and for an entry with a wallclock timeout it kills the
+# run on overrun (a SIGUSR1 hint to the runner, then a SIGTERM -> grace ->
+# SIGKILL escalation), arming the cap when the runner signals the command
+# has started. A leading `--interactive` in the wrapped argv tells it not to
 # clock the pre-command wait, which for an interactive job is unbounded.
 GUARD_SUBCOMMAND = "_run-guard"
 
@@ -225,18 +228,17 @@ def _guarded_argv(
     timeout: int,
     interactive: bool,
 ) -> tuple[str, ...]:
-    """The unit's full run command. A positive `timeout` wraps the base
-    run in the timeout guard, which enforces the timeout and kills the
-    session on overrun; an uncapped entry (`timeout <= 0`) runs the base
-    argv directly, no guard.
+    """The unit's full run command: the base run wrapped in the guard,
+    which stops the run when the scheduler stops the unit and, given a
+    positive `timeout`, enforces it. An uncapped entry (`timeout` 0) is
+    wrapped all the same, with a cap of 0: it has no timeout to enforce
+    but is stopped like any other.
 
-    An `interactive` guarded entry carries a leading `--interactive` marker
-    so the guard leaves the pre-command wait unbounded and clocks the cap
-    only once the command starts. A non-interactive entry omits it, so its
-    argv is unchanged from an unmarked guard wrap."""
+    An `interactive` entry carries a leading `--interactive` marker so the
+    guard leaves the pre-command wait unbounded and clocks the cap only
+    once the command starts. A non-interactive entry omits it, so its argv
+    is unchanged from an unmarked guard wrap."""
     base = _run_argv(uv_path, crony_path, ref)
-    if timeout <= 0:
-        return base
     marker = ("--interactive",) if interactive else ()
     return (
         str(uv_path),
@@ -508,9 +510,8 @@ class _JobCommon:
 
     @property
     def _guard_timeout(self) -> int:
-        """The wallclock cap the timeout guard wraps the unit's run in
-        (0 = no guard). The entry's `timeout`; an uncapped entry (0) runs
-        unguarded."""
+        """The wallclock cap the guard wrapping the unit's run enforces
+        (0 = no cap). The entry's `timeout`."""
         return self.timeout
 
     @property

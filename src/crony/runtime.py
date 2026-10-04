@@ -51,8 +51,9 @@ RUNNING_REF_ENV = "CRONY_RUNNING_REF"
 # runner can signal the guard SIGUSR1 the instant it starts the command
 # (an interactive run's guard arms its wallclock cap on that signal,
 # excluding the approval wait from the cap; any other run is armed at
-# launch and the signal changes nothing). Absent when a run has no guard
-# (an uncapped entry), in which case the runner arms nothing.
+# launch, or has no cap to arm, and the signal changes nothing). Absent
+# when the runner was started without a guard, in which case it arms
+# nothing.
 GUARD_PID_ENV = "CRONY_GUARD_PID"
 
 

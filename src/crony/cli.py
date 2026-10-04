@@ -683,11 +683,13 @@ def _build_parser() -> StrictArgumentParser:
             help="Entity address `<bundle>:<uuid>` (internal-only form).",
         )
 
-    # _run-guard -- internal wallclock-timeout enforcer wrapping `_run`;
-    # rendered into the platform unit by apply, never invoked by hand.
-    # Hidden from `crony --help` for the same reason as `_run` (no
-    # `help=`). Takes the cap then the full inner command via REMAINDER
-    # so the inner `--script` / flags aren't parsed as guard options.
+    # _run-guard -- internal wrapper around every unit's `_run`, which
+    # stops the run when the scheduler stops the unit and enforces its
+    # wallclock timeout where it has one; rendered into the platform unit
+    # by apply, never invoked by hand. Hidden from `crony --help` for the
+    # same reason as `_run` (no `help=`). Takes the cap then the full
+    # inner command via REMAINDER so the inner `--script` / flags aren't
+    # parsed as guard options.
     p_guard = subparsers.add_parser(crony.model.GUARD_SUBCOMMAND)
     p_guard.add_argument(
         "cap",
@@ -697,7 +699,7 @@ def _build_parser() -> StrictArgumentParser:
     p_guard.add_argument(
         "argv",
         nargs=argparse.REMAINDER,
-        help="The `crony _run` command to run under the cap.",
+        help="The `crony _run` command to run under the guard.",
     )
 
     # _jitter -- internal launchd start-time jitter companion; baked into

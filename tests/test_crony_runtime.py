@@ -1228,19 +1228,31 @@ class TestExecPathStrings:
 
 
 class TestGuardedArgv:
-    """`model._guarded_argv` wraps the base run in the timeout guard for a
-    capped entry; an interactive entry carries a leading `--interactive`
-    marker, a non-interactive one does not. The invocation prefix recovers
-    uv / crony from any guarded shape just as it does from the bare one."""
+    """`model._guarded_argv` wraps the base run in the guard for every
+    entry, with the entry's timeout as the cap -- 0 for an uncapped one;
+    an interactive entry carries a leading `--interactive` marker, a
+    non-interactive one does not. The invocation prefix recovers uv /
+    crony from any guarded shape just as it does from the bare one."""
 
     _UV = Path("/abs/uv")
     _CRONY = Path("/abs/crony")
     _REF = EntityRef("default", "u-test")
 
-    def test_uncapped_is_bare_run(self) -> None:
-        assert crony_model._guarded_argv(
+    def test_uncapped_wraps_with_a_zero_cap(self) -> None:
+        # Nothing to time out, but the run still has to be stoppable, so
+        # it is wrapped with the no-cap value rather than left bare.
+        argv = crony_model._guarded_argv(
             self._UV, self._CRONY, self._REF, 0, False
-        ) == crony_model._run_argv(self._UV, self._CRONY, self._REF)
+        )
+        assert argv == (
+            "/abs/uv",
+            "run",
+            "--script",
+            "/abs/crony",
+            crony_model.GUARD_SUBCOMMAND,
+            "0",
+            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+        )
 
     def test_capped_wraps_with_timeout_as_cap(self) -> None:
         argv = crony_model._guarded_argv(
@@ -1271,11 +1283,22 @@ class TestGuardedArgv:
             *crony_model._run_argv(self._UV, self._CRONY, self._REF),
         )
 
-    def test_uncapped_interactive_is_still_bare_run(self) -> None:
-        # No cap means no guard at all, so the marker never appears.
-        assert crony_model._guarded_argv(
+    def test_uncapped_interactive_carries_marker(self) -> None:
+        # The marker describes the entry, not its cap, so an uncapped
+        # interactive entry renders it like a capped one.
+        argv = crony_model._guarded_argv(
             self._UV, self._CRONY, self._REF, 0, True
-        ) == crony_model._run_argv(self._UV, self._CRONY, self._REF)
+        )
+        assert argv == (
+            "/abs/uv",
+            "run",
+            "--script",
+            "/abs/crony",
+            crony_model.GUARD_SUBCOMMAND,
+            "0",
+            "--interactive",
+            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+        )
 
     def test_paths_recover_from_guarded_shape(self) -> None:
         argv = crony_model._guarded_argv(

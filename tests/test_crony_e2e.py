@@ -757,9 +757,11 @@ class TestDaemonSupervision:
 
     Most tests assert on scheduler-observable state (the respawn counter,
     unit registration) rather than on the job's command running. crony
-    bakes no CRONY_* overrides into a production unit, so the retry-limit
-    test rewrites its isolated test unit with those values, reloads it,
-    and can then observe the runner's persistent state and status safely.
+    bakes no CRONY_* overrides into a production unit, so the tests that
+    need the command to really run -- the retry-limit test, and the ones
+    that stop a command which ignores the stop -- rewrite their isolated
+    test unit with those values and reload it, and can then observe the
+    runner's persistent state and status safely.
     """
 
     def _apply_daemon(self, e2e: _CronyE2E) -> None:
@@ -815,6 +817,56 @@ class TestDaemonSupervision:
             lambda: bool(self._start_marker(e2e)), timeout=60, what=what
         )
         return self._start_marker(e2e)
+
+    def _wait_restarted(self, e2e: _CronyE2E, before: str, what: str) -> None:
+        """Block until the unit has been started again since `before` was
+        read off it.
+
+        Reloading a launchd unit registers it afresh and its launch count
+        starts over, so there any count at all is a start since the
+        reload. systemd keeps the old start's timestamp until the next
+        one, so there the marker has to move off it."""
+        stale = ("",) if _IS_DARWIN else ("", before)
+        e2e.wait_until(
+            lambda: self._start_marker(e2e) not in stale,
+            timeout=60,
+            what=what,
+        )
+
+    # The marker the stubborn daemon's command carries, there to be edited:
+    # changing it changes the entry's config without changing what it does.
+    _STUBBORN_REVISION = ": first"
+
+    def _start_stubborn_daemon(self, e2e: _CronyE2E) -> int:
+        """Start a daemon whose command ignores the stop it is sent, and
+        return that command's pid once it is running.
+
+        Ignoring the stop is the worst case for stopping a daemon: nothing
+        short of a SIGKILL ends it, so it is still there afterwards unless
+        something escalates. The command gives up on its own after two
+        minutes, so a stop that fails cannot leave it running for good.
+        """
+        pidfile = e2e.state_dir.parent / "stubborn.pid"
+        command = (
+            f'trap "" TERM; echo $$ > {shlex.quote(str(pidfile))}; '
+            f"{self._STUBBORN_REVISION}; "
+            "i=0; while [ $i -lt 600 ]; do sleep 0.2; i=$((i + 1)); done"
+        )
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
+        e2e.write_bundle(
+            f"[job.d]\ncommand = {json.dumps(command)}\ndaemon = true\n",
+            ["d"],
+        )
+        e2e.crony("apply", e2e.full("d"))
+        e2e.inject_isolated_env("d", restart=True)
+
+        def published() -> bool:
+            return _read_text(pidfile).strip().isdigit()
+
+        e2e.wait_until(
+            published, timeout=60, what="the daemon's command to start"
+        )
+        return int(_read_text(pidfile))
 
     def test_starts_itself_without_a_trigger(self, e2e: _CronyE2E) -> None:
         # No timer and nothing kickstarts it: applying a daemon is what
@@ -932,6 +984,57 @@ class TestDaemonSupervision:
             what="the destroyed daemon to stop",
         )
 
+    def test_disable_stops_a_command_that_ignores_the_stop(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # Taking the unit away is not enough to stop a daemon: the stop
+        # has to reach its command, and be escalated when the command
+        # ignores it. A disabled daemon that is merely unsupervised keeps
+        # running and keeps its run lock, and status reads `running`.
+        pid = self._start_stubborn_daemon(e2e)
+        e2e.crony("disable", e2e.full("d"))
+        e2e.wait_until(
+            lambda: not _pid_alive(pid),
+            timeout=30,
+            what="the disabled daemon's command to be killed",
+        )
+        assert e2e.status_status(e2e.full("d")) == "disabled"
+
+    def test_reapply_stops_the_old_command_before_starting_the_new(
+        self, e2e: _CronyE2E
+    ) -> None:
+        # Applying a changed daemon reloads it. The old instance has to be
+        # gone by the time the new one starts: a new instance that finds
+        # the run lock still held gives way to its holder and exits, so
+        # the daemon is left down once the old one is finally killed.
+        pid = self._start_stubborn_daemon(e2e)
+        bundle = e2e.dropin_dir / f"{E2E_BUNDLE}.toml"
+        edited = bundle.read_text().replace(self._STUBBORN_REVISION, ": second")
+        assert edited != bundle.read_text()
+        bundle.write_text(edited)
+        before = self._start_marker(e2e)
+        e2e.crony("apply", e2e.full("d"))
+        # No waiting for the kill here: apply returning is the claim that
+        # the old instance is gone, with only the reaping left to settle.
+        e2e.wait_until(
+            lambda: not _pid_alive(pid),
+            timeout=2,
+            what="the old command to be gone once apply returned",
+        )
+        self._wait_restarted(e2e, before, "the reloaded daemon to start")
+
+    def test_destroy_stops_a_command_that_ignores_the_stop(
+        self, e2e: _CronyE2E
+    ) -> None:
+        pid = self._start_stubborn_daemon(e2e)
+        e2e.crony("destroy", e2e.full("d"))
+        e2e.wait_until(
+            lambda: not _pid_alive(pid),
+            timeout=30,
+            what="the destroyed daemon's command to be killed",
+        )
+        assert e2e.status_config(e2e.full("d")) in (None, "missing")
+
 
 _CAPS = pytest.mark.parametrize("timeout", [60, 0], ids=["capped", "uncapped"])
 
@@ -943,10 +1046,9 @@ class TestStopBeforeCommand:
 
     The gate stands in for every pre-command wait -- an interactive job's
     idle detection and approval dialog cannot be driven here; the unit
-    tests cover that loop. Each case runs capped, where the guard relays
-    the stop into the run's session, and uncapped, where no guard stands
-    between the scheduler and uv and the runner -- which is what shows
-    uv letting the runner finish its record before the unit is reaped.
+    tests cover that loop. Each case runs capped and uncapped: the guard
+    relays the stop into the run's session either way, and having no
+    timeout to enforce must not change how a run is stopped.
 
     The runner the scheduler spawns has to record into this test's
     throwaway state tree, so the unit is rewritten to carry the CRONY_*
@@ -1009,7 +1111,7 @@ class TestStopBeforeCommand:
     def test_service_stop_during_gate_reads_canceled(
         self, e2e: _CronyE2E, timeout: int
     ) -> None:
-        # systemd signals the service's whole cgroup at once: uv, any
+        # systemd signals the service's whole cgroup at once: uv, the
         # guard, the runner, and the gate alike.
         sd = self._start_gated_run(e2e, timeout)
         e2e.systemctl_user(
@@ -1019,11 +1121,11 @@ class TestStopBeforeCommand:
 
 
 class TestStopOutlivedByTheRun:
-    """A capped run that outlives a scheduler stop and exits on its own --
-    here a command that traps the stop and exits 0 -- reads `ok`, never
+    """A run that outlives a scheduler stop and exits on its own -- here a
+    command that traps the stop and exits 0 -- reads `ok`, never
     `crashed`. The scheduler records the guard's exit as the launch's, so
     the guard has to report the exit the run itself recorded rather than
-    the stop.
+    the stop, with a cap to enforce or without one.
 
     The stop has to leave the scheduler's record of the exit in place:
     `launchctl kill` on launchd (a bootout would clear it) and `systemctl
@@ -1031,15 +1133,16 @@ class TestStopOutlivedByTheRun:
     CRONY_* overrides so the run records into this test's state tree.
     """
 
-    def test_trapped_stop_reads_ok(self, e2e: _CronyE2E) -> None:
+    # The cap is well clear of the waits below, so a stop that fails to
+    # land fails there rather than racing the cap into a timeout.
+    @pytest.mark.parametrize("timeout", [300, 0], ids=["capped", "uncapped"])
+    def test_trapped_stop_reads_ok(self, e2e: _CronyE2E, timeout: int) -> None:
         e2e.write_bundle(
             "[job.probe]\n"
             'command = \'trap "exit 0" TERM; echo started; '
             "while :; do sleep 0.2; done'\n"
             'schedule = "*-*-* 03:00"\n'
-            # Well clear of the waits below, so a stop that fails to land
-            # fails there rather than racing the cap into a timeout.
-            "job-timeout-sec = 300\n",
+            f"job-timeout-sec = {timeout}\n",
             ["probe"],
         )
         e2e.crony("apply", e2e.full("probe"))
@@ -1083,11 +1186,11 @@ class TestLeftoversOfAFinishedRun:
     """What a run leaves behind in its session does not outlive it.
 
     A command that backgrounds a child and exits is finished as far as its
-    runner can tell, and records `ok`, but the child is still there.
-    Something has to end it when the run ends, with a guard in the way of
-    the scheduler's own cleanup or without one. The unit carries the
-    CRONY_* overrides, as in `TestStopBeforeCommand`, so the command
-    really runs.
+    runner can tell, and records `ok`, but the child is still there. The
+    run's guard stands between it and the scheduler's own cleanup, so the
+    guard has to end it when the run ends, with a cap to enforce or
+    without one. The unit carries the CRONY_* overrides, as in
+    `TestStopBeforeCommand`, so the command really runs.
     """
 
     @_CAPS

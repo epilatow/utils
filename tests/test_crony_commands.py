@@ -446,9 +446,10 @@ class TestApplyLinux:
 
 
 class TestApplyTimeoutGuard:
-    """Apply renders the timeout guard into the unit's run command for a
-    capped entry, with cap = the entry timeout, and renders a bare run
-    for an uncapped one. Same on both platforms.
+    """Apply renders the guard into every unit's run command, with cap =
+    the entry timeout -- which for an uncapped entry is the no-cap 0, so
+    it is stopped like any other without being timed out. Same on both
+    platforms.
     """
 
     _GUARD = crony_model.GUARD_SUBCOMMAND
@@ -473,10 +474,18 @@ class TestApplyTimeoutGuard:
         plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
         assert f"{self._GUARD} {300} " in plist
 
-    def test_darwin_uncapped_job_renders_bare_run(
-        self, tmp_path: Path, monkeypatch: Any
+    @staticmethod
+    def _unit_text(h: _ApplyHarness, platform: str) -> str:
+        """The installed unit that carries `j`'s run command."""
+        if platform == "darwin":
+            return (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
+        return (h.sysd / f"crony-{h.full('j')}.service").read_text()
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_uncapped_job_renders_guard_with_no_cap(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         h.config(
             {
                 "job": {
@@ -490,8 +499,21 @@ class TestApplyTimeoutGuard:
             default_target_jobs=["j"],
         )
         h.apply("j")
-        plist = (h.agents / f"org.crony.{h.full('j')}.plist").read_text()
-        assert self._GUARD not in plist
+        assert f"{self._GUARD} 0 " in self._unit_text(h, platform)
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_daemon_renders_guard_with_no_cap(
+        self, tmp_path: Path, monkeypatch: Any, platform: str
+    ) -> None:
+        # A daemon is uncapped by definition and runs until it is stopped,
+        # so the guard is the only thing that ends it when its unit goes.
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        h.config(
+            {"job": {"j": {"command": "true", "daemon": True}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        assert f"{self._GUARD} 0 " in self._unit_text(h, platform)
 
     def test_linux_capped_job_renders_guard(
         self, tmp_path: Path, monkeypatch: Any
