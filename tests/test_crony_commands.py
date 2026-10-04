@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from enum import Enum, auto
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2156,39 +2157,69 @@ class TestCronyExecutable:
         assert crony_runtime._crony_executable() == REPO_ROOT / "bin" / "crony"
 
 
+class _UvSource(Enum):
+    """How an apply comes by its uv: named by `$UV` with none on PATH,
+    found on PATH with no `$UV`, or found on PATH while `$UV` names the
+    binary that PATH entry resolves to -- what uv exports on Linux."""
+
+    ENV = auto()
+    PATH = auto()
+    PATH_WITH_RESOLVED_ENV = auto()
+
+
 class TestUvExecutable:
     """`_uv_executable` locates the uv binary baked into platform units.
 
-    crony always runs under uv, which exports its own absolute path as
-    `$UV`, so that is the authoritative source independent of PATH; a
-    PATH lookup is the fallback for the rare run outside uv.
+    The uv on PATH is the one baked, under the name PATH gives it, since
+    that is the name that survives an upgrade. `$UV`, which uv exports to
+    whatever it launches, answers only when PATH has no uv: it names the
+    running binary, but not always by a name that lasts.
     """
 
-    def test_prefers_env_uv(self, tmp_path: Path, monkeypatch: Any) -> None:
-        uv = tmp_path / "real-uv"
-        uv.write_text("")
-        monkeypatch.setenv("UV", str(uv))
-        # PATH would answer differently; $UV must win.
-        monkeypatch.setattr(
-            crony_runtime.shutil, "which", lambda _name: "/usr/bin/uv"
-        )
-        assert crony_runtime._uv_executable() == uv.absolute()
-
-    def test_falls_back_to_path_when_env_uv_missing_file(
-        self, tmp_path: Path, monkeypatch: Any
+    def test_prefers_path_uv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # $UV set but pointing at a path that no longer exists (uv moved):
-        # fall back to the PATH lookup rather than baking a dead path.
-        monkeypatch.setenv("UV", str(tmp_path / "gone" / "uv"))
+        env_uv = tmp_path / "env-uv"
+        env_uv.write_text("")
         path_uv = tmp_path / "path-uv"
         path_uv.write_text("")
+        monkeypatch.setenv("UV", str(env_uv))
+        # $UV would answer differently; PATH must win.
         monkeypatch.setattr(
             crony_runtime.shutil, "which", lambda _name: str(path_uv)
         )
         assert crony_runtime._uv_executable() == path_uv.absolute()
 
-    def test_falls_back_to_path_when_env_uv_unset(
-        self, tmp_path: Path, monkeypatch: Any
+    def test_path_symlink_survives_uv_reporting_its_resolved_binary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # What uv does on Linux: started through a symlink, it exports
+        # the binary the symlink resolves to. The symlink is the name to
+        # bake, and it is still on PATH to be found.
+        binary = tmp_path / "versioned" / "uv"
+        binary.parent.mkdir()
+        binary.write_text("")
+        binary.chmod(0o755)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "uv").symlink_to(binary)
+        monkeypatch.setenv("UV", str(binary))
+        monkeypatch.setenv("PATH", str(bin_dir))
+        assert crony_runtime._uv_executable() == bin_dir / "uv"
+
+    def test_falls_back_to_env_uv_when_path_has_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A run whose PATH has no uv -- a unit's own minimal PATH, say --
+        # still knows which uv launched it.
+        uv = tmp_path / "real-uv"
+        uv.write_text("")
+        monkeypatch.setenv("UV", str(uv))
+        monkeypatch.setattr(crony_runtime.shutil, "which", lambda _name: None)
+        assert crony_runtime._uv_executable() == uv.absolute()
+
+    def test_uses_path_uv_when_env_uv_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("UV", raising=False)
         path_uv = tmp_path / "path-uv"
@@ -2200,9 +2231,14 @@ class TestUvExecutable:
 
     @pytest.mark.parametrize("platform", ["darwin", "linux"])
     @pytest.mark.parametrize(
-        ("from_env", "uv_name"),
-        [(True, "uv"), (True, "uv-stable"), (False, "uv")],
-        ids=["UV", "UV-alias", "PATH"],
+        ("source", "uv_name"),
+        [
+            (_UvSource.ENV, "uv"),
+            (_UvSource.ENV, "uv-stable"),
+            (_UvSource.PATH, "uv"),
+            (_UvSource.PATH_WITH_RESOLVED_ENV, "uv"),
+        ],
+        ids=["UV", "UV-alias", "PATH", "PATH-over-resolved-UV"],
     )
     @pytest.mark.parametrize(
         "relative", [False, True], ids=["absolute", "relative"]
@@ -2215,7 +2251,7 @@ class TestUvExecutable:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         platform: str,
-        from_env: bool,
+        source: _UvSource,
         uv_name: str,
         relative: bool,
         existing: bool,
@@ -2242,12 +2278,15 @@ class TestUvExecutable:
         monkeypatch.chdir(tmp_path)
         lookup_dir = Path("bin") if relative else bin_dir
         monkeypatch.setattr(sys, "argv", [str(lookup_dir / crony_name)])
-        if from_env:
+        if source is _UvSource.ENV:
             monkeypatch.setenv("UV", str(lookup_dir / uv_name))
             monkeypatch.setenv("PATH", "")
         else:
-            monkeypatch.delenv("UV", raising=False)
             monkeypatch.setenv("PATH", str(lookup_dir))
+            if source is _UvSource.PATH_WITH_RESOLVED_ENV:
+                monkeypatch.setenv("UV", str(old_uv))
+            else:
+                monkeypatch.delenv("UV", raising=False)
         h.config(
             {
                 "job": {"j": {"command": "true"}},
@@ -2304,8 +2343,19 @@ class TestUvExecutable:
             ref = config.current.by_full_name[h.full(short)]
             assert config.cfg_status(ref) == "synced"
 
-    def test_errors_when_uv_not_found(self, monkeypatch: Any) -> None:
-        monkeypatch.delenv("UV", raising=False)
+    @pytest.mark.parametrize("env_uv", [None, "gone/uv"], ids=["unset", "dead"])
+    def test_errors_when_uv_not_found(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        env_uv: str | None,
+    ) -> None:
+        # Nothing on PATH, and $UV either absent or naming a file that is
+        # no longer there: better an error than a dead path in a unit.
+        if env_uv is None:
+            monkeypatch.delenv("UV", raising=False)
+        else:
+            monkeypatch.setenv("UV", str(tmp_path / env_uv))
         monkeypatch.setattr(crony_runtime.shutil, "which", lambda _name: None)
         with pytest.raises(PreconditionError, match="uv not found"):
             crony_runtime._uv_executable()

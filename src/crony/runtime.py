@@ -1098,29 +1098,35 @@ def _uv_executable() -> Path:
     that omits $HOME/.local/bin and /opt/homebrew/bin, so the absolute
     path is written into the unit's argv to sidestep PATH at run time.
 
-    crony only ever runs under uv (its shebang is `uv run --script`), and
-    uv exports its own absolute path as `$UV` to every process it
-    launches -- so that is the authoritative source, independent of PATH.
-    Falls back to a PATH lookup for the rare invocation outside uv (a
-    direct `python bin/crony`), and errors only when neither answers,
-    since a misconfigured environment shouldn't silently render a unit
-    that fails at run time.
+    The `uv` on PATH is the one to bake. It is the name the operator's
+    environment resolves, which is the name a package manager keeps
+    pointed at the current install -- typically a symlink that outlives
+    an upgrade. The path is made absolute without resolving it, so that
+    stable name is what lands in the unit. Whatever PATH names has to run
+    from the scheduler's bare environment too: a launcher that leans on
+    the operator's shell setup is baked as found and fails there.
 
-    Preserve symlinks in the absolute path so package managers can
-    retarget them during upgrades without invalidating installed units.
+    `$UV`, which uv exports to every process it launches, is the fallback
+    for a run whose PATH has no uv. It is not the first choice because it
+    does not reliably carry that stable name: on Linux uv reports its
+    fully resolved binary, the versioned path an upgrade removes. So an
+    apply made with no uv on PATH still bakes that path there, and
+    disagrees with one made with uv on PATH. Errors only when neither
+    answers, since a misconfigured environment shouldn't silently render
+    a unit that fails at run time.
     """
+    path = shutil.which("uv")
+    if path is not None:
+        return Path(path).absolute()
     env_uv = os.environ.get("UV")
     if env_uv and Path(env_uv).is_file():
         return Path(env_uv).absolute()
-    path = shutil.which("uv")
-    if path is None:
-        raise crony.errors.PreconditionError(
-            "uv not found via $UV or PATH; install it "
-            "(https://docs.astral.sh/uv/) before running `crony apply`. "
-            "Platform units bake uv's absolute path so the scheduler "
-            "doesn't have to find it on its minimal PATH."
-        )
-    return Path(path).absolute()
+    raise crony.errors.PreconditionError(
+        "uv not found on PATH or via $UV; install it "
+        "(https://docs.astral.sh/uv/) before running `crony apply`. "
+        "Platform units bake uv's absolute path so the scheduler "
+        "doesn't have to find it on its minimal PATH."
+    )
 
 
 def _write_apply_state(
