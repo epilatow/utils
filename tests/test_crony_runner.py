@@ -4232,6 +4232,67 @@ class TestDoRunGuard:
     def test_propagates_nonzero_exit(self) -> None:
         assert _run_guard_in_child(10, ["/bin/sh", "-c", "exit 7"]) == 7
 
+    @_GUARD_CAPS
+    def test_sweeps_what_a_finished_run_left_behind(
+        self, tmp_path: Path, cap: int
+    ) -> None:
+        # The run exits on its own, leaving a background child in its
+        # session. Nothing else will ever signal that child -- the
+        # scheduler tracks the guard, not the session -- so the guard ends
+        # it, and still reports the exit the run itself made.
+        pidfile = tmp_path / "leftover.pid"
+        argv = ["/bin/sh", "-c", f"sleep 30 & echo $! > {pidfile}; exit 3"]
+        start = time.monotonic()
+        assert _run_guard_in_child(cap, argv) == 3
+        # The child died on the sweep's SIGTERM: had it only been waited
+        # on and then SIGKILLed, the guard would have sat out the grace.
+        assert time.monotonic() - start < crony_runner._KILL_GRACE_SEC
+        leftover = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(leftover, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"leftover {leftover} outlived the finished run")
+
+    @_GUARD_CAPS
+    def test_sweep_sigkills_a_leftover_that_ignores_it(
+        self, tmp_path: Path, monkeypatch: Any, cap: int
+    ) -> None:
+        # A leftover that ignores the sweep's SIGTERM is SIGKILLed after
+        # the grace, like anything else that outlives one of the guard's
+        # signals.
+        monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        pidfile = tmp_path / "stubborn.pid"
+        argv = [
+            "/bin/sh",
+            "-c",
+            (
+                f"sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & "
+                f"echo $! > {pidfile}; exit 3"
+            ),
+        ]
+        assert _run_guard_in_child(cap, argv) == 3
+        leftover = int(pidfile.read_text().strip())
+        for _ in range(50):
+            try:
+                os.kill(leftover, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"stubborn leftover {leftover} survived the sweep")
+
+    @_GUARD_CAPS
+    def test_clean_exit_is_not_held_for_the_grace(self, cap: int) -> None:
+        # With nothing left behind there is nothing to sweep, and the
+        # guard exits as soon as the run does.
+        start = time.monotonic()
+        assert _run_guard_in_child(cap, ["/bin/sh", "-c", "exit 0"]) == 0
+        assert time.monotonic() - start < crony_runner._KILL_GRACE_SEC
+
     def test_zero_cap_never_times_out(self) -> None:
         # No cap means no deadline at all, not one of zero seconds: the
         # run is left to finish and its own exit propagates.

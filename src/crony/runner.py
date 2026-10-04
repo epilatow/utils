@@ -1910,10 +1910,11 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
 
 
 # The grace the guard waits after signalling a session before it SIGKILLs
-# whatever survives -- the SIGTERM of a timeout kill, or the stop signal
-# relayed on a scheduler stop of a running unit (a system shutdown, a manual
-# stop, or crony's own `launchctl bootout` from apply-reload / disable /
-# destroy). The guard has to do this SIGKILL itself: the run lives in the
+# whatever survives -- the SIGTERM of a timeout kill, the SIGTERM that
+# sweeps what a finished run left behind, or the stop signal relayed on a
+# scheduler stop of a running unit (a system shutdown, a manual stop, or
+# crony's own `launchctl bootout` from apply-reload / disable / destroy).
+# The guard has to do this SIGKILL itself: the run lives in the
 # guard's own session (start_new_session), which the scheduler does not
 # track -- it tracks the guard -- so nothing else reaps a session whose
 # command ignores the signal (and the runner outlives stop signals by
@@ -2126,11 +2127,16 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
       same signal to the session, then the same grace -> SIGKILL. No
       hint, so the runner records a stop: `canceled` when its command had
       not started yet, else the command's plain signal death; no flag.
+    - when the run ends on its own: SIGTERM whatever it left behind in the
+      session -- a background child its command started, say -- then the
+      same grace -> SIGKILL, so nothing of a finished run outlives the
+      guard. The scheduler cannot do this itself: it tracks the guard, and
+      the session is not the guard's.
 
-    Either way the guard then exits with the run's own exit code when the
-    run recorded an outcome, and with the timeout code or 128 + the stop
-    signal when it recorded none (`_killed_run_exit`). A run that meets
-    neither a timeout nor a stop passes its code straight through.
+    After a timeout or a stop the guard exits with the run's own exit code
+    when the run recorded an outcome, and with the timeout code or 128 +
+    the stop signal when it recorded none (`_killed_run_exit`). A run that
+    meets neither passes its code straight through, swept or not.
 
     Because the runner survives the SIGTERM to record and then exits, its
     exit is the signal that the session is dead; the guard waits on the
@@ -2238,6 +2244,16 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
                     128 + stop_signum,
                     recorded=_run_recorded(sd, launch_pid),
                 )
+            )
+        if _group_alive(pgid):
+            # The run ended on its own and left something in its session.
+            # A stop landing during this sweep is relayed by the handler
+            # and changes nothing else: the run's outcome is already the
+            # code it exited with.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGTERM)
+            _reap_session(
+                proc, pgid, sd, timed_out=False, launch_pid=launch_pid
             )
         raise SystemExit(rc if rc >= 0 else 128 - rc)
 

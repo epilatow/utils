@@ -1079,6 +1079,43 @@ class TestStopOutlivedByTheRun:
         assert rec["process_exit"] == 0
 
 
+class TestLeftoversOfAFinishedRun:
+    """What a run leaves behind in its session does not outlive it.
+
+    A command that backgrounds a child and exits is finished as far as its
+    runner can tell, and records `ok`, but the child is still there.
+    Something has to end it when the run ends, with a guard in the way of
+    the scheduler's own cleanup or without one. The unit carries the
+    CRONY_* overrides, as in `TestStopBeforeCommand`, so the command
+    really runs.
+    """
+
+    @_CAPS
+    def test_background_child_is_gone_once_the_run_ends(
+        self, e2e: _CronyE2E, timeout: int
+    ) -> None:
+        pidfile = e2e.state_dir.parent / "leftover.pid"
+        # The child gives up on its own after two minutes, so a cleanup
+        # that fails cannot leave it running for good.
+        command = f"sleep 120 & echo $! > {shlex.quote(str(pidfile))}"
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\n"
+            'schedule = "*-*-* 03:00"\n'
+            f"job-timeout-sec = {timeout}\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=False)
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
+        pid = int(pidfile.read_text())
+        e2e.wait_until(
+            lambda: not _pid_alive(pid),
+            timeout=30,
+            what="the finished run's background child to be ended",
+        )
+
+
 class TestTimeoutBeforeCommand:
     """A capped run that uses up its cap before its command starts -- here
     in a gate that outlasts it -- reads `timeout`, never `crashed`: the
@@ -1133,6 +1170,20 @@ def _read_text(path: Path) -> str:
         return path.read_text()
     except FileNotFoundError:
         return ""
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether `pid` still names a process, one that has exited but not
+    yet been reaped included.
+
+    A copy of the runner's own check rather than an import of it: the
+    runner module would bring its dependencies into this script's PEP 723
+    set, which holds only what driving the CLI needs."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 if __name__ == "__main__":
