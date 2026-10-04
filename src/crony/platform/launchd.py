@@ -42,6 +42,14 @@ from crony.unit import (
 # companion.
 _JITTER_SUFFIX = ".jitter"
 
+# Seconds launchd waits after the SIGTERM of a stop before it SIGKILLs the
+# unit's process, pinned in every plist as `ExitTimeOut`. The key's default
+# is system-defined and too short to rely on: a unit's command needs the
+# whole of its own stop handling (`crony.runner._KILL_GRACE_SEC`) before
+# launchd gives up on it, or launchd kills it part-way through, drops the
+# label, and leaves whatever it had not yet stopped running untracked.
+_EXIT_TIMEOUT_SEC = 10
+
 
 def _label(name: str) -> str:
     """launchd Label for a job/group."""
@@ -123,6 +131,7 @@ def _render_plist(
         "RunAtLoad": False,
         "KeepAlive": False,
         "AbandonProcessGroup": False,
+        "ExitTimeOut": _EXIT_TIMEOUT_SEC,
     }
     contents.update(_priority_keys(priority))
     if daemon is not None and timing is not None:
@@ -208,7 +217,12 @@ def _is_loaded(lbl: str) -> bool:
 # reload boots out, waits for the label to disappear (bounded), then
 # bootstraps -- retrying the whole sequence a few times to absorb any
 # residual teardown lag before surfacing a genuine failure.
-_BOOTOUT_SETTLE_TIMEOUT_SEC = 5.0
+#
+# The label stays registered for as long as the stopping unit's process
+# is alive, which is up to the exit timeout for one that does not go
+# quietly. The wait outlasts that, so a reload never starts the new
+# instance while the old one is still running.
+_BOOTOUT_SETTLE_TIMEOUT_SEC = _EXIT_TIMEOUT_SEC + 5.0
 _BOOTOUT_POLL_INTERVAL_SEC = 0.02
 _BOOTSTRAP_ATTEMPTS = 3
 _BOOTSTRAP_BACKOFF_SEC = 0.1

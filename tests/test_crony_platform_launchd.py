@@ -165,6 +165,9 @@ class TestPlistRendering:
             d = plistlib.loads(plist.encode("utf-8"))
             assert d["Label"] == "org.crony.j"
             assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+            # launchd's own stop-to-kill default is system-defined, so
+            # every shape states the timeout it needs.
+            assert d["ExitTimeOut"] == launchd._EXIT_TIMEOUT_SEC
 
 
 class TestLaunchdPriority:
@@ -735,12 +738,16 @@ class TestLaunchdDaemon:
         # A daemon names no times, so it carries no schedule keys.
         assert "StartInterval" not in data
         assert "StartCalendarInterval" not in data
+        assert data["ExitTimeOut"] == launchd._EXIT_TIMEOUT_SEC
 
     def test_disabled_daemon_is_inert(self) -> None:
         data = self._plist(armed=False)
         assert data["RunAtLoad"] is False
         assert data["KeepAlive"] is False
         assert "ThrottleInterval" not in data
+        # Still stoppable on the same terms: a disabled daemon can be
+        # triggered by hand, and that run is stopped like any other.
+        assert data["ExitTimeOut"] == launchd._EXIT_TIMEOUT_SEC
 
 
 if __name__ == "__main__":

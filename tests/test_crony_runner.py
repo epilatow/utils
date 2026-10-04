@@ -75,6 +75,7 @@ from crony.model import (  # noqa: E402
 )
 from crony.platform import (  # noqa: E402
     PidWait,
+    launchd,
 )
 from crony.platform import fda as crony_fda  # noqa: E402
 from crony.platform.fda import FDAWrapper  # noqa: E402
@@ -4639,6 +4640,29 @@ class TestDoRunGuard:
         elapsed = time.monotonic() - start
         assert code == int(ExitCode.TIMEOUT)
         assert elapsed < 20
+
+
+class TestStopTimeouts:
+    """Every wait that follows a stop outlasts the guard's own teardown.
+
+    The guard gives a stopped run its kill grace, after whichever it may
+    sit out first: one poll before it notices the stop, or the hint settle
+    when the stop lands during a timeout kill. Anything waiting on that
+    stop -- launchd's own force-kill, a destroy waiting for the run's last
+    write -- has to be longer, or it acts while the run is still being
+    torn down. The waits live in modules the runner is built on, which
+    cannot import its grace, so nothing but this holds them in order."""
+
+    _GUARD_STOP_SEC = (
+        max(crony_runner._GUARD_POLL_SEC, crony_runner._TIMEOUT_HINT_SETTLE_SEC)
+        + crony_runner._KILL_GRACE_SEC
+    )
+
+    def test_launchd_exit_timeout_outlasts_the_guard(self) -> None:
+        assert self._GUARD_STOP_SEC < launchd._EXIT_TIMEOUT_SEC
+
+    def test_destroy_wait_outlasts_the_guard(self) -> None:
+        assert self._GUARD_STOP_SEC < crony_runtime._RUN_SETTLE_TIMEOUT_SEC
 
 
 class _FakeScheduler:

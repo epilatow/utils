@@ -1554,8 +1554,12 @@ def _link_alias(node: crony.model.Job | crony.model.JobGroup) -> None:
 
 
 # How long `destroy_one` waits for a stopped run to finish writing
-# before it removes the state dir out from under it.
-_RUN_SETTLE_TIMEOUT_SEC = 5.0
+# before it removes the state dir out from under it. Longer than the
+# guard takes to end a run that resists its stop
+# (`crony.runner._KILL_GRACE_SEC`), with room for the scheduler to
+# deliver that stop, so only a run that has outlived its own stop is
+# left behind.
+_RUN_SETTLE_TIMEOUT_SEC = 10.0
 _RUN_SETTLE_POLL_SEC = 0.05
 
 

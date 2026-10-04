@@ -9267,6 +9267,11 @@ class TestDaemonLifecycle:
         sd.mkdir(parents=True, exist_ok=True)
         unit = self._unit(h, platform)
         assert unit.exists()
+        # The lock is held by this test for the whole destroy, so nothing
+        # ever releases it: the wait for the run to finish would sit out
+        # its full bound. That wait has its own tests; here it is cut
+        # short.
+        monkeypatch.setattr(crony_runtime, "_RUN_SETTLE_TIMEOUT_SEC", 0.2)
         with crony_runtime.acquire_lock(sd / "run.lock"):
             crony_commands.do_destroy(jobs=["d"], bundle=None, orphans=False)
         assert not unit.exists()

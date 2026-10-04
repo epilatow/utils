@@ -1917,14 +1917,17 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
 # guard's own session (start_new_session), which the scheduler does not
 # track -- it tracks the guard -- so nothing else reaps a session whose
 # command ignores the signal (and the runner outlives stop signals by
-# design, exiting only once it has recorded the run). So this grace MUST
-# stay below the lowest scheduler stop-to-kill timeout, so the guard reaps
-# the session before the scheduler SIGKILLs the guard out from under it --
-# on launchd (process-group based) that kill hits the guard's group, not
-# the child's separate session, which would then orphan. launchd's
-# ExitTimeOut (20s default, which we do not override) is the binding bound;
-# systemd's TimeoutStopSec (90s) is looser.
-_KILL_GRACE_SEC = 10
+# design, exiting only once it has recorded the run). So this grace, plus
+# whatever the guard sits out before it starts counting -- a poll
+# (`_GUARD_POLL_SEC`), or the hint settle when the stop lands during a
+# timeout kill (`_TIMEOUT_HINT_SETTLE_SEC`) -- MUST stay below every
+# scheduler's stop-to-kill timeout. Past that the scheduler stops waiting
+# and treats the unit as gone while the guard is still tearing the run
+# down: launchd drops the label, so a reload starts the replacement
+# against a run that still holds its lock. The launchd backend pins its
+# units' stop timeout above this; systemd's default TimeoutStopSec (90s)
+# is looser still.
+_KILL_GRACE_SEC = 5
 # Pause after the SIGUSR1 timeout hint so the runner records it before the
 # SIGTERM that follows lands. Standard signals carry no delivery-ordering
 # guarantee (Linux signal(7): unspecified; macOS sigaction(2): only trap
