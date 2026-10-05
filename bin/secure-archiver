@@ -27,7 +27,8 @@ import textwrap
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -501,12 +502,18 @@ def run_cmd(
         )
     except subprocess.CalledProcessError as e:
         raise SubprocessError(e.returncode, e.cmd, e.output, e.stderr) from e
+    except OSError as e:
+        raise SecureArchiverError(
+            f"Cannot run {cmd[0]} (working directory {cwd or Path.cwd()}): {e}"
+        ) from e
 
 
 def ensure_tools() -> None:
     for tool in ("op", "7zz"):
         if shutil.which(tool) is None:
-            raise RuntimeError(f"Required tool not found in PATH: {tool}")
+            raise SecureArchiverError(
+                f"Required tool not found in PATH: {tool}"
+            )
 
 
 # Setting up the `op` client -- its connection to the 1Password app,
@@ -632,7 +639,7 @@ def op_read_refs(refs: Sequence[str]) -> dict[str, str]:
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
+    with filesystem_operation("read", path), path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -652,18 +659,18 @@ def find_config(explicit_path: Path | None = None) -> Path:
         ConfigError: If no config file found
     """
     if explicit_path:
-        if not explicit_path.exists():
+        if path_stat(explicit_path) is None:
             raise ConfigError(f"Config file not found: {explicit_path}")
         return explicit_path
 
     # Check current working directory
     cwd_config = Path.cwd() / DEFAULT_CONFIG_NAME
-    if cwd_config.exists():
+    if path_stat(cwd_config) is not None:
         return cwd_config
 
     # Check home directory dotfile
     dotfile_path = Path.home() / f".{DEFAULT_CONFIG_NAME}"
-    if dotfile_path.exists():
+    if path_stat(dotfile_path) is not None:
         return dotfile_path
 
     raise ConfigError(
@@ -688,10 +695,10 @@ def load_config(path: Path | None) -> Config:
         ConfigError: If config not found or validation fails.
     """
     config_path = find_config(path)
-    if not config_path.exists():
+    if path_stat(config_path) is None:
         raise ConfigError(f"Config file not found: {config_path}")
     try:
-        cfg_dict = tomllib.loads(config_path.read_text("utf-8"))
+        cfg_dict = tomllib.loads(read_text(config_path))
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"Invalid TOML in {config_path}: {e}") from e
     return Config.from_dict(cfg_dict, config_path)
@@ -705,8 +712,10 @@ def ensure_out_dir_usable(out_dir: Path) -> None:
     Reading it is as load-bearing as writing it: what gets published and
     what gets pruned are both decided from the revisions already there.
     """
-    require(out_dir.exists(), f"output_dir does not exist: {out_dir}")
-    require(out_dir.is_dir(), f"output_dir is not a directory: {out_dir}")
+    require(
+        path_stat(out_dir) is not None, f"output_dir does not exist: {out_dir}"
+    )
+    require(path_is_dir(out_dir), f"output_dir is not a directory: {out_dir}")
     require(
         os.access(out_dir, os.W_OK), f"output_dir is not writable: {out_dir}"
     )
@@ -727,6 +736,63 @@ def unreadable_error(path: Path | str, err: OSError) -> UnreadableError:
     return UnreadableError(
         f"Cannot read {path}: {err.strerror} (errno {err.errno})"
     )
+
+
+@contextmanager
+def filesystem_operation(action: str, *paths: Path) -> Iterator[None]:
+    """Report a failed operation with its paths even if errno omits them."""
+    try:
+        yield
+    except OSError as e:
+        targets = " -> ".join(str(path) for path in paths)
+        error_paths = [
+            str(name)
+            for name in (e.filename, e.filename2)
+            if name is not None
+            and str(name) not in {str(path) for path in paths}
+        ]
+        if error_paths:
+            targets += f" (OS path: {' -> '.join(error_paths)})"
+        reason = e.strerror or str(e)
+        raise SecureArchiverError(
+            f"Cannot {action} {targets}: {reason} (errno {e.errno})"
+        ) from e
+    except UnicodeError as e:
+        # Decode errors can quote secret bytes; identify only the file.
+        targets = " -> ".join(str(path) for path in paths)
+        raise SecureArchiverError(
+            f"Cannot {action} {targets}: invalid UTF-8 text"
+        ) from e
+
+
+def read_text(path: Path) -> str:
+    """Read UTF-8 text, reporting the path on I/O or encoding failure."""
+    with filesystem_operation("read", path):
+        return path.read_text(encoding="utf-8")
+
+
+def write_text(path: Path, content: str, *, private: bool = False) -> None:
+    """Write UTF-8 text, optionally restricting access to its owner."""
+    with filesystem_operation("write", path):
+        path.write_text(content, encoding="utf-8")
+    if private:
+        with filesystem_operation("set permissions on", path):
+            os.chmod(path, 0o600)
+
+
+@contextmanager
+def temporary_directory() -> Iterator[Path]:
+    """Create and clean up scratch space with path-aware I/O errors."""
+    with filesystem_operation(
+        "create temporary directory in", Path(tempfile.gettempdir())
+    ):
+        directory = tempfile.TemporaryDirectory()
+    path = Path(directory.name)
+    try:
+        yield path
+    finally:
+        with filesystem_operation("remove temporary directory", path):
+            directory.cleanup()
 
 
 def path_lstat(path: Path) -> os.stat_result | None:
@@ -1036,7 +1102,8 @@ def stage_flat_copy(
     # Create subdirectory if specified
     if target_dir:
         subdir = staging_dir / target_dir
-        subdir.mkdir(parents=True, exist_ok=True)
+        with filesystem_operation("create directory", subdir):
+            subdir.mkdir(parents=True, exist_ok=True)
     else:
         subdir = staging_dir
 
@@ -1054,8 +1121,10 @@ def stage_flat_copy(
         seen_names.add(rel_path)
 
         dst = subdir / name
-        shutil.copyfile(src, dst)
-        os.chmod(dst, 0o600)
+        with filesystem_operation("copy", src, dst):
+            shutil.copyfile(src, dst)
+        with filesystem_operation("set permissions on", dst):
+            os.chmod(dst, 0o600)
         staged.append(rel_path)
     return staged
 
@@ -1085,13 +1154,13 @@ def stage_op_ref(
     # Create subdirectory if specified
     if target_dir:
         subdir = staging_dir / target_dir
-        subdir.mkdir(parents=True, exist_ok=True)
+        with filesystem_operation("create directory", subdir):
+            subdir.mkdir(parents=True, exist_ok=True)
     else:
         subdir = staging_dir
 
     out = subdir / filename
-    out.write_text(content, encoding="utf-8")
-    os.chmod(out, 0o600)
+    write_text(out, content, private=True)
     return rel_path
 
 
@@ -1102,19 +1171,26 @@ def build_manifest(staging_dir: Path, names: Iterable[str]) -> dict[str, Any]:
         entries.append(
             {
                 "name": name,
-                "size": p.stat().st_size,
+                "size": file_size(p),
                 "sha256": sha256_file(p),
             }
         )
     return {"version": 1, "entries": entries}
 
 
+def file_size(path: Path) -> int:
+    """Read the size of a required file with path-aware I/O errors."""
+    with filesystem_operation("stat", path):
+        return path.stat().st_size
+
+
 def write_manifest(staging_dir: Path, manifest: dict[str, Any]) -> None:
     out = staging_dir / "manifest.json"
-    out.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    write_text(
+        out,
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        private=True,
     )
-    os.chmod(out, 0o600)
 
 
 def extract_manifest_from_archive(
@@ -1126,8 +1202,7 @@ def extract_manifest_from_archive(
     if path_lstat(archive_path) is None:
         return None
 
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
+    with temporary_directory() as td_path:
         cp = run_cmd(
             [
                 "7zz",
@@ -1141,15 +1216,20 @@ def extract_manifest_from_archive(
             check=False,
         )
         if cp.returncode != 0:
-            raise RuntimeError(
+            raise SecureArchiverError(
                 f"Failed to extract manifest from {archive_path}.\n"
                 f"7zz stderr:\n{cp.stderr.strip()}"
             )
 
         manifest_file = td_path / "manifest.json"
-        if not manifest_file.exists():
+        if path_stat(manifest_file) is None:
             return None
-        loaded = json.loads(manifest_file.read_text("utf-8"))
+        try:
+            loaded = json.loads(read_text(manifest_file))
+        except json.JSONDecodeError as e:
+            raise SecureArchiverError(
+                f"Invalid manifest in {archive_path} ({manifest_file}): {e}"
+            ) from e
         if isinstance(loaded, dict):
             return loaded
         return None
@@ -1162,8 +1242,7 @@ def make_archive_with_7zz(
     filenames: list[str],
 ) -> None:
     listfile = staging_dir / ".filelist.txt"
-    listfile.write_text("\n".join(filenames) + "\n", encoding="utf-8")
-    os.chmod(listfile, 0o600)
+    write_text(listfile, "\n".join(filenames) + "\n", private=True)
 
     cmd = [
         "7zz",
@@ -1178,8 +1257,8 @@ def make_archive_with_7zz(
     ]
     cp = run_cmd(cmd, cwd=staging_dir, check=False)
     if cp.returncode != 0:
-        raise RuntimeError(
-            f"Failed to create archive {out_archive.name}.\n"
+        raise SecureArchiverError(
+            f"Failed to create archive {out_archive}.\n"
             f"7zz stderr:\n{cp.stderr.strip()}"
         )
 
@@ -1230,11 +1309,13 @@ def prune_archives(out_dir: Path, archive_name: str, keep: int) -> None:
     if len(archives) <= keep:
         return
     for archive_path in archives[: len(archives) - keep]:
-        archive_path.unlink()
+        with filesystem_operation("remove", archive_path):
+            archive_path.unlink()
         # Also delete corresponding readme
         readme_path = archive_path.with_suffix(".txt")
-        if readme_path.exists():
-            readme_path.unlink()
+        if path_stat(readme_path) is not None:
+            with filesystem_operation("remove", readme_path):
+                readme_path.unlink()
 
 
 ARCHIVE_README_TEMPLATE = """\
@@ -1316,11 +1397,11 @@ def write_archive_readme(
 
     Creates {archive_name}.{timestamp}.txt alongside the .7z archive.
     Substitutes {archive_name}, {op_password_uri}, and {description}.
-    Raises RuntimeError if the file already exists (concurrent run).
+    Raises SecureArchiverError if the file already exists (concurrent run).
     """
     out_file = out_dir / f"{archive_name}.{timestamp}.txt"
-    if out_file.exists():
-        raise RuntimeError(
+    if path_stat(out_file) is not None:
+        raise SecureArchiverError(
             f"Readme already exists (concurrent run?): {out_file}"
         )
     if dry_run:
@@ -1329,7 +1410,7 @@ def write_archive_readme(
     content = generate_readme_content(
         archive_name, op_password_uri, description
     )
-    out_file.write_text(content, encoding="utf-8")
+    write_text(out_file, content)
 
 
 def write_output_readme(
@@ -1357,21 +1438,21 @@ def write_output_readme(
     eprint("=== README.txt ===")
 
     # Check if content has changed
-    if readme_path.exists():
-        existing = readme_path.read_text(encoding="utf-8")
+    is_update = path_stat(readme_path) is not None
+    if is_update:
+        existing = read_text(readme_path)
         if existing == content:
             eprint("[README.txt] No changes detected; not updating.")
             return False
 
     if dry_run:
-        if readme_path.exists():
+        if is_update:
             eprint("[README.txt] DRY RUN: would update README.txt")
         else:
             eprint("[README.txt] DRY RUN: would create README.txt")
         return True
 
-    is_update = readme_path.exists()
-    readme_path.write_text(content, encoding="utf-8")
+    write_text(readme_path, content)
     if is_update:
         eprint("[README.txt] Updated README.txt")
     else:
@@ -1554,7 +1635,8 @@ def publish(
     from a single run share the same timestamp.
 
     Returns True if published, False if skipped due to no changes.
-    Raises RuntimeError if files already exist (concurrent run detection).
+    Raises SecureArchiverError if files already exist (concurrent run
+    detection).
     """
     manifest = build_manifest(staging_dir, staged_names)
     write_manifest(staging_dir, manifest)
@@ -1576,8 +1658,8 @@ def publish(
     readme_changed = False
     if latest_archive:
         latest_readme = latest_archive.with_suffix(".txt")
-        if latest_readme.exists():
-            existing_readme = latest_readme.read_text(encoding="utf-8")
+        if path_stat(latest_readme) is not None:
+            existing_readme = read_text(latest_readme)
             readme_changed = existing_readme != new_readme_content
         else:
             # Readme missing but should exist - treat as changed
@@ -1603,14 +1685,14 @@ def publish(
         change_reason = "+".join(parts) + " changed"
 
     # Check for concurrent run (same timestamp)
-    if new_archive.exists():
-        raise RuntimeError(
+    if path_stat(new_archive) is not None:
+        raise SecureArchiverError(
             f"Archive already exists (concurrent run?): {new_archive}"
         )
 
     if dry_run:
-        with tempfile.TemporaryDirectory() as td:
-            tmp_out = Path(td) / f"{archive_name}.{timestamp}.7z"
+        with temporary_directory() as td:
+            tmp_out = td / f"{archive_name}.{timestamp}.7z"
             make_archive_with_7zz(
                 staging_dir, tmp_out, password=password, filenames=all_files
             )
@@ -1630,13 +1712,14 @@ def publish(
 
     # Create archive with timestamp in filename
     tmp_archive = out_dir / f".{archive_name}.{timestamp}.new.7z"
-    if tmp_archive.exists():
-        raise RuntimeError(f"Temp archive already exists: {tmp_archive}")
+    if path_stat(tmp_archive) is not None:
+        raise SecureArchiverError(f"Temp archive already exists: {tmp_archive}")
 
     make_archive_with_7zz(
         staging_dir, tmp_archive, password=password, filenames=all_files
     )
-    tmp_archive.rename(new_archive)
+    with filesystem_operation("rename", tmp_archive, new_archive):
+        tmp_archive.rename(new_archive)
 
     # Write corresponding readme
     write_archive_readme(
@@ -1684,7 +1767,9 @@ def _secure_archiver_script_path() -> str:
     Resolves symlinks so the command points at the real script in the
     repo rather than an install symlink that could later move.
     """
-    return str(Path(__file__).resolve())
+    path = Path(__file__)
+    with filesystem_operation("resolve", path):
+        return str(path.resolve())
 
 
 _CRONY = CronyAutomation(
@@ -1731,7 +1816,8 @@ def _render_crony_bundle() -> str:
 def do_automate_apply(config_only: bool) -> None:
     """Write secure-archiver's crony(1) bundle and (unless `config_only`)
     deploy the scheduled create job via `crony apply`."""
-    _CRONY.apply_bundle(_render_crony_bundle(), config_only=config_only)
+    with filesystem_operation("apply automation using", _CRONY.bundle_path()):
+        _CRONY.apply_bundle(_render_crony_bundle(), config_only=config_only)
 
 
 def do_automate_status(config_only: bool) -> None:
@@ -1739,17 +1825,19 @@ def do_automate_status(config_only: bool) -> None:
     (unless `config_only`) show crony's per-job status table. A stale or
     missing bundle warns, so the process exits with the WARNING status."""
     global _warning_occurred
-    _warning_occurred |= _CRONY.report_status(
-        lambda text: text == _render_crony_bundle(),
-        config_only=config_only,
-    )
+    with filesystem_operation("inspect automation using", _CRONY.bundle_path()):
+        _warning_occurred |= _CRONY.report_status(
+            lambda text: text == _render_crony_bundle(),
+            config_only=config_only,
+        )
 
 
 def do_automate_destroy(config_only: bool) -> None:
     """Tear down the scheduled create job and remove the crony(1) bundle.
     `config_only` removes just the bundle file, leaving the deployed job
     in place."""
-    _CRONY.destroy(config_only=config_only)
+    with filesystem_operation("destroy automation using", _CRONY.bundle_path()):
+        _CRONY.destroy(config_only=config_only)
 
 
 # The DESCRIPTION and GETTING STARTED text, shown in `--help` (appended to
@@ -1993,8 +2081,7 @@ def do_update(
         resolved = resolve_path_includes(archive_cfg.include)
         op_values = op_read_refs(archive_cfg.op_refs())
 
-        with tempfile.TemporaryDirectory() as td:
-            staging_dir = Path(td)
+        with temporary_directory() as staging_dir:
             staged = build_staging_for_archive(
                 archive_cfg,
                 staging_dir,
@@ -2021,11 +2108,9 @@ def do_update(
 
 def do_config_init(output_file: Path) -> None:
     """Write an example config file."""
-    if output_file.exists():
+    if path_stat(output_file) is not None:
         raise ConfigError(f"File already exists: {output_file}")
-    output_file.write_text(
-        _DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    write_text(output_file, read_text(_DEFAULT_CONFIG_PATH))
     eprint(f"Wrote example config to: {output_file}")
 
 
@@ -2057,17 +2142,24 @@ COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
 @cli_entrypoint
 def cli() -> int:
     """CLI entry point with exception handling."""
-    parser = build_parser()
-    args_dict = vars(parser.parse_command())
-    command = args_dict.pop("command")
-
     try:
+        parser = build_parser()
+        args_dict = vars(parser.parse_command())
+        command = args_dict.pop("command")
         COMMAND_CALLBACKS[command](**args_dict)
+        if _warning_occurred:
+            return ExitCode.WARNING
     except SecureArchiverError as e:
         eprint(f"ERROR: {e}")
         return e.exit_code
-    if _warning_occurred:
-        return ExitCode.WARNING
+    except OSError as e:
+        eprint(f"ERROR: {e}")
+        return ExitCode.ERROR
+    except Exception as e:  # noqa: BLE001 - CLI errors must not print tracebacks
+        # Preserve a distinct status for bugs while keeping scheduler logs
+        # readable. Expected failures carry operation context at their source.
+        eprint(f"ERROR: Unexpected {type(e).__name__}: {e}")
+        return ExitCode.CRASHED
     return ExitCode.SUCCESS
 
 
@@ -2080,6 +2172,13 @@ MAN_SPEC = ManSpec(
     description=_DESCRIPTION,
     pre_sections=[TextSection("GETTING STARTED", _GETTING_STARTED)],
     post_sections=[
+        TextSection(
+            "ERRORS",
+            "Errors are reported on standard error without Python tracebacks. "
+            "Filesystem errors identify the operation, affected paths, and "
+            "operating-system reason. Unexpected errors return the crash "
+            "exit status.",
+        ),
         ItemsSection(
             "FILES",
             [

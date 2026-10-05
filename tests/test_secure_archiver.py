@@ -9,16 +9,19 @@
 Comprehensive unit tests for secure_archiver
 """
 
+import errno
+import io
 import json
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 from conftest import (
@@ -1373,7 +1376,9 @@ class TestArchiveCreationAndExtraction:
         out_archive = tmp_path / "test.7z"
 
         # Try to archive non-existent files
-        with pytest.raises(RuntimeError, match="Failed to create archive"):
+        with pytest.raises(
+            sa.SecureArchiverError, match="Failed to create archive"
+        ):
             sa.make_archive_with_7zz(
                 staging, out_archive, "password123", ["nonexistent.txt"]
             )
@@ -2480,7 +2485,7 @@ class TestArchiveReadme:
         readme_file = tmp_path / "TestArchive.20260115_120000.txt"
         readme_file.write_text("pre-existing content")
 
-        with pytest.raises(RuntimeError, match="already exists"):
+        with pytest.raises(sa.SecureArchiverError, match="already exists"):
             sa.write_archive_readme(
                 out_dir=tmp_path,
                 archive_name="TestArchive",
@@ -3233,6 +3238,521 @@ class TestOutputReadme:
         # Original content should be unchanged
         readme_path = tmp_path / "README.txt"
         assert readme_path.read_text() == "Original content\n"
+
+
+class TestFilesystemErrors:
+    """Failures name the affected paths and remain readable at the CLI."""
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_readme_deadlock_at_cli(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        dry_run: bool,
+    ) -> None:
+        readme = tmp_path / "README.txt"
+        readme.write_text("existing\n")
+        cfg = sa.Config(
+            general=sa.GeneralConfig(str(tmp_path), readme="updated"),
+            archives={
+                "test": sa.ArchiveConfig(
+                    op_password="op://v/i/p",
+                    description="desc",
+                    include=[sa.PathIncludeEntry(str(readme))],
+                ),
+            },
+        )
+        with (
+            patch(
+                "secure_archiver.load_config", autospec=True, return_value=cfg
+            ),
+            patch("secure_archiver.ensure_tools", autospec=True),
+            patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=OSError(11, "Resource deadlock avoided"),
+            ),
+            patch(
+                "secure_archiver.op_read_refs", autospec=True
+            ) as read_secrets,
+            patch(
+                "sys.argv",
+                ["prog", "create", *(["--dry-run"] if dry_run else [])],
+            ),
+        ):
+            assert sa.cli() == sa.ExitCode.ERROR
+            read_secrets.assert_not_called()
+        stderr = capsys.readouterr().err
+        assert (
+            f"ERROR: Cannot read {readme}: Resource deadlock avoided" in stderr
+        )
+        assert "(errno 11)" in stderr
+        assert "Traceback" not in stderr
+        assert readme.read_text() == "existing\n"
+
+    @pytest.mark.parametrize(
+        ("writer", "filename"),
+        [
+            (lambda p: sa.write_output_readme(p, "content"), "README.txt"),
+            (
+                lambda p: sa.write_archive_readme(
+                    p, "test", "stamp", "op://v/i/p", "desc"
+                ),
+                "test.stamp.txt",
+            ),
+            (lambda p: sa.write_manifest(p, {"entries": []}), "manifest.json"),
+            (
+                lambda p: sa.make_archive_with_7zz(
+                    p, p / "archive.7z", "password", []
+                ),
+                ".filelist.txt",
+            ),
+            (lambda p: sa.do_config_init(p / "config.toml"), "config.toml"),
+            (
+                lambda p: sa.stage_op_ref(
+                    p,
+                    "secret.txt",
+                    "op://v/i/p",
+                    content="secret",
+                    seen_names=set(),
+                ),
+                "secret.txt",
+            ),
+        ],
+        ids=[
+            "output-readme",
+            "archive-readme",
+            "manifest",
+            "file-list",
+            "config-init",
+            "secret",
+        ],
+    )
+    def test_write_failure_names_path(
+        self, tmp_path: Path, writer: Callable[[Path], object], filename: str
+    ) -> None:
+        with (
+            patch.object(
+                Path,
+                "write_text",
+                autospec=True,
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            writer(tmp_path)
+        assert f"Cannot write {tmp_path / filename}" in str(exc.value)
+        assert "No space left on device" in str(exc.value)
+        assert f"errno {errno.ENOSPC}" in str(exc.value)
+
+    def test_config_read_failure_names_path(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text("[general]\n")
+        with (
+            patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.load_config(config)
+        assert f"Cannot read {config}: Input/output error" in str(exc.value)
+
+    def test_hash_read_failure_names_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "file.txt"
+        with (
+            patch.object(
+                Path,
+                "open",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.sha256_file(path)
+        assert f"Cannot read {path}: Input/output error" in str(exc.value)
+
+    def test_hash_failure_after_open_names_path(self, tmp_path: Path) -> None:
+        path = tmp_path / "file.txt"
+        stream = create_autospec(io.BufferedReader, instance=True)
+        stream.__enter__.return_value = stream
+        stream.read.side_effect = OSError(
+            errno.EDEADLK, "Resource deadlock avoided"
+        )
+        with (
+            patch.object(
+                Path, "open", autospec=True, return_value=stream
+            ) as opened,
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.sha256_file(path)
+        opened.assert_called_once_with(path, "rb")
+        stream.read.assert_called_once()
+        assert f"Cannot read {path}: Resource deadlock avoided" in str(
+            exc.value
+        )
+        assert f"errno {errno.EDEADLK}" in str(exc.value)
+
+    def test_manifest_stat_failure_names_path(self, tmp_path: Path) -> None:
+        with (
+            patch.object(
+                Path,
+                "stat",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.build_manifest(tmp_path, ["file.txt"])
+        assert f"Cannot stat {tmp_path / 'file.txt'}" in str(exc.value)
+
+    @pytest.mark.parametrize("invalid_json", [False, True])
+    def test_extracted_manifest_failure_names_path(
+        self, tmp_path: Path, invalid_json: bool
+    ) -> None:
+        archive = tmp_path / "test.7z"
+        archive.touch()
+
+        def extract(
+            _cmd: object, **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with (
+            patch(
+                "secure_archiver.path_stat",
+                autospec=True,
+                return_value=archive.stat(),
+            ),
+            patch(
+                "secure_archiver.run_cmd", autospec=True, side_effect=extract
+            ),
+            patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                return_value="invalid JSON",
+                side_effect=None
+                if invalid_json
+                else OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.extract_manifest_from_archive(archive, "password")
+        assert "manifest.json" in str(exc.value)
+        if invalid_json:
+            assert str(archive) in str(exc.value)
+            assert "Invalid manifest" in str(exc.value)
+        else:
+            assert "Input/output error" in str(exc.value)
+
+    def test_invalid_readme_encoding_does_not_quote_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        readme = tmp_path / "README.txt"
+        readme.write_bytes(b"PRIVATE\xff")
+        with pytest.raises(sa.SecureArchiverError) as exc:
+            sa.write_output_readme(tmp_path, "content")
+        assert str(exc.value) == f"Cannot read {readme}: invalid UTF-8 text"
+
+    def test_copy_failure_names_both_paths(self, tmp_path: Path) -> None:
+        source = tmp_path / "source.txt"
+        source.write_text("content")
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        with (
+            patch(
+                "secure_archiver.shutil.copyfile",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.stage_flat_copy(staging, [source], seen_names=set())
+        assert f"Cannot copy {source} -> {staging / source.name}" in str(
+            exc.value
+        )
+
+    def test_permission_failure_names_destination(self, tmp_path: Path) -> None:
+        with (
+            patch(
+                "secure_archiver.os.chmod",
+                autospec=True,
+                side_effect=OSError(errno.EPERM, "Operation not permitted"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.write_manifest(tmp_path, {"entries": []})
+        assert f"Cannot set permissions on {tmp_path / 'manifest.json'}" in str(
+            exc.value
+        )
+
+    def test_directory_creation_failure_names_path(
+        self, tmp_path: Path
+    ) -> None:
+        with (
+            patch.object(
+                Path,
+                "mkdir",
+                autospec=True,
+                side_effect=OSError(errno.EACCES, "Permission denied"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.stage_op_ref(
+                tmp_path,
+                "secret.txt",
+                "op://v/i/p",
+                content="secret",
+                seen_names=set(),
+                target_dir="subdir",
+            )
+        assert f"Cannot create directory {tmp_path / 'subdir'}" in str(
+            exc.value
+        )
+
+    def test_readme_stat_refusal_is_not_absence(self, tmp_path: Path) -> None:
+        with (
+            patch(
+                "secure_archiver.os.stat",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            patch.object(Path, "write_text", autospec=True) as write,
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.write_output_readme(tmp_path, "content")
+        assert str(tmp_path / "README.txt") in str(exc.value)
+        write.assert_not_called()
+
+    def test_temporary_directory_creation_failure(self) -> None:
+        root = Path(tempfile.gettempdir())
+        with (
+            patch(
+                "secure_archiver.tempfile.TemporaryDirectory",
+                autospec=True,
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+            sa.temporary_directory(),
+        ):
+            pytest.fail("A failed directory creation cannot enter its body")
+        assert f"Cannot create temporary directory in {root}" in str(exc.value)
+
+    def test_temporary_directory_cleanup_failure(self) -> None:
+        with (
+            patch.object(
+                tempfile.TemporaryDirectory,
+                "cleanup",
+                autospec=True,
+                side_effect=OSError(errno.EACCES, "Permission denied"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+            sa.temporary_directory() as path,
+        ):
+            assert path.is_dir()
+        assert f"Cannot remove temporary directory {path}" in str(exc.value)
+
+    @pytest.mark.parametrize("readme_failure", [False, True])
+    def test_prune_failure_names_path(
+        self, tmp_path: Path, readme_failure: bool
+    ) -> None:
+        archive = tmp_path / "test.20260101_000000.7z"
+        readme = archive.with_suffix(".txt")
+        archive.touch()
+        readme.touch()
+        unlink = Path.unlink
+        failed = readme if readme_failure else archive
+
+        def remove(path: Path, missing_ok: bool = False) -> None:
+            if path == failed:
+                raise OSError(errno.EACCES, "Permission denied")
+            unlink(path, missing_ok=missing_ok)
+
+        with (
+            patch.object(Path, "unlink", autospec=True, side_effect=remove),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.prune_archives(tmp_path, "test", 0)
+        assert f"Cannot remove {failed}: Permission denied" in str(exc.value)
+
+    def test_latest_readme_failure_stops_publish(self, tmp_path: Path) -> None:
+        archive = tmp_path / "test.20260101_000000.7z"
+        readme = archive.with_suffix(".txt")
+        archive.touch()
+        readme.touch()
+        with (
+            patch(
+                "secure_archiver.extract_manifest_from_archive",
+                autospec=True,
+                return_value={},
+            ),
+            patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            patch(
+                "secure_archiver.make_archive_with_7zz", autospec=True
+            ) as create,
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.publish(
+                "test",
+                tmp_path,
+                "password",
+                tmp_path,
+                [],
+                timestamp="20260102_000000",
+                op_password_uri="op://v/i/p",
+                description="desc",
+                keep_revisions=3,
+                dry_run=False,
+                force_update=False,
+            )
+        assert f"Cannot read {readme}: Input/output error" in str(exc.value)
+        create.assert_not_called()
+
+    def test_rename_failure_names_both_paths(self, tmp_path: Path) -> None:
+        with (
+            patch("secure_archiver.make_archive_with_7zz", autospec=True),
+            patch.object(
+                Path,
+                "rename",
+                autospec=True,
+                side_effect=OSError(errno.EIO, "Input/output error"),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+        ):
+            sa.publish(
+                "test",
+                tmp_path,
+                "password",
+                tmp_path,
+                [],
+                timestamp="20260102_000000",
+                op_password_uri="op://v/i/p",
+                description="desc",
+                keep_revisions=3,
+                dry_run=False,
+                force_update=False,
+            )
+        source = tmp_path / ".test.20260102_000000.new.7z"
+        destination = tmp_path / "test.20260102_000000.7z"
+        assert f"Cannot rename {source} -> {destination}" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        ("exception", "exit_code", "message"),
+        [
+            (
+                ValueError("unexpected value"),
+                sa.ExitCode.CRASHED,
+                "Unexpected ValueError: unexpected value",
+            ),
+            (
+                OSError(errno.EIO, "Input/output error", "/path/to/file"),
+                sa.ExitCode.ERROR,
+                "/path/to/file",
+            ),
+        ],
+    )
+    def test_cli_fallback_has_no_traceback(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        exception: Exception,
+        exit_code: sa.ExitCode,
+        message: str,
+    ) -> None:
+        callback = create_autospec(sa.do_update, side_effect=exception)
+        with (
+            patch.dict(sa.COMMAND_CALLBACKS, {"create": callback}),
+            patch("sys.argv", ["prog", "create"]),
+        ):
+            assert sa.cli() == exit_code
+        stderr = capsys.readouterr().err
+        assert "ERROR:" in stderr
+        assert message in stderr
+        assert "Traceback" not in stderr
+
+    def test_parser_failure_has_no_traceback(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch(
+            "secure_archiver.build_parser",
+            autospec=True,
+            side_effect=ValueError("bad parser"),
+        ):
+            assert sa.cli() == sa.ExitCode.CRASHED
+        assert (
+            capsys.readouterr().err
+            == "ERROR: Unexpected ValueError: bad parser\n"
+        )
+
+    def test_missing_executable_is_expected_error(self, tmp_path: Path) -> None:
+        command = str(tmp_path / "missing-program")
+        with pytest.raises(sa.SecureArchiverError) as exc:
+            sa.run_cmd([command])
+        assert f"Cannot run {command}" in str(exc.value)
+        assert "No such file or directory" in str(exc.value)
+        assert exc.value.exit_code == sa.ExitCode.ERROR
+
+    @pytest.mark.parametrize(
+        ("verb", "method", "action"),
+        [
+            ("apply", "apply_bundle", "apply"),
+            ("status", "report_status", "inspect"),
+            ("destroy", "destroy", "destroy"),
+        ],
+    )
+    def test_automation_failure_at_cli(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        verb: str,
+        method: str,
+        action: str,
+    ) -> None:
+        monkeypatch.setenv("CRONY_CONFIG_DROPIN_DIR", str(tmp_path))
+        bundle = tmp_path / "secure-archiver.toml"
+        with (
+            patch.object(
+                sa._CRONY,
+                method,
+                autospec=True,
+                side_effect=OSError(11, "Resource deadlock avoided"),
+            ),
+            patch("sys.argv", ["prog", "automate", verb, "--config-only"]),
+        ):
+            assert sa.cli() == sa.ExitCode.ERROR
+        expected = (
+            f"ERROR: Cannot {action} automation using {bundle}: "
+            "Resource deadlock avoided (errno 11)\n"
+        )
+        assert capsys.readouterr().err == expected
+
+    def test_filesystem_error_keeps_more_specific_os_path(
+        self, tmp_path: Path
+    ) -> None:
+        child = tmp_path / "child"
+        with (
+            patch.object(
+                tempfile.TemporaryDirectory,
+                "cleanup",
+                autospec=True,
+                side_effect=OSError(
+                    errno.EACCES, "Permission denied", str(child)
+                ),
+            ),
+            pytest.raises(sa.SecureArchiverError) as exc,
+            sa.temporary_directory(),
+        ):
+            pass
+        assert f"OS path: {child}" in str(exc.value)
 
 
 class TestGeneralConfigReadme:

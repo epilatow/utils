@@ -101,6 +101,12 @@ bundle.
 - **`--config-only`**\
   only remove the bundle file; skip crony destroy
 
+## ERRORS
+
+Errors are reported on standard error without Python tracebacks. Filesystem
+errors identify the operation, affected paths, and operating-system reason.
+Unexpected errors return the crash exit status.
+
 ## FILES
 
 - **`./secure-archiver.toml`**\

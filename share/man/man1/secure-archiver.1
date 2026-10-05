@@ -85,6 +85,10 @@ Tear down secure\-archiver\(aqs scheduled create job and remove its crony(1) bun
 \f[CR]\-\-config\-only\f[R]
 only remove the bundle file; skip crony destroy
 .RE
+.SH ERRORS
+Errors are reported on standard error without Python tracebacks.\&
+Filesystem errors identify the operation, affected paths, and operating\-system reason.\&
+Unexpected errors return the crash exit status.\&
 .SH FILES
 .TP
 \f[CR]./secure\-archiver.toml\f[R]
