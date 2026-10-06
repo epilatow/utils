@@ -63,7 +63,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.errors import ExitCode
-from crony.platform import current_platform, get_scheduler
+from crony.platform import (
+    LaunchdUnitPlatformProperties,
+    current_platform,
+    get_scheduler,
+)
+from crony.unit import EntityName, OnDemand, PriorityClass, UnitSpec
 
 REPO_ROOT = Path(__file__).parent.parent
 _script_path = REPO_ROOT / "bin" / "crony"
@@ -660,6 +665,53 @@ class TestLaunchdInterval:
         )
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
+
+
+@pytest.mark.skipif(not _IS_DARWIN, reason="launchd-only")
+class TestLaunchdFileMaterialization:
+    """The rendered key enables native policy in a job and its children."""
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_policy_inherited_by_child(
+        self, e2e: _CronyE2E, enabled: bool
+    ) -> None:
+        # Drive the backend directly so testing the native I/O policy does
+        # not require an FDA grant for a temporary checkout's app identity.
+        result = e2e.state_dir / "materialization-policy.json"
+        probe = "import ctypes; print(ctypes.CDLL(None).getiopolicy_np(3, 0))"
+        command = (
+            "import ctypes, json, subprocess, sys; from pathlib import Path; "
+            "policy = ctypes.CDLL(None).getiopolicy_np(3, 0); "
+            f"child = int(subprocess.check_output([sys.executable, '-c', "
+            f"{probe!r}], text=True)); "
+            f"path = Path({str(result)!r}); tmp = path.with_suffix('.tmp'); "
+            "tmp.write_text(json.dumps([policy, child])); tmp.replace(path)"
+        )
+        spec = UnitSpec(
+            name=EntityName(E2E_BUNDLE, "materialization-probe"),
+            cmd=(sys.executable, "-c", command),
+            timing=OnDemand(),
+            priority=PriorityClass.NORMAL,
+            platform_properties=LaunchdUnitPlatformProperties(
+                MaterializeDatalessFiles=enabled
+            ),
+        )
+        scheduler = get_scheduler("darwin", e2e.unit_dir)
+        for unit in scheduler.render_units(spec).units:
+            (e2e.unit_dir / unit.filename).write_text(unit.content)
+        try:
+            scheduler.activate(spec)
+            scheduler.trigger(str(spec.name))
+            e2e.wait_until(
+                result.exists,
+                timeout=15,
+                what="materialization policy probe to finish",
+            )
+            expected = 2 if enabled else 1
+            assert json.loads(result.read_text()) == [expected, expected]
+        finally:
+            scheduler.deactivate(str(spec.name))
+            scheduler.remove_files(str(spec.name))
 
 
 @pytest.mark.skipif(

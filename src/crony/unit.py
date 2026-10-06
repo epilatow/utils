@@ -3,7 +3,7 @@
 """Typed value objects describing a scheduled unit.
 
 bin/crony owns the domain model (Job, JobGroup, Config) and the command
-handlers; this module holds the platform-neutral building blocks the
+handlers; this module holds the common building blocks the
 launchd / systemd scheduler modules render from. The two identity forms
 (EntityRef, EntityName), the schedule and interval, the priority class,
 and the UnitSpec that bundles them all carry validation and round-trip
@@ -22,6 +22,7 @@ group -> children fan-out happens at run time, so the platform layer
 never needs to be job/group aware.
 """
 
+import abc
 import enum
 import re
 import uuid
@@ -518,6 +519,15 @@ class DaemonSpec:
     restart_seconds: int
 
 
+class UnitPlatformProperties(abc.ABC):
+    """Native unit properties, defined by the selected platform module."""
+
+    @property
+    @abc.abstractmethod
+    def platform(self) -> str:
+        """The platform selector for the scheduler that accepts these."""
+
+
 @dataclass(frozen=True)
 class UnitSpec:
     """One scheduled unit, described without crony's job/group model.
@@ -542,11 +552,15 @@ class UnitSpec:
                 identifies a disabled daemon -- whose timing is None,
                 and which must therefore be rendered and torn down as a
                 daemon rather than as an ordinary dormant entry.
+    platform_properties
+                Native settings owned by the selected platform's concrete
+                UnitPlatformProperties type.
     """
 
     name: EntityName
     cmd: tuple[str, ...]
     timing: Timing | None
     priority: PriorityClass
+    platform_properties: UnitPlatformProperties
     jitter: JitterSpec | None = None
     daemon: DaemonSpec | None = None

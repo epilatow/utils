@@ -264,6 +264,22 @@ def exec_path_strings(argv: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _unit_platform_properties(
+    platform: str | None, flags: crony.config.JobFlags
+) -> crony.unit.UnitPlatformProperties:
+    """Resolve native unit settings from the platform and job flags."""
+    resolved_platform = platform or crony.platform.current_platform()
+    if resolved_platform == "darwin":
+        return crony.platform.LaunchdUnitPlatformProperties(
+            MaterializeDatalessFiles=(
+                crony.config.JobFlags.FULL_DISK_ACCESS in flags
+            )
+        )
+    if resolved_platform == "linux":
+        return crony.platform.SystemdUnitPlatformProperties()
+    raise ValueError(f"unsupported platform: {resolved_platform!r}")
+
+
 def _normalized_spec(
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
@@ -272,6 +288,8 @@ def _normalized_spec(
     guard_timeout: int,
     guard_interactive: bool,
     daemon_timing: crony.unit.Timing | None,
+    *,
+    platform_properties: crony.unit.UnitPlatformProperties,
 ) -> crony.unit.UnitSpec:
     """A UnitSpec with blank (`Path("")`) executable paths -- the
     path-independent form both graphs normalize to for the drift compare.
@@ -294,6 +312,7 @@ def _normalized_spec(
         priority=priority,
         jitter=_jitter_spec(name, ref, timing, Path(""), Path("")),
         daemon=_daemon_spec(daemon_timing),
+        platform_properties=platform_properties,
     )
 
 
@@ -308,9 +327,8 @@ _EMPTY_RENDERED_UNITS = crony.platform.RenderedUnits(())
 class _JobCommon:
     """Holds the fields both snapshot kinds carry.
 
-    The one per-kind difference is the unit's priority: a group renders
-    without one, so `unit_spec` reads it through the `_unit_priority`
-    hook that `Job` overrides to bake in its resolved class.
+    A per-kind hook supplies the unit's priority: groups use the default
+    and `Job` overrides it.
 
     `state_dir_symlink` is the short-name alias as a graph knows it:
     (alias_path, target). A config-built (pending) node carries the
@@ -336,6 +354,12 @@ class _JobCommon:
     # (computed once at apply time). 0 means uncapped -- the runner
     # treats it as an infinite deadline.
     timeout: int
+    # Derived from the selected platform and resolved flags; retained so
+    # every render uses the same native settings. Rendered unit contents
+    # capture their drift, so this value is not compared or persisted.
+    platform_properties: crony.unit.UnitPlatformProperties = field(
+        compare=False, kw_only=True
+    )
     state_dir_symlink: tuple[Path, str] | None = field(
         default=None, kw_only=True
     )
@@ -564,6 +588,7 @@ class _JobCommon:
                 self.entity_name, self.entity_ref, timing, uv_path, crony_path
             ),
             daemon=_daemon_spec(self.timing),
+            platform_properties=self.platform_properties,
         )
 
     def with_unit_disabled(
@@ -573,11 +598,20 @@ class _JobCommon:
         re-rendered for the resulting schedule shape, so a pending node
         mirrored onto a disabled current node reads `synced` rather than
         stale."""
+        properties = self.platform_properties
+        if platform is not None:
+            flags = (
+                self.flags
+                if self.kind is crony.unit.EntityKind.JOB
+                else crony.config.JobFlags(0)
+            )
+            properties = _unit_platform_properties(platform, flags)
         return dataclasses.replace(
             self,
             unit_disabled=disabled,
+            platform_properties=properties,
             rendered_units=_pending_rendered_units(
-                platform,
+                properties,
                 self.entity_name,
                 self.entity_ref,
                 None if disabled else self.timing,
@@ -715,8 +749,8 @@ class Job(_JobCommon):
 
     @property
     def full_disk_access(self) -> bool:
-        """Whether the job runs through the macOS Full Disk Access
-        wrapper -- the FULL_DISK_ACCESS flag. A no-op off darwin."""
+        """Whether the job requests macOS protected and cloud-file access
+        -- the FULL_DISK_ACCESS flag. A no-op off darwin."""
         return crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
 
     @property
@@ -773,8 +807,9 @@ class Job(_JobCommon):
         priority = config.resolved_priority(job)
         timeout = config.resolved_job_timeout_sec(job)
         interactive = crony.config.JobFlags.INTERACTIVE in flags
+        platform_properties = _unit_platform_properties(platform, flags)
         rendered_units = _pending_rendered_units(
-            platform,
+            platform_properties,
             name,
             crony.unit.EntityRef(name.bundle, job.uuid),
             job.timing,
@@ -802,6 +837,7 @@ class Job(_JobCommon):
             timing=job.timing,
             priority=priority,
             flags=flags,
+            platform_properties=platform_properties,
             uv_path=uv_path,
             crony_path=crony_path,
             rendered_units=rendered_units,
@@ -877,8 +913,9 @@ class Job(_JobCommon):
         # that reproduces the on-disk file must drop the timing too.
         eff_timing = None if snap.unit_disabled else timing
         interactive = crony.config.JobFlags.INTERACTIVE in flags
+        platform_properties = _unit_platform_properties(platform, flags)
         rendered_units = _current_rendered_units(
-            platform,
+            platform_properties,
             en,
             snap.entity_ref(),
             eff_timing,
@@ -912,6 +949,7 @@ class Job(_JobCommon):
             timing=timing,
             flags=flags,
             unit_disabled=snap.unit_disabled,
+            platform_properties=platform_properties,
             # Wrapper state is derived (job-only): stamp the caller's
             # probed value, gated on the full-disk-access flag.
             fda_wrapper=cls._fda_wrapper_for(flags, fda_wrapper),
@@ -1002,8 +1040,11 @@ class JobGroup(_JobCommon):
         if flags is None:
             flags = config.composed_flags(group.flags, group.timing)
         timeout = config.resolved_group_timeout_sec(target, group.name)
+        platform_properties = _unit_platform_properties(
+            platform, crony.config.JobFlags(0)
+        )
         rendered_units = _pending_rendered_units(
-            platform,
+            platform_properties,
             name,
             crony.unit.EntityRef(name.bundle, group.uuid),
             group.timing,
@@ -1024,6 +1065,7 @@ class JobGroup(_JobCommon):
             trigger_timeout_sec=config.defaults.trigger_timeout_sec,
             timing=group.timing,
             flags=flags,
+            platform_properties=platform_properties,
             uv_path=uv_path,
             crony_path=crony_path,
             rendered_units=rendered_units,
@@ -1073,8 +1115,11 @@ class JobGroup(_JobCommon):
         timing = snap.timing()
         flags = snap.job_flags()
         eff_timing = None if snap.unit_disabled else timing
+        platform_properties = _unit_platform_properties(
+            platform, crony.config.JobFlags(0)
+        )
         rendered_units = _current_rendered_units(
-            platform,
+            platform_properties,
             en,
             snap.entity_ref(),
             eff_timing,
@@ -1099,6 +1144,7 @@ class JobGroup(_JobCommon):
             timing=timing,
             flags=flags,
             unit_disabled=snap.unit_disabled,
+            platform_properties=platform_properties,
             uv_path=installed_uv,
             crony_path=installed_crony,
             rendered_units=rendered_units,
@@ -1110,7 +1156,7 @@ class JobGroup(_JobCommon):
 
 
 def _pending_rendered_units(
-    platform: str | None,
+    platform_properties: crony.unit.UnitPlatformProperties,
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
     timing: crony.unit.Timing | None,
@@ -1124,13 +1170,10 @@ def _pending_rendered_units(
     is path-independent (a moved-but-present binary is not drift). The
     config unit renders first, matching a current node's on-disk view, so
     the two relate slot-for-slot and any extra on-disk file (a leftover)
-    surfaces as a trailing difference. Pure (no disk I/O); `platform`
-    defaults to the running host's. `daemon_timing` is the entry's own
-    firing mode, which a disabled entry's stripped `timing` can no longer
-    report -- see `_normalized_spec`."""
-    sched = crony.platform.get_scheduler(
-        platform or crony.platform.current_platform()
-    )
+    surfaces as a trailing difference. Pure (no disk I/O). `daemon_timing`
+    is the entry's own firing mode, which a disabled entry's stripped
+    `timing` can no longer report -- see `_normalized_spec`."""
+    sched = crony.platform.get_scheduler(platform_properties.platform)
     return sched.render_units(
         _normalized_spec(
             name,
@@ -1140,12 +1183,13 @@ def _pending_rendered_units(
             guard_timeout,
             guard_interactive,
             daemon_timing,
+            platform_properties=platform_properties,
         )
     )
 
 
 def _current_rendered_units(
-    platform: str | None,
+    platform_properties: crony.unit.UnitPlatformProperties,
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
     timing: crony.unit.Timing | None,
@@ -1179,9 +1223,7 @@ def _current_rendered_units(
     firing mode -- see `_normalized_spec`."""
     if not ondisk_units.units:
         return _EMPTY_RENDERED_UNITS
-    sched = crony.platform.get_scheduler(
-        platform or crony.platform.current_platform()
-    )
+    sched = crony.platform.get_scheduler(platform_properties.platform)
     normalized_units = {
         u.filename: u.content
         for u in sched.render_units(
@@ -1193,6 +1235,7 @@ def _current_rendered_units(
                 guard_timeout,
                 guard_interactive,
                 daemon_timing,
+                platform_properties=platform_properties,
             )
         ).units
     }
@@ -1223,6 +1266,7 @@ def _current_rendered_units(
                         name, ref, timing, installed_uv, installed_crony
                     ),
                     daemon=_daemon_spec(daemon_timing),
+                    platform_properties=platform_properties,
                 )
             ).units
         }

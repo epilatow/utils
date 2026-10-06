@@ -152,7 +152,8 @@ _FLAG_DESCRIPTIONS: dict[JobFlags, str] = {
     ),
     JobFlags.FULL_DISK_ACCESS: (
         "macOS/Darwin only. Execute the job with TCC Full Disk Access "
-        "permissions."
+        "permissions and allow cloud-only file contents to download on "
+        "access."
     ),
 }
 

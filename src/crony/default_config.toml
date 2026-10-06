@@ -193,7 +193,8 @@
 # its own key may be set that way OR in `flags`, never both at the same
 # level. full-disk-access (macOS) runs the command under a Full Disk
 # Access grant via Crony.app: `crony apply` builds the wrapper, then
-# grant it in System Settings (apply prints how); a no-op off macOS.
+# grant it in System Settings (apply prints how). It also allows
+# cloud-only file contents to download on access. A no-op off macOS.
 #success-exit-codes = [1]      # non-zero exit codes to classify as
 #            success (exit 0 is always success). A run whose code is
 #            listed is "ok" -- not failed, no notification -- and the

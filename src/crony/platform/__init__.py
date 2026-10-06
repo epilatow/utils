@@ -15,9 +15,9 @@ produced by `current_platform()`):
   desktop-interaction primitives for interactive jobs).
 
 The launchd / systemd modules are re-exported so callers can reach their
-pure filename helpers without importing the submodules directly; the
-host backends are reached only through `get_host`, so they are exported
-by class, not module.
+pure filename helpers without importing the submodules directly. Their
+concrete unit-property types are exported by class. The host backends are
+reached only through `get_host`, so they are exported by class, not module.
 
 `current_platform()` / `current_host()` detect the running host's
 platform string and short hostname. Every caller routes host / platform
@@ -33,7 +33,10 @@ from crony.errors import CronyError
 from crony.platform import launchd, systemd
 from crony.platform.darwin import DarwinHost
 from crony.platform.host import HostPlatform, PidWait
-from crony.platform.launchd import LaunchdScheduler
+from crony.platform.launchd import (
+    LaunchdScheduler,
+    LaunchdUnitPlatformProperties,
+)
 from crony.platform.linux import LinuxHost
 from crony.platform.scheduler import (
     UNIT_PREFIX,
@@ -43,13 +46,17 @@ from crony.platform.scheduler import (
     SchedulerWarning,
     UnitLastExit,
 )
-from crony.platform.systemd import SystemdScheduler
+from crony.platform.systemd import (
+    SystemdScheduler,
+    SystemdUnitPlatformProperties,
+)
 
 __all__ = [
     "UNIT_PREFIX",
     "DarwinHost",
     "HostPlatform",
     "LaunchdScheduler",
+    "LaunchdUnitPlatformProperties",
     "LinuxHost",
     "PidWait",
     "RenderedUnit",
@@ -57,6 +64,7 @@ __all__ = [
     "Scheduler",
     "SchedulerWarning",
     "SystemdScheduler",
+    "SystemdUnitPlatformProperties",
     "UnitLastExit",
     "current_host",
     "current_platform",

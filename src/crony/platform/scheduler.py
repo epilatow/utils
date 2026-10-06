@@ -9,7 +9,7 @@ behind one API over `UnitSpec`; `crony.platform.launchd` and
 `crony.platform.systemd` implement it, and `get_scheduler` picks one for
 the running host.
 
-This layer translates one entity's platform-neutral `UnitSpec` into a
+This layer translates one entity's `UnitSpec` into a
 specific host scheduler's unit files and live state, and reports back
 what that scheduler currently holds. Its whole responsibility, and its
 whole vocabulary:
@@ -138,7 +138,10 @@ class Scheduler(abc.ABC):
         (a systemd `.timer` is included only for a scheduled entry). Each
         `content` is the render of `spec` for that unit, with whatever
         executable paths `spec.cmd` carries. To relate a render to what is
-        on disk, align by `filename` against `ondisk_units`."""
+        on disk, align by `filename` against `ondisk_units`.
+
+        `spec.platform_properties` must have this backend's native property
+        type; a different backend's properties raise TypeError."""
 
     @abc.abstractmethod
     def config_filename(self, name: str) -> Path:

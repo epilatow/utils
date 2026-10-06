@@ -16,6 +16,7 @@ import plistlib
 import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import crony.errors
@@ -32,8 +33,24 @@ from crony.unit import (
     PriorityClass,
     Schedule,
     Timing,
+    UnitPlatformProperties,
     UnitSpec,
 )
+
+
+@dataclass(frozen=True)
+class LaunchdUnitPlatformProperties(UnitPlatformProperties):
+    """Native launchd settings. False leaves materialization at its default."""
+
+    MaterializeDatalessFiles: bool = False
+
+    @property
+    def platform(self) -> str:
+        return "darwin"
+
+
+_DEFAULT_PLATFORM_PROPERTIES = LaunchdUnitPlatformProperties()
+
 
 # The dotted component appended to a jittered interval job's base name to
 # form its companion unit's name (`<name>.jitter`). The dotted-prefix name
@@ -99,6 +116,10 @@ def _render_plist(
     timing: Timing | None,
     priority: PriorityClass = PriorityClass.NORMAL,
     daemon: DaemonSpec | None = None,
+    *,
+    platform_properties: LaunchdUnitPlatformProperties = (
+        _DEFAULT_PLATFORM_PROPERTIES
+    ),
 ) -> str:
     """Render the LaunchAgent plist XML for a job or group.
 
@@ -134,6 +155,8 @@ def _render_plist(
         "ExitTimeOut": _EXIT_TIMEOUT_SEC,
     }
     contents.update(_priority_keys(priority))
+    if platform_properties.MaterializeDatalessFiles:
+        contents["MaterializeDatalessFiles"] = True
     if daemon is not None and timing is not None:
         # `SuccessfulExit: false` is launchd's native spelling of the
         # runner's contract: respawn on a non-zero exit, stay down on a
@@ -245,6 +268,10 @@ class LaunchdScheduler(Scheduler):
         return Path.home() / "Library" / "LaunchAgents"
 
     def render_units(self, spec: UnitSpec) -> RenderedUnits:
+        if not isinstance(
+            spec.platform_properties, LaunchdUnitPlatformProperties
+        ):
+            raise TypeError("launchd requires launchd unit platform properties")
         # The service plist carries the command and the real schedule. A
         # jittered interval job (spec.jitter set by the model) also gets a
         # companion plist (slot 1) that fires once, at the model's per-job
@@ -258,7 +285,12 @@ class LaunchdScheduler(Scheduler):
             RenderedUnit(
                 Path(_plist_filename(name)),
                 _render_plist(
-                    name, spec.cmd, spec.timing, spec.priority, spec.daemon
+                    name,
+                    spec.cmd,
+                    spec.timing,
+                    spec.priority,
+                    spec.daemon,
+                    platform_properties=spec.platform_properties,
                 ),
             ),
         ]

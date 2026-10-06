@@ -13,6 +13,7 @@ import configparser
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from crony.platform.scheduler import (
@@ -28,9 +29,20 @@ from crony.unit import (
     Interval,
     PriorityClass,
     Schedule,
+    UnitPlatformProperties,
     UnitSpec,
     is_scheduled,
 )
+
+
+@dataclass(frozen=True)
+class SystemdUnitPlatformProperties(UnitPlatformProperties):
+    """Systemd units currently carry no native properties."""
+
+    @property
+    def platform(self) -> str:
+        return "linux"
+
 
 # --quiet drops the success-path symlink chatter. Enable (create the
 # boot symlink) and restart (activate now) are separate calls: `enable
@@ -356,6 +368,10 @@ class SystemdScheduler(Scheduler):
         return Path.home() / ".config" / "systemd" / "user"
 
     def render_units(self, spec: UnitSpec) -> RenderedUnits:
+        if not isinstance(
+            spec.platform_properties, SystemdUnitPlatformProperties
+        ):
+            raise TypeError("systemd requires systemd unit platform properties")
         # A `.service` defines / runs the job; a scheduled entry also gets
         # a `.timer` that arms it. An unscheduled entry renders the
         # `.service` alone -- no `.timer`. A stale `.timer` from a

@@ -5,8 +5,9 @@
 # ///
 # This is AI generated code
 
-"""Unit tests for crony.unit (the platform-neutral value objects)."""
+"""Unit tests for crony.unit value objects."""
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -14,6 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from crony.platform.launchd import LaunchdUnitPlatformProperties
+from crony.platform.systemd import SystemdUnitPlatformProperties
 from crony.unit import (
     DAEMON_SPEC,
     ON_DEMAND_SPEC,
@@ -237,6 +240,7 @@ class TestUnitSpec:
             cmd=cmd,
             timing=Schedule.from_str("daily"),
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
         )
         assert str(spec.name) == "default.job"
         assert spec.cmd == cmd
@@ -249,6 +253,7 @@ class TestUnitSpec:
             cmd=(),
             timing=None,
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
         )
         assert spec.jitter is None
 
@@ -261,10 +266,27 @@ class TestUnitSpec:
             cmd=(),
             timing=Interval.from_str("1h"),
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
             jitter=jitter,
         )
         assert spec.jitter is jitter
         assert spec.jitter.offset.total_seconds == 90
+
+    def test_native_fields_belong_to_scheduler_types(self) -> None:
+        common_fields = {f.name for f in dataclasses.fields(UnitSpec)}
+        assert "platform_properties" in common_fields
+        assert "MaterializeDatalessFiles" not in common_fields
+        assert [
+            f.name for f in dataclasses.fields(LaunchdUnitPlatformProperties)
+        ] == ["MaterializeDatalessFiles"]
+        assert dataclasses.fields(SystemdUnitPlatformProperties) == ()
+
+    def test_platform_identity_and_defaults(self) -> None:
+        launchd = LaunchdUnitPlatformProperties()
+        systemd = SystemdUnitPlatformProperties()
+        assert launchd.platform == "darwin"
+        assert launchd.MaterializeDatalessFiles is False
+        assert systemd.platform == "linux"
 
 
 class TestDaemonTiming:
@@ -295,6 +317,7 @@ class TestDaemonTiming:
             cmd=("/bin/true",),
             timing=Daemon(),
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
         )
         # Timing alone never implies the carrier; the model sets it.
         assert spec.daemon is None

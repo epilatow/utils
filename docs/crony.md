@@ -417,7 +417,8 @@ Send a synthetic failure notification.
   unprivileged Linux user denied the polkit action) runs the job without it
   rather than failing.
 - **`full-disk-access`**\
-  macOS/Darwin only. Execute the job with TCC Full Disk Access permissions.
+  macOS/Darwin only. Execute the job with TCC Full Disk Access permissions and
+  allow cloud-only file contents to download on access.
 
 ### MASKED values
 

@@ -22,10 +22,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.errors import SubprocessError
 from crony.platform import (
+    LaunchdUnitPlatformProperties,
     UnitLastExit,
     get_scheduler,
     launchd,
 )
+from crony.platform.systemd import SystemdUnitPlatformProperties
 from crony.unit import (
     Daemon,
     DaemonSpec,
@@ -64,6 +66,7 @@ def _activate_spec(
         cmd=_CMD,
         timing=timing,
         priority=PriorityClass.NORMAL,
+        platform_properties=LaunchdUnitPlatformProperties(),
         daemon=daemon,
     )
 
@@ -209,13 +212,80 @@ class TestLaunchdPriority:
         assert launchd._priority_keys(PriorityClass.NORMAL) == {}
 
 
+class TestLaunchdFileMaterialization:
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize(
+        "timing,daemon",
+        [
+            (Schedule.from_str("daily"), None),
+            (Interval.from_str("1h"), None),
+            (OnDemand(), None),
+            (None, None),
+            (Daemon(), DaemonSpec(restart_seconds=7)),
+            (None, DaemonSpec(restart_seconds=7)),
+        ],
+    )
+    def test_service_policy_across_firing_modes(
+        self,
+        enabled: bool,
+        timing: Timing | None,
+        daemon: DaemonSpec | None,
+    ) -> None:
+        spec = UnitSpec(
+            name=EntityName("default", "j"),
+            cmd=_CMD,
+            timing=timing,
+            priority=PriorityClass.NORMAL,
+            daemon=daemon,
+            platform_properties=LaunchdUnitPlatformProperties(
+                MaterializeDatalessFiles=enabled
+            ),
+        )
+        units = get_scheduler("darwin", _DIR).render_units(spec)
+        data = plistlib.loads(units.units[0].content.encode())
+        if enabled:
+            assert data["MaterializeDatalessFiles"] is True
+        else:
+            assert "MaterializeDatalessFiles" not in data
+
+    def test_jitter_companion_keeps_system_policy(self) -> None:
+        spec = UnitSpec(
+            name=EntityName("default", "j"),
+            cmd=_CMD,
+            timing=Interval.from_str("1h"),
+            priority=PriorityClass.NORMAL,
+            jitter=JitterSpec(offset=Interval.from_str("1s"), cmd=_CMD),
+            platform_properties=LaunchdUnitPlatformProperties(
+                MaterializeDatalessFiles=True
+            ),
+        )
+        units = get_scheduler("darwin", _DIR).render_units(spec)
+        service, companion = [
+            plistlib.loads(u.content.encode()) for u in units.units
+        ]
+        assert service["MaterializeDatalessFiles"] is True
+        assert "MaterializeDatalessFiles" not in companion
+
+
 class TestLaunchdScheduler:
+    def test_rejects_systemd_properties(self) -> None:
+        spec = UnitSpec(
+            name=EntityName("default", "j"),
+            cmd=_CMD,
+            timing=None,
+            priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
+        )
+        with pytest.raises(TypeError, match="launchd unit platform properties"):
+            get_scheduler("darwin", _DIR).render_units(spec)
+
     def test_render_one_plist(self) -> None:
         spec = UnitSpec(
             name=EntityName.from_str("default.brew"),
             cmd=_CMD,
             timing=Schedule.from_str("daily"),
             priority=PriorityClass.NORMAL,
+            platform_properties=LaunchdUnitPlatformProperties(),
         )
         units = get_scheduler("darwin", _DIR).render_units(spec)
         assert [u.filename for u in units.units] == [
@@ -592,6 +662,7 @@ class TestLaunchdJitter:
             cmd=_CMD,
             timing=Interval.from_str("1h"),
             priority=PriorityClass.NORMAL,
+            platform_properties=LaunchdUnitPlatformProperties(),
             jitter=jitter,
         )
 
@@ -719,6 +790,7 @@ class TestLaunchdDaemon:
             cmd=_CMD,
             timing=Daemon() if armed else None,
             priority=PriorityClass.NORMAL,
+            platform_properties=LaunchdUnitPlatformProperties(),
             daemon=self._DAEMON,
         )
         units = get_scheduler("darwin", _DIR).render_units(spec)

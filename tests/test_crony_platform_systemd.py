@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.errors import SubprocessError
 from crony.platform import (
+    LaunchdUnitPlatformProperties,
     SchedulerWarning,
+    SystemdUnitPlatformProperties,
     UnitLastExit,
     get_scheduler,
     systemd,
@@ -61,6 +63,7 @@ def _activate_spec(
         cmd=_CMD,
         timing=timing,
         priority=PriorityClass.NORMAL,
+        platform_properties=SystemdUnitPlatformProperties(),
         daemon=daemon,
     )
 
@@ -147,6 +150,7 @@ class TestSystemdScheduler:
             cmd=_CMD,
             timing=timing,
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
         )
 
     def test_service_and_timer_when_scheduled(self) -> None:
@@ -158,6 +162,17 @@ class TestSystemdScheduler:
             Path("crony-default.brew.timer"),
         ]
         assert all(u.content for u in units.units)
+
+    def test_rejects_launchd_properties(self) -> None:
+        spec = UnitSpec(
+            name=EntityName("default", "j"),
+            cmd=_CMD,
+            timing=None,
+            priority=PriorityClass.NORMAL,
+            platform_properties=LaunchdUnitPlatformProperties(),
+        )
+        with pytest.raises(TypeError, match="systemd unit platform properties"):
+            get_scheduler("linux", _DIR).render_units(spec)
 
     def test_service_only_when_scheduleless(self) -> None:
         # An unscheduled entry renders the `.service` alone -- no empty
@@ -566,6 +581,7 @@ class TestSystemdAnalyzeVerify:
                 cmd=cmd,
                 timing=timing,
                 priority=prio,
+                platform_properties=SystemdUnitPlatformProperties(),
                 daemon=daemon,
             )
             for u in sched.render_units(spec).units:
@@ -793,6 +809,7 @@ class TestSystemdDaemon:
             cmd=_CMD,
             timing=Daemon() if armed else None,
             priority=PriorityClass.NORMAL,
+            platform_properties=SystemdUnitPlatformProperties(),
             daemon=self._DAEMON,
         )
 

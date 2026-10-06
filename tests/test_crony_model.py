@@ -9,6 +9,7 @@
 
 import dataclasses
 import json
+import plistlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,13 @@ from crony.model import (  # noqa: E402
     _JobCommon,
     snapshot_from_dict,
 )
-from crony.platform import RenderedUnits  # noqa: E402
+from crony.platform import (  # noqa: E402
+    LaunchdUnitPlatformProperties,
+    RenderedUnit,
+    RenderedUnits,
+    SystemdUnitPlatformProperties,
+    get_scheduler,
+)
 from crony.platform.fda import FDAWrapper  # noqa: E402
 from crony.snapshot import (  # noqa: E402
     _COMPAT_FLOOR_SCHEMA,
@@ -446,8 +453,7 @@ class TestFdaWrapperField:
 class TestSharedSnapshotSurface:
     """`timing`, `unit_spec`, and `to_dict` are declared once on the
     `_JobCommon` base and shared by both `Job` and `JobGroup`; only the
-    unit's priority differs (a job exposes its resolved class, a group
-    renders without one).
+    unit's priority differs by kind.
     """
 
     def _job_snap(self) -> Any:
@@ -536,6 +542,163 @@ class TestSharedSnapshotSurface:
         d = group.to_dict()
         d["group_budget_sec"] = d.pop("timeout")
         assert snapshot_from_dict(d).timeout == group.timeout
+
+
+class TestFileMaterialization:
+    """Job policy reaches installation and both sides of the drift compare."""
+
+    def _snap(self, *, fda: bool = True, platform: str = "darwin") -> Job:
+        cfg = _parse(
+            {
+                "job": {
+                    "j": _job(
+                        flags=["full-disk-access"] if fda else [],
+                        uuid="11111111-2222-3333-4444-555555555555",
+                    )
+                }
+            }
+        )
+        return Job._from_config(
+            cfg,
+            cfg.jobs["j"],
+            EntityName("default", "j"),
+            platform=platform,
+            uv_path=Path("/abs/uv"),
+            crony_path=Path("/abs/crony"),
+        )
+
+    def _current(self, pending: Job, units: RenderedUnits) -> Job:
+        current = snapshot_from_dict(
+            pending.to_dict(),
+            platform=pending.platform_properties.platform,
+            ondisk_units=units,
+            installed_uv=pending.uv_path,
+            installed_crony=pending.crony_path,
+        )
+        assert isinstance(current, Job)
+        return current
+
+    @pytest.mark.parametrize("fda", [False, True])
+    def test_job_policy_and_pending_render(self, fda: bool) -> None:
+        pending = self._snap(fda=fda)
+        properties = pending.unit_spec().platform_properties
+        assert isinstance(properties, LaunchdUnitPlatformProperties)
+        assert properties.MaterializeDatalessFiles is fda
+        data = plistlib.loads(pending.rendered_units.units[0].content.encode())
+        if fda:
+            assert data["MaterializeDatalessFiles"] is True
+        else:
+            assert "MaterializeDatalessFiles" not in data
+        assert "platform_properties" not in pending.to_dict()
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_applied_render_normalizes_and_preserves_policy(
+        self, disabled: bool
+    ) -> None:
+        pending = self._snap().with_unit_disabled(disabled, "darwin")
+        units = get_scheduler("darwin").render_units(pending.unit_spec())
+        current = self._current(pending, units)
+        assert current.rendered_units == pending.rendered_units
+        assert current.unit_spec() == pending.unit_spec()
+        enabled = current.with_unit_disabled(False, "darwin")
+        assert enabled.rendered_units == self._snap().rendered_units
+
+    @pytest.mark.parametrize("setting", [None, False])
+    def test_missing_or_disabled_plist_policy_is_drift(
+        self, setting: bool | None
+    ) -> None:
+        pending = self._snap()
+        units = get_scheduler("darwin").render_units(pending.unit_spec())
+        unit = units.units[0]
+        data = plistlib.loads(unit.content.encode())
+        if setting is None:
+            data.pop("MaterializeDatalessFiles")
+        else:
+            data["MaterializeDatalessFiles"] = setting
+        old_units = RenderedUnits(
+            (RenderedUnit(unit.filename, plistlib.dumps(data).decode()),)
+        )
+        current = self._current(pending, old_units)
+        assert current.rendered_units != pending.rendered_units
+
+    def test_group_passes_flag_to_jobs_without_materializing_itself(
+        self,
+    ) -> None:
+        cfg = _parse(
+            {
+                "job": {
+                    "a": _grouped_job(),
+                    "b": _grouped_job(flags=["full-disk-access=false"]),
+                },
+                "job-group": {
+                    "g": {
+                        "jobs": ["a", "b"],
+                        "schedule": "daily",
+                        "flags": ["full-disk-access"],
+                    }
+                },
+                "target": {
+                    "platform": {
+                        "darwin": {"jobs": ["g"]},
+                        "linux": {"jobs": ["g"]},
+                    }
+                },
+            }
+        )
+        for name, enabled in (("g", False), ("a", True), ("b", False)):
+            node = dataclasses.replace(
+                _resolve_snapshot_for(cfg, name),
+                uv_path=Path("/abs/uv"),
+                crony_path=Path("/abs/crony"),
+            )
+            node = node.with_unit_disabled(False, "darwin")
+            properties = node.unit_spec().platform_properties
+            assert isinstance(properties, LaunchdUnitPlatformProperties)
+            assert properties.MaterializeDatalessFiles is enabled
+
+    def test_linux_render_is_unchanged(self) -> None:
+        assert isinstance(
+            self._snap(platform="linux").unit_spec().platform_properties,
+            SystemdUnitPlatformProperties,
+        )
+        assert (
+            self._snap(platform="linux").rendered_units
+            == self._snap(fda=False, platform="linux").rendered_units
+        )
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_disable_and_reload_preserve_selected_platform(
+        self, platform: str
+    ) -> None:
+        pending = self._snap(platform=platform)
+        disabled = pending.with_unit_disabled(True)
+        assert disabled.platform_properties is pending.platform_properties
+        assert (
+            disabled.unit_spec().platform_properties
+            is pending.platform_properties
+        )
+        units = get_scheduler(platform).render_units(disabled.unit_spec())
+        current = self._current(disabled, units)
+        assert current.platform_properties == pending.platform_properties
+        assert current.rendered_units == disabled.rendered_units
+        assert (
+            current.with_unit_disabled(False).rendered_units
+            == pending.rendered_units
+        )
+
+    def test_explicit_platform_override_changes_native_type(self) -> None:
+        pending = self._snap().with_unit_disabled(True, "linux")
+        assert isinstance(
+            pending.platform_properties, SystemdUnitPlatformProperties
+        )
+        darwin = pending.with_unit_disabled(False, "darwin")
+        assert darwin.platform_properties == LaunchdUnitPlatformProperties(
+            MaterializeDatalessFiles=True
+        )
+
+    def test_unsupported_platform_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unsupported platform"):
+            self._snap(platform="unsupported")
 
 
 class TestUnitDisabled:
