@@ -15,9 +15,9 @@
  *
  * This is a non-activating panel, ordered in without ever being made
  * key, so keystrokes keep going to the application the user was working
- * in. Its key equivalents stay inert for the dialog's whole life: the
- * panel takes key status only for a view that needs to be first
- * responder, and it holds nothing but buttons, which answer a click.
+ * in. Selecting the message can give the panel keyboard focus without
+ * activating the app, so its text can be copied. Buttons alone do not
+ * ask for key status, and answer a click.
  * (That click does land on the first press -- the buttons accept a
  * first mouse -- so nothing here needs clicking twice.)
  * Being noticed is left to passive signals: a floating window
@@ -64,9 +64,8 @@ const ICON_GAP = 14;
 // this is an NSPanel rather than an NSWindow: a plain window can become
 // key, and merely declining to activate does not prevent the window
 // server from routing keystrokes to it. A non-activating panel cannot
-// take the keyboard from the application in front, so the guarantee
-// holds however the window is ordered in, rather than resting on this
-// file never calling an activating method.
+// take the keyboard merely by appearing. It can take key status when
+// the user clicks its selectable text, without activating the app.
 const WINDOW_STYLE = 1 | 2 | 128;
 const NS_BACKING_STORE_BUFFERED = 2;
 const NS_FLOATING_WINDOW_LEVEL = 3;
@@ -74,6 +73,10 @@ const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0;
 const NS_CRITICAL_REQUEST = 0;
 const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES = 1;
 const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY = 256;
+const NS_EVENT_TYPE_KEY_DOWN = 10;
+const NS_EVENT_MODIFIER_FLAG_COMMAND = 1 << 20;
+// Shift | Control | Option | Command; Caps Lock does not change a shortcut.
+const SHORTCUT_MODIFIERS = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 
 // How long the event pump waits for one event before re-checking
 // whether the dialog has been answered. The slice is spent asleep
@@ -206,8 +209,8 @@ function layout(label, buttonsWidth, buttonHeight, caution) {
 
 /*
  * Build the dialog, without putting it on screen -- presentDialog does
- * that. Returns the panel, its buttons, the computed geometry, and the
- * handler: the buttons and geometry so a test can drive a click and
+ * that. Returns the panel, its message field, buttons, geometry, and
+ * handler: the field, buttons and geometry so a test can drive input and
  * check the layout without a user, and the handler because the panel
  * refers to its delegate weakly.
  */
@@ -237,10 +240,8 @@ function buildDialog(opts) {
     NS_BACKING_STORE_BUFFERED,
     false,
   );
-  // Only a control that genuinely needs typing may pull key status,
-  // and this panel has none -- its buttons answer a click. So the
-  // keyboard stays with whatever the user is working in even while
-  // the dialog is the frontmost thing on screen.
+  // Buttons do not pull key status. The selectable message does when
+  // clicked, so copying is available after deliberate interaction.
   win.becomesKeyOnlyIfNeeded = true;
   win.floatingPanel = true;
   // The panel owns its views once they are added as subviews below,
@@ -272,15 +273,12 @@ function buildDialog(opts) {
     win.contentView.addSubview(buttons[i]);
   }
   // Return would answer the default button and Escape the cancel
-  // button, and neither is reachable here -- which is the point. Key
-  // equivalents are only reached by a key window, and this panel
-  // never becomes one: it takes key status only for a view needing
-  // first responder, and it has none. AppKit goes further for the
+  // button once the user has focused the message. Before that, key
+  // equivalents are inert. AppKit goes further for the
   // default button specifically, disabling its Return equivalent
   // while the window is not key, so reading an empty key equivalent
   // back from it is that mechanism working rather than the assignment
-  // failing. They are set anyway, so the intent is on the record if
-  // the panel ever gains a field and starts taking key status.
+  // failing.
   buttons[buttons.length - 1].keyEquivalent = "\r";
   if (buttons.length > 1) {
     buttons[0].keyEquivalent = "\u001b";
@@ -294,6 +292,7 @@ function buildDialog(opts) {
     buttons: buttons,
     geometry: geometry,
     handler: handler,
+    messageField: label,
   };
 }
 
@@ -328,6 +327,34 @@ function presentDialog(dialog) {
 }
 
 /*
+ * Command-C and Command-A are normally menu key equivalents, not
+ * NSTextView key bindings. This standalone event loop must dispatch
+ * their actions itself. Only the focused message's field editor may
+ * receive them; other keys continue through normal AppKit dispatch.
+ */
+function handleMessageShortcut(dialog, event) {
+  if (
+    Number(event.type) !== NS_EVENT_TYPE_KEY_DOWN ||
+    (Number(event.modifierFlags) & SHORTCUT_MODIFIERS) !==
+      NS_EVENT_MODIFIER_FLAG_COMMAND ||
+    !dialog.window.isKeyWindow
+  ) {
+    return false;
+  }
+  const editor = dialog.messageField.currentEditor;
+  if (editor.isNil() || !dialog.window.firstResponder.isEqual(editor)) {
+    return false;
+  }
+  const key = ObjC.unwrap(event.charactersIgnoringModifiers).toLowerCase();
+  const action = key === "c" ? "copy:" : key === "a" ? "selectAll:" : null;
+  // Target the verified editor; JS null would bridge the sender to NSNull.
+  return (
+    action !== null &&
+    $.NSApplication.sharedApplication.sendActionToFrom(action, editor, $())
+  );
+}
+
+/*
  * Wait for the dialog to be answered, however long that takes: an
  * approval prompt the user leaves sitting is a pending decision, not a
  * timeout.
@@ -358,7 +385,7 @@ function pumpUntilAnswered(dialog) {
       $.NSDefaultRunLoopMode,
       true,
     );
-    if (!event.isNil()) {
+    if (!event.isNil() && !handleMessageShortcut(dialog, event)) {
       app.sendEvent(event);
     }
   }

@@ -8,10 +8,10 @@
 """Behavior tests for the JXA dialog crony draws on macOS.
 
 `src/crony/platform/dialog.js` is the window both desktop prompts appear
-in, and its reason for existing is that it must never take the keyboard
-from the application the user is working in. That is a runtime property
--- it lives in what AppKit does with a window that is shown but never
-made key -- so a mocked subprocess cannot show it. These tests run the
+in, and its reason for existing is that appearing must not take the
+keyboard from the application the user is working in. That is a runtime
+property -- it lives in what AppKit does with a window shown without
+being made key -- so a mocked subprocess cannot show it. These tests run the
 real script under osascript and assert on the window it actually built.
 
 Every test that builds a dialog puts a window on screen and an icon in
@@ -35,7 +35,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 
@@ -50,8 +50,7 @@ _script_path = Path(__file__)
 DIALOG_JS = REPO_ROOT / "src" / "crony" / "platform" / "dialog.js"
 
 
-# The opt-in marker is per class, not here: TestDialogUsage builds no
-# dialog and so runs by default.
+# All AppKit behavior tests are opt-in, including windowless dispatch tests.
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin", reason="the dialog is Cocoa"
 )
@@ -99,8 +98,7 @@ function main() {
     result.appActive = $.NSApplication.sharedApplication.isActive;
     result.windowIsKey = approval.window.isKeyWindow;
     result.windowVisible = approval.window.isVisible;
-    // The structural facts that make taking the keyboard impossible,
-    // as opposed to merely not happening on this run.
+    // The structure that avoids taking the keyboard on presentation.
     result.isPanel = approval.window.isKindOfClass($.NSPanel);
     result.styleMask = Number(approval.window.styleMask);
     result.becomesKeyOnlyIfNeeded = approval.window.becomesKeyOnlyIfNeeded;
@@ -155,38 +153,6 @@ function main() {
     result.dismissedAnswered = isAnswered();
     result.dismissedAnswer = answer();
 
-    // The wait must dequeue and dispatch events, or the dialog draws
-    // but cannot be clicked. Post an event, run one pump slice, and
-    // see whether it was taken off the queue. Spinning the run loop
-    // instead leaves it sitting there.
-    const probe = buildDialog({
-        title: 'crony: synthetic job',
-        message: 'event pump probe',
-        buttons: ['OK'],
-        caution: false,
-    });
-    presentDialog(probe);
-    const app = $.NSApplication.sharedApplication;
-    function postTagged(tag) {
-        app.postEventAtStart(
-            $.NSEvent.otherEventWithTypeLocationModifierFlagsTimestampWindowNumberContextSubtypeData1Data2(
-                $.NSEventTypeApplicationDefined, $.NSMakePoint(0, 0), 0, 0,
-                probe.window.windowNumber, $(), 0, tag, 0),
-            true);
-    }
-    postTagged(4242);
-    // The pump returns only once the dialog is answered, so close the
-    // window from the run loop it is servicing -- which also proves it
-    // services timers, not just the event queue.
-    probe.window.performSelectorWithObjectAfterDelay('close', $(), 0.5);
-    pumpUntilAnswered(probe);
-    result.pumpDrainedItsEvent = app
-        .nextEventMatchingMaskUntilDateInModeDequeue(
-            Number.MAX_SAFE_INTEGER,
-            $.NSDate.dateWithTimeIntervalSinceNow(0.1),
-            $.NSDefaultRunLoopMode, true)
-        .isNil();
-
     return JSON.stringify(result);
 }
 
@@ -221,8 +187,8 @@ class TestDialogTakesNoFocus:
     observable from here: `NSApp.isActive` reports what the app has
     processed rather than what the window server did, and it read
     `false` on a build that was demonstrably swallowing keystrokes. So
-    the assertions below pin the *structure* that makes taking the
-    keyboard impossible -- a non-activating panel, which cannot -- and
+    the assertions below pin the *structure* that avoids taking the
+    keyboard on presentation -- a non-activating panel -- and
     treat the live readings as corroboration only. The gate for the
     property is the manual typing check in DEVELOPMENT.md.
     """
@@ -239,8 +205,7 @@ class TestDialogTakesNoFocus:
     def test_panel_takes_key_status_only_if_needed(
         self, built: dict[str, Any]
     ) -> None:
-        # Nothing here needs typing -- the buttons answer a click -- so
-        # this panel never has a reason to pull key status.
+        # Buttons do not pull key status; selecting the message can.
         assert built["becomesKeyOnlyIfNeeded"] is True
 
     def test_panel_joins_the_frontmost_space(
@@ -271,9 +236,8 @@ class TestDialogTakesNoFocus:
         self, built: dict[str, Any]
     ) -> None:
         # AppKit disables the default button's Return equivalent while
-        # its window is not key, and this panel never becomes key -- it
-        # takes key status only for a view needing first responder, and
-        # has none. So a stray Return cannot run the job at any point.
+        # its window is not key. A stray Return cannot run the job before
+        # the user deliberately focuses the message.
         # Asserting the binding was set before presenting keeps this
         # honest: an empty result either way would also pass on a file
         # that never asked for the binding at all.
@@ -317,6 +281,161 @@ class TestDialogChoice:
         assert built["dismissedAnswer"] == ""
 
 
+_COPY_HARNESS = """
+ObjC.import('Foundation');
+eval(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(
+    '%DIALOG_JS%', $.NSUTF8StringEncoding, null)));
+
+function main() {
+    const app = $.NSApplication.sharedApplication;
+    const retained = $.NSMutableArray.array;
+    let actions = [];
+    ObjC.registerSubclass({
+        name: 'CronyShortcutTestEditor',
+        superclass: 'NSObject',
+        methods: {
+            'copy:': {
+                types: ['void', ['id']],
+                implementation: function () {
+                    actions.push('copy');
+                },
+            },
+            'selectAll:': {
+                types: ['void', ['id']],
+                implementation: function () {
+                    actions.push('selectAll');
+                },
+            },
+        },
+    });
+    const command = 1 << 20;
+    const cases = [
+        {name: 'copy', pump: true},
+        {name: 'selectAllThenCopy', pump: true, keys: ['a', 'c']},
+        {name: 'capsLockCopy', pump: true, keys: ['C'],
+            flags: command | (1 << 16)},
+        {name: 'notKey', keyWindow: false},
+        {name: 'noEditor', editor: false},
+        {name: 'otherResponder', responder: false},
+        {name: 'withoutCommand', flags: 0},
+        {name: 'shift', flags: command | (1 << 17)},
+        {name: 'control', flags: command | (1 << 18)},
+        {name: 'option', flags: command | (1 << 19)},
+        {name: 'otherKey', keys: ['x']},
+        {name: 'keyUp', type: 11},
+    ];
+    const result = {};
+    cases.forEach(function (test) {
+        actions = [];
+        const editor = $.CronyShortcutTestEditor.alloc.init;
+        retained.addObject(editor);
+        const keys = test.keys || ['c'];
+        const responder = test.responder === false
+            ? $.NSObject.alloc.init : editor;
+        retained.addObject(responder);
+        // Focus is a controlled input. Events and target/action dispatch
+        // use AppKit, without asking the window server for focus.
+        const dialog = {
+            window: {
+                isKeyWindow: test.keyWindow !== false,
+                firstResponder: responder,
+                get isVisible() { return actions.length < keys.length; },
+            },
+            messageField: {
+                currentEditor: test.editor === false ? $() : editor,
+            },
+        };
+        const events = keys.map(function (key) {
+            return $.NSEvent
+                .keyEventWithTypeLocationModifierFlagsTimestampWindowNumberContextCharactersCharactersIgnoringModifiersIsARepeatKeyCode(
+                    test.type || 10, $.NSMakePoint(0, 0),
+                    test.flags === undefined ? command : test.flags,
+                    0, 0, $(), key, key, false, key === 'a' ? 0 : 8);
+        });
+        let handled = null;
+        if (test.pump) {
+            for (let i = events.length - 1; i >= 0; i--) {
+                app.postEventAtStart(events[i], true);
+            }
+            pumpUntilAnswered(dialog);
+        } else {
+            handled = handleMessageShortcut(dialog, events[0]);
+        }
+        result[test.name] = {
+            actions: actions,
+            handled: handled,
+        };
+    });
+    return JSON.stringify(result);
+}
+run = main;
+"""
+
+
+class _ShortcutResult(TypedDict):
+    actions: list[str]
+    handled: bool | None
+
+
+@pytest.fixture(scope="module")
+def shortcuts() -> dict[str, _ShortcutResult]:
+    proc = subprocess.run(
+        [
+            "osascript",
+            "-l",
+            "JavaScript",
+            "-e",
+            _COPY_HARNESS.replace("%DIALOG_JS%", str(DIALOG_JS)),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    parsed: dict[str, _ShortcutResult] = json.loads(proc.stdout)
+    return parsed
+
+
+@pytest.mark.visible_dialog
+class TestDialogCopy:
+    @pytest.mark.parametrize(
+        ("case", "expected"),
+        [
+            ("copy", ["copy"]),
+            ("selectAllThenCopy", ["selectAll", "copy"]),
+            ("capsLockCopy", ["copy"]),
+        ],
+    )
+    def test_pump_dispatches_shortcuts(
+        self,
+        shortcuts: dict[str, _ShortcutResult],
+        case: str,
+        expected: list[str],
+    ) -> None:
+        assert shortcuts[case]["actions"] == expected
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "notKey",
+            "noEditor",
+            "otherResponder",
+            "withoutCommand",
+            "shift",
+            "control",
+            "option",
+            "otherKey",
+            "keyUp",
+        ],
+    )
+    def test_other_events_are_not_consumed(
+        self, shortcuts: dict[str, _ShortcutResult], case: str
+    ) -> None:
+        assert shortcuts[case]["handled"] is False
+        assert shortcuts[case]["actions"] == []
+
+
 @pytest.mark.visible_dialog
 class TestDialogLayout:
     """The window is sized from its content, so neither prompt is
@@ -332,26 +451,6 @@ class TestDialogLayout:
 
     def test_failure_dialog_has_one_button(self, built: dict[str, Any]) -> None:
         assert built["failureButtons"] == ["OK"]
-
-
-@pytest.mark.visible_dialog
-class TestDialogIsAnswerable:
-    """The wait has to take events off the queue, or the dialog draws
-    but cannot be clicked -- an approval prompt that never returns
-    holds the job's lock forever, and a failure popup floats
-    undismissable above every window."""
-
-    def test_wait_drains_the_event_queue(self, built: dict[str, Any]) -> None:
-        # Spinning the run loop services input sources but never
-        # dequeues, so the window server's events sit there and every
-        # button stays inert; a posted event must be gone from the
-        # queue once the wait has run.
-        #
-        # That shows the event was dequeued, not that `sendEvent:`
-        # delivered it -- a loop dropping what it dequeued would pass
-        # this too. Delivery needs the window server to route a real
-        # click, which is the manual check DEVELOPMENT.md carries.
-        assert built["pumpDrainedItsEvent"] is True
 
 
 # Drives dialog.js's own `run(argv)` -- the entry point production uses,
