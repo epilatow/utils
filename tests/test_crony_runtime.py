@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,10 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     PreconditionError,
     UsageError,
+)
+from crony.launch import (  # noqa: E402
+    LauncherPath,
+    parse_argv,
 )
 from crony.model import (  # noqa: E402
     ConfigStatus,
@@ -1176,199 +1181,84 @@ class TestPlatformUnitDiscovery:
         assert crony_runtime._platform_unit_names() == set()
 
 
-class TestExecPathStrings:
-    """`model.exec_path_strings` recovers the absolute uv / crony
-    executable path strings baked into a unit's invocation prefix,
-    regardless of their filenames or whether they still exist on disk
-    (rendering the normalized unit and checking the paths' existence on
-    disk are separate concerns).
-    """
-
-    def test_recovers_paths(self) -> None:
-        argv = crony_model._run_argv(
-            Path("/abs/uv"), Path("/abs/crony"), EntityRef("d", "u-test")
-        )
-        assert crony_model.exec_path_strings(list(argv)) == (
-            "/abs/uv",
-            "/abs/crony",
-        )
-
-    def test_unrelated_path_names_are_not_launchers(self) -> None:
-        argv = ["/a/uv", "x", "/b/crony", "y", "z", "/a/uv"]
-        assert crony_model.exec_path_strings(argv) == (None, None)
-
-    @pytest.mark.parametrize("timeout", [0, 120])
-    def test_recovers_launcher_aliases(self, timeout: int) -> None:
-        argv = crony_model._guarded_argv(
-            Path("/bin/uv-stable"),
-            Path("/bin/crony-stable"),
-            EntityRef("d", "u-test"),
-            timeout,
-            True,
-        )
-        assert crony_model.exec_path_strings(list(argv)) == (
-            "/bin/uv-stable",
-            "/bin/crony-stable",
-        )
-
-    def test_recovers_even_when_absent_on_disk(self) -> None:
-        # The strings are returned even for a baked path that's since been
-        # removed; the filesystem check that decides whether the unit can
-        # be reproduced happens elsewhere (the current-graph scan).
-        argv = ["/gone/uv", "run", "--script", "/gone/crony", "_run", "x:y"]
-        assert crony_model.exec_path_strings(argv) == (
-            "/gone/uv",
-            "/gone/crony",
-        )
-
-    def test_recovers_paths_with_private_cache(self) -> None:
-        argv = [
-            "/gone/uv",
-            "run",
-            "--cache-dir",
-            "/home/user with spaces/.cache/crony/uv",
-            "--script",
-            "/gone/crony",
-            "_run",
-            "x:y",
-        ]
-        assert crony_model.exec_path_strings(argv) == (
-            "/gone/uv",
-            "/gone/crony",
-        )
-
-    def test_none_for_missing_element(self) -> None:
-        assert crony_model.exec_path_strings(["/abs/uv", "run", "x:y"]) == (
-            None,
-            None,
-        )
-        assert crony_model.exec_path_strings(["run", "x:y"]) == (None, None)
-
-
 class TestGuardedArgv:
     """`model._guarded_argv` wraps the base run in the guard for every
     entry, with the entry's timeout as the cap -- 0 for an uncapped one;
     an interactive entry carries a leading `--interactive` marker, a
-    non-interactive one does not. The invocation prefix recovers uv /
-    crony from any guarded shape just as it does from the bare one."""
+    non-interactive one does not. Both launches use crony's shebang."""
 
-    _UV = Path("/abs/uv")
-    _CRONY = Path("/abs/crony")
     _REF = EntityRef("default", "u-test")
 
     def test_uncapped_wraps_with_a_zero_cap(self) -> None:
         # Nothing to time out, but the run still has to be stoppable, so
         # it is wrapped with the no-cap value rather than left bare.
-        argv = crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 0, False
-        )
+        argv = crony_model._guarded_argv(self._REF, 0, False)
         assert argv == (
-            "/abs/uv",
-            "run",
-            "--cache-dir",
-            str(Path.home() / ".cache" / "crony" / "uv"),
-            "--script",
-            "/abs/crony",
+            "crony",
             crony_model.GUARD_SUBCOMMAND,
             "0",
-            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+            *crony_model._run_argv(self._REF),
         )
 
     def test_capped_wraps_with_timeout_as_cap(self) -> None:
-        argv = crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 120, False
-        )
+        argv = crony_model._guarded_argv(self._REF, 120, False)
         assert argv == (
-            "/abs/uv",
-            "run",
-            "--cache-dir",
-            str(Path.home() / ".cache" / "crony" / "uv"),
-            "--script",
-            "/abs/crony",
+            "crony",
             crony_model.GUARD_SUBCOMMAND,
             str(120),
-            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+            *crony_model._run_argv(self._REF),
         )
 
     def test_interactive_capped_carries_marker(self) -> None:
-        argv = crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 120, True
-        )
+        argv = crony_model._guarded_argv(self._REF, 120, True)
         assert argv == (
-            "/abs/uv",
-            "run",
-            "--cache-dir",
-            str(Path.home() / ".cache" / "crony" / "uv"),
-            "--script",
-            "/abs/crony",
+            "crony",
             crony_model.GUARD_SUBCOMMAND,
             str(120),
             "--interactive",
-            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+            *crony_model._run_argv(self._REF),
         )
 
     def test_uncapped_interactive_carries_marker(self) -> None:
         # The marker describes the entry, not its cap, so an uncapped
         # interactive entry renders it like a capped one.
-        argv = crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 0, True
-        )
+        argv = crony_model._guarded_argv(self._REF, 0, True)
         assert argv == (
-            "/abs/uv",
-            "run",
-            "--cache-dir",
-            str(Path.home() / ".cache" / "crony" / "uv"),
-            "--script",
-            "/abs/crony",
+            "crony",
             crony_model.GUARD_SUBCOMMAND,
             "0",
             "--interactive",
-            *crony_model._run_argv(self._UV, self._CRONY, self._REF),
+            *crony_model._run_argv(self._REF),
         )
 
-    def test_paths_recover_from_guarded_shape(self) -> None:
-        argv = crony_model._guarded_argv(
-            self._UV, self._CRONY, self._REF, 600, True
-        )
-        assert crony_model.exec_path_strings(list(argv)) == (
-            "/abs/uv",
-            "/abs/crony",
-        )
+    def test_command_has_no_uv_options(self) -> None:
+        argv = crony_model._guarded_argv(self._REF, 600, True)
+        assert argv.count("crony") == 2
+        assert "--script" not in argv and "--cache-dir" not in argv
 
 
 class TestPrivateUvCache:
-    def test_all_launchers_share_the_home_cache(
+    def test_all_launchers_use_the_shebang(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         home = tmp_path / "home with spaces"
         monkeypatch.setattr(Path, "home", lambda: home)
         monkeypatch.setattr(crony_model, "_current_machine_id", lambda: "host")
         before = os.environ.copy()
-        uv = Path("/abs/uv")
-        crony = Path("/abs/crony")
         ref = EntityRef("default", "u-test")
         jitter = crony_model._jitter_spec(
             EntityName("default", "j"),
             ref,
             Interval("30min", 1800),
-            uv,
-            crony,
+            LauncherPath(Path("/crony-bin"), Path("/uv-bin")),
         )
         assert jitter is not None
-        prefix = (
-            "/abs/uv",
-            "run",
-            "--cache-dir",
-            str(home / ".cache" / "crony" / "uv"),
-            "--script",
-            "/abs/crony",
-        )
-        runner = crony_model._run_argv(uv, crony, ref)
-        guard = crony_model._guarded_argv(uv, crony, ref, 120, False)
-        assert runner[:6] == prefix
-        assert guard[:6] == prefix
-        assert guard[8:14] == prefix
-        assert jitter.cmd[:6] == prefix
+        runner = crony_model._run_argv(ref)
+        guard = crony_model._guarded_argv(ref, 120, False)
+        parsed = parse_argv(list(jitter.cmd))
+        assert parsed is not None
+        assert runner[0] == guard[0] == guard[3] == parsed.argv[0] == "crony"
+        assert "--cache-dir" not in guard + parsed.argv
         assert os.environ == before
 
     def test_shebang_expands_home_as_one_argument(self, tmp_path: Path) -> None:
@@ -1398,11 +1288,7 @@ class TestPrivateUvCache:
 
 
 class TestInstalledCmdParsing:
-    """The backends parse an on-disk unit back to its run argv
-    (`launchd._plist_argv` / `systemd._service_argv`), or None when the
-    file isn't the shape `render` produces. Interpreting the argv is the
-    runtime layer's job (see `TestExecPathsFromArgv`).
-    """
+    """Backend parsers decode raw target argv without interpreting it."""
 
     _CMD = ("/abs/uv", "run", "--script", "/abs/crony", "run", "x:y")
 
@@ -1426,18 +1312,16 @@ class TestInstalledCmdParsing:
             is None
         )
 
-    def test_none_for_plist_without_sh_wrapper(self) -> None:
-        # render wraps the argv in `/bin/sh -c 'exec ...'`; a bare argv
-        # array isn't the shape installed_cmd recognizes.
+    def test_bare_argv_is_preserved(self) -> None:
         bogus = (
             '<?xml version="1.0"?><plist><dict>'
             "<key>ProgramArguments</key><array>"
             "<string>/abs/uv</string><string>run</string>"
             "</array></dict></plist>"
         )
-        assert launchd._plist_argv(bogus) is None
+        assert launchd._plist_argv(bogus) == ["/abs/uv", "run"]
 
-    def test_none_for_plist_sh_wrapper_without_exec(self) -> None:
+    def test_shell_script_is_opaque_to_platform(self) -> None:
         bogus = (
             '<?xml version="1.0"?><plist><dict>'
             "<key>ProgramArguments</key><array>"
@@ -1445,7 +1329,13 @@ class TestInstalledCmdParsing:
             "<string>/abs/uv run --script /abs/crony _run x:y</string>"
             "</array></dict></plist>"
         )
-        assert launchd._plist_argv(bogus) is None
+        argv = launchd._plist_argv(bogus)
+        assert argv == [
+            "/bin/sh",
+            "-c",
+            "/abs/uv run --script /abs/crony _run x:y",
+        ]
+        assert parse_argv(argv) is None
 
     def test_none_for_systemd_missing_exec_start(self) -> None:
         assert systemd._service_argv("[Service]\nType=oneshot\n") is None
@@ -1494,6 +1384,85 @@ class TestUnitDriftDetection:
         _, config, _ = self._apply_and_load(tmp_path, monkeypatch)
         ref = config.current.by_full_name["default.j"]
         assert config.cfg_status(ref) == "synced"
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    @pytest.mark.parametrize("cache_option", [False, True])
+    def test_unsupported_launcher_is_replaced_and_apply_preserves_toml(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        platform: str,
+        cache_option: bool,
+    ) -> None:
+        h, config, _ = self._apply_and_load(tmp_path, monkeypatch, platform)
+        ref = config.current.by_full_name[h.full("j")]
+        node = config.current.job_from_ref(ref)
+        assert node is not None and node.uv_path and node.crony_path
+        argv: list[str] = []
+        current_launch = parse_argv(list(node.unit_spec().cmd))
+        assert current_launch is not None
+        for token in current_launch.argv:
+            if token == "crony":
+                argv.extend((str(node.uv_path), "run"))
+                if cache_option:
+                    argv.extend(("--cache-dir", str(tmp_path / "old-cache")))
+                argv.extend(("--script", str(node.crony_path)))
+            else:
+                argv.append(token)
+        sched = crony_runtime.scheduler(platform)
+        cmd = (
+            ("/bin/sh", "-c", f"exec {shlex.join(argv)}")
+            if platform == "darwin"
+            else tuple(argv)
+        )
+        legacy = dataclasses.replace(node.unit_spec(), cmd=cmd)
+        sched.install(legacy, activate=False)
+        toml_before = crony_paths.CONFIG_FILE.read_bytes()
+        config = crony_runtime.load_config()
+        assert config.cfg_status(ref) == "broken"
+        assert (
+            crony_commands._stale_fields(
+                config.pending.job_from_ref(ref),
+                config.current.job_from_ref(ref),
+            )
+            == "unit-config-1"
+        )
+        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        config = crony_runtime.load_config()
+        assert config.cfg_status(ref) == "synced"
+        assert crony_paths.CONFIG_FILE.read_bytes() == toml_before
+        launch = parse_argv(sched.installed_cmd(h.full("j")) or [])
+        assert launch is not None and launch.path is not None
+        assert launch.argv[0] == "crony"
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_shebang_cache_change_does_not_change_unit_or_status(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        platform: str,
+    ) -> None:
+        launcher_dir = tmp_path / "launcher"
+        launcher_dir.mkdir()
+        launcher = launcher_dir / "crony"
+        launcher.write_bytes((REPO_ROOT / "bin" / "crony").read_bytes())
+        launcher.chmod(0o755)
+        monkeypatch.setattr(
+            crony_runtime, "_crony_executable", lambda: launcher
+        )
+        h, config, _ = self._apply_and_load(tmp_path, monkeypatch, platform)
+        ref = config.current.by_full_name[h.full("j")]
+        sched = crony_runtime.scheduler(platform)
+        before = sched.ondisk_units(h.full("j"))
+        launcher.write_text(
+            launcher.read_text().replace(
+                ".cache/crony/uv", ".cache/crony/another-cache"
+            )
+        )
+        config = crony_runtime.load_config()
+        assert config.cfg_status(ref) == "synced"
+        assert sched.ondisk_units(h.full("j")) == before
+        assert crony_runtime.apply_one(config, ref) == "unchanged"
 
     def test_hand_edited_plist_flags_stale(
         self, tmp_path: Path, monkeypatch: Any
@@ -1728,7 +1697,11 @@ class TestUnitDriftDetection:
         content = unit_config.read_text()
         live_uv = str(crony_runtime._uv_executable())
         bogus_uv = str(tmp_path / "nonexistent" / "uv")
-        unit_config.write_text(content.replace(live_uv, bogus_uv))
+        unit_config.write_text(
+            content.replace(
+                str(Path(live_uv).parent), str(Path(bogus_uv).parent)
+            )
+        )
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         assert config.cfg_status(ref) == "broken"
@@ -1747,14 +1720,16 @@ class TestUnitDriftDetection:
         alt.mkdir()
         alt_uv = alt / "uv"
         alt_uv.write_text("")
+        alt_uv.chmod(0o755)
         alt_crony = alt / "crony"
         alt_crony.write_text("")
+        alt_crony.chmod(0o755)
         content = unit_config.read_text()
         content = content.replace(
-            str(crony_runtime._uv_executable()), str(alt_uv)
+            str(crony_runtime._uv_executable().parent), str(alt_uv.parent)
         )
         content = content.replace(
-            str(crony_runtime._crony_executable()), str(alt_crony)
+            str(crony_runtime._crony_executable().parent), str(alt_crony.parent)
         )
         unit_config.write_text(content)
         config = crony_runtime.load_config()

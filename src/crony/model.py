@@ -35,6 +35,7 @@ from typing import Any, Self
 
 import crony.config
 import crony.errors
+import crony.launch
 import crony.paths
 import crony.platform
 import crony.snapshot
@@ -148,49 +149,31 @@ def _current_machine_id() -> str:
     ).machine_id()
 
 
-def _uv_script_argv(uv_path: Path, crony_path: Path) -> tuple[str, ...]:
-    """Launch crony with its own cache without changing jobs' environment."""
-    return (
-        str(uv_path),
-        "run",
-        "--cache-dir",
-        str(Path.home() / ".cache" / "crony" / "uv"),
-        "--script",
-        str(crony_path),
-    )
-
-
 def _jitter_spec(
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
     timing: crony.unit.Timing | None,
-    uv_path: Path,
-    crony_path: Path,
+    launcher_path: crony.launch.LauncherPath,
 ) -> crony.unit.JitterSpec | None:
     """The `JitterSpec` for an eligible interval unit, else None. Owns the
     eligibility decision and the offset draw so the backends only render
-    the result; the companion argv's uv / crony paths mirror `cmd`'s, so a
-    normalized (blank-path) spec blanks them too and a moved binary is not
-    drift."""
+    the result."""
     if not _is_jittered(timing):
         return None
     # _is_jittered is true only for an eligible Interval; narrow it for the
     # offset draw and the synthesized offset Interval.
     assert isinstance(timing, crony.unit.Interval)
     offset = _jitter_offset_seconds(name, timing, _current_machine_id())
-    # The companion argv mirrors `_run_argv`: absolute uv / crony paths are
-    # baked in because schedulers start a unit with a minimal PATH. `ref`
-    # locates the service state dir (its lock / log); `name` addresses the
-    # service and companion units through the scheduler, so the runner
-    # needs no launchctl strings baked in.
+    # `ref` locates the service state; `name` addresses its scheduler units.
     cmd = (
-        *_uv_script_argv(uv_path, crony_path),
+        "crony",
         JITTER_SUBCOMMAND,
         str(ref),
         str(name),
     )
     return crony.unit.JitterSpec(
-        offset=crony.unit.Interval(f"{offset}s", offset), cmd=cmd
+        offset=crony.unit.Interval(f"{offset}s", offset),
+        cmd=crony.launch.target_argv(cmd, launcher_path),
     )
 
 
@@ -211,25 +194,19 @@ def _daemon_spec(
     )
 
 
-def _run_argv(
-    uv_path: Path, crony_path: Path, ref: crony.unit.EntityRef
-) -> tuple[str, ...]:
+def _run_argv(ref: crony.unit.EntityRef) -> tuple[str, ...]:
     """The argv a unit uses to invoke the runner for `ref`.
 
-    The absolute uv / crony paths are baked in because platform
-    schedulers start a unit with a minimal PATH that omits uv; the
-    runner is addressed by `<bundle>:<uuid>` so it skips the name lookup.
+    The runner is addressed by `<bundle>:<uuid>` so it skips name lookup.
     """
     return (
-        *_uv_script_argv(uv_path, crony_path),
+        "crony",
         RUN_SUBCOMMAND,
         str(ref),
     )
 
 
 def _guarded_argv(
-    uv_path: Path,
-    crony_path: Path,
     ref: crony.unit.EntityRef,
     timeout: int,
     interactive: bool,
@@ -244,33 +221,15 @@ def _guarded_argv(
     guard leaves the pre-command wait unbounded and clocks the cap only
     once the command starts. A non-interactive entry omits it, so its argv
     is unchanged from an unmarked guard wrap."""
-    base = _run_argv(uv_path, crony_path, ref)
+    base = _run_argv(ref)
     marker = ("--interactive",) if interactive else ()
     return (
-        *_uv_script_argv(uv_path, crony_path),
+        "crony",
         GUARD_SUBCOMMAND,
         str(timeout),
         *marker,
         *base,
     )
-
-
-def exec_path_strings(argv: list[str]) -> tuple[str | None, str | None]:
-    """The `(uv, crony)` executable path strings baked into a unit's run
-    argv. Bare, guard-wrapped, and jitter commands use the same uv script
-    prefix, including an optional cache directory. Launcher filenames do
-    not matter. Both are None when argv lacks a recognized prefix.
-    Existence is the caller's concern; this returns the strings so they
-    can be compared against disk even when the binary is gone."""
-    if (
-        len(argv) >= 6
-        and argv[1:3] == ["run", "--cache-dir"]
-        and argv[4] == "--script"
-    ):
-        return argv[0], argv[5]
-    if len(argv) >= 4 and argv[1:3] == ["run", "--script"]:
-        return argv[0], argv[3]
-    return None, None
 
 
 def _unit_platform_properties(
@@ -300,7 +259,7 @@ def _normalized_spec(
     *,
     platform_properties: crony.unit.UnitPlatformProperties,
 ) -> crony.unit.UnitSpec:
-    """A UnitSpec with blank (`Path("")`) executable paths -- the
+    """A comparison-only UnitSpec with placeholder launcher directories -- the
     path-independent form both graphs normalize to for the drift compare.
     Rendering it drops any dependence on where the uv / crony binaries
     live, so a moved-but-present binary collapses to the same content as
@@ -311,15 +270,14 @@ def _normalized_spec(
     `daemon_timing` is the entry's own mode, which a disabled entry's
     render can no longer report but which still decides whether this is
     a daemon unit."""
-    cmd = _guarded_argv(
-        Path(""), Path(""), ref, guard_timeout, guard_interactive
-    )
+    cmd = _guarded_argv(ref, guard_timeout, guard_interactive)
+    launcher_path = crony.launch.LauncherPath(Path(""), Path(""))
     return crony.unit.UnitSpec(
         name=name,
-        cmd=cmd,
+        cmd=crony.launch.target_argv(cmd, launcher_path),
         timing=timing,
         priority=priority,
-        jitter=_jitter_spec(name, ref, timing, Path(""), Path("")),
+        jitter=_jitter_spec(name, ref, timing, launcher_path),
         daemon=_daemon_spec(daemon_timing),
         platform_properties=platform_properties,
     )
@@ -558,7 +516,7 @@ class _JobCommon:
 
     def unit_spec(self) -> crony.unit.UnitSpec:
         """The platform UnitSpec the scheduler renders for this node's
-        real unit -- self-contained: the run command is built from the
+        real unit -- self-contained: the launcher PATH is built from the
         uv / crony executables the node carries (a pending node's live
         ones, a re-render's stamped ones). A disabled entry renders
         schedule-less (`timing` dropped) -- loaded and triggerable, but
@@ -572,7 +530,7 @@ class _JobCommon:
 
         Requires those paths; a node only ever compared, never installed
         (a bare snapshot load), has no unit to render and raises. The
-        drift comparison renders with blank executable paths and builds
+        drift comparison renders with neutral launcher directories and builds
         its spec directly, so it does not go through here."""
         if self.uv_path is None or self.crony_path is None:
             raise crony.errors.PreconditionError(
@@ -580,21 +538,20 @@ class _JobCommon:
                 f"to render its unit"
             )
         uv_path, crony_path = self.uv_path, self.crony_path
+        launcher_path = crony.launch.LauncherPath.from_executables(
+            crony_path, uv_path
+        )
         cmd = _guarded_argv(
-            uv_path,
-            crony_path,
-            self.entity_ref,
-            self._guard_timeout,
-            self._guard_interactive,
+            self.entity_ref, self._guard_timeout, self._guard_interactive
         )
         timing = None if self.unit_disabled else self.timing
         return crony.unit.UnitSpec(
             name=self.entity_name,
-            cmd=cmd,
+            cmd=crony.launch.target_argv(cmd, launcher_path),
             timing=timing,
             priority=self._unit_priority,
             jitter=_jitter_spec(
-                self.entity_name, self.entity_ref, timing, uv_path, crony_path
+                self.entity_name, self.entity_ref, timing, launcher_path
             ),
             daemon=_daemon_spec(self.timing),
             platform_properties=self.platform_properties,
@@ -1249,16 +1206,17 @@ def _current_rendered_units(
         ).units
     }
     # `comparison_units` renders with the installed (on-disk) uv / crony
-    # paths. It is only a yardstick for the synced test below and is never
-    # stored: unlike the pending node's units (rendered with blank paths
+    # directories. It is only a yardstick for the synced test below and is
+    # never stored: unlike the pending node's units (neutral directories
     # so a moved-but-present binary is not drift), it is what a clean
     # on-disk unit should byte-match, so an on-disk file equal to it is a
     # faithful install of this entry.
     comparison_units: dict[Path, str] = {}
     if installed_uv is not None and installed_crony is not None:
+        launcher_path = crony.launch.LauncherPath.from_executables(
+            installed_crony, installed_uv
+        )
         cmd = _guarded_argv(
-            installed_uv,
-            installed_crony,
             ref,
             guard_timeout,
             guard_interactive,
@@ -1268,12 +1226,10 @@ def _current_rendered_units(
             for u in sched.render_units(
                 crony.unit.UnitSpec(
                     name=name,
-                    cmd=cmd,
+                    cmd=crony.launch.target_argv(cmd, launcher_path),
                     timing=timing,
                     priority=priority,
-                    jitter=_jitter_spec(
-                        name, ref, timing, installed_uv, installed_crony
-                    ),
+                    jitter=_jitter_spec(name, ref, timing, launcher_path),
                     daemon=_daemon_spec(daemon_timing),
                     platform_properties=platform_properties,
                 )

@@ -137,7 +137,7 @@ class Scheduler(abc.ABC):
         the slots this spec actually produces, each carrying a real render
         (a systemd `.timer` is included only for a scheduled entry). Each
         `content` is the render of `spec` for that unit, with whatever
-        executable paths `spec.cmd` carries. To relate a render to what is
+        opaque target argv `spec.cmd` carries. To relate a render to what is
         on disk, align by `filename` against `ondisk_units`.
 
         `spec.platform_properties` must have this backend's native property
@@ -219,11 +219,12 @@ class Scheduler(abc.ABC):
 
     @abc.abstractmethod
     def installed_cmd(self, name: str) -> list[str] | None:
-        """The command argv embedded in `name`'s installed config unit,
+        """The raw target argv in `name`'s installed config unit,
         or None when no unit in the format `render` produces is present
         (missing, unreadable, or a different shape).
 
-        The inverse of the `spec.cmd` embedding `render` performs.
+        The inverse of the argv embedding `render` performs. The caller
+        interprets those arguments; this layer only decodes native syntax.
         """
 
     @abc.abstractmethod

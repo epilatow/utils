@@ -184,6 +184,92 @@ class TestRuntimeEnvExpansion:
     fire.
     """
 
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "/crony:/uv:",
+            "/tools:/tools:",
+            "/virtualenv/bin:/uv:",
+            "/crony:/virtualenv/bin:",
+            "/virtualenv/bin:/virtualenv/bin:",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "venv", ["", "/virtualenv/bin:", "/virtualenv/bin:/virtualenv/bin:"]
+    )
+    def test_scheduler_path_restored_before_env_expansion(
+        self,
+        monkeypatch: Any,
+        prefix: str,
+        venv: str,
+    ) -> None:
+        monkeypatch.setenv("LAUNCHER_PATH_PREFIX", prefix)
+        inherited = f"/virtualenv/bin:{prefix}/usr/bin:/bin"
+        monkeypatch.setenv("LAUNCHER_ORIGINAL_PATH", inherited)
+        original = f"{venv}{prefix}{inherited}"
+        monkeypatch.setenv("PATH", original)
+        env = crony_runner._runtime_env(
+            {
+                "BEFORE_PATH": "$PATH",
+                "PATH": "/extra:$PATH",
+            }
+        )
+        assert env["BEFORE_PATH"] == inherited
+        assert env["PATH"] == f"/extra:{inherited}"
+        assert "LAUNCHER_PATH_PREFIX" not in env
+        assert "LAUNCHER_ORIGINAL_PATH" not in env
+        assert os.environ["PATH"] == original
+        assert os.environ["LAUNCHER_PATH_PREFIX"] == prefix
+        assert os.environ["LAUNCHER_ORIGINAL_PATH"] == inherited
+
+    def test_unmarked_path_is_preserved(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("LAUNCHER_PATH_PREFIX", raising=False)
+        monkeypatch.delenv("LAUNCHER_ORIGINAL_PATH", raising=False)
+        monkeypatch.setenv("PATH", "/crony:/uv:/usr/bin")
+        assert crony_runner._runtime_env({})["PATH"] == "/crony:/uv:/usr/bin"
+
+    def test_unmarked_private_python_bin_is_preserved(
+        self,
+        monkeypatch: Any,
+    ) -> None:
+        monkeypatch.delenv("LAUNCHER_PATH_PREFIX", raising=False)
+        monkeypatch.delenv("LAUNCHER_ORIGINAL_PATH", raising=False)
+        monkeypatch.setenv("PATH", "/crony-python/bin:/usr/bin:/bin")
+        assert (
+            crony_runner._runtime_env({})["PATH"]
+            == "/crony-python/bin:/usr/bin:/bin"
+        )
+
+    def test_missing_path_remains_missing(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("PATH", raising=False)
+        monkeypatch.delenv("LAUNCHER_ORIGINAL_PATH", raising=False)
+        monkeypatch.setenv("LAUNCHER_PATH_PREFIX", "/crony:/uv:")
+        env = crony_runner._runtime_env({})
+        assert "PATH" not in env
+        assert "LAUNCHER_PATH_PREFIX" not in env
+
+    def test_unsaved_prefix_is_removed_without_changing_path(
+        self,
+        monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("LAUNCHER_PATH_PREFIX", "/crony:/uv:")
+        monkeypatch.delenv("LAUNCHER_ORIGINAL_PATH", raising=False)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        env = crony_runner._runtime_env({})
+        assert env["PATH"] == "/usr/bin:/bin"
+        assert "LAUNCHER_PATH_PREFIX" not in env
+
+    def test_empty_original_path_is_restored(
+        self,
+        monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setenv("LAUNCHER_PATH_PREFIX", "/crony:/uv:")
+        monkeypatch.setenv("LAUNCHER_ORIGINAL_PATH", "")
+        monkeypatch.setenv("PATH", "/virtualenv/bin:/crony:/uv:")
+        env = crony_runner._runtime_env({})
+        assert env["PATH"] == ""
+        assert "LAUNCHER_ORIGINAL_PATH" not in env
+
     def test_inherits_path_when_no_env_override(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         env = crony_runner._runtime_env({})

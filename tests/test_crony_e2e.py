@@ -63,6 +63,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony.errors import ExitCode
+from crony.launch import parse_argv
 from crony.platform import (
     LaunchdUnitPlatformProperties,
     current_platform,
@@ -504,6 +505,51 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
+    def test_job_env_expansion_excludes_launcher_path(
+        self,
+        e2e: _CronyE2E,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_uv = shutil.which("uv")
+        assert real_uv is not None
+        directory = tmp_path / "private launcher space"
+        directory.mkdir()
+        (directory / "uv").symlink_to(real_uv)
+        launcher = directory / "crony"
+        launcher.symlink_to(CRONY_BIN)
+        monkeypatch.setattr(sys.modules[__name__], "CRONY_BIN", launcher)
+        e2e.env["PATH"] = f"{directory}:{e2e.env['PATH']}"
+        result_file = tmp_path / "job-environment"
+        command = (
+            'printf \'%s\\n\' "$BEFORE_PATH" "$PATH" '
+            '"${LAUNCHER_PATH_PREFIX-}" "${LAUNCHER_ORIGINAL_PATH-}" '
+            '"${VIRTUAL_ENV-}" '
+            f"> {shlex.quote(str(result_file))}"
+        )
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\n"
+            'schedule = "*-*-* 03:00"\n'
+            'env.BEFORE_PATH = "$PATH"\n'
+            'env.PATH = "/job-extra:$PATH"\n',
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        assert e2e.status_config(e2e.full("probe")) == "synced"
+        e2e.inject_isolated_env("probe", restart=False)
+        e2e.crony("trigger", e2e.full("probe"))
+        e2e.wait_until(result_file.is_file, timeout=60, what="job environment")
+        e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
+        before, job_path, marker, saved_path, private_env = (
+            result_file.read_text().splitlines()
+        )
+        assert str(directory) not in before.split(":")
+        assert private_env
+        assert str(Path(private_env) / "bin") not in before.split(":")
+        assert job_path == f"/job-extra:{before}"
+        assert marker == ""
+        assert saved_path == ""
+
     def test_destroy_removes_deployment(self, e2e: _CronyE2E) -> None:
         e2e.write_bundle(
             '[job.probe]\ncommand = "true"\nschedule = "*-*-* 03:00"\n',
@@ -515,15 +561,17 @@ class TestApplyLifecycle:
         # Still in config, no longer deployed -> missing (not synced).
         assert e2e.status_config(e2e.full("probe")) == "missing"
 
+    @pytest.mark.parametrize("bin_name", ["bin", "bin space $literal%q'\\"])
     def test_trigger_survives_launcher_symlink_retarget(
         self,
         e2e: _CronyE2E,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        bin_name: str,
     ) -> None:
         real_uv = shutil.which("uv")
         assert real_uv is not None
-        bin_dir = tmp_path / "bin"
+        bin_dir = tmp_path / bin_name
         bin_dir.mkdir()
         for version in ("old", "new"):
             directory = tmp_path / version
@@ -546,12 +594,15 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
 
-        argv = get_scheduler(_PLATFORM, e2e.unit_dir).installed_cmd(
-            e2e.full("probe")
+        launch = parse_argv(
+            get_scheduler(_PLATFORM, e2e.unit_dir).installed_cmd(
+                e2e.full("probe")
+            )
+            or []
         )
-        assert argv is not None
-        assert str(uv) in argv
-        assert str(crony) in argv
+        assert launch is not None and launch.path is not None
+        assert launch.argv[0] == "crony"
+        assert launch.path.crony_dir == launch.path.uv_dir == bin_dir
         for launcher in (uv, crony):
             launcher.unlink()
             launcher.symlink_to(tmp_path / "new" / launcher.name)

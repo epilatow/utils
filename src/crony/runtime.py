@@ -32,6 +32,7 @@ from typing import Any, TypeGuard
 
 import crony.config
 import crony.errors
+import crony.launch
 import crony.model
 import crony.paths
 import crony.platform
@@ -826,24 +827,72 @@ def _current_unit_facts(
     name: str, sched: crony.platform.Scheduler
 ) -> tuple[Path | None, Path | None, bool, bool]:
     """The scheduler facts `_build_current_graph` bakes onto a current
-    node beyond its unit view: the uv / crony executable paths extracted
-    from the installed run command and confirmed still present on disk
-    (None when a baked binary is gone), whether the scheduler has the unit
+    node beyond its unit view: the uv / crony executable paths recovered
+    from the installed launcher and confirmed still present on disk
+    (None for an unsupported target or missing binary), whether its unit is
     loaded, and whether its schedule is armed. `cfg_status` reads these to
     tell a runnable, armed unit from a `broken` / gone / dead one."""
-    uv_s, crony_s = crony.model.exec_path_strings(
-        sched.installed_cmd(name) or []
-    )
-    installed_uv = Path(uv_s) if uv_s and Path(uv_s).is_file() else None
-    installed_crony = (
-        Path(crony_s) if crony_s and Path(crony_s).is_file() else None
-    )
+    launch = crony.launch.parse_argv(sched.installed_cmd(name) or [])
+    installed_uv = installed_crony = None
+    if launch is not None and launch.argv[:1] == ("crony",):
+        installed_uv, installed_crony = _launcher_executables(launch.path)
     return (
         installed_uv,
         installed_crony,
         sched.is_loaded(name),
         sched.schedule_armed(name),
     )
+
+
+def _launcher_executables(
+    path: crony.launch.LauncherPath,
+) -> tuple[Path | None, Path | None]:
+    """Resolve each designated executable using only the two PATH entries.
+
+    A missing or shadowed designated executable cannot fall through to an
+    unrelated binary in the scheduler's inherited PATH.
+    """
+    prefix = f"{path.crony_dir}:{path.uv_dir}"
+    if not path.crony_dir.is_absolute() or not path.uv_dir.is_absolute():
+        return None, None
+    resolved: list[Path | None] = []
+    for directory, name in ((path.uv_dir, "uv"), (path.crony_dir, "crony")):
+        expected = directory / name
+        found = shutil.which(name, path=prefix)
+        try:
+            valid = found is not None and Path(found).samefile(expected)
+        except OSError:
+            valid = False
+        resolved.append(expected if valid else None)
+    return resolved[0], resolved[1]
+
+
+def require_launchers(
+    snapshot: crony.model.Job | crony.model.JobGroup,
+) -> None:
+    """Refuse an install whose PATH cannot run its selected launchers."""
+    if snapshot.crony_path is None or snapshot.uv_path is None:
+        raise crony.errors.PreconditionError("no resolved crony / uv launcher")
+    path = crony.launch.LauncherPath.from_executables(
+        snapshot.crony_path, snapshot.uv_path
+    )
+    selected_uv, selected_crony = _launcher_executables(path)
+    try:
+        valid = (
+            selected_uv is not None
+            and selected_crony is not None
+            and snapshot.uv_path is not None
+            and snapshot.crony_path is not None
+            and selected_uv.samefile(snapshot.uv_path)
+            and selected_crony.samefile(snapshot.crony_path)
+        )
+    except OSError:
+        valid = False
+    if not valid:
+        raise crony.errors.PreconditionError(
+            "launcher PATH must resolve crony and uv in their selected "
+            "directories; check executable names, permissions, and shadowing"
+        )
 
 
 def _units_changing(
@@ -1071,10 +1120,10 @@ def _repo_root() -> Path:
 def _crony_executable() -> Path:
     """Absolute path to bin/crony for re-invocation by groups.
 
-    Preserve the invoked crony launcher or a matching PATH entry, including
-    symlinks. Only accept paths to this package's entry script so a
-    different checkout on PATH cannot supply its runner. Module callers
-    without a matching launcher fall back to this repository's bin/crony.
+    Select a launcher named crony for this package, preserving symlinks.
+    An invocation under another basename uses its matching sibling crony;
+    without one, try PATH and then this repository's bin/crony. Reject a
+    different checkout's entry so it cannot supply this package's runner.
     """
     entry = _repo_root() / "bin" / "crony"
     candidates = [sys.argv[0]] if sys.argv else []
@@ -1083,6 +1132,8 @@ def _crony_executable() -> Path:
         candidates.append(path)
     for candidate in candidates:
         launcher = Path(candidate).absolute()
+        if launcher.name != "crony":
+            launcher = launcher.parent / "crony"
         try:
             if launcher.samefile(entry):
                 return launcher
@@ -1092,17 +1143,13 @@ def _crony_executable() -> Path:
 
 
 def _uv_executable() -> Path:
-    """Absolute path to `uv`, baked into platform unit files.
-
-    The platform scheduler starts a unit's program with a minimal PATH
-    that omits $HOME/.local/bin and /opt/homebrew/bin, so the absolute
-    path is written into the unit's argv to sidestep PATH at run time.
+    """Locate uv's stable launcher; its directory supplies the unit PATH.
 
     The `uv` on PATH is the one to bake. It is the name the operator's
     environment resolves, which is the name a package manager keeps
     pointed at the current install -- typically a symlink that outlives
     an upgrade. The path is made absolute without resolving it, so that
-    stable name is what lands in the unit. Whatever PATH names has to run
+    stable directory is what lands in the unit. Whatever PATH names must run
     from the scheduler's bare environment too: a launcher that leans on
     the operator's shell setup is baked as found and fails there.
 
@@ -1124,8 +1171,7 @@ def _uv_executable() -> Path:
     raise crony.errors.PreconditionError(
         "uv not found on PATH or via $UV; install it "
         "(https://docs.astral.sh/uv/) before running `crony apply`. "
-        "Platform units bake uv's absolute path so the scheduler "
-        "doesn't have to find it on its minimal PATH."
+        "Platform units prepend uv's directory to their inherited PATH."
     )
 
 
@@ -1275,6 +1321,7 @@ def apply_one(
         )
     full_name = str(snapshot.entity_name)
     bundle_name = ref.bundle
+    require_launchers(snapshot)
 
     # The full names the bundle's config currently defines, used to
     # keep the rename cleanup below from unlinking a *different* live
@@ -1484,6 +1531,7 @@ def _install_unit(
     platform writes every unit file before any reload and re-arms them
     together; `activate=False` skips the reload for a self-apply whose
     unit didn't change."""
+    require_launchers(snapshot)
     sched.install(snapshot.unit_spec(), activate=activate)
     _write_apply_state(snapshot)
 
@@ -1506,7 +1554,7 @@ def set_disabled(
     must be currently applied; the `enable` / `disable` commands resolve
     only installed entries.
 
-    Like an apply, the re-render bakes the live uv / crony executables --
+    Like an apply, the re-render selects the live uv / crony directories --
     stamped onto the node here, since the current graph carries the paths
     extracted from the existing unit (which a binary move would leave
     stale) -- so a disabled entry stays runnable across a binary move."""

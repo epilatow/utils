@@ -79,6 +79,30 @@ def _priority_block(priority: PriorityClass) -> str:
     return ""
 
 
+def _exec_start(argv: tuple[str, ...]) -> str:
+    """Encode literal argv using systemd's quoting and expansion rules.
+
+    ':' disables environment expansion. Percent specifiers must still be
+    doubled so the supplied argument values reach the program unchanged.
+    """
+    quoted = []
+    for arg in argv:
+        escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
+        quoted.append(f'"{escaped.replace("%", "%%")}"')
+    return ":" + " ".join(quoted)
+
+
+def _exec_start_argv(command: str) -> list[str] | None:
+    """Decode literal-prefixed or unprefixed native command argv."""
+    try:
+        if not command.startswith(":"):
+            return shlex.split(command)
+        argv = tuple(arg.replace("%%", "%") for arg in shlex.split(command[1:]))
+    except ValueError:
+        return None
+    return list(argv) if _exec_start(argv) == command else None
+
+
 def _render_service(
     name: str,
     cmd: tuple[str, ...],
@@ -101,6 +125,7 @@ def _render_service(
     so the unit is `static` -- it cannot start at boot, and `is-enabled`
     still reports it loaded rather than reading as drift.
     """
+    exec_start = _exec_start(cmd)
     if daemon is not None:
         # `on-failure`, not `always`, so the runner's exit code decides:
         # non-zero means the command exited and should be restarted, zero
@@ -127,7 +152,7 @@ def _render_service(
             "\n"
             "[Service]\n"
             "Type=simple\n"
-            f"ExecStart={shlex.join(cmd)}\n"
+            f"ExecStart={exec_start}\n"
             "WorkingDirectory=%h\n"
             f"{supervise}"
             f"{_priority_block(priority)}"
@@ -139,7 +164,7 @@ def _render_service(
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"ExecStart={shlex.join(cmd)}\n"
+        f"ExecStart={exec_start}\n"
         "WorkingDirectory=%h\n"
         f"{_priority_block(priority)}"
     )
@@ -180,10 +205,7 @@ def _render_timer(
 
 
 def _service_argv(content: str) -> list[str] | None:
-    """Recover the argv from a `.service`'s ExecStart, or None when it
-    isn't in the shape `_render_service` produces.
-
-    The inverse of `_render_service`'s ExecStart embedding."""
+    """Decode the service's target argv without interpreting the command."""
     parser = configparser.ConfigParser(
         interpolation=None, delimiters=("=",), strict=False
     )
@@ -194,10 +216,7 @@ def _service_argv(content: str) -> list[str] | None:
     exec_start = parser.get("Service", "ExecStart", fallback=None)
     if not isinstance(exec_start, str):
         return None
-    try:
-        return shlex.split(exec_start)
-    except ValueError:
-        return None
+    return _exec_start_argv(exec_start)
 
 
 def _is_enabled(unit: str) -> str:

@@ -13,7 +13,6 @@ native start-time randomization.
 
 import os
 import plistlib
-import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -135,20 +134,9 @@ def _render_plist(
     construction (escaping, typed values, DOCTYPE); `sort_keys`
     keeps the byte output deterministic across renders.
     """
-    # launchd execs ProgramArguments[0] through xpcproxy, which
-    # enforces AMFI launch constraints. uv ships ad-hoc-signed, and
-    # after `uv self update` swaps the binary for a new cdhash that
-    # first launchd-driven launch is killed (OS_REASON_CODESIGNING)
-    # before crony runs -- silently breaking every scheduled unit
-    # until something relaunches it. Going through /bin/sh (a
-    # platform binary that always launches) makes uv an ordinary
-    # exec, like a terminal invocation, which the constraint check
-    # doesn't reach. `exec` so sh is replaced by the command (one
-    # process; its pid and exit code propagate straight to launchd).
-    inner = shlex.join(cmd)
     contents: dict[str, object] = {
         "Label": _label(name),
-        "ProgramArguments": ["/bin/sh", "-c", f"exec {inner}"],
+        "ProgramArguments": list(cmd),
         "RunAtLoad": False,
         "KeepAlive": False,
         "AbandonProcessGroup": False,
@@ -177,11 +165,7 @@ def _render_plist(
 
 
 def _plist_argv(content: str) -> list[str] | None:
-    """Recover the argv embedded in a plist, or None when it isn't in the
-    shape `_render_plist` produces.
-
-    The inverse of `_render_plist`'s embedding: it unwraps the
-    `/bin/sh -c 'exec <argv>'` ProgramArguments back to the argv list."""
+    """Decode the raw ProgramArguments array without interpreting it."""
     try:
         data = plistlib.loads(content.encode("utf-8"))
     except plistlib.InvalidFileException, ValueError, OSError:
@@ -191,15 +175,7 @@ def _plist_argv(content: str) -> list[str] | None:
     args = data.get("ProgramArguments")
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         return None
-    if len(args) != 3 or args[:2] != ["/bin/sh", "-c"]:
-        return None
-    try:
-        inner = shlex.split(args[2])
-    except ValueError:
-        return None
-    if not inner or inner[0] != "exec":
-        return None
-    return inner[1:]
+    return args
 
 
 def _launchctl_list() -> str:
@@ -273,13 +249,8 @@ class LaunchdScheduler(Scheduler):
         ):
             raise TypeError("launchd requires launchd unit platform properties")
         # The service plist carries the command and the real schedule. A
-        # jittered interval job (spec.jitter set by the model) also gets a
-        # companion plist (slot 1) that fires once, at the model's per-job
-        # offset, and kickstarts the service -- launchd has no native
-        # start-time randomization. The companion reuses _render_plist, so
-        # it inherits the /bin/sh exec wrapper the service uses, and runs
-        # the opaque argv the model baked (`spec.jitter.cmd`) -- this layer
-        # neither decides eligibility nor builds the argv.
+        # jittered interval job also gets a companion plist that fires once
+        # at its supplied offset. Both targets are opaque argv from the spec.
         name = str(spec.name)
         units = [
             RenderedUnit(

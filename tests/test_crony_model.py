@@ -486,7 +486,7 @@ class TestSharedSnapshotSurface:
         assert spec.priority == snap.priority
         assert snap.priority is PriorityClass.HIGH
         assert spec.timing == snap.timing
-        assert spec.cmd[0] == "/uv"
+        assert spec.cmd[:2] == ("/bin/sh", "-c")
 
     def test_group_unit_spec_is_normal(self) -> None:
         # Groups request no special scheduling, which resolves to the
@@ -1295,7 +1295,11 @@ class TestDaemonSnapshot:
         # kill a command that is meant to keep running.
         snap = self._renderable()
         assert snap.timeout == 0
-        assert snap.unit_spec().cmd[6:8] == ("_run-guard", "0")
+        from crony.launch import parse_argv
+
+        launch = parse_argv(list(snap.unit_spec().cmd))
+        assert launch is not None
+        assert launch.argv[1:3] == ("_run-guard", "0")
 
 
 if __name__ == "__main__":

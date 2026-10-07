@@ -39,6 +39,7 @@ from typing import (
 
 import crony.config
 import crony.errors
+import crony.launch
 import crony.model
 import crony.notify
 import crony.platform
@@ -135,9 +136,8 @@ def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
 
     The command runs from the platform scheduler's unit, which hands
     the runner an already minimal, curated environment. crony passes
-    that inherited env through unchanged: setting it up is the
-    scheduler's job, and
-    re-filtering it strips session locators a job may need --
+    that inherited env through, after restoring the scheduler's PATH.
+    Re-filtering other variables strips session locators a job may need --
     notably XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS, without
     which a job that shells out to `systemctl --user` (e.g. one
     whose command is `crony apply`) cannot reach the user bus.
@@ -152,6 +152,7 @@ def _runtime_env(user_env: dict[str, str]) -> dict[str, str]:
     snapshot churn across the shells an apply runs from.
     """
     env: dict[str, str] = dict(os.environ)
+    crony.launch.restore_job_env(env)
     for k, raw in user_env.items():
         env[k] = _expand_env_value(raw, env)
     return env

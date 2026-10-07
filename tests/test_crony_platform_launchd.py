@@ -9,7 +9,6 @@
 
 import os
 import plistlib
-import shlex
 import subprocess
 import sys
 import time
@@ -136,20 +135,14 @@ class TestPlistRendering:
         assert "StartInterval" not in plist
         assert "StartCalendarInterval" not in plist
 
-    def test_program_args_wrap_uv_in_sh_with_absolute_path(self) -> None:
+    def test_program_arguments_preserve_supplied_argv(self) -> None:
         plist = launchd._render_plist(
             "j",
             _CMD,
             Schedule.from_str("daily"),
         )
         d = plistlib.loads(plist.encode("utf-8"))
-        assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
-        # uv's absolute path because launchd's per-agent PATH omits
-        # it, exec so sh is replaced by uv, and the bundle:uuid ref
-        # (not the name) so the runner locates the state dir.
-        assert d["ProgramArguments"][2] == (
-            "exec /abs/uv run --script /abs/crony _run default:u-test"
-        )
+        assert d["ProgramArguments"] == list(_CMD)
 
     def test_every_shape_is_a_valid_plist(self) -> None:
         # Each rendered plist must parse back as a well-formed plist
@@ -167,7 +160,7 @@ class TestPlistRendering:
             plist = launchd._render_plist("j", _CMD, timing, priority)
             d = plistlib.loads(plist.encode("utf-8"))
             assert d["Label"] == "org.crony.j"
-            assert d["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+            assert d["ProgramArguments"] == list(_CMD)
             # launchd's own stop-to-kill default is system-defined, so
             # every shape states the timeout it needs.
             assert d["ExitTimeOut"] == launchd._EXIT_TIMEOUT_SEC
@@ -677,13 +670,9 @@ class TestLaunchdJitter:
         jp = plistlib.loads(units.units[1].content.encode("utf-8"))
         assert jp["Label"] == "org.crony.default.brew.jitter"
         assert jp["RunAtLoad"] is False
-        # StartInterval is the model's offset; ProgramArguments is the
-        # model's opaque argv, /bin/sh-wrapped (AMFI) -- not built here.
+        # The supplied offset and argv pass through unchanged.
         assert jp["StartInterval"] == 1685
-        assert jp["ProgramArguments"][:2] == ["/bin/sh", "-c"]
-        assert jp["ProgramArguments"][2] == (
-            f"exec {shlex.join(self._JITTER.cmd)}"
-        )
+        assert jp["ProgramArguments"] == list(self._JITTER.cmd)
 
     def test_no_companion_when_jitter_none(self) -> None:
         units = get_scheduler("darwin", _DIR).render_units(self._spec(None))

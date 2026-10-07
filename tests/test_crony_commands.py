@@ -49,6 +49,7 @@ from conftest_crony import (  # noqa: E402
 from crony import cli as crony_cli  # noqa: E402
 from crony import commands as crony_commands  # noqa: E402
 from crony import config as crony_config  # noqa: E402
+from crony import launch as crony_launch  # noqa: E402
 from crony import model as crony_model  # noqa: E402
 from crony import paths as crony_paths  # noqa: E402
 from crony import platform as crony_platform  # noqa: E402
@@ -1033,12 +1034,12 @@ class TestApplyFullSync:
         assert not old_dir.exists()
 
     def _stage_uuid_change(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, platform: str = "darwin"
     ) -> tuple[Any, str, str, Path]:
         # apply j at U_old, then change its uuid in config to U_new
         # WITHOUT applying -- U_old is now a superseded orphan (its
         # uuid is gone from config) under the still-selected name.
-        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         cfg1 = h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
@@ -1046,8 +1047,9 @@ class TestApplyFullSync:
         old_uuid = cfg1.jobs["j"].uuid
         h.apply("j")
         old_dir = h.state / "default" / old_uuid
-        plist = h.agents / f"org.crony.{h.full('j')}.plist"
-        assert old_dir.is_dir() and plist.exists()
+        sched = crony_runtime.scheduler(platform)
+        unit = sched.unit_dir / sched.config_filename(h.full("j"))
+        assert old_dir.is_dir() and unit.exists()
         new_uuid = "abcdabcd-1111-2222-3333-444455556666"
         h.config(
             {
@@ -1062,6 +1064,48 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         return h, old_uuid, new_uuid, old_dir
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    @pytest.mark.parametrize("full_sync", [False, True])
+    def test_invalid_replacement_launcher_preserves_installed_state(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        platform: str,
+        full_sync: bool,
+    ) -> None:
+        h, _old, new_uuid, old_dir = self._stage_uuid_change(
+            tmp_path, monkeypatch, platform
+        )
+        log = old_dir / "run.log"
+        log.write_text("retained execution history\n")
+        state_before = {
+            p.relative_to(old_dir): p.read_bytes()
+            for p in old_dir.rglob("*")
+            if p.is_file()
+        }
+        sched = crony_runtime.scheduler(platform)
+        units_before = sched.ondisk_units(h.full("j"))
+        alias = h.state / "default" / "j"
+        alias_before = os.readlink(alias)
+        bad_dir = tmp_path / "invalid-launcher"
+        bad_dir.mkdir()
+        bad_uv = bad_dir / "renamed-uv"
+        bad_uv.write_text("#!/bin/sh\nexit 0\n")
+        bad_uv.chmod(0o755)
+        monkeypatch.setattr(crony_runtime, "_uv_executable", lambda: bad_uv)
+        jobs = [] if full_sync else [h.full("j")]
+        with pytest.raises(PreconditionError, match="launcher PATH"):
+            crony_commands.do_apply(jobs=jobs, verbose=False, bundle=None)
+        assert old_dir.is_dir()
+        assert {
+            p.relative_to(old_dir): p.read_bytes()
+            for p in old_dir.rglob("*")
+            if p.is_file()
+        } == state_before
+        assert sched.ondisk_units(h.full("j")) == units_before
+        assert os.readlink(alias) == alias_before
+        assert not (h.state / "default" / new_uuid).exists()
 
     def test_destroy_orphans_reclaims_superseded_uuid_in_full(
         self, tmp_path: Path, monkeypatch: Any
@@ -2130,14 +2174,19 @@ class TestCronyExecutable:
         monkeypatch.setenv("PATH", str(tmp_path))
         assert crony_runtime._crony_executable() == invoked
 
-    def test_preserves_invoked_launcher_alias(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("has_sibling", [False, True])
+    def test_alias_uses_named_sibling_or_repository_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_sibling: bool
     ) -> None:
         caller = tmp_path / "caller"
         caller.symlink_to(REPO_ROOT / "bin" / "crony")
+        named = tmp_path / "crony"
+        if has_sibling:
+            named.symlink_to(caller)
         monkeypatch.setattr(sys, "argv", [str(caller)])
         monkeypatch.setenv("PATH", "")
-        assert crony_runtime._crony_executable() == caller
+        expected = named if has_sibling else REPO_ROOT / "bin" / "crony"
+        assert crony_runtime._crony_executable() == expected
 
     def test_rejects_other_checkout_launchers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2266,14 +2315,19 @@ class TestUvExecutable:
             binary.chmod(0o755)
         uv = bin_dir / uv_name
         uv.symlink_to(old_uv)
+        if uv_name != "uv":
+            (bin_dir / "uv").symlink_to(uv)
         old_repo = tmp_path / "repo-old"
         new_repo = tmp_path / "repo-new"
         for repo in (old_repo, new_repo):
             (repo / "bin").mkdir(parents=True)
             (repo / "bin" / "crony").write_text("")
+            (repo / "bin" / "crony").chmod(0o755)
         crony_name = "crony-stable" if uv_name == "uv-stable" else "crony"
         crony = bin_dir / crony_name
         crony.symlink_to(old_repo / "bin" / "crony")
+        if crony_name != "crony":
+            (bin_dir / "crony").symlink_to(crony)
         monkeypatch.setattr(crony_runtime, "_repo_root", lambda: old_repo)
         monkeypatch.chdir(tmp_path)
         lookup_dir = Path("bin") if relative else bin_dir
@@ -2295,8 +2349,13 @@ class TestUvExecutable:
             default_target_jobs=["g"],
         )
         if existing:
+            old_bin = tmp_path / "old-bin"
+            old_bin.mkdir()
+            (old_bin / "uv").symlink_to(old_uv)
             with monkeypatch.context() as parent:
-                parent.setattr(crony_runtime, "_uv_executable", lambda: old_uv)
+                parent.setattr(
+                    crony_runtime, "_uv_executable", lambda: old_bin / "uv"
+                )
                 parent.setattr(
                     crony_runtime,
                     "_crony_executable",
@@ -2320,13 +2379,14 @@ class TestUvExecutable:
         sched = crony_runtime.scheduler()
         config = crony_runtime.load_config()
         for short in ("j", "g"):
-            argv = sched.installed_cmd(h.full(short))
-            assert argv is not None
-            installed_uv, installed_crony = crony_model.exec_path_strings(argv)
-            assert installed_uv == str(uv)
-            assert installed_crony == str(crony)
-            assert str(old_uv) not in argv
-            assert str(old_repo / "bin" / "crony") not in argv
+            launch = crony_launch.parse_argv(
+                sched.installed_cmd(h.full(short)) or []
+            )
+            assert launch is not None and launch.path is not None
+            assert launch.argv[0] == "crony"
+            assert launch.path.crony_dir == launch.path.uv_dir == bin_dir
+            assert str(old_uv) not in launch.argv
+            assert str(old_repo / "bin" / "crony") not in launch.argv
             ref = config.current.by_full_name[h.full(short)]
             assert config.cfg_status(ref) == "synced"
             assert h.apply(short) == "unchanged"

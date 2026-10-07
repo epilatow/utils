@@ -79,7 +79,7 @@ class TestSystemdRendering:
         assert "[Service]" in svc
         assert "Type=oneshot" in svc
         assert "ExecStart=" in svc
-        assert " _run default:u-test" in svc
+        assert systemd._service_argv(svc) == list(_CMD)
         assert "WorkingDirectory=%h" in svc
 
     def test_timer_oncalendar(self) -> None:
@@ -111,14 +111,29 @@ class TestSystemdRendering:
         assert "RandomizedDelaySec" not in timer
         assert "FixedRandomDelay" not in timer
 
-    def test_service_invokes_uv_with_absolute_path(self) -> None:
-        # systemd user services run with a minimal default PATH; render
-        # uv's absolute path so the unit doesn't depend on PATH.
+    def test_service_preserves_supplied_argv(self) -> None:
         svc = systemd._render_service("j", _CMD)
-        assert (
-            "ExecStart=/abs/uv run --script /abs/crony _run default:u-test"
-            in svc
-        )
+        assert systemd._service_argv(svc) == list(_CMD)
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            (
+                "/bin/echo",
+                "a b",
+                "a'b",
+                'a"b',
+                "$VARIABLE",
+                "${OTHER}",
+                "%q",
+                "a\\b",
+            ),
+            ("/bin/sh", "-c", 'printf "%s" "$PATH"'),
+        ],
+    )
+    def test_literal_argv_round_trips(self, cmd: tuple[str, ...]) -> None:
+        svc = systemd._render_service("j", cmd)
+        assert systemd._service_argv(svc) == list(cmd)
 
 
 class TestSystemdPriority:
@@ -523,7 +538,10 @@ class TestSystemdAnalyzeVerify:
     in CI on the Linux matrix leg and is skipped elsewhere.
     """
 
-    def test_every_unit_shape_verifies(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("with_shell", [False, True])
+    def test_every_unit_shape_verifies(
+        self, tmp_path: Path, with_shell: bool
+    ) -> None:
         # ExecStart's executable must resolve for verify to pass;
         # sys.executable is a real absolute path. The argv after it is
         # irrelevant to verify (the unit is never run).
@@ -575,7 +593,16 @@ class TestSystemdAnalyzeVerify:
         ]
         written: list[Path] = []
         for nm, timing, prio, daemon in shapes:
-            cmd = (str(real), "run", "--script", str(real), "_run", str(_REF))
+            cmd: tuple[str, ...] = (
+                str(real),
+                "run",
+                "--script",
+                str(real),
+                "_run",
+                str(_REF),
+            )
+            if with_shell:
+                cmd = ("/bin/sh", "-c", 'printf "%s" "$PATH"; echo "percent%q"')
             spec = UnitSpec(
                 name=EntityName.from_str(nm),
                 cmd=cmd,

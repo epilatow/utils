@@ -817,6 +817,13 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     # landed in this apply pass.
     full_names_to_apply = _topo_apply_order(by_full, full_names_to_apply)
 
+    # Validate the whole replacement set before deleting installed state.
+    for full in full_names_to_apply:
+        ref = config.pending.by_full_name[full]
+        pending = config.pending.job_from_ref(ref)
+        assert pending is not None
+        crony.runtime.require_launchers(pending)
+
     # Clean-first reconcile: before installing the pending units, drop
     # whatever the config no longer selects so the apply lays down a
     # clean replacement. A full sync reclaims every unselected on-disk
