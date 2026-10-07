@@ -78,6 +78,9 @@ keep-awake the host cannot grant. To grant it, install a polkit rule (a
 for the `org.freedesktop.login1.inhibit-block-sleep` action when
 `subject.user` is the job's user.
 
+Crony runs via uv with a custom uv cache path of ~/.cache/crony/uv to avoid
+holding persistent locks in global uv cache path.
+
 ## COMMON ARGUMENTS
 
 - **`job`**\

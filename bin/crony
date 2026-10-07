@@ -1,9 +1,12 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env -S uv\_run\_--cache-dir\_${HOME}/.cache/crony/uv\_--script
 # /// script
 # requires-python = ">=3.14"
 # dependencies = ["tomlkit", "pydantic>=2"]
 # ///
 # This is AI generated code
+#
+# \_ keeps the -S command in one kernel argument on macOS; env splits it.
+# env expands ${HOME} before uv starts, preserving spaces in the home path.
 #
 # IMPORTANT: This script has tests in tests/test_crony.py
 #

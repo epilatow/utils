@@ -1295,7 +1295,7 @@ class TestDaemonSnapshot:
         # kill a command that is meant to keep running.
         snap = self._renderable()
         assert snap.timeout == 0
-        assert snap.unit_spec().cmd[4:6] == ("_run-guard", "0")
+        assert snap.unit_spec().cmd[6:8] == ("_run-guard", "0")
 
 
 if __name__ == "__main__":

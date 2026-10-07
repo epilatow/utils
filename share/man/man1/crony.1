@@ -63,6 +63,8 @@ The keep\-awake job flag holds the system awake for the job\(aqs duration.\&
 On systemd platforms this takes a sleep inhibitor, which is a privileged polkit action; the seatless user a \(gasystemd \-\-user\(ga job runs as is denied it by default, so the job runs without keep\-awake rather than failing.\&
 The \(gacrony status\(ga and \(gacrony config validate\(ga commands warn when a job requests keep\-awake the host cannot grant.\&
 To grant it, install a polkit rule (a \(ga.rules\(ga file under \(ga/etc/polkit\-1/rules.d/\(ga) that returns \(gapolkit.Result.YES\(ga for the \(gaorg.freedesktop.login1.inhibit\-block\-sleep\(ga action when \(gasubject.user\(ga is the job\(aqs user.\&
+.PP
+Crony runs via uv with a custom uv cache path of \(ti/.cache/crony/uv to avoid holding persistent locks in global uv cache path.\&
 .SH COMMON ARGUMENTS
 .TP
 \f[CR]job\f[R]

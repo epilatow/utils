@@ -124,7 +124,10 @@ status` and `crony config validate` commands warn when a job requests
 keep-awake the host cannot grant. To grant it, install a polkit rule (a
 `.rules` file under `/etc/polkit-1/rules.d/`) that returns
 `polkit.Result.YES` for the `org.freedesktop.login1.inhibit-block-sleep`
-action when `subject.user` is the job's user.\
+action when `subject.user` is the job's user.
+
+Crony runs via uv with a custom uv cache path of ~/.cache/crony/uv to avoid
+holding persistent locks in global uv cache path.\
 """
 
 # The `crony status` overview. A module-level constant (rather than an inline

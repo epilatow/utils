@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,7 @@ from crony.snapshot import CURRENT_SNAPSHOT_SCHEMA  # noqa: E402
 from crony.unit import (  # noqa: E402
     EntityName,
     EntityRef,
+    Interval,
     Schedule,
 )
 
@@ -1219,6 +1221,22 @@ class TestExecPathStrings:
             "/gone/crony",
         )
 
+    def test_recovers_paths_with_private_cache(self) -> None:
+        argv = [
+            "/gone/uv",
+            "run",
+            "--cache-dir",
+            "/home/user with spaces/.cache/crony/uv",
+            "--script",
+            "/gone/crony",
+            "_run",
+            "x:y",
+        ]
+        assert crony_model.exec_path_strings(argv) == (
+            "/gone/uv",
+            "/gone/crony",
+        )
+
     def test_none_for_missing_element(self) -> None:
         assert crony_model.exec_path_strings(["/abs/uv", "run", "x:y"]) == (
             None,
@@ -1247,6 +1265,8 @@ class TestGuardedArgv:
         assert argv == (
             "/abs/uv",
             "run",
+            "--cache-dir",
+            str(Path.home() / ".cache" / "crony" / "uv"),
             "--script",
             "/abs/crony",
             crony_model.GUARD_SUBCOMMAND,
@@ -1261,6 +1281,8 @@ class TestGuardedArgv:
         assert argv == (
             "/abs/uv",
             "run",
+            "--cache-dir",
+            str(Path.home() / ".cache" / "crony" / "uv"),
             "--script",
             "/abs/crony",
             crony_model.GUARD_SUBCOMMAND,
@@ -1275,6 +1297,8 @@ class TestGuardedArgv:
         assert argv == (
             "/abs/uv",
             "run",
+            "--cache-dir",
+            str(Path.home() / ".cache" / "crony" / "uv"),
             "--script",
             "/abs/crony",
             crony_model.GUARD_SUBCOMMAND,
@@ -1292,6 +1316,8 @@ class TestGuardedArgv:
         assert argv == (
             "/abs/uv",
             "run",
+            "--cache-dir",
+            str(Path.home() / ".cache" / "crony" / "uv"),
             "--script",
             "/abs/crony",
             crony_model.GUARD_SUBCOMMAND,
@@ -1308,6 +1334,67 @@ class TestGuardedArgv:
             "/abs/uv",
             "/abs/crony",
         )
+
+
+class TestPrivateUvCache:
+    def test_all_launchers_share_the_home_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home with spaces"
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(crony_model, "_current_machine_id", lambda: "host")
+        before = os.environ.copy()
+        uv = Path("/abs/uv")
+        crony = Path("/abs/crony")
+        ref = EntityRef("default", "u-test")
+        jitter = crony_model._jitter_spec(
+            EntityName("default", "j"),
+            ref,
+            Interval("30min", 1800),
+            uv,
+            crony,
+        )
+        assert jitter is not None
+        prefix = (
+            "/abs/uv",
+            "run",
+            "--cache-dir",
+            str(home / ".cache" / "crony" / "uv"),
+            "--script",
+            "/abs/crony",
+        )
+        runner = crony_model._run_argv(uv, crony, ref)
+        guard = crony_model._guarded_argv(uv, crony, ref, 120, False)
+        assert runner[:6] == prefix
+        assert guard[:6] == prefix
+        assert guard[8:14] == prefix
+        assert jitter.cmd[:6] == prefix
+        assert os.environ == before
+
+    def test_shebang_expands_home_as_one_argument(self, tmp_path: Path) -> None:
+        shim_dir = tmp_path / "bin"
+        shim_dir.mkdir()
+        uv = shim_dir / "uv"
+        uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        uv.chmod(0o755)
+        home = tmp_path / "home with spaces"
+        command = REPO_ROOT / "bin" / "crony"
+        result = subprocess.run(
+            [str(command), "_run", "default:u-test"],
+            env={**os.environ, "HOME": str(home), "PATH": str(shim_dir)},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.splitlines() == [
+            "run",
+            "--cache-dir",
+            str(home / ".cache" / "crony" / "uv"),
+            "--script",
+            str(command),
+            "_run",
+            "default:u-test",
+        ]
 
 
 class TestInstalledCmdParsing:

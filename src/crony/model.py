@@ -148,6 +148,18 @@ def _current_machine_id() -> str:
     ).machine_id()
 
 
+def _uv_script_argv(uv_path: Path, crony_path: Path) -> tuple[str, ...]:
+    """Launch crony with its own cache without changing jobs' environment."""
+    return (
+        str(uv_path),
+        "run",
+        "--cache-dir",
+        str(Path.home() / ".cache" / "crony" / "uv"),
+        "--script",
+        str(crony_path),
+    )
+
+
 def _jitter_spec(
     name: crony.unit.EntityName,
     ref: crony.unit.EntityRef,
@@ -172,10 +184,7 @@ def _jitter_spec(
     # service and companion units through the scheduler, so the runner
     # needs no launchctl strings baked in.
     cmd = (
-        str(uv_path),
-        "run",
-        "--script",
-        str(crony_path),
+        *_uv_script_argv(uv_path, crony_path),
         JITTER_SUBCOMMAND,
         str(ref),
         str(name),
@@ -212,10 +221,7 @@ def _run_argv(
     runner is addressed by `<bundle>:<uuid>` so it skips the name lookup.
     """
     return (
-        str(uv_path),
-        "run",
-        "--script",
-        str(crony_path),
+        *_uv_script_argv(uv_path, crony_path),
         RUN_SUBCOMMAND,
         str(ref),
     )
@@ -241,10 +247,7 @@ def _guarded_argv(
     base = _run_argv(uv_path, crony_path, ref)
     marker = ("--interactive",) if interactive else ()
     return (
-        str(uv_path),
-        "run",
-        "--script",
-        str(crony_path),
+        *_uv_script_argv(uv_path, crony_path),
         GUARD_SUBCOMMAND,
         str(timeout),
         *marker,
@@ -254,11 +257,17 @@ def _guarded_argv(
 
 def exec_path_strings(argv: list[str]) -> tuple[str | None, str | None]:
     """The `(uv, crony)` executable path strings baked into a unit's run
-    argv. Bare, guard-wrapped, and jitter commands all start with
-    `<uv> run --script <crony>`, regardless of launcher filenames.
-    Both are None when the argv does not carry that invocation prefix.
+    argv. Bare, guard-wrapped, and jitter commands use the same uv script
+    prefix, including an optional cache directory. Launcher filenames do
+    not matter. Both are None when argv lacks a recognized prefix.
     Existence is the caller's concern; this returns the strings so they
     can be compared against disk even when the binary is gone."""
+    if (
+        len(argv) >= 6
+        and argv[1:3] == ["run", "--cache-dir"]
+        and argv[4] == "--script"
+    ):
+        return argv[0], argv[5]
     if len(argv) >= 4 and argv[1:3] == ["run", "--script"]:
         return argv[0], argv[3]
     return None, None
