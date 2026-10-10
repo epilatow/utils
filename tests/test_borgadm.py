@@ -3542,7 +3542,7 @@ class TestTimestampPruning:
     def test_incremental_prune(self) -> None:
         """Test incremental pruning simulation."""
         # Archive names intentionally model naive local wall-clock keys.
-        start = datetime(2000, 1, 1, 0, 0, 0)  # noqa: DTZ001
+        start = datetime(2000, 1, 1, 0, 0, 0)
         ts_all: set[str] = set()
         for i in range(int(24 * 365 * 3.5)):
             ts = start + timedelta(hours=i)
@@ -3568,7 +3568,7 @@ class TestTimestampPruning:
     def test_bulk_prune(self) -> None:
         """Test bulk pruning of many timestamps."""
         # Archive names intentionally model naive local wall-clock keys.
-        start = datetime(2000, 1, 1, 0, 0, 0)  # noqa: DTZ001
+        start = datetime(2000, 1, 1, 0, 0, 0)
         ts_all = {
             (start + timedelta(hours=i)).strftime("%Y%m%d_%H%M%S")
             for i in range(int(24 * 365 * 3.5))

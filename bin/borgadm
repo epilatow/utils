@@ -1523,9 +1523,7 @@ def ts_to_keep(timestamps: set[str]) -> OrderedDict[str, str]:
         ts_keep_new: OrderedDict[str, str] = collections.OrderedDict()
         for ts in sorted(timestamps - set(ts_keep.keys())):
             assert ts not in ts_keep
-            dt: datetime = datetime.strptime(  # noqa: DTZ007
-                ts, "%Y%m%d_%H%M%S"
-            )
+            dt: datetime = datetime.strptime(ts, "%Y%m%d_%H%M%S")
             if last is None or (dt - last) >= interval.timedelta():
                 last = dt
                 ts_keep_new[ts] = str(interval)
@@ -2111,8 +2109,8 @@ def do_check_age(bypass_lock: bool) -> None:
     latest = next(iter(backups.keys()))
 
     # Archive names are local wall-clock keys, not timezone-aware instants.
-    ts = datetime.strptime(latest, "%Y%m%d_%H%M%S")  # noqa: DTZ007
-    age = int((datetime.now() - ts).total_seconds())  # noqa: DTZ005
+    ts = datetime.strptime(latest, "%Y%m%d_%H%M%S")
+    age = int((datetime.now() - ts).total_seconds())
     if age > seconds:
         raise CheckAgeError(
             f"Latest full backup ({latest}) is too old:"
