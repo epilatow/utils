@@ -1,6 +1,6 @@
 line-length = 80
 # target-version is left unset: ruff infers it from pyproject's
-# requires-python (>=3.14), so the floor is the single source of truth.
+# requires-python (>=3.15,<3.16), so the floor is the single source of truth.
 
 [lint]
 extend-select = ["RUF059"]

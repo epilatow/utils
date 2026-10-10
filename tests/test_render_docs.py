@@ -1,11 +1,11 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.14"
+# requires-python = ">=3.15,<3.16"
 # dependencies = [
 #     "pytest",
 #     "pytest-cov",
 #     "tomlkit",
-#     "pydantic>=2",
+#     "pydantic>=2.14",
 #     "mdformat",
 #     "mdformat-gfm",
 #     "mdformat-tables",

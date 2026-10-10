@@ -19,11 +19,13 @@ Development conventions for working in this repo are layered:
 ## Prerequisites
 
 - `uv` (the test suite and every PEP 723 script run through it).
-- Python 3.14. The repo pins the interpreter with a `.python-version` file so
+- Python 3.15. The repo pins the interpreter with a `.python-version` file so
   `uv run` resolves the same version locally and in CI (uv downloads it if
   absent), rather than letting each environment pick the newest it happens to
-  have. The `>=3.14` floor in every PEP 723 block and in `pyproject.toml` is
-  kept in lockstep with the pin; bump both together to adopt a newer Python.
+  have. Every PEP 723 block and `pyproject.toml` require `>=3.15,<3.16`,
+  limiting execution to the stable 3.15 series. Keep these bounds, the pin,
+  and the `mypy-python-version` fallback in lockstep when adopting a newer
+  Python.
 - Node, for the two `npx`-launched gates -- markdownlint and prettier. Both
   fail rather than skip without it, so the suite needs it on any host that
   runs the whole thing: a formatting or lint gate that quietly covered nothing
