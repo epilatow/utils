@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).parent.parent
 _script_path = Path(__file__)
 
 # Pinned; see the module docstring on why this does not float.
-PRETTIER = "prettier@3.6.2"
+PRETTIER = "prettier@3.9.10"
 
 _SUFFIXES = (".js", ".mjs", ".cjs")
 # Vendored and mechanically synced from repo-shared, so not ours to format.
