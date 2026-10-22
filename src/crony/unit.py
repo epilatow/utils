@@ -289,7 +289,7 @@ class Schedule:
         return self.source
 
 
-# The canonical display token for the trigger-only firing mode (see
+# The canonical display token for the on-demand firing mode (see
 # OnDemand) -- what `str(OnDemand())` and the status SCHEDULE cell show.
 # The config spells the mode as the `on-demand = true` key, not this
 # string.
@@ -298,8 +298,8 @@ ON_DEMAND_SPEC = "on-demand"
 
 @dataclass(frozen=True)
 class OnDemand:
-    """The trigger-only firing mode: an entry that declares
-    ``on-demand = true`` and fires only via ``crony trigger`` (or a
+    """The on-demand firing mode: an entry that declares
+    ``on-demand = true`` and fires only via ``crony start`` (or a
     parent group's dispatch), never on its own timer.
 
     A firing mode in its own right, distinct from an entry that declares
@@ -308,7 +308,7 @@ class OnDemand:
     OnDemand needs no such ancestor: it is a valid firing point for itself
     and its subtree. It reaches a backend as its own ``UnitSpec.timing``,
     which the backend -- seeing `is_scheduled` is False -- renders as a
-    dormant unit (loaded and triggerable, no timer), exactly as a transit
+    dormant unit (loaded and startable, no timer), exactly as a transit
     group does.
     """
 
@@ -343,7 +343,7 @@ class Daemon:
 
 
 # How an entry fires: a calendar Schedule, a repeat Interval, OnDemand
-# (trigger-only), or Daemon (continuously). The four are mutually
+# (on-demand), or Daemon (continuously). The four are mutually
 # exclusive, so a single value (or None, for an entry that declares no
 # firing mode -- a transit group or a group-only job) models it without
 # an "at most one set" invariant. isinstance discriminates the variant.
@@ -352,7 +352,7 @@ Timing = Schedule | Interval | OnDemand | Daemon
 
 def is_scheduled(timing: Timing | None) -> TypeIs[Schedule | Interval]:
     """Whether `timing` arms a scheduler timer. A Schedule or Interval
-    does; OnDemand (trigger-only), Daemon (which runs continuously rather
+    does; OnDemand (on-demand), Daemon (which runs continuously rather
     than at times), and None (a transit group or group-only job) do not.
     The single predicate the model, status, and the backends share, so
     "has a timer" is decided identically everywhere; a TypeIs so a
@@ -424,7 +424,7 @@ class UnitSpec:
     cmd         The argv the unit runs.
     timing      The entry's firing mode: a Schedule or Interval (which
                 arm a timer -- `is_scheduled`), Daemon (continuous),
-                OnDemand (trigger-only), or None (a transit group or
+                OnDemand (on-demand), or None (a transit group or
                 group-only job). A backend renders OnDemand and None the
                 same way -- a dormant unit with no timer. A disabled
                 entry is rendered with None, whatever its mode.

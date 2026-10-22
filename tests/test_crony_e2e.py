@@ -537,7 +537,7 @@ class TestApplyLifecycle:
         e2e.crony("apply", e2e.full("probe"))
         assert e2e.status_config(e2e.full("probe")) == "synced"
         e2e.inject_isolated_env("probe", restart=False)
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_until(result_file.is_file, timeout=60, what="job environment")
         e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
         before, job_path, marker, saved_path, private_env = (
@@ -562,7 +562,7 @@ class TestApplyLifecycle:
         assert e2e.status_config(e2e.full("probe")) == "missing"
 
     @pytest.mark.parametrize("bin_name", ["bin", "bin space $literal%q'\\"])
-    def test_trigger_survives_launcher_symlink_retarget(
+    def test_start_survives_launcher_symlink_retarget(
         self,
         e2e: _CronyE2E,
         tmp_path: Path,
@@ -609,7 +609,7 @@ class TestApplyLifecycle:
             (tmp_path / "old" / launcher.name).unlink()
         assert e2e.status_config(e2e.full("probe")) == "synced"
         e2e.inject_isolated_env("probe", restart=False)
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_until(
             marker.is_file, timeout=60, what="the retargeted launchers to run"
         )
@@ -752,7 +752,7 @@ class TestLaunchdFileMaterialization:
             (e2e.unit_dir / unit.filename).write_text(unit.content)
         try:
             scheduler.activate(spec)
-            scheduler.trigger(str(spec.name))
+            scheduler.start(str(spec.name))
             e2e.wait_until(
                 result.exists,
                 timeout=15,
@@ -878,7 +878,7 @@ class TestDaemonSupervision:
         unit, or `""` when it has never started.
 
         Deliberately not a restart counter. systemd's `NRestarts` moves
-        only for an *automatic* restart, so a manual `crony trigger`
+        only for an *automatic* restart, so a manual `crony start`
         leaves it flat; the main process's start timestamp moves however
         the start was initiated. launchd's `runs` counts every launch,
         including a kickstart, so it already has that property.
@@ -971,7 +971,7 @@ class TestDaemonSupervision:
         )
         return int(_read_text(pidfile))
 
-    def test_starts_itself_without_a_trigger(self, e2e: _CronyE2E) -> None:
+    def test_starts_itself_without_a_start(self, e2e: _CronyE2E) -> None:
         # No timer and nothing kickstarts it: applying a daemon is what
         # starts it, which is the whole point of the mode.
         self._apply_daemon(e2e)
@@ -992,7 +992,7 @@ class TestDaemonSupervision:
             what="the supervisor to respawn the daemon",
         )
 
-    def test_retry_limit_stops_and_trigger_rearms_it(
+    def test_retry_limit_stops_and_start_rearms_it(
         self, e2e: _CronyE2E
     ) -> None:
         e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
@@ -1021,11 +1021,11 @@ class TestDaemonSupervision:
         time.sleep(4)
         assert self._start_marker(e2e) == settled
 
-        e2e.crony("trigger", e2e.full("d"))
+        e2e.crony("start", e2e.full("d"))
         e2e.wait_until(
             lambda: self._start_marker(e2e) not in ("", settled),
             timeout=60,
-            what="trigger to restart the exhausted daemon",
+            what="start to restart the exhausted daemon",
         )
 
     def test_disable_stops_it(self, e2e: _CronyE2E) -> None:
@@ -1035,7 +1035,7 @@ class TestDaemonSupervision:
         self._wait_started(e2e, "the daemon to start")
         e2e.crony("disable", e2e.full("d"))
         # A disabled entry stays registered with the scheduler on
-        # purpose -- dormant but triggerable -- so "stopped" is that it
+        # purpose -- dormant but startable -- so "stopped" is that it
         # is no longer being restarted, not that its unit is gone.
         time.sleep(3)
         settled = self._start_marker(e2e)
@@ -1044,10 +1044,10 @@ class TestDaemonSupervision:
             "disabled daemon was still being respawned"
         )
 
-    def test_triggering_a_disabled_daemon_runs_it_once(
+    def test_starting_a_disabled_daemon_runs_it_once(
         self, e2e: _CronyE2E
     ) -> None:
-        # A disabled daemon stays registered and triggerable, so it can
+        # A disabled daemon stays registered and startable, so it can
         # be started by hand -- but disabling stripped the supervision
         # (launchd `KeepAlive`, systemd `Restart=`), so what starts is a
         # one-shot: the scheduler does not bring it back when it stops,
@@ -1058,19 +1058,19 @@ class TestDaemonSupervision:
         time.sleep(3)
         settled = self._start_marker(e2e)
 
-        e2e.crony("trigger", e2e.full("d"))
+        e2e.crony("start", e2e.full("d"))
         e2e.wait_until(
             lambda: self._start_marker(e2e) not in ("", settled),
             timeout=60,
-            what="the triggered daemon to start",
+            what="the started daemon to start",
         )
         started = self._start_marker(e2e)
         # Several restart intervals: it must not start again.
         time.sleep(8)
         assert self._start_marker(e2e) == started, (
-            "a triggered disabled daemon was respawned after it stopped"
+            "a started disabled daemon was respawned after it stopped"
         )
-        # Triggering does not clear the operator-disable, so the entry
+        # Starting does not clear the operator-disable, so the entry
         # reports disabled again once the run it started has ended.
         assert e2e.status_status(e2e.full("d")) == "disabled"
 
@@ -1159,7 +1159,7 @@ class TestStopBeforeCommand:
     """
 
     def _start_gated_run(self, e2e: _CronyE2E, timeout: int) -> Path:
-        """Apply and trigger a job whose gate outlasts the test's stop,
+        """Apply and start a job whose gate outlasts the test's stop,
         returning its state dir once the run is sitting in that gate."""
         e2e.write_bundle(
             "[job.probe]\n"
@@ -1172,11 +1172,11 @@ class TestStopBeforeCommand:
         e2e.crony("apply", e2e.full("probe"))
         e2e.inject_isolated_env("probe", restart=False)
         sd = e2e.state_dir / E2E_BUNDLE / "probe"
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_until(
             lambda: "gate: " in _read_text(sd / "run.log"),
             timeout=60,
-            what="the triggered run to reach its gate",
+            what="the started run to reach its gate",
         )
         return sd
 
@@ -1251,11 +1251,11 @@ class TestStopOutlivedByTheRun:
         e2e.crony("apply", e2e.full("probe"))
         e2e.inject_isolated_env("probe", restart=False)
         sd = e2e.state_dir / E2E_BUNDLE / "probe"
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_until(
             lambda: "started\n" in _read_text(sd / "run.log"),
             timeout=60,
-            what="the triggered command to start",
+            what="the started command to start",
         )
         if _IS_DARWIN:
             subprocess.run(
@@ -1312,7 +1312,7 @@ class TestLeftoversOfAFinishedRun:
         )
         e2e.crony("apply", e2e.full("probe"))
         e2e.inject_isolated_env("probe", restart=False)
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_for_recorded_status(e2e.full("probe"), "ok")
         pid = int(pidfile.read_text())
         e2e.wait_until(
@@ -1348,11 +1348,11 @@ class TestTimeoutBeforeCommand:
         e2e.crony("apply", e2e.full("probe"))
         e2e.inject_isolated_env("probe", restart=False)
         sd = e2e.state_dir / E2E_BUNDLE / "probe"
-        e2e.crony("trigger", e2e.full("probe"))
+        e2e.crony("start", e2e.full("probe"))
         e2e.wait_until(
             lambda: "gate: " in _read_text(sd / "run.log"),
             timeout=60,
-            what="the triggered run to reach its gate",
+            what="the started run to reach its gate",
         )
         e2e.wait_until(
             lambda: not e2e.unit_running("probe"),

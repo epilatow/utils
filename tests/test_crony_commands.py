@@ -42,8 +42,8 @@ from conftest_crony import (  # noqa: E402
     _RunnerHarness,
     _uuid_toml,
     record_subprocess_calls,
+    started_a_unit,
     touched_the_scheduler,
-    triggered_a_unit,
 )
 
 from crony import cli as crony_cli  # noqa: E402
@@ -411,7 +411,7 @@ class TestApplyDarwin:
         # A no-op apply reaches no scheduler at all
         assert not touched_the_scheduler(h.calls)
 
-    def test_drift_triggers_update(
+    def test_drift_starts_update(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2446,7 +2446,7 @@ class TestEnableDisable:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # disable re-renders the plist with no schedule and reloads
-        # (bootout + bootstrap) -- a loaded-but-dormant, still-triggerable
+        # (bootout + bootstrap) -- a loaded-but-dormant, still-startable
         # unit, with no launchctl `disable` record involved.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
@@ -2463,13 +2463,13 @@ class TestEnableDisable:
         assert "disable" not in verbs
         assert "StartCalendarInterval" not in plist.read_text()
 
-    def test_disabled_job_synced_triggerable_and_shown_disabled(
+    def test_disabled_job_synced_startable_and_shown_disabled(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # End to end: disabling a scheduled job leaves it config=synced
         # (the disable is a runtime overlay, not drift), shown SCHEDULE=
-        # disabled, and still triggerable -- kickstart fires the loaded
-        # schedule-less unit (the original disabled-trigger bug).
+        # disabled, and still startable -- kickstart fires the loaded
+        # schedule-less unit (the original disabled-start bug).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
@@ -2494,8 +2494,8 @@ class TestEnableDisable:
         out = capsys.readouterr().out
         assert "disabled" in out
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["j"], wait=False, start_timeout=None, bundle=None
         )
         cmd = next(
             c for c in h.calls if c[0] == "launchctl" and c[1] == "kickstart"
@@ -2593,11 +2593,11 @@ class TestEnableDisable:
         assert self._schedule_cell(h.full("od"), capsys) == "on-demand"
         assert self._schedule_cell(h.full("child"), capsys) == "grouped"
 
-    def test_trigger_fires_on_demand_job_on_linux(
+    def test_start_fires_on_demand_job_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # An on-demand job has no schedule and sits directly under a
-        # target, yet applies and is triggerable -- trigger starts its
+        # target, yet applies and is startable -- start starts its
         # dormant `.service` (no `.timer` is installed for it).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         h.config(
@@ -2606,8 +2606,8 @@ class TestEnableDisable:
         )
         h.apply("j")
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["j"], wait=False, start_timeout=None, bundle=None
         )
         cmd = next(
             c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
@@ -2620,7 +2620,7 @@ class TestEnableDisable:
             f"crony-{h.full('j')}.service",
         ]
 
-    def test_trigger_invokes_launchctl_kickstart_on_darwin(
+    def test_start_invokes_launchctl_kickstart_on_darwin(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
@@ -2630,8 +2630,8 @@ class TestEnableDisable:
         )
         h.apply("j")
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["j"], wait=False, start_timeout=None, bundle=None
         )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd == [
@@ -2640,7 +2640,7 @@ class TestEnableDisable:
             f"gui/{os.getuid()}/org.crony.{h.full('j')}",
         ]
 
-    def test_trigger_invokes_systemctl_start_on_linux(
+    def test_start_invokes_systemctl_start_on_linux(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
@@ -2650,13 +2650,13 @@ class TestEnableDisable:
         )
         h.apply("j")
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["j"], wait=False, start_timeout=None, bundle=None
         )
         cmd = next(
             c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
         )
-        # --no-block keeps the async trigger from blocking on the
+        # --no-block keeps the async start from blocking on the
         # Type=oneshot service's ExecStart.
         assert cmd == [
             "systemctl",
@@ -2666,21 +2666,21 @@ class TestEnableDisable:
             f"crony-{h.full('j')}.service",
         ]
 
-    def test_trigger_unknown_name_rejected(
+    def test_start_unknown_name_rejected(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="not runnable here"):
-            crony_commands.do_trigger(
-                jobs=["ghost"], wait=False, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["ghost"], wait=False, start_timeout=None, bundle=None
             )
 
-    def test_trigger_wait_refuses_config_removed_orphan(
+    def test_start_wait_refuses_config_removed_orphan(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Apply a job, then drop it from the config so it's an
-        # installed orphan. `trigger --wait` resolves timeouts from
+        # installed orphan. `start --wait` resolves timeouts from
         # the config, which no longer describes it -- it must raise
         # a clean UsageError, not a raw KeyError.
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2691,17 +2691,17 @@ class TestEnableDisable:
         h.apply("j")
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="not in the current config"):
-            crony_commands.do_trigger(
+            crony_commands.do_start(
                 jobs=[h.full("j")],
                 wait=True,
-                trigger_timeout=None,
+                start_timeout=None,
                 bundle=None,
             )
 
-    def test_trigger_wait_maps_timeout_to_nonzero_exit(
+    def test_start_wait_maps_timeout_to_nonzero_exit(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `crony trigger --wait` must surface a non-zero exit code
+        # `crony start --wait` must surface a non-zero exit code
         # when the job times out (exit_code is None for that class).
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
@@ -2711,7 +2711,7 @@ class TestEnableDisable:
         h.apply("j")
         monkeypatch.setattr(
             crony_runner,
-            "trigger_unit_sync",
+            "start_unit_wait",
             lambda *_a, **_kw: {
                 "exit_class": "timeout",
                 "exit_code": None,
@@ -2719,12 +2719,12 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony_commands.do_trigger(
-                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["j"], wait=True, start_timeout=None, bundle=None
             )
         assert exc.value.code == int(ExitCode.TIMEOUT)
 
-    def test_trigger_wait_uncapped_job_passes_inf(
+    def test_start_wait_uncapped_job_passes_inf(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # An uncapped job (job_timeout_sec=0) must reach the waiter as
@@ -2750,13 +2750,13 @@ class TestEnableDisable:
             captured["job_timeout"] = kw["job_timeout"]
             return {"exit_class": "ok", "exit_code": 0, "signal": None}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _capture)
-        crony_commands.do_trigger(
-            jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _capture)
+        crony_commands.do_start(
+            jobs=["j"], wait=True, start_timeout=None, bundle=None
         )
         assert math.isinf(captured["job_timeout"])
 
-    def test_trigger_wait_maps_signal_to_128_plus_n(
+    def test_start_wait_maps_signal_to_128_plus_n(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2767,7 +2767,7 @@ class TestEnableDisable:
         h.apply("j")
         monkeypatch.setattr(
             crony_runner,
-            "trigger_unit_sync",
+            "start_unit_wait",
             lambda *_a, **_kw: {
                 "exit_class": "signal",
                 "exit_code": None,
@@ -2775,12 +2775,12 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony_commands.do_trigger(
-                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["j"], wait=True, start_timeout=None, bundle=None
             )
         assert exc.value.code == 137
 
-    def test_trigger_wait_passes_through_command_exit_code(
+    def test_start_wait_passes_through_command_exit_code(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _ApplyHarness(tmp_path, monkeypatch)
@@ -2791,7 +2791,7 @@ class TestEnableDisable:
         h.apply("j")
         monkeypatch.setattr(
             crony_runner,
-            "trigger_unit_sync",
+            "start_unit_wait",
             lambda *_a, **_kw: {
                 "exit_class": "fail",
                 "exit_code": 7,
@@ -2799,16 +2799,16 @@ class TestEnableDisable:
             },
         )
         with pytest.raises(SystemExit) as exc:
-            crony_commands.do_trigger(
-                jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["j"], wait=True, start_timeout=None, bundle=None
             )
         assert exc.value.code == 7
 
-    def test_trigger_wait_treats_ok_as_zero_despite_nonzero_code(
+    def test_start_wait_treats_ok_as_zero_despite_nonzero_code(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A success_exit_codes match records exit_class "ok" with a
-        # non-zero exit_code; `trigger --wait` must still exit 0, not
+        # non-zero exit_code; `start --wait` must still exit 0, not
         # surface the raw code.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
@@ -2818,33 +2818,33 @@ class TestEnableDisable:
         h.apply("j")
         monkeypatch.setattr(
             crony_runner,
-            "trigger_unit_sync",
+            "start_unit_wait",
             lambda *_a, **_kw: {
                 "exit_class": "ok",
                 "exit_code": 1,
                 "signal": None,
             },
         )
-        # rc maps to 0, so do_trigger returns without raising SystemExit.
-        crony_commands.do_trigger(
-            jobs=["j"], wait=True, trigger_timeout=None, bundle=None
+        # rc maps to 0, so do_start returns without raising SystemExit.
+        crony_commands.do_start(
+            jobs=["j"], wait=True, start_timeout=None, bundle=None
         )
 
-    def test_trigger_timeout_requires_wait(self) -> None:
-        # --trigger-timeout is only meaningful under --wait; the parser
+    def test_start_timeout_requires_wait(self) -> None:
+        # --start-timeout is only meaningful under --wait; the parser
         # rejects the combination (exit 2) before dispatch.
         with pytest.raises(SystemExit) as exc:
             crony_cli._build_parser().parse_command(
-                ["trigger", "j", "--trigger-timeout", "10"]
+                ["start", "j", "--start-timeout", "10"]
             )
         assert exc.value.code == 2
 
-    def test_trigger_rejects_ambiguous_uuid_swap(
+    def test_start_rejects_ambiguous_uuid_swap(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A uuid edit is a new entity, not a rename: the name `j` now
         # addresses one uuid on disk (the applied unit) and a different
-        # uuid in config. That's ambiguous, so `do_trigger` refuses and
+        # uuid in config. That's ambiguous, so `do_start` refuses and
         # points at `crony apply` rather than guessing a target.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         cfg = h.config(
@@ -2877,8 +2877,8 @@ class TestEnableDisable:
             default_target_jobs=["j"],
         )
         with pytest.raises(UsageError, match="crony apply"):
-            crony_commands.do_trigger(
-                jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["j"], wait=False, start_timeout=None, bundle=None
             )
 
     def _rename_keeping_uuid(self, h: _ApplyHarness, old: str, new: str) -> str:
@@ -2905,20 +2905,20 @@ class TestEnableDisable:
         )
         return job_uuid
 
-    def test_trigger_renamed_entry_by_new_name(
+    def test_start_renamed_entry_by_new_name(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A rename keeps the uuid; triggering by the new config name
+        # A rename keeps the uuid; starting by the new config name
         # before re-apply fires the installed unit (still under the old
         # name) and flags the uuid-keyed state dir.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         job_uuid = self._rename_keeping_uuid(h, "j", "k")
         sd = h.state / DEFAULT_BUNDLE_NAME / job_uuid
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["k"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["k"], wait=False, start_timeout=None, bundle=None
         )
-        assert (sd / "user-trigger.flag").exists()
+        assert (sd / "user-start.flag").exists()
         kick = next(
             c for c in h.calls if c[0] == "launchctl" and c[1] == "kickstart"
         )
@@ -3003,11 +3003,11 @@ class TestEnableDisable:
         with pytest.raises(UsageError, match="crony apply"):
             crony_commands.do_destroy(jobs=["j"], bundle=None, orphans=False)
 
-    def test_trigger_refuses_unit_only_entry(
+    def test_start_refuses_unit_only_entry(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A unit-only remnant (platform unit on disk, no parseable
-        # snapshot) is not runnable: trigger must refuse rather than
+        # snapshot) is not runnable: start must refuse rather than
         # fire a unit whose snapshot can't load.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
@@ -3019,15 +3019,15 @@ class TestEnableDisable:
         sd = h.state_dir("j", ensure_snapshot=False)
         (sd / "snapshot.json").unlink()
         with pytest.raises(UsageError, match="crony apply"):
-            crony_commands.do_trigger(
-                jobs=["j"], wait=False, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["j"], wait=False, start_timeout=None, bundle=None
             )
 
-    def test_trigger_works_on_schedule_less_job(
+    def test_start_works_on_schedule_less_job(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Every entry installs a platform unit, including schedule-
-        # less group-only jobs. trigger fires that unit directly.
+        # less group-only jobs. start fires that unit directly.
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config(
             {
@@ -3038,8 +3038,8 @@ class TestEnableDisable:
         )
         h.apply("a")
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=["a"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["a"], wait=False, start_timeout=None, bundle=None
         )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd[1] == "kickstart"
@@ -3089,22 +3089,22 @@ class TestEnableDisable:
         with pytest.raises(UsageError, match="unknown bundle"):
             crony_commands.do_disable(jobs=[], bundle="ghost")
         with pytest.raises(UsageError, match="unknown bundle"):
-            crony_commands.do_trigger(
-                jobs=[], wait=False, trigger_timeout=None, bundle="ghost"
+            crony_commands.do_start(
+                jobs=[], wait=False, start_timeout=None, bundle="ghost"
             )
 
     def test_names_or_all_required(self) -> None:
         # An unscoped bulk verb (no names, no --all) is rejected by the
         # parser (exit 2) so it can't silently act on everything --
         # including with only --bundle, which narrows but doesn't select.
-        for verb in ("enable", "disable", "trigger"):
+        for verb in ("enable", "disable", "start"):
             for argv in ([verb], [verb, "-b", "x"]):
                 with pytest.raises(SystemExit) as exc:
                     crony_cli._build_parser().parse_command(argv)
                 assert exc.value.code == 2
 
     def test_all_with_names_rejected(self) -> None:
-        for verb in ("enable", "disable", "trigger"):
+        for verb in ("enable", "disable", "start"):
             with pytest.raises(SystemExit) as exc:
                 crony_cli._build_parser().parse_command([verb, "--all", "foo"])
             assert exc.value.code == 2
@@ -3112,7 +3112,7 @@ class TestEnableDisable:
     def test_all_parses_and_is_consumed(self) -> None:
         # --all (optionally -b) parses; the validator consumes it so it
         # never reaches the handler signature.
-        for verb in ("enable", "disable", "trigger"):
+        for verb in ("enable", "disable", "start"):
             for argv in ([verb, "--all"], [verb, "--all", "-b", "x"]):
                 args = crony_cli._build_parser().parse_command(argv)
                 assert args.command == verb
@@ -3195,10 +3195,10 @@ class TestEnableDisable:
         crony_commands.do_disable(jobs=[], bundle=None)
         assert disabled_flags() == {"a": True, "b": True}
 
-    def test_trigger_bulk_includes_unscheduled_in_bundle(
+    def test_start_bulk_includes_unscheduled_in_bundle(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # Trigger fires every stamped entry, including schedule-less
+        # Start fires every stamped entry, including schedule-less
         # ones (their dormant units kickstart fine).
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.config(
@@ -3211,8 +3211,8 @@ class TestEnableDisable:
         h.apply("a")
         h.apply("g")
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=[], wait=False, trigger_timeout=None, bundle="default"
+        crony_commands.do_start(
+            jobs=[], wait=False, start_timeout=None, bundle="default"
         )
         labels = [
             c[-1]
@@ -3222,10 +3222,10 @@ class TestEnableDisable:
         assert any(h.full("a") in lbl for lbl in labels)
         assert any(h.full("g") in lbl for lbl in labels)
 
-    def test_enable_disable_trigger_scoped_when_bundle_config_broken(
+    def test_enable_disable_start_scoped_when_bundle_config_broken(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # enable / disable / trigger address installed units, not
+        # enable / disable / start address installed units, not
         # the pending config, so scoping them to a bundle whose
         # config has since broken must still act on that bundle's
         # installed entries rather than be refused as an unknown
@@ -3259,8 +3259,8 @@ class TestEnableDisable:
         assert any("borgadm.k" in str(c) for c in h.calls)
 
         h.calls.clear()
-        crony_commands.do_trigger(
-            jobs=[], wait=False, trigger_timeout=None, bundle="borgadm"
+        crony_commands.do_start(
+            jobs=[], wait=False, start_timeout=None, bundle="borgadm"
         )
         assert any("borgadm.k" in str(c) for c in h.calls)
 
@@ -5864,7 +5864,7 @@ class TestValidate:
     ) -> None:
         # Orphans live in no bundle, so a bundle-scoped validate
         # ignores them. The orphan stamp here would normally
-        # trigger a WARNING; --bundle borgadm should exit clean.
+        # start a WARNING; --bundle borgadm should exit clean.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
         h.fabricate_orphan("ghost")
         h.config({}, default_target_jobs=[])
@@ -8467,7 +8467,7 @@ class TestSnapshotLifecycle:
         # test scopes to the structural surfaces only.
         parser = crony_cli._build_parser()
         usage_line = parser.format_usage()
-        assert "trigger" not in usage_line  # uses metavar, not choices
+        assert "start" not in usage_line  # uses metavar, not choices
         assert "run" not in usage_line, (
             f"`run` leaked into usage line: {usage_line!r}"
         )
@@ -8477,9 +8477,9 @@ class TestSnapshotLifecycle:
         assert not re.search(r"^    run\b", help_text, flags=re.MULTILINE), (
             f"`run` leaked into subcommand description block:\n{help_text}"
         )
-        # Sanity: `trigger` IS user-facing and must show up.
-        assert re.search(r"^    trigger\b", help_text, flags=re.MULTILINE), (
-            "`trigger` missing from subcommand description block"
+        # Sanity: `start` IS user-facing and must show up.
+        assert re.search(r"^    start\b", help_text, flags=re.MULTILINE), (
+            "`start` missing from subcommand description block"
         )
 
 
@@ -8730,9 +8730,9 @@ class TestInteractiveHelpers:
         assert crony_runner._show_interactive_dialog("foo", "msg") == "cancel"
 
 
-class TestUserTriggerFlag:
-    """The one-shot sentinel file written by `trigger_unit` when
-    the user invokes `crony trigger` and consumed by `crony _run` to
+class TestUserStartFlag:
+    """The one-shot sentinel file written by `start_unit` when
+    the user invokes `crony start` and consumed by `crony _run` to
     bypass the interactive wait.
     """
 
@@ -8744,15 +8744,15 @@ class TestUserTriggerFlag:
         # it sits alongside run.lock / pending.flag / last-run.json
         # rather than under a phantom legacy path.
         sd = h.fabricate_orphan("iv")
-        assert not crony_runtime.consume_user_trigger_flag(sd)
-        crony_runtime.write_user_trigger_flag(sd)
-        assert (sd / "user-trigger.flag").exists()
-        assert crony_runtime.consume_user_trigger_flag(sd)
-        assert not (sd / "user-trigger.flag").exists()
+        assert not crony_runtime.consume_user_start_flag(sd)
+        crony_runtime.write_user_start_flag(sd)
+        assert (sd / "user-start.flag").exists()
+        assert crony_runtime.consume_user_start_flag(sd)
+        assert not (sd / "user-start.flag").exists()
         # Second consume on absent flag returns False.
-        assert not crony_runtime.consume_user_trigger_flag(sd)
+        assert not crony_runtime.consume_user_start_flag(sd)
 
-    def test_trigger_unit_writes_flag_only_when_user_initiated(
+    def test_start_unit_writes_flag_only_when_user_initiated(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -8768,16 +8768,16 @@ class TestUserTriggerFlag:
             "run",
             lambda *a, **_kw: subprocess.CompletedProcess(a, 0),
         )
-        crony_runner.trigger_unit(
-            full, "darwin", triggered_by_user=True, state_dir=sd
+        crony_runner.start_unit(
+            full, "darwin", started_by_user=True, state_dir=sd
         )
-        flag = sd / "user-trigger.flag"
+        flag = sd / "user-start.flag"
         assert flag.exists()
         flag.unlink()
-        crony_runner.trigger_unit(full, "darwin")
+        crony_runner.start_unit(full, "darwin")
         assert not flag.exists()
 
-    def test_trigger_unit_unlinks_flag_on_kickstart_failure(
+    def test_start_unit_unlinks_flag_on_kickstart_failure(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # If the platform-scheduler kick fails after we've written
@@ -8800,10 +8800,10 @@ class TestUserTriggerFlag:
 
         monkeypatch.setattr(crony_commands.subprocess, "run", fake_run)
         with pytest.raises(subprocess.CalledProcessError):
-            crony_runner.trigger_unit(
-                full, "darwin", triggered_by_user=True, state_dir=sd
+            crony_runner.start_unit(
+                full, "darwin", started_by_user=True, state_dir=sd
             )
-        assert not (sd / "user-trigger.flag").exists()
+        assert not (sd / "user-start.flag").exists()
 
 
 class TestJobStatusInteractive:
@@ -9312,7 +9312,7 @@ class TestStatusColor:
 
 class TestSchedulerCallPredicates:
     """The predicates the daemon and apply tests ask about recorded
-    calls -- driven through each backend's real `trigger`, since the
+    calls -- driven through each backend's real `start`, since the
     verbs and binaries they know are the ones those backends emit.
 
     Both are read almost entirely in negative assertions, which is the
@@ -9321,23 +9321,23 @@ class TestSchedulerCallPredicates:
     here is what stops that."""
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
-    def test_sees_each_backends_trigger(
+    def test_sees_each_backends_start(
         self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
         calls = record_subprocess_calls(monkeypatch)
-        crony_platform.get_scheduler(platform, tmp_path).trigger("default.j")
+        crony_platform.get_scheduler(platform, tmp_path).start("default.j")
         assert calls, "the backend issued no call to inspect"
-        assert triggered_a_unit(calls)
+        assert started_a_unit(calls)
         assert touched_the_scheduler(calls)
 
-    def test_launchd_trigger_carries_no_bare_start(
+    def test_launchd_start_carries_no_bare_start(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The fact the helper exists for: launchd spells it `kickstart`,
         # so an assertion naming only `start` reads a real fire as no
         # fire at all -- these are argv lists, matched element-wise.
         calls = record_subprocess_calls(monkeypatch)
-        crony_platform.get_scheduler("darwin", tmp_path).trigger("default.j")
+        crony_platform.get_scheduler("darwin", tmp_path).start("default.j")
         assert calls
         assert all("start" not in argv for argv in calls)
 
@@ -9347,13 +9347,11 @@ class TestSchedulerCallPredicates:
         # counts here. Literals rather than a driven `activate`, which
         # would need a whole UnitSpec -- so unlike the fire direction
         # above, this would not notice a backend changing its verb.
-        assert not triggered_a_unit([["systemctl", "--user", "restart", "u"]])
-        assert not triggered_a_unit(
-            [["launchctl", "bootstrap", "gui/501", "p"]]
-        )
+        assert not started_a_unit([["systemctl", "--user", "restart", "u"]])
+        assert not started_a_unit([["launchctl", "bootstrap", "gui/501", "p"]])
 
-    def test_no_calls_is_no_trigger(self) -> None:
-        assert not triggered_a_unit([])
+    def test_no_calls_is_no_start(self) -> None:
+        assert not started_a_unit([])
 
 
 class TestDaemonLifecycle:
@@ -9500,7 +9498,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
 
         assert h.apply("d") == "unchanged"
-        assert not triggered_a_unit(h.calls)
+        assert not started_a_unit(h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
     def test_enable_rearms_exhausted_enabled_daemon(
@@ -9546,10 +9544,10 @@ class TestDaemonLifecycle:
                 return toks
         raise AssertionError(f"no status row for {full}")
 
-    def test_disabled_daemon_that_was_triggered_reads_disabled_running(
+    def test_disabled_daemon_that_was_started_reads_disabled_running(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
-        # Triggering a disabled daemon starts it without clearing the
+        # Starting a disabled daemon starts it without clearing the
         # operator-disable, so the two cells report different things and
         # both are right: SCHEDULE says it will not start itself again,
         # STATUS says it is up right now. The disable override on the
@@ -9685,7 +9683,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
 
         crony_commands.do_enable(jobs=["d"], bundle=None)
-        assert not triggered_a_unit(h.calls)
+        assert not started_a_unit(h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
     def test_enable_reports_a_rearm_as_such(
@@ -9777,7 +9775,7 @@ class TestDaemonLifecycle:
     def test_entering_the_daemon_mode_clears_it_even_while_disabled(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A disabled daemon is still triggerable by hand, so it must not
+        # A disabled daemon is still startable by hand, so it must not
         # start its first budget holding entries the scheduled shape's
         # ratio window left behind.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
@@ -9981,10 +9979,10 @@ class TestDaemonLifecycle:
         assert (h.sysd / f"crony-{h.full('renamed')}.service").exists()
         assert not (h.sysd / f"crony-{h.full('d')}.service").exists()
 
-    def test_trigger_wait_rejection_reads_applied_state(
+    def test_start_wait_rejection_reads_applied_state(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `trigger` fires the unit that is installed, so an un-applied
+        # `start` fires the unit that is installed, so an un-applied
         # edit must not decide whether waiting is possible. The config
         # here no longer says daemon; the installed unit still is one.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
@@ -10003,11 +10001,11 @@ class TestDaemonLifecycle:
             default_target_jobs=["d"],
         )
         with pytest.raises(UsageError, match="daemon"):
-            crony_commands.do_trigger(
-                jobs=["d"], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["d"], wait=True, start_timeout=None, bundle=None
             )
 
-    def test_trigger_all_wait_rejects_before_firing_anything(
+    def test_start_all_wait_rejects_before_firing_anything(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The daemon check runs as a pre-flight pass: discovering it
@@ -10027,12 +10025,12 @@ class TestDaemonLifecycle:
         h.apply("d")
         h.calls.clear()
         with pytest.raises(UsageError, match="daemon"):
-            crony_commands.do_trigger(
-                jobs=[], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=[], wait=True, start_timeout=None, bundle=None
             )
-        assert not triggered_a_unit(h.calls)
+        assert not started_a_unit(h.calls)
 
-    def test_trigger_wait_rejects_a_daemon(
+    def test_start_wait_rejects_a_daemon(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # --wait blocks for the next completion; a daemon has none.
@@ -10040,11 +10038,11 @@ class TestDaemonLifecycle:
         self._daemon_cfg(h)
         h.apply("d")
         with pytest.raises(UsageError, match="daemon"):
-            crony_commands.do_trigger(
-                jobs=["d"], wait=True, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["d"], wait=True, start_timeout=None, bundle=None
             )
 
-    def test_plain_trigger_accepts_a_daemon(
+    def test_plain_start_accepts_a_daemon(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Starting a daemon is the meaningful operation -- it is how a
@@ -10052,13 +10050,13 @@ class TestDaemonLifecycle:
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         self._daemon_cfg(h)
         h.apply("d")
-        crony_commands.do_trigger(
-            jobs=["d"], wait=False, trigger_timeout=None, bundle=None
+        crony_commands.do_start(
+            jobs=["d"], wait=False, start_timeout=None, bundle=None
         )
-        assert triggered_a_unit(h.calls)
-        assert crony_runtime.user_trigger_flag_path(h.state_dir("d")).is_file()
+        assert started_a_unit(h.calls)
+        assert crony_runtime.user_start_flag_path(h.state_dir("d")).is_file()
 
-    def test_trigger_of_a_running_daemon_writes_no_sentinel(
+    def test_start_of_a_running_daemon_writes_no_sentinel(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The scheduler swallows the fire, so nothing consumes the
@@ -10071,11 +10069,71 @@ class TestDaemonLifecycle:
         sd = h.state_dir("d")
         sd.mkdir(parents=True, exist_ok=True)
         with crony_runtime.acquire_lock(sd / "run.lock"):
-            crony_commands.do_trigger(
-                jobs=["d"], wait=False, trigger_timeout=None, bundle=None
+            crony_commands.do_start(
+                jobs=["d"], wait=False, start_timeout=None, bundle=None
             )
-        assert triggered_a_unit(h.calls)
-        assert not crony_runtime.user_trigger_flag_path(sd).exists()
+        assert started_a_unit(h.calls)
+        assert not crony_runtime.user_start_flag_path(sd).exists()
+
+
+@pytest.mark.parametrize("mode", ["schedule", "on-demand", "daemon", "group"])
+@pytest.mark.parametrize("running", [False, True])
+def test_start_reports_a_running_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    running: bool,
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+    if mode == "group":
+        h.config(
+            {
+                "job": {"child": {"command": "true"}},
+                "job-group": {"j": {"jobs": ["child"], "on-demand": True}},
+            },
+            default_target_jobs=["j"],
+        )
+    else:
+        timing: str | bool = "daily" if mode == "schedule" else True
+        h.config(
+            {"job": {"j": {"command": "true", mode: timing}}},
+            default_target_jobs=["j"],
+        )
+    h.apply("j")
+    caplog.set_level(logging.INFO)
+    sd = h.state_dir("j")
+    if running:
+        with crony_runtime.acquire_lock(sd / "run.lock"):
+            crony_commands.do_start(["j"], False, None, None)
+    else:
+        crony_commands.do_start(["j"], False, None, None)
+    expected = "already running" if running else "starting"
+    assert f"{h.full('j')}: {expected}" in caplog.text
+
+
+def test_start_reports_pending_approval_bypass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+    h.config(
+        {
+            "job": {
+                "j": {"command": "true", "on-demand": True, "interactive": True}
+            }
+        },
+        default_target_jobs=["j"],
+    )
+    h.apply("j")
+    sd = h.state_dir("j")
+    (sd / "pending.flag").write_bytes(b"")
+    caplog.set_level(logging.INFO)
+    with crony_runtime.acquire_lock(sd / "run.lock"):
+        crony_commands.do_start(["j"], False, None, None)
+    assert "already running (bypassing pending approval)" in caplog.text
+    assert crony_runtime.user_start_flag_path(sd).exists()
 
 
 if __name__ == "__main__":

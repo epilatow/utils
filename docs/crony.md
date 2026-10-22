@@ -13,19 +13,18 @@ jobs through a uniform shim, which provides consistent logging, execution
 gates, timeouts, environment management, etc. Jobs can be grouped, and groups
 or jobs run on a schedule; a job can instead be a daemon, which runs
 continuously and gets five automatic restarts when it stops prematurely. An
-exhausted daemon stays loaded but stopped until the next login, `trigger`,
+exhausted daemon stays loaded but stopped until the next login, `start`,
 `apply`, or `enable` starts a fresh retry budget. Jobs can also be managed
 manually (enabled/disabled independently of the underlying scheduler, and run
-at will via the `trigger` subcommand). Crony supports the following
-notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
-macOS/darwin).
+at will via the `start` subcommand). Crony supports the following notification
+mechanisms for job failures: email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
 Subcommands fall into categories:
 
 - configuration (`config`): manage config files
 - deployment (`apply`, `destroy`): deploy configured jobs
 - runtime state (`enable`, `disable`): manage scheduler arming
-- operational (`status`, `logs`, `trigger`): manage deployed jobs
+- operational (`status`, `logs`, `start`): manage deployed jobs
 
 Configuration is managed via bundles:
 
@@ -33,7 +32,7 @@ Configuration is managed via bundles:
 - `~/.config/crony/config/<x>.toml` -> bundle name "\<x>"
 
 Bundles are independent. Job and group names are namespaced as
-\<bundle>.\<name>; bare CLI input (`crony trigger foo`) is shorthand for
+\<bundle>.\<name>; bare CLI input (`crony start foo`) is shorthand for
 `default.foo`. The `-b/--bundle <name>` flag on various subcommands scopes
 name resolution to that bundle.
 
@@ -51,8 +50,8 @@ their execution status) with `crony status`. To deploy configured jobs run
 `crony apply`. If you change the configuration for a deployed job,
 `crony status` will report that the job is `stale` and you can update the
 deployed configuration by running `crony apply` again. To see execution logs
-(file path, content, etc.) for a job use `crony logs`. To manually trigger a
-job run use `crony trigger`. To disable a job (without destroying it), use
+(file path, content, etc.) for a job use `crony logs`. To manually start a job
+run use `crony start`. To disable a job (without destroying it), use
 `crony disable` (you can subsequently re-enable it with `crony enable`). To
 remove deployed jobs run `crony destroy`. (Destroying jobs removes all
 previous job state: log files, last run information, etc.)
@@ -156,11 +155,11 @@ declined gate left stopped. Requires a target: job(s) or --all.
 
 ### `disable [--all] [-b BUNDLE] [job ...]`
 
-Disarm the named jobs' schedules: loaded and triggerable, but not firing on
+Disarm the named jobs' schedules: loaded and startable, but not firing on
 their own. Disabling a daemon stops it; it stays stopped across a reboot until
 re-enabled. Requires a target: job(s) or --all.
 
-### `trigger [--all] [-b BUNDLE] [-w] [--trigger-timeout TRIGGER_TIMEOUT] [job ...]`
+### `start [--all] [-b BUNDLE] [-w] [--start-timeout START_TIMEOUT] [job ...]`
 
 Ask the platform scheduler to fire the named jobs now, via the same path a
 scheduled fire uses. Starting a stopped daemon this way gives it a fresh retry
@@ -170,9 +169,9 @@ budget. Requires a target: job(s) or --all.
   Block until each named entry's next completion and exit with that exit code
   (worst across multiple names). Naming a daemon is an error -- it runs until
   stopped, so there is no completion to wait for.
-- **`--trigger-timeout TRIGGER_TIMEOUT`**\
-  Override [defaults].trigger_timeout_sec (seconds to wait for a runner to
-  come online after dispatch). Only meaningful with --wait.
+- **`--start-timeout START_TIMEOUT`**\
+  Override [defaults].start-timeout-sec (seconds to wait for a runner to come
+  online after dispatch). Only meaningful with --wait.
 
 ### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 
@@ -339,23 +338,22 @@ Send a synthetic failure notification.
 - **`interval=<x>`**\
   A systemd time-span interval for job execution.
 - **`grouped`**\
-  A job/group with no schedule of its own, it runs when triggered by a parent
+  A job/group with no schedule of its own, it runs when started by a parent
   job group.
 - **`on-demand`**\
-  A trigger-only job/group (on-demand = true) with no schedule of its own and
-  no scheduled parent. It runs only when run manually via the `trigger`
-  subcommand.
+  An on-demand job/group (on-demand = true) with no schedule of its own and no
+  scheduled parent. It runs only when run manually via the `start` subcommand.
 - **`daemon`**\
   A job (daemon = true) that runs continuously rather than at scheduled times.
   It starts at login and gets five automatic restarts when its command exits
   prematurely. After exhausting them it reports fail and stays stopped until
-  the next login, `apply`, `enable`, or `trigger`. Five minutes of continuous
+  the next login, `apply`, `enable`, or `start`. Five minutes of continuous
   runtime resets the retry budget. If its execution gate fails it stays
   stopped without consuming retries.
 - **`disabled`**\
   A job that has been disabled via the `disable` subcommand; it will not be
-  run via any schedule. It can be run manually via the `trigger` subcommand,
-  and re-enabled via the `enable` subcommand.
+  run via any schedule. It can be run manually via the `start` subcommand, and
+  re-enabled via the `enable` subcommand.
 
 ### STATUS values
 
@@ -399,8 +397,8 @@ Send a synthetic failure notification.
   Daemons only. The daemon has been disabled via the `disable` subcommand, so
   it is stopped and will not start itself again -- neither at boot nor by a
   restart -- until it is re-enabled. It can still be started manually via the
-  `trigger` subcommand. A scheduled job reports its last run's outcome
-  instead; its SCHEDULE cell carries the disabled state.
+  `start` subcommand. A scheduled job reports its last run's outcome instead;
+  its SCHEDULE cell carries the disabled state.
 - **`never`**\
   Jobs and groups. A newly deployed job or group that hasn't been run yet.
 - **`unknown`**\

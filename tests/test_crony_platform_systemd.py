@@ -208,7 +208,7 @@ class TestSystemdScheduler:
         assert all(u.content for u in units.units)
 
     def test_service_only_when_on_demand(self) -> None:
-        # A trigger-only OnDemand entry arms no timer -- the backend
+        # An on-demand OnDemand entry arms no timer -- the backend
         # renders the dormant `.service` alone, same as a schedule-less
         # entry (the model no longer collapses OnDemand to None).
         units = get_scheduler("linux", _DIR).render_units(
@@ -345,15 +345,15 @@ class TestSystemdActivate:
                 _activate_spec("default.brew", Interval.from_str("1h"))
             )
 
-    def test_trigger_uses_no_block(
+    def test_start_uses_no_block(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The .service is Type=oneshot, for which a plain `systemctl
-        # start` blocks until ExecStart exits. --no-block keeps trigger
+        # start` blocks until ExecStart exits. --no-block keeps start
         # async (it must return once the fire is accepted, not once the
         # job finishes).
         calls = self._record(monkeypatch)
-        get_scheduler("linux", tmp_path).trigger("default.brew")
+        get_scheduler("linux", tmp_path).start("default.brew")
         assert calls == [
             [
                 "systemctl",
@@ -364,7 +364,7 @@ class TestSystemdActivate:
             ]
         ]
 
-    def test_trigger_failure_raises_subprocess_error(
+    def test_start_failure_raises_subprocess_error(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A rejected `systemctl start` surfaces as a crony SubprocessError.
@@ -374,7 +374,7 @@ class TestSystemdActivate:
             lambda cmd, **_kw: subprocess.CompletedProcess(list(cmd), 1),
         )
         with pytest.raises(SubprocessError):
-            get_scheduler("linux", tmp_path).trigger("default.brew")
+            get_scheduler("linux", tmp_path).start("default.brew")
 
 
 class TestSystemdScheduleArmed:
@@ -888,7 +888,7 @@ class TestSystemdDaemon:
 
     def test_disabled_service_drops_supervision(self) -> None:
         # Without this, anything that started a disabled daemon -- a
-        # `crony trigger`, a stray `systemctl start` -- would put it back
+        # `crony start`, a stray `systemctl start` -- would put it back
         # under permanent supervision, which is not what disabled means.
         svc = (
             get_scheduler("linux", _DIR)

@@ -45,10 +45,10 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   gates, timeouts, environment management, etc. Jobs can be grouped, and
   groups or jobs run on a schedule; a job can instead be a daemon, which runs
   continuously and gets five automatic restarts when it stops prematurely. An
-  exhausted daemon stays loaded but stopped until the next login, `trigger`,
+  exhausted daemon stays loaded but stopped until the next login, `start`,
   `apply`, or `enable` starts a fresh retry budget. Jobs can also be managed
   manually (enabled/disabled independently of the underlying scheduler, and
-  run at will via the `trigger` subcommand). Crony supports the following
+  run at will via the `start` subcommand). Crony supports the following
   notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
   macOS/darwin).
 - **[darwin-tz-watchdog](docs/darwin-tz-watchdog.md)**\

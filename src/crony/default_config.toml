@@ -12,10 +12,10 @@
 # bundle can borrow the default bundle's notify config (see the
 # defaults section below).
 # Job and group names are namespaced as <bundle>.<short>; on the
-# CLI, a bare name (`crony trigger foo`) is shorthand for
+# CLI, a bare name (`crony start foo`) is shorthand for
 # `default.foo` and never falls through to other bundles. The
 # `-b/--bundle <name>` flag on multi-job subcommands (apply,
-# destroy, status, enable, disable, trigger) scopes the operation
+# destroy, status, enable, disable, start) scopes the operation
 # to <name>, so a bare arg resolves there instead of `default`.
 #
 # Directives below are commented with a bare `#` (no space) so a real
@@ -41,7 +41,7 @@
 #notify-attach-max-kb = 256          # email cap (ntfy uses a 3 KB cap)
 #notify-success-ratio = "1/1"        # failure-notification floor (see below)
 #job-timeout-sec      = 1800         # per-job wallclock cap; 0 = no cap
-#trigger-timeout-sec  = 15           # `crony trigger --wait` deadline
+#start-timeout-sec    = 15           # `crony start --wait` deadline
 #priority             = "high"       # priority class; jobs may override
 #keep-awake           = true         # default; jobs may override
 # Optional: capabilities can also be set as a cascading list --
@@ -149,8 +149,8 @@
 # scheduled group dispatches it. Validation rejects a target chain
 # that reaches a job through a path with no firing point anywhere --
 # give the job a schedule / interval, place it under a scheduled group,
-# set `on-demand = true` (see reindex below) to make it a trigger-only
-# job run solely via `crony trigger`, or set `daemon = true` (see
+# set `on-demand = true` (see reindex below) to make it an on-demand
+# job run solely via `crony start`, or set `daemon = true` (see
 # codex-remote-control below) to run it continuously.
 #
 # `uuid` is the stable per-bundle identity of the entry, decoupled
@@ -182,7 +182,7 @@
 #   "low"    throttle: macOS Background + low-priority IO + Nice 10;
 #            Linux Nice 10 + idle IO scheduling.
 #   "normal" (default) emit nothing. Applies on every fire path
-#            (scheduled, `crony trigger`, parent-group dispatch).
+#            (scheduled, `crony start`, parent-group dispatch).
 #keep-awake = true             # hold a power assertion for the run so an
 #            idle / on-AC machine doesn't sleep mid-job. NOTE: closing
 #            the lid on battery still sleeps the machine -- nothing in
@@ -222,9 +222,9 @@
 #command = "uv cache prune"
 #gate    = "command -v uv"
 
-# Trigger-only (on-demand) job: no schedule and no scheduled parent, so
+# On-demand (on-demand) job: no schedule and no scheduled parent, so
 # it never fires on its own -- it runs only when invoked with
-# `crony trigger reindex`. `on-demand = true` opts it out of the "would
+# `crony start reindex`. `on-demand = true` opts it out of the "would
 # never fire" check and shows `on-demand` in `crony status`. Mutually
 # exclusive with `schedule` / `interval`.
 #[job.reindex]
@@ -235,7 +235,7 @@
 # at login and gets five automatic restarts when its command exits
 # prematurely (six attempts total), so use it for a process that is meant
 # to stay up. After the sixth exit it reports `fail` and stays loaded but
-# stopped until the next login, `crony trigger`, `crony apply`, or `crony
+# stopped until the next login, `crony start`, `crony apply`, or `crony
 # enable` starts a fresh retry budget. Running continuously for five
 # minutes also resets the budget before a later exit. `daemon = true` is
 # mutually exclusive with `schedule` / `interval` / `on-demand`, and
@@ -244,7 +244,7 @@
 # The gate runs before every start, so it doubles as a precondition: a
 # daemon whose gate fails stays stopped immediately rather than consuming
 # retries, and comes back at the next login, `crony apply`, `crony enable`,
-# or `crony trigger`.
+# or `crony start`.
 #
 # A daemon cannot be a [job-group.*] member (a group waits for each child
 # to finish), and rejects a non-zero `job-timeout-sec` (it is uncapped by
@@ -288,7 +288,7 @@
 # a firing point somewhere -- a schedule, an interval, an on-demand
 # entry (`on-demand = true`, valid on a group too), or a daemon
 # (`daemon = true`, jobs only) -- or validation rejects it. An on-demand
-# group is triggered as a unit via `crony trigger <group>`, dispatching
+# group is started as a unit via `crony start <group>`, dispatching
 # its children on demand; its members are still members, so they follow
 # the rules below whether or not the group itself ever fires on a timer.
 #

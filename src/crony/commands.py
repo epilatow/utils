@@ -3,7 +3,7 @@
 """crony's command handlers.
 
 The do_* verbs behind the CLI -- apply / destroy / enable / disable /
-trigger / status / logs / config / validate / notify-test -- plus the
+start / status / logs / config / validate / notify-test -- plus the
 name-resolution and apply-ordering helpers and the status renderer (its
 column model, divergence and color handling, and per-column state
 derivation). This is the in-process API a caller drives instead of
@@ -68,7 +68,7 @@ def _schedule_display(timing: crony.unit.Timing | None) -> str:
     """Render a unit's timing into one status cell value.
 
     A Schedule shows its OnCalendar source; an Interval shows
-    `interval=<spec>`. A trigger-only OnDemand entry displays as
+    `interval=<spec>`. An on-demand OnDemand entry displays as
     `on-demand` and a continuous Daemon one as `daemon`. An entry with no
     timing -- a transit group or a group-only job -- displays as
     `grouped`. This renders only the schedule shape; the caller overrides
@@ -995,7 +995,7 @@ def _resolve_addressable(
     config: crony.model.Config, full: str
 ) -> crony.unit.EntityRef | None:
     """Resolve a user-supplied name to the single uuid it addresses
-    for an action command (enable / disable / trigger / destroy).
+    for an action command (enable / disable / start / destroy).
 
     A rename keeps the uuid, so a not-yet-applied new name resolves to
     the same uuid as its installed old name; either is accepted.
@@ -1038,7 +1038,7 @@ def _resolve_action_targets(
     the unit that exists, while the uuid pins the state dir.
 
     `runnable_only` narrows the acceptable set to entities with a
-    parseable current snapshot (`current.refs()`) -- the gate `trigger`
+    parseable current snapshot (`current.refs()`) -- the gate `start`
     needs, since firing a broken or unit-only entry would launch a unit
     whose snapshot can't load. A rename's uuid is still in `current`
     (under its old-name snapshot), so renames pass either way. Without
@@ -1073,13 +1073,13 @@ def _resolve_bulk_names(
     bundle: str | None,
     stamped: set[str],
 ) -> list[str]:
-    """Derive the operate-on name set for enable / disable / trigger.
+    """Derive the operate-on name set for enable / disable / start.
 
     With positional `jobs`, normalize each via `resolve_cli_name`
     (which honors `-b`'s bundle-scoping rules). With no positionals
     (the `--all` path the parser requires), the set is every stamped
     name -- every kind (scheduled, grouped, group container), since a
-    disable / enable / trigger applies to all of them -- narrowed to
+    disable / enable / start applies to all of them -- narrowed to
     `bundle` when one is given.
     """
     if jobs:
@@ -1136,7 +1136,7 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     """Disarm the named jobs' schedules (operator-disable).
 
     Re-renders each installed unit with no schedule -- loaded and
-    triggerable, but not firing on its own -- and records `unit_disabled`
+    startable, but not firing on its own -- and records `unit_disabled`
     on its snapshot so a later `crony apply` preserves it. For a daemon
     that means stopping it: firing on its own is all it does, so a
     disabled one is rendered inert (it neither starts at boot nor is
@@ -1167,15 +1167,22 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
         logger.info("%s: disabled", full)
 
 
-def do_trigger(
+def _report_start(full_name: str, state_dir: Path, *, running: bool) -> None:
+    message = "already running" if running else "starting"
+    if running and (state_dir / "pending.flag").exists():
+        message += " (bypassing pending approval)"
+    logger.info("%s: %s", full_name, message)
+
+
+def do_start(
     jobs: list[str],
     wait: bool,
-    trigger_timeout: int | None,
+    start_timeout: int | None,
     bundle: str | None,
 ) -> None:
     """Ask the platform scheduler to fire the named jobs.
 
-    `trigger` exercises the same platform-scheduler path a
+    `start` exercises the same platform-scheduler path a
     scheduled fire would, so the run uses the exact execution
     context (env, working dir, signal handling) the next
     scheduled invocation would use. This is the user-facing way
@@ -1186,20 +1193,20 @@ def do_trigger(
     less entries' units just sit dormant until explicitly started).
 
     Default mode is async (the scheduler fires and returns): the
-    trigger returns as soon as the platform has accepted it. With
+    start returns as soon as the platform has accepted it. With
     `--wait`, blocks until each named entry's next completion and exits
     with that exit code (the worst exit code across multiple names if
     more than one); a daemon has no completion to wait for, so naming
     one with `--wait` is a usage error.
 
-    Triggering a daemon starts it with a fresh retry budget -- useful
+    Starting a daemon starts it with a fresh retry budget -- useful
     when its gate previously declined and now would pass, or when it
-    used up its automatic restarts. Triggering one that is already
+    used up its automatic restarts. Starting one that is already
     running is the same no-op it is for any running unit, and writes no
     sentinel, so it cannot rearm a later restart.
 
-    `--trigger-timeout <sec>` (only with `--wait`) overrides the
-    default 15s "trigger never produced a run" deadline.
+    `--start-timeout <sec>` (only with `--wait`) overrides the
+    default 15s "start never produced a run" deadline.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
     shorthand for `default.<short>`. A rename (same uuid, new config
@@ -1207,8 +1214,8 @@ def do_trigger(
     uuids in config vs on disk is rejected until `crony apply`.
     Refuses names not stamped on this host (run apply first).
 
-    With `--all`, triggers every stamped entry (including schedule-less
-    ones, since trigger is meaningful for them too), narrowed to one
+    With `--all`, starts every stamped entry (including schedule-less
+    ones, since start is meaningful for them too), narrowed to one
     bundle when `--bundle <name>` is also given. With `--bundle` plus
     positional args, bare names resolve in `<name>` and qualified names
     must match it.
@@ -1223,7 +1230,7 @@ def do_trigger(
     if not wait:
         for full, ref, unit_name in targets:
             state_dir = crony.model.Job.state_dir_from_ref(ref)
-            # Triggering a running daemon is a no-op the scheduler
+            # Starting a running daemon is a no-op the scheduler
             # swallows, so the sentinel would sit unread until some
             # later automatic restart consumed it and handed that
             # restart a retry budget nobody asked for. Skip writing it
@@ -1231,38 +1238,39 @@ def do_trigger(
             # still gets one: an interactive job's pending run polls
             # for it to break out of its wait.
             applied = config.current.job_from_ref(ref)
+            running = crony.runtime.run_in_progress(state_dir)
             running_daemon = (
                 applied is not None
                 and crony.unit.is_daemon(applied.timing)
-                and crony.runtime.run_in_progress(state_dir)
+                and running
             )
             # Fire the unit under its installed (current) name; the
-            # user-trigger flag lands in the uuid-keyed state dir.
-            crony.runner.trigger_unit(
+            # user-start flag lands in the uuid-keyed state dir.
+            crony.runner.start_unit(
                 unit_name,
-                triggered_by_user=not running_daemon,
+                started_by_user=not running_daemon,
                 state_dir=state_dir,
             )
-            logger.info("%s: triggered", full)
+            _report_start(full, state_dir, running=running)
         return
 
     # Synchronous waiter mode. Reject any daemon up front: --wait has no
     # completion to wait for on one, and finding that out partway through
     # the list would leave the earlier names already fired.
     for full, ref, _unit_name in targets:
-        # The APPLIED mode, not the config's: `trigger` fires the unit
+        # The APPLIED mode, not the config's: `start` fires the unit
         # that is installed, so an un-applied edit either way must not
         # decide whether waiting is possible.
         applied = config.current.job_from_ref(ref)
         if applied is not None and crony.unit.is_daemon(applied.timing):
             raise crony.errors.UsageError(
                 f"{full!r} is a daemon, which runs until it is stopped; "
-                f"--wait has no completion to wait for. Trigger it "
+                f"--wait has no completion to wait for. Start it "
                 f"without --wait to start it."
             )
 
     # Resolve per-name timeouts via each name's bundle; bundles can
-    # disagree about defaults so we look up trigger_timeout_sec
+    # disagree about defaults so we look up start_timeout_sec
     # per-bundle too.
     worst_rc = 0
     for full, ref, unit_name in targets:
@@ -1274,7 +1282,7 @@ def do_trigger(
             )
         if short not in b.config.jobs and short not in b.config.job_groups:
             # Installed on disk but no longer in the config (an
-            # orphan). A plain `trigger` still fires it, but --wait
+            # orphan). A plain `start` still fires it, but --wait
             # resolves per-name timeouts from the config, which no
             # longer describes it -- refuse with a clear message
             # rather than a raw KeyError.
@@ -1293,19 +1301,23 @@ def do_trigger(
                 b.config.resolved_group_timeout_sec(b_target, short)
             )
         tt = (
-            float(trigger_timeout)
-            if trigger_timeout is not None
-            else float(b.config.defaults.trigger_timeout_sec)
+            float(start_timeout)
+            if start_timeout is not None
+            else float(b.config.defaults.start_timeout_sec)
         )
-        rec = crony.runner.trigger_unit_sync(
+        state_dir = crony.model.Job.state_dir_from_ref(ref)
+        _report_start(
+            full, state_dir, running=crony.runtime.run_in_progress(state_dir)
+        )
+        rec = crony.runner.start_unit_wait(
             unit_name,
-            state_dir=crony.model.Job.state_dir_from_ref(ref),
+            state_dir=state_dir,
             job_timeout=timeout,
-            trigger_timeout=tt,
-            triggered_by_user=True,
+            start_timeout=tt,
+            started_by_user=True,
         )
         cls = rec.get("exit_class", "ok")
-        rc = crony.runner.trigger_exit_code(rec)
+        rc = crony.runner.start_exit_code(rec)
         logger.info("%s: %s (exit %s)", full, cls, rc)
         if rc and (not worst_rc or abs(rc) > abs(worst_rc)):
             worst_rc = rc
@@ -2016,7 +2028,7 @@ def _entry_is_scheduled(
 ) -> bool:
     # "Scheduled" selects the `.timer` unit name over the bare
     # `.service`. Anything that arms no timer (a transit group, a
-    # trigger-only OnDemand entry, a daemon, or no timing) is not
+    # on-demand OnDemand entry, a daemon, or no timing) is not
     # scheduled -- `is_scheduled` is the shared "arms a real timer" test.
     # A daemon reads False and so names its `.service`, which is the
     # only unit it has.
@@ -2031,7 +2043,7 @@ def _snapshot_says_scheduled(
     """`True` / `False` if the current-graph entry for `full`
     arms a real timer (a Schedule / Interval, so the scheduler names
     its `.timer`); `None` otherwise. An entry that arms no timer -- a
-    transit group, a trigger-only OnDemand job, or a daemon -- reads
+    transit group, an on-demand OnDemand job, or a daemon -- reads
     `False` (the bare `.service`). Used to guess UNIT NAME for entries
     whose live config no longer exists.
 

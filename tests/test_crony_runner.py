@@ -41,7 +41,7 @@ from conftest_crony import (  # noqa: E402
     _parse,
     _resolve_snapshot_for,
     _RunnerHarness,
-    _stub_trigger_sync,
+    _stub_start_sync,
     crony,
 )
 
@@ -63,8 +63,8 @@ from crony.errors import (  # noqa: E402
     JobTimeoutError,
     PreconditionError,
     RunnerCrashed,
+    StartTimeout,
     SubprocessError,
-    TriggerStartTimeout,
     UnitNotInstalledError,
     UsageError,
 )
@@ -1337,7 +1337,7 @@ class TestRunGroup:
         )
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "b")
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {
                 h.full("a"): {"exit_code": 0, "exit_class": "ok"},
@@ -1373,7 +1373,7 @@ class TestRunGroup:
             default_target_jobs=["g"],
         )
         h.write_snap(cfg, "a")
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {h.full("a"): {"exit_code": 0, "exit_class": "ok"}},
         )
@@ -1403,7 +1403,7 @@ class TestRunGroup:
         )
         h.write_snap(cfg, "good")
         h.write_snap(cfg, "bad")
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {
                 h.full("bad"): {"exit_code": 3, "exit_class": "fail"},
@@ -1443,7 +1443,7 @@ class TestRunGroup:
         def _overran(*_a: object, **_k: object) -> dict[str, Any]:
             raise JobTimeoutError("child overran its own cap")
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _overran)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _overran)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "timeout"
@@ -1481,7 +1481,7 @@ class TestRunGroup:
                 observed[s] = signal.getsignal(s)
             return {"exit_class": "ok", "exit_code": 0}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _probe)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _probe)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         assert observed == {s: signal.SIG_IGN for s in guarded}
 
@@ -1507,7 +1507,7 @@ class TestRunGroup:
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "leaf")
         # The subgroup completed, reporting a fault of its own.
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {h.full("leaf"): {"exit_class": "fail", "exit_code": 1}},
         )
@@ -1538,7 +1538,7 @@ class TestRunGroup:
         def _crashed(*_a: object, **_k: object) -> dict[str, Any]:
             raise RunnerCrashed("runner exited without recording")
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _crashed)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _crashed)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "fail"
@@ -1564,7 +1564,7 @@ class TestRunGroup:
         def _not_installed(*_a: object, **_k: object) -> None:
             raise UnitNotInstalledError("unit not installed")
 
-        monkeypatch.setattr(crony_runner, "trigger_unit", _not_installed)
+        monkeypatch.setattr(crony_runner, "start_unit", _not_installed)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "fail"
@@ -1588,9 +1588,9 @@ class TestRunGroup:
         h.write_snap(cfg, "a")
 
         def _never_started(*_a: object, **_k: object) -> dict[str, Any]:
-            raise TriggerStartTimeout("platform never produced a runner")
+            raise StartTimeout("platform never produced a runner")
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _never_started)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _never_started)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "timeout"
@@ -1624,7 +1624,7 @@ class TestRunGroup:
                 raise SubprocessError(1, ["launchctl", "kickstart"])
             return {"exit_class": "ok", "exit_code": 0}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _reject_a)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _reject_a)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         # `b` still ran, and the group wears `a`'s failed dispatch.
@@ -1650,7 +1650,7 @@ class TestRunGroup:
             },
             default_target_jobs=["g"],
         )
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {
                 h.full("a"): {"exit_code": 0, "exit_class": "ok"},
@@ -1685,7 +1685,7 @@ class TestRunGroup:
         )
         h.write_snap(cfg, "a", disabled=True)
         h.write_snap(cfg, "b")
-        _stub_trigger_sync(
+        _stub_start_sync(
             monkeypatch,
             {h.full("b"): {"exit_code": 0, "exit_class": "ok"}},
         )
@@ -1738,7 +1738,7 @@ class TestRunGroup:
             return float(real_monotonic()) + clock["now"]
 
         monkeypatch.setattr(crony_commands.time, "monotonic", fake_monotonic)
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _slow)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _slow)
 
         # Advance the fake clock forward in the stub so the second
         # iteration sees no remaining budget.
@@ -1749,7 +1749,7 @@ class TestRunGroup:
             clock["now"] += 11.0  # past 1.05*(5+5) budget
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub_advance)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _stub_advance)
 
         h.write_snap(cfg, "a")
         h.write_snap(cfg, "b")
@@ -1794,7 +1794,7 @@ class TestRunGroup:
         def _cut_short(*_a: object, **_k: object) -> dict[str, Any]:
             raise JobTimeoutError("wait cut short by the group's budget")
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _cut_short)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _cut_short)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         rec = h.last_run("g")
         assert rec["jobs_run"][0]["exit_class"] == "timeout"
@@ -1827,7 +1827,7 @@ class TestRunGroup:
             captured[full_name] = job_timeout
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _capture)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _capture)
         h.write_snap(cfg, "a")
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
         assert math.isinf(captured[h.full("a")])
@@ -1869,7 +1869,7 @@ class TestRunGroup:
                 )
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _stub)
         h.write_snap(cfg, "missing")
         h.write_snap(cfg, "ok")
         rc = crony_runner._run_group(h.snap(cfg, "g"))
@@ -1920,7 +1920,7 @@ class TestRunGroup:
         def _stub(*_args: object, **_kwargs: object) -> dict[str, Any]:
             return {"exit_code": 0, "exit_class": "ok"}
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _stub)
         # Only "ok" gets a snapshot; "gone" stays unresolvable.
         h.write_snap(cfg, "ok")
         rc = crony_runner._run_group(h.snap(cfg, "g"))
@@ -1939,7 +1939,7 @@ class TestRunGroup:
 
 class TestRunGroupInteractive:
     """A group that contains an interactive child fires that child
-    async (via `trigger_unit`, not `trigger_unit_sync`) and moves
+    async (via `start_unit`, not `start_unit_wait`) and moves
     on without waiting. The interactive child's own runner does its
     wait + dialog independently, and the parent group's deadline
     excludes the child's job_timeout_sec.
@@ -1981,8 +1981,8 @@ class TestRunGroupInteractive:
         def _stub_async(name: str, *_args: object, **_kwargs: object) -> None:
             async_calls.append(name)
 
-        monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub_sync)
-        monkeypatch.setattr(crony_runner, "trigger_unit", _stub_async)
+        monkeypatch.setattr(crony_runner, "start_unit_wait", _stub_sync)
+        monkeypatch.setattr(crony_runner, "start_unit", _stub_async)
 
         rc = crony_runner._run_group(h.snap(cfg, "g"))
         assert rc == 0
@@ -2240,10 +2240,8 @@ class TestRunGroupInteractive:
         )
         h.write_snap(cfg, "iv")
         h.write_snap(cfg, "bad")
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_k: None
-        )
-        _stub_trigger_sync(
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_k: None)
+        _stub_start_sync(
             monkeypatch,
             {h.full("bad"): {"exit_code": 3, "exit_class": "fail"}},
         )
@@ -2255,9 +2253,9 @@ class TestRunGroupInteractive:
         assert rec["exit_class"] == "ok"
 
 
-class TestTriggerUnitNotInstalled:
-    """`trigger_unit` refuses early when the platform unit file
-    doesn't exist, and `trigger_unit_sync` doesn't side-effect a
+class TestStartUnitNotInstalled:
+    """`start_unit` refuses early when the platform unit file
+    doesn't exist, and `start_unit_wait` doesn't side-effect a
     state dir for a never-installed name.
     """
 
@@ -2266,20 +2264,20 @@ class TestTriggerUnitNotInstalled:
     # doesn't exist and a unit lookup deterministically reads "absent"
     # -- no per-test unit-dir setup needed.
 
-    def test_trigger_unit_raises_when_unit_file_missing(
+    def test_start_unit_raises_when_unit_file_missing(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("ghost")
         platform = crony_platform.current_platform()
         with pytest.raises(UnitNotInstalledError, match="not installed"):
-            crony_runner.trigger_unit(full, platform)
+            crony_runner.start_unit(full, platform)
         # No state dir leaked: the bundle subdir for default
         # should not have any uuid-keyed entries.
         bundle_dir = h.state / DEFAULT_BUNDLE_NAME
         assert not bundle_dir.exists() or not any(bundle_dir.iterdir())
 
-    def test_trigger_unit_sync_does_not_create_state_dir(
+    def test_start_unit_wait_does_not_create_state_dir(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The waiter takes a read-only stance on the state dir
@@ -2290,11 +2288,11 @@ class TestTriggerUnitNotInstalled:
         full = h.full("ghost")
         ghost_sd = h.state / DEFAULT_BUNDLE_NAME / "u-ghost"
         with pytest.raises(UnitNotInstalledError):
-            crony_runner.trigger_unit_sync(
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=ghost_sd,
                 job_timeout=5.0,
-                trigger_timeout=5.0,
+                start_timeout=5.0,
             )
         # The waiter took read-only stance; refusing didn't create
         # the state dir we pointed it at.
@@ -3459,30 +3457,30 @@ class TestGroupExitClass:
         )
 
 
-class TestTriggerExitCode:
-    """`crony trigger --wait` maps the record it waited for to its own
+class TestStartExitCode:
+    """`crony start --wait` maps the record it waited for to its own
     exit code. A group records no process exit -- its outcome lives
     entirely in `exit_class` -- so the exit-class fallbacks carry it.
     """
 
     def test_group_ok_exits_zero(self) -> None:
         # A group that ran every child, some of which failed. The
-        # children's own triggers surface their failures; the group's
+        # children's own starts surface their failures; the group's
         # does not.
-        assert crony_runner.trigger_exit_code({"exit_class": "ok"}) == 0
+        assert crony_runner.start_exit_code({"exit_class": "ok"}) == 0
 
     def test_group_fail_exits_nonzero(self) -> None:
         # The group could not run a child. There is no `exit_code` to
         # fall back on, so the class alone has to carry it -- otherwise
-        # `crony trigger --wait <group>` would report success for a group
+        # `crony start --wait <group>` would report success for a group
         # that never dispatched.
-        assert crony_runner.trigger_exit_code({"exit_class": "fail"}) == int(
+        assert crony_runner.start_exit_code({"exit_class": "fail"}) == int(
             ExitCode.ERROR
         )
 
     def test_group_timeout_exits_timeout(self) -> None:
         # The group blew its cumulative budget with children left to run.
-        assert crony_runner.trigger_exit_code({"exit_class": "timeout"}) == int(
+        assert crony_runner.start_exit_code({"exit_class": "timeout"}) == int(
             ExitCode.TIMEOUT
         )
 
@@ -3490,7 +3488,7 @@ class TestTriggerExitCode:
         # A job killed by a signal records no exit_code of its own; the
         # code is derived as the shell's 128 + signal-number convention.
         rec = {"exit_class": "signal", "signal": 9}
-        assert crony_runner.trigger_exit_code(rec) == 128 + 9
+        assert crony_runner.start_exit_code(rec) == 128 + 9
 
     def test_run_stopped_before_its_command_exits_128_plus_signal(
         self,
@@ -3499,18 +3497,18 @@ class TestTriggerExitCode:
         # not complete: it carries the stopping signal and no exit_code, and
         # the wait reports the same 128 + signal the runner exited with.
         rec = {"exit_class": "canceled", "exit_code": None, "signal": 15}
-        assert crony_runner.trigger_exit_code(rec) == 128 + 15
+        assert crony_runner.start_exit_code(rec) == 128 + 15
 
     def test_declined_run_still_exits_zero(self) -> None:
         # A run the user declined records its own exit_code 0 and no
         # signal, so the stop mapping above does not reach it.
         rec = {"exit_class": "canceled", "exit_code": 0, "signal": None}
-        assert crony_runner.trigger_exit_code(rec) == 0
+        assert crony_runner.start_exit_code(rec) == 0
 
     def test_signal_without_a_number_falls_back_to_error(self) -> None:
         # A signal class with no recorded number (a partial record) has
         # no 128 + N to compute, so it takes the general error code.
-        assert crony_runner.trigger_exit_code({"exit_class": "signal"}) == int(
+        assert crony_runner.start_exit_code({"exit_class": "signal"}) == int(
             ExitCode.ERROR
         )
 
@@ -3518,23 +3516,23 @@ class TestTriggerExitCode:
         # A `success_exit_codes` match keeps the real code on the record
         # but classifies the run ok, so the wait exits 0 regardless.
         rec = {"exit_class": "ok", "exit_code": 3}
-        assert crony_runner.trigger_exit_code(rec) == 0
+        assert crony_runner.start_exit_code(rec) == 0
 
     def test_recorded_exit_code_is_returned_verbatim(self) -> None:
         # A record that carries its own exit_code returns it directly --
         # the exit-class fallbacks are only for records that lack one.
         rec = {"exit_class": "fail", "exit_code": 42}
-        assert crony_runner.trigger_exit_code(rec) == 42
+        assert crony_runner.start_exit_code(rec) == 42
 
     def test_unrecognized_class_without_a_code_exits_zero(self) -> None:
         # A corrupt or unknown exit_class with no exit_code is not a
         # failure this can name, so it maps to 0 rather than guessing.
-        assert crony_runner.trigger_exit_code({"exit_class": "bogus"}) == 0
+        assert crony_runner.start_exit_code({"exit_class": "bogus"}) == 0
 
 
-class TestTriggerUnitSync:
-    """`trigger_unit_sync` wraps the kickstart + pid-watch +
-    last-run.json cross-check. Stub the platform trigger and
+class TestStartUnitWait:
+    """`start_unit_wait` wraps the kickstart + pid-watch +
+    last-run.json cross-check. Stub the platform start and
     write a synthetic last-run.json to exercise the waiter loop
     without requiring real launchd / systemd."""
 
@@ -3545,7 +3543,7 @@ class TestTriggerUnitSync:
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
 
-        def _stub_trigger(*_args: object, **_kwargs: object) -> None:
+        def _stub_start(*_args: object, **_kwargs: object) -> None:
             # Pretend the runner ran and wrote a fresh result.
             (sd / "last-run.json").write_text(
                 '{"ended_at": "2099-01-01T00:00:00-08:00",'
@@ -3553,34 +3551,32 @@ class TestTriggerUnitSync:
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(crony_runner, "trigger_unit", _stub_trigger)
-        rec = crony_runner.trigger_unit_sync(
-            full, state_dir=sd, job_timeout=5.0, trigger_timeout=5.0
+        monkeypatch.setattr(crony_runner, "start_unit", _stub_start)
+        rec = crony_runner.start_unit_wait(
+            full, state_dir=sd, job_timeout=5.0, start_timeout=5.0
         )
         assert rec["exit_code"] == 0
         assert rec["exit_class"] == "ok"
 
-    def test_trigger_start_timeout_raises(
+    def test_start_start_timeout_raises(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
-        with pytest.raises(TriggerStartTimeout, match="never produced"):
-            crony_runner.trigger_unit_sync(
-                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
+        with pytest.raises(StartTimeout, match="never produced"):
+            crony_runner.start_unit_wait(
+                full, state_dir=sd, job_timeout=5.0, start_timeout=1.0
             )
 
     def test_stale_last_run_json_loops_until_fresh_arrives(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # Pre-existing last-run.json from a prior run (ended_at
-        # before the trigger). The waiter should NOT accept it as
+        # before the start). The waiter should NOT accept it as
         # the answer; it should keep waiting until either a fresh
-        # one appears or the trigger_timeout fires.
+        # one appears or the start_timeout fires.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
@@ -3589,28 +3585,26 @@ class TestTriggerUnitSync:
             ' "exit_code": 0, "exit_class": "ok"}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
-        with pytest.raises(TriggerStartTimeout):
-            crony_runner.trigger_unit_sync(
-                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
+        with pytest.raises(StartTimeout):
+            crony_runner.start_unit_wait(
+                full, state_dir=sd, job_timeout=5.0, start_timeout=1.0
             )
 
     def test_subsecond_run_is_recognized_as_fresh(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `pre_trigger` and `ended_at` must compare at the same
+        # `pre_start` and `ended_at` must compare at the same
         # precision: the runner's `now_iso()` truncates to whole
         # seconds, so a run that completes within the same second
-        # as the trigger needs `pre_trigger` truncated too --
-        # otherwise the waiter sees `ended_at < pre_trigger` and
-        # spins until `trigger_timeout`.
+        # as the start needs `pre_start` truncated too --
+        # otherwise the waiter sees `ended_at < pre_start` and
+        # spins until `start_timeout`.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
 
-        def _stub_trigger(*_args: object, **_kwargs: object) -> None:
+        def _stub_start(*_args: object, **_kwargs: object) -> None:
             # Write a last-run.json whose ended_at is the same
             # whole-second timestamp `now_iso()` would produce
             # right now -- modeling a sub-second run.
@@ -3620,22 +3614,22 @@ class TestTriggerUnitSync:
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(crony_runner, "trigger_unit", _stub_trigger)
-        rec = crony_runner.trigger_unit_sync(
-            full, state_dir=sd, job_timeout=5.0, trigger_timeout=2.0
+        monkeypatch.setattr(crony_runner, "start_unit", _stub_start)
+        rec = crony_runner.start_unit_wait(
+            full, state_dir=sd, job_timeout=5.0, start_timeout=2.0
         )
         assert rec["exit_class"] == "fail"
         assert rec["exit_code"] == 4
 
-    def test_long_run_past_trigger_timeout_still_returns(
+    def test_long_run_past_start_timeout_still_returns(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # `trigger_timeout` is the "did the platform respond?"
+        # `start_timeout` is the "did the platform respond?"
         # detector, not a completion deadline. Once the runner is in
         # flight (run.lock held, pid published), the waiter must switch
         # to `job_timeout`-bounded watching so a long but well-behaved
         # run completes normally; otherwise a job whose execution
-        # exceeds `trigger_timeout` would record as `timeout` even after
+        # exceeds `start_timeout` would record as `timeout` even after
         # a clean `ok` exit.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
@@ -3644,7 +3638,7 @@ class TestTriggerUnitSync:
         # Model a running runner: it holds run.lock and published its
         # pid (this test process, which won't exit during the test). We
         # stub `_wait_for_pid_exit` to simulate it finishing AFTER
-        # trigger_timeout has already elapsed.
+        # start_timeout has already elapsed.
         (sd / "run.pid").write_text(f"{os.getpid()}\n")
         wait_calls: list[float] = []
 
@@ -3659,19 +3653,17 @@ class TestTriggerUnitSync:
             )
             return PidWait.EXITED
 
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _stub_wait)
         with crony_runtime.acquire_lock(sd / "run.lock"):
-            rec = crony_runner.trigger_unit_sync(
-                full, state_dir=sd, job_timeout=120.0, trigger_timeout=1.0
+            rec = crony_runner.start_unit_wait(
+                full, state_dir=sd, job_timeout=120.0, start_timeout=1.0
             )
-        # The runner completed, even though trigger_timeout (1s)
+        # The runner completed, even though start_timeout (1s)
         # was tighter than what a real-world startup might take.
         assert rec["exit_class"] == "ok"
         # The wait was bounded by the larger job_timeout, not
-        # trigger_timeout: confirms the deadline switch happened
+        # start_timeout: confirms the deadline switch happened
         # once the pid was observed.
         assert wait_calls and wait_calls[0] > 1.0
 
@@ -3684,7 +3676,7 @@ class TestTriggerUnitSync:
         # corpse whose kernel pid-exit notification returns instantly is
         # what busy-spun the group dispatch, so the liveness probe gates
         # the pid-exit wait: the corpse falls to the bounded poll path and
-        # surfaces TriggerStartTimeout within trigger_timeout instead of
+        # surfaces StartTimeout within start_timeout instead of
         # looping forever, even with an uncapped job_timeout.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
@@ -3700,19 +3692,17 @@ class TestTriggerUnitSync:
             waited.append(pid)
             return PidWait.EXITED
 
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _no_wait)
         with (
             crony_runtime.acquire_lock(sd / "run.lock"),
-            pytest.raises(TriggerStartTimeout, match="never produced"),
+            pytest.raises(StartTimeout, match="never produced"),
         ):
-            crony_runner.trigger_unit_sync(
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=math.inf,
-                trigger_timeout=1.0,
+                start_timeout=1.0,
             )
         # The dead pid was never handed to the pid-exit wait: liveness
         # gates the wait, so the corpse never re-armed the loop.
@@ -3723,7 +3713,7 @@ class TestTriggerUnitSync:
     ) -> None:
         # A job's run cap says how long it may RUN, not how long the
         # scheduler may take to launch it, so a cap shorter than
-        # trigger_timeout must not end the wait for the runner to appear.
+        # start_timeout must not end the wait for the runner to appear.
         # Otherwise a job that is merely slow to start reads as one that
         # never started -- and for a group child, that failure is one the
         # group would wear, which is exactly the false failure a group's
@@ -3752,14 +3742,12 @@ class TestTriggerUnitSync:
             return False
 
         monkeypatch.setattr(crony_runtime, "run_in_progress", _slow_to_start)
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
-        rec = crony_runner.trigger_unit_sync(
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
+        rec = crony_runner.start_unit_wait(
             full,
             state_dir=sd,
             job_timeout=1.0,
-            trigger_timeout=30.0,
+            start_timeout=30.0,
         )
         assert rec["exit_class"] == "ok"
 
@@ -3770,7 +3758,7 @@ class TestTriggerUnitSync:
         # the job started -- not from when we asked the scheduler to start
         # it. Charging the launch latency against it would time out a job
         # that had been running for no time at all: here the runner
-        # appears a second after the trigger with a 2s cap, and must get
+        # appears a second after the start with a 2s cap, and must get
         # its 2s. It is given the pid-exit wait rather than an immediate
         # JobTimeoutError.
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -3785,7 +3773,7 @@ class TestTriggerUnitSync:
             return float(real_monotonic()) + clock["now"]
 
         # Not running on the first look; running by the second, a full
-        # second after the trigger (longer than the cap it will be
+        # second after the start (longer than the cap it will be
         # judged against).
         looks = {"n": 0}
 
@@ -3811,15 +3799,13 @@ class TestTriggerUnitSync:
 
         monkeypatch.setattr(crony_commands.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(crony_runtime, "run_in_progress", _slow_to_start)
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _record_wait)
-        rec = crony_runner.trigger_unit_sync(
+        rec = crony_runner.start_unit_wait(
             full,
             state_dir=sd,
             job_timeout=2.0,
-            trigger_timeout=30.0,
+            start_timeout=30.0,
         )
         assert rec["exit_class"] == "ok"
         # The job got its full cap from the moment it was seen running,
@@ -3837,15 +3823,13 @@ class TestTriggerUnitSync:
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
         # Nothing ever fires, so no runner and no record ever appear.
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
-        with pytest.raises(TriggerStartTimeout, match="never produced"):
-            crony_runner.trigger_unit_sync(
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
+        with pytest.raises(StartTimeout, match="never produced"):
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=1.0,
-                trigger_timeout=1.0,
+                start_timeout=1.0,
             )
 
     def test_caller_budget_bounds_the_start_allowance(
@@ -3861,15 +3845,13 @@ class TestTriggerUnitSync:
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
-        with pytest.raises(TriggerStartTimeout, match="never produced"):
-            crony_runner.trigger_unit_sync(
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
+        with pytest.raises(StartTimeout, match="never produced"):
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=math.inf,
-                trigger_timeout=30.0,
+                start_timeout=30.0,
                 wait_budget=1.0,
             )
 
@@ -3916,19 +3898,17 @@ class TestTriggerUnitSync:
         monkeypatch.setattr(
             crony_runtime, "run_in_progress", _finishes_notifying
         )
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             crony_runner,
             "_wait_for_pid_exit",
             lambda *_a, **_kw: PidWait.EXITED,
         )
-        rec = crony_runner.trigger_unit_sync(
+        rec = crony_runner.start_unit_wait(
             full,
             state_dir=sd,
             job_timeout=math.inf,
-            trigger_timeout=30.0,
+            start_timeout=30.0,
         )
         # The child's real outcome, not a fabricated crash.
         assert rec["exit_class"] == "fail"
@@ -3954,20 +3934,18 @@ class TestTriggerUnitSync:
             "run_in_progress",
             lambda *_a, **_k: next(in_flight, False),
         )
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             crony_runner,
             "_wait_for_pid_exit",
             lambda *_a, **_kw: PidWait.EXITED,
         )
         with pytest.raises(RunnerCrashed, match="without recording"):
-            crony_runner.trigger_unit_sync(
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=math.inf,
-                trigger_timeout=1.0,
+                start_timeout=1.0,
             )
 
     def test_result_landing_on_the_deadline_is_returned_not_a_crash(
@@ -4018,17 +3996,15 @@ class TestTriggerUnitSync:
 
         monkeypatch.setattr(crony_commands.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(crony_runtime, "run_in_progress", _finished)
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             crony_runner, "_wait_for_pid_exit", _wait_and_overrun
         )
-        rec = crony_runner.trigger_unit_sync(
+        rec = crony_runner.start_unit_wait(
             full,
             state_dir=sd,
             job_timeout=1.0,
-            trigger_timeout=30.0,
+            start_timeout=30.0,
         )
         assert rec["exit_class"] == "ok"
 
@@ -4038,7 +4014,7 @@ class TestTriggerUnitSync:
         # The verdict is settled the moment the lock goes free with no
         # record behind it: the runner writes its record before releasing
         # the lock, so there will never be one. Nothing is learned by
-        # polling on to a deadline, and a long trigger_timeout must not
+        # polling on to a deadline, and a long start_timeout must not
         # keep a group waiting on a child that is already dead.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
@@ -4051,20 +4027,18 @@ class TestTriggerUnitSync:
             "run_in_progress",
             lambda *_a, **_k: next(in_flight, False),
         )
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             crony_runner,
             "_wait_for_pid_exit",
             lambda *_a, **_kw: PidWait.EXITED,
         )
         with pytest.raises(RunnerCrashed, match="without recording"):
-            crony_runner.trigger_unit_sync(
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=math.inf,
-                trigger_timeout=600.0,
+                start_timeout=600.0,
             )
 
     def test_leftover_run_pid_without_held_lock_is_ignored(
@@ -4089,13 +4063,11 @@ class TestTriggerUnitSync:
             waited.append(pid)
             return PidWait.EXITED
 
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _record_wait)
-        with pytest.raises(TriggerStartTimeout, match="never produced"):
-            crony_runner.trigger_unit_sync(
-                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+        with pytest.raises(StartTimeout, match="never produced"):
+            crony_runner.start_unit_wait(
+                full, state_dir=sd, job_timeout=5.0, start_timeout=1.0
             )
         assert waited == []
 
@@ -4103,15 +4075,15 @@ class TestTriggerUnitSync:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # A child already running (its own schedule, another dispatch, a
-        # manual trigger) holds run.lock and named its pid before this
-        # trigger. run.lock -- not run.pid's age -- marks it in flight, so
+        # manual start) holds run.lock and named its pid before this
+        # start. run.lock -- not run.pid's age -- marks it in flight, so
         # the waiter attaches to that live pid and returns its result.
         h = _RunnerHarness(tmp_path, monkeypatch)
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
         pid_path = sd / "run.pid"
         pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        old = time.time() - 3600  # started well before this trigger
+        old = time.time() - 3600  # started well before this start
         os.utime(pid_path, (old, old))
         waited: list[int] = []
 
@@ -4128,15 +4100,13 @@ class TestTriggerUnitSync:
             )
             return PidWait.EXITED
 
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(
             crony_runner, "_wait_for_pid_exit", _wait_then_complete
         )
         with crony_runtime.acquire_lock(sd / "run.lock"):
-            rec = crony_runner.trigger_unit_sync(
-                full, state_dir=sd, job_timeout=5.0, trigger_timeout=1.0
+            rec = crony_runner.start_unit_wait(
+                full, state_dir=sd, job_timeout=5.0, start_timeout=1.0
             )
         assert rec["exit_class"] == "ok"
         assert waited == [os.getpid()]
@@ -4162,19 +4132,17 @@ class TestTriggerUnitSync:
             time.sleep(0.2)
             return PidWait.TIMED_OUT
 
-        monkeypatch.setattr(
-            crony_runner, "trigger_unit", lambda *_a, **_kw: None
-        )
+        monkeypatch.setattr(crony_runner, "start_unit", lambda *_a, **_kw: None)
         monkeypatch.setattr(crony_runner, "_wait_for_pid_exit", _timeout_wait)
         with (
             crony_runtime.acquire_lock(sd / "run.lock"),
             pytest.raises(JobTimeoutError, match="did not complete"),
         ):
-            crony_runner.trigger_unit_sync(
+            crony_runner.start_unit_wait(
                 full,
                 state_dir=sd,
                 job_timeout=0.1,
-                trigger_timeout=30.0,
+                start_timeout=30.0,
             )
 
     def test_completed_run_at_exhausted_budget_returns(
@@ -4189,16 +4157,16 @@ class TestTriggerUnitSync:
         full = h.full("foo")
         sd = h.fabricate_orphan("foo")
 
-        def _stub_trigger(*_args: object, **_kwargs: object) -> None:
+        def _stub_start(*_args: object, **_kwargs: object) -> None:
             (sd / "last-run.json").write_text(
                 f'{{"ended_at": "{crony_runtime.now_iso()}",'
                 ' "exit_code": 0, "exit_class": "ok"}',
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(crony_runner, "trigger_unit", _stub_trigger)
-        rec = crony_runner.trigger_unit_sync(
-            full, state_dir=sd, job_timeout=0.0, trigger_timeout=5.0
+        monkeypatch.setattr(crony_runner, "start_unit", _stub_start)
+        rec = crony_runner.start_unit_wait(
+            full, state_dir=sd, job_timeout=0.0, start_timeout=5.0
         )
         assert rec["exit_class"] == "ok"
         assert rec["exit_code"] == 0
@@ -4267,7 +4235,7 @@ class TestRunJobInteractive:
         assert not sentinel.exists()
         assert not (h.state / h.full("iv") / "pending.flag").exists()
 
-    def test_user_trigger_flag_bypasses_wait_loop(
+    def test_user_start_flag_bypasses_wait_loop(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -4284,11 +4252,11 @@ class TestRunJobInteractive:
             default_target_jobs=["iv"],
         )
         # Snapshot resolution creates the state dir, but the flag
-        # might be written by trigger BEFORE the runner starts. Mimic
+        # might be written by start BEFORE the runner starts. Mimic
         # that: write the flag before _run_job, into the uuid-keyed
         # state dir.
         sd = h.state_dir("iv", cfg=cfg)
-        crony_runtime.write_user_trigger_flag(sd)
+        crony_runtime.write_user_start_flag(sd)
 
         called: list[bool] = []
 
@@ -4305,12 +4273,12 @@ class TestRunJobInteractive:
         rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
         # The flag was consumed.
-        assert not (sd / "user-trigger.flag").exists()
+        assert not (sd / "user-start.flag").exists()
 
-    def test_user_trigger_mid_wait_breaks_out_and_execs(
+    def test_user_start_mid_wait_breaks_out_and_execs(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # The P1 case from the prior review: a `crony trigger` that
+        # The P1 case from the prior review: a `crony start` that
         # arrives WHILE the interactive runner is already in its
         # wait loop must break the waiter out and run the command.
         # Without this guarantee, the bypass flag would sit on disk
@@ -4331,7 +4299,7 @@ class TestRunJobInteractive:
         sd = h.state_dir("iv", cfg=cfg)
         # Drive the real _interactive_wait_and_prompt: HID idle is
         # high (idle break), screen is locked -- no natural
-        # accumulation -- but on the second poll a `crony trigger`
+        # accumulation -- but on the second poll a `crony start`
         # writes the bypass flag and the wait short-circuits.
         host = SimpleNamespace(
             hid_idle_seconds=lambda: 999.0, screen_locked=lambda: True
@@ -4342,7 +4310,7 @@ class TestRunJobInteractive:
         def fake_sleep(_s: float) -> None:
             sleeps[0] += 1
             if sleeps[0] == 1:
-                crony_runtime.write_user_trigger_flag(sd)
+                crony_runtime.write_user_start_flag(sd)
 
         monkeypatch.setattr(crony_commands.time, "sleep", fake_sleep)
 
@@ -4351,7 +4319,7 @@ class TestRunJobInteractive:
         rec = h.last_run("iv")
         assert rec["exit_class"] == "ok"
         # The flag was consumed during the wait.
-        assert not (sd / "user-trigger.flag").exists()
+        assert not (sd / "user-start.flag").exists()
 
 
 def _fork_guard(cap: int, argv: list[str]) -> int:
@@ -5044,16 +5012,16 @@ class TestAwaitWakeup:
 
 class _FakeScheduler:
     """Records the scheduler calls do_jitter makes, so the test asserts it
-    goes through the platform layer (trigger / deactivate_jitter) rather
-    than shelling out itself. `trigger_fails` models a failed kickstart."""
+    goes through the platform layer (start / deactivate_jitter) rather
+    than shelling out itself. `start_fails` models a failed kickstart."""
 
-    def __init__(self, *, trigger_fails: bool = False) -> None:
+    def __init__(self, *, start_fails: bool = False) -> None:
         self.calls: list[tuple[str, str]] = []
-        self._trigger_fails = trigger_fails
+        self._start_fails = start_fails
 
-    def trigger(self, name: str) -> None:
-        self.calls.append(("trigger", name))
-        if self._trigger_fails:
+    def start(self, name: str) -> None:
+        self.calls.append(("start", name))
+        if self._start_fails:
             raise SubprocessError(1, ["launchctl", "kickstart"])
 
     def deactivate_jitter(self, name: str) -> None:
@@ -5062,8 +5030,8 @@ class _FakeScheduler:
 
 class TestDoJitter:
     """The jitter companion drives the service's run.lock (held -> no-op;
-    free -> trigger the service then log the outcome, both under the lock),
-    self-unloads unless the trigger failed, and reaches the scheduler for
+    free -> start the service then log the outcome, both under the lock),
+    self-unloads unless the start failed, and reaches the scheduler for
     every platform action -- no scheduler-specific commands in the
     runner."""
 
@@ -5075,27 +5043,27 @@ class TestDoJitter:
         tmp_path: Path,
         monkeypatch: Any,
         *,
-        trigger_fails: bool = False,
+        start_fails: bool = False,
     ) -> tuple[str, Path, _FakeScheduler]:
         monkeypatch.setattr(crony_paths, "STATE_DIR", tmp_path)
         ref = f"default:{self._UUID}"
         state_dir = Job.state_dir_from_ref(EntityRef("default", self._UUID))
-        sched = _FakeScheduler(trigger_fails=trigger_fails)
+        sched = _FakeScheduler(start_fails=start_fails)
         monkeypatch.setattr(crony_runtime, "scheduler", lambda: sched)
         return ref, state_dir, sched
 
-    def test_free_lock_triggers_and_logs_then_self_unloads(
+    def test_free_lock_starts_and_logs_then_self_unloads(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         ref, sd, sched = self._setup(tmp_path, monkeypatch)
         sd.mkdir(parents=True)
         crony_runner.do_jitter(ref, self._NAME)
         assert sched.calls == [
-            ("trigger", self._NAME),
+            ("start", self._NAME),
             ("deactivate_jitter", self._NAME),
         ]
         logged = (sd / RUN_LOG_NAME).read_text(encoding="utf-8")
-        assert self._NAME in logged and "triggered" in logged
+        assert self._NAME in logged and "started" in logged
         assert "FAILED" not in logged
 
     def test_held_lock_is_a_noop_but_self_unloads(
@@ -5114,16 +5082,16 @@ class TestDoJitter:
         assert sched.calls == [("deactivate_jitter", self._NAME)]
         assert not (sd / RUN_LOG_NAME).exists()
 
-    def test_failed_trigger_stays_loaded(
+    def test_failed_start_stays_loaded(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        ref, sd, sched = self._setup(tmp_path, monkeypatch, trigger_fails=True)
+        ref, sd, sched = self._setup(tmp_path, monkeypatch, start_fails=True)
         sd.mkdir(parents=True)
-        # A failed trigger re-raises (surfacing a non-zero exit) and skips
+        # A failed start re-raises (surfacing a non-zero exit) and skips
         # the self-unload so it retries next epoch, recording the failure.
         with pytest.raises(SubprocessError):
             crony_runner.do_jitter(ref, self._NAME)
-        assert sched.calls == [("trigger", self._NAME)]
+        assert sched.calls == [("start", self._NAME)]
         logged = (sd / RUN_LOG_NAME).read_text(encoding="utf-8")
         assert "FAILED" in logged
 
@@ -5245,7 +5213,7 @@ class TestRunDaemon:
         assert rec["process_exit"] == 0
         assert "retry limit reached" in snap.log_path_resolved.read_text()
 
-    def test_trigger_rearms_an_exhausted_daemon(
+    def test_start_rearms_an_exhausted_daemon(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -5253,7 +5221,7 @@ class TestRunDaemon:
         snap = h.snap(cfg, "d")
         for _ in range(crony_config.DAEMON_RETRY_LIMIT + 1):
             crony_runner._run_job(snap)
-        crony_runtime.write_user_trigger_flag(snap.state_dir)
+        crony_runtime.write_user_start_flag(snap.state_dir)
 
         assert crony_runner._run_job(snap) == 7
         assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
@@ -5271,19 +5239,19 @@ class TestRunDaemon:
         for _ in range(crony_config.DAEMON_RETRY_LIMIT + 1):
             crony_runner._run_job(snap)
         assert crony_runtime.daemon_retries_exhausted(snap.state_dir)
-        assert not crony_runtime.user_trigger_flag_path(snap.state_dir).exists()
+        assert not crony_runtime.user_start_flag_path(snap.state_dir).exists()
 
         # Asks for a restart again rather than staying down, and the
         # window restarts at this one exit.
         assert crony_runner._run_job(snap) == 7
         assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
 
-    def test_a_fresh_trigger_rearms_a_partly_spent_budget(
+    def test_a_fresh_start_rearms_a_partly_spent_budget(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # With attempts still left the exhausted-history inference does
         # not apply, so this is the sentinel's own arm: an operator who
-        # triggers a struggling daemon gets it a full budget rather than
+        # starts a struggling daemon gets it a full budget rather than
         # whatever remained.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = self._cfg(h, command="exit 7")
@@ -5292,27 +5260,27 @@ class TestRunDaemon:
             crony_runner._run_job(snap)
         assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 3
         assert not crony_runtime.daemon_retries_exhausted(snap.state_dir)
-        crony_runtime.write_user_trigger_flag(snap.state_dir)
+        crony_runtime.write_user_start_flag(snap.state_dir)
 
         assert crony_runner._run_job(snap) == 7
         assert len(crony_runtime.read_exit_history(snap.state_dir).runs) == 1
 
-    def test_a_stale_trigger_flag_does_not_rearm(
+    def test_a_stale_start_flag_does_not_rearm(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # A sentinel left behind by a trigger the scheduler swallowed
+        # A sentinel left behind by a start the scheduler swallowed
         # must not hand a much later automatic restart a fresh budget --
-        # otherwise a daemon triggered once while healthy could never
+        # otherwise a daemon started once while healthy could never
         # exhaust its retries.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = self._cfg(h, command="exit 7")
         snap = h.snap(cfg, "d")
         for _ in range(crony_config.DAEMON_RETRY_LIMIT):
             crony_runner._run_job(snap)
-        flag = crony_runtime.user_trigger_flag_path(snap.state_dir)
-        crony_runtime.write_user_trigger_flag(snap.state_dir)
+        flag = crony_runtime.user_start_flag_path(snap.state_dir)
+        crony_runtime.write_user_start_flag(snap.state_dir)
         stale = time.time() - (
-            crony_config.DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS + 60
+            crony_config.DAEMON_START_REARM_MAX_AGE_SECONDS + 60
         )
         os.utime(flag, (stale, stale))
 

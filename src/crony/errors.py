@@ -80,7 +80,7 @@ class UnitNotInstalledError(PreconditionError):
     """A dispatcher was asked to fire a unit that isn't installed
     on this host.
 
-    Surfaces from `trigger_unit` when the platform unit file the
+    Surfaces from `start_unit` when the platform unit file the
     dispatcher would reach for doesn't exist. The typical cause
     is a parent group whose snapshot still references a child
     that was destroyed (or never applied here): `crony apply`
@@ -94,9 +94,9 @@ class UnitNotInstalledError(PreconditionError):
     """
 
 
-class TriggerStartTimeout(JobTimeoutError):
+class StartTimeout(JobTimeoutError):
     """The platform never produced a runner within
-    `trigger_timeout_sec` after we asked it to fire the unit.
+    `start_timeout_sec` after we asked it to fire the unit.
     Suggests an invalid unit, a stalled scheduler queue, or
     the unit not being loaded (run `crony apply` first).
 
@@ -107,7 +107,7 @@ class TriggerStartTimeout(JobTimeoutError):
     crashed.
 
     Subclass of `JobTimeoutError` so it shares the TIMEOUT exit
-    code; the specialization conveys 'the trigger never started'
+    code; the specialization conveys 'the unit never started'
     rather than 'the runner exceeded its timeout'.
     """
 
@@ -123,13 +123,13 @@ class RunnerCrashed(CronyError):
     mid-run). `crony status` reaches that same `crashed` verdict
     independently, by reconciling the stale pid.
 
-    Distinct from `TriggerStartTimeout` (nothing ever ran) because the
+    Distinct from `StartTimeout` (nothing ever ran) because the
     job DID run: a parent group that gets this has done its job of
     running the child, so the crash is the child's outcome, not the
     group's fault.
 
     Carries the general `ERROR` code rather than `CRASHED`: `CRASHED` is
     crony's exit code for crony ITSELF dying on an unhandled exception,
-    so reusing it here would leave a `crony trigger --wait` caller unable
+    so reusing it here would leave a `crony start --wait` caller unable
     to tell a crashed job from a crashed crony.
     """

@@ -50,7 +50,7 @@ import crony.unit
 def timeout_to_wait(sec: int) -> float:
     """Map a resolved timeout (0 = no cap) to the float the pid-watch
     waiters take: math.inf for no cap, else the value. Used wherever a
-    resolved/snapshot timeout feeds `trigger_unit_sync`, so the
+    resolved/snapshot timeout feeds `start_unit_wait`, so the
     uncapped sentinel reaches it as inf (which it converts to a
     no-timeout wait) rather than as 0 (a near-instant wait)."""
     return math.inf if sec == 0 else float(sec)
@@ -439,7 +439,7 @@ def _wait_for_user_active(
     """Block until the user has been active for `required_sec`
     continuous seconds, polling every `poll_sec`. Returns True on
     success; returns False when `bypass_check` returns True so
-    the caller can short-circuit (a user trigger arriving while a
+    the caller can short-circuit (a user start arriving while a
     pending waiter holds the lock signals via this path).
 
     "Active" means HID idle <= idle_break_sec and the screen is not
@@ -482,7 +482,7 @@ def _delay_or_bypass(
     `bypass_check` returned True mid-sleep. Used by the
     interactive delay-then-reprompt path so a "Delay Job" choice
     doesn't strand the runner in an unbreakable hour-long sleep
-    when the user changes their mind and triggers manually.
+    when the user changes their mind and starts manually.
     """
     elapsed = 0
     while elapsed < delay_sec:
@@ -538,10 +538,10 @@ def _interactive_wait_and_prompt(
     so a post-mortem reader can see how long the user took, whether
     they delayed, etc.
 
-    Polls `consume_user_trigger_flag` inside both the active-
-    wait and the delay-sleep so a `crony trigger` arriving while
+    Polls `consume_user_start_flag` inside both the active-
+    wait and the delay-sleep so a `crony start` arriving while
     this run is pending breaks the waiter out and runs the
-    command. `crony trigger` writes that flag in its own process
+    command. `crony start` writes that flag in its own process
     (its fire of the already-running unit is a no-op), so polling
     is how the pending run learns of it. Without the poll, the
     flag would sit on disk until the next scheduled fire and
@@ -551,7 +551,7 @@ def _interactive_wait_and_prompt(
     sd = snap.state_dir
 
     def _bypass() -> bool:
-        return crony.runtime.consume_user_trigger_flag(sd)
+        return crony.runtime.consume_user_start_flag(sd)
 
     while True:
         log_file.write(
@@ -564,9 +564,7 @@ def _interactive_wait_and_prompt(
         if not _wait_for_user_active(
             snap.interactive_active_sec, bypass_check=_bypass
         ):
-            log_file.write(
-                b"interactive: bypass (user-triggered during wait)\n"
-            )
+            log_file.write(b"interactive: bypass (user-started during wait)\n")
             return _InteractiveChoice.RUN
         log_file.write(b"interactive: prompting user\n")
         choice = _show_interactive_dialog(
@@ -583,9 +581,7 @@ def _interactive_wait_and_prompt(
         if not _delay_or_bypass(
             snap.interactive_delay_sec, bypass_check=_bypass
         ):
-            log_file.write(
-                b"interactive: bypass (user-triggered during delay)\n"
-            )
+            log_file.write(b"interactive: bypass (user-started during delay)\n")
             return _InteractiveChoice.RUN
 
 
@@ -632,16 +628,16 @@ def _run_job(snap: crony.model.Job) -> int:
     # see the DAEMON_EXITED arm below.
     is_daemon = crony.unit.is_daemon(snap.timing)
     if is_daemon:
-        # A recent `crony trigger` explicitly starts a new retry budget;
+        # A recent `crony start` explicitly starts a new retry budget;
         # apply and enable clear the history themselves. An
         # already-exhausted state also means this launch could not be an
         # automatic restart (the prior run returned zero to stop them),
         # so login or another external start gets a fresh budget too.
-        user_triggered = crony.runtime.consume_user_trigger_flag(
+        user_started = crony.runtime.consume_user_start_flag(
             sd,
-            max_age_sec=crony.config.DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS,
+            max_age_sec=crony.config.DAEMON_START_REARM_MAX_AGE_SECONDS,
         )
-        if user_triggered or crony.runtime.daemon_retries_exhausted(sd):
+        if user_started or crony.runtime.daemon_retries_exhausted(sd):
             crony.runtime.clear_exit_history(sd)
     notify_channels, notify_defaults, success_ratio = (
         crony.notify.resolve_notify_at_runtime(full_name)
@@ -681,7 +677,7 @@ def _run_job(snap: crony.model.Job) -> int:
                 # end.
                 _raise_on_stop()
                 # Publish our pid for waiters (parent groups, `crony
-                # trigger --wait`) to watch for exit, and leave it in place
+                # start --wait`) to watch for exit, and leave it in place
                 # on exit: run.pid persists across runs as the record of
                 # the last launch, read afterward by the dispatch waiter
                 # and when status is built.
@@ -788,11 +784,9 @@ def _run_job(snap: crony.model.Job) -> int:
                     raise
 
                 if snap.interactive:
-                    bypass = crony.runtime.consume_user_trigger_flag(sd)
+                    bypass = crony.runtime.consume_user_start_flag(sd)
                     if bypass:
-                        log_file.write(
-                            b"interactive: bypass (user-triggered)\n"
-                        )
+                        log_file.write(b"interactive: bypass (user-started)\n")
                     else:
                         pending_flag = sd / "pending.flag"
                         pending_flag.write_bytes(b"")
@@ -1004,7 +998,7 @@ def _record_outcome(
                     "daemon: retry limit reached after "
                     f"{premature_exits} premature exits; "
                     "leaving stopped (the next login, or "
-                    "crony trigger / apply / enable, "
+                    "crony start / apply / enable, "
                     "retries it)\n"
                 ).encode()
             )
@@ -1177,7 +1171,7 @@ def _child_timeout_from_snapshot(child_ref: crony.unit.EntityRef) -> float:
     consistent with what the child's own runner will enforce.
     Falls back to a generous default if the child snapshot is
     missing -- `crony status` will surface that as a broken or
-    stale entry, but the trigger itself will fail fast and the
+    stale entry, but the start itself will fail fast and the
     group's `timeout` budget still bounds the wait.
 
     Returns `math.inf` for an uncapped child (a `timeout` of 0); the
@@ -1226,7 +1220,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
 
     Fires each child through the platform scheduler in order,
     waiting for completion via kernel-level pid-exit notification
-    (`trigger_unit_sync`). The group's `run.log` becomes a
+    (`start_unit_wait`). The group's `run.log` becomes a
     sequencer trace (fired/finished lines per child); child
     stdout/stderr stays in each child's own log. The group never
     sends notifications; each child's own runner handles notify
@@ -1245,7 +1239,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
     turn belongs on that child's row. See `_group_exit_class`.
     """
     full_name = str(snap.entity_name)
-    trigger_timeout = snap.trigger_timeout_sec
+    start_timeout = snap.start_timeout_sec
 
     sd = snap.state_dir
     sd.mkdir(parents=True, exist_ok=True)
@@ -1350,7 +1344,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             ).encode()
                         )
                         try:
-                            trigger_unit(child_full_name)
+                            start_unit(child_full_name)
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
@@ -1415,11 +1409,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                         # budget go to the waiter separately, not as the
                         # smaller of the two: it keeps them apart, and the
                         # exception it raises says which verdict to record.
-                        rec = trigger_unit_sync(
+                        rec = start_unit_wait(
                             child_full_name,
                             state_dir=child_sd,
                             job_timeout=child_timeout,
-                            trigger_timeout=trigger_timeout,
+                            start_timeout=start_timeout,
                             wait_budget=remaining,
                         )
                     except crony.errors.RunnerCrashed as e:
@@ -1437,7 +1431,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                             )
                         )
                         continue
-                    except crony.errors.TriggerStartTimeout as e:
+                    except crony.errors.StartTimeout as e:
                         # No runner ever appeared, so the child never ran:
                         # the group failed to run it. Caught before the
                         # JobTimeoutError arm below -- it is a subclass.
@@ -1487,7 +1481,7 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                         crony.model.ExitClass.parse(rec.get("exit_class"))
                         or crony.model.ExitClass.FAIL
                     )
-                    rc = trigger_exit_code(rec)
+                    rc = start_exit_code(rec)
                     log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
                     children.append(
                         crony.model.GroupChildResult(
@@ -1549,11 +1543,11 @@ def _run_group(snap: crony.model.JobGroup) -> int:
         return int(crony.errors.ExitCode.LOCK_BUSY)
 
 
-def trigger_unit(
+def start_unit(
     name: str,
     platform: str | None = None,
     *,
-    triggered_by_user: bool = False,
+    started_by_user: bool = False,
     state_dir: Path | None = None,
 ) -> None:
     """Ask the platform scheduler to fire `name` immediately.
@@ -1561,21 +1555,21 @@ def trigger_unit(
     Runs the unit now -- the scheduler's run-immediately path, as
     opposed to queuing the next scheduled fire.
 
-    Both platforms treat "trigger an already-running unit" as a
+    Both platforms treat "start an already-running unit" as a
     no-op -- the in-flight run continues and there is no fresh
     fire. Waiters that need to know the next completion's outcome
-    use `trigger_unit_sync` instead.
+    use `start_unit_wait` instead.
 
-    `triggered_by_user` writes a one-shot sentinel flag in the
+    `started_by_user` writes a one-shot sentinel flag in the
     entity's state dir, consumed by `crony _run` on startup to
     skip the interactive wait or reset a daemon's retry budget.
     Callers decide whether this fire earns one -- a fire the
     scheduler will swallow does not. The caller passes `state_dir`
     (resolved from the entity's `(bundle, uuid)` via Config) so
     the flag lands in the right uuid-keyed dir; when
-    `triggered_by_user` is True and `state_dir` is None the call
+    `started_by_user` is True and `state_dir` is None the call
     raises `ValueError`. Group-dispatched fires
-    (`_run_group` -> `trigger_unit_sync` -> `trigger_unit`) keep
+    (`_run_group` -> `start_unit_wait` -> `start_unit`) keep
     the default False so a group never accidentally bypasses an
     interactive wait. Under the current validation rules groups
     can't contain interactive jobs so this is defense-in-depth,
@@ -1595,25 +1589,25 @@ def trigger_unit(
             f"unit for {name!r} is not installed on this host "
             f"(run `crony apply` to re-pin the parent's snapshot)"
         )
-    if triggered_by_user and state_dir is None:
+    if started_by_user and state_dir is None:
         raise ValueError(
-            "triggered_by_user requires a state_dir (caller resolves "
+            "started_by_user requires a state_dir (caller resolves "
             "via Config; this avoids a name->uuid disk scan inside "
-            "the trigger path)"
+            "the start path)"
         )
-    if triggered_by_user and state_dir is not None:
-        crony.runtime.write_user_trigger_flag(state_dir)
+    if started_by_user and state_dir is not None:
+        crony.runtime.write_user_start_flag(state_dir)
     succeeded = False
     try:
-        crony.runtime.scheduler(platform).trigger(name)
+        crony.runtime.scheduler(platform).start(name)
         succeeded = True
     finally:
-        if triggered_by_user and state_dir is not None and not succeeded:
+        if started_by_user and state_dir is not None and not succeeded:
             # Don't strand the bypass flag on disk if dispatch
             # never reached the scheduler. The next legitimately
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
-            crony.runtime.user_trigger_flag_path(state_dir).unlink(
+            crony.runtime.user_start_flag_path(state_dir).unlink(
                 missing_ok=True
             )
 
@@ -1650,14 +1644,14 @@ def _record_written_by(
     return rec
 
 
-def trigger_unit_sync(
+def start_unit_wait(
     full_name: str,
     *,
     state_dir: Path,
     job_timeout: float,
-    trigger_timeout: float,
+    start_timeout: float,
     wait_budget: float = math.inf,
-    triggered_by_user: bool = False,
+    started_by_user: bool = False,
 ) -> dict[str, Any]:
     """Fire `full_name` via the platform and wait for completion.
 
@@ -1672,7 +1666,7 @@ def trigger_unit_sync(
     Waiting has two sequential phases, each with its own allowance, so
     that a job which is merely slow to START is never mistaken for one
     that never started. Until a live runner is seen, the platform has
-    `trigger_timeout` to produce one; the job's own `job_timeout` does
+    `start_timeout` to produce one; the job's own `job_timeout` does
     not apply, since a cap on how long the job may RUN says nothing about
     how long the scheduler may take to launch it. Once a runner is seen,
     `job_timeout` caps the run. `wait_budget` hard-bounds both phases
@@ -1684,10 +1678,10 @@ def trigger_unit_sync(
     which is what says whether the job ran at all -- never by which
     allowance ran out:
 
-    - `TriggerStartTimeout`: the start allowance elapsed with no runner
+    - `StartTimeout`: the start allowance elapsed with no runner
       ever seen and no fresh last-run.json. The "platform never started
       anything" detector (invalid unit, stalled queue, unloaded unit).
-      Raised whether it was the platform's own `trigger_timeout` that
+      Raised whether it was the platform's own `start_timeout` that
       elapsed or a shorter `wait_budget`: either way no runner was ever
       seen, and that -- not the clock that stopped us -- is what says the
       job never ran.
@@ -1710,7 +1704,7 @@ def trigger_unit_sync(
     (`job_timeout` is `math.inf`) with a genuinely live runner waits as
     long as that runner lives, unless `wait_budget` bounds it.
 
-    Mechanism: a pre-trigger timestamp T is taken, the platform is asked
+    Mechanism: a pre-start timestamp T is taken, the platform is asked
     to fire the unit, and the waiter watches for the runner's pid
     (published via `<state>/<bundle>/<uuid>/run.pid`) to exit via
     kernel-level pid-exit notification. run.pid persists across runs, so
@@ -1719,28 +1713,28 @@ def trigger_unit_sync(
     earlier runner's exit -- and treats a leftover run.pid with no held
     lock as no live runner. When the pid is gone, last-run.json is read;
     if its `ended_at` is at or after T, the run is "ours" (semantics: the
-    next completion after the trigger). Otherwise we sleep briefly,
+    next completion after the start). Otherwise we sleep briefly,
     re-read the pid file, and try again.
 
-    Triggering an already-running unit is a no-op on both
+    Starting an already-running unit is a no-op on both
     platforms; the waiter still attaches to the in-flight pid and
     returns its result. That's what we want -- "the next
     completion" is well-defined and serves the group-dispatch use
     case (we wanted the child's run; an in-flight run satisfies).
     """
     # Match the runner's `now_iso()` precision (whole seconds): if
-    # pre_trigger captured microseconds and the runner's ended_at
+    # pre_start captured microseconds and the runner's ended_at
     # truncated them, a sub-second run could compare ended_at <
-    # pre_trigger and the loop would conclude "no fresh run yet"
-    # for the entire trigger_timeout window.
-    pre_trigger_dt = datetime.datetime.fromisoformat(crony.runtime.now_iso())
+    # pre_start and the loop would conclude "no fresh run yet"
+    # for the entire start_timeout window.
+    pre_start_dt = datetime.datetime.fromisoformat(crony.runtime.now_iso())
     pid_path = state_dir / "run.pid"
     last_run_path = state_dir / "last-run.json"
 
-    trigger_unit(
+    start_unit(
         full_name,
-        triggered_by_user=triggered_by_user,
-        state_dir=state_dir if triggered_by_user else None,
+        started_by_user=started_by_user,
+        state_dir=state_dir if started_by_user else None,
     )
 
     started_at = time.monotonic()
@@ -1750,7 +1744,7 @@ def trigger_unit_sync(
 
         run.pid can come and go between polls, but the file the runner
         writes at exit persists, so even a sub-second run is observable
-        here. `ended_at` must be at or after the pre-trigger timestamp:
+        here. `ended_at` must be at or after the pre-start timestamp:
         an older record belongs to some earlier run, not to ours.
         """
         rec = _read_last_run(last_run_path)
@@ -1763,7 +1757,7 @@ def trigger_unit_sync(
             ended_dt = datetime.datetime.fromisoformat(ended_at)
         except ValueError:
             return None
-        return rec if ended_dt >= pre_trigger_dt else None
+        return rec if ended_dt >= pre_start_dt else None
 
     def _live_runner_pid() -> int | None:
         """The pid of a live runner holding this job's lock, else None.
@@ -1796,7 +1790,7 @@ def trigger_unit_sync(
     run_started: float | None = None
     # The platform's allowance to produce a runner, bounded by what the
     # caller can spare: we cannot hand it 15s of patience we do not have.
-    start_allowance = min(trigger_timeout, wait_budget)
+    start_allowance = min(start_timeout, wait_budget)
     while True:
         now = time.monotonic()
         elapsed = now - started_at
@@ -1856,26 +1850,26 @@ def trigger_unit_sync(
             _wait_for_pid_exit(pid, timeout=pid_wait)
             continue
         # No runner has ever appeared for this dispatch: it is starting,
-        # or run.pid is a stale leftover (a dead or pre-trigger pid). When
+        # or run.pid is a stale leftover (a dead or pre-start pid). When
         # the allowance for that runs out, nothing ran -- which is the
         # verdict whether the platform used up its own allowance or the
         # caller could not spare that much. Either way we never saw a
         # runner, and that, not the clock that stopped us, is what says
         # the job never started.
         if elapsed > start_allowance:
-            raise crony.errors.TriggerStartTimeout(
-                f"trigger of {full_name!r} never produced a fresh "
+            raise crony.errors.StartTimeout(
+                f"start of {full_name!r} never produced a fresh "
                 f"run within {start_allowance:g}s"
             )
         time.sleep(1.0)
 
 
-def trigger_exit_code(rec: dict[str, Any]) -> int:
+def start_exit_code(rec: dict[str, Any]) -> int:
     """Map a last-run.json record to a process exit code.
 
     A run classified "ok" maps to 0 even when its recorded `exit_code`
     is non-zero -- a `success_exit_codes` match preserves the real code
-    but classifies the run a success, so `crony trigger --wait` exits 0
+    but classifies the run a success, so `crony start --wait` exits 0
     just like the 0 `crony _run` surfaces to the scheduler.
 
     A record without an `exit_code` is one of something that never
@@ -1884,7 +1878,7 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
     group record at all (a group runs no process -- its outcome lives
     entirely in `exit_class`). `... or 0` would mask every one of those
     as success, so the code is derived from the exit_class instead, and
-    `crony trigger --wait` exits non-zero against a job that timed out or
+    `crony start --wait` exits non-zero against a job that timed out or
     was stopped, or a group that could not run a child. Any other class
     reaching this fallback (a corrupt or unrecognized record) is not a
     failure we can name, so it maps to 0.
@@ -1909,7 +1903,7 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
         # A record classified `fail` with no `exit_code` of its own: a
         # group that could not run one of its children (a group carries
         # no process exit, its outcome lives in exit_class). Without this
-        # a `crony trigger --wait <group>` against a group that failed to
+        # a `crony start --wait <group>` against a group that failed to
         # dispatch would exit 0 and read as success.
         return int(crony.errors.ExitCode.ERROR)
     return 0
@@ -2322,7 +2316,7 @@ def do_run(ref: str) -> None:
         raise crony.errors.UsageError(
             f"crony _run takes <bundle>:<uuid>, got {ref!r}; "
             f"this entry point is for platform-unit invocation. "
-            f"Use `crony trigger <name>` to fire by name."
+            f"Use `crony start <name>` to fire by name."
         )
     snap: crony.model.Job | crony.model.JobGroup | None = None
     try:
@@ -2443,7 +2437,7 @@ def do_jitter(ref: str, name: str) -> None:
     don't have a native jitter offset implementation for interval-based
     services, this subcommand can be invoked once via an
     additional service unit to implement a jitter offset for the primary
-    service by triggering it before its scheduled interval time. Not
+    service by starting it before its scheduled interval time. Not
     user-facing.
 
     `ref` is the service's `<bundle>:<uuid>` (it locates the state dir);
@@ -2451,15 +2445,15 @@ def do_jitter(ref: str, name: str) -> None:
     scheduler, so this common layer runs no scheduler-specific commands.
 
     The service's own `run.lock` decides whether to act, and serializes
-    the trigger and its log line against a concurrent run:
+    the start and its log line against a concurrent run:
     - HELD -> a run is already in flight -> nothing to phase, so the
       companion just unloads itself.
-    - FREE -> no run this epoch -> WHILE HOLDING the lock it triggers the
+    - FREE -> no run this epoch -> WHILE HOLDING the lock it starts the
       service through the scheduler and appends a line to the service's
-      run.log recording whether the trigger succeeded (so a failing
-      trigger is visible in the log), then releases. On success it unloads
+      run.log recording whether the start succeeded (so a failing
+      start is visible in the log), then releases. On success it unloads
       itself -- its last act, since unloading may terminate it; on a failed
-      trigger it re-raises (so the failure surfaces a non-zero exit the
+      start it re-raises (so the failure surfaces a non-zero exit the
       scheduler records) and stays loaded to retry at the next offset.
     """
     parsed = crony.unit.EntityRef.from_str(ref)
@@ -2478,13 +2472,13 @@ def do_jitter(ref: str, name: str) -> None:
         return
     try:
         with crony.runtime.acquire_lock(state_dir / "run.lock"):
-            # Trigger the service while holding the lock, then log the
+            # Start the service while holding the lock, then log the
             # outcome under the same lock (so the line can't splice into a
-            # concurrent run's output, and so a failing trigger is
-            # recorded). The trigger is async -- it starts the service,
+            # concurrent run's output, and so a failing start is
+            # recorded). The start is async -- it starts the service,
             # which acquires this lock only after we release it here.
             try:
-                sched.trigger(name)
+                sched.start(name)
             except crony.errors.SubprocessError:
                 # Record the failure, then re-raise: surface a non-zero
                 # exit and stay loaded to retry next offset (no unload).
@@ -2495,17 +2489,17 @@ def do_jitter(ref: str, name: str) -> None:
         # A run is already in flight; it phases the cadence itself.
         sched.deactivate_jitter(name)
         return
-    # Triggered successfully; unload so it does not fire again this epoch.
+    # Started successfully; unload so it does not fire again this epoch.
     sched.deactivate_jitter(name)
 
 
 def _append_jitter_log(state_dir: Path, name: str, *, succeeded: bool) -> None:
-    """Append the jitter companion's one-line trigger marker to the
-    service's run.log, recording whether the trigger succeeded. Called
+    """Append the jitter companion's one-line start marker to the
+    service's run.log, recording whether the start succeeded. Called
     only while run.lock is held, so it cannot interleave with a concurrent
     run's output block."""
     now = crony.runtime.now_iso()
-    outcome = "triggered" if succeeded else "trigger FAILED"
+    outcome = "started" if succeeded else "start FAILED"
     line = f"\n=== {now} JITTER {name} {outcome} ===\n"
     with open(state_dir / crony.model.RUN_LOG_NAME, "ab") as f:
         f.write(line.encode("utf-8"))

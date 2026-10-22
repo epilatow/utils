@@ -72,7 +72,7 @@ class _SnapshotCommon(_SnapshotModel):
     timeout: Annotated[int, _Since(5)]
     schedule: Annotated[str | None, _Since(4)] = None
     interval: Annotated[str | None, _Since(4)] = None
-    # The trigger-only firing mode (`on-demand = true` in config);
+    # The on-demand firing mode (`on-demand = true` in config);
     # mutually exclusive with `schedule` / `interval` above, so at most
     # one of the three timing keys is set. Persisted so the applied side
     # shows `on-demand` and a switch to / from a real schedule reads as
@@ -110,7 +110,7 @@ class _SnapshotCommon(_SnapshotModel):
 
     def timing(self) -> crony.unit.Timing | None:
         """The Timing value object for this snapshot's timing keys:
-        OnDemand for the trigger-only mode, Daemon for the continuous
+        OnDemand for the on-demand mode, Daemon for the continuous
         one, else the schedule / interval string, else None (a transit
         group or group-only job)."""
         if self.on_demand:
@@ -173,7 +173,7 @@ class GroupSnapshot(_SnapshotCommon):
     # uuids -- not full names -- so a child rename doesn't flip the
     # parent's snapshot.
     children: Annotated[list[str], _Since(4)]
-    trigger_timeout_sec: Annotated[int, _Since(4)]
+    start_timeout_sec: Annotated[int, _Since(9)]
 
     def child_refs(self) -> list[crony.unit.EntityRef]:
         """This group's children as their value objects: each on-disk
@@ -230,8 +230,11 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
     / `group_budget_sec`); v5 unified them into `timeout`. Pre-dash
     snapshots keyed flags by the underscore spelling (`keep_awake`). Some
     older snapshots also persist a redundant `bundle` (recomputed from
-    the full `name`)."""
+    the full `name`). Schema v9 renames the group's trigger_timeout_sec
+    field to start_timeout_sec."""
     data = dict(raw)
+    if data.get("schema", 0) < 9 and "trigger_timeout_sec" in data:
+        data.setdefault("start_timeout_sec", data.pop("trigger_timeout_sec"))
     data.pop("bundle", None)
     legacy_timeout = data.pop("group_budget_sec", None)
     legacy_timeout = data.pop("job_timeout_sec", legacy_timeout)

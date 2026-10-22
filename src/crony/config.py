@@ -400,11 +400,11 @@ DEFAULT_SUCCESS_RATIO: SuccessRatio = SuccessRatio(1, 1)
 DAEMON_RETRY_LIMIT: int = 5
 DAEMON_RETRY_RESET_SECONDS: int = 5 * 60
 
-# How long a `crony trigger` sentinel still counts as the reason a
+# How long a `crony start` sentinel still counts as the reason a
 # daemon is starting. Past this the launch is an automatic restart that
 # happens to find an abandoned flag, and honoring it would hand out an
 # unearned budget.
-DAEMON_TRIGGER_REARM_MAX_AGE_SECONDS: int = 60
+DAEMON_START_REARM_MAX_AGE_SECONDS: int = 60
 
 
 @dataclass
@@ -442,11 +442,11 @@ class Defaults:
     # Default per-job wallclock cap. 0 = no cap (for jobs that manage
     # their own timeout); see TomlJob.job_timeout_sec.
     job_timeout_sec: int = 1800
-    # How long `crony trigger --wait` waits for a runner to come
+    # How long `crony start --wait` waits for a runner to come
     # online after asking the platform scheduler to fire the unit.
-    # Catches "trigger seemed to succeed but nothing happened"
+    # Catches "start seemed to succeed but nothing happened"
     # cases (invalid unit, queue stalled, etc.).
-    trigger_timeout_sec: int = 15
+    start_timeout_sec: int = 15
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior
     # when a bundle sets no default.
@@ -485,7 +485,7 @@ class _HostList:
 # Resolution-time defaults for interactive jobs whose user did not
 # override `interactive-active` / `interactive-delay`. 10 min of
 # continuous active input is conservative enough that a passing
-# wiggle of the mouse doesn't trigger the dialog; a 1h delay after
+# wiggle of the mouse doesn't start the dialog; a 1h delay after
 # "Delay Job" gives breathing room before crony asks again.
 INTERACTIVE_ACTIVE_DEFAULT_SEC: int = 600
 INTERACTIVE_DELAY_DEFAULT_SEC: int = 3600
@@ -1118,13 +1118,13 @@ class TomlBundleConfig:
         an uncapped child can't be bounded by a finite cumulative
         deadline, so the whole group goes uncapped. The value is pinned
         on the JobGroup snapshot at apply, and the runtime (`_run_group`,
-        `trigger_unit_sync`) reads it from there rather than re-deriving.
+        `start_unit_wait`) reads it from there rather than re-deriving.
         Cycle-safety: `_validate_config` rejects cycles in group
         references, so the recursion always terminates.
 
         Children not selected on this host contribute zero (own
         filter excludes them or empty-group cascade demoted them) --
-        the parent won't trigger them here, so the budget shouldn't
+        the parent won't start them here, so the budget shouldn't
         reserve their time either. Interactive children (by their
         resolved flags -- explicit or inherited) contribute the dispatch
         allowance rather than their `job-timeout-sec`: the group fires
@@ -1341,7 +1341,7 @@ class TomlConfig:
         `notify-test` reads the bundle's notify settings. A bundle
         whose file failed to parse has none of that, so scoping to it
         is an error. Subcommands that address installed units
-        (`status` / `destroy` / `enable` / `disable` / `trigger`) use
+        (`status` / `destroy` / `enable` / `disable` / `start`) use
         `Config.require_addressable` instead, which also accepts a
         bundle present only as on-disk state.
         """
@@ -1381,7 +1381,7 @@ class TomlConfig:
 # =============================================================================
 # The four mutually-exclusive firing modes: schedules use systemd
 # OnCalendar syntax, intervals use systemd time-span syntax,
-# `on-demand = true` is trigger-only, and `daemon = true` runs
+# `on-demand = true` is on-demand, and `daemon = true` runs
 # continuously. Schedule / Interval are parsed and
 # validated by the crony.unit value objects; `_parse_timing` wraps them
 # for the config loader, resolves the on-demand mode, enforces the
@@ -1450,7 +1450,7 @@ def _parse_timing(
     """Build a unit's firing mode from the config's mutually-exclusive
     `schedule` / `interval` / `on-demand` / `daemon` keys, or None when
     none is set (a transit group or group-only job). `on-demand = true`
-    selects the trigger-only mode (`crony.unit.OnDemand`) and
+    selects the on-demand mode (`crony.unit.OnDemand`) and
     `daemon = true` the continuous one (`crony.unit.Daemon`). Surfaces
     the value objects' validation as a config error tied to `where`.
     Intervals below `_min_interval_seconds` are rejected."""
@@ -1534,7 +1534,7 @@ _KNOWN_DEFAULTS: frozenset[str] = (
             "notify-attach-max-kb",
             "notify-success-ratio",
             "job-timeout-sec",
-            "trigger-timeout-sec",
+            "start-timeout-sec",
             "priority",
             "flags",
             "env",
@@ -2285,8 +2285,8 @@ def _parse_defaults(raw: dict[str, Any], *, is_default: bool) -> Defaults:
         job_timeout_sec=_nonneg_int(
             raw, "job-timeout-sec", where, default=1800
         ),
-        trigger_timeout_sec=_positive_int(
-            raw, "trigger-timeout-sec", where, default=15
+        start_timeout_sec=_positive_int(
+            raw, "start-timeout-sec", where, default=15
         ),
         priority=_parse_priority_field(raw, where),
         keep_awake=flags.get(JobFlags.KEEP_AWAKE, False),
@@ -2798,7 +2798,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                 return notify_msg
         # Chain walk: every path from the target through groups to a
         # leaf job must reach a firing point somewhere -- a schedule, an
-        # interval, a trigger-only `on-demand = true` entry, or a
+        # interval, an on-demand `on-demand = true` entry, or a
         # `daemon = true` one (any non-None timing). Cycles in the group
         # graph are caught on the way down. A walk into an errored entry
         # stops without complaint -- the per-entity error is already
@@ -2835,7 +2835,7 @@ def _validate_config(config: TomlBundleConfig, *, is_default: bool) -> None:
                         f"never fire (give it a schedule / interval, "
                         f"place it under a scheduled group, set "
                         f"on-demand = true to run it only via "
-                        f"`crony trigger`, or daemon = true to run it "
+                        f"`crony start`, or daemon = true to run it "
                         f"continuously)"
                     )
                 return

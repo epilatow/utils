@@ -65,6 +65,12 @@ _script_path = REPO_ROOT / "src" / "crony" / "config.py"
 
 
 class TestParseDefaults:
+    def test_start_timeout_key(self) -> None:
+        cfg = _parse({"defaults": {"start-timeout-sec": 3}})
+        assert cfg.defaults.start_timeout_sec == 3
+        with pytest.raises(ConfigError, match="unknown key"):
+            _parse({"defaults": {"trigger-timeout-sec": 3}})
+
     def test_empty_config_uses_defaults(self) -> None:
         cfg = _parse({})
         assert cfg.defaults.notify_channels == []
@@ -1073,7 +1079,7 @@ class TestValidateConfig:
     def test_on_demand_group_member_allowed(self) -> None:
         # `on-demand` arms no timer, so it is not a second firing
         # source -- the group remains the only thing that starts it
-        # automatically, and `crony trigger` still reaches it by hand.
+        # automatically, and `crony start` still reaches it by hand.
         cfg = _parse(
             {
                 "job": {"a": _grouped_job(**{"on-demand": True})},
@@ -1378,7 +1384,7 @@ class TestValidateConfig:
     def test_on_demand_job_directly_reachable_ok(self) -> None:
         # `on-demand = true` is its own firing point, so a target
         # reaching a schedule-less on-demand job directly is valid -- it
-        # runs only via `crony trigger`.
+        # runs only via `crony start`.
         cfg = _parse(
             {
                 "job": {
@@ -1393,7 +1399,7 @@ class TestValidateConfig:
     def test_on_demand_group_makes_subtree_reachable(self) -> None:
         # An on-demand group is a firing point for its whole subtree: a
         # schedule-less child under it is reachable (dispatched when the
-        # group is triggered), so the chain is valid.
+        # group is started), so the chain is valid.
         cfg = _parse(
             {
                 "job": {"a": {"command": "true"}},

@@ -237,7 +237,7 @@ def _derive_job_status(
     is an artifact of being stopped (a signal death, which would read
     `fail`), so the last outcome is not the useful answer the way it is
     for a scheduled job. It ranks below `is_running`: a disabled daemon
-    someone triggered by hand really is running.
+    someone started by hand really is running.
     """
     js = crony.model.JobStatus
     if is_running:
@@ -800,7 +800,7 @@ def daemon_retries_exhausted(state_dir: Path) -> bool:
 
 
 def dispatch_unit_path(name: str, platform: str | None = None) -> Path:
-    """File `trigger_unit` fires for `name` (may not exist). Used to
+    """File `start_unit` fires for `name` (may not exist). Used to
     refuse early when the unit was never installed."""
     return scheduler(platform).dispatch_unit_path(name)
 
@@ -1051,39 +1051,39 @@ def _alias_symlink_names() -> set[str]:
     return names
 
 
-def user_trigger_flag_path(state_dir: Path) -> Path:
-    """Filesystem path of the one-shot user-trigger sentinel."""
-    return state_dir / "user-trigger.flag"
+def user_start_flag_path(state_dir: Path) -> Path:
+    """Filesystem path of the one-shot user-start sentinel."""
+    return state_dir / "user-start.flag"
 
 
-def write_user_trigger_flag(state_dir: Path) -> None:
-    """Write the user-trigger sentinel just before kicking the
+def write_user_start_flag(state_dir: Path) -> None:
+    """Write the user-start sentinel just before kicking the
     platform scheduler. Empty file -- presence is the signal. The
     caller passes the entry's uuid-keyed state dir so the sentinel
     lives alongside the other per-run files (run.lock, pending.flag,
     last-run.json).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    user_trigger_flag_path(state_dir).write_bytes(b"")
+    user_start_flag_path(state_dir).write_bytes(b"")
 
 
-def consume_user_trigger_flag(
+def consume_user_start_flag(
     state_dir: Path, *, max_age_sec: float | None = None
 ) -> bool:
-    """Read-and-delete the user-trigger sentinel. Returns True when this
-    caller claimed a trigger worth acting on (the runner should bypass
+    """Read-and-delete the user-start sentinel. Returns True when this
+    caller claimed a start worth acting on (the runner should bypass
     the interactive wait), False otherwise.
 
     The `unlink` is the claim: it succeeds for exactly one caller, so
-    concurrent readers cannot both act on one trigger. `max_age_sec`
-    bounds how long a trigger stays meaningful -- an older flag is still
+    concurrent readers cannot both act on one start. `max_age_sec`
+    bounds how long a start stays meaningful -- an older flag is still
     claimed and deleted, but reported as nothing to act on. A caller
-    that cannot guarantee its launch was the one the trigger kicked
+    that cannot guarantee its launch was the one the start kicked
     passes a bound so an abandoned sentinel cannot be honored by an
     unrelated later launch; the interactive bypass, which is consumed by
-    the run the trigger started, passes none.
+    the run started by that request, passes none.
     """
-    path = user_trigger_flag_path(state_dir)
+    path = user_start_flag_path(state_dir)
     try:
         age_sec = time.time() - path.stat().st_mtime
         path.unlink()
@@ -1277,7 +1277,7 @@ def _rearm_daemon(snapshot: crony.model.Job) -> None:
             f"(run `crony apply` to reinstall it)"
         )
     clear_exit_history(snapshot.state_dir)
-    scheduler().trigger(name)
+    scheduler().start(name)
 
 
 def apply_one(
@@ -1337,7 +1337,7 @@ def apply_one(
     # pending one. Both sides are the same dataclass shape, so
     # equality is a single Python `==`. A missing / unparseable /
     # wrong-schema prior snapshot is absent from `current` and so
-    # "not equal", triggering a fresh write. Unit-file drift is folded
+    # "not equal", starting a fresh write. Unit-file drift is folded
     # into that same `==`: both nodes carry their normalized config /
     # timer units (pinned at load), so a hand-edited / missing / drifted
     # unit leaves them unequal even when the other snapshot fields match,
@@ -1518,7 +1518,7 @@ def _install_unit(
 
     Shared by `apply_one` and `set_disabled`. A disabled or schedule-less
     snapshot renders with no schedule (`unit_spec` drops the timing), so
-    it loads dormant -- registered and triggerable, just not armed. The
+    it loads dormant -- registered and startable, just not armed. The
     platform writes every unit file before any reload and re-arms them
     together; `activate=False` skips the reload for a self-apply whose
     unit didn't change."""
@@ -1573,7 +1573,7 @@ def set_disabled(
     ):
         # Re-enabling starts the daemon again, so it gets a full budget.
         # Clear after the install for the same reason `apply_one` does:
-        # a disabled daemon someone triggered by hand is running, and
+        # a disabled daemon someone started by hand is running, and
         # the exit the install just caused would otherwise land behind
         # the clear and spend an attempt.
         clear_exit_history(snapshot.state_dir)

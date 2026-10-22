@@ -581,7 +581,7 @@ class LaunchdScheduler(Scheduler):
         # no logout-survival toggle to check, so nothing to warn about.
         return
 
-    def trigger(self, name: str) -> None:
+    def start(self, name: str) -> None:
         # kickstart invokes now; `start` only queues the next fire.
         self._run_checked(["launchctl", "kickstart", self._gui(name)])
 

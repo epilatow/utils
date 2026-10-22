@@ -741,7 +741,7 @@ class TestUnitDisabled:
 
 
 class TestOnDemand:
-    """`on-demand = true` is the trigger-only firing mode: the node
+    """`on-demand = true` is the on-demand firing mode: the node
     carries an `OnDemand` timing (so status shows `on-demand` and a switch
     to / from a real schedule reads as drift), but `unit_spec` renders it
     dormant like a transit group, and it round-trips through
@@ -1299,6 +1299,25 @@ class TestDaemonSnapshot:
         launch = parse_argv(list(snap.unit_spec().cmd))
         assert launch is not None
         assert launch.argv[1:3] == ("_run-guard", "0")
+
+
+def test_schema_v8_group_remains_runnable_after_timeout_rename() -> None:
+    cfg = _parse(
+        {
+            "job": {"child": {"command": "true"}},
+            "job-group": {"g": {"jobs": ["child"], "on-demand": True}},
+        }
+    )
+    group = _resolve_snapshot_for(cfg, "g")
+    assert isinstance(group, JobGroup)
+    raw = group.to_dict()
+    raw["schema"] = 8
+    raw["trigger_timeout_sec"] = raw.pop("start_timeout_sec")
+    restored = snapshot_from_dict(raw)
+    assert isinstance(restored, JobGroup)
+    assert restored.start_timeout_sec == group.start_timeout_sec
+    assert restored.snapshot_schema == 8
+    assert CURRENT_SNAPSHOT_SCHEMA == 9
 
 
 if __name__ == "__main__":

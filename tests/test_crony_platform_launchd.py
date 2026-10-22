@@ -128,7 +128,7 @@ class TestPlistRendering:
         assert "<integer>1800</integer>" in plist
 
     def test_on_demand_renders_dormant_plist(self) -> None:
-        # A trigger-only OnDemand entry arms no timer -- the plist carries
+        # An on-demand OnDemand entry arms no timer -- the plist carries
         # neither StartInterval nor StartCalendarInterval, a dormant unit
         # loaded but fired only via kickstart.
         plist = launchd._render_plist("j", _CMD, OnDemand())
@@ -153,7 +153,7 @@ class TestPlistRendering:
             (Interval.from_str("30min"), PriorityClass.NORMAL),
             (Schedule.from_str("Mon *-*-* 09:00"), PriorityClass.HIGH),
             (Schedule.from_str("*-*-* 03:00"), PriorityClass.LOW),
-            (OnDemand(), PriorityClass.NORMAL),  # trigger-only
+            (OnDemand(), PriorityClass.NORMAL),  # on-demand
             (None, PriorityClass.NORMAL),  # transit / group-only
         ]
         for timing, priority in shapes:
@@ -448,7 +448,7 @@ class TestLaunchdReload:
             sched.activate(_activate_spec("default.j", Interval.from_str("1h")))
         assert not any(c[:2] == ["launchctl", "bootstrap"] for c in calls)
 
-    def test_trigger_failure_raises_subprocess_error(
+    def test_start_failure_raises_subprocess_error(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         # A rejected kickstart surfaces as a crony SubprocessError.
@@ -459,7 +459,7 @@ class TestLaunchdReload:
             lambda cmd, **_kw: subprocess.CompletedProcess(list(cmd), 1),
         )
         with pytest.raises(SubprocessError):
-            sched.trigger("default.j")
+            sched.start("default.j")
 
     def test_settle_waits_for_label_to_clear(
         self, monkeypatch: Any, tmp_path: Path
@@ -806,7 +806,7 @@ class TestLaunchdDaemon:
         assert data["KeepAlive"] is False
         assert "ThrottleInterval" not in data
         # Still stoppable on the same terms: a disabled daemon can be
-        # triggered by hand, and that run is stopped like any other.
+        # started by hand, and that run is stopped like any other.
         assert data["ExitTimeOut"] == launchd._EXIT_TIMEOUT_SEC
 
 

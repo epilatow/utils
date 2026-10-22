@@ -60,9 +60,9 @@ logging, execution gates, timeouts, environment management, etc. Jobs can
 be grouped, and groups or jobs run on a schedule; a job can instead be a
 daemon, which runs continuously and gets five automatic restarts when it
 stops prematurely. An exhausted daemon stays loaded but stopped until the
-next login, `trigger`, `apply`, or `enable` starts a fresh retry budget.
+next login, `start`, `apply`, or `enable` starts a fresh retry budget.
 Jobs can also be managed manually (enabled/disabled independently of the
-underlying scheduler, and run at will via the `trigger` subcommand). Crony
+underlying scheduler, and run at will via the `start` subcommand). Crony
 supports the following notification mechanisms for job failures:
 email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
@@ -70,14 +70,14 @@ Subcommands fall into categories:
 - configuration (`config`): manage config files
 - deployment (`apply`, `destroy`): deploy configured jobs
 - runtime state (`enable`, `disable`): manage scheduler arming
-- operational (`status`, `logs`, `trigger`): manage deployed jobs
+- operational (`status`, `logs`, `start`): manage deployed jobs
 
 Configuration is managed via bundles:
 - `~/.config/crony/config.toml` -> bundle name "default"
 - `~/.config/crony/config/<x>.toml` -> bundle name "<x>"
 
 Bundles are independent. Job and group names are namespaced as
-<bundle>.<name>; bare CLI input (`crony trigger foo`) is shorthand for
+<bundle>.<name>; bare CLI input (`crony start foo`) is shorthand for
 `default.foo`. The `-b/--bundle <name>` flag on various subcommands scopes
 name resolution to that bundle.\
 """
@@ -99,8 +99,8 @@ their execution status) with `crony status`. To deploy configured jobs run
 `crony apply`. If you change the configuration for a deployed job, `crony
 status` will report that the job is `stale` and you can update the deployed
 configuration by running `crony apply` again. To see execution logs (file
-path, content, etc.) for a job use `crony logs`. To manually trigger a job
-run use `crony trigger`. To disable a job (without destroying it), use
+path, content, etc.) for a job use `crony logs`. To manually start a job
+run use `crony start`. To disable a job (without destroying it), use
 `crony disable` (you can subsequently re-enable it with `crony enable`). To
 remove deployed jobs run `crony destroy`. (Destroying jobs removes all
 previous job state: log files, last run information, etc.)\
@@ -289,7 +289,7 @@ def _require_names_or_all(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     """Shared precondition for the bulk verbs (enable / disable /
-    trigger): require either positional names or `--all`, so an unscoped
+    start): require either positional names or `--all`, so an unscoped
     invocation can't silently act on every stamped entry. `--all` may be
     narrowed by `--bundle`; it is consumed once validated (the handler
     infers the whole-set action from an empty name list)."""
@@ -312,12 +312,12 @@ def _validate_disable(
     _require_names_or_all(parser, args)
 
 
-def _validate_trigger(
+def _validate_start(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    if args.trigger_timeout is not None and not args.wait:
+    if args.start_timeout is not None and not args.wait:
         parser.error(
-            "--trigger-timeout requires --wait (only meaningful in "
+            "--start-timeout requires --wait (only meaningful in "
             "synchronous mode)"
         )
     _require_names_or_all(parser, args)
@@ -508,9 +508,9 @@ def _build_parser() -> StrictArgumentParser:
     # disable
     p_disable = subparsers.add_parser(
         "disable",
-        help="Disarm the named jobs' schedules (still triggerable).",
+        help="Disarm the named jobs' schedules (still startable).",
         description=(
-            "Disarm the named jobs' schedules: loaded and triggerable, "
+            "Disarm the named jobs' schedules: loaded and startable, "
             "but not firing on their own. Disabling a daemon stops it; "
             "it stays stopped across a reboot until re-enabled. "
             "Requires a target: job(s) or --all."
@@ -521,9 +521,9 @@ def _build_parser() -> StrictArgumentParser:
     _add_bundle_argument(p_disable)
     p_disable.add_validate_callback(_validate_disable)
 
-    # trigger
-    p_trigger = subparsers.add_parser(
-        "trigger",
+    # start
+    p_start = subparsers.add_parser(
+        "start",
         help="Ask the platform scheduler to fire the named jobs now.",
         description=(
             "Ask the platform scheduler to fire the named jobs now, via "
@@ -532,10 +532,10 @@ def _build_parser() -> StrictArgumentParser:
             "target: job(s) or --all."
         ),
     )
-    _add_jobs_argument(p_trigger)
-    _add_all_argument(p_trigger)
-    _add_bundle_argument(p_trigger)
-    p_trigger.add_argument(
+    _add_jobs_argument(p_start)
+    _add_all_argument(p_start)
+    _add_bundle_argument(p_start)
+    p_start.add_argument(
         "-w",
         "--wait",
         action="store_true",
@@ -546,18 +546,18 @@ def _build_parser() -> StrictArgumentParser:
             "there is no completion to wait for."
         ),
     )
-    p_trigger.add_argument(
-        "--trigger-timeout",
+    p_start.add_argument(
+        "--start-timeout",
         type=int,
         default=None,
-        dest="trigger_timeout",
+        dest="start_timeout",
         help=(
-            "Override [defaults].trigger_timeout_sec (seconds to "
+            "Override [defaults].start-timeout-sec (seconds to "
             "wait for a runner to come online after dispatch). "
             "Only meaningful with --wait."
         ),
     )
-    p_trigger.add_validate_callback(_validate_trigger)
+    p_start.add_validate_callback(_validate_start)
 
     # status
     p_status = subparsers.add_parser(
@@ -666,7 +666,7 @@ def _build_parser() -> StrictArgumentParser:
 
     # _run -- internal entry point for platform units; hidden from
     # `crony --help` since end users should never invoke it directly
-    # (use `crony trigger` instead, which goes through the platform
+    # (use `crony start` instead, which goes through the platform
     # scheduler so the run uses the same execution context as a
     # scheduled fire). The leading underscore marks it private, matching
     # `_run-guard`. The legacy `run` spelling is registered alongside as
@@ -753,7 +753,7 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "destroy": crony.commands.do_destroy,
     "enable": crony.commands.do_enable,
     "disable": crony.commands.do_disable,
-    "trigger": crony.commands.do_trigger,
+    "start": crony.commands.do_start,
     "status": crony.commands.do_status,
     "logs": crony.commands.do_logs,
     crony.model.RUN_SUBCOMMAND: crony.runner.do_run,

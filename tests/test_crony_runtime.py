@@ -1110,7 +1110,7 @@ class TestResolveMethods:
         )
         config = crony_runtime.load_config()
         assert config.resolve_pending("default.a") is not None
-        # Never applied -> not in current, so trigger / destroy
+        # Never applied -> not in current, so start / destroy
         # have nothing on disk to act on.
         assert config.resolve_runnable("default.a") is None
         assert config.resolve_current("default.a") is None
@@ -1538,7 +1538,7 @@ class TestUnitDriftDetection:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         # The plist is intact but the scheduler has it unloaded (e.g. a
-        # hand `launchctl bootout`): an entry the scheduler can't trigger
+        # hand `launchctl bootout`): an entry the scheduler can't start
         # reads broken (re-apply reloads it), not synced.
         h, _, _ = self._apply_and_load(tmp_path, monkeypatch)
         monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
@@ -2552,34 +2552,34 @@ class TestDaemonRetryHistory:
         assert crony_runtime.daemon_retries_exhausted(tmp_path)
 
 
-class TestUserTriggerFlagAge:
+class TestUserStartFlagAge:
     """The sentinel is deleted on read either way; `max_age_sec` decides
     whether the reader is allowed to act on it."""
 
     def test_a_fresh_flag_is_honored(self, tmp_path: Path) -> None:
-        crony_runtime.write_user_trigger_flag(tmp_path)
-        assert crony_runtime.consume_user_trigger_flag(tmp_path, max_age_sec=60)
+        crony_runtime.write_user_start_flag(tmp_path)
+        assert crony_runtime.consume_user_start_flag(tmp_path, max_age_sec=60)
 
     def test_a_stale_flag_is_consumed_but_ignored(self, tmp_path: Path) -> None:
-        crony_runtime.write_user_trigger_flag(tmp_path)
-        path = crony_runtime.user_trigger_flag_path(tmp_path)
+        crony_runtime.write_user_start_flag(tmp_path)
+        path = crony_runtime.user_start_flag_path(tmp_path)
         old = time.time() - 120
         os.utime(path, (old, old))
-        assert not crony_runtime.consume_user_trigger_flag(
+        assert not crony_runtime.consume_user_start_flag(
             tmp_path, max_age_sec=60
         )
         # Left on disk it would be read again by the next launch.
         assert not path.exists()
 
     def test_age_is_ignored_without_a_bound(self, tmp_path: Path) -> None:
-        crony_runtime.write_user_trigger_flag(tmp_path)
-        path = crony_runtime.user_trigger_flag_path(tmp_path)
+        crony_runtime.write_user_start_flag(tmp_path)
+        path = crony_runtime.user_start_flag_path(tmp_path)
         old = time.time() - 86400
         os.utime(path, (old, old))
-        assert crony_runtime.consume_user_trigger_flag(tmp_path)
+        assert crony_runtime.consume_user_start_flag(tmp_path)
 
     def test_a_missing_flag_reads_absent(self, tmp_path: Path) -> None:
-        assert not crony_runtime.consume_user_trigger_flag(
+        assert not crony_runtime.consume_user_start_flag(
             tmp_path, max_age_sec=60
         )
 
@@ -2606,7 +2606,7 @@ class TestDaemonJobStatus:
         )
 
     def test_running_outranks_disabled(self) -> None:
-        # A disabled daemon someone triggered by hand really is running,
+        # A disabled daemon someone started by hand really is running,
         # and that is the more useful cell.
         assert (
             self._derive(is_running=True, disabled_daemon=True)

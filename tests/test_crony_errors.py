@@ -26,8 +26,8 @@ from crony.errors import (
     LockBusyError,
     PreconditionError,
     RunnerCrashed,
+    StartTimeout,
     SubprocessError,
-    TriggerStartTimeout,
     UnitNotInstalledError,
     UsageError,
 )
@@ -76,7 +76,7 @@ class TestExceptionRelationships:
             PreconditionError,
             JobTimeoutError,
             UnitNotInstalledError,
-            TriggerStartTimeout,
+            StartTimeout,
             RunnerCrashed,
         ):
             assert issubclass(exc, CronyError)
@@ -87,9 +87,9 @@ class TestExceptionRelationships:
         assert issubclass(UnitNotInstalledError, PreconditionError)
         assert "exit_code" not in UnitNotInstalledError.__dict__
         assert UnitNotInstalledError.exit_code is ExitCode.PRECONDITION
-        assert issubclass(TriggerStartTimeout, JobTimeoutError)
-        assert "exit_code" not in TriggerStartTimeout.__dict__
-        assert TriggerStartTimeout.exit_code is ExitCode.TIMEOUT
+        assert issubclass(StartTimeout, JobTimeoutError)
+        assert "exit_code" not in StartTimeout.__dict__
+        assert StartTimeout.exit_code is ExitCode.TIMEOUT
 
     def test_runner_crashed_is_not_a_job_timeout(self) -> None:
         # A crashed runner is not a timeout of any kind: the job ran and
@@ -101,7 +101,7 @@ class TestExceptionRelationships:
     def test_runner_crashed_takes_the_error_not_crashed_code(self) -> None:
         # CRASHED is the code crony exits with when crony ITSELF dies on
         # an unhandled exception, so a job that crashed must not surface
-        # it -- a `crony trigger --wait` caller could no longer tell the
+        # it -- a `crony start --wait` caller could no longer tell the
         # two apart. It takes the general error code instead.
         assert RunnerCrashed.exit_code is ExitCode.ERROR
 

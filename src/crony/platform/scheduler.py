@@ -15,7 +15,7 @@ what that scheduler currently holds. Its whole responsibility, and its
 whole vocabulary:
 
   - render a `UnitSpec` into unit file(s) (filename + content);
-  - write, load, reload, trigger, and remove those files with the
+  - write, load, reload, start, and remove those files with the
     scheduler;
   - read back what is on disk and what the scheduler reports (paths,
     content, loaded / armed state, last exit).
@@ -231,7 +231,7 @@ class Scheduler(abc.ABC):
 
     @abc.abstractmethod
     def dispatch_unit_path(self, name: str) -> Path:
-        """The unit file `trigger` fires for `name` (may not exist)."""
+        """The unit file `start` fires for `name` (may not exist)."""
 
     @abc.abstractmethod
     def unit_name(self, name: str, scheduled: bool | None, /) -> str:
@@ -257,7 +257,7 @@ class Scheduler(abc.ABC):
     @abc.abstractmethod
     def is_loaded(self, name: str) -> bool:
         """Whether the scheduler has a unit by `name` loaded / registered
-        (so it can be triggered), independently of whether it has a schedule
+        (so it can be started), independently of whether it has a schedule
         or supervision armed."""
 
     @abc.abstractmethod
@@ -318,8 +318,8 @@ class Scheduler(abc.ABC):
         and surface the message."""
 
     @abc.abstractmethod
-    def trigger(self, name: str) -> None:
-        """Fire `name` immediately (no-op if a run is already in flight).
+    def start(self, name: str) -> None:
+        """Start the unit's instance now (no-op if already running).
 
         Raises `crony.errors.SubprocessError` when the scheduler rejects
         the fire. A backend routes it through `_run_checked`, which converts
@@ -332,7 +332,7 @@ class Scheduler(abc.ABC):
         through the CLI instead of a bare `CalledProcessError` (which the
         CLI does not recognize, so it crashes with a traceback). This is
         the shared fire path for a backend's mutating scheduler commands
-        (load, enable, restart, trigger); best-effort probes and teardowns
+        (load, enable, restart, start); best-effort probes and teardowns
         that tolerate failure run their own `subprocess` calls directly."""
         result = subprocess.run(argv, check=False)
         if result.returncode != 0:

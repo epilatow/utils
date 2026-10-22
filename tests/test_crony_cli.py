@@ -121,6 +121,17 @@ class TestHelpOutput:
         assert "run.lock held by another" not in text
         assert "run precondition failed" not in text
 
+    def test_start_replaces_the_old_command(self) -> None:
+        parser = crony_cli._build_parser()
+        args = parser.parse_command(
+            ["start", "--wait", "--start-timeout", "2", "j"]
+        )
+        assert args.command == "start"
+        assert args.start_timeout == 2
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_command(["trigger", "j"])
+        assert exc.value.code == 2
+
 
 class TestUnknownArgRoutedToSubparser(UnknownArgRoutedToSubparserBase):
     """Unknown args print the subcommand's usage line."""
@@ -141,7 +152,7 @@ class TestCmdCallbacks(CmdCallbacksBase):
     CLI_FUNC = staticmethod(crony_cli.cli)
     EXIT_CODE_USAGE = ExitCode.USAGE
     TEST_SUBCOMMAND = "status"
-    # destroy / enable / disable / trigger validators consume --all once
+    # destroy / enable / disable / start validators consume --all once
     # checked, so it never reaches the handler signatures.
     POPPED_ARGS: ClassVar = {"all_jobs"}
     EXCEPTION_EXIT_CODE_MAP: ClassVar = [

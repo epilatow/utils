@@ -72,7 +72,7 @@ RUN_LOG_NAME: str = "run.log"
 
 # Hidden crony subcommand the platform unit invokes to perform a run.
 # The leading underscore marks it internal (matching `_run-guard`): end
-# users fire jobs via `crony trigger`, never by calling this directly.
+# users fire jobs via `crony start`, never by calling this directly.
 RUN_SUBCOMMAND = "_run"
 
 # Temporary back-compat alias for RUN_SUBCOMMAND. Units installed before
@@ -340,7 +340,7 @@ class _JobCommon:
     # Whether the operator turned this scheduled entry off (`crony
     # disable`). The schedule stays pinned in `timing` (so `enable`
     # restores it), but a disabled entry renders its unit with no
-    # schedule (`unit_spec` drops the timing) -- loaded and triggerable,
+    # schedule (`unit_spec` drops the timing) -- loaded and startable,
     # just not firing on its own. For a daemon, whose only mode of
     # firing is its own, that means an inert unit: stopped, and started
     # by neither boot nor a restart. Persisted in snapshot.json (it is real
@@ -508,9 +508,9 @@ class _JobCommon:
         real unit -- self-contained: the launcher PATH is built from the
         uv / crony executables the node carries (a pending node's live
         ones, a re-render's stamped ones). A disabled entry renders
-        schedule-less (`timing` dropped) -- loaded and triggerable, but
+        schedule-less (`timing` dropped) -- loaded and startable, but
         not firing on its own -- while keeping its schedule pinned in the
-        `timing` field so `enable` restores it. A trigger-only OnDemand
+        `timing` field so `enable` restores it. An on-demand OnDemand
         entry keeps its OnDemand timing here (so status shows `on-demand`)
         and the backend renders it dormant like any non-`is_scheduled`
         entry. A daemon additionally carries its supervision parameters,
@@ -595,7 +595,7 @@ class _JobCommon:
         )
 
     def _on_demand(self) -> bool:
-        """Whether this entry's timing is the trigger-only OnDemand mode
+        """Whether this entry's timing is the on-demand OnDemand mode
         (persisted so the applied side shows `on-demand` and a switch to
         or from a schedule reads as drift)."""
         return isinstance(self.timing, crony.unit.OnDemand)
@@ -934,7 +934,7 @@ class JobGroup(_JobCommon):
     """
 
     children: list[crony.unit.EntityRef]
-    trigger_timeout_sec: int
+    start_timeout_sec: int
 
     @classmethod
     def _from_config(
@@ -976,7 +976,7 @@ class JobGroup(_JobCommon):
         masked here). The reference becomes a no-op on this host, so
         a shared bundle can list a host-restricted child from a
         parent group that runs everywhere without the parent
-        dispatcher trying to trigger a unit that wasn't installed.
+        dispatcher trying to start a unit that wasn't installed.
         """
         sel_jobs, sel_groups = config.selected_jobs_and_groups(target)
         # Each child edge is the child's bundle-scoped ref (the parent's
@@ -1016,7 +1016,7 @@ class JobGroup(_JobCommon):
             state_dir_symlink=cls._state_dir_symlink_expected(name, group.uuid),
             children=children,
             timeout=timeout,
-            trigger_timeout_sec=config.defaults.trigger_timeout_sec,
+            start_timeout_sec=config.defaults.start_timeout_sec,
             timing=group.timing,
             flags=flags,
             platform_properties=platform_properties,
@@ -1043,7 +1043,7 @@ class JobGroup(_JobCommon):
                 crony.config.JobFlags.FULL_DISK_ACCESS in self.flags
             ),
             children=[r.uuid for r in self.children],
-            trigger_timeout_sec=self.trigger_timeout_sec,
+            start_timeout_sec=self.start_timeout_sec,
         )
 
     @classmethod
@@ -1092,7 +1092,7 @@ class JobGroup(_JobCommon):
             uuid=snap.uuid,
             timeout=snap.timeout,
             children=snap.child_refs(),
-            trigger_timeout_sec=snap.trigger_timeout_sec,
+            start_timeout_sec=snap.start_timeout_sec,
             timing=timing,
             flags=flags,
             unit_disabled=snap.unit_disabled,
@@ -1538,7 +1538,7 @@ class JobStatus(_DescribedStrEnum):
             "subcommand, so it is stopped and will not start itself again "
             "-- neither at boot nor by a restart -- until it is "
             "re-enabled. It can still be started manually via the "
-            "`trigger` subcommand. A scheduled job reports its last run's "
+            "`start` subcommand. A scheduled job reports its last run's "
             "outcome instead; its SCHEDULE cell carries the disabled "
             "state."
         ),
@@ -1639,16 +1639,16 @@ class ScheduleValue(_DescribedStrEnum):
     GROUPED = (
         "grouped",
         (
-            "A job/group with no schedule of its own, it runs when triggered "
+            "A job/group with no schedule of its own, it runs when started "
             "by a parent job group."
         ),
     )
     ON_DEMAND = (
         "on-demand",
         (
-            "A trigger-only job/group (on-demand = true) with no schedule of "
+            "An on-demand job/group (on-demand = true) with no schedule of "
             "its own and no scheduled parent. It runs only when run manually "
-            "via the `trigger` subcommand."
+            "via the `start` subcommand."
         ),
     )
     DAEMON = (
@@ -1658,7 +1658,7 @@ class ScheduleValue(_DescribedStrEnum):
             "scheduled times. It starts at login and gets five automatic "
             "restarts when its command exits prematurely. After exhausting "
             "them it reports fail and stays stopped until the next login, "
-            "`apply`, `enable`, or `trigger`. Five minutes of continuous "
+            "`apply`, `enable`, or `start`. Five minutes of continuous "
             "runtime resets the retry budget. If its execution gate fails "
             "it stays stopped without consuming retries."
         ),
@@ -1668,7 +1668,7 @@ class ScheduleValue(_DescribedStrEnum):
         (
             "A job that has been disabled via the `disable` subcommand; it "
             "will not be run via any schedule. It can be run manually via the "
-            "`trigger` subcommand, and re-enabled via the `enable` "
+            "`start` subcommand, and re-enabled via the `enable` "
             "subcommand."
         ),
     )
@@ -1753,7 +1753,7 @@ class JobRunResult(_CommonRunResult):
     # True when a failing run's notification was withheld by the
     # notify-success-ratio floor (enough of the last N runs succeeded).
     # Recorded for forensics ("why wasn't I paged?"); deliberately not
-    # surfaced by status, trigger, or any other crony command output.
+    # surfaced by status, start, or any other crony command output.
     notify_suppressed: bool = False
 
 
@@ -2188,7 +2188,7 @@ class Config:
         parseable current snapshot, or an orphan whose name was
         recovered (a leftover platform unit / alias symlink, or a
         broken snapshot). Computed from the one `load_config()` disk
-        pass -- the addressable set status / trigger / enable /
+        pass -- the addressable set status / start / enable /
         disable / destroy operate on, without re-walking the state-dir
         and unit trees per command.
         """
@@ -2210,7 +2210,7 @@ class Config:
         this host: either a successfully parsed bundle, or one with
         on-disk orphans. Used by the subcommands that address
         installed units (`status` / `destroy` / `enable` / `disable`
-        / `trigger`); the on-disk fallback lets them scope to a bundle
+        / `start`); the on-disk fallback lets them scope to a bundle
         whose config has since broken -- exactly when the operator
         most needs to inspect, disarm, or tear it down. Commands that
         parse the pending config (`apply` / `validate`) use
@@ -2232,7 +2232,7 @@ class Config:
         run -- its baked uv / crony binary is gone, its config unit file
         was deleted while the scheduler still has it loaded (it works now
         but dies on reboot), the scheduler has no unit loaded for it (it
-        can't be triggered, by schedule, group, or hand), a scheduled
+        can't be started, by schedule, group, or hand), a scheduled
         entry's schedule-arming timer file is gone (it will never fire),
         or that timer is present and loaded but dead -- armed with a next
         firing of infinity so it will never fire -- is reported broken
@@ -2280,7 +2280,7 @@ class Config:
             )
         if c.uv_path is None or c.crony_path is None:
             return ConfigStatus.BROKEN
-        # A unit the scheduler has no record of can't be triggered -- by
+        # A unit the scheduler has no record of can't be started -- by
         # schedule, as part of a group, or by hand -- so it is broken
         # regardless of whether it is scheduled or disabled (a disabled
         # entry installs a loaded-but-schedule-less unit, which still

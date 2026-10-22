@@ -602,11 +602,11 @@ class SystemdScheduler(Scheduler):
             "session"
         )
 
-    def trigger(self, name: str) -> None:
+    def start(self, name: str) -> None:
         # The timer's job is to fire the .service; start it directly.
         # --no-block enqueues the start job and returns without waiting
         # for it: a scheduled entry's .service is Type=oneshot, for which
-        # a plain `systemctl start` blocks until ExecStart exits. trigger's
+        # a plain `systemctl start` blocks until ExecStart exits. start's
         # contract is to return once the platform accepts the fire, not
         # once the job finishes -- a caller that wants completion waits
         # for it separately.

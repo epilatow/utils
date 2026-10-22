@@ -94,7 +94,7 @@ def _resolve_snapshot_for(
 
 
 # Scratch namespace published to the crony test files. The runner
-# harness's `trigger_unit_sync` stub records each dispatched call on
+# harness's `start_unit_wait` stub records each dispatched call on
 # `crony._ledger` (installed via monkeypatch), and test_crony_runner
 # reads it back to assert on what was dispatched.
 crony = SimpleNamespace()
@@ -204,10 +204,10 @@ def _grouped_job(**overrides: Any) -> dict[str, Any]:
 # launchd `kickstart`. Not the reinstall verbs -- systemd's `restart`
 # and launchd's `bootstrap` do start a unit, but they are `activate`,
 # which the apply tests distinguish from a fire.
-_TRIGGER_VERBS = frozenset({"start", "kickstart"})
+_START_VERBS = frozenset({"start", "kickstart"})
 
 
-def triggered_a_unit(calls: list[list[str]]) -> bool:
+def started_a_unit(calls: list[list[str]]) -> bool:
     """Whether any recorded subprocess call fired a unit.
 
     Argv is matched element-wise, so a check naming one backend's verb
@@ -215,7 +215,7 @@ def triggered_a_unit(calls: list[list[str]]) -> bool:
     positive assertion, silently fatal in a negative one. Both verbs
     live here so a caller cannot get only half of them.
     """
-    return any(_TRIGGER_VERBS & set(argv) for argv in calls)
+    return any(_START_VERBS & set(argv) for argv in calls)
 
 
 # The binary each backend drives. Same element-wise trap as the verbs:
@@ -227,7 +227,7 @@ _SCHEDULER_BINS = frozenset({"systemctl", "launchctl"})
 def touched_the_scheduler(calls: list[list[str]]) -> bool:
     """Whether any recorded subprocess call drove a scheduler binary.
 
-    Broader than `triggered_a_unit` -- any `systemctl` / `launchctl`
+    Broader than `started_a_unit` -- any `systemctl` / `launchctl`
     counts, not just a fire -- and the question a test asks when the
     answer should be that crony left the scheduler alone. Not every
     subprocess a backend runs: `plutil`, which launchd's activate calls
@@ -514,7 +514,7 @@ class _RunnerHarness:
                 {
                     "children": [],
                     "timeout": 600,
-                    "trigger_timeout_sec": 15,
+                    "start_timeout_sec": 15,
                     "schedule": "daily",
                     "interval": None,
                 }
@@ -550,7 +550,7 @@ class _RunnerHarness:
 
         `ensure_snapshot=True` materializes a minimal snapshot.json so
         the runtime helpers that resolve a state dir by walking
-        `snapshot.json` (logs, trigger, status) can find it. Useful
+        `snapshot.json` (logs, start, status) can find it. Useful
         for tests that fabricate a state dir without actually running
         apply.
         """
@@ -600,7 +600,7 @@ class _RunnerHarness:
                         {
                             "children": [],
                             "timeout": 600,
-                            "trigger_timeout_sec": 15,
+                            "start_timeout_sec": 15,
                             "schedule": "daily",
                             "interval": None,
                         }
@@ -731,14 +731,14 @@ def _cast_dict(text: str) -> dict[str, Any]:
     return out
 
 
-def _stub_trigger_sync(
+def _stub_start_sync(
     monkeypatch: Any, results: dict[str, dict[str, Any]]
 ) -> None:
-    """Replace `trigger_unit_sync` with a deterministic stub.
+    """Replace `start_unit_wait` with a deterministic stub.
 
     `results` maps full child names -> the dict each call should
     return (mimicking last-run.json). The stub records each call's
-    args (job_timeout, trigger_timeout, wait_budget) on a ledger we can
+    args (job_timeout, start_timeout, wait_budget) on a ledger we can
     assert against.
     """
     ledger: list[dict[str, Any]] = []
@@ -748,7 +748,7 @@ def _stub_trigger_sync(
         *,
         state_dir: Path,
         job_timeout: float,
-        trigger_timeout: float,
+        start_timeout: float,
         wait_budget: float = math.inf,
     ) -> dict[str, Any]:
         ledger.append(
@@ -756,13 +756,13 @@ def _stub_trigger_sync(
                 "full_name": full_name,
                 "state_dir": state_dir,
                 "job_timeout": job_timeout,
-                "trigger_timeout": trigger_timeout,
+                "start_timeout": start_timeout,
                 "wait_budget": wait_budget,
             }
         )
         return results.get(full_name, {"exit_code": 0, "exit_class": "ok"})
 
-    monkeypatch.setattr(crony_runner, "trigger_unit_sync", _stub)
+    monkeypatch.setattr(crony_runner, "start_unit_wait", _stub)
     monkeypatch.setattr(crony, "_ledger", ledger, raising=False)
 
 
