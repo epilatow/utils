@@ -445,7 +445,7 @@ class Defaults:
     # How long `crony trigger --wait` waits for a runner to come
     # online after asking the platform scheduler to fire the unit.
     # Catches "trigger seemed to succeed but nothing happened"
-    # cases (broken plist, queue stalled, etc.).
+    # cases (invalid unit, queue stalled, etc.).
     trigger_timeout_sec: int = 15
     # Cascaded to jobs that don't set their own; see TomlJob.priority /
     # TomlJob.keep_awake. None / False keep today's per-job behavior

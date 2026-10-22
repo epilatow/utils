@@ -176,8 +176,8 @@ def _crashed(
     SIGKILL, macOS OS_REASON_CODESIGNING, a stop that reached it before
     its stop handling was in place, or a stopped run SIGKILLed for
     overrunning its grace) or exited before the runner wrote
-    `last-run.json`. A stop the runner does outlive -- launchd unloading
-    the unit, a manual stop -- it records like any other outcome. Two
+    `last-run.json`. A stop the runner does outlive is recorded like any
+    other outcome. Two
     independent signals:
 
     - run.pid naming a different pid than the last record wrote: the
@@ -901,8 +901,8 @@ def _units_changing(
 ) -> bool:
     """Whether applying `snapshot`'s live units would rewrite any on-disk
     unit -- a rendered slot missing from disk, or differing from what's
-    there. Drives the launchd self-apply defer: reloading terminates the
-    running job, so it must happen only when something actually changed.
+    there. A self-apply whose reload terminates its running job must
+    reload only when something actually changed.
 
     A live-path compare: `snapshot` is the pending node carrying the live
     executables an apply would bake in -- not the installed unit's
@@ -925,8 +925,8 @@ def _reload_kills_run(
     """Whether applying `snapshot` stops the run currently under its
     unit.
 
-    True on a scheduler whose reload is a stop-and-start of every unit
-    (launchd). True for a daemon on any scheduler, in either direction:
+    True when `reload_terminates_running_job`. True for a daemon on any
+    scheduler, in either direction:
     a daemon has no separate arming unit, so activating one restarts the
     service that is running the job rather than a timer beside it, and
     leaving the mode retires the daemon unit outright. `current` is the
@@ -1288,7 +1288,7 @@ def apply_one(
     DEFERRED means applying now would take a unit out from under a
     running job, in either of two ways: the entry's own running job is
     performing this apply on a scheduler whose reload terminates the
-    running unit (launchd) and the unit would change, or the entry is
+    running unit and the unit would change, or the entry is
     moving to a new name while a run is in flight, whose retiring of the
     old name's units stops them on every scheduler. Nothing is written
     (snapshot included), so disk stays consistent; the caller surfaces a
@@ -1301,13 +1301,8 @@ def apply_one(
     full namespaced name `<bundle>.<short>` is what lands on disk
     (the platform unit identifier).
 
-    Every entry installs a platform unit, even schedule-less ones:
-    a transit group's plist sits dormant until a parent dispatches
-    it (or `crony trigger` fires it explicitly). On linux, only the
-    .service file is installed for schedule-less entries; the
-    .timer (which would have nothing to trigger on) is omitted, and
-    apply cleans up a stale .timer if an entry transitions
-    scheduled -> unscheduled.
+    Every entry installs a platform unit, even schedule-less ones, which
+    remain dormant until explicitly dispatched.
 
     The entity's prior snapshot (with its pinned normalized units)
     comes from the loaded model (`current`): the entry's own state is
@@ -1364,12 +1359,13 @@ def apply_one(
 
     # A job whose own run is performing this apply cannot reload its own
     # unit on a scheduler where the reload terminates the running job
-    # (launchd): doing so would kill this very process. If the unit would
+    # (`reload_terminates_running_job`): that would kill this process.
+    # If the unit would
     # change, defer the whole apply -- write nothing (snapshot included)
     # so the old snapshot still matches the old unit, and a later apply
     # not running as this entry does the full update. If the unit would
     # not change, fall through and apply normally but skip the reload
-    # below (there is nothing to reload). Other schedulers (systemd)
+    # below (there is nothing to reload). Other schedulers
     # reload without stopping running units, so they apply normally.
     running_ref = crony.unit.EntityRef.from_str(
         os.environ.get(RUNNING_REF_ENV, "")
@@ -1461,14 +1457,9 @@ def apply_one(
             current_snapshot.state_dir_symlink_path,
         )
 
-    # Leaving the daemon mode retires the daemon unit first. Installing
-    # over it is not enough: the entry keeps the same `.service`
-    # filename, so nothing prunes it, and a backend that arms the new
-    # shape by starting a timer never touches the service the old daemon
-    # is still running under -- leaving the process up forever, holding
-    # the run lock the new schedule's fires need, and (on systemd) its
-    # boot symlink behind. The reverse direction needs nothing: entering
-    # the mode installs a unit that starts itself.
+    # Leaving daemon mode must retire its supervision and running instance
+    # before installing the new mode. The reverse direction needs nothing:
+    # entering the mode installs a unit that starts itself.
     #
     # Either direction ends whatever is running under the old unit, and
     # deliberately so: a mode change replaces the unit, and the two
@@ -1621,9 +1612,8 @@ _RUN_SETTLE_POLL_SEC = 0.05
 def _await_run_finished(state_dir: Path) -> None:
     """Block until no run holds `state_dir`'s lock, bounded.
 
-    The unit is retired before this, but stopping it is not synchronous
-    everywhere -- `launchctl bootout` returns before the process group
-    is gone -- and a runner ignores the stop signal so it can record its
+    The unit is retired before this, but its run may still be ending.
+    A runner survives the stop signal so it can record its
     outcome first. Without this the state dir could be removed while
     that write is still in flight, recreating it as a stray. Bounded so
     a wedged runner delays a destroy rather than hanging it."""
@@ -1644,8 +1634,7 @@ def destroy_one(
     Tolerant of partial state throughout so a partially-installed
     entity can still be cleaned up.
 
-    `name` is the full namespaced name used for platform unit paths
-    (`org.crony.<name>.plist`, `crony-<name>.{service,timer}`); pass
+    `name` is the full namespaced name used for platform units; pass
     `None` to skip platform unit cleanup (e.g. a ref-form destroy whose
     snapshot is unparseable). `alias_dir` is the entity's
     `state_dir_symlink_path` (resolved by the caller from the entity it

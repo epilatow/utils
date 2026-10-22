@@ -18,7 +18,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from crony import model, runtime
-from crony.config import JobFlags
 from crony.launch import (
     LauncherPath,
     parse_argv,
@@ -128,9 +127,7 @@ def test_rendered_unit_executes_shebang_with_runtime_path(
         cmd=target_argv(model._guarded_argv(ref, 120, False), path),
         timing=timing,
         priority=PriorityClass.NORMAL,
-        platform_properties=model._unit_platform_properties(
-            platform, JobFlags(0)
-        ),
+        platform_properties=model._unit_platform_properties(platform),
         jitter=model._jitter_spec(name, ref, timing, path),
     )
     sched = get_scheduler(platform, tmp_path / "units")

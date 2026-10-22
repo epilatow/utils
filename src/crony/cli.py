@@ -553,7 +553,7 @@ def _build_parser() -> StrictArgumentParser:
         dest="trigger_timeout",
         help=(
             "Override [defaults].trigger_timeout_sec (seconds to "
-            "wait for a runner to come online after kickstart). "
+            "wait for a runner to come online after dispatch). "
             "Only meaningful with --wait."
         ),
     )
@@ -705,7 +705,7 @@ def _build_parser() -> StrictArgumentParser:
         help="The `crony _run` command to run under the guard.",
     )
 
-    # _jitter -- internal launchd start-time jitter companion; baked into
+    # _jitter -- internal start-time jitter companion; baked into
     # a jittered interval job's jitter LaunchAgent by apply, never invoked
     # by hand. Hidden from `crony --help` for the same reason as `_run` (no
     # `help=`). Takes the service's `<bundle>:<uuid>` and its `<bundle>.

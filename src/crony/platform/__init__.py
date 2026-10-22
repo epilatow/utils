@@ -51,6 +51,11 @@ from crony.platform.systemd import (
     SystemdUnitPlatformProperties,
 )
 
+_SCHEDULERS: dict[str, type[Scheduler]] = {
+    "darwin": LaunchdScheduler,
+    "linux": SystemdScheduler,
+}
+
 __all__ = [
     "UNIT_PREFIX",
     "DarwinHost",
@@ -72,6 +77,7 @@ __all__ = [
     "get_scheduler",
     "launchd",
     "systemd",
+    "validate_schedule",
 ]
 
 
@@ -83,6 +89,12 @@ def current_platform() -> str:
     if s.startswith("linux"):
         return "linux"
     raise CronyError(f"unsupported platform: {s}")
+
+
+def validate_schedule(source: str) -> None:
+    """Require a schedule to be renderable by every supported scheduler."""
+    for backend in _SCHEDULERS.values():
+        backend.validate_schedule(source)
 
 
 def current_host() -> str:
@@ -97,11 +109,11 @@ def get_scheduler(platform: str, unit_dir: Path | None = None) -> Scheduler:
     backend's own default (its standard per-OS location under the user's
     home). Callers pass an explicit dir to redirect it -- which the
     tests do, so they never touch the real unit directory."""
-    if platform == "darwin":
-        return LaunchdScheduler(unit_dir)
-    if platform == "linux":
-        return SystemdScheduler(unit_dir)
-    raise ValueError(f"unsupported platform: {platform!r}")
+    try:
+        backend = _SCHEDULERS[platform]
+    except KeyError:
+        raise ValueError(f"unsupported platform: {platform!r}") from None
+    return backend(unit_dir)
 
 
 def get_host(platform: str) -> HostPlatform:

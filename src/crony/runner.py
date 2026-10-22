@@ -992,9 +992,8 @@ def _record_outcome(
         )
         premature_exits = len(retry_history.runs)
         if premature_exits > crony.config.DAEMON_RETRY_LIMIT:
-            # Scheduler-facing success is the portable "stop automatically
-            # restarting" signal for launchd SuccessfulExit=false and systemd
-            # Restart=on-failure. Preserve the command's actual exit_code, but
+            # Scheduler-facing success asks supervision to leave it down.
+            # Preserve the command's actual exit_code, but
             # a cleanly exiting continuous service is still unhealthy once
             # crony gives up on keeping it alive.
             surfaced_rc = 0
@@ -1610,7 +1609,7 @@ def trigger_unit(
         succeeded = True
     finally:
         if triggered_by_user and state_dir is not None and not succeeded:
-            # Don't strand the bypass flag on disk if the kickstart
+            # Don't strand the bypass flag on disk if dispatch
             # never reached the scheduler. The next legitimately
             # scheduled fire would otherwise consume it and skip
             # its wait silently.
@@ -1687,7 +1686,7 @@ def trigger_unit_sync(
 
     - `TriggerStartTimeout`: the start allowance elapsed with no runner
       ever seen and no fresh last-run.json. The "platform never started
-      anything" detector (broken plist, stalled queue, unloaded unit).
+      anything" detector (invalid unit, stalled queue, unloaded unit).
       Raised whether it was the platform's own `trigger_timeout` that
       elapsed or a shorter `wait_budget`: either way no runner was ever
       seen, and that -- not the clock that stopped us -- is what says the
@@ -1919,8 +1918,7 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
 # The grace the guard waits after signalling a session before it SIGKILLs
 # whatever survives -- the SIGTERM of a timeout kill, the SIGTERM that
 # sweeps what a finished run left behind, or the stop signal relayed on a
-# scheduler stop of a running unit (a system shutdown, a manual stop, or
-# crony's own `launchctl bootout` from apply-reload / disable / destroy).
+# scheduler stop of a running unit.
 # The guard has to do this SIGKILL itself: the run lives in the
 # guard's own session (start_new_session), which the scheduler does not
 # track -- it tracks the guard -- so nothing else reaps a session whose
@@ -1930,10 +1928,7 @@ def trigger_exit_code(rec: dict[str, Any]) -> int:
 # timeout kill (`_TIMEOUT_HINT_SETTLE_SEC`), MUST stay below every
 # scheduler's stop-to-kill timeout. Past that the scheduler stops waiting
 # and treats the unit as gone while the guard is still tearing the run
-# down: launchd drops the label, so a reload starts the replacement
-# against a run that still holds its lock. The launchd backend pins its
-# units' stop timeout above this; systemd's default TimeoutStopSec (90s)
-# is looser still.
+# down. Scheduler.stop_timeout_sec declares that deadline for each backend.
 _KILL_GRACE_SEC = 5
 # Pause after the SIGUSR1 timeout hint so the runner records it before the
 # SIGTERM that follows lands. Standard signals carry no delivery-ordering
@@ -2446,7 +2441,7 @@ def _record_precondition_cancel(
 def do_jitter(ref: str, name: str) -> None:
     """Platform start-time jitter offset companion. On platforms that
     don't have a native jitter offset implementation for interval-based
-    services (e.g. launchd), this subcommand can be invoked once via an
+    services, this subcommand can be invoked once via an
     additional service unit to implement a jitter offset for the primary
     service by triggering it before its scheduled interval time. Not
     user-facing.
@@ -2463,8 +2458,7 @@ def do_jitter(ref: str, name: str) -> None:
       service through the scheduler and appends a line to the service's
       run.log recording whether the trigger succeeded (so a failing
       trigger is visible in the log), then releases. On success it unloads
-      itself -- its last act, since on launchd the unload boots out its
-      own label, which is synchronous and kills this process; on a failed
+      itself -- its last act, since unloading may terminate it; on a failed
       trigger it re-raises (so the failure surfaces a non-zero exit the
       scheduler records) and stays loaded to retry at the next offset.
     """

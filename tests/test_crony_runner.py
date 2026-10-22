@@ -5375,6 +5375,15 @@ class TestRunDaemon:
             assert crony_runner._run_job(snap) == 0
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_guard_finishes_within_scheduler_stop_timeout(platform: str) -> None:
+    scheduler = crony_platform.get_scheduler(platform)
+    assert (
+        crony_runner._KILL_GRACE_SEC + crony_runner._TIMEOUT_HINT_SETTLE_SEC
+        < scheduler.stop_timeout_sec
+    )
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

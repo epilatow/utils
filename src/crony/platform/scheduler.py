@@ -88,7 +88,7 @@ class UnitLastExit:
     signal -- the `launchctl list` convention, which the systemd backend
     normalizes to. A unit with a launch in flight, or one the scheduler
     has no readable status for, is omitted from `unit_last_exits`
-    entirely (its in-flight state is the lock's job, not this).
+    entirely.
     """
 
     exit_status: int
@@ -105,21 +105,23 @@ class Scheduler(abc.ABC):
     """Render and manage the platform units for crony entities."""
 
     # Whether picking up a changed unit file forces a reload that
-    # terminates an in-flight run of that same unit, for EVERY entry
-    # this backend manages. True for launchd (the reload is unload+load,
-    # which kills the running job's process group); False for systemd,
-    # whose `daemon-reload` plus timer re-arm leaves the running
-    # `.service` untouched. A caller may widen it per entry -- a
-    # self-starting unit has no separate arming unit, so activating it
-    # restarts the thing that is running whatever this says. Each
-    # backend sets it explicitly.
+    # terminates an in-flight run of that same unit for every entry.
+    # A caller may widen this for units with additional requirements.
     reload_terminates_running_job: bool
+    # Seconds allowed for a unit to exit after a stop before forced killing.
+    stop_timeout_sec: int
+
+    @staticmethod  # noqa: B027 - default capability accepts the full syntax
+    def validate_schedule(_source: str) -> None:
+        """Validate a schedule against this backend's rendering limits.
+
+        Backends accepting the full schedule syntax need no additional check.
+        """
 
     def __init__(self, unit_dir: Path | None = None) -> None:
         # Directory the host's units live in. Defaults to the backend's
-        # `default_unit_dir()` (its standard per-OS location); a caller
-        # may pass an explicit dir to redirect it -- which the tests do,
-        # so they never touch the real unit directory.
+        # `default_unit_dir()`; a caller may redirect it with an explicit dir.
+        # Tests redirect it so they never write to the real unit directory.
         self.unit_dir = (
             unit_dir if unit_dir is not None else self.default_unit_dir()
         )
@@ -135,7 +137,7 @@ class Scheduler(abc.ABC):
         """`spec`'s platform units, in slot order (the config / service
         unit first, the companion next where the backend has one) -- only
         the slots this spec actually produces, each carrying a real render
-        (a systemd `.timer` is included only for a scheduled entry). Each
+        (a scheduling companion is included only when needed). Each
         `content` is the render of `spec` for that unit, with whatever
         opaque target argv `spec.cmd` carries. To relate a render to what is
         on disk, align by `filename` against `ondisk_units`.
@@ -236,9 +238,9 @@ class Scheduler(abc.ABC):
         """The unit identifier shown in status' UNIT NAME column -- the
         scheduler's own naming for `name`, independent of whether a file
         is on disk. `scheduled` selects the schedule-bearing unit where
-        a backend installs more than one (systemd `.timer` vs
-        `.service`); None means the caller couldn't determine it, so a
-        backend that needs it to choose returns "" while one whose name
+        a backend installs more than one. None means the caller couldn't
+        determine it, so a backend that needs it to choose returns "" while
+        one whose name
         is schedule-independent ignores it."""
 
     @abc.abstractmethod
@@ -255,25 +257,16 @@ class Scheduler(abc.ABC):
     @abc.abstractmethod
     def is_loaded(self, name: str) -> bool:
         """Whether the scheduler has a unit by `name` loaded / registered
-        (so it can be triggered). The operator-disabled state is not a
-        scheduler fact -- a disabled entry installs an ordinary
-        loaded-but-schedule-less unit, so it still reads loaded; the
-        disabled overlay rides on the entry's snapshot
-        (`Job.unit_disabled`)."""
+        (so it can be triggered), independently of whether it has a schedule
+        or supervision armed."""
 
     @abc.abstractmethod
     def schedule_armed(self, name: str) -> bool:
         """Whether the scheduler has a live firing scheduled for `name`.
 
-        `is_loaded` says the unit is registered; this says the registered
-        schedule will actually fire. An entry with a separate arming unit
-        (a systemd `.timer`) is armed only when that unit confirms a live
-        next firing -- such a timer can be loaded and enabled yet have no
-        valid anchor, reporting a next elapse of infinity so it never
-        fires. An entry whose schedule rides on the loaded config unit
-        (launchd, or a grouped / disabled entry with no timer) has no such
-        state and is armed whenever loaded. Each backend hides that
-        distinction and returns a plain armed / not-armed answer.
+        `is_loaded` says the unit is registered; this says its schedule
+        will actually fire. A separate arming unit must confirm a live next
+        firing. An entry without one is armed whenever loaded.
         """
 
     @abc.abstractmethod
@@ -282,11 +275,7 @@ class Scheduler(abc.ABC):
         outcome (`UnitLastExit`), in one bulk query.
 
         Keyed by the full `<bundle>.<short>` name. A unit the scheduler
-        has no record for is simply absent from the map. Status reads
-        this to tell a launch that ended without recording a result
-        (killed, or exited before the runner wrote `last-run.json`)
-        from a clean run, so a stale `last-run.json` isn't reported as
-        the live outcome."""
+        has no completed launch for is simply absent from the map."""
 
     @abc.abstractmethod
     def activate(self, spec: UnitSpec, /) -> None:
@@ -295,11 +284,9 @@ class Scheduler(abc.ABC):
 
         The whole spec, so a backend reads whichever distinctions its own
         scheduler draws rather than being handed one pre-collapsed
-        answer. `timing` None is a schedule-less entry -- a grouped /
-        transit unit, or one the operator disabled -- which registers
-        (loaded, triggerable) but arms nothing; combined with a `daemon`
-        spec it is a disabled daemon, which must additionally be stopped
-        and kept from starting at boot."""
+        answer. `timing` None registers the unit without arming a schedule
+        or supervision; a daemon with no timing is also stopped and kept
+        from starting at boot."""
 
     @abc.abstractmethod
     def deactivate(self, name: str) -> None:
@@ -311,8 +298,7 @@ class Scheduler(abc.ABC):
     # forgotten @abstractmethod -- most backends render no companion.
     def deactivate_jitter(self, _name: str) -> None:  # noqa: B027
         """Unload only the entity's jitter companion, leaving the service
-        loaded -- the runner's self-unload of a fired companion. Defaults
-        to a no-op: a backend that renders no jitter companion (its
+        loaded. Defaults to a no-op: a backend that renders no companion (its
         jitter, if any, is native) has nothing to unload. A backend that
         phases via a separate unit overrides this to unload that unit,
         tolerant of an already-absent companion."""
@@ -336,10 +322,8 @@ class Scheduler(abc.ABC):
         """Fire `name` immediately (no-op if a run is already in flight).
 
         Raises `crony.errors.SubprocessError` when the scheduler rejects
-        the fire, so a failed fire surfaces a proper crony exit code (the
-        jitter companion and `crony trigger` both propagate it). A backend
-        routes its fire through `_run_checked`, which converts a command
-        failure to that type."""
+        the fire. A backend routes it through `_run_checked`, which converts
+        a command failure to that type."""
 
     @staticmethod
     def _run_checked(argv: list[str]) -> None:

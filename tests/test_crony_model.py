@@ -583,7 +583,7 @@ class TestFileMaterialization:
         pending = self._snap(fda=fda)
         properties = pending.unit_spec().platform_properties
         assert isinstance(properties, LaunchdUnitPlatformProperties)
-        assert properties.MaterializeDatalessFiles is fda
+        assert pending.unit_spec().full_disk_access is fda
         data = plistlib.loads(pending.rendered_units.units[0].content.encode())
         if fda:
             assert data["MaterializeDatalessFiles"] is True
@@ -654,7 +654,7 @@ class TestFileMaterialization:
             node = node.with_unit_disabled(False, "darwin")
             properties = node.unit_spec().platform_properties
             assert isinstance(properties, LaunchdUnitPlatformProperties)
-            assert properties.MaterializeDatalessFiles is enabled
+            assert node.unit_spec().full_disk_access is enabled
 
     def test_linux_render_is_unchanged(self) -> None:
         assert isinstance(
@@ -692,9 +692,8 @@ class TestFileMaterialization:
             pending.platform_properties, SystemdUnitPlatformProperties
         )
         darwin = pending.with_unit_disabled(False, "darwin")
-        assert darwin.platform_properties == LaunchdUnitPlatformProperties(
-            MaterializeDatalessFiles=True
-        )
+        assert darwin.platform_properties == LaunchdUnitPlatformProperties()
+        assert darwin.unit_spec().full_disk_access
 
     def test_unsupported_platform_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="unsupported platform"):

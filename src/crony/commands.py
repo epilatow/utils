@@ -783,7 +783,7 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
         errored_in_args = sorted(n for n in normalized if n in errored)
         if errored_in_args:
             # An errored entry has no parsed TomlBundleConfig fields, so we
-            # can't render its plist / unit. Bail before any
+            # can't render its unit. Bail before any
             # partial apply happens.
             raise crony.errors.UsageError(
                 f"config error -- fix and re-run apply: {errored_in_args}"
@@ -1183,7 +1183,7 @@ def do_trigger(
     the platform unit's entry point and not user-facing. Works
     on every stamped entry, including transit groups and group-
     only jobs (every entry installs a platform unit; schedule-
-    less entries' units just sit dormant until kickstarted).
+    less entries' units just sit dormant until explicitly started).
 
     Default mode is async (the scheduler fires and returns): the
     trigger returns as soon as the platform has accepted it. With

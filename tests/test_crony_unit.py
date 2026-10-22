@@ -15,8 +15,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from crony.platform.launchd import LaunchdUnitPlatformProperties
-from crony.platform.systemd import SystemdUnitPlatformProperties
+from crony.platform.launchd import (
+    LaunchdUnitPlatformProperties,
+    calendar_for_schedule,
+)
+from crony.platform.systemd import (
+    SystemdScheduler,
+    SystemdUnitPlatformProperties,
+)
 from crony.unit import (
     DAEMON_SPEC,
     ON_DEMAND_SPEC,
@@ -158,6 +164,16 @@ class TestInterval:
 
 
 class TestSchedule:
+    def test_validation_respects_every_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def reject(_source: str) -> None:
+            raise ValueError("backend cannot render this schedule")
+
+        monkeypatch.setattr(SystemdScheduler, "validate_schedule", reject)
+        with pytest.raises(ValueError, match="backend cannot render"):
+            Schedule.from_str("daily")
+
     @pytest.mark.parametrize(
         ("spec", "calendar"),
         [
@@ -174,10 +190,10 @@ class TestSchedule:
             ),
         ],
     )
-    def test_to_plist_calendar(
+    def test_calendar_projection(
         self, spec: str, calendar: dict[str, int]
     ) -> None:
-        assert Schedule.from_str(spec).to_plist_calendar() == calendar
+        assert calendar_for_schedule(str(Schedule.from_str(spec))) == calendar
 
     @pytest.mark.parametrize(
         "spec",
@@ -191,7 +207,7 @@ class TestSchedule:
         sched = Schedule.from_str("2030-01-02 05:06:07")
         assert str(sched) == "2030-01-02 05:06:07"
         # launchd has no Year or Second field.
-        assert sched.to_plist_calendar() == {
+        assert calendar_for_schedule(str(sched)) == {
             "Minute": 6,
             "Hour": 5,
             "Day": 2,

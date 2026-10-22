@@ -2,8 +2,8 @@
 
 """Typed value objects describing a scheduled unit.
 
-bin/crony owns the domain model (Job, JobGroup, Config) and the command
-handlers; this module holds the common building blocks the
+crony.model owns the domain model (Job, JobGroup, Config), and crony.commands
+owns the command handlers; this module holds the common building blocks the
 launchd / systemd scheduler modules render from. The two identity forms
 (EntityRef, EntityName), the schedule and interval, the priority class,
 and the UnitSpec that bundles them all carry validation and round-trip
@@ -11,11 +11,9 @@ and the UnitSpec that bundles them all carry validation and round-trip
 instead of bare strings.
 
 Schedule and Interval validate eagerly but keep the spec as written:
-``str(value)`` round-trips the user's input exactly (what systemd
-consumes and what status displays), while the launchd-specific
-projections (``Schedule.to_plist_calendar`` / ``Interval.total_seconds``)
-are parsed on demand. So "daily" stays "daily" rather than canonicalizing
-to a different-but-equivalent form.
+``str(value)`` round-trips the user's input exactly, while an interval
+also exposes its duration in seconds. So "daily" stays "daily" rather than
+canonicalizing to a different-but-equivalent form.
 
 Every entity -- job or group -- maps to exactly one scheduled unit; the
 group -> children fan-out happens at run time, so the platform layer
@@ -26,7 +24,7 @@ import abc
 import enum
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TypeIs
 
 # Bundle names come from filenames and are the namespace prefix, so the
@@ -146,7 +144,7 @@ class PriorityClass(enum.Enum):
     """A unit's scheduling priority.
 
     A neutral classification each scheduler maps to its own knobs
-    (launchd plist ProcessType / Nice, systemd Nice + IO class).
+    (CPU and IO scheduling).
     """
 
     HIGH = "high"
@@ -212,11 +210,10 @@ _INTERVAL_UNIT_SECONDS: dict[str, int] = {
 
 @dataclass(frozen=True)
 class Interval:
-    """A systemd time-span (e.g. "30min", "1h30m"), kept as written.
+    """A time-span (e.g. "30min", "1h30m"), kept as written.
 
-    ``from_str`` validates the spec and computes ``total_seconds`` (for
-    launchd's StartInterval); ``str(interval)`` returns the original
-    spec, which systemd consumes for OnUnitActiveSec.
+    ``from_str`` validates the spec and computes ``total_seconds``;
+    ``str(interval)`` returns the original spec.
     """
 
     source: str
@@ -232,7 +229,7 @@ class Interval:
 
 
 def _interval_seconds(text: str) -> int:
-    """Parse a systemd time-span into a positive number of seconds.
+    """Parse a time-span into a positive number of seconds.
 
     Raises ValueError on empty, unparseable, or non-positive input.
     """
@@ -263,58 +260,21 @@ def _interval_seconds(text: str) -> int:
     return total
 
 
-# Keyword OnCalendar specs expand directly to a launchd
-# StartCalendarInterval. (systemd consumes the keyword spec itself.)
-_ONCALENDAR_KEYWORD_CALENDAR: dict[str, dict[str, int]] = {
-    "hourly": {"Minute": 0},
-    "daily": {"Minute": 0, "Hour": 0},
-    "weekly": {"Minute": 0, "Hour": 0, "Weekday": 1},
-    "monthly": {"Minute": 0, "Hour": 0, "Day": 1},
-    "yearly": {"Minute": 0, "Hour": 0, "Day": 1, "Month": 1},
-    "annually": {"Minute": 0, "Hour": 0, "Day": 1, "Month": 1},
-}
-
-# Day-of-week name -> launchd Weekday integer (Sunday = 0).
-_DOW_TO_INT: dict[str, int] = {
-    "sun": 0,
-    "mon": 1,
-    "tue": 2,
-    "wed": 3,
-    "thu": 4,
-    "fri": 5,
-    "sat": 6,
-}
-
-_SCHEDULE_TIME_RE = re.compile(r"^(\*|\d{1,2}):(\d{2})(?::(\d{2}))?$")
-_SCHEDULE_DATE_RE = re.compile(r"^(\*|\d{4})-(\*|\d{1,2})-(\*|\d{1,2})$")
-
-
 @dataclass(frozen=True)
 class Schedule:
     """An OnCalendar schedule, kept as written but validated eagerly.
 
-    ``from_str`` accepts the keywords (hourly..yearly), a bare
-    ``[H|*]:MM[:SS]``, and ``[DOW ][YYYY|*]-[M|*]-[D|*] [H|*]:MM[:SS]``,
-    and rejects step / range / list forms (``/`` ``..`` ``,``) on every
-    platform because launchd cannot express them. ``str(schedule)``
-    returns the spec as written (what systemd consumes for OnCalendar
-    and what status shows); ``to_plist_calendar`` returns the launchd
-    StartCalendarInterval, parsed and validated once at construction.
-    launchd has no Year or Second field, so those components (valid on
-    systemd) are dropped for launchd.
+    ``from_str`` preserves the user's source and validates it against
+    the supported backends' rendering capabilities, so a configuration
+    remains portable.
     """
 
     source: str
-    # The launchd projection, parsed once in __post_init__. Excluded
-    # from eq/hash/repr (it is a pure function of `source`).
-    _calendar: dict[str, int] = field(
-        init=False, compare=False, repr=False, default_factory=dict
-    )
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "_calendar", _oncalendar_to_calendar(self.source)
-        )
+        from crony.platform import validate_schedule
+
+        validate_schedule(self.source)
 
     @classmethod
     def from_str(cls, spec: str) -> Schedule:
@@ -327,9 +287,6 @@ class Schedule:
 
     def __str__(self) -> str:
         return self.source
-
-    def to_plist_calendar(self) -> dict[str, int]:
-        return dict(self._calendar)
 
 
 # The canonical display token for the trigger-only firing mode (see
@@ -385,69 +342,6 @@ class Daemon:
         return DAEMON_SPEC
 
 
-def _check_range(name: str, value: int, low: int, high: int) -> None:
-    if not low <= value <= high:
-        raise ValueError(f"{name} {value} out of range {low}-{high}")
-
-
-def _oncalendar_to_calendar(text: str) -> dict[str, int]:
-    """Parse a supported OnCalendar spec into a launchd
-    StartCalendarInterval, validating ranges and rejecting the
-    step / range / list forms launchd cannot express.
-
-    Seconds are parsed and range-checked, and the year is parsed, but
-    both are omitted from the result -- launchd has no field for them.
-    """
-    if text in _ONCALENDAR_KEYWORD_CALENDAR:
-        return dict(_ONCALENDAR_KEYWORD_CALENDAR[text])
-    if "/" in text or ".." in text or "," in text:
-        raise ValueError(
-            f"OnCalendar pattern {text!r} uses step / range / list "
-            "features crony does not render to launchd; use a single "
-            "concrete time or weekday/day entry"
-        )
-    parts = text.split()
-    cal: dict[str, int] = {}
-    if parts and parts[0].lower() in _DOW_TO_INT:
-        cal["Weekday"] = _DOW_TO_INT[parts[0].lower()]
-        parts = parts[1:]
-    if len(parts) == 2:
-        date_m = _SCHEDULE_DATE_RE.fullmatch(parts[0])
-        if not date_m:
-            raise _unsupported_schedule(text)
-        if date_m.group(2) != "*":
-            month = int(date_m.group(2))
-            _check_range("month", month, 1, 12)
-            cal["Month"] = month
-        if date_m.group(3) != "*":
-            day = int(date_m.group(3))
-            _check_range("day", day, 1, 31)
-            cal["Day"] = day
-        parts = parts[1:]
-    if len(parts) != 1:
-        raise _unsupported_schedule(text)
-    time_m = _SCHEDULE_TIME_RE.fullmatch(parts[0])
-    if not time_m:
-        raise _unsupported_schedule(text)
-    minute = int(time_m.group(2))
-    _check_range("minute", minute, 0, 59)
-    cal["Minute"] = minute
-    if time_m.group(1) != "*":
-        hour = int(time_m.group(1))
-        _check_range("hour", hour, 0, 23)
-        cal["Hour"] = hour
-    if time_m.group(3) is not None:
-        _check_range("second", int(time_m.group(3)), 0, 59)
-    return cal
-
-
-def _unsupported_schedule(text: str) -> ValueError:
-    return ValueError(
-        f"crony does not render OnCalendar pattern {text!r}; try a "
-        "simpler form like '03:15', '*-*-* 03:15', or 'Mon *-*-* 09:00'"
-    )
-
-
 # How an entry fires: a calendar Schedule, a repeat Interval, OnDemand
 # (trigger-only), or Daemon (continuously). The four are mutually
 # exclusive, so a single value (or None, for an entry that declares no
@@ -486,12 +380,11 @@ class JitterSpec:
 
     offset      The fixed per-job first-fire offset as an Interval, in
                 `[1, N)` for an interval of `N`. A backend delays the first
-                fire by it (systemd `OnActiveSec`, launchd a companion that
-                fires at it and triggers the service).
+                fire by it.
     cmd         The argv a phasing companion runs -- an opaque crony
                 invocation the model bakes, exactly like `UnitSpec.cmd`.
                 Consumed by backends that implement jitter via a separate
-                unit (e.g. launchd).
+                unit.
     """
 
     offset: Interval
@@ -508,12 +401,7 @@ class DaemonSpec:
     once the entry is disabled, since a disabled entry renders with no
     timing at all.
 
-    restart_seconds  The minimum spacing between restarts. Each
-                     supervisor applies it its own way -- systemd waits
-                     this long after the command exits, launchd floors
-                     the interval between launches -- so it bounds how
-                     fast a failing command can be retried rather than
-                     naming an exact delay.
+    restart_seconds  The minimum restart spacing requested of the scheduler.
     """
 
     restart_seconds: int
@@ -552,6 +440,8 @@ class UnitSpec:
                 identifies a disabled daemon -- whose timing is None,
                 and which must therefore be rendered and torn down as a
                 daemon rather than as an ordinary dormant entry.
+    full_disk_access
+                The command requires access to protected local files.
     platform_properties
                 Native settings owned by the selected platform's concrete
                 UnitPlatformProperties type.
@@ -564,3 +454,4 @@ class UnitSpec:
     platform_properties: UnitPlatformProperties
     jitter: JitterSpec | None = None
     daemon: DaemonSpec | None = None
+    full_disk_access: bool = False

@@ -172,7 +172,7 @@ budget. Requires a target: job(s) or --all.
   stopped, so there is no completion to wait for.
 - **`--trigger-timeout TRIGGER_TIMEOUT`**\
   Override [defaults].trigger_timeout_sec (seconds to wait for a runner to
-  come online after kickstart). Only meaningful with --wait.
+  come online after dispatch). Only meaningful with --wait.
 
 ### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 

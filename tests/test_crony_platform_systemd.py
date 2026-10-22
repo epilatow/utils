@@ -73,6 +73,15 @@ _DIR = Path("/unused")
 
 
 class TestSystemdRendering:
+    @pytest.mark.parametrize("daemon", [None, DaemonSpec(restart_seconds=7)])
+    @pytest.mark.parametrize("armed", [False, True])
+    def test_stop_deadline_is_pinned(
+        self, daemon: DaemonSpec | None, armed: bool
+    ) -> None:
+        scheduler = get_scheduler("linux", _DIR)
+        service = systemd._render_service("j", _CMD, daemon=daemon, armed=armed)
+        assert f"TimeoutStopSec={scheduler.stop_timeout_sec}\n" in service
+
     def test_service_unit(self) -> None:
         svc = systemd._render_service("brew", _CMD)
         assert "[Unit]" in svc

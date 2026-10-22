@@ -230,9 +230,8 @@ class TestLaunchdFileMaterialization:
             timing=timing,
             priority=PriorityClass.NORMAL,
             daemon=daemon,
-            platform_properties=LaunchdUnitPlatformProperties(
-                MaterializeDatalessFiles=enabled
-            ),
+            platform_properties=LaunchdUnitPlatformProperties(),
+            full_disk_access=enabled,
         )
         units = get_scheduler("darwin", _DIR).render_units(spec)
         data = plistlib.loads(units.units[0].content.encode())

@@ -4,9 +4,9 @@
 
 Each entity is a `.service` unit; scheduled entries also get a `.timer`
 that arms it. Schedule-less entries install only the static `.service`,
-which sits dormant until `crony trigger` or a parent group fires it. A
+which sits dormant until explicitly started. A
 daemon's `.service` needs no timer either, but starts itself and carries
-`Restart=` so the supervisor can bring it back when the runner asks.
+`Restart=` so the supervisor can bring it back after a non-zero exit.
 """
 
 import configparser
@@ -43,6 +43,9 @@ class SystemdUnitPlatformProperties(UnitPlatformProperties):
     def platform(self) -> str:
         return "linux"
 
+
+# Pin TimeoutStopSec so cleanup deadlines do not depend on host defaults.
+_STOP_TIMEOUT_SEC = 90
 
 # --quiet drops the success-path symlink chatter. Enable (create the
 # boot symlink) and restart (activate now) are separate calls: `enable
@@ -120,25 +123,16 @@ def _render_service(
     A timed entry's service is a `oneshot` the `.timer` starts, so it is
     independent of the schedule. A `daemon` runs long enough to be a
     `simple` service (`oneshot` cannot carry `Restart=`) that restarts
-    when the runner requests it and is wanted at login. `armed` False is an
-    operator-disabled daemon: same shape, minus the `[Install]` section,
+    after a non-zero exit and is wanted at login. `armed` False renders
+    the same shape, minus supervision and the `[Install]` section,
     so the unit is `static` -- it cannot start at boot, and `is-enabled`
     still reports it loaded rather than reading as drift.
     """
     exec_start = _exec_start(cmd)
     if daemon is not None:
-        # `on-failure`, not `always`, so the runner's exit code decides:
-        # non-zero means the command exited and should be restarted, zero
-        # means its gate declined to run it or its cross-platform retry
-        # budget is exhausted, and it should stay down until an explicit
-        # rearm or the next boot. StartLimitIntervalSec=0 disables the
-        # separate native rate limiter: the runner owns the retry count,
-        # keeping systemd and launchd behavior identical.
-        # Disabled drops the supervision as well as the boot wiring:
-        # leaving `Restart=` in place would put the daemon back under
-        # permanent supervision the moment anything started it (a
-        # `crony trigger`, a stray `systemctl start`), which is not what
-        # "disabled" promises.
+        # on-failure respawns non-zero exits and leaves zero exits down.
+        # StartLimitIntervalSec=0 leaves restart-count policy to the unit's
+        # command. An unarmed spec omits supervision and boot wiring.
         supervise = (
             f"Restart=on-failure\nRestartSec={daemon.restart_seconds}\n"
             if armed
@@ -154,6 +148,7 @@ def _render_service(
             "Type=simple\n"
             f"ExecStart={exec_start}\n"
             "WorkingDirectory=%h\n"
+            f"TimeoutStopSec={_STOP_TIMEOUT_SEC}\n"
             f"{supervise}"
             f"{_priority_block(priority)}"
             f"{install}"
@@ -166,6 +161,7 @@ def _render_service(
         "Type=oneshot\n"
         f"ExecStart={exec_start}\n"
         "WorkingDirectory=%h\n"
+        f"TimeoutStopSec={_STOP_TIMEOUT_SEC}\n"
         f"{_priority_block(priority)}"
     )
 
@@ -376,11 +372,12 @@ class SystemdScheduler(Scheduler):
     # For a scheduled entry a reload is `daemon-reload` plus enabling and
     # restarting the `.timer`, which re-arms the schedule without
     # touching the `.service` -- so a job can rewrite its own unit while
-    # in flight without killing its runner. A daemon has no timer and is
+    # in flight without terminating its command. A daemon has no timer and is
     # restarted directly, so a self-applying daemon does take itself
     # down; that is inherent to updating the unit a process is running
     # under, and the same is true of every entry on launchd.
     reload_terminates_running_job = False
+    stop_timeout_sec = _STOP_TIMEOUT_SEC
 
     @staticmethod
     def default_unit_dir() -> Path:
@@ -406,8 +403,7 @@ class SystemdScheduler(Scheduler):
                     spec.cmd,
                     spec.priority,
                     spec.daemon,
-                    # A daemon renders schedule-less only when the
-                    # operator disabled it, which is what un-arms it.
+                    # No timing means no supervision or boot wiring.
                     armed=spec.timing is not None,
                 ),
             )
@@ -450,8 +446,8 @@ class SystemdScheduler(Scheduler):
         return self.unit_dir / _service_filename(name)
 
     def unit_name(self, name: str, scheduled: bool | None, /) -> str:
-        # A scheduled entry is driven by its `.timer`; a grouped /
-        # transit entry installs only the `.service`. None means the
+        # A scheduled entry is driven by its `.timer`; a schedule-less
+        # entry installs only the `.service`. None means the
         # caller can't decide which, so there is no name to report.
         if scheduled is None:
             return ""
@@ -471,13 +467,9 @@ class SystemdScheduler(Scheduler):
 
     def is_loaded(self, name: str) -> bool:
         # A scheduled entry arms an enabled `.timer`; a schedule-less one
-        # (grouped / transit or disabled) installs no timer, only a
-        # static `.service`. Query the timer when it is installed, else
-        # fall back to the service (systemd reports a unit with no
-        # [Install] section `static`), so a grouped / disabled entry
-        # still reads loaded. Anything else means the scheduler has no
-        # unit. The operator-disabled state is not read here -- it is
-        # flagged off the snapshot, not the scheduler.
+        # installs only a static `.service`. Query the timer when installed,
+        # else fall back to the service (systemd reports a unit with no
+        # [Install] section `static`). Other states mean no loaded unit.
         timer = self.unit_dir / _timer_filename(name)
         unit = (
             _timer_filename(name) if timer.exists() else _service_filename(name)
@@ -491,9 +483,7 @@ class SystemdScheduler(Scheduler):
         # monotonic anchor never elapses reports NextElapseUSecMonotonic=
         # infinity (and no realtime elapse) and will never fire -- loaded
         # but dead. An inactive / unqueryable timer is not confirmed
-        # armed. A grouped / disabled entry installs no timer -- its
-        # schedule rides on the loaded `.service`, so it is armed whenever
-        # the scheduler has it loaded.
+        # armed. A service without a timer is armed whenever loaded.
         timer = self.unit_dir / _timer_filename(name)
         if not timer.is_file():
             return self.is_loaded(name)
@@ -541,11 +531,10 @@ class SystemdScheduler(Scheduler):
         if spec.daemon is not None:
             service = _service_filename(name)
             if spec.timing is None:
-                # Operator-disabled: stop it now and drop the boot
+                # No timing: stop it now and drop the boot
                 # symlink. Rewriting the unit file does neither -- the
                 # running instance keeps going and the existing
-                # `default.target.wants` link survives -- so a disabled
-                # daemon would otherwise stay up and return at boot.
+                # `default.target.wants` link survives.
                 _disable_unit(service)
                 return
             # Enable for boot, then restart so an apply always leaves the
@@ -555,7 +544,7 @@ class SystemdScheduler(Scheduler):
             self._run_checked(_SYSTEMCTL_RESTART + [service])
             return
         # Only a scheduled entry has a `.timer`; a schedule-less `.service`
-        # (grouped or disabled) sits dormant. Enable creates the boot
+        # sits dormant. Enable creates the boot
         # symlink; restart re-activates the timer so its monotonic anchor
         # (OnActiveSec) is re-seeded even when the timer was already
         # running -- a plain `enable --now` would no-op the start on an

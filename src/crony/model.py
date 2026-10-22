@@ -81,20 +81,13 @@ RUN_SUBCOMMAND = "_run"
 # re-renders them. Remove once no `run`-baked units remain on any host.
 RUN_SUBCOMMAND_LEGACY = "run"
 
-# Hidden crony subcommand every unit's run is wrapped in. It launches the
-# inner `crony _run` in its own session and owns that session's killing:
-# when the scheduler stops the unit it relays the stop and then SIGKILLs
-# whatever is left, when the run ends on its own it clears out what the
-# run left behind, and for an entry with a wallclock timeout it kills the
-# run on overrun (a SIGUSR1 hint to the runner, then a SIGTERM -> grace ->
-# SIGKILL escalation), arming the cap when the runner signals the command
-# has started. A leading `--interactive` in the wrapped argv tells it not to
-# clock the pre-command wait, which for an interactive job is unbounded.
+# Hidden subcommand that enforces run timeouts, relays scheduler stops,
+# and cleans up a finished run's remaining descendants.
 GUARD_SUBCOMMAND = "_run-guard"
 
 # Hidden crony subcommand the platform unit layer can use to implement jitter
 # for an interval service's first fire, if the system job scheduler doesn't
-# support jitter directly (e.g. launchd).
+# support jitter directly.
 JITTER_SUBCOMMAND = "_jitter"
 
 
@@ -233,16 +226,12 @@ def _guarded_argv(
 
 
 def _unit_platform_properties(
-    platform: str | None, flags: crony.config.JobFlags
+    platform: str | None,
 ) -> crony.unit.UnitPlatformProperties:
-    """Resolve native unit settings from the platform and job flags."""
+    """Select the backend's default native settings."""
     resolved_platform = platform or crony.platform.current_platform()
     if resolved_platform == "darwin":
-        return crony.platform.LaunchdUnitPlatformProperties(
-            MaterializeDatalessFiles=(
-                crony.config.JobFlags.FULL_DISK_ACCESS in flags
-            )
-        )
+        return crony.platform.LaunchdUnitPlatformProperties()
     if resolved_platform == "linux":
         return crony.platform.SystemdUnitPlatformProperties()
     raise ValueError(f"unsupported platform: {resolved_platform!r}")
@@ -258,6 +247,7 @@ def _normalized_spec(
     daemon_timing: crony.unit.Timing | None,
     *,
     platform_properties: crony.unit.UnitPlatformProperties,
+    full_disk_access: bool = False,
 ) -> crony.unit.UnitSpec:
     """A comparison-only UnitSpec with placeholder launcher directories -- the
     path-independent form both graphs normalize to for the drift compare.
@@ -280,6 +270,7 @@ def _normalized_spec(
         jitter=_jitter_spec(name, ref, timing, launcher_path),
         daemon=_daemon_spec(daemon_timing),
         platform_properties=platform_properties,
+        full_disk_access=full_disk_access,
     )
 
 
@@ -321,7 +312,7 @@ class _JobCommon:
     # (computed once at apply time). 0 means uncapped -- the runner
     # treats it as an infinite deadline.
     timeout: int
-    # Derived from the selected platform and resolved flags; retained so
+    # Selected backend defaults; retained so
     # every render uses the same native settings. Rendered unit contents
     # capture their drift, so this value is not compared or persisted.
     platform_properties: crony.unit.UnitPlatformProperties = field(
@@ -386,11 +377,9 @@ class _JobCommon:
     )
     # Live on-disk / scheduler facts the current graph pins so
     # `cfg_status` can tell `broken` from `missing` for a unit whose
-    # file is gone: whether the config unit (launchd plist / systemd
-    # `.service`) is on disk (`unit_config_exists`), and whether the
-    # scheduler has the entry's unit loaded (`unit_loaded`) -- the
-    # schedule-bearing one a backend arms (the plist on launchd, the
-    # `.timer` on systemd, falling back to the static `.service`). Both
+    # file is gone: whether the config unit is on disk
+    # (`unit_config_exists`), and whether the scheduler has the entry's
+    # unit loaded (`unit_loaded`). Both
     # `compare=False` (runtime facts, not config); a pending node leaves
     # the defaults. Keyword-only.
     unit_config_exists: bool = field(default=False, compare=False, kw_only=True)
@@ -555,6 +544,8 @@ class _JobCommon:
             ),
             daemon=_daemon_spec(self.timing),
             platform_properties=self.platform_properties,
+            full_disk_access=self.kind is crony.unit.EntityKind.JOB
+            and crony.config.JobFlags.FULL_DISK_ACCESS in self.flags,
         )
 
     def with_unit_disabled(
@@ -566,12 +557,7 @@ class _JobCommon:
         stale."""
         properties = self.platform_properties
         if platform is not None:
-            flags = (
-                self.flags
-                if self.kind is crony.unit.EntityKind.JOB
-                else crony.config.JobFlags(0)
-            )
-            properties = _unit_platform_properties(platform, flags)
+            properties = _unit_platform_properties(platform)
         return dataclasses.replace(
             self,
             unit_disabled=disabled,
@@ -585,6 +571,8 @@ class _JobCommon:
                 self._guard_timeout,
                 self._guard_interactive,
                 self.timing,
+                full_disk_access=self.kind is crony.unit.EntityKind.JOB
+                and crony.config.JobFlags.FULL_DISK_ACCESS in self.flags,
             ),
         )
 
@@ -773,7 +761,7 @@ class Job(_JobCommon):
         priority = config.resolved_priority(job)
         timeout = config.resolved_job_timeout_sec(job)
         interactive = crony.config.JobFlags.INTERACTIVE in flags
-        platform_properties = _unit_platform_properties(platform, flags)
+        platform_properties = _unit_platform_properties(platform)
         rendered_units = _pending_rendered_units(
             platform_properties,
             name,
@@ -783,6 +771,7 @@ class Job(_JobCommon):
             timeout,
             interactive,
             job.timing,
+            full_disk_access=crony.config.JobFlags.FULL_DISK_ACCESS in flags,
         )
         return cls(
             snapshot_schema=crony.snapshot.CURRENT_SNAPSHOT_SCHEMA,
@@ -879,7 +868,7 @@ class Job(_JobCommon):
         # that reproduces the on-disk file must drop the timing too.
         eff_timing = None if snap.unit_disabled else timing
         interactive = crony.config.JobFlags.INTERACTIVE in flags
-        platform_properties = _unit_platform_properties(platform, flags)
+        platform_properties = _unit_platform_properties(platform)
         rendered_units = _current_rendered_units(
             platform_properties,
             en,
@@ -892,6 +881,7 @@ class Job(_JobCommon):
             ondisk_units,
             installed_uv,
             installed_crony,
+            full_disk_access=crony.config.JobFlags.FULL_DISK_ACCESS in flags,
         )
         unit_config_exists = _unit_config_exists(platform, en, ondisk_units)
         return cls(
@@ -1006,9 +996,7 @@ class JobGroup(_JobCommon):
         if flags is None:
             flags = config.composed_flags(group.flags, group.timing)
         timeout = config.resolved_group_timeout_sec(target, group.name)
-        platform_properties = _unit_platform_properties(
-            platform, crony.config.JobFlags(0)
-        )
+        platform_properties = _unit_platform_properties(platform)
         rendered_units = _pending_rendered_units(
             platform_properties,
             name,
@@ -1081,9 +1069,7 @@ class JobGroup(_JobCommon):
         timing = snap.timing()
         flags = snap.job_flags()
         eff_timing = None if snap.unit_disabled else timing
-        platform_properties = _unit_platform_properties(
-            platform, crony.config.JobFlags(0)
-        )
+        platform_properties = _unit_platform_properties(platform)
         rendered_units = _current_rendered_units(
             platform_properties,
             en,
@@ -1130,6 +1116,8 @@ def _pending_rendered_units(
     guard_timeout: int,
     guard_interactive: bool,
     daemon_timing: crony.unit.Timing | None,
+    *,
+    full_disk_access: bool = False,
 ) -> crony.platform.RenderedUnits:
     """The normalized `RenderedUnits` for a config-built (pending) node:
     the platform render of the entry's blank-path unit spec, so the form
@@ -1150,6 +1138,7 @@ def _pending_rendered_units(
             guard_interactive,
             daemon_timing,
             platform_properties=platform_properties,
+            full_disk_access=full_disk_access,
         )
     )
 
@@ -1166,6 +1155,8 @@ def _current_rendered_units(
     ondisk_units: crony.platform.RenderedUnits,
     installed_uv: Path | None,
     installed_crony: Path | None,
+    *,
+    full_disk_access: bool = False,
 ) -> crony.platform.RenderedUnits:
     """The normalized `RenderedUnits` for a current (applied) node, scored
     against what is on disk. The model owns this compare; the platform
@@ -1202,6 +1193,7 @@ def _current_rendered_units(
                 guard_interactive,
                 daemon_timing,
                 platform_properties=platform_properties,
+                full_disk_access=full_disk_access,
             )
         ).units
     }
@@ -1232,6 +1224,7 @@ def _current_rendered_units(
                     jitter=_jitter_spec(name, ref, timing, launcher_path),
                     daemon=_daemon_spec(daemon_timing),
                     platform_properties=platform_properties,
+                    full_disk_access=full_disk_access,
                 )
             ).units
         }
@@ -2298,16 +2291,10 @@ class Config:
         # entry can't fire through it -- broken (re-apply re-renders it).
         # The config unit's absence was handled above; this catches a
         # schedule-arming companion the pending node renders but the
-        # install lacks (a systemd `.timer` deleted while the `.service`
-        # stays). The model asks the opaque units, never naming which.
+        # install lacks.
         if _rendered_unit_missing(p.rendered_units, c.rendered_units):
             return ConfigStatus.BROKEN
-        # The timer can be present and loaded yet dead: a systemd interval
-        # timer with no valid anchor reports a next elapse of infinity and
-        # will never fire. `unit_armed` is False for that loaded-but-dead
-        # case (a loaded entry with no arming timer stays armed), and the
-        # not-loaded case already returned above, so an armed-but-dead
-        # schedule reads broken here.
+        # A loaded unit without a live scheduled firing is broken.
         if not c.unit_armed:
             return ConfigStatus.BROKEN
         return ConfigStatus.SYNCED if p == c else ConfigStatus.STALE

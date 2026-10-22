@@ -11,8 +11,10 @@ companion plist that phases the service's first fire, since launchd has no
 native start-time randomization.
 """
 
+import dataclasses
 import os
 import plistlib
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -60,11 +62,103 @@ _JITTER_SUFFIX = ".jitter"
 
 # Seconds launchd waits after the SIGTERM of a stop before it SIGKILLs the
 # unit's process, pinned in every plist as `ExitTimeOut`. The key's default
-# is system-defined and too short to rely on: a unit's command needs the
-# whole of its own stop handling (`crony.runner._KILL_GRACE_SEC`) before
-# launchd gives up on it, or launchd kills it part-way through, drops the
-# label, and leaves whatever it had not yet stopped running untracked.
+# is system-defined; pin it to allow bounded cleanup before forced killing.
+# A system-chosen deadline may expire before the unit's command can clean up.
 _EXIT_TIMEOUT_SEC = 10
+
+
+# Keyword OnCalendar specs expand directly to a launchd
+# StartCalendarInterval. (systemd consumes the keyword spec itself.)
+_ONCALENDAR_KEYWORD_CALENDAR: dict[str, dict[str, int]] = {
+    "hourly": {"Minute": 0},
+    "daily": {"Minute": 0, "Hour": 0},
+    "weekly": {"Minute": 0, "Hour": 0, "Weekday": 1},
+    "monthly": {"Minute": 0, "Hour": 0, "Day": 1},
+    "yearly": {"Minute": 0, "Hour": 0, "Day": 1, "Month": 1},
+    "annually": {"Minute": 0, "Hour": 0, "Day": 1, "Month": 1},
+}
+
+# Day-of-week name -> launchd Weekday integer (Sunday = 0).
+_DOW_TO_INT: dict[str, int] = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+
+_SCHEDULE_TIME_RE = re.compile(r"^(\*|\d{1,2}):(\d{2})(?::(\d{2}))?$")
+_SCHEDULE_DATE_RE = re.compile(r"^(\*|\d{4})-(\*|\d{1,2})-(\*|\d{1,2})$")
+
+
+def _check_range(name: str, value: int, low: int, high: int) -> None:
+    if not low <= value <= high:
+        raise ValueError(f"{name} {value} out of range {low}-{high}")
+
+
+def calendar_for_schedule(text: str) -> dict[str, int]:
+    """Parse a supported OnCalendar spec into a launchd
+    StartCalendarInterval, validating ranges and rejecting the
+    step / range / list forms launchd cannot express.
+
+    Seconds are parsed and range-checked, and the year is parsed, but
+    both are omitted from the result -- launchd has no field for them.
+    """
+    if text in _ONCALENDAR_KEYWORD_CALENDAR:
+        return dict(_ONCALENDAR_KEYWORD_CALENDAR[text])
+    if "/" in text or ".." in text or "," in text:
+        raise ValueError(
+            f"OnCalendar pattern {text!r} uses step / range / list "
+            "features crony does not render to launchd; use a single "
+            "concrete time or weekday/day entry"
+        )
+    parts = text.split()
+    cal: dict[str, int] = {}
+    if parts and parts[0].lower() in _DOW_TO_INT:
+        cal["Weekday"] = _DOW_TO_INT[parts[0].lower()]
+        parts = parts[1:]
+    if len(parts) == 2:
+        date_m = _SCHEDULE_DATE_RE.fullmatch(parts[0])
+        if not date_m:
+            raise _unsupported_schedule(text)
+        if date_m.group(2) != "*":
+            month = int(date_m.group(2))
+            _check_range("month", month, 1, 12)
+            cal["Month"] = month
+        if date_m.group(3) != "*":
+            day = int(date_m.group(3))
+            _check_range("day", day, 1, 31)
+            cal["Day"] = day
+        parts = parts[1:]
+    if len(parts) != 1:
+        raise _unsupported_schedule(text)
+    time_m = _SCHEDULE_TIME_RE.fullmatch(parts[0])
+    if not time_m:
+        raise _unsupported_schedule(text)
+    minute = int(time_m.group(2))
+    _check_range("minute", minute, 0, 59)
+    cal["Minute"] = minute
+    if time_m.group(1) != "*":
+        hour = int(time_m.group(1))
+        _check_range("hour", hour, 0, 23)
+        cal["Hour"] = hour
+    if time_m.group(3) is not None:
+        _check_range("second", int(time_m.group(3)), 0, 59)
+    return cal
+
+
+def _unsupported_schedule(text: str) -> ValueError:
+    return ValueError(
+        f"crony does not render OnCalendar pattern {text!r}; try a "
+        "simpler form like '03:15', '*-*-* 03:15', or 'Mon *-*-* 09:00'"
+    )
+
+
+def validate_schedule(source: str) -> None:
+    """Reject a schedule that cannot be rendered as StartCalendarInterval."""
+    calendar_for_schedule(source)
 
 
 def _label(name: str) -> str:
@@ -92,7 +186,7 @@ def _priority_keys(priority: PriorityClass) -> dict[str, object]:
     HIGH runs the job at app-like QoS with normal CPU + IO
     (ProcessType=Interactive avoids the Background QoS throttling that
     can drastically slow IO-bound work); LOW throttles it. The keys
-    are inherited by the command the runner spawns.
+    are inherited by descendant commands.
     """
     if priority is PriorityClass.HIGH:
         return {
@@ -126,8 +220,8 @@ def _render_plist(
     `cmd` is the argv the unit executes.
 
     A `daemon` unit starts on load and is respawned when its command
-    exits non-zero. A daemon whose `timing` is None is operator-disabled:
-    it renders inert (no start, no respawn) so it stays stopped across a
+    exits non-zero and left down after a zero exit. A daemon whose `timing`
+    is None renders inert (no start, no respawn) so it stays stopped across a
     reboot, while remaining a daemon for teardown purposes.
 
     Serialized with `plistlib` so the XML is well-formed by
@@ -146,19 +240,15 @@ def _render_plist(
     if platform_properties.MaterializeDatalessFiles:
         contents["MaterializeDatalessFiles"] = True
     if daemon is not None and timing is not None:
-        # `SuccessfulExit: false` is launchd's native spelling of the
-        # runner's contract: respawn on a non-zero exit, stay down on a
-        # zero one. The runner surfaces non-zero while its cross-platform
-        # retry budget remains, and zero when its gate declines to run it
-        # or that budget is exhausted. ThrottleInterval floors the
-        # bounded respawn rate so a command failing instantly cannot spin.
+        # SuccessfulExit=false respawns non-zero exits; ThrottleInterval
+        # floors the spacing between launches, including early failures.
         contents["RunAtLoad"] = True
         contents["KeepAlive"] = {"SuccessfulExit": False}
         contents["ThrottleInterval"] = daemon.restart_seconds
     elif isinstance(timing, Interval):
         contents["StartInterval"] = timing.total_seconds
     elif isinstance(timing, Schedule):
-        contents["StartCalendarInterval"] = timing.to_plist_calendar()
+        contents["StartCalendarInterval"] = calendar_for_schedule(str(timing))
     return plistlib.dumps(
         contents, fmt=plistlib.FMT_XML, sort_keys=True
     ).decode("utf-8")
@@ -236,8 +326,13 @@ class LaunchdScheduler(Scheduler):
     jitter companion plist for a jittered interval job."""
 
     # A reload is bootout+bootstrap; bootout terminates the running job's
-    # process group, so reloading a job's own unit kills its runner.
+    # process group.
     reload_terminates_running_job = True
+    stop_timeout_sec = _EXIT_TIMEOUT_SEC
+
+    @staticmethod
+    def validate_schedule(source: str) -> None:
+        validate_schedule(source)
 
     @staticmethod
     def default_unit_dir() -> Path:
@@ -261,7 +356,13 @@ class LaunchdScheduler(Scheduler):
                     spec.timing,
                     spec.priority,
                     spec.daemon,
-                    platform_properties=spec.platform_properties,
+                    platform_properties=dataclasses.replace(
+                        spec.platform_properties,
+                        MaterializeDatalessFiles=(
+                            spec.full_disk_access
+                            or spec.platform_properties.MaterializeDatalessFiles
+                        ),
+                    ),
                 ),
             ),
         ]
@@ -439,7 +540,7 @@ class LaunchdScheduler(Scheduler):
     def activate(self, spec: UnitSpec, /) -> None:
         # The schedule rides in the plist itself, so there is nothing to
         # arm separately: a plist with no Start* keys loads fine, dormant,
-        # and a disabled daemon's inert plist loads without starting.
+        # and a daemon with no timing loads without starting or supervision.
         # Bootstrapping is also how a re-applied daemon picks up new
         # config -- bootout stops the running instance first.
         name = str(spec.name)
@@ -447,31 +548,26 @@ class LaunchdScheduler(Scheduler):
         # for a jittered interval job, its companion. A re-apply re-anchors
         # the service, so the companion (which self-unloads after its one
         # fire) must re-load too, or the re-anchored service has nothing to
-        # re-phase it and the herd reforms. RunAtLoad=false, so neither
-        # runs on load; companion-before-service order is a convention,
-        # immaterial under the jitter floor.
+        # re-phase it and the herd reforms. Interval units have RunAtLoad=false;
+        # companion-before-service order is immaterial under the jitter floor.
         for unit_name in self._discovered_unit_names(name):
             plist = self.unit_dir / _plist_filename(unit_name)
             # Validate before asking launchd to load (`-s` keeps stdout
-            # quiet on success). A disabled entry's plist is schedule-less
-            # but still bootstrapped -- loaded and triggerable, just
-            # dormant.
+            # quiet on success). A schedule-less plist is still bootstrapped.
             self._run_checked(["plutil", "-s", str(plist)])
             self._bootstrap(unit_name, plist)
 
     def deactivate(self, name: str) -> None:
         # Boot out every on-disk unit's label, not just the service's: a
         # still-loaded jitter companion left registered would keep firing
-        # and re-kickstart a now-disabled service (whose lock is always
-        # free), so its label must clear too. Tolerant of an already-
-        # unloaded companion -- its steady state after the one fire, where
+        # and re-kickstart the service, so its label must clear too.
+        # Tolerant of an already-unloaded companion after its one fire, where
         # a not-found bootout is a harmless no-op.
         for unit_name in self._discovered_unit_names(name):
             self._bootout(unit_name)
 
     def deactivate_jitter(self, name: str) -> None:
-        # Unload only `name`'s jitter companion (not the service), the
-        # runner's self-unload of the fired companion. A not-found bootout
+        # Unload only `name`'s jitter companion. A not-found bootout
         # (already unloaded, or never a jittered job) is a harmless no-op.
         self._bootout(f"{name}{_JITTER_SUFFIX}")
 
@@ -493,7 +589,7 @@ class LaunchdScheduler(Scheduler):
         # Remove every discovered plist not in `keep`, booting out its own
         # label first. The service plist render always produces, so it
         # stays in `keep`; a jitter companion that became ineligible (the
-        # job was disabled or its interval shortened below the floor) drops
+        # spec has no timing or its interval is below the jitter floor) drops
         # out of `keep` and is pruned here, as is a stale file from an old
         # naming scheme. Booting out each pruned label before the unlink
         # keeps a still-loaded companion from leaking as a live agent

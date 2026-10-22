@@ -97,7 +97,7 @@ class UnitNotInstalledError(PreconditionError):
 class TriggerStartTimeout(JobTimeoutError):
     """The platform never produced a runner within
     `trigger_timeout_sec` after we asked it to fire the unit.
-    Suggests a broken plist / unit, a stalled scheduler queue, or
+    Suggests an invalid unit, a stalled scheduler queue, or
     the unit not being loaded (run `crony apply` first).
 
     Raised only when no runner was ever observed. A runner that
