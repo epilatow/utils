@@ -325,6 +325,14 @@ class Scheduler(abc.ABC):
         the fire. A backend routes it through `_run_checked`, which converts
         a command failure to that type."""
 
+    @abc.abstractmethod
+    def stop(self, name: str, signum: int) -> None:
+        """Send `signum` to the unit's main process, leaving it loaded.
+
+        The rendered unit's supervision decides whether it respawns.
+        Returns when the scheduler accepts the request.
+        """
+
     @staticmethod
     def _run_checked(argv: list[str]) -> None:
         """Run `argv`, raising `crony.errors.SubprocessError` on a non-zero

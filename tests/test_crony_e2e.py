@@ -1392,6 +1392,163 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+class TestUserStop:
+    def _running_job(
+        self, e2e: _CronyE2E, *, daemon: bool
+    ) -> tuple[Path, Path]:
+        pidfile = e2e.state_dir.parent / "command.pid"
+        command = (
+            f"echo $$ > {shlex.quote(str(pidfile))}; "
+            "while :; do sleep 0.2; done"
+        )
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "2"
+        timing = "daemon = true" if daemon else 'schedule = "daily"'
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\n{timing}\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=daemon)
+        if not daemon:
+            e2e.crony("start", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: _read_text(pidfile).strip().isdigit(),
+            timeout=60,
+            what="the command to publish its pid",
+        )
+        return e2e.state_dir / E2E_BUNDLE / "probe", pidfile
+
+    def test_stop_running_scheduled_job_keeps_schedule(
+        self, e2e: _CronyE2E
+    ) -> None:
+        sd, _pidfile = self._running_job(e2e, daemon=False)
+        assert "stopping" in e2e.crony("stop", e2e.full("probe")).stderr
+        e2e.wait_for_recorded_status(e2e.full("probe"), "stopped")
+        assert (
+            json.loads((sd / "last-run.json").read_text())["exit_class"]
+            == "stopped"
+        )
+        if _IS_LINUX:
+            assert (
+                e2e.systemctl_user(
+                    "is-active", f"crony-{e2e.full('probe')}.timer"
+                ).stdout.strip()
+                == "active"
+            )
+        else:
+            assert e2e.launchctl_loaded(e2e.darwin_label("probe"))
+
+    def test_stop_during_gate(self, e2e: _CronyE2E) -> None:
+        sd = TestStopBeforeCommand()._start_gated_run(e2e, 300)
+        e2e.crony("stop", e2e.full("probe"))
+        e2e.wait_for_recorded_status(e2e.full("probe"), "stopped")
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["gate"] == "none"
+        assert rec["exit_code"] is None
+
+    def test_stop_enabled_daemon_restarts_without_budget_charge(
+        self, e2e: _CronyE2E
+    ) -> None:
+        sd, pidfile = self._running_job(e2e, daemon=True)
+        first = _read_text(pidfile)
+        before = _read_text(sd / "exit-history.json")
+        e2e.crony("stop", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: bool(_read_text(pidfile)) and _read_text(pidfile) != first,
+            timeout=60,
+            what="supervision to restart the stopped daemon",
+        )
+        assert (
+            json.loads((sd / "last-run.json").read_text())["exit_class"]
+            == "stopped"
+        )
+        assert _read_text(sd / "exit-history.json") == before
+        assert "LOCK_BUSY" not in _read_text(sd / "run.log")
+
+    def test_stop_disabled_daemon_stays_down(self, e2e: _CronyE2E) -> None:
+        sd, pidfile = self._running_job(e2e, daemon=True)
+        e2e.crony("disable", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: not e2e.unit_running("probe"),
+            timeout=60,
+            what="daemon disable",
+        )
+        pidfile.unlink(missing_ok=True)
+        e2e.inject_isolated_env("probe", restart=False)
+        e2e.crony("start", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: _read_text(pidfile).strip().isdigit(),
+            timeout=60,
+            what="manual daemon start",
+        )
+        e2e.crony("stop", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: not e2e.unit_running("probe"),
+            timeout=60,
+            what="manual daemon stop",
+        )
+        assert (
+            json.loads((sd / "last-run.json").read_text())["exit_class"]
+            == "stopped"
+        )
+        time.sleep(3)
+        assert not e2e.unit_running("probe")
+
+    def test_stop_idle_is_a_noop(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(
+            '[job.probe]\ncommand = "true"\non-demand = true\n', ["probe"]
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        assert "not running" in e2e.crony("stop", e2e.full("probe")).stderr
+
+    @pytest.mark.parametrize("stop_group", [False, True])
+    def test_group_and_child_stops_preserve_dispatch(
+        self, e2e: _CronyE2E, stop_group: bool
+    ) -> None:
+        allow = e2e.state_dir.parent / "allow-child"
+        done = e2e.state_dir.parent / "child-done"
+        never = e2e.state_dir.parent / "never-started"
+        command = (
+            f"echo ready; while [ ! -e {shlex.quote(str(allow))} ]; "
+            f"do sleep 0.1; done; touch {shlex.quote(str(done))}"
+        )
+        never_command = "touch " + shlex.quote(str(never))
+        e2e.write_bundle(
+            f"[job.a]\ncommand = {json.dumps(command)}\njob-timeout-sec = 60\n"
+            f"[job.b]\ncommand = {json.dumps(never_command)}\n"
+            '[job-group.g]\njobs = ["a", "b"]\non-demand = true\n',
+            ["g"],
+        )
+        e2e.crony("apply")
+        for name in ("a", "b", "g"):
+            e2e.inject_isolated_env(name, restart=False)
+        e2e.crony("start", e2e.full("g"))
+        child_sd = e2e.state_dir / E2E_BUNDLE / "a"
+        group_sd = e2e.state_dir / E2E_BUNDLE / "g"
+        e2e.wait_until(
+            lambda: "ready" in _read_text(child_sd / "run.log"),
+            timeout=60,
+            what="the group's first child",
+        )
+        e2e.crony("stop", e2e.full("g" if stop_group else "a"))
+        if not stop_group:
+            e2e.wait_for_recorded_status(e2e.full("a"), "stopped")
+            e2e.wait_for_recorded_status(e2e.full("g"), "ok")
+            assert never.exists()
+            rec = json.loads((group_sd / "last-run.json").read_text())
+            assert rec["jobs_run"][0]["exit_class"] == "stopped"
+            return
+        e2e.wait_for_recorded_status(e2e.full("g"), "stopped")
+        assert not done.exists()
+        rec = json.loads((group_sd / "last-run.json").read_text())
+        assert rec["jobs_run"][0]["exit_class"] == "dispatched"
+        allow.write_text("go", encoding="utf-8")
+        e2e.wait_until(
+            done.exists, timeout=30, what="the independent child to finish"
+        )
+        assert not never.exists()
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

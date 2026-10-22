@@ -162,6 +162,7 @@ _EXIT_TO_JOBSTATUS: dict[crony.model.ExitClass, crony.model.JobStatus] = {
     crony.model.ExitClass.TIMEOUT: crony.model.JobStatus.TIMEOUT,
     crony.model.ExitClass.GATED: crony.model.JobStatus.GATED,
     crony.model.ExitClass.CANCELED: crony.model.JobStatus.CANCELED,
+    crony.model.ExitClass.STOPPED: crony.model.JobStatus.STOPPED,
 }
 
 
@@ -1083,7 +1084,11 @@ def consume_user_start_flag(
     unrelated later launch; the interactive bypass, which is consumed by
     the run started by that request, passes none.
     """
-    path = user_start_flag_path(state_dir)
+    return _consume_user_flag(user_start_flag_path(state_dir), max_age_sec)
+
+
+def _consume_user_flag(path: Path, max_age_sec: float | None) -> bool:
+    """Claim one sentinel, rejecting an abandoned request when bounded."""
     try:
         age_sec = time.time() - path.stat().st_mtime
         path.unlink()

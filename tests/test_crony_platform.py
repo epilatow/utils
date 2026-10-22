@@ -10,8 +10,12 @@ get_scheduler / get_host factories). Backend-specific tests live in
 test_crony_platform_{launchd,systemd}.py (schedulers) and
 test_crony_platform_host_{darwin,linux}.py (host platforms)."""
 
+import os
+import signal
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -69,6 +73,40 @@ class TestPlatformDetection:
         assert isinstance(h, str)
         assert len(h) > 0
         assert "." not in h
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR2])
+def test_stop_signals_the_instance_without_disarming(
+    platform: str, signum: int
+) -> None:
+    name = "default.j"
+    signal_name = signal.Signals(signum).name
+    expected = (
+        [
+            "launchctl",
+            "kill",
+            signal_name,
+            f"gui/{os.getuid()}/org.crony.{name}",
+        ]
+        if platform == "darwin"
+        else [
+            "systemctl",
+            "--user",
+            "kill",
+            "--kill-whom=main",
+            f"--signal={signal_name}",
+            f"crony-{name}.service",
+        ]
+    )
+    with patch.object(
+        subprocess,
+        "run",
+        autospec=True,
+        return_value=subprocess.CompletedProcess(expected, 0),
+    ) as run:
+        get_scheduler(platform, Path("/unused")).stop(name, signum)
+    run.assert_called_once_with(expected, check=False)
 
 
 if __name__ == "__main__":

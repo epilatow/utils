@@ -11,6 +11,8 @@ It reads one or more TOML config bundles and can deploy the corresponding platfo
 It runs jobs through a uniform shim, which provides consistent logging, execution gates, timeouts, environment management, etc.\&
 Jobs can be grouped, and groups or jobs run on a schedule; a job can instead be a daemon, which runs continuously and gets five automatic restarts when it stops prematurely.\&
 An exhausted daemon stays loaded but stopped until the next login, \(gastart\(ga, \(gaapply\(ga, or \(gaenable\(ga starts a fresh retry budget.\&
+Stopping an enabled daemon will stop the currently running instance, but it will subsequently be automatically restarted.\&
+A disabled daemon stays stopped.\&
 Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gastart\(ga subcommand).\&
 Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
 .PP
@@ -23,7 +25,7 @@ deployment (\(gaapply\(ga, \(gadestroy\(ga): deploy configured jobs
 .IP \(bu 2
 runtime state (\(gaenable\(ga, \(gadisable\(ga): manage scheduler arming
 .IP \(bu 2
-operational (\(gastatus\(ga, \(galogs\(ga, \(gastart\(ga): manage deployed jobs
+operational (\(gastatus\(ga, \(galogs\(ga, \(gastart\(ga, \(gastop\(ga): manage deployed jobs
 .PD
 .PP
 Configuration is managed via bundles:
@@ -155,6 +157,13 @@ Override [defaults].start\-timeout\-sec (seconds to wait for a runner to come on
 Only meaningful with \-\-wait.\&
 .RE
 .TP
+\f[B]stop\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
+Stop the named running jobs or groups without disarming their schedules.\&
+An enabled daemon restarts automatically; a disabled daemon stays stopped.\&
+Stopping a group leaves its in\-flight child running and dispatches no further children.\&
+Returns once the scheduler accepts the request.\&
+Requires a target: job(s) or \-\-all.\&
+.TP
 \f[B]status\f[R] [\-a] [\-\-cols COLS] [\-b BUNDLE] [\-\-config\-current | \-\-config\-pending] [\-\-exclude\-healthy] [job ...]\&
 Print resolved state per job.\&
 With no job arguments every job is shown; pass job names to restrict the table.\&
@@ -176,7 +185,7 @@ For dual\-source columns (name, schedule, groups, ...), show the currently\-acti
 For dual\-source columns (name, schedule, groups, ...), show the pending value from the config (the default).\&
 .TP
 \f[CR]\-\-exclude\-healthy\f[R]
-Drop rows that are config=synced, enabled in the scheduler, and last in ok/never/gated \-\- or, for a daemon, running/gated (up, or deliberately kept down by its gate).\&
+Drop rows that are config=synced, enabled in the scheduler, and last in ok/never/gated/stopped \-\- or, for a daemon, running/gated/stopped (up, or deliberately down).\&
 Output is flat (no tree indent).\&
 Always exits 0 \-\- this is a filter on the display, not a gate.\&
 .RE
@@ -374,7 +383,12 @@ A declined gate skips the job even if its command script is missing or not execu
 Jobs and groups.\&
 A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined.\&
 A job whose command script is missing or not executable is canceled when its gate passes or it has no gate.\&
-A job stopped before its command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too.\&
+A job stopped by the scheduler before its command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too.\&
+A scheduler stop also cancels a group during child dispatch.\&
+.TP
+\f[I]stopped\f[R]
+Jobs and groups.\&
+The last run was cut short by \(gacrony stop\(ga.\&
 .TP
 \f[I]crashed\f[R]
 Jobs and groups.\&

@@ -14,17 +14,20 @@ gates, timeouts, environment management, etc. Jobs can be grouped, and groups
 or jobs run on a schedule; a job can instead be a daemon, which runs
 continuously and gets five automatic restarts when it stops prematurely. An
 exhausted daemon stays loaded but stopped until the next login, `start`,
-`apply`, or `enable` starts a fresh retry budget. Jobs can also be managed
-manually (enabled/disabled independently of the underlying scheduler, and run
-at will via the `start` subcommand). Crony supports the following notification
-mechanisms for job failures: email/smtp, ntfy, and pop-ups (on macOS/darwin).
+`apply`, or `enable` starts a fresh retry budget. Stopping an enabled daemon
+will stop the currently running instance, but it will subsequently be
+automatically restarted. A disabled daemon stays stopped. Jobs can also be
+managed manually (enabled/disabled independently of the underlying scheduler,
+and run at will via the `start` subcommand). Crony supports the following
+notification mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
+macOS/darwin).
 
 Subcommands fall into categories:
 
 - configuration (`config`): manage config files
 - deployment (`apply`, `destroy`): deploy configured jobs
 - runtime state (`enable`, `disable`): manage scheduler arming
-- operational (`status`, `logs`, `start`): manage deployed jobs
+- operational (`status`, `logs`, `start`, `stop`): manage deployed jobs
 
 Configuration is managed via bundles:
 
@@ -173,6 +176,14 @@ budget. Requires a target: job(s) or --all.
   Override [defaults].start-timeout-sec (seconds to wait for a runner to come
   online after dispatch). Only meaningful with --wait.
 
+### `stop [--all] [-b BUNDLE] [job ...]`
+
+Stop the named running jobs or groups without disarming their schedules. An
+enabled daemon restarts automatically; a disabled daemon stays stopped.
+Stopping a group leaves its in-flight child running and dispatches no further
+children. Returns once the scheduler accepts the request. Requires a target:
+job(s) or --all.
+
 ### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 
 Print resolved state per job. With no job arguments every job is shown; pass
@@ -196,8 +207,8 @@ the two.
   value from the config (the default).
 - **`--exclude-healthy`**\
   Drop rows that are config=synced, enabled in the scheduler, and last in
-  ok/never/gated -- or, for a daemon, running/gated (up, or deliberately kept
-  down by its gate). Output is flat (no tree indent). Always exits 0 -- this
+  ok/never/gated/stopped -- or, for a daemon, running/gated/stopped (up, or
+  deliberately down). Output is flat (no tree indent). Always exits 0 -- this
   is a filter on the display, not a gate.
 
 ### `logs [-n N] [-s SINCE] [-t | -l] [-p] job`
@@ -382,8 +393,11 @@ Send a synthetic failure notification.
   Jobs and groups. A run canceled or skipped before its command ran -- for an
   interactive job, one the user declined. A job whose command script is
   missing or not executable is canceled when its gate passes or it has no
-  gate. A job stopped before its command started (its unit stopped or reloaded
-  during its gate or interactive wait) is canceled too.
+  gate. A job stopped by the scheduler before its command started (its unit
+  stopped or reloaded during its gate or interactive wait) is canceled too. A
+  scheduler stop also cancels a group during child dispatch.
+- **`stopped`**\
+  Jobs and groups. The last run was cut short by `crony stop`.
 - **`crashed`**\
   Jobs and groups. The scheduler failed to launch the job or group, or it was
   killed/crashed before it could save its exit status to disk.

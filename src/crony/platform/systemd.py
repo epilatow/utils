@@ -12,6 +12,7 @@ daemon's `.service` needs no timer either, but starts itself and carries
 import configparser
 import os
 import shlex
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -616,6 +617,21 @@ class SystemdScheduler(Scheduler):
                 "--user",
                 "start",
                 "--no-block",
+                _service_filename(name),
+            ]
+        )
+
+    def stop(self, name: str, signum: int) -> None:
+        # An explicit stop suppresses Restart=. Signal the main process
+        # instead, leaving its supervision and any timer armed. Descendants
+        # receive the main process's relay rather than a second direct signal.
+        self._run_checked(
+            [
+                "systemctl",
+                "--user",
+                "kill",
+                "--kill-whom=main",
+                f"--signal={signal.Signals(signum).name}",
                 _service_filename(name),
             ]
         )

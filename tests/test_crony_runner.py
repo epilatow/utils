@@ -1449,16 +1449,11 @@ class TestRunGroup:
         assert rec["jobs_run"][0]["exit_class"] == "timeout"
         assert rec["exit_class"] == "ok"
 
-    def test_run_group_ignores_guard_signals_while_running(
+    def test_run_group_handles_stops_and_notes_timeout_hint(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
-        # The group runner enforces its own budget and records the timeout
-        # itself, so while running it ignores the guard's stop/hint signals
-        # (a default SIGUSR1 would kill it): a backstop fire then rides to
-        # SIGKILL and reads as a timeout via the flag, never a crash. Probe
-        # the live dispositions from inside dispatch. (It does not restore
-        # them -- the runner exits after its run; the autouse fixture
-        # isolates the test process.)
+        # A group enforces its own timeout but must interrupt a child wait
+        # when stopped. Probe dispositions while it is dispatching.
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
             {
@@ -1473,6 +1468,7 @@ class TestRunGroup:
             signal.SIGINT,
             signal.SIGHUP,
             signal.SIGUSR1,
+            signal.SIGUSR2,
         )
         observed: dict[int, Any] = {}
 
@@ -1483,7 +1479,8 @@ class TestRunGroup:
 
         monkeypatch.setattr(crony_runner, "start_unit_wait", _probe)
         assert crony_runner._run_group(h.snap(cfg, "g")) == 0
-        assert observed == {s: signal.SIG_IGN for s in guarded}
+        assert callable(observed[signal.SIGUSR1])
+        assert all(callable(observed[s]) for s in crony_runner._STOP_SIGNALS)
 
     def test_subgroup_fault_does_not_fail_parent_group(
         self, tmp_path: Path, monkeypatch: Any
@@ -3153,8 +3150,9 @@ class TestRunJobStoppedBeforeCommand:
         assert outcome == crony_runner._ExitOutcome(rc=0, signal=None)
         assert timed_out is True
 
+    @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR2])
     def test_stop_during_command_spawn_reaches_the_command(
-        self, tmp_path: Path, monkeypatch: Any
+        self, tmp_path: Path, monkeypatch: Any, signum: int
     ) -> None:
         # A stop landing while the command is being started is no longer
         # the runner's to raise on -- the command may already be running --
@@ -3168,6 +3166,7 @@ class TestRunJobStoppedBeforeCommand:
             *args: Any, **kwargs: Any
         ) -> subprocess.Popen[bytes]:
             proc = real_popen(*args, **kwargs)
+            signal.raise_signal(signum)
             signal.raise_signal(signal.SIGTERM)
             return proc
 
@@ -3186,7 +3185,9 @@ class TestRunJobStoppedBeforeCommand:
                 ["sleep", "5"], env=dict(os.environ), log_file=log_file
             )
         popen.assert_called_once()
-        assert outcome == crony_runner._ExitOutcome(rc=0, signal=signal.SIGTERM)
+        assert outcome == crony_runner._ExitOutcome(
+            rc=0, signal=signal.SIGTERM, stop_signal=signum
+        )
         assert timed_out is False
 
     def test_command_starts_with_default_stop_dispositions(
@@ -4657,24 +4658,29 @@ class TestDoRunGuard:
             pytest.fail(f"grandchild {gc_pid} survived SIGTERM forwarding")
 
     @_GUARD_CAPS
+    @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR2])
     def test_stop_sigkills_a_run_that_ignores_it(
-        self, tmp_path: Path, monkeypatch: Any, cap: int
+        self, tmp_path: Path, monkeypatch: Any, cap: int, signum: int
     ) -> None:
         # A run that ignores the relayed stop must not outlive it: the
         # guard escalates to SIGKILL after the grace, and since such a run
         # recorded nothing the stop signal is what the guard reports.
         monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         pidfile = tmp_path / "stubborn.pid"
         ready = tmp_path / "ready"
         argv = [
             "/bin/sh",
             "-c",
             (
-                f'trap "" TERM; echo $$ > {pidfile}; touch {ready}; '
+                _publish_pid_sh(sd)
+                + f'trap "" TERM USR2; echo $$ > {pidfile}; touch {ready}; '
                 f"while :; do sleep 0.2; done"
             ),
+            "_",
+            ref,
         ]
-        code = _stop_guard_in_child(argv, ready, signal.SIGTERM, cap)
+        code = _stop_guard_in_child(argv, ready, signum, cap)
         assert code == 128 + signal.SIGTERM
         run_pid = int(pidfile.read_text().strip())
         for _ in range(50):
@@ -4733,6 +4739,40 @@ class TestDoRunGuard:
             == 128 + signal.SIGTERM
         )
 
+    @_GUARD_CAPS
+    def test_operator_stop_notifies_runner_and_terminates_command(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap: int
+    ) -> None:
+        sd, ref = _guard_state_dir(tmp_path, monkeypatch)
+        ready = tmp_path / "ready"
+        runner_hint = tmp_path / "runner-hint"
+        command_signal = tmp_path / "command-signal"
+        command_code = (
+            "import signal, sys, time\n"
+            "from pathlib import Path\n"
+            "def stopped(signum, _frame):\n"
+            f"    Path({str(command_signal)!r}).write_text(str(signum))\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, stopped)\n"
+            "signal.signal(signal.SIGUSR2, stopped)\n"
+            f"Path({str(ready)!r}).touch()\n"
+            "while True: time.sleep(1)\n"
+        )
+        runner_code = (
+            "import os, signal, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+            "signal.signal(signal.SIGUSR2, "
+            f"lambda *_: Path({str(runner_hint)!r}).touch())\n"
+            f"Path({str(sd / 'run.pid')!r}).write_text(str(os.getpid()))\n"
+            "sys.exit(subprocess.call([sys.executable, '-c', "
+            f"{command_code!r}]))\n"
+        )
+        argv = [sys.executable, "-c", runner_code, "_", ref]
+        assert _stop_guard_in_child(argv, ready, signal.SIGUSR2, cap) == 143
+        assert runner_hint.exists()
+        assert command_signal.read_text() == str(signal.SIGTERM)
+
     def test_timeout_delivers_sigusr1_hint(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -4745,7 +4785,7 @@ class TestDoRunGuard:
         # foreground sleep would defer it); the settle gives the trap time
         # to fire before the SIGTERM. The real Python runner handles the
         # signal immediately, so this deferral is the shell's alone.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 1.0)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 1.0)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         marker = tmp_path / "got-usr1"
         argv = [
@@ -4769,7 +4809,7 @@ class TestDoRunGuard:
         # A run that records on its way out of a timeout kill -- what the
         # runner does with the hint -- exits with the code it recorded, and
         # that is what the scheduler must see.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 1.0)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 1.0)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
             "/bin/sh",
@@ -4794,7 +4834,7 @@ class TestDoRunGuard:
         # nothing, so the timeout verdict has to survive that exit code --
         # otherwise status reconciles the launch against the previous run's
         # record and shows its stale outcome.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 0.2)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
             "/bin/sh",
@@ -4820,7 +4860,7 @@ class TestDoRunGuard:
         # earlier launch's pid. A run killed before publishing a pid of its
         # own must not be credited with that record -- its exit would then
         # read as an outcome it never recorded.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 0.2)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch, prior_run_pid=999999)
         argv = [
             "/bin/sh",
@@ -4847,7 +4887,7 @@ class TestDoRunGuard:
         # exited says nothing about whether the run recorded. Here it exits
         # that way, a descendant survives the grace, and nothing was
         # recorded: the flag is what tells status this was a timeout.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 0.2)
         monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
@@ -4872,7 +4912,7 @@ class TestDoRunGuard:
         # A run that ignores the SIGUSR1 hint and SIGTERM is SIGKILLed on
         # timeout; the guard leaves a killed-flag (keyed on the run's ref)
         # so status can read the SIGKILLed, never-recorded run as a timeout.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 0.2)
         monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
@@ -4895,7 +4935,7 @@ class TestDoRunGuard:
         # recorded and exited, leaving only a signal-ignoring descendant for
         # the SIGKILL to reap, has its own record to report -- flagging it a
         # timeout would overrule that record.
-        monkeypatch.setattr(crony_runner, "_TIMEOUT_HINT_SETTLE_SEC", 0.2)
+        monkeypatch.setattr(crony_runner, "_SIGNAL_HINT_SETTLE_SEC", 0.2)
         monkeypatch.setattr(crony_runner, "_KILL_GRACE_SEC", 0.5)
         sd, ref = _guard_state_dir(tmp_path, monkeypatch)
         argv = [
@@ -4957,7 +4997,7 @@ class TestStopTimeouts:
     import its grace, so nothing but this holds them in order."""
 
     _GUARD_STOP_SEC = (
-        crony_runner._TIMEOUT_HINT_SETTLE_SEC + crony_runner._KILL_GRACE_SEC
+        crony_runner._SIGNAL_HINT_SETTLE_SEC + crony_runner._KILL_GRACE_SEC
     )
 
     def test_launchd_exit_timeout_outlasts_the_guard(self) -> None:
@@ -5347,9 +5387,290 @@ class TestRunDaemon:
 def test_guard_finishes_within_scheduler_stop_timeout(platform: str) -> None:
     scheduler = crony_platform.get_scheduler(platform)
     assert (
-        crony_runner._KILL_GRACE_SEC + crony_runner._TIMEOUT_HINT_SETTLE_SEC
+        crony_runner._KILL_GRACE_SEC + crony_runner._SIGNAL_HINT_SETTLE_SEC
         < scheduler.stop_timeout_sec
     )
+
+
+class TestUserStop:
+    @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGUSR2])
+    def test_stop_during_command_wait_is_noted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int
+    ) -> None:
+        monkeypatch.delenv(crony_runtime.GUARD_PID_ENV, raising=False)
+
+        def stopped_wait() -> int:
+            signal.raise_signal(signum)
+            signal.raise_signal(signal.SIGTERM)
+            return 0
+
+        with (
+            mock.patch.object(subprocess, "Popen", autospec=True) as popen,
+            open(tmp_path / "run.log", "ab") as log,
+        ):
+            popen.return_value.wait.side_effect = stopped_wait
+            outcome, timed_out = crony_runner._exec_command(
+                ["true"], env={}, log_file=log
+            )
+        assert outcome == crony_runner._ExitOutcome(0, None, signum)
+        assert not timed_out
+
+    def test_dispatch_acceptance_is_recorded_before_a_pending_stop(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="darwin")
+        h.config(
+            {"job": {"j": {"command": "true", "on-demand": True}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        accepted: list[bool] = []
+
+        def interrupted(
+            _scheduler: crony_platform.Scheduler, _name: str
+        ) -> None:
+            signal.raise_signal(signal.SIGUSR2)
+
+        crony_runner._raise_on_stop(crony_runner._STOP_SIGNALS)
+        with (
+            mock.patch.object(
+                crony_platform.LaunchdScheduler,
+                "start",
+                autospec=True,
+                side_effect=interrupted,
+            ),
+            pytest.raises(crony_runner._StopRequested),
+        ):
+            crony_runner.start_unit(
+                h.full("j"),
+                "darwin",
+                on_dispatched=lambda: accepted.append(True),
+            )
+        assert accepted == [True]
+
+    @pytest.mark.parametrize("daemon", [False, True])
+    @pytest.mark.parametrize("rc", [0, 7])
+    def test_command_stop_preserves_result_and_history(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        daemon: bool,
+        rc: int,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "defaults": {
+                    "notify-channels": ["ntfy"],
+                    "notify-success-ratio": "1/2",
+                    "notify": {"ntfy": _ntfy_block()},
+                },
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "daemon": daemon,
+                        "on-demand": not daemon,
+                    }
+                },
+            },
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert isinstance(snap, Job)
+        sd = snap.state_dir
+        sd.mkdir(parents=True, exist_ok=True)
+        crony_runtime.append_exit_history(
+            sd, ExitClass.FAIL, crony_runtime.now_iso()
+        )
+        before = (sd / "exit-history.json").read_bytes()
+
+        def stop_command(
+            *_args: object, **_kwargs: object
+        ) -> tuple[crony_runner._ExitOutcome, bool]:
+            return crony_runner._ExitOutcome(rc, None, signal.SIGUSR2), False
+
+        with (
+            mock.patch.object(
+                crony_runner,
+                "_exec_command",
+                autospec=True,
+                side_effect=stop_command,
+            ),
+            mock.patch.object(
+                crony_notify, "dispatch_notify", autospec=True
+            ) as notify,
+        ):
+            code = crony_runner._run_job(snap)
+        rec = h.last_run("j")
+        assert rec["exit_class"] == "stopped"
+        assert rec["exit_code"] == rc
+        assert rec["signal"] is None
+        assert rec["stop_signal"] == signal.SIGTERM
+        assert crony_runner.start_exit_code(rec) == 128 + signal.SIGTERM
+        assert code == (
+            int(ExitCode.DAEMON_EXITED) if daemon else 128 + signal.SIGTERM
+        )
+        assert rec["process_exit"] == code
+        assert (sd / "exit-history.json").read_bytes() == before
+        notify.assert_not_called()
+
+    @pytest.mark.parametrize("daemon", [False, True])
+    def test_user_stop_before_command_is_recorded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        daemon: bool,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {
+                    "j": {
+                        "command": "true",
+                        "gate": "true",
+                        "daemon": daemon,
+                        "on-demand": not daemon,
+                    }
+                }
+            },
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert isinstance(snap, Job)
+
+        def stopped_gate(_snap: Job) -> list[str] | None:
+            signal.raise_signal(signal.SIGUSR2)
+            raise AssertionError("stop did not unwind the gate")
+
+        with mock.patch.object(
+            crony_runner, "_gate_argv", autospec=True, side_effect=stopped_gate
+        ):
+            code = crony_runner._run_job(snap)
+        assert code == (
+            int(ExitCode.DAEMON_EXITED) if daemon else 128 + signal.SIGTERM
+        )
+        assert h.last_run("j")["exit_class"] == "stopped"
+        assert crony_runtime.read_exit_history(snap.state_dir).runs == []
+
+    def test_operator_stop_does_not_relabel_the_next_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "on-demand": True}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+        assert isinstance(snap, Job)
+
+        with mock.patch.object(
+            crony_runner,
+            "_exec_command",
+            autospec=True,
+            return_value=(
+                crony_runner._ExitOutcome(0, None, signal.SIGUSR2),
+                False,
+            ),
+        ):
+            assert crony_runner._run_job(snap) == 143
+        assert h.last_run("j")["exit_class"] == "stopped"
+        with mock.patch.object(
+            crony_runner,
+            "_exec_command",
+            autospec=True,
+            return_value=(crony_runner._ExitOutcome(0, 15, 15), False),
+        ):
+            assert crony_runner._run_job(snap) == 143
+        assert h.last_run("j")["exit_class"] == "signal"
+
+    @pytest.mark.parametrize("user_stop", [False, True])
+    @pytest.mark.parametrize("guard_timeout", [False, True])
+    def test_group_stop_leaves_inflight_child_dispatched(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        user_stop: bool,
+        guard_timeout: bool,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}, "b": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a", "b"], "on-demand": True}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
+        dispatched: list[str] = []
+
+        def interrupted(
+            name: str, *, on_dispatched: Callable[[], None], **_kwargs: object
+        ) -> dict[str, Any]:
+            dispatched.append(name)
+            on_dispatched()
+            if guard_timeout:
+                signal.raise_signal(signal.SIGUSR1)
+            signal.raise_signal(signal.SIGUSR2 if user_stop else signal.SIGTERM)
+            raise AssertionError("group stop did not unwind dispatch")
+
+        with mock.patch.object(
+            crony_runner,
+            "start_unit_wait",
+            autospec=True,
+            side_effect=interrupted,
+        ):
+            assert crony_runner._run_group(h.snap(cfg, "g")) == (
+                int(ExitCode.TIMEOUT) if guard_timeout else 143
+            )
+        rec = h.last_run("g")
+        assert rec["exit_class"] == (
+            "timeout"
+            if guard_timeout
+            else "stopped"
+            if user_stop
+            else "canceled"
+        )
+        assert rec["jobs_run"] == [
+            {"name": h.full("a"), "exit_class": "dispatched", "exit_code": 0}
+        ]
+        assert dispatched == [h.full("a")]
+        assert h.full("b") in (h.state_dir("g") / "run.log").read_text()
+        assert not (h.state_dir("a") / "last-run.json").exists()
+
+    def test_group_continues_after_a_child_is_stopped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {
+                "job": {"a": {"command": "true"}, "b": {"command": "true"}},
+                "job-group": {"g": {"jobs": ["a", "b"], "on-demand": True}},
+            },
+            default_target_jobs=["g"],
+        )
+        h.write_snap(cfg, "a")
+        h.write_snap(cfg, "b")
+        _stub_start_sync(
+            monkeypatch,
+            {
+                h.full("a"): {"exit_class": "stopped", "stop_signal": 15},
+                h.full("b"): {"exit_class": "ok", "exit_code": 0},
+            },
+        )
+        assert crony_runner._run_group(h.snap(cfg, "g")) == 0
+        rec = h.last_run("g")
+        assert rec["exit_class"] == "ok"
+        assert [child["exit_class"] for child in rec["jobs_run"]] == [
+            "stopped",
+            "ok",
+        ]
 
 
 if __name__ == "__main__":

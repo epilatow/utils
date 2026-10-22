@@ -95,6 +95,20 @@ class TestIsolateCronyHomeFixture(SentinelHomeBase):
 
 
 class TestHelpOutput:
+    @pytest.mark.parametrize("argv", [["stop"], ["stop", "j", "--all"]])
+    def test_stop_requires_names_or_all(self, argv: list[str]) -> None:
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(argv)
+        assert exc.value.code == 2
+
+    def test_stop_accepts_bundle_all(self) -> None:
+        args = crony_cli._build_parser().parse_command(
+            ["stop", "--all", "-b", "backups"]
+        )
+        assert args.command == "stop"
+        assert args.bundle == "backups"
+        assert args.jobs == []
+
     """`crony --help` surfaces the overview appended to the epilog."""
 
     def test_help_includes_overview(self) -> None:

@@ -750,6 +750,7 @@ def _stub_start_sync(
         job_timeout: float,
         start_timeout: float,
         wait_budget: float = math.inf,
+        **_kwargs: object,
     ) -> dict[str, Any]:
         ledger.append(
             {

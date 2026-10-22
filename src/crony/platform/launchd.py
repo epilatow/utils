@@ -15,6 +15,7 @@ import dataclasses
 import os
 import plistlib
 import re
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -584,6 +585,12 @@ class LaunchdScheduler(Scheduler):
     def start(self, name: str) -> None:
         # kickstart invokes now; `start` only queues the next fire.
         self._run_checked(["launchctl", "kickstart", self._gui(name)])
+
+    def stop(self, name: str, signum: int) -> None:
+        # kill leaves the label and its KeepAlive supervision registered.
+        self._run_checked(
+            ["launchctl", "kill", signal.Signals(signum).name, self._gui(name)]
+        )
 
     def prune_units(self, name: str, keep: set[str]) -> None:
         # Remove every discovered plist not in `keep`, booting out its own

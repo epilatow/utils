@@ -220,20 +220,26 @@ class _ExitOutcome(NamedTuple):
     `signal` is set to the killing signal number when the process was
     terminated by a signal, and None when it exited normally. `rc` is
     0 in the signal case and the process's own exit code otherwise.
+    `stop_signal` is the stop delivered to the runner, even when the
+    command handles it and exits normally.
     """
 
     rc: int
     signal: int | None
+    stop_signal: int | None = None
 
 
-# The scheduler-stop signals the guard relays into a run's session (and a
-# scheduler that signals a unit's whole process tree delivers directly as
-# well). A runner that has taken on its run does not die on these: a job
-# runner turns one arriving before its command starts into a recorded stop
-# (`_raise_on_stop`), and a runner otherwise ignores them so it survives to
-# record its outcome; the command, which keeps the default dispositions,
-# still dies on them.
-_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# Stop signals handled by the runner. Ordinary stops reach the whole run
+# session; the operator-stop message reaches only the runner, before the
+# guard sends SIGTERM to the session. Before command launch they unwind
+# into recording; afterward they are noted without interrupting the wait.
+USER_STOP_SIGNAL = signal.SIGUSR2
+_STOP_SIGNALS = (
+    signal.SIGTERM,
+    signal.SIGINT,
+    signal.SIGHUP,
+    USER_STOP_SIGNAL,
+)
 # Every signal the guard sends a run: the stops it relays, plus the SIGUSR1
 # hint it sends the runner alone just before it kills a run for its
 # timeout. A runner handles the hint alongside the stops, and like them it
@@ -258,6 +264,11 @@ class _StopRequested(BaseException):
         return self.signum == signal.SIGUSR1
 
 
+def _termination_signal(signum: int) -> int:
+    """Translate an operator-stop message into normal command termination."""
+    return signal.SIGTERM if signum == USER_STOP_SIGNAL else signum
+
+
 def _ignore_signals(sigs: tuple[int, ...]) -> None:
     """SIG_IGN each of `sigs`, making a runner passive to the guard's
     stop / timeout signals: it survives to record (or, if it hangs, until
@@ -269,11 +280,12 @@ def _ignore_signals(sigs: tuple[int, ...]) -> None:
         signal.signal(s, signal.SIG_IGN)
 
 
-def _raise_on_stop() -> None:
-    """Install the job runner's pre-command stop handler: a stop signal or
-    the guard's timeout hint raises `_StopRequested`, so `_run_job` records
-    the run as stopped, or timed out, before its command ran instead of
-    the runner dying unrecorded.
+def _raise_on_stop(sigs: tuple[int, ...] = _GUARD_SIGNALS) -> None:
+    """Raise `_StopRequested` on `sigs`, defaulting to all guard signals.
+
+    A caller that handles a timeout hint separately passes only stop
+    signals. Unwinding lets it record before exiting instead of dying
+    unrecorded.
 
     Raising, rather than setting a flag, is what makes the pre-command
     waits interruptible: a handler that returns lets an interrupted
@@ -289,7 +301,7 @@ def _raise_on_stop() -> None:
         _ignore_signals(_GUARD_SIGNALS)
         raise _StopRequested(signum)
 
-    for s in _GUARD_SIGNALS:
+    for s in sigs:
         signal.signal(s, _on_stop)
 
 
@@ -317,11 +329,12 @@ def _exec_command(
       the SIGTERM that kills a timed-out run, so a returned ``True`` means
       "killed for exceeding the timeout" -- the caller records TIMEOUT
       rather than a plain signal death.
-    - Just after the spawn, SIGTERM / SIGINT / SIGHUP are ignored, so the
-      stop signal the guard relays into the session does not take the
-      runner down before it records; the command, unaffected, still dies
-      on it. A stop the runner noted during the spawn is passed on to the
+    - SIGTERM / SIGINT / SIGHUP record the stop signal without unwinding
+      the wait. The command receives the stop independently. A stop
+      the runner noted during the spawn is passed on to the
       command, which may have started too late to receive it.
+    - SIGUSR2 identifies an operator stop. A later SIGTERM does not erase
+      that reason; a command spawned after the hint receives SIGTERM.
 
     With the command running and those handlers in place, it signals the
     guard to arm the cap from this moment (`_arm_guard`), which is what
@@ -341,7 +354,8 @@ def _exec_command(
 
     def _note_stop(signum: int, _frame: object) -> None:
         nonlocal spawn_stop
-        spawn_stop = signum
+        if spawn_stop != USER_STOP_SIGNAL:
+            spawn_stop = signum
 
     for s in _STOP_SIGNALS:
         signal.signal(s, _note_stop)
@@ -352,14 +366,13 @@ def _exec_command(
         stderr=subprocess.STDOUT,
         env=env,
     )
-    _ignore_signals(_STOP_SIGNALS)
     if spawn_stop is not None:
-        proc.send_signal(spawn_stop)
+        proc.send_signal(_termination_signal(spawn_stop))
     _arm_guard()
     rc = proc.wait()
     if rc < 0:
-        return _ExitOutcome(rc=0, signal=-rc), timed_out
-    return _ExitOutcome(rc=rc, signal=None), timed_out
+        return _ExitOutcome(rc=0, signal=-rc, stop_signal=spawn_stop), timed_out
+    return _ExitOutcome(rc=rc, signal=None, stop_signal=spawn_stop), timed_out
 
 
 def _signal_label(sig: int) -> str:
@@ -607,6 +620,9 @@ def _run_job(snap: crony.model.Job) -> int:
     outcome is recorded; a running command dies on the stop itself
     (`_exec_command`).
 
+    An operator-stop signal records `stopped`, without notification or
+    exit-history changes. The command's own exit detail is preserved.
+
     For a daemon the code is instead a message to the supervisor about
     whether to restart: ExitCode.DAEMON_EXITED when the command exited
     cleanly (bring it back), and 0 for a gated skip, lock contention, or
@@ -828,13 +844,29 @@ def _run_job(snap: crony.model.Job) -> int:
                 outcome, timed_out = _exec_command(
                     argv, env=env, log_file=log_file
                 )
-                rc, sig = outcome
-                if timed_out:
+                rc, sig = outcome.rc, outcome.signal
+                stop_signal = outcome.stop_signal
+                user_stopped = stop_signal == USER_STOP_SIGNAL
+                if stop_signal is not None:
+                    stop_signal = _termination_signal(stop_signal)
+                if user_stopped:
+                    assert stop_signal is not None
+                    exit_class = crony.model.ExitClass.STOPPED
+                    exit_code: int | None = rc if sig is None else None
+                    surfaced_rc = (
+                        int(crony.errors.ExitCode.DAEMON_EXITED)
+                        if is_daemon
+                        else 128 + stop_signal
+                    )
+                    _write_crony_line(
+                        log_file, log_path, "run stopped by user request"
+                    )
+                elif timed_out:
                     # The guard sent SIGUSR1 before the SIGTERM that
                     # stopped it: the run was killed for exceeding its
                     # timeout, recorded as such rather than a signal death.
                     exit_class = crony.model.ExitClass.TIMEOUT
-                    exit_code: int | None = None
+                    exit_code = None
                     sig = None
                     surfaced_rc = int(crony.errors.ExitCode.TIMEOUT)
                     # Say so in the log too. A killed command's output just
@@ -881,7 +913,13 @@ def _run_job(snap: crony.model.Job) -> int:
                 return _record_outcome(
                     snap,
                     log_file,
-                    _RunOutcome(exit_class, exit_code, sig, surfaced_rc),
+                    _RunOutcome(
+                        exit_class,
+                        exit_code,
+                        sig,
+                        surfaced_rc,
+                        stop_signal if user_stopped else None,
+                    ),
                     gate=gate,
                     started=started,
                     started_iso=started_iso,
@@ -953,6 +991,7 @@ class _RunOutcome(NamedTuple):
     exit_code: int | None
     signal: int | None
     surfaced_rc: int
+    stop_signal: int | None = None
 
 
 def _record_outcome(
@@ -972,15 +1011,21 @@ def _record_outcome(
     maintain the notify-success-ratio window, dispatch failure
     notifications, and write the record. Returns the code the runner
     surfaces, which exhausting a daemon's budget can override (as it can
-    the class) from what `outcome` says.
+    the class) from what `outcome` says. An operator stop leaves both
+    histories untouched and sends no notification.
     """
     full_name = str(snap.entity_name)
     sd = snap.state_dir
     log_path = snap.log_path_resolved
-    exit_class, exit_code, sig, surfaced_rc = outcome
+    exit_class, exit_code, sig, surfaced_rc, stop_signal = outcome
+    if exit_class == crony.model.ExitClass.STOPPED:
+        notify_channels = []
     duration_sec = time.time() - started
     ended_at = crony.runtime.now_iso()
-    if crony.unit.is_daemon(snap.timing):
+    if (
+        crony.unit.is_daemon(snap.timing)
+        and exit_class != crony.model.ExitClass.STOPPED
+    ):
         retry_history = crony.runtime.record_daemon_exit(
             sd, duration_sec, exit_class, ended_at
         )
@@ -1030,6 +1075,7 @@ def _record_outcome(
         gate=gate,
         log_path=str(snap.log_path),
         notifications=notifications,
+        stop_signal=stop_signal,
     )
 
     # Maintain the exit-history window only when the ratio can actually
@@ -1038,7 +1084,7 @@ def _record_outcome(
     # completion -- OK runs are the successes the window needs, and it must
     # not depend on notify_channels, or toggling channels would punch gaps in
     # the window.
-    if success_ratio.n > 1:
+    if success_ratio.n > 1 and exit_class != crony.model.ExitClass.STOPPED:
         history = crony.runtime.append_exit_history(
             sd, exit_class, result.ended_at
         )
@@ -1046,9 +1092,10 @@ def _record_outcome(
     else:
         successes = None
 
-    should_dispatch = exit_class != crony.model.ExitClass.OK and bool(
-        notify_channels
-    )
+    should_dispatch = exit_class not in (
+        crony.model.ExitClass.OK,
+        crony.model.ExitClass.STOPPED,
+    ) and bool(notify_channels)
     if (
         should_dispatch
         and successes is not None
@@ -1104,35 +1151,45 @@ def _record_pre_command_stop(
     started_iso: str,
 ) -> int:
     """Record a job run stopped by `signum` before its command started,
-    and return the exit code the runner surfaces for it: 128 + `signum`,
-    as for a signal-killed command. The runner exits the launch with it
-    (through any guard, which passes a run's own exit through), so the
-    scheduler's view of the launch agrees with the record.
+    and return its surfaced exit: DAEMON_EXITED for a user-stopped daemon,
+    otherwise 128 + `signum`, as for a signal-killed command. The guard passes
+    that exit through, so the scheduler's view agrees with the record.
 
-    The run is `canceled` -- it never got to its command -- with the
-    signal that stopped it and whatever gate result it had reached. It
+    The run is `stopped` for an operator-stop signal, else `canceled`, with
+    the command's termination signal and whatever gate result it reached. It
     dispatches no notification and adds nothing to the exit history: a
     stop is neither an outcome of the command nor a daemon exiting on its
     own. Runs with every guard signal already ignored (`_raise_on_stop`
     disarms before raising), so a further one cannot cut the record short.
     """
     sd = snap.state_dir
+    user_stopped = signum == USER_STOP_SIGNAL
+    signum = _termination_signal(signum)
     _reclaim_interrupted_launch(sd)
     _write_crony_line(
         log_file,
         snap.log_path_resolved,
         f"run stopped by {_signal_label(signum)} before its command ran",
     )
-    process_exit = 128 + signum
+    process_exit = (
+        int(crony.errors.ExitCode.DAEMON_EXITED)
+        if user_stopped and crony.unit.is_daemon(snap.timing)
+        else 128 + signum
+    )
     result = crony.model.JobRunResult(
         host=crony.platform.current_host(),
         platform=crony.platform.current_platform(),
         started_at=started_iso,
         ended_at=crony.runtime.now_iso(),
         duration_sec=time.time() - started,
-        exit_class=crony.model.ExitClass.CANCELED,
+        exit_class=(
+            crony.model.ExitClass.STOPPED
+            if user_stopped
+            else crony.model.ExitClass.CANCELED
+        ),
         exit_code=None,
         signal=signum,
+        stop_signal=signum if user_stopped else None,
         process_exit=process_exit,
         gate=gate,
         log_path=str(snap.log_path),
@@ -1258,9 +1315,6 @@ def _run_group(snap: crony.model.JobGroup) -> int:
 
     try:
         with crony.runtime.acquire_lock(lock_path):
-            # Left in place on exit; see `_run_job` for the run.pid
-            # lifecycle.
-            pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
             # Scope any killed-flag to this run: clear a stale one so it
             # cannot mislabel a later crash as a timeout (see `_run_job`).
             (sd / "killed.flag").unlink(missing_ok=True)
@@ -1272,86 +1326,229 @@ def _run_group(snap: crony.model.JobGroup) -> int:
             # A child that ran and failed is the child's problem and is
             # deliberately not recorded here (see `_group_exit_class`).
             faults: list[_GroupFault] = []
-            # The group runner enforces its own cumulative budget and
-            # records the timeout itself; its guard is only a backstop for
-            # the group runner wedging. So it ignores the guard's signals
-            # (the SIGUSR1 hint too, or a default disposition would kill
-            # it) -- a normal timeout self-records, a wedged one rides to
-            # the guard's SIGKILL and reads as a timeout via the flag.
-            _ignore_signals(_GUARD_SIGNALS)
-            try:
-                # Resolve each child ref to its current full name via
-                # the child's own snapshot. A None resolution means the
-                # child has no state dir on this host -- log it, record a
-                # fail row, and count it as a fault of the group (which
-                # could not run that child).
-                resolved_children: list[
-                    tuple[crony.unit.EntityRef, str | None]
-                ] = [
-                    (child_ref, _child_full_name_from_uuid(child_ref))
-                    for child_ref in snap.children
-                ]
-                resolved_pairs = [
-                    (r, n) for r, n in resolved_children if n is not None
-                ]
-                header_children = [
-                    n if n is not None else str(r) for r, n in resolved_children
-                ]
-                timeout_label = (
-                    "none" if snap.timeout == 0 else f"{snap.timeout}s"
-                )
-                header = (
-                    f"\n=== {started_iso} group {full_name} "
-                    f"children={header_children} "
-                    f"timeout={timeout_label} pid={os.getpid()} ===\n"
-                ).encode()
-                log_file.write(header)
+            active_child: str | None = None
+            stop_signal: int | None = None
+            user_stopped = False
+            timeout_hint = False
 
-                deadline = (
-                    math.inf
-                    if snap.timeout == 0
-                    else time.monotonic() + snap.timeout
-                )
-                for child_ref, child_full_name in resolved_pairs:
-                    child_sd = crony.model.Job.state_dir_from_ref(child_ref)
-                    if _child_is_disabled(child_ref):
-                        # An operator-disabled child is intentionally not
-                        # run: skipping it is the group doing as it was
-                        # told, not a failure to run it, so record it
-                        # `gated` and move on without faulting the group.
-                        log_file.write(
-                            f"-> {child_full_name}: skipped "
-                            f"(disabled)\n".encode()
-                        )
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=child_full_name,
-                                exit_class=crony.model.ExitClass.GATED,
-                                exit_code=0,
+            def note_timeout(_signum: int, _frame: object) -> None:
+                nonlocal timeout_hint
+                timeout_hint = True
+
+            resolved_children: list[
+                tuple[crony.unit.EntityRef, str | None]
+            ] = []
+            try:
+                try:
+                    # The guard's hint distinguishes its timeout backstop
+                    # from an ordinary stop while a child is in flight.
+                    signal.signal(signal.SIGUSR1, note_timeout)
+                    _raise_on_stop(_STOP_SIGNALS)
+                    pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+                    # Resolve each child ref to its current full name via
+                    # the child's own snapshot. A None resolution means the
+                    # child has no state dir on this host -- log it, record a
+                    # fail row, and count it as a fault of the group (which
+                    # could not run that child).
+                    resolved_children = [
+                        (child_ref, _child_full_name_from_uuid(child_ref))
+                        for child_ref in snap.children
+                    ]
+                    resolved_pairs = [
+                        (r, n) for r, n in resolved_children if n is not None
+                    ]
+                    header_children = [
+                        n if n is not None else str(r)
+                        for r, n in resolved_children
+                    ]
+                    timeout_label = (
+                        "none" if snap.timeout == 0 else f"{snap.timeout}s"
+                    )
+                    header = (
+                        f"\n=== {started_iso} group {full_name} "
+                        f"children={header_children} "
+                        f"timeout={timeout_label} pid={os.getpid()} ===\n"
+                    ).encode()
+                    log_file.write(header)
+
+                    deadline = (
+                        math.inf
+                        if snap.timeout == 0
+                        else time.monotonic() + snap.timeout
+                    )
+                    for child_ref, child_full_name in resolved_pairs:
+                        active_child = None
+
+                        def mark_dispatched(
+                            name: str = child_full_name,
+                        ) -> None:
+                            nonlocal active_child
+                            active_child = name
+
+                        child_sd = crony.model.Job.state_dir_from_ref(child_ref)
+                        if _child_is_disabled(child_ref):
+                            # An operator-disabled child is intentionally not
+                            # run: skipping it is the group doing as it was
+                            # told, not a failure to run it, so record it
+                            # `gated` and move on without faulting the group.
+                            log_file.write(
+                                f"-> {child_full_name}: skipped "
+                                f"(disabled)\n".encode()
                             )
-                        )
-                        continue
-                    if _child_is_interactive(child_ref):
-                        # Interactive children fire async (no wait,
-                        # no budget deduction). Their own runner does
-                        # the user-active wait + dialog independently;
-                        # the parent group's outcome doesn't depend on
-                        # whether the user ever clicked Run Job.
-                        log_file.write(
-                            (
-                                f"-> {child_full_name}: dispatched "
-                                f"(interactive, async)\n"
-                            ).encode()
-                        )
-                        try:
-                            start_unit(child_full_name)
                             children.append(
                                 crony.model.GroupChildResult(
                                     name=child_full_name,
-                                    exit_class=crony.model.ExitClass.DISPATCHED,
+                                    exit_class=crony.model.ExitClass.GATED,
                                     exit_code=0,
                                 )
                             )
+                            continue
+                        if _child_is_interactive(child_ref):
+                            # Interactive children fire async (no wait,
+                            # no budget deduction). Their own runner does
+                            # the user-active wait + dialog independently;
+                            # the parent group's outcome doesn't depend on
+                            # whether the user ever clicked Run Job.
+                            log_file.write(
+                                (
+                                    f"-> {child_full_name}: dispatched "
+                                    f"(interactive, async)\n"
+                                ).encode()
+                            )
+                            try:
+                                start_unit(
+                                    child_full_name,
+                                    on_dispatched=mark_dispatched,
+                                )
+                                children.append(
+                                    crony.model.GroupChildResult(
+                                        name=child_full_name,
+                                        exit_class=crony.model.ExitClass.DISPATCHED,
+                                        exit_code=0,
+                                    )
+                                )
+                            except _CHILD_NOT_RUN as e:
+                                # The group could not run this child at all.
+                                log_file.write(f"   {e}\n".encode())
+                                faults.append(crony.model.ExitClass.FAIL)
+                                children.append(
+                                    crony.model.GroupChildResult(
+                                        name=child_full_name,
+                                        exit_class=crony.model.ExitClass.FAIL,
+                                        exit_code=int(e.exit_code),
+                                    )
+                                )
+                            continue
+
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            # The group's own budget ran out before it got to
+                            # this child, so the child never ran: the group's
+                            # fault, not the child's.
+                            log_file.write(
+                                (
+                                    f"-> {child_full_name}: TIMEOUT "
+                                    f"(group budget exhausted)\n"
+                                ).encode()
+                            )
+                            faults.append(crony.model.ExitClass.TIMEOUT)
+                            children.append(
+                                crony.model.GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class=crony.model.ExitClass.TIMEOUT,
+                                    exit_code=int(
+                                        crony.errors.ExitCode.TIMEOUT
+                                    ),
+                                )
+                            )
+                            continue
+
+                        child_timeout = _child_timeout_from_snapshot(child_ref)
+                        # Both bounds are logged because they bound different
+                        # things: neither alone says how long the group will
+                        # sit here.
+                        cap_label = (
+                            "none"
+                            if math.isinf(child_timeout)
+                            else f"{child_timeout:g}s"
+                        )
+                        budget_label = (
+                            "none"
+                            if math.isinf(remaining)
+                            else f"{remaining:.0f}s"
+                        )
+                        log_file.write(
+                            (
+                                f"-> {child_full_name} (timeout={cap_label}, "
+                                f"budget-left={budget_label})\n"
+                            ).encode()
+                        )
+                        try:
+                            # The child's own cap and the group's remaining
+                            # budget go to the waiter separately, not as the
+                            # smaller of the two: it keeps them apart, and the
+                            # exception it raises says which verdict to record.
+                            rec = start_unit_wait(
+                                child_full_name,
+                                state_dir=child_sd,
+                                job_timeout=child_timeout,
+                                start_timeout=start_timeout,
+                                wait_budget=remaining,
+                                on_dispatched=mark_dispatched,
+                            )
+                        except crony.errors.RunnerCrashed as e:
+                            # The child ran and was killed before it could
+                            # record a result. The group DID run it, so the
+                            # crash is the child's outcome -- its own row says
+                            # `crashed`, reached independently by reconciling
+                            # its stale pid -- and never a fault of the group.
+                            log_file.write(f"   {e}\n".encode())
+                            children.append(
+                                crony.model.GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class=crony.model.ExitClass.FAIL,
+                                    exit_code=int(e.exit_code),
+                                )
+                            )
+                            continue
+                        except crony.errors.StartTimeout as e:
+                            # No runner ever appeared, so the child never ran:
+                            # the group failed to run it. Caught before the
+                            # JobTimeoutError arm below -- it is a subclass.
+                            log_file.write(f"   {e}\n".encode())
+                            faults.append(crony.model.ExitClass.TIMEOUT)
+                            children.append(
+                                crony.model.GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class=crony.model.ExitClass.TIMEOUT,
+                                    exit_code=int(
+                                        crony.errors.ExitCode.TIMEOUT
+                                    ),
+                                )
+                            )
+                            continue
+                        except crony.errors.JobTimeoutError as e:
+                            # Raised only once the child was seen running, so
+                            # the group got it running: no fault of the group,
+                            # whichever allowance then ran out. That covers the
+                            # group giving up on a still-live child because its
+                            # own budget expired mid-wait -- deliberately, since
+                            # the child goes on running under its own unit and
+                            # its row reports what it does, and no later child
+                            # was starved of its turn (a budget that starves one
+                            # faults the group on the `remaining <= 0` path
+                            # above, before dispatch).
+                            log_file.write(f"   {e}\n".encode())
+                            children.append(
+                                crony.model.GroupChildResult(
+                                    name=child_full_name,
+                                    exit_class=crony.model.ExitClass.TIMEOUT,
+                                    exit_code=int(
+                                        crony.errors.ExitCode.TIMEOUT
+                                    ),
+                                )
+                            )
+                            continue
                         except _CHILD_NOT_RUN as e:
                             # The group could not run this child at all.
                             log_file.write(f"   {e}\n".encode())
@@ -1363,175 +1560,106 @@ def _run_group(snap: crony.model.JobGroup) -> int:
                                     exit_code=int(e.exit_code),
                                 )
                             )
-                        continue
-
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # The group's own budget ran out before it got to
-                        # this child, so the child never ran: the group's
-                        # fault, not the child's.
+                            continue
+                        cls = (
+                            crony.model.ExitClass.parse(rec.get("exit_class"))
+                            or crony.model.ExitClass.FAIL
+                        )
+                        rc = start_exit_code(rec)
                         log_file.write(
-                            (
-                                f"-> {child_full_name}: TIMEOUT "
-                                f"(group budget exhausted)\n"
-                            ).encode()
+                            f"   finished: {cls} (exit {rc})\n".encode()
                         )
-                        faults.append(crony.model.ExitClass.TIMEOUT)
                         children.append(
                             crony.model.GroupChildResult(
                                 name=child_full_name,
-                                exit_class=crony.model.ExitClass.TIMEOUT,
-                                exit_code=int(crony.errors.ExitCode.TIMEOUT),
-                            )
-                        )
-                        continue
-
-                    child_timeout = _child_timeout_from_snapshot(child_ref)
-                    # Both bounds are logged because they bound different
-                    # things: neither alone says how long the group will
-                    # sit here.
-                    cap_label = (
-                        "none"
-                        if math.isinf(child_timeout)
-                        else f"{child_timeout:g}s"
-                    )
-                    budget_label = (
-                        "none" if math.isinf(remaining) else f"{remaining:.0f}s"
-                    )
-                    log_file.write(
-                        (
-                            f"-> {child_full_name} (timeout={cap_label}, "
-                            f"budget-left={budget_label})\n"
-                        ).encode()
-                    )
-                    try:
-                        # The child's own cap and the group's remaining
-                        # budget go to the waiter separately, not as the
-                        # smaller of the two: it keeps them apart, and the
-                        # exception it raises says which verdict to record.
-                        rec = start_unit_wait(
-                            child_full_name,
-                            state_dir=child_sd,
-                            job_timeout=child_timeout,
-                            start_timeout=start_timeout,
-                            wait_budget=remaining,
-                        )
-                    except crony.errors.RunnerCrashed as e:
-                        # The child ran and was killed before it could
-                        # record a result. The group DID run it, so the
-                        # crash is the child's outcome -- its own row says
-                        # `crashed`, reached independently by reconciling
-                        # its stale pid -- and never a fault of the group.
-                        log_file.write(f"   {e}\n".encode())
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=child_full_name,
-                                exit_class=crony.model.ExitClass.FAIL,
-                                exit_code=int(e.exit_code),
-                            )
-                        )
-                        continue
-                    except crony.errors.StartTimeout as e:
-                        # No runner ever appeared, so the child never ran:
-                        # the group failed to run it. Caught before the
-                        # JobTimeoutError arm below -- it is a subclass.
-                        log_file.write(f"   {e}\n".encode())
-                        faults.append(crony.model.ExitClass.TIMEOUT)
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=child_full_name,
-                                exit_class=crony.model.ExitClass.TIMEOUT,
-                                exit_code=int(crony.errors.ExitCode.TIMEOUT),
-                            )
-                        )
-                        continue
-                    except crony.errors.JobTimeoutError as e:
-                        # Raised only once the child was seen running, so
-                        # the group got it running: no fault of the group,
-                        # whichever allowance then ran out. That covers the
-                        # group giving up on a still-live child because its
-                        # own budget expired mid-wait -- deliberately, since
-                        # the child goes on running under its own unit and
-                        # its row reports what it does, and no later child
-                        # was starved of its turn (a budget that starves one
-                        # faults the group on the `remaining <= 0` path
-                        # above, before dispatch).
-                        log_file.write(f"   {e}\n".encode())
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=child_full_name,
-                                exit_class=crony.model.ExitClass.TIMEOUT,
-                                exit_code=int(crony.errors.ExitCode.TIMEOUT),
-                            )
-                        )
-                        continue
-                    except _CHILD_NOT_RUN as e:
-                        # The group could not run this child at all.
-                        log_file.write(f"   {e}\n".encode())
-                        faults.append(crony.model.ExitClass.FAIL)
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=child_full_name,
-                                exit_class=crony.model.ExitClass.FAIL,
-                                exit_code=int(e.exit_code),
-                            )
-                        )
-                        continue
-                    cls = (
-                        crony.model.ExitClass.parse(rec.get("exit_class"))
-                        or crony.model.ExitClass.FAIL
-                    )
-                    rc = start_exit_code(rec)
-                    log_file.write(f"   finished: {cls} (exit {rc})\n".encode())
-                    children.append(
-                        crony.model.GroupChildResult(
-                            name=child_full_name,
-                            exit_class=cls,
-                            exit_code=rc,
-                        )
-                    )
-
-                # Synthetic FAIL rows for children whose snapshot is
-                # absent on this host (rename mid-flight, partial
-                # state wipe, or a uuid the parent's snapshot still
-                # references but no child snapshot resolves). Emitted
-                # after the dispatch loop so log order matches the
-                # header's child list.
-                for child_ref, resolved_name in resolved_children:
-                    if resolved_name is None:
-                        # Unresolvable child: the group could not run it.
-                        log_file.write(
-                            (
-                                f"-> ref {child_ref}: "
-                                f"no snapshot on this host (FAIL)\n"
-                            ).encode()
-                        )
-                        faults.append(crony.model.ExitClass.FAIL)
-                        children.append(
-                            crony.model.GroupChildResult(
-                                name=str(child_ref),
-                                exit_class=crony.model.ExitClass.FAIL,
-                                exit_code=int(
-                                    crony.errors.ExitCode.PRECONDITION
-                                ),
+                                exit_class=cls,
+                                exit_code=rc,
                             )
                         )
 
+                    # Synthetic FAIL rows for children whose snapshot is
+                    # absent on this host (rename mid-flight, partial
+                    # state wipe, or a uuid the parent's snapshot still
+                    # references but no child snapshot resolves). Emitted
+                    # after the dispatch loop so log order matches the
+                    # header's child list.
+                    for child_ref, resolved_name in resolved_children:
+                        if resolved_name is None:
+                            # Unresolvable child: the group could not run it.
+                            log_file.write(
+                                (
+                                    f"-> ref {child_ref}: "
+                                    f"no snapshot on this host (FAIL)\n"
+                                ).encode()
+                            )
+                            faults.append(crony.model.ExitClass.FAIL)
+                            children.append(
+                                crony.model.GroupChildResult(
+                                    name=str(child_ref),
+                                    exit_class=crony.model.ExitClass.FAIL,
+                                    exit_code=int(
+                                        crony.errors.ExitCode.PRECONDITION
+                                    ),
+                                )
+                            )
+
+                except _StopRequested as stop:
+                    user_stopped = stop.signum == USER_STOP_SIGNAL
+                    stop_signal = _termination_signal(stop.signum)
+                    if active_child is not None and not any(
+                        child.name == active_child for child in children
+                    ):
+                        children.append(
+                            crony.model.GroupChildResult(
+                                name=active_child,
+                                exit_class=crony.model.ExitClass.DISPATCHED,
+                                exit_code=0,
+                            )
+                        )
+                    reached = {child.name for child in children}
+                    remaining_names = [
+                        name if name is not None else str(ref)
+                        for ref, name in resolved_children
+                        if (name if name is not None else str(ref))
+                        not in reached
+                    ]
+                    _write_crony_line(
+                        log_file,
+                        log_path,
+                        f"group {'timed out' if timeout_hint else 'stopped'}; "
+                        "children never reached: "
+                        f"{remaining_names}",
+                    )
+                _ignore_signals(_GUARD_SIGNALS)
+                if stop_signal is None:
+                    exit_class = _group_exit_class(faults)
+                    process_exit = 0
+                elif timeout_hint:
+                    exit_class = crony.model.ExitClass.TIMEOUT
+                    process_exit = int(crony.errors.ExitCode.TIMEOUT)
+                else:
+                    exit_class = (
+                        crony.model.ExitClass.STOPPED
+                        if user_stopped
+                        else crony.model.ExitClass.CANCELED
+                    )
+                    process_exit = 128 + stop_signal
                 result = crony.model.GroupRunResult(
                     host=host,
                     platform=platform,
                     started_at=started_iso,
                     ended_at=crony.runtime.now_iso(),
                     duration_sec=time.time() - started,
-                    exit_class=_group_exit_class(faults),
-                    process_exit=0,
+                    exit_class=exit_class,
+                    process_exit=process_exit,
+                    stop_signal=stop_signal,
                     log_path=str(reported_log_path),
                     jobs_run=children,
                 )
                 crony.runtime.write_last_run(
                     last_run_path, dataclasses.asdict(result)
                 )
-                return 0
+                return process_exit
             finally:
                 log_file.close()
     except crony.errors.LockBusyError:
@@ -1549,6 +1677,7 @@ def start_unit(
     *,
     started_by_user: bool = False,
     state_dir: Path | None = None,
+    on_dispatched: Callable[[], None] | None = None,
 ) -> None:
     """Ask the platform scheduler to fire `name` immediately.
 
@@ -1576,6 +1705,10 @@ def start_unit(
     but it keeps the signal scoped to the dispatcher rather than
     sprinkled at the CLI handler.
 
+    `on_dispatched` is called after the scheduler accepts the start. Stop
+    signals are deferred until the callback finishes, so an interrupted
+    caller can account for every accepted dispatch.
+
     Raises `UnitNotInstalledError` if the platform unit file
     doesn't exist. Refusing early matters for the group-dispatch
     path: a parent's snapshot can name a child whose unit was
@@ -1597,19 +1730,30 @@ def start_unit(
         )
     if started_by_user and state_dir is not None:
         crony.runtime.write_user_start_flag(state_dir)
+    previous_mask = (
+        signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+        if on_dispatched is not None
+        else None
+    )
     succeeded = False
     try:
         crony.runtime.scheduler(platform).start(name)
         succeeded = True
+        if on_dispatched is not None:
+            on_dispatched()
     finally:
-        if started_by_user and state_dir is not None and not succeeded:
-            # Don't strand the bypass flag on disk if dispatch
-            # never reached the scheduler. The next legitimately
-            # scheduled fire would otherwise consume it and skip
-            # its wait silently.
-            crony.runtime.user_start_flag_path(state_dir).unlink(
-                missing_ok=True
-            )
+        try:
+            if started_by_user and state_dir is not None and not succeeded:
+                # Don't strand the bypass flag on disk if dispatch
+                # never reached the scheduler. The next legitimately
+                # scheduled fire would otherwise consume it and skip
+                # its wait silently.
+                crony.runtime.user_start_flag_path(state_dir).unlink(
+                    missing_ok=True
+                )
+        finally:
+            if previous_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _read_last_run(last_run_path: Path) -> dict[str, Any] | None:
@@ -1652,6 +1796,7 @@ def start_unit_wait(
     start_timeout: float,
     wait_budget: float = math.inf,
     started_by_user: bool = False,
+    on_dispatched: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Fire `full_name` via the platform and wait for completion.
 
@@ -1735,6 +1880,7 @@ def start_unit_wait(
         full_name,
         started_by_user=started_by_user,
         state_dir=state_dir if started_by_user else None,
+        on_dispatched=on_dispatched,
     )
 
     started_at = time.monotonic()
@@ -1884,6 +2030,10 @@ def start_exit_code(rec: dict[str, Any]) -> int:
     failure we can name, so it maps to 0.
     """
     exit_class = crony.model.ExitClass.parse(rec.get("exit_class"))
+    if exit_class is crony.model.ExitClass.STOPPED:
+        return 128 + int(
+            rec.get("stop_signal") or rec.get("signal") or signal.SIGTERM
+        )
     if exit_class is crony.model.ExitClass.OK:
         return 0
     rc = rec.get("exit_code")
@@ -1894,11 +2044,13 @@ def start_exit_code(rec: dict[str, Any]) -> int:
     if exit_class is crony.model.ExitClass.SIGNAL:
         sig = rec.get("signal")
         return 128 + int(sig) if sig else int(crony.errors.ExitCode.ERROR)
-    if exit_class is crony.model.ExitClass.CANCELED and rec.get("signal"):
+    if exit_class is crony.model.ExitClass.CANCELED and (
+        rec.get("signal") or rec.get("stop_signal")
+    ):
         # A run stopped before its command ran records the stopping
         # signal in place of an exit code, and exits 128 + it -- the code
         # the wait reports, as for a signal-killed command.
-        return 128 + int(rec["signal"])
+        return 128 + int(rec.get("signal") or rec["stop_signal"])
     if exit_class is crony.model.ExitClass.FAIL:
         # A record classified `fail` with no `exit_code` of its own: a
         # group that could not run one of its children (a group carries
@@ -1918,18 +2070,18 @@ def start_exit_code(rec: dict[str, Any]) -> int:
 # track -- it tracks the guard -- so nothing else reaps a session whose
 # command ignores the signal (and the runner outlives stop signals by
 # design, exiting only once it has recorded the run). So this grace, plus
-# the hint settle the guard sits out first when a stop lands during a
-# timeout kill (`_TIMEOUT_HINT_SETTLE_SEC`), MUST stay below every
+# the hint settle before an operator stop or timeout kill
+# (`_SIGNAL_HINT_SETTLE_SEC`), MUST stay below every
 # scheduler's stop-to-kill timeout. Past that the scheduler stops waiting
 # and treats the unit as gone while the guard is still tearing the run
 # down. Scheduler.stop_timeout_sec declares that deadline for each backend.
 _KILL_GRACE_SEC = 5
-# Pause after the SIGUSR1 timeout hint so the runner records it before the
-# SIGTERM that follows lands. Standard signals carry no delivery-ordering
+# Pause after a timeout or operator-stop hint so the runner handles it
+# before SIGTERM follows. Standard signals carry no delivery-ordering
 # guarantee (Linux signal(7): unspecified; macOS sigaction(2): only trap
 # signals ordered), and the runner-vs-job race is cross-process anyway, so
 # this separates the hint from the kill.
-_TIMEOUT_HINT_SETTLE_SEC = 1.0
+_SIGNAL_HINT_SETTLE_SEC = 1.0
 # Poll granularity while the guard waits for the killed session to drain,
 # small so a clean teardown returns promptly (the common case).
 _REAP_POLL_SEC = 0.1
@@ -2106,6 +2258,15 @@ def _await_wakeup(wake_r: int, timeout: float | None) -> None:
             pass
 
 
+def _signal_runner(sd: Path | None, pgid: int, signum: int) -> None:
+    """Notify this session's runner before terminating its command group."""
+    runner_pid = _read_runner_pid(sd)
+    if runner_pid is not None and _in_process_group(runner_pid, pgid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(runner_pid, signum)
+    time.sleep(_SIGNAL_HINT_SETTLE_SEC)
+
+
 def do_run_guard(cap: int, argv: list[str]) -> None:
     """Enforce a run's wallclock timeout and own all its killing.
     Platform schedulers invoke this; not user-facing.
@@ -2135,8 +2296,9 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
       leaves a killed-flag so status reads the run as a timeout.
     - on a scheduler stop (a received SIGTERM/SIGINT/SIGHUP): relay the
       same signal to the session, then the same grace -> SIGKILL. No
-      hint, so the runner records a stop: `canceled` when its command had
-      not started yet, else the command's plain signal death; no flag.
+      timeout hint; the runner classifies the stop and records its outcome.
+    - on an operator stop (SIGUSR2): notify only the runner with SIGUSR2,
+      then SIGTERM the session and use the same grace -> SIGKILL.
     - when the run ends on its own: SIGTERM whatever it left behind in the
       session -- a background child its command started, say -- then the
       same grace -> SIGKILL, so nothing of a finished run outlives the
@@ -2171,8 +2333,9 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
 
     def _on_stop(signum: int, _frame: object) -> None:
         nonlocal stop_signum
-        stop_signum = signum
-        if pgid is not None:
+        if stop_signum is None:
+            stop_signum = signum
+        if pgid is not None and signum != USER_STOP_SIGNAL:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signum)
 
@@ -2204,7 +2367,7 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
     # SIGUSR1 too would leave the guard dead with a new session starting.
     # The runner resets these to SIG_DFL at its own exec, so nothing is
     # inherited.
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for sig in _STOP_SIGNALS:
         signal.signal(sig, _on_stop)
     signal.signal(signal.SIGUSR1, _on_arm)
     signal.signal(signal.SIGCHLD, _on_child)
@@ -2220,25 +2383,25 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
         deadline = time.monotonic() + cap
     while True:
         if stop_signum is not None:
-            # The stop was already relayed into the session; escalate to
-            # SIGKILL if it does not die. Not a timeout: no hint, no flag.
+            if stop_signum == USER_STOP_SIGNAL:
+                _signal_runner(sd, pgid, USER_STOP_SIGNAL)
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGTERM)
+            # Ordinary stops are relayed by the handler. Escalate either
+            # kind when descendants survive the initial termination.
             _reap_session(
                 proc, pgid, sd, timed_out=False, launch_pid=launch_pid
             )
             raise SystemExit(
                 _killed_run_exit(
                     proc,
-                    128 + stop_signum,
+                    128 + _termination_signal(stop_signum),
                     recorded=_run_recorded(sd, launch_pid),
                 )
             )
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            runner_pid = _read_runner_pid(sd)
-            if runner_pid is not None and _in_process_group(runner_pid, pgid):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(runner_pid, signal.SIGUSR1)
-            time.sleep(_TIMEOUT_HINT_SETTLE_SEC)
+            _signal_runner(sd, pgid, signal.SIGUSR1)
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signal.SIGTERM)
             _reap_session(proc, pgid, sd, timed_out=True, launch_pid=launch_pid)
@@ -2256,22 +2419,12 @@ def do_run_guard(cap: int, argv: list[str]) -> None:
             _await_wakeup(wake_r, remaining)
             continue
         if stop_signum is not None:
-            # A stop landed after the check above and its relay already let
-            # the runner exit; still reap the session so a descendant that
-            # ignored the relayed signal does not outlive the guard.
-            _reap_session(
-                proc, pgid, sd, timed_out=False, launch_pid=launch_pid
-            )
-            raise SystemExit(
-                _killed_run_exit(
-                    proc,
-                    128 + stop_signum,
-                    recorded=_run_recorded(sd, launch_pid),
-                )
-            )
+            # Handle a stop that arrived during the completion check at
+            # the same point as one received while waiting.
+            continue
         if _group_alive(pgid):
             # The run ended on its own and left something in its session.
-            # A stop landing during this sweep is relayed by the handler
+            # An ordinary stop during this sweep is relayed by the handler
             # and changes nothing else: the run's outcome is already the
             # code it exited with.
             with contextlib.suppress(ProcessLookupError, PermissionError):

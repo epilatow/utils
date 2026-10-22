@@ -1413,6 +1413,7 @@ class ExitClass(StrEnum):
     SIGNAL = "signal"
     GATED = "gated"
     CANCELED = "canceled"
+    STOPPED = "stopped"
     DISPATCHED = "dispatched"
 
     @classmethod
@@ -1506,9 +1507,15 @@ class JobStatus(_DescribedStrEnum):
             "ran -- for an interactive job, one the user declined. A job "
             "whose command script is missing or not executable is canceled "
             "when its gate passes or it has no gate. A job "
-            "stopped before its command started (its unit stopped or "
+            "stopped by the scheduler before its command started (its unit "
+            "stopped or "
             "reloaded during its gate or interactive wait) is canceled too."
+            " A scheduler stop also cancels a group during child dispatch."
         ),
+    )
+    STOPPED = (
+        ExitClass.STOPPED,
+        "Jobs and groups. The last run was cut short by `crony stop`.",
     )
     CRASHED = (
         "crashed",
@@ -1718,6 +1725,8 @@ class _CommonRunResult:
     # Keyword-only so the subclasses can append their own non-default
     # fields after it.
     pid: int = field(default_factory=os.getpid, kw_only=True)
+    # The stop that cut the run short, independent of the command's outcome.
+    stop_signal: int | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -1730,6 +1739,10 @@ class JobRunResult(_CommonRunResult):
     `exit_code`. One that ran out its cap that early is an ordinary
     `timeout` -- the timeout code, and neither an `exit_code` nor a
     `signal`, since no command of its own ever ran.
+
+    A user stop records `stopped`, preserves the command's own exit detail,
+    and records the requested signal in `stop_signal`. It surfaces 128 plus
+    that signal, or DAEMON_EXITED for a daemon so supervision can restart it.
 
     A daemon's `process_exit` is instead what the supervisor is being
     told to do, so an ok run carries `ExitCode.DAEMON_EXITED` (restart
@@ -1769,8 +1782,8 @@ class GroupChildResult:
 @dataclass
 class GroupRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed group run. Its
-    `process_exit` is always 0 -- a group's outcome lives in
-    `exit_class`, not its process exit -- but it is still reconciled
+    `process_exit` is 0 on completion and 128 plus the signal on a stop.
+    A group's ordinary outcome lives in `exit_class`, but it is reconciled
     against the scheduler so a group whose parent launch was killed
     reads as `crashed`.
 

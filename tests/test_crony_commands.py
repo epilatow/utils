@@ -24,6 +24,7 @@ from enum import Enum, auto
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import tomlkit
@@ -68,6 +69,7 @@ from crony.errors import (  # noqa: E402
     ExitCode,
     LockBusyError,
     PreconditionError,
+    SubprocessError,
     UnitNotInstalledError,
     UsageError,
 )
@@ -10134,6 +10136,133 @@ def test_start_reports_pending_approval_bypass(
         crony_commands.do_start(["j"], False, None, None)
     assert "already running (bypassing pending approval)" in caplog.text
     assert crony_runtime.user_start_flag_path(sd).exists()
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+@pytest.mark.parametrize("running", [False, True])
+def test_stop_signals_only_running_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    platform: str,
+    running: bool,
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+    h.config(
+        {"job": {"j": {"command": "true", "on-demand": True}}},
+        default_target_jobs=["j"],
+    )
+    h.apply("j")
+    sd = h.state_dir("j")
+    observed: list[str] = []
+
+    def stop(
+        _scheduler: crony_platform.Scheduler, name: str, signum: int
+    ) -> None:
+        assert signum == crony_runner.USER_STOP_SIGNAL
+        observed.append(name)
+
+    backend = type(crony_runtime.scheduler())
+    caplog.set_level(logging.INFO)
+    with patch.object(backend, "stop", autospec=True, side_effect=stop):
+        if running:
+            with crony_runtime.acquire_lock(sd / "run.lock"):
+                crony_commands.do_stop(["j"], None)
+        else:
+            crony_commands.do_stop(["j"], None)
+    assert observed == ([h.full("j")] if running else [])
+    expected = "stopping" if running else "not running"
+    assert f"{h.full('j')}: {expected}" in caplog.text
+
+
+@pytest.mark.parametrize("daemon", [False, True])
+def test_stopped_status_is_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    daemon: bool,
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch)
+    h.config(
+        {
+            "job": {
+                "j": {
+                    "command": "true",
+                    "daemon": daemon,
+                    "on-demand": not daemon,
+                }
+            }
+        },
+        default_target_jobs=["j"],
+    )
+    h.apply("j")
+    (h.state_dir("j") / "last-run.json").write_text(
+        '{"exit_class":"stopped","process_exit":143,"stop_signal":15}',
+        encoding="utf-8",
+    )
+    crony_commands.do_status(
+        jobs=[],
+        cols=None,
+        show_masked=False,
+        bundle=None,
+        config_current=False,
+        config_pending=False,
+        exclude_healthy=True,
+    )
+    assert h.full("j") not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_stop_dispatch_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+    h.config(
+        {"job": {"j": {"command": "true", "on-demand": True}}},
+        default_target_jobs=["j"],
+    )
+    h.apply("j")
+    sd = h.state_dir("j")
+    backend = type(crony_runtime.scheduler())
+    with (
+        crony_runtime.acquire_lock(sd / "run.lock"),
+        patch.object(
+            backend,
+            "stop",
+            autospec=True,
+            side_effect=SubprocessError(1, ["scheduler", "stop"]),
+        ),
+        pytest.raises(SubprocessError),
+    ):
+        crony_commands.do_stop(["j"], None)
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_stop_racing_run_completion_is_successful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+    h.config(
+        {"job": {"j": {"command": "true", "on-demand": True}}},
+        default_target_jobs=["j"],
+    )
+    h.apply("j")
+    backend = type(crony_runtime.scheduler())
+    with (
+        patch.object(
+            crony_runtime,
+            "run_in_progress",
+            autospec=True,
+            side_effect=[True, False],
+        ),
+        patch.object(
+            backend,
+            "stop",
+            autospec=True,
+            side_effect=SubprocessError(3, ["scheduler", "stop"]),
+        ),
+    ):
+        crony_commands.do_stop(["j"], None)
 
 
 if __name__ == "__main__":

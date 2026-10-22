@@ -1073,13 +1073,13 @@ def _resolve_bulk_names(
     bundle: str | None,
     stamped: set[str],
 ) -> list[str]:
-    """Derive the operate-on name set for enable / disable / start.
+    """Derive the operate-on name set for enable / disable / start / stop.
 
     With positional `jobs`, normalize each via `resolve_cli_name`
     (which honors `-b`'s bundle-scoping rules). With no positionals
     (the `--all` path the parser requires), the set is every stamped
     name -- every kind (scheduled, grouped, group container), since a
-    disable / enable / start applies to all of them -- narrowed to
+    disable / enable / start / stop applies to all of them -- narrowed to
     `bundle` when one is given.
     """
     if jobs:
@@ -1165,6 +1165,29 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
     for full, ref, _unit_name in targets:
         crony.runtime.set_disabled(config, ref, disabled=True)
         logger.info("%s: disabled", full)
+
+
+def do_stop(jobs: list[str], bundle: str | None) -> None:
+    """Request a stop of each running entry without changing its arming."""
+    config = crony.runtime.load_config()
+    config.require_addressable(bundle)
+    names = _resolve_bulk_names(jobs, bundle, config.installed_full_names())
+    targets = _resolve_action_targets(config, names, runnable_only=True)
+    for full, ref, unit_name in targets:
+        state_dir = crony.model.Job.state_dir_from_ref(ref)
+        if not crony.runtime.run_in_progress(state_dir):
+            logger.info("%s: not running", full)
+            continue
+        try:
+            crony.runtime.scheduler().stop(
+                unit_name, crony.runner.USER_STOP_SIGNAL
+            )
+        except crony.errors.SubprocessError:
+            if not crony.runtime.run_in_progress(state_dir):
+                logger.info("%s: not running", full)
+                continue
+            raise
+        logger.info("%s: stopping", full)
 
 
 def _report_start(full_name: str, state_dir: Path, *, running: bool) -> None:
@@ -2341,9 +2364,9 @@ def do_status(
     exclusive.
 
     `--exclude-healthy` drops rows where CONFIG is `synced`, the entry
-    is not disabled, and STATUS is `ok` / `never` / `gated` -- or, for a
-    daemon, `running` / `gated`. A daemon is healthy when it is up, or
-    when its gate deliberately kept it down; its other outcomes mean it
+    is not disabled, and STATUS is `ok` / `never` / `gated` / `stopped` --
+    or, for a daemon, `running` / `gated` / `stopped`. A daemon is healthy
+    when it is up, gated, or deliberately stopped; its other outcomes mean it
     stopped without being told to, where a scheduled job's next fire
     retries them. A disabled entry is unhealthy (it isn't firing), so it
     survives the filter, as does a scheduled job stuck mid-run. Output
@@ -2778,13 +2801,14 @@ def do_status(
         # indent, since the surviving rows won't reconstruct the
         # tree anyway and a half-indented subtree is more
         # confusing than a flat list. Healthy: `config == synced`
-        # AND not disabled AND `status` in {ok, never, gated}. A
+        # AND not disabled AND `status` in {ok, never, gated, stopped}. A
         # disabled entry is unhealthy because it isn't firing; its
         # SCHEDULE cell reads `disabled`. (A not-loaded unit is
         # already excluded by `config != synced` -- it reads broken.)
         # A daemon is healthy when it is up, or when it is deliberately
         # not up: `gated` means its own precondition declined to run it,
-        # which is the gate working, not a fault. Its other outcomes mean
+        # which is the gate working, not a fault. An operator stop is also
+        # healthy. Its other outcomes mean
         # it stopped without being told to, so they survive the filter.
         # A daemon that will be retried still surfaces: the retries are
         # bounded, and the filter has no way to know a given `fail` is
@@ -2794,9 +2818,11 @@ def do_status(
         healthy_status = {
             crony.model.JobStatus.OK,
             crony.model.JobStatus.NEVER,
+            crony.model.JobStatus.STOPPED,
             crony.model.JobStatus.GATED,
         }
         healthy_daemon_status = {
+            crony.model.JobStatus.STOPPED,
             crony.model.JobStatus.RUNNING,
             crony.model.JobStatus.GATED,
         }

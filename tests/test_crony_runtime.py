@@ -2393,6 +2393,7 @@ class TestDeriveJobStatus:
             ("timeout", crony_model.JobStatus.TIMEOUT),
             ("gated", crony_model.JobStatus.GATED),
             ("canceled", crony_model.JobStatus.CANCELED),
+            ("stopped", crony_model.JobStatus.STOPPED),
         ],
     )
     def test_recorded_exit_class(

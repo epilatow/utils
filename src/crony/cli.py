@@ -61,6 +61,9 @@ be grouped, and groups or jobs run on a schedule; a job can instead be a
 daemon, which runs continuously and gets five automatic restarts when it
 stops prematurely. An exhausted daemon stays loaded but stopped until the
 next login, `start`, `apply`, or `enable` starts a fresh retry budget.
+Stopping an enabled daemon will stop the currently running instance,
+but it will subsequently be automatically restarted. A disabled daemon
+stays stopped.
 Jobs can also be managed manually (enabled/disabled independently of the
 underlying scheduler, and run at will via the `start` subcommand). Crony
 supports the following notification mechanisms for job failures:
@@ -70,7 +73,7 @@ Subcommands fall into categories:
 - configuration (`config`): manage config files
 - deployment (`apply`, `destroy`): deploy configured jobs
 - runtime state (`enable`, `disable`): manage scheduler arming
-- operational (`status`, `logs`, `start`): manage deployed jobs
+- operational (`status`, `logs`, `start`, `stop`): manage deployed jobs
 
 Configuration is managed via bundles:
 - `~/.config/crony/config.toml` -> bundle name "default"
@@ -289,7 +292,7 @@ def _require_names_or_all(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
     """Shared precondition for the bulk verbs (enable / disable /
-    start): require either positional names or `--all`, so an unscoped
+    start / stop): require either positional names or `--all`, so an unscoped
     invocation can't silently act on every stamped entry. `--all` may be
     narrowed by `--bundle`; it is consumed once validated (the handler
     infers the whole-set action from an empty name list)."""
@@ -559,6 +562,24 @@ def _build_parser() -> StrictArgumentParser:
     )
     p_start.add_validate_callback(_validate_start)
 
+    # stop
+    p_stop = subparsers.add_parser(
+        "stop",
+        help="Stop the named running jobs without disarming them.",
+        description=(
+            "Stop the named running jobs or groups without disarming their "
+            "schedules. An enabled daemon restarts automatically; a "
+            "disabled daemon stays stopped. Stopping a group leaves its "
+            "in-flight child running and dispatches no further children. "
+            "Returns once the scheduler accepts the request. "
+            "Requires a target: job(s) or --all."
+        ),
+    )
+    _add_jobs_argument(p_stop)
+    _add_all_argument(p_stop)
+    _add_bundle_argument(p_stop)
+    p_stop.add_validate_callback(_require_names_or_all)
+
     # status
     p_status = subparsers.add_parser(
         "status",
@@ -612,9 +633,9 @@ def _build_parser() -> StrictArgumentParser:
         action="store_true",
         help=(
             "Drop rows that are config=synced, enabled in the "
-            "scheduler, and last in ok/never/gated -- or, for a "
-            "daemon, running/gated (up, or deliberately kept down by "
-            "its gate). Output is flat (no tree indent). Always exits "
+            "scheduler, and last in ok/never/gated/stopped -- or, for a "
+            "daemon, running/gated/stopped (up, or deliberately down). "
+            "Output is flat (no tree indent). Always exits "
             "0 -- this is a filter on the display, not a gate."
         ),
     )
@@ -754,6 +775,7 @@ _COMMAND_CALLBACKS: dict[str, Callable[..., None]] = {
     "enable": crony.commands.do_enable,
     "disable": crony.commands.do_disable,
     "start": crony.commands.do_start,
+    "stop": crony.commands.do_stop,
     "status": crony.commands.do_status,
     "logs": crony.commands.do_logs,
     crony.model.RUN_SUBCOMMAND: crony.runner.do_run,
