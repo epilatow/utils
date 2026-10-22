@@ -1685,17 +1685,27 @@ _RUN_SETTLE_TIMEOUT_SEC = 10.0
 _RUN_SETTLE_POLL_SEC = 0.05
 
 
-def _await_run_finished(state_dir: Path) -> None:
-    """Block until no run holds `state_dir`'s lock, bounded.
+def await_run_finished(
+    state_dir: Path, *, runner_pid: int | None = None
+) -> bool:
+    """Wait up to 10s for a run to end and record; report whether it did.
 
-    The unit is retired before this, but its run may still be ending.
-    A runner survives the stop signal so it can record its
-    outcome first. Without this the state dir could be removed while
-    that write is still in flight, recreating it as a stray. Bounded so
-    a wedged runner delays a destroy rather than hanging it."""
+    A free lock means recording has finished. With `runner_pid`, a new
+    instance holding the lock also proves that the original released it,
+    so an immediate respawn cannot extend the stopped instance's wait.
+    Without it, wait for all run activity to finish before state removal.
+    """
     deadline = time.monotonic() + _RUN_SETTLE_TIMEOUT_SEC
-    while run_in_progress(state_dir) and time.monotonic() < deadline:
+    while run_in_progress(state_dir):
+        if (
+            runner_pid is not None
+            and read_pid_file(state_dir / "run.pid") != runner_pid
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(_RUN_SETTLE_POLL_SEC)
+    return True
 
 
 def destroy_one(
@@ -1724,5 +1734,5 @@ def destroy_one(
         alias_dir.unlink()
     if state_dir is None or not state_dir.is_dir():
         return
-    _await_run_finished(state_dir)
+    await_run_finished(state_dir)
     shutil.rmtree(state_dir)

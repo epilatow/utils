@@ -17,6 +17,13 @@ A disabled daemon stays stopped.\&
 Jobs can also be managed manually (enabled/disabled independently of the underlying scheduler, and run at will via the \(gastart\(ga subcommand).\&
 Crony supports the following notification mechanisms for job failures: email/smtp, ntfy, and pop\-ups (on macOS/darwin).\&
 .PP
+By default, \(gastart\(ga and \(gastop\(ga return once the scheduler accepts the request.\&
+\(gaenable\(ga, \(gadisable\(ga, \(gaapply\(ga, and \(gadestroy\(ga wait for any run they stop, but do not wait for a run they start.\&
+On \(gastart\(ga, \(gastop\(ga, \(gaenable\(ga, and \(gaapply\(ga, \(ga\-s/\-\-sync\(ga also waits until the requested effect is in place, and fails with the timeout exit code if its bounded wait expires.\&
+With \(ga\-\-sync\(ga, targets are requested and waited for one at a time; a timeout aborts the command before later targets are requested.\&
+\(gastart \-\-wait\(ga waits for completion and returns the run\(aqs exit code; it is mutually exclusive with \(ga\-\-sync\(ga.\&
+\(gadisable\(ga and \(gadestroy\(ga already wait for the runs they stop.\&
+.PP
 Subcommands fall into categories:
 .PD 0
 .IP \(bu 2
@@ -113,18 +120,22 @@ Without \-\-bundle every bundle file is scanned; with it, only that bundle\(aqs 
 \f[B]config generate\-uuid\f[R]
 Print one freshly\-minted UUID.\&
 .TP
-\f[B]apply\f[R] [\-v] [\-b BUNDLE] [job ...]\&
+\f[B]apply\f[R] [\-v] [\-b BUNDLE] [\-s] [job ...]\&
 Render and activate platform units to match config.\&
 With no job arguments this is a full sync (install missing, fix drift, remove orphans); with names it surgically updates just those entries.\&
 A daemon left stopped by an exhausted retry budget or a declined gate is restarted with a fresh budget, reported as \(garearmed\(ga.\&
+With \-\-sync, also wait for each daemon started by this apply to come up, bounded by its bundle\(aqs start\-timeout\-sec.\&
 .RS
 .TP
 \f[CR]\-v, \-\-verbose\f[R]
 Also print \(aqunchanged\(aq lines.\&
+.TP
+\f[CR]\-s, \-\-sync\f[R]
+Wait until the requested effect is in place; fail with the timeout exit code if the wait exceeds its bound.\&
 .RE
 .TP
 \f[B]destroy\f[R] [\-\-all] [\-\-orphans] [\-b BUNDLE] [job ...]\&
-Remove platform units \-\- the platform unit files and the entry\(aqs state dir both go away.\&
+Remove platform units \-\- the platform unit files and the entry\(aqs state dir both go away, after waiting for any stopped run to end.\&
 Requires a target: job(s), \-\-all, or \-\-orphans.\&
 .RS
 .TP
@@ -133,21 +144,33 @@ Limit removal to entries with on\-disk remnants that no config selects on this h
 Combinable with \-b/\-\-bundle; mutually exclusive with positional names and \-\-all.\&
 .RE
 .TP
-\f[B]enable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
+\f[B]enable\f[R] [\-\-all] [\-b BUNDLE] [\-s] [job ...]\&
 Re\-arm the named jobs\(aq schedules (clear the operator\-disable).\&
 Enabling an already\-enabled daemon restarts one that an exhausted retry budget or a declined gate left stopped.\&
+With \-\-sync, also wait for each daemon started by this enable to come up, bounded by its bundle\(aqs start\-timeout\-sec.\&
 Requires a target: job(s) or \-\-all.\&
+.RS
+.TP
+\f[CR]\-s, \-\-sync\f[R]
+Wait until the requested effect is in place; fail with the timeout exit code if the wait exceeds its bound.\&
+.RE
 .TP
 \f[B]disable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
 Disarm the named jobs\(aq schedules: loaded and startable, but not firing on their own.\&
 Disabling a daemon stops it; it stays stopped across a reboot until re\-enabled.\&
+Waits for any run stopped by the update to end.\&
 Requires a target: job(s) or \-\-all.\&
 .TP
-\f[B]start\f[R] [\-\-all] [\-b BUNDLE] [\-w] [\-\-start\-timeout START_TIMEOUT] [job ...]\&
+\f[B]start\f[R] [\-\-all] [\-b BUNDLE] [\-s | \-w] [\-\-start\-timeout START_TIMEOUT] [job ...]\&
 Ask the platform scheduler to fire the named jobs now, via the same path a scheduled fire uses.\&
 Starting a stopped daemon this way gives it a fresh retry budget.\&
 Requires a target: job(s) or \-\-all.\&
+With \-\-sync, wait until each run is up or has already finished, bounded by start\-timeout\-sec or \-\-start\-timeout.\&
+Already\-running entries return at once.\&
 .RS
+.TP
+\f[CR]\-s, \-\-sync\f[R]
+Wait until the requested effect is in place; fail with the timeout exit code if the wait exceeds its bound.\&
 .TP
 \f[CR]\-w, \-\-wait\f[R]
 Block until each named entry\(aqs next completion and exit with that exit code (worst across multiple names).\&
@@ -155,15 +178,20 @@ Naming a daemon is an error \-\- it runs until stopped, so there is no completio
 .TP
 \f[CR]\-\-start\-timeout START_TIMEOUT\f[R]
 Override [defaults].start\-timeout\-sec (seconds to wait for a runner to come online after dispatch).\&
-Only meaningful with \-\-wait.\&
+Requires \-\-wait or \-\-sync.\&
 .RE
 .TP
-\f[B]stop\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
+\f[B]stop\f[R] [\-\-all] [\-b BUNDLE] [\-s] [job ...]\&
 Stop the named running jobs or groups without disarming their schedules.\&
 An enabled daemon restarts automatically; a disabled daemon stays stopped.\&
 Stopping a group leaves its in\-flight child running and dispatches no further children.\&
-Returns once the scheduler accepts the request.\&
+Returns once the scheduler accepts the request; \-\-sync waits up to 10s for the stopped run to end and record, without waiting for a daemon\(aqs replacement.\&
 Requires a target: job(s) or \-\-all.\&
+.RS
+.TP
+\f[CR]\-s, \-\-sync\f[R]
+Wait until the requested effect is in place; fail with the timeout exit code if the wait exceeds its bound.\&
+.RE
 .TP
 \f[B]status\f[R] [\-a] [\-\-cols COLS] [\-b BUNDLE] [\-\-config\-current | \-\-config\-pending] [\-\-exclude\-healthy] [job ...]\&
 Print resolved state per job.\&

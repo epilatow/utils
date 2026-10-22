@@ -349,7 +349,7 @@ gated by platform checks.
   namespace. That rewrite is drift, so such a test cannot also assert on the
   CONFIG column.
 
-  The daemon rearm cases use an isolated test launcher instead, so the
+  The daemon rearm and sync cases use an isolated test launcher, so the
   environment survives native unit rewrites by enable and apply. It invokes
   the real CLI and scheduler while keeping every spawned runner in the test
   namespace.

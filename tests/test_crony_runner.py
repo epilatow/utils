@@ -2464,7 +2464,9 @@ class TestJobPriority:
             },
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         unit = h.agents / f"org.crony.{h.full('j')}.plist"
         content = unit.read_text()
         munged = content.replace(
@@ -5766,6 +5768,69 @@ class TestUserStop:
             "stopped",
             "ok",
         ]
+
+
+class TestAwaitRunStarted:
+    def test_rearm_can_coalesce_with_an_existing_runner(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text(str(os.getpid()))
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            request = crony_runner.prepare_run_start(
+                "default.j", tmp_path, replacing=True
+            )
+            crony_runner.await_run_started(
+                request, start_timeout=0, allow_existing=True
+            )
+
+    def test_already_running_returns_without_waiting_for_exit(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text(str(os.getpid()))
+        request = crony_runner.prepare_run_start("default.j", tmp_path)
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            crony_runner.await_run_started(request, start_timeout=0)
+
+    def test_preexisting_same_second_record_is_not_a_new_run(
+        self, tmp_path: Path
+    ) -> None:
+        record = tmp_path / "last-run.json"
+        record.write_text(json.dumps({"ended_at": crony_runtime.now_iso()}))
+        request = crony_runner.prepare_run_start("default.j", tmp_path)
+        with pytest.raises(StartTimeout):
+            crony_runner.await_run_started(request, start_timeout=-1)
+
+    def test_fast_completion_satisfies_up(self, tmp_path: Path) -> None:
+        request = crony_runner.prepare_run_start("default.j", tmp_path)
+        (tmp_path / "last-run.json").write_text(
+            json.dumps({"ended_at": crony_runtime.now_iso(), "pid": 123})
+        )
+        crony_runner.await_run_started(request, start_timeout=0)
+
+    def test_replacement_rejects_outgoing_runner_and_its_final_record(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text(str(os.getpid()))
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            request = crony_runner.prepare_run_start(
+                "default.j", tmp_path, replacing=True
+            )
+            (tmp_path / "last-run.json").write_text(
+                json.dumps(
+                    {"ended_at": crony_runtime.now_iso(), "pid": os.getpid()}
+                )
+            )
+            with pytest.raises(StartTimeout):
+                crony_runner.await_run_started(request, start_timeout=-1)
+
+    def test_replacement_accepts_a_new_runner(self, tmp_path: Path) -> None:
+        (tmp_path / "run.pid").write_text("123")
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            request = crony_runner.prepare_run_start(
+                "default.j", tmp_path, replacing=True
+            )
+            (tmp_path / "run.pid").write_text(str(os.getpid()))
+            crony_runner.await_run_started(request, start_timeout=0)
 
 
 if __name__ == "__main__":

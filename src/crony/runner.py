@@ -1828,6 +1828,65 @@ def _record_written_by(
     return rec
 
 
+@dataclasses.dataclass(frozen=True)
+class RunStart:
+    """Evidence captured before an action that may start a run."""
+
+    full_name: str
+    state_dir: Path
+    requested_at: datetime.datetime
+    record_stamp: tuple[int, int] | None
+    replaced_pid: int | None
+
+
+def _record_stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_mtime_ns
+
+
+def prepare_run_start(
+    full_name: str, state_dir: Path, *, replacing: bool = False
+) -> RunStart:
+    """Capture a run boundary before dispatch, enable, or apply.
+
+    A replacement excludes the outgoing instance and its final record;
+    an ordinary start may attach to an instance already running.
+    """
+    return RunStart(
+        full_name=full_name,
+        state_dir=state_dir,
+        requested_at=datetime.datetime.fromisoformat(crony.runtime.now_iso()),
+        record_stamp=_record_stamp(state_dir / "last-run.json"),
+        replaced_pid=(
+            crony.runtime.read_pid_file(state_dir / "run.pid")
+            if replacing and crony.runtime.run_in_progress(state_dir)
+            else None
+        ),
+    )
+
+
+def await_run_started(
+    request: RunStart, *, start_timeout: float, allow_existing: bool = False
+) -> None:
+    """Wait for a held run lock or a completion newer than the request.
+
+    A rearm may coalesce with a run that has just started, so its caller
+    can allow that instance even if replacement evidence was captured.
+    """
+    if allow_existing:
+        request = dataclasses.replace(request, replaced_pid=None)
+    _await_run(
+        request,
+        job_timeout=math.inf,
+        start_timeout=start_timeout,
+        wait_budget=math.inf,
+        until_started=True,
+    )
+
+
 def start_unit_wait(
     full_name: str,
     *,
@@ -1881,25 +1940,9 @@ def start_unit_wait(
 
     The three are reported apart because a parent group must tell its own
     fault (it never got the child running) from its child's (the child
-    ran, then crashed or overran). A dead, vanished, or leftover pid can
-    never spin this loop -- run.pid persists across runs, so the waiter
-    attaches only while run.lock is held (a run in flight; see
-    Mechanism); a leftover with no held lock falls through to the bounded
-    start-timeout poll instead of re-arming the wait. An uncapped job
-    (`job_timeout` is `math.inf`) with a genuinely live runner waits as
-    long as that runner lives, unless `wait_budget` bounds it.
-
-    Mechanism: a pre-start timestamp T is taken, the platform is asked
-    to fire the unit, and the waiter watches for the runner's pid
-    (published via `<state>/<bundle>/<uuid>/run.pid`) to exit via
-    kernel-level pid-exit notification. run.pid persists across runs, so
-    the waiter attaches to its pid only while run.lock is held -- a run
-    genuinely in flight, the kernel having released the lock on any
-    earlier runner's exit -- and treats a leftover run.pid with no held
-    lock as no live runner. When the pid is gone, last-run.json is read;
-    if its `ended_at` is at or after T, the run is "ours" (semantics: the
-    next completion after the start). Otherwise we sleep briefly,
-    re-read the pid file, and try again.
+    ran, then crashed or overran). An uncapped job (`job_timeout` is
+    `math.inf`) waits as long as its runner lives unless `wait_budget`
+    bounds it.
 
     Starting an already-running unit is a no-op on both
     platforms; the waiter still attaches to the in-flight pid and
@@ -1907,14 +1950,7 @@ def start_unit_wait(
     completion" is well-defined and serves the group-dispatch use
     case (we wanted the child's run; an in-flight run satisfies).
     """
-    # Match the runner's `now_iso()` precision (whole seconds): if
-    # pre_start captured microseconds and the runner's ended_at
-    # truncated them, a sub-second run could compare ended_at <
-    # pre_start and the loop would conclude "no fresh run yet"
-    # for the entire start_timeout window.
-    pre_start_dt = datetime.datetime.fromisoformat(crony.runtime.now_iso())
-    pid_path = state_dir / "run.pid"
-    last_run_path = state_dir / "last-run.json"
+    request = prepare_run_start(full_name, state_dir)
 
     start_unit(
         full_name,
@@ -1923,6 +1959,31 @@ def start_unit_wait(
         on_dispatched=on_dispatched,
     )
 
+    result = _await_run(
+        request,
+        job_timeout=job_timeout,
+        start_timeout=start_timeout,
+        wait_budget=wait_budget,
+        until_started=False,
+    )
+    assert result is not None
+    return result
+
+
+def _await_run(
+    request: RunStart,
+    *,
+    job_timeout: float,
+    start_timeout: float,
+    wait_budget: float,
+    until_started: bool,
+) -> dict[str, Any] | None:
+    """Share launch observation between up and completion waits."""
+    full_name = request.full_name
+    state_dir = request.state_dir
+    pre_start_dt = request.requested_at
+    pid_path = state_dir / "run.pid"
+    last_run_path = state_dir / "last-run.json"
     started_at = time.monotonic()
 
     def _fresh_record() -> dict[str, Any] | None:
@@ -1930,11 +1991,16 @@ def start_unit_wait(
 
         run.pid can come and go between polls, but the file the runner
         writes at exit persists, so even a sub-second run is observable
-        here. `ended_at` must be at or after the pre-start timestamp:
-        an older record belongs to some earlier run, not to ours.
+        here. Both a changed file revision and a fresh end timestamp are
+        required, so an older run from the same second cannot satisfy it.
         """
+        if _record_stamp(last_run_path) == request.record_stamp:
+            return None
         rec = _read_last_run(last_run_path)
-        if rec is None:
+        if rec is None or (
+            request.replaced_pid is not None
+            and rec.get("pid") == request.replaced_pid
+        ):
             return None
         ended_at = rec.get("ended_at")
         if not ended_at:
@@ -1959,6 +2025,7 @@ def start_unit_wait(
         pid = crony.runtime.read_pid_file(pid_path)
         if (
             pid is not None
+            and pid != request.replaced_pid
             and crony.runtime.run_in_progress(state_dir)
             and _pid_alive(pid)
         ):
@@ -1990,6 +2057,8 @@ def start_unit_wait(
             return rec
         pid = _live_runner_pid()
         if pid is not None:
+            if until_started:
+                return None
             if saw_runner is None:
                 run_started = now
             saw_runner = pid

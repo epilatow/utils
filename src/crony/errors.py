@@ -71,7 +71,7 @@ class PreconditionError(CronyError):
 
 
 class JobTimeoutError(CronyError):
-    """`crony _run` killed the wrapped command on timeout."""
+    """A run exceeded its timeout, or a bounded run-effect wait expired."""
 
     exit_code = ExitCode.TIMEOUT
 

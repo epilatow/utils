@@ -69,8 +69,10 @@ from crony.config import (  # noqa: E402
 from crony.errors import (  # noqa: E402
     ConfigError,
     ExitCode,
+    JobTimeoutError,
     LockBusyError,
     PreconditionError,
+    StartTimeout,
     SubprocessError,
     UnitNotInstalledError,
     UsageError,
@@ -719,7 +721,9 @@ class TestApplySelfUpdate:
             default_target_jobs=["j"],
         )
         with pytest.raises(SystemExit) as exc:
-            crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=["j"], verbose=False, bundle=None, sync=False
+            )
         assert exc.value.code == int(ExitCode.WARNING)
 
 
@@ -854,7 +858,9 @@ class TestApplyFullDiskAccess:
             },
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         assert built == [True]
 
     def test_skips_wrapper_without_fda_job(
@@ -870,7 +876,9 @@ class TestApplyFullDiskAccess:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         assert built == []
 
     def test_grant_warning_does_not_fail_apply(
@@ -897,7 +905,9 @@ class TestApplyFullDiskAccess:
             default_target_jobs=["j"],
         )
         with caplog.at_level(logging.WARNING):
-            crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=["j"], verbose=False, bundle=None, sync=False
+            )
         assert "grant me FDA" in caplog.text
         # The plist still lands -- a missing grant warns, it does not
         # abort the apply.
@@ -918,7 +928,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert (h.state_dir("j") / "snapshot.json").exists()
         assert not (orphan_dir / "snapshot.json").exists()
 
@@ -931,7 +941,9 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         assert (orphan_dir / "snapshot.json").exists()  # left alone
 
     def test_no_arg_apply_fully_wipes_orphan_state_dir(
@@ -950,7 +962,7 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert not orphan_dir.exists()
 
     def test_no_arg_apply_removes_broken_snapshot_orphan(
@@ -968,7 +980,7 @@ class TestApplyFullSync:
             encoding="utf-8",
         )
         h.config({}, default_target_jobs=[])
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert not broken_dir.exists()
 
     def test_no_arg_apply_removes_unit_only_orphan(
@@ -981,7 +993,7 @@ class TestApplyFullSync:
         plist = h.agents / "org.crony.default.ghost.plist"
         plist.write_text("", encoding="utf-8")
         h.config({}, default_target_jobs=[])
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert not plist.exists()
 
     def test_no_arg_apply_leaves_running_orphan_in_place(
@@ -998,7 +1010,9 @@ class TestApplyFullSync:
         with open(orphan_dir / "run.lock", "w") as held:
             try:
                 _fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-                crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+                crony_commands.do_apply(
+                    jobs=[], verbose=False, bundle=None, sync=False
+                )
                 assert orphan_dir.exists()
             finally:
                 _fcntl.flock(held, _fcntl.LOCK_UN)
@@ -1033,7 +1047,9 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         assert cfg2.jobs["j"].uuid == new_uuid
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         assert (h.state / "default" / new_uuid / "snapshot.json").is_file()
         assert not old_dir.exists()
 
@@ -1100,7 +1116,9 @@ class TestApplyFullSync:
         monkeypatch.setattr(crony_runtime, "_uv_executable", lambda: bad_uv)
         jobs = [] if full_sync else [h.full("j")]
         with pytest.raises(PreconditionError, match="launcher PATH"):
-            crony_commands.do_apply(jobs=jobs, verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=jobs, verbose=False, bundle=None, sync=False
+            )
         assert old_dir.is_dir()
         assert {
             p.relative_to(old_dir): p.read_bytes()
@@ -1136,7 +1154,7 @@ class TestApplyFullSync:
             tmp_path, monkeypatch
         )
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert not old_dir.exists()
         assert (h.state / "default" / new_uuid / "snapshot.json").is_file()
         assert plist.exists()
@@ -1168,7 +1186,9 @@ class TestApplyFullSync:
             },
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
         node = config.current.job_from_ref(ref)
@@ -1194,7 +1214,9 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=["j"], verbose=False, bundle=None, sync=False
+        )
         assert broken_dir.exists()
 
     def test_unchanged_suppressed_by_default(
@@ -1208,10 +1230,12 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         # Re-apply with no changes: nothing to print.
         with caplog.at_level(logging.INFO, logger="crony"):
-            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=[], verbose=False, bundle=None, sync=False
+            )
         messages = [r.getMessage() for r in caplog.records]
         assert not any("unchanged" in m for m in messages), messages
 
@@ -1240,7 +1264,9 @@ class TestApplyFullSync:
             default_target_jobs=["j"],
         )
         with pytest.raises(UsageError, match="unselected on this host"):
-            crony_commands.do_apply(jobs=["j"], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=["j"], verbose=False, bundle=None, sync=False
+            )
         assert not (h.agents / f"org.crony.{h.full('j')}.plist").exists()
 
     def test_unchanged_shown_with_verbose(
@@ -1254,9 +1280,11 @@ class TestApplyFullSync:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         with caplog.at_level(logging.INFO, logger="crony"):
-            crony_commands.do_apply(jobs=[], verbose=True, bundle=None)
+            crony_commands.do_apply(
+                jobs=[], verbose=True, bundle=None, sync=False
+            )
         messages = [r.getMessage() for r in caplog.records]
         assert any("unchanged" in m for m in messages), messages
 
@@ -1266,7 +1294,9 @@ class TestApplyFullSync:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="unknown bundle"):
-            crony_commands.do_apply(jobs=[], verbose=False, bundle="ghost")
+            crony_commands.do_apply(
+                jobs=[], verbose=False, bundle="ghost", sync=False
+            )
 
     def test_bundle_scopes_orphan_removal(
         self, tmp_path: Path, monkeypatch: Any
@@ -1286,7 +1316,9 @@ class TestApplyFullSync:
             ),
             encoding="utf-8",
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle="borgadm")
+        crony_commands.do_apply(
+            jobs=[], verbose=False, bundle="borgadm", sync=False
+        )
         assert (default_orphan / "snapshot.json").exists()
         assert not (borgadm_orphan / "snapshot.json").exists()
 
@@ -1305,7 +1337,9 @@ class TestApplyFullSync:
             ),
             encoding="utf-8",
         )
-        crony_commands.do_apply(jobs=["k"], verbose=False, bundle="borgadm")
+        crony_commands.do_apply(
+            jobs=["k"], verbose=False, bundle="borgadm", sync=False
+        )
         bundles = TomlConfig.load_all()
         borgadm = bundles.by_name("borgadm")
         assert borgadm is not None
@@ -1333,7 +1367,9 @@ class TestApplyFullSync:
             "this is not [valid toml", encoding="utf-8"
         )
         with pytest.raises(UsageError, match="refusing the full-sync"):
-            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=[], verbose=False, bundle=None, sync=False
+            )
 
     def test_bundle_scoped_apply_proceeds_when_sibling_bundle_errored(
         self, tmp_path: Path, monkeypatch: Any
@@ -1354,7 +1390,7 @@ class TestApplyFullSync:
         )
         sd = h.state_dir("j", cfg=cfg, ensure_snapshot=False)
         crony_commands.do_apply(
-            jobs=[], verbose=False, bundle=DEFAULT_BUNDLE_NAME
+            jobs=[], verbose=False, bundle=DEFAULT_BUNDLE_NAME, sync=False
         )
         assert (sd / "snapshot.json").exists()
 
@@ -1393,7 +1429,7 @@ class TestApplyCreatesRunLog:
             },
             default_target_jobs=["g"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert (
             h.state_dir("g", cfg=cfg, ensure_snapshot=False) / "run.log"
         ).is_file()
@@ -1459,7 +1495,7 @@ class TestApplyRenamePreservesHistory:
         foo_uuid = cfg.jobs["foo"].uuid
         cfg2_raw["job"]["bar"]["uuid"] = foo_uuid
         h.config(cfg2_raw, default_target_jobs=["bar"])
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         # State dir didn't move (same uuid -> same path); log
         # survives untouched.
         assert (foo_dir / "run.log").read_text() == "from the foo era\n"
@@ -1513,7 +1549,7 @@ class TestApplyRenamePreservesHistory:
             },
             default_target_jobs=["zzz", "aaa"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         # The renamed entry's history survived (not wiped by the
         # new aaa's residue sweep).
         assert (renamed_dir / "run.log").read_text() == "history\n"
@@ -1575,7 +1611,7 @@ class TestApplyAlias:
         alias = h.state / "default" / "j"
         alias.unlink()
         assert crony_runtime.load_config().cfg_status(ref) == "stale"
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert alias.is_symlink()
         assert crony_runtime.load_config().cfg_status(ref) == "synced"
 
@@ -1594,7 +1630,7 @@ class TestApplyAlias:
         alias.unlink()
         alias.symlink_to("00000000-0000-0000-0000-000000000000")
         assert crony_runtime.load_config().cfg_status(ref) == "stale"
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert os.readlink(alias) == sd.name
         assert crony_runtime.load_config().cfg_status(ref) == "synced"
 
@@ -2365,7 +2401,9 @@ class TestUvExecutable:
                     "_crony_executable",
                     lambda: old_repo / "bin" / "crony",
                 )
-                crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+                crony_commands.do_apply(
+                    jobs=[], verbose=False, bundle=None, sync=False
+                )
             config = crony_runtime.load_config()
             for short in ("j", "g"):
                 ref = config.current.by_full_name[h.full(short)]
@@ -2379,7 +2417,9 @@ class TestUvExecutable:
                     assert sched.ondisk_units(h.full(short)) == before
                 assert h.apply(short) == "updated"
         else:
-            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=[], verbose=False, bundle=None, sync=False
+            )
         sched = crony_runtime.scheduler()
         config = crony_runtime.load_config()
         for short in ("j", "g"):
@@ -2440,7 +2480,7 @@ class TestEnableDisable:
         crony_commands.do_disable(jobs=["j"], bundle=None)
         assert not (h.sysd / f"crony-{h.full('j')}.timer").exists()
         h.calls.clear()
-        crony_commands.do_enable(jobs=["j"], bundle=None)
+        crony_commands.do_enable(jobs=["j"], bundle=None, sync=False)
         timer = f"crony-{h.full('j')}.timer"
         assert ["systemctl", "--user", "--quiet", "enable", timer] in h.calls
         assert ["systemctl", "--user", "--quiet", "restart", timer] in h.calls
@@ -2499,7 +2539,7 @@ class TestEnableDisable:
         assert "disabled" in out
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["j"], wait=False, start_timeout=None, bundle=None
+            jobs=["j"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         cmd = next(
             c for c in h.calls if c[0] == "launchctl" and c[1] == "kickstart"
@@ -2512,7 +2552,7 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="not stamped"):
-            crony_commands.do_enable(jobs=["ghost"], bundle=None)
+            crony_commands.do_enable(jobs=["ghost"], bundle=None, sync=False)
 
     def test_unknown_name_rejected_for_disable(
         self, tmp_path: Path, monkeypatch: Any
@@ -2565,7 +2605,7 @@ class TestEnableDisable:
         node = config.current.job_from_ref(ref)
         assert node is not None and node.unit_disabled is True
         assert self._schedule_cell(h.full("a"), capsys) == "disabled"
-        crony_commands.do_enable(jobs=["a"], bundle=None)
+        crony_commands.do_enable(jobs=["a"], bundle=None, sync=False)
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("a")]
         node = config.current.job_from_ref(ref)
@@ -2611,7 +2651,7 @@ class TestEnableDisable:
         h.apply("j")
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["j"], wait=False, start_timeout=None, bundle=None
+            jobs=["j"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         cmd = next(
             c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
@@ -2635,7 +2675,7 @@ class TestEnableDisable:
         h.apply("j")
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["j"], wait=False, start_timeout=None, bundle=None
+            jobs=["j"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd == [
@@ -2655,7 +2695,7 @@ class TestEnableDisable:
         h.apply("j")
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["j"], wait=False, start_timeout=None, bundle=None
+            jobs=["j"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         cmd = next(
             c for c in h.calls if c[:3] == ["systemctl", "--user", "start"]
@@ -2677,7 +2717,11 @@ class TestEnableDisable:
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="not runnable here"):
             crony_commands.do_start(
-                jobs=["ghost"], wait=False, start_timeout=None, bundle=None
+                jobs=["ghost"],
+                wait=False,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
 
     def test_start_wait_refuses_config_removed_orphan(
@@ -2700,6 +2744,7 @@ class TestEnableDisable:
                 wait=True,
                 start_timeout=None,
                 bundle=None,
+                sync=False,
             )
 
     def test_start_wait_maps_timeout_to_nonzero_exit(
@@ -2724,7 +2769,11 @@ class TestEnableDisable:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_start(
-                jobs=["j"], wait=True, start_timeout=None, bundle=None
+                jobs=["j"],
+                wait=True,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
         assert exc.value.code == int(ExitCode.TIMEOUT)
 
@@ -2756,7 +2805,7 @@ class TestEnableDisable:
 
         monkeypatch.setattr(crony_runner, "start_unit_wait", _capture)
         crony_commands.do_start(
-            jobs=["j"], wait=True, start_timeout=None, bundle=None
+            jobs=["j"], wait=True, start_timeout=None, bundle=None, sync=False
         )
         assert math.isinf(captured["job_timeout"])
 
@@ -2780,7 +2829,11 @@ class TestEnableDisable:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_start(
-                jobs=["j"], wait=True, start_timeout=None, bundle=None
+                jobs=["j"],
+                wait=True,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
         assert exc.value.code == 137
 
@@ -2804,7 +2857,11 @@ class TestEnableDisable:
         )
         with pytest.raises(SystemExit) as exc:
             crony_commands.do_start(
-                jobs=["j"], wait=True, start_timeout=None, bundle=None
+                jobs=["j"],
+                wait=True,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
         assert exc.value.code == 7
 
@@ -2831,7 +2888,7 @@ class TestEnableDisable:
         )
         # rc maps to 0, so do_start returns without raising SystemExit.
         crony_commands.do_start(
-            jobs=["j"], wait=True, start_timeout=None, bundle=None
+            jobs=["j"], wait=True, start_timeout=None, bundle=None, sync=False
         )
 
     def test_start_timeout_requires_wait(self) -> None:
@@ -2882,7 +2939,11 @@ class TestEnableDisable:
         )
         with pytest.raises(UsageError, match="crony apply"):
             crony_commands.do_start(
-                jobs=["j"], wait=False, start_timeout=None, bundle=None
+                jobs=["j"],
+                wait=False,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
 
     def _rename_keeping_uuid(self, h: _ApplyHarness, old: str, new: str) -> str:
@@ -2920,7 +2981,7 @@ class TestEnableDisable:
         sd = h.state / DEFAULT_BUNDLE_NAME / job_uuid
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["k"], wait=False, start_timeout=None, bundle=None
+            jobs=["k"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         assert (sd / "user-start.flag").exists()
         kick = next(
@@ -2939,7 +3000,7 @@ class TestEnableDisable:
         plist = h.agents / "org.crony.default.j.plist"
         assert "StartCalendarInterval" not in plist.read_text()
         h.calls.clear()
-        crony_commands.do_enable(jobs=["k"], bundle=None)
+        crony_commands.do_enable(jobs=["k"], bundle=None, sync=False)
         # The reload targets the old-name label, and the schedule is back.
         assert any("org.crony.default.j" in part for c in h.calls for part in c)
         assert "StartCalendarInterval" in plist.read_text()
@@ -3024,7 +3085,11 @@ class TestEnableDisable:
         (sd / "snapshot.json").unlink()
         with pytest.raises(UsageError, match="crony apply"):
             crony_commands.do_start(
-                jobs=["j"], wait=False, start_timeout=None, bundle=None
+                jobs=["j"],
+                wait=False,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
 
     def test_start_works_on_schedule_less_job(
@@ -3043,7 +3108,7 @@ class TestEnableDisable:
         h.apply("a")
         h.calls.clear()
         crony_commands.do_start(
-            jobs=["a"], wait=False, start_timeout=None, bundle=None
+            jobs=["a"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         cmd = next(c for c in h.calls if c[0] == "launchctl")
         assert cmd[1] == "kickstart"
@@ -3089,12 +3154,16 @@ class TestEnableDisable:
         h = _ApplyHarness(tmp_path, monkeypatch)
         h.config({}, default_target_jobs=[])
         with pytest.raises(UsageError, match="unknown bundle"):
-            crony_commands.do_enable(jobs=[], bundle="ghost")
+            crony_commands.do_enable(jobs=[], bundle="ghost", sync=False)
         with pytest.raises(UsageError, match="unknown bundle"):
             crony_commands.do_disable(jobs=[], bundle="ghost")
         with pytest.raises(UsageError, match="unknown bundle"):
             crony_commands.do_start(
-                jobs=[], wait=False, start_timeout=None, bundle="ghost"
+                jobs=[],
+                wait=False,
+                start_timeout=None,
+                bundle="ghost",
+                sync=False,
             )
 
     def test_names_or_all_required(self) -> None:
@@ -3162,7 +3231,7 @@ class TestEnableDisable:
         assert not (h.sysd / f"crony-{h.full('b')}.timer").exists()
         assert not (h.sysd / f"crony-{h.full('g')}.timer").exists()
 
-        crony_commands.do_enable(jobs=[], bundle="default")
+        crony_commands.do_enable(jobs=[], bundle="default", sync=False)
         assert disabled_flags() == {"a": False, "b": False, "g": False}
         assert (h.sysd / f"crony-{h.full('b')}.timer").exists()
         assert (h.sysd / f"crony-{h.full('g')}.timer").exists()
@@ -3216,7 +3285,11 @@ class TestEnableDisable:
         h.apply("g")
         h.calls.clear()
         crony_commands.do_start(
-            jobs=[], wait=False, start_timeout=None, bundle="default"
+            jobs=[],
+            wait=False,
+            start_timeout=None,
+            bundle="default",
+            sync=False,
         )
         labels = [
             c[-1]
@@ -3259,12 +3332,16 @@ class TestEnableDisable:
         assert any("borgadm.k" in str(c) for c in h.calls)
 
         h.calls.clear()
-        crony_commands.do_enable(jobs=[], bundle="borgadm")
+        crony_commands.do_enable(jobs=[], bundle="borgadm", sync=False)
         assert any("borgadm.k" in str(c) for c in h.calls)
 
         h.calls.clear()
         crony_commands.do_start(
-            jobs=[], wait=False, start_timeout=None, bundle="borgadm"
+            jobs=[],
+            wait=False,
+            start_timeout=None,
+            bundle="borgadm",
+            sync=False,
         )
         assert any("borgadm.k" in str(c) for c in h.calls)
 
@@ -5125,7 +5202,7 @@ class TestStatusReport:
             },
             default_target_jobs=["g1"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         crony_commands.do_status(
             jobs=[],
             cols=crony_commands.parse_cols_arg("job,groups"),
@@ -7080,7 +7157,7 @@ class TestNameCollision:
         stray_dir = self._plant_residue(h, h.full("j"), stray_uuid)
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         assert plist.exists()
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         # Stray residue gone; live state dir and shared unit intact.
         assert not stray_dir.exists()
         assert (h.state / "default" / live_uuid / "snapshot.json").is_file()
@@ -7658,7 +7735,7 @@ class TestStatusFlagsColumns:
             },
             default_target_jobs=["g"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         self._status("job,keep-awake,flags")
         out = capsys.readouterr().out
         group_row = self._row_for(out, h.full("g"))
@@ -8423,7 +8500,7 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         snap_path = h.state_dir("g") / "snapshot.json"
         snap = _cast_dict(snap_path.read_text())
         # 1.05 * 100 = 105
@@ -8445,7 +8522,9 @@ class TestSnapshotLifecycle:
             },
             default_target_jobs=["g"],
         )
-        crony_commands.do_apply(jobs=[h.full("g")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("g")], verbose=False, bundle=None, sync=False
+        )
         snap_after = _cast_dict(snap_path.read_text())
         assert snap_after["timeout"] == 210
 
@@ -8511,7 +8590,7 @@ class TestLifecycleSmoke:
         )
         crony_commands.do_validate(bundle=None, file=None)
         # apply -> renders + activates
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         assert (h.agents / f"org.crony.{h.full('j')}.plist").exists()
         # status -> prints the synced/enabled tuple (sched stub)
         capsys.readouterr()  # drop earlier output
@@ -9022,7 +9101,7 @@ class TestStatusRenameUuidModel:
             },
             default_target_jobs=["u-oss"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         started = "2020-01-01T00:00:00-08:00"
         self._stamp_run(h.state_dir("u-oss", cfg=cfg), started)
         self._stamp_run(h.state_dir("oss-nvm", cfg=cfg), started)
@@ -9480,7 +9559,7 @@ class TestDaemonLifecycle:
         h.apply("d")
         crony_commands.do_disable(jobs=["d"], bundle=None)
         h.calls.clear()
-        crony_commands.do_enable(jobs=["d"], bundle=None)
+        crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         service = f"crony-{h.full('d')}.service"
         assert ["systemctl", "--user", "--quiet", "enable", service] in h.calls
         assert "[Install]" in self._unit(h, "linux").read_text()
@@ -9501,7 +9580,7 @@ class TestDaemonLifecycle:
                 sd, 1, crony_model.ExitClass.FAIL, f"t{i}"
             )
 
-        crony_commands.do_enable(jobs=["d"], bundle=None)
+        crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         assert crony_runtime.read_exit_history(sd).runs == []
 
     def test_reapply_does_not_rearm_a_disabled_exhausted_daemon(
@@ -9537,7 +9616,7 @@ class TestDaemonLifecycle:
             )
         h.calls.clear()
 
-        crony_commands.do_enable(jobs=["d"], bundle=None)
+        crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         assert [
             "systemctl",
             "--user",
@@ -9705,7 +9784,7 @@ class TestDaemonLifecycle:
             monkeypatch.setattr(launchd, "_is_loaded", lambda _label: False)
         h.calls.clear()
 
-        crony_commands.do_enable(jobs=["d"], bundle=None)
+        crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         assert not started_a_unit(h.calls)
         assert crony_runtime.daemon_retries_exhausted(sd)
 
@@ -9723,7 +9802,7 @@ class TestDaemonLifecycle:
             )
 
         with caplog.at_level(logging.INFO):
-            crony_commands.do_enable(jobs=["d"], bundle=None)
+            crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         assert f"{h.full('d')}: rearmed" in caplog.text
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
@@ -9745,7 +9824,7 @@ class TestDaemonLifecycle:
         self._unit(h, platform).unlink()
 
         with pytest.raises(UnitNotInstalledError):
-            crony_commands.do_enable(jobs=["d"], bundle=None)
+            crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
 
     def test_reapply_restarts_a_gated_daemon(
         self, tmp_path: Path, monkeypatch: Any
@@ -10025,7 +10104,11 @@ class TestDaemonLifecycle:
         )
         with pytest.raises(UsageError, match="daemon"):
             crony_commands.do_start(
-                jobs=["d"], wait=True, start_timeout=None, bundle=None
+                jobs=["d"],
+                wait=True,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
 
     def test_start_all_wait_rejects_before_firing_anything(
@@ -10049,7 +10132,7 @@ class TestDaemonLifecycle:
         h.calls.clear()
         with pytest.raises(UsageError, match="daemon"):
             crony_commands.do_start(
-                jobs=[], wait=True, start_timeout=None, bundle=None
+                jobs=[], wait=True, start_timeout=None, bundle=None, sync=False
             )
         assert not started_a_unit(h.calls)
 
@@ -10062,7 +10145,11 @@ class TestDaemonLifecycle:
         h.apply("d")
         with pytest.raises(UsageError, match="daemon"):
             crony_commands.do_start(
-                jobs=["d"], wait=True, start_timeout=None, bundle=None
+                jobs=["d"],
+                wait=True,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
 
     def test_plain_start_accepts_a_daemon(
@@ -10074,7 +10161,7 @@ class TestDaemonLifecycle:
         self._daemon_cfg(h)
         h.apply("d")
         crony_commands.do_start(
-            jobs=["d"], wait=False, start_timeout=None, bundle=None
+            jobs=["d"], wait=False, start_timeout=None, bundle=None, sync=False
         )
         assert started_a_unit(h.calls)
         assert crony_runtime.user_start_flag_path(h.state_dir("d")).is_file()
@@ -10097,7 +10184,11 @@ class TestDaemonLifecycle:
         )
         with crony_runtime.acquire_lock(sd / "run.lock"):
             crony_commands.do_start(
-                jobs=["d"], wait=False, start_timeout=None, bundle=None
+                jobs=["d"],
+                wait=False,
+                start_timeout=None,
+                bundle=None,
+                sync=False,
             )
         assert started_a_unit(h.calls)
         assert not crony_runtime.user_start_flag_path(sd).exists()
@@ -10132,9 +10223,9 @@ def test_start_reports_a_running_entry(
     sd = h.state_dir("j")
     if running:
         with crony_runtime.acquire_lock(sd / "run.lock"):
-            crony_commands.do_start(["j"], False, None, None)
+            crony_commands.do_start(["j"], False, None, None, sync=False)
     else:
-        crony_commands.do_start(["j"], False, None, None)
+        crony_commands.do_start(["j"], False, None, None, sync=False)
     expected = "already running" if running else "starting"
     assert f"{h.full('j')}: {expected}" in caplog.text
 
@@ -10158,7 +10249,7 @@ def test_start_reports_pending_approval_bypass(
     (sd / "pending.flag").write_bytes(b"")
     caplog.set_level(logging.INFO)
     with crony_runtime.acquire_lock(sd / "run.lock"):
-        crony_commands.do_start(["j"], False, None, None)
+        crony_commands.do_start(["j"], False, None, None, sync=False)
     assert "already running (bypassing pending approval)" in caplog.text
     assert crony_runtime.user_start_flag_path(sd).exists()
 
@@ -10192,9 +10283,9 @@ def test_stop_signals_only_running_entries(
     with patch.object(backend, "stop", autospec=True, side_effect=stop):
         if running:
             with crony_runtime.acquire_lock(sd / "run.lock"):
-                crony_commands.do_stop(["j"], None)
+                crony_commands.do_stop(["j"], None, sync=False)
         else:
-            crony_commands.do_stop(["j"], None)
+            crony_commands.do_stop(["j"], None, sync=False)
     assert observed == ([h.full("j")] if running else [])
     expected = "stopping" if running else "not running"
     assert f"{h.full('j')}: {expected}" in caplog.text
@@ -10259,7 +10350,7 @@ def test_stop_dispatch_failure_is_reported(
         ),
         pytest.raises(SubprocessError),
     ):
-        crony_commands.do_stop(["j"], None)
+        crony_commands.do_stop(["j"], None, sync=False)
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
@@ -10287,7 +10378,148 @@ def test_stop_racing_run_completion_is_successful(
             side_effect=SubprocessError(3, ["scheduler", "stop"]),
         ),
     ):
-        crony_commands.do_stop(["j"], None)
+        crony_commands.do_stop(["j"], None, sync=False)
+
+
+class TestSyncCommands:
+    @pytest.mark.parametrize("command", ["start", "enable", "apply"])
+    @pytest.mark.parametrize("times_out", [False, True])
+    def test_waits_for_started_daemon_and_surfaces_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+        times_out: bool,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        body = {"command": "serve", "daemon": True}
+        h.config(
+            {"defaults": {"start-timeout-sec": 3}, "job": {"d": body}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        if command == "enable":
+            crony_commands.do_disable(jobs=["d"], bundle=None)
+        if command == "apply":
+            h.config(
+                {
+                    "defaults": {"start-timeout-sec": 3},
+                    "job": {"d": {"command": "serve-again", "daemon": True}},
+                },
+                default_target_jobs=["d"],
+            )
+
+        def invoke() -> None:
+            if command == "start":
+                crony_commands.do_start(
+                    jobs=["d"],
+                    wait=False,
+                    start_timeout=None,
+                    bundle=None,
+                    sync=True,
+                )
+            elif command == "enable":
+                crony_commands.do_enable(jobs=["d"], bundle=None, sync=True)
+            else:
+                crony_commands.do_apply(
+                    jobs=["d"], verbose=False, bundle=None, sync=True
+                )
+
+        with patch.object(
+            crony_runner, "await_run_started", autospec=True
+        ) as waiter:
+            if times_out:
+                waiter.side_effect = StartTimeout("never produced a run")
+                with pytest.raises(StartTimeout):
+                    invoke()
+            else:
+                invoke()
+            waiter.assert_called_once()
+            expected = {"start_timeout": 3.0}
+            if command != "start":
+                expected["allow_existing"] = False
+            assert waiter.call_args.kwargs == expected
+
+    @pytest.mark.parametrize("command", ["enable", "apply"])
+    def test_unchanged_daemon_does_not_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"d": {"command": "serve", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        h.apply("d")
+        with patch.object(
+            crony_runner, "await_run_started", autospec=True
+        ) as waiter:
+            if command == "enable":
+                crony_commands.do_enable(jobs=["d"], bundle=None, sync=True)
+            else:
+                crony_commands.do_apply(
+                    jobs=["d"], verbose=False, bundle=None, sync=True
+                )
+            waiter.assert_not_called()
+
+    @pytest.mark.parametrize("command", ["start", "stop"])
+    def test_idle_stop_and_running_start_return_immediately(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "on-demand": True}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        with (
+            patch.object(
+                crony_runner, "await_run_started", autospec=True
+            ) as up,
+            patch.object(
+                crony_runtime, "await_run_finished", autospec=True
+            ) as down,
+        ):
+            if command == "stop":
+                crony_commands.do_stop(jobs=["j"], bundle=None, sync=True)
+            else:
+                with crony_runtime.acquire_lock(h.state_dir("j") / "run.lock"):
+                    crony_commands.do_start(
+                        jobs=["j"],
+                        wait=False,
+                        start_timeout=None,
+                        bundle=None,
+                        sync=True,
+                    )
+            up.assert_not_called()
+            down.assert_not_called()
+
+    @pytest.mark.parametrize("finished", [False, True])
+    def test_stop_waits_for_the_original_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finished: bool
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
+        h.config(
+            {"job": {"j": {"command": "true", "on-demand": True}}},
+            default_target_jobs=["j"],
+        )
+        h.apply("j")
+        sd = h.state_dir("j")
+        (sd / "run.pid").write_text("123")
+        with (
+            crony_runtime.acquire_lock(sd / "run.lock"),
+            patch.object(
+                crony_runtime,
+                "await_run_finished",
+                autospec=True,
+                return_value=finished,
+            ) as waiter,
+        ):
+            if finished:
+                crony_commands.do_stop(jobs=["j"], bundle=None, sync=True)
+            else:
+                with pytest.raises(JobTimeoutError):
+                    crony_commands.do_stop(jobs=["j"], bundle=None, sync=True)
+            waiter.assert_called_once_with(sd, runner_pid=123)
 
 
 if __name__ == "__main__":

@@ -717,7 +717,25 @@ def _reclaim(
             logger.info("%s: removed", e.full_name or str(e.entity_ref))
 
 
-def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
+def _start_timeout(
+    config: crony.model.Config, full_name: str, override: int | None = None
+) -> float:
+    """Resolve a launch allowance, including installed orphan entries."""
+    if override is not None:
+        return float(override)
+    bundle_name, _short = crony.config.parse_full_name(full_name)
+    bundle = config.toml_config.by_name(bundle_name)
+    defaults = (
+        bundle.config.defaults
+        if bundle is not None
+        else crony.config.Defaults()
+    )
+    return float(defaults.start_timeout_sec)
+
+
+def do_apply(
+    jobs: list[str], verbose: bool, bundle: str | None, sync: bool
+) -> None:
     """Render and activate platform units to match config.
 
     No args: full sync across every bundle. Install missing, fix
@@ -744,6 +762,9 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
     `unchanged` results are suppressed by default so the output
     only shows the entries the apply actually touched. `-v` /
     `--verbose` prints them too.
+
+    `--sync` additionally waits for each daemon this apply starts or
+    rearms, within its bundle's start-timeout-sec.
     """
     # One in-memory model for the whole command: selection comes
     # from the parsed bundles, drift / orphan reconciliation from
@@ -851,7 +872,29 @@ def do_apply(jobs: list[str], verbose: bool, bundle: str | None) -> None:
 
     for full in full_names_to_apply:
         ref = config.pending.by_full_name[full]
+        pending = config.pending.job_from_ref(ref)
+        assert pending is not None
+        request = (
+            crony.runner.prepare_run_start(
+                full, pending.state_dir, replacing=True
+            )
+            if sync
+            and crony.unit.is_daemon(pending.timing)
+            and not pending.unit_disabled
+            and os.environ.get(crony.runtime.RUNNING_REF_ENV) != str(ref)
+            else None
+        )
         result = crony.runtime.apply_one(config, ref)
+        if request is not None and result in {
+            crony.runtime.ApplyResult.ADDED,
+            crony.runtime.ApplyResult.UPDATED,
+            crony.runtime.ApplyResult.REARMED,
+        }:
+            crony.runner.await_run_started(
+                request,
+                start_timeout=_start_timeout(config, full),
+                allow_existing=result == crony.runtime.ApplyResult.REARMED,
+            )
         if result == crony.runtime.ApplyResult.DEFERRED:
             # apply_one already logged the why at warning level.
             deferred = True
@@ -1089,7 +1132,7 @@ def _resolve_bulk_names(
     return sorted(stamped)
 
 
-def do_enable(jobs: list[str], bundle: str | None) -> None:
+def do_enable(jobs: list[str], bundle: str | None, sync: bool) -> None:
     """Re-arm the named jobs' schedules (clear the operator-disable).
 
     Re-renders each installed unit with its pinned schedule and reloads
@@ -1110,6 +1153,9 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
     with a fresh budget, so `enable` revives a daemon without an edit to
     its config.
 
+    `--sync` additionally waits for a daemon this enable starts or rearms,
+    within its bundle's start-timeout-sec.
+
     With `--all`, enables every stamped entry, narrowed to one bundle
     when `--bundle <name>` is also given. With `--bundle` plus
     positional args, bare names resolve in `<name>` and qualified
@@ -1126,7 +1172,22 @@ def do_enable(jobs: list[str], bundle: str | None) -> None:
         # enable that did not happen.
         current = config.current.job_from_ref(ref)
         was_enabled = current is not None and not current.unit_disabled
+        request = (
+            crony.runner.prepare_run_start(
+                full, current.state_dir, replacing=True
+            )
+            if sync
+            and current is not None
+            and crony.unit.is_daemon(current.timing)
+            else None
+        )
         changed = crony.runtime.set_disabled(config, ref, disabled=False)
+        if request is not None and changed:
+            crony.runner.await_run_started(
+                request,
+                start_timeout=_start_timeout(config, full),
+                allow_existing=was_enabled,
+            )
         logger.info(
             "%s: %s", full, "rearmed" if was_enabled and changed else "enabled"
         )
@@ -1167,8 +1228,8 @@ def do_disable(jobs: list[str], bundle: str | None) -> None:
         logger.info("%s: disabled", full)
 
 
-def do_stop(jobs: list[str], bundle: str | None) -> None:
-    """Request a stop of each running entry without changing its arming."""
+def do_stop(jobs: list[str], bundle: str | None, sync: bool) -> None:
+    """Stop running entries without changing arming; optionally await them."""
     config = crony.runtime.load_config()
     config.require_addressable(bundle)
     names = _resolve_bulk_names(jobs, bundle, config.installed_full_names())
@@ -1178,6 +1239,7 @@ def do_stop(jobs: list[str], bundle: str | None) -> None:
         if not crony.runtime.run_in_progress(state_dir):
             logger.info("%s: not running", full)
             continue
+        runner_pid = crony.runtime.read_pid_file(state_dir / "run.pid")
         try:
             crony.runtime.scheduler().stop(
                 unit_name, crony.runner.USER_STOP_SIGNAL
@@ -1187,7 +1249,13 @@ def do_stop(jobs: list[str], bundle: str | None) -> None:
                 logger.info("%s: not running", full)
                 continue
             raise
-        logger.info("%s: stopping", full)
+        if sync and not crony.runtime.await_run_finished(
+            state_dir, runner_pid=runner_pid
+        ):
+            raise crony.errors.JobTimeoutError(
+                f"{full!r} did not stop before the timeout"
+            )
+        logger.info("%s: %s", full, "stopped" if sync else "stopping")
 
 
 def _report_start(full_name: str, state_dir: Path, *, running: bool) -> None:
@@ -1202,6 +1270,7 @@ def do_start(
     wait: bool,
     start_timeout: int | None,
     bundle: str | None,
+    sync: bool,
 ) -> None:
     """Ask the platform scheduler to fire the named jobs.
 
@@ -1228,7 +1297,10 @@ def do_start(
     running is the same no-op it is for any running unit, and writes no
     sentinel, so it cannot rearm a later restart.
 
-    `--start-timeout <sec>` (only with `--wait`) overrides the
+    `--sync` waits only for the run to come up, or to finish if it is
+    fast; an already-running entry returns immediately.
+
+    `--start-timeout <sec>` (with `--wait` or `--sync`) overrides the
     default 15s "start never produced a run" deadline.
 
     Names are full namespaced (`<bundle>.<short>`); bare input is
@@ -1262,6 +1334,11 @@ def do_start(
             # for it to break out of its wait.
             applied = config.current.job_from_ref(ref)
             running = crony.runtime.run_in_progress(state_dir)
+            request = (
+                crony.runner.prepare_run_start(full, state_dir)
+                if sync and not running
+                else None
+            )
             running_daemon = (
                 applied is not None
                 and crony.unit.is_daemon(applied.timing)
@@ -1275,6 +1352,11 @@ def do_start(
                 state_dir=state_dir,
             )
             _report_start(full, state_dir, running=running)
+            if request is not None:
+                crony.runner.await_run_started(
+                    request,
+                    start_timeout=_start_timeout(config, full, start_timeout),
+                )
         return
 
     # Synchronous waiter mode. Reject any daemon up front: --wait has no
@@ -1323,11 +1405,7 @@ def do_start(
             timeout = crony.runner.timeout_to_wait(
                 b.config.resolved_group_timeout_sec(b_target, short)
             )
-        tt = (
-            float(start_timeout)
-            if start_timeout is not None
-            else float(b.config.defaults.start_timeout_sec)
-        )
+        tt = _start_timeout(config, full, start_timeout)
         state_dir = crony.model.Job.state_dir_from_ref(ref)
         _report_start(
             full, state_dir, running=crony.runtime.run_in_progress(state_dir)

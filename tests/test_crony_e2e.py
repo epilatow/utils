@@ -46,6 +46,7 @@ platform's scheduler fails (it does not skip) -- an explicitly requested
 suite that silently passed would hide the missing coverage.
 """
 
+import fcntl
 import json
 import os
 import plistlib
@@ -1656,6 +1657,39 @@ class TestUserStop:
             done.exists, timeout=30, what="the independent child to finish"
         )
         assert not never.exists()
+
+
+class TestSyncEffects:
+    @pytest.mark.parametrize("operation", ["start", "enable", "apply"])
+    def test_waits_for_up_and_stop_records_original_instance(
+        self, e2e: _CronyE2E, operation: str
+    ) -> None:
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "2"
+        e2e.use_isolated_launcher()
+        timing = "on-demand = true" if operation == "start" else "daemon = true"
+        e2e.write_bundle(
+            f'[job.probe]\ncommand = "sleep 120"\n{timing}\n', ["probe"]
+        )
+        full = e2e.full("probe")
+        if operation == "apply":
+            e2e.crony("apply", "--sync", full)
+        else:
+            e2e.crony("apply", full)
+            if operation == "enable":
+                e2e.crony("disable", full)
+            e2e.crony(operation, "--sync", full)
+        sd = e2e.state_dir / E2E_BUNDLE / "probe"
+        pid = int((sd / "run.pid").read_text())
+        with (
+            (sd / "run.lock").open("r+") as lock,
+            pytest.raises(BlockingIOError),
+        ):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stopped = e2e.crony("stop", "--sync", full)
+        assert "stopped" in stopped.stderr
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["pid"] == pid
+        assert rec["exit_class"] == "stopped"
 
 
 if __name__ == "__main__":

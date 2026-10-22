@@ -435,6 +435,34 @@ class TestHelpWidth(HelpWidthBase):
     PARSER_FUNC = staticmethod(crony_cli._build_parser)
 
 
+class TestSyncArguments:
+    @pytest.mark.parametrize("command", ["start", "stop", "enable", "apply"])
+    @pytest.mark.parametrize("flag", ["-s", "--sync"])
+    def test_accepts_sync(self, command: str, flag: str) -> None:
+        args = crony_cli._build_parser().parse_command([command, flag, "j"])
+        assert args.sync
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["start", "j", "--sync", "--wait"],
+            ["start", "j", "--start-timeout", "1"],
+            ["disable", "j", "--sync"],
+            ["destroy", "j", "--sync"],
+        ],
+    )
+    def test_rejects_invalid_combinations(self, argv: list[str]) -> None:
+        with pytest.raises(SystemExit) as exc:
+            crony_cli._build_parser().parse_command(argv)
+        assert exc.value.code == 2
+
+    def test_start_timeout_with_sync(self) -> None:
+        args = crony_cli._build_parser().parse_command(
+            ["start", "j", "--sync", "--start-timeout", "2"]
+        )
+        assert args.sync and args.start_timeout == 2
+
+
 if __name__ == "__main__":
     from conftest import run_tests
 

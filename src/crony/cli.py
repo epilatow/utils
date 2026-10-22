@@ -71,6 +71,17 @@ underlying scheduler, and run at will via the `start` subcommand). Crony
 supports the following notification mechanisms for job failures:
 email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
+By default, `start` and `stop` return once the scheduler accepts the
+request. `enable`, `disable`, `apply`, and `destroy` wait for any run
+they stop, but do not wait for a run they start. On `start`, `stop`,
+`enable`, and `apply`, `-s/--sync` also waits until the requested effect
+is in place, and fails with the timeout exit code if its bounded wait
+expires. With `--sync`, targets are requested and waited for one at a
+time; a timeout aborts the command before later targets are requested.
+`start --wait` waits for completion and returns the run's exit code;
+it is mutually exclusive with `--sync`. `disable` and `destroy` already
+wait for the runs they stop.
+
 Subcommands fall into categories:
 - configuration (`config`): manage config files
 - deployment (`apply`, `destroy`): deploy configured jobs
@@ -320,11 +331,8 @@ def _validate_disable(
 def _validate_start(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    if args.start_timeout is not None and not args.wait:
-        parser.error(
-            "--start-timeout requires --wait (only meaningful in "
-            "synchronous mode)"
-        )
+    if args.start_timeout is not None and not (args.wait or args.sync):
+        parser.error("--start-timeout requires --wait or --sync")
     _require_names_or_all(parser, args)
 
 
@@ -348,6 +356,12 @@ def _validate_notify_test(
             f"--bundle {args.bundle!r} contradicts --channel "
             f"{args.channel!r} (bundle {channel_bundle!r}); pick one"
         )
+
+
+_SYNC_HELP = (
+    "Wait until the requested effect is in place; fail with the timeout "
+    "exit code if the wait exceeds its bound."
+)
 
 
 def _build_parser() -> StrictArgumentParser:
@@ -457,7 +471,9 @@ def _build_parser() -> StrictArgumentParser:
             "drift, remove orphans); with names it surgically updates "
             "just those entries. A daemon left stopped by an exhausted "
             "retry budget or a declined gate is restarted with a fresh "
-            "budget, reported as `rearmed`."
+            "budget, reported as `rearmed`. With --sync, also wait for "
+            "each daemon started by this apply to come up, bounded by "
+            "its bundle's start-timeout-sec."
         ),
     )
     _add_jobs_argument(p_apply)
@@ -468,6 +484,12 @@ def _build_parser() -> StrictArgumentParser:
         help="Also print 'unchanged' lines.",
     )
     _add_bundle_argument(p_apply)
+    p_apply.add_argument(
+        "-s",
+        "--sync",
+        action="store_true",
+        help=_SYNC_HELP,
+    )
 
     # destroy
     p_destroy = subparsers.add_parser(
@@ -475,7 +497,8 @@ def _build_parser() -> StrictArgumentParser:
         help="Remove platform units.",
         description=(
             "Remove platform units -- the platform unit files and the "
-            "entry's state dir both go away. Requires a target: job(s), "
+            "entry's state dir both go away, after waiting for any "
+            "stopped run to end. Requires a target: job(s), "
             "--all, or --orphans."
         ),
     )
@@ -502,12 +525,20 @@ def _build_parser() -> StrictArgumentParser:
             "Re-arm the named jobs' schedules (clear the "
             "operator-disable). Enabling an already-enabled daemon "
             "restarts one that an exhausted retry budget or a declined "
-            "gate left stopped. Requires a target: job(s) or --all."
+            "gate left stopped. With --sync, also wait for each daemon "
+            "started by this enable to come up, bounded by its bundle's "
+            "start-timeout-sec. Requires a target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_enable)
     _add_all_argument(p_enable)
     _add_bundle_argument(p_enable)
+    p_enable.add_argument(
+        "-s",
+        "--sync",
+        action="store_true",
+        help=_SYNC_HELP,
+    )
     p_enable.add_validate_callback(_validate_enable)
 
     # disable
@@ -517,7 +548,8 @@ def _build_parser() -> StrictArgumentParser:
         description=(
             "Disarm the named jobs' schedules: loaded and startable, "
             "but not firing on their own. Disabling a daemon stops it; "
-            "it stays stopped across a reboot until re-enabled. "
+            "it stays stopped across a reboot until re-enabled. Waits "
+            "for any run stopped by the update to end. "
             "Requires a target: job(s) or --all."
         ),
     )
@@ -534,13 +566,22 @@ def _build_parser() -> StrictArgumentParser:
             "Ask the platform scheduler to fire the named jobs now, via "
             "the same path a scheduled fire uses. Starting a stopped "
             "daemon this way gives it a fresh retry budget. Requires a "
-            "target: job(s) or --all."
+            "target: job(s) or --all. With --sync, wait until each run "
+            "is up or has already finished, bounded by start-timeout-sec "
+            "or --start-timeout. Already-running entries return at once."
         ),
     )
     _add_jobs_argument(p_start)
     _add_all_argument(p_start)
     _add_bundle_argument(p_start)
-    p_start.add_argument(
+    start_wait = p_start.add_mutually_exclusive_group()
+    start_wait.add_argument(
+        "-s",
+        "--sync",
+        action="store_true",
+        help=_SYNC_HELP,
+    )
+    start_wait.add_argument(
         "-w",
         "--wait",
         action="store_true",
@@ -559,7 +600,7 @@ def _build_parser() -> StrictArgumentParser:
         help=(
             "Override [defaults].start-timeout-sec (seconds to "
             "wait for a runner to come online after dispatch). "
-            "Only meaningful with --wait."
+            "Requires --wait or --sync."
         ),
     )
     p_start.add_validate_callback(_validate_start)
@@ -573,13 +614,21 @@ def _build_parser() -> StrictArgumentParser:
             "schedules. An enabled daemon restarts automatically; a "
             "disabled daemon stays stopped. Stopping a group leaves its "
             "in-flight child running and dispatches no further children. "
-            "Returns once the scheduler accepts the request. "
+            "Returns once the scheduler accepts the request; --sync "
+            "waits up to 10s for the stopped run to end and record, "
+            "without waiting for a daemon's replacement. "
             "Requires a target: job(s) or --all."
         ),
     )
     _add_jobs_argument(p_stop)
     _add_all_argument(p_stop)
     _add_bundle_argument(p_stop)
+    p_stop.add_argument(
+        "-s",
+        "--sync",
+        action="store_true",
+        help=_SYNC_HELP,
+    )
     p_stop.add_validate_callback(_require_names_or_all)
 
     # status

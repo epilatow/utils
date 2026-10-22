@@ -545,7 +545,7 @@ class TestPerEntityConfigErrors:
         )
         with pytest.raises(UsageError, match="config error"):
             crony_commands.do_apply(
-                jobs=[h.full("bad")], verbose=False, bundle=None
+                jobs=[h.full("bad")], verbose=False, bundle=None, sync=False
             )
 
     def test_apply_no_args_skips_errored_silently(
@@ -570,7 +570,7 @@ class TestPerEntityConfigErrors:
             },
             default_target_jobs=["good"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         # The good plist landed; the bad one didn't.
         assert (h.agents / f"org.crony.{h.full('good')}.plist").exists()
         assert not (h.agents / f"org.crony.{h.full('bad')}.plist").exists()
@@ -1369,7 +1369,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         config = crony_runtime.load_config()
         unit_dir = h.agents if platform == "darwin" else h.sysd
         if platform == "darwin":
@@ -1427,7 +1429,9 @@ class TestUnitDriftDetection:
             )
             == "unit-config-1"
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         config = crony_runtime.load_config()
         assert config.cfg_status(ref) == "synced"
         assert crony_paths.CONFIG_FILE.read_bytes() == toml_before
@@ -1472,7 +1476,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         plist = h.agents / f"org.crony.{h.full('j')}.plist"
         content = plist.read_text()
         # Flip Hour 3 -> Hour 5: the snapshot still says 03:00, so a
@@ -1503,7 +1509,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         leftover = h.agents / f"org.crony.{h.full('j')}.oldscheme.plist"
         leftover.write_text("stale junk", encoding="utf-8")
         config = crony_runtime.load_config()
@@ -1557,7 +1565,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         path = h.sysd / f"crony-{h.full('j')}.{edit}"
         path.write_text(path.read_text() + "\n# edited\n")
         config = crony_runtime.load_config()
@@ -1594,7 +1604,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         (h.sysd / f"crony-{h.full('j')}.timer").unlink()
         config = crony_runtime.load_config()
         ref = config.current.by_full_name[h.full("j")]
@@ -1612,7 +1624,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "schedule": "*-*-* 03:00"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         monkeypatch.setattr(
             systemd,
             "_show_timer",
@@ -1648,7 +1662,9 @@ class TestUnitDriftDetection:
             {"job": {"j": {"command": "true", "interval": "8h"}}},
             default_target_jobs=["j"],
         )
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         # Report the on-disk timer as dead; its content is unchanged.
         monkeypatch.setattr(
             systemd,
@@ -1660,7 +1676,9 @@ class TestUnitDriftDetection:
             },
         )
         h.calls.clear()
-        crony_commands.do_apply(jobs=[h.full("j")], verbose=False, bundle=None)
+        crony_commands.do_apply(
+            jobs=[h.full("j")], verbose=False, bundle=None, sync=False
+        )
         timer = f"crony-{h.full('j')}.timer"
         assert ["systemctl", "--user", "--quiet", "restart", timer] in h.calls
 
@@ -1680,7 +1698,7 @@ class TestUnitDriftDetection:
             },
             default_target_jobs=["g"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         config = crony_runtime.load_config()
         a_ref = config.current.by_full_name[h.full("a")]
         g_ref = config.current.by_full_name[h.full("g")]
@@ -1762,7 +1780,9 @@ class TestUnitDriftDetection:
         h, _, unit_config = self._apply_and_load(tmp_path, monkeypatch)
         unit_config.unlink()
         with caplog.at_level(logging.INFO, logger="crony"):
-            crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+            crony_commands.do_apply(
+                jobs=[], verbose=False, bundle=None, sync=False
+            )
         assert unit_config.exists()
         msgs = [r.getMessage() for r in caplog.records]
         assert any(f"{h.full('j')}: updated" in m for m in msgs), msgs
@@ -1849,7 +1869,7 @@ class TestUnitDriftDetection:
             },
             default_target_jobs=["root"],
         )
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         timer = h.sysd / f"crony-{h.full('transit')}.timer"
         timer.write_text(
             systemd._render_timer(
@@ -1877,7 +1897,7 @@ class TestApplyDottedPrefixGuard:
             default_target_jobs=[short],
         )
         crony_commands.do_apply(
-            jobs=[h.full(short)], verbose=False, bundle=None
+            jobs=[h.full(short)], verbose=False, bundle=None, sync=False
         )
 
     def _reconfigure_to(self, h: _ApplyHarness, short: str) -> None:
@@ -1898,7 +1918,7 @@ class TestApplyDottedPrefixGuard:
         self._reconfigure_to(h, "foo.bar")
         with pytest.raises(PreconditionError, match="dotted-prefix"):
             crony_commands.do_apply(
-                jobs=[h.full("foo.bar")], verbose=False, bundle=None
+                jobs=[h.full("foo.bar")], verbose=False, bundle=None, sync=False
             )
 
     @pytest.mark.parametrize("platform", ["darwin", "linux"])
@@ -1908,7 +1928,7 @@ class TestApplyDottedPrefixGuard:
         h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
         self._apply_job(h, "foo.bar.baz")
         self._reconfigure_to(h, "foo.bar")
-        crony_commands.do_apply(jobs=[], verbose=False, bundle=None)
+        crony_commands.do_apply(jobs=[], verbose=False, bundle=None, sync=False)
         config = crony_runtime.load_config()
         assert h.full("foo.bar") in config.current.by_full_name
         assert h.full("foo.bar.baz") not in config.current.by_full_name
@@ -1926,7 +1946,7 @@ class TestApplyDottedPrefixGuard:
         self._apply_job(h, "foo.abc")
         self._reconfigure_to(h, "foo.ab")
         crony_commands.do_apply(
-            jobs=[h.full("foo.ab")], verbose=False, bundle=None
+            jobs=[h.full("foo.ab")], verbose=False, bundle=None, sync=False
         )
         config = crony_runtime.load_config()
         assert h.full("foo.ab") in config.current.by_full_name
@@ -2705,7 +2725,7 @@ class TestDestroyRunSettle:
         monkeypatch.setattr(
             crony_runtime, "run_in_progress", fake_run_in_progress
         )
-        crony_runtime._await_run_finished(sd)
+        crony_runtime.await_run_finished(sd)
         assert len(released) >= 3
         assert sd.is_dir()  # the wait itself removes nothing
 
@@ -2715,8 +2735,30 @@ class TestDestroyRunSettle:
         monkeypatch.setattr(crony_runtime, "run_in_progress", lambda _sd: True)
         monkeypatch.setattr(crony_runtime, "_RUN_SETTLE_TIMEOUT_SEC", 0.2)
         started = time.monotonic()
-        crony_runtime._await_run_finished(sd)
+        crony_runtime.await_run_finished(sd)
         assert time.monotonic() - started < 5
+
+
+class TestAwaitStoppedInstance:
+    def test_free_lock_is_complete(self, tmp_path: Path) -> None:
+        assert crony_runtime.await_run_finished(tmp_path)
+
+    def test_new_instance_does_not_extend_stop_wait(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "run.pid").write_text("456")
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            assert crony_runtime.await_run_finished(tmp_path, runner_pid=123)
+
+    def test_timeout_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(crony_runtime, "_RUN_SETTLE_TIMEOUT_SEC", 0)
+        (tmp_path / "run.pid").write_text("123")
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            assert not crony_runtime.await_run_finished(
+                tmp_path, runner_pid=123
+            )
 
 
 if __name__ == "__main__":

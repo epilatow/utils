@@ -23,6 +23,16 @@ independently of the underlying scheduler, and run at will via the `start`
 subcommand). Crony supports the following notification mechanisms for job
 failures: email/smtp, ntfy, and pop-ups (on macOS/darwin).
 
+By default, `start` and `stop` return once the scheduler accepts the request.
+`enable`, `disable`, `apply`, and `destroy` wait for any run they stop, but do
+not wait for a run they start. On `start`, `stop`, `enable`, and `apply`,
+`-s/--sync` also waits until the requested effect is in place, and fails with
+the timeout exit code if its bounded wait expires. With `--sync`, targets are
+requested and waited for one at a time; a timeout aborts the command before
+later targets are requested. `start --wait` waits for completion and returns
+the run's exit code; it is mutually exclusive with `--sync`. `disable` and
+`destroy` already wait for the runs they stop.
+
 Subcommands fall into categories:
 
 - configuration (`config`): manage config files
@@ -130,60 +140,82 @@ file is scanned; with it, only that bundle's file.
 
 Print one freshly-minted UUID.
 
-### `apply [-v] [-b BUNDLE] [job ...]`
+### `apply [-v] [-b BUNDLE] [-s] [job ...]`
 
 Render and activate platform units to match config. With no job arguments this
 is a full sync (install missing, fix drift, remove orphans); with names it
 surgically updates just those entries. A daemon left stopped by an exhausted
 retry budget or a declined gate is restarted with a fresh budget, reported as
-`rearmed`.
+`rearmed`. With --sync, also wait for each daemon started by this apply to
+come up, bounded by its bundle's start-timeout-sec.
 
 - **`-v, --verbose`**\
   Also print 'unchanged' lines.
+- **`-s, --sync`**\
+  Wait until the requested effect is in place; fail with the timeout exit code
+  if the wait exceeds its bound.
 
 ### `destroy [--all] [--orphans] [-b BUNDLE] [job ...]`
 
 Remove platform units -- the platform unit files and the entry's state dir
-both go away. Requires a target: job(s), --all, or --orphans.
+both go away, after waiting for any stopped run to end. Requires a target:
+job(s), --all, or --orphans.
 
 - **`--orphans`**\
   Limit removal to entries with on-disk remnants that no config selects on
   this host. Combinable with -b/--bundle; mutually exclusive with positional
   names and --all.
 
-### `enable [--all] [-b BUNDLE] [job ...]`
+### `enable [--all] [-b BUNDLE] [-s] [job ...]`
 
 Re-arm the named jobs' schedules (clear the operator-disable). Enabling an
 already-enabled daemon restarts one that an exhausted retry budget or a
-declined gate left stopped. Requires a target: job(s) or --all.
+declined gate left stopped. With --sync, also wait for each daemon started by
+this enable to come up, bounded by its bundle's start-timeout-sec. Requires a
+target: job(s) or --all.
+
+- **`-s, --sync`**\
+  Wait until the requested effect is in place; fail with the timeout exit code
+  if the wait exceeds its bound.
 
 ### `disable [--all] [-b BUNDLE] [job ...]`
 
 Disarm the named jobs' schedules: loaded and startable, but not firing on
 their own. Disabling a daemon stops it; it stays stopped across a reboot until
-re-enabled. Requires a target: job(s) or --all.
+re-enabled. Waits for any run stopped by the update to end. Requires a target:
+job(s) or --all.
 
-### `start [--all] [-b BUNDLE] [-w] [--start-timeout START_TIMEOUT] [job ...]`
+### `start [--all] [-b BUNDLE] [-s | -w] [--start-timeout START_TIMEOUT] [job ...]`
 
 Ask the platform scheduler to fire the named jobs now, via the same path a
 scheduled fire uses. Starting a stopped daemon this way gives it a fresh retry
-budget. Requires a target: job(s) or --all.
+budget. Requires a target: job(s) or --all. With --sync, wait until each run
+is up or has already finished, bounded by start-timeout-sec or
+--start-timeout. Already-running entries return at once.
 
+- **`-s, --sync`**\
+  Wait until the requested effect is in place; fail with the timeout exit code
+  if the wait exceeds its bound.
 - **`-w, --wait`**\
   Block until each named entry's next completion and exit with that exit code
   (worst across multiple names). Naming a daemon is an error -- it runs until
   stopped, so there is no completion to wait for.
 - **`--start-timeout START_TIMEOUT`**\
   Override [defaults].start-timeout-sec (seconds to wait for a runner to come
-  online after dispatch). Only meaningful with --wait.
+  online after dispatch). Requires --wait or --sync.
 
-### `stop [--all] [-b BUNDLE] [job ...]`
+### `stop [--all] [-b BUNDLE] [-s] [job ...]`
 
 Stop the named running jobs or groups without disarming their schedules. An
 enabled daemon restarts automatically; a disabled daemon stays stopped.
 Stopping a group leaves its in-flight child running and dispatches no further
-children. Returns once the scheduler accepts the request. Requires a target:
-job(s) or --all.
+children. Returns once the scheduler accepts the request; --sync waits up to
+10s for the stopped run to end and record, without waiting for a daemon's
+replacement. Requires a target: job(s) or --all.
+
+- **`-s, --sync`**\
+  Wait until the requested effect is in place; fail with the timeout exit code
+  if the wait exceeds its bound.
 
 ### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 
