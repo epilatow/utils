@@ -335,19 +335,24 @@ gated by platform checks.
   companion fires within seconds instead of the 10m production floor; both
   read live per call and default to the production values when unset. The
   daemon tests drive a third seam the same way, `CRONY_DAEMON_RESTART_SECONDS`
-  (the supervisor's restart backoff), so a restart lands in seconds instead of
-  the 30s production default. It is baked into the rendered unit, so it must
-  stay set for the whole test -- including any `crony status` call, which
-  would otherwise report drift. The retry-budget test, the tests that stop a
-  daemon whose command ignores the stop, the test that a finished run's
-  leftover processes are cleaned up, and the tests that stop or time out a
-  started run and check the status its record gives it, need one thing the env
-  seams cannot give them: a unit the *scheduler* spawns reads the operator's
-  real state tree, because a rendered unit deliberately does not inherit the
-  CLI process's `CRONY_*` overrides. They rewrite the installed unit to carry
-  those overrides and reload it, so the scheduler-spawned runner keeps its
-  persistent state inside the throwaway namespace. That rewrite is drift, so
-  such a test cannot also assert on the CONFIG column.
+  (the runner's minimum launch spacing), so a restart lands in seconds instead
+  of the 30s production default. The runner reads it live; scheduler-spawned
+  units must carry it in their environment to exercise the override. The
+  retry-budget test, the tests that stop a daemon whose command ignores the
+  stop, the test that a finished run's leftover processes are cleaned up, and
+  the tests that stop or time out a started run and check the status its
+  record gives it, need one thing the env seams cannot give them: a unit the
+  *scheduler* spawns reads the operator's real state tree, because a rendered
+  unit deliberately does not inherit the CLI process's `CRONY_*` overrides.
+  They rewrite the installed unit to carry those overrides and reload it, so
+  the scheduler-spawned runner keeps its persistent state inside the throwaway
+  namespace. That rewrite is drift, so such a test cannot also assert on the
+  CONFIG column.
+
+  The daemon rearm cases use an isolated test launcher instead, so the
+  environment survives native unit rewrites by enable and apply. It invokes
+  the real CLI and scheduler while keeping every spawned runner in the test
+  namespace.
 
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm

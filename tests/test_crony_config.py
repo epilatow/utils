@@ -3483,8 +3483,7 @@ class TestParseDaemon:
 
 
 class TestDaemonRestartSeconds:
-    """The restart backoff is written verbatim into a unit file, so the
-    seam that overrides it has to stay in a range a scheduler accepts."""
+    """The runner's restart-spacing seam retains a positive delay."""
 
     def test_defaults_to_the_production_value(self, monkeypatch: Any) -> None:
         monkeypatch.delenv("CRONY_DAEMON_RESTART_SECONDS", raising=False)
@@ -3495,12 +3494,9 @@ class TestDaemonRestartSeconds:
         assert crony_config.daemon_restart_seconds() == 2
 
     @pytest.mark.parametrize("bad", ["0", "-5", "not-a-number"])
-    def test_unusable_override_never_reaches_a_unit_file(
+    def test_unusable_override_retains_positive_spacing(
         self, monkeypatch: Any, bad: str
     ) -> None:
-        # A non-positive restart interval renders a unit the scheduler
-        # rejects or ignores, so the floor holds regardless of the
-        # override; a non-integer falls back to the default.
         monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", bad)
         assert crony_config.daemon_restart_seconds() >= 1
 

@@ -48,11 +48,13 @@ utils/bin/linkfiles install utils/share $HOME/.local/share
   exhausted daemon stays loaded but stopped until the next login, `start`,
   `apply`, or `enable` starts a fresh retry budget. Stopping an enabled daemon
   will stop the currently running instance, but it will subsequently be
-  automatically restarted. A disabled daemon stays stopped. Jobs can also be
-  managed manually (enabled/disabled independently of the underlying
-  scheduler, and run at will via the `start` subcommand). Crony supports the
-  following notification mechanisms for job failures: email/smtp, ntfy, and
-  pop-ups (on macOS/darwin).
+  automatically restarted. If the instance ran for less than the restart
+  delay, crony waits for the rest of that delay before restarting it. A
+  disabled daemon stays stopped. Jobs can also be managed manually
+  (enabled/disabled independently of the underlying scheduler, and run at will
+  via the `start` subcommand). Crony supports the following notification
+  mechanisms for job failures: email/smtp, ntfy, and pop-ups (on
+  macOS/darwin).
 - **[darwin-tz-watchdog](docs/darwin-tz-watchdog.md)**\
   darwin-tz-watchdog restarts macOS UserEventAgent-Aqua when its cached
   timezone has gone stale. UserEventAgent-Aqua dispatches user-level launchd

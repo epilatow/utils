@@ -1413,16 +1413,13 @@ def jitter_floor_seconds() -> int:
 
 
 def daemon_restart_seconds() -> int:
-    """How long a supervisor waits before restarting a daemon whose
-    command exited, in seconds -- 30 by default.
+    """Minimum spacing between daemon launches, in seconds -- 30 by default.
 
     Long enough that a command failing instantly cannot spin the
     supervisor, short enough that a real outage recovers promptly. Read
     live from `CRONY_DAEMON_RESTART_SECONDS` so a test can drive a short
     backoff; a non-integer override falls back to the default, and the
-    result is floored at 1 -- the value is written verbatim into a unit
-    file, and a scheduler rejects or ignores a non-positive restart
-    interval."""
+    result is floored at 1 to retain a positive spacing."""
     return max(1, _env_int("DAEMON_RESTART_SECONDS", 30))
 
 

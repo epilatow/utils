@@ -173,6 +173,7 @@ class _CronyE2E:
         self.state_dir.mkdir()
         self.config_file = self.config_dir / "config.toml"
         self.config_file.write_text("# crony e2e (empty base bundle)\n")
+        self.crony_bin: Path | None = None
         self.env = os.environ.copy()
         self.env["CRONY_CONFIG_DIR"] = str(self.config_dir)
         self.env["CRONY_CONFIG_FILE"] = str(self.config_file)
@@ -207,13 +208,39 @@ class _CronyE2E:
         self, *args: str, check: bool = True, timeout: int = 120
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(CRONY_BIN), *args],
+            [str(self.crony_bin or CRONY_BIN), *args],
             env=self.env,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=check,
         )
+
+    def use_isolated_launcher(self) -> None:
+        """Keep test paths in every runner across native unit rewrites.
+
+        The launcher invokes the real CLI and pins its own path so enable
+        and apply can start a fresh runner without an intervening fixture
+        reload. Its environment is scoped to this reserved test bundle.
+        """
+        launcher = self.config_dir.parent / "launcher" / "crony"
+        launcher.parent.mkdir()
+        isolated = {k: v for k, v in self.env.items() if k.startswith("CRONY_")}
+        launcher.write_text(
+            "#!/usr/bin/env -S uv run --script\n"
+            "# /// script\n"
+            '# requires-python = ">=3.15,<3.16"\n'
+            '# dependencies = ["tomlkit", "pydantic>=2.14"]\n'
+            "# ///\n"
+            "import os, sys\nfrom pathlib import Path\n"
+            f"os.environ.update({isolated!r})\n"
+            f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
+            "from crony import cli, runtime\n"
+            "runtime._crony_executable = lambda: Path(__file__)\n"
+            "raise SystemExit(cli.cli())\n"
+        )
+        launcher.chmod(0o755)
+        self.crony_bin = launcher
 
     def systemctl_user(
         self, *args: str, check: bool = False
@@ -1394,14 +1421,14 @@ def _pid_alive(pid: int) -> bool:
 
 class TestUserStop:
     def _running_job(
-        self, e2e: _CronyE2E, *, daemon: bool
+        self, e2e: _CronyE2E, *, daemon: bool, restart_seconds: int = 2
     ) -> tuple[Path, Path]:
         pidfile = e2e.state_dir.parent / "command.pid"
         command = (
             f"echo $$ > {shlex.quote(str(pidfile))}; "
             "while :; do sleep 0.2; done"
         )
-        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "2"
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = str(restart_seconds)
         timing = "daemon = true" if daemon else 'schedule = "daily"'
         e2e.write_bundle(
             f"[job.probe]\ncommand = {json.dumps(command)}\n{timing}\n",
@@ -1464,6 +1491,88 @@ class TestUserStop:
         )
         assert _read_text(sd / "exit-history.json") == before
         assert "LOCK_BUSY" not in _read_text(sd / "run.log")
+
+    def test_long_lived_daemon_restarts_without_full_delay(
+        self, e2e: _CronyE2E
+    ) -> None:
+        _sd, pidfile = self._running_job(e2e, daemon=True, restart_seconds=30)
+        first = _read_text(pidfile)
+        time.sleep(30.1)
+        e2e.crony("stop", e2e.full("probe"))
+        e2e.wait_until(
+            lambda: bool(_read_text(pidfile)) and _read_text(pidfile) != first,
+            timeout=15,
+            what="the long-lived daemon to restart promptly",
+        )
+
+    def test_crash_loop_retains_restart_spacing(self, e2e: _CronyE2E) -> None:
+        marker = e2e.state_dir.parent / "attempts"
+        command = f"echo attempt >> {shlex.quote(str(marker))}; exit 1"
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "4"
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\ndaemon = true\n",
+            ["probe"],
+        )
+        e2e.crony("apply", e2e.full("probe"))
+        e2e.inject_isolated_env("probe", restart=True)
+        e2e.wait_until(
+            lambda: bool(_read_text(marker)), timeout=60, what="first attempt"
+        )
+        time.sleep(5)
+        assert len(_read_text(marker).splitlines()) <= 2
+        e2e.wait_until(
+            lambda: len(_read_text(marker).splitlines()) >= 2,
+            timeout=10,
+            what="a throttled retry to make progress",
+        )
+
+    @pytest.mark.parametrize("operation", ["start", "enable", "apply"])
+    def test_explicit_rearm_skips_large_spacing(
+        self, e2e: _CronyE2E, operation: str
+    ) -> None:
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "60"
+        e2e.use_isolated_launcher()
+        pidfile = e2e.state_dir.parent / "rearmed-command.pid"
+        command = (
+            f"echo $$ > {shlex.quote(str(pidfile))}; "
+            "while :; do sleep 0.2; done"
+        )
+        e2e.write_bundle(
+            f"[job.probe]\ncommand = {json.dumps(command)}\ndaemon = true\n",
+            ["probe"],
+        )
+        full = e2e.full("probe")
+        e2e.crony("apply", full)
+        e2e.wait_until(
+            lambda: _read_text(pidfile).strip().isdigit(),
+            timeout=60,
+            what="the first daemon command",
+        )
+        first = _read_text(pidfile)
+        if operation == "apply":
+            config = e2e.dropin_dir / f"{E2E_BUNDLE}.toml"
+            config.write_text(
+                config.read_text().replace("sleep 0.2", "sleep 0.3")
+            )
+        elif operation == "enable":
+            e2e.crony("disable", full)
+        else:
+            e2e.crony("stop", full)
+            record = e2e.state_dir / E2E_BUNDLE / "probe" / "last-run.json"
+            e2e.wait_until(
+                lambda: (
+                    json.loads(_read_text(record) or "{}").get("exit_class")
+                    == "stopped"
+                ),
+                timeout=20,
+                what="the stopped daemon to record",
+            )
+        e2e.crony(operation, full)
+        e2e.wait_until(
+            lambda: bool(_read_text(pidfile)) and _read_text(pidfile) != first,
+            timeout=20,
+            what=f"{operation} to bypass the remaining spacing",
+        )
 
     def test_stop_disabled_daemon_stays_down(self, e2e: _CronyE2E) -> None:
         sd, pidfile = self._running_job(e2e, daemon=True)

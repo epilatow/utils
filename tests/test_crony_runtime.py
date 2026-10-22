@@ -2554,8 +2554,49 @@ class TestDaemonRetryHistory:
 
 
 class TestUserStartFlagAge:
-    """The sentinel is deleted on read either way; `max_age_sec` decides
-    whether the reader is allowed to act on it."""
+    """The sentinel is deleted on claim; freshness bounds its effect."""
+
+    def test_reload_rearm_is_reserved_for_a_new_launch(
+        self, tmp_path: Path
+    ) -> None:
+        before = time.time() - 1
+        crony_runtime.write_user_start_flag(tmp_path, next_launch_only=True)
+        assert not crony_runtime.consume_user_start_flag(
+            tmp_path, max_age_sec=60, launch_started_at=before
+        )
+        assert crony_runtime.user_start_flag_path(tmp_path).exists()
+        assert crony_runtime.consume_user_start_flag(
+            tmp_path, max_age_sec=60, launch_started_at=time.time()
+        )
+
+    def test_reload_rearm_cannot_bypass_interactive_approval(
+        self, tmp_path: Path
+    ) -> None:
+        crony_runtime.write_user_start_flag(tmp_path, next_launch_only=True)
+        assert not crony_runtime.consume_user_start_flag(tmp_path)
+        assert crony_runtime.user_start_flag_path(tmp_path).exists()
+        assert crony_runtime.consume_user_start_flag(
+            tmp_path, launch_started_at=time.time()
+        )
+
+    def test_abandoned_reload_request_expires_without_bypassing_approval(
+        self, tmp_path: Path
+    ) -> None:
+        crony_runtime.write_user_start_flag(tmp_path, next_launch_only=True)
+        flag = crony_runtime.user_start_flag_path(tmp_path)
+        old = time.time() - 3600
+        os.utime(flag, (old, old))
+        assert not crony_runtime.consume_user_start_flag(tmp_path)
+        assert not flag.exists()
+
+    def test_plain_start_can_wake_an_existing_launch(
+        self, tmp_path: Path
+    ) -> None:
+        before = time.time() - 1
+        crony_runtime.write_user_start_flag(tmp_path)
+        assert crony_runtime.consume_user_start_flag(
+            tmp_path, max_age_sec=60, launch_started_at=before
+        )
 
     def test_a_fresh_flag_is_honored(self, tmp_path: Path) -> None:
         crony_runtime.write_user_start_flag(tmp_path)

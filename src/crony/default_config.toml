@@ -241,7 +241,9 @@
 # mutually exclusive with `schedule` / `interval` / `on-demand`, and
 # shows `daemon` in `crony status`.
 # `crony stop` stops the currently running instance. An enabled daemon is
-# automatically restarted; a disabled daemon stays stopped.
+# automatically restarted. If the instance ran for less than the restart
+# delay, crony waits for the rest of that delay before restarting it.
+# A disabled daemon stays stopped.
 #
 # The gate runs before every start, so it doubles as a precondition: a
 # daemon whose gate fails stays stopped immediately rather than consuming

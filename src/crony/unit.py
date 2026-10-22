@@ -401,10 +401,10 @@ class DaemonSpec:
     once the entry is disabled, since a disabled entry renders with no
     timing at all.
 
-    restart_seconds  The minimum restart spacing requested of the scheduler.
+    respawn_floor_seconds  A short native floor against launcher crash loops.
     """
 
-    restart_seconds: int
+    respawn_floor_seconds: int = 1
 
 
 class UnitPlatformProperties(abc.ABC):

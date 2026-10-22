@@ -621,6 +621,11 @@ class TestRunJobBasics:
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            crony_runner,
+            "_throttle_daemon_restart",
+            mock.create_autospec(crony_runner._throttle_daemon_restart),
+        )
         cfg = h.config(
             {
                 "job": {
@@ -5158,6 +5163,14 @@ class TestRunDaemon:
     code differs. Exhausting the budget is the one place the record
     itself changes: the run reads `fail` however the command exited."""
 
+    @pytest.fixture(autouse=True)
+    def _without_restart_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            crony_runner,
+            "_throttle_daemon_restart",
+            mock.create_autospec(crony_runner._throttle_daemon_restart),
+        )
+
     def _cfg(self, h: Any, **overrides: Any) -> Any:
         body: dict[str, Any] = {"command": "true", "daemon": True}
         body.update(overrides)
@@ -5390,6 +5403,88 @@ def test_guard_finishes_within_scheduler_stop_timeout(platform: str) -> None:
         crony_runner._KILL_GRACE_SEC + crony_runner._SIGNAL_HINT_SETTLE_SEC
         < scheduler.stop_timeout_sec
     )
+
+
+class TestDaemonRestartThrottle:
+    def test_start_in_final_poll_chunk_is_claimed(self, tmp_path: Path) -> None:
+        crony_runtime.record_daemon_exit(tmp_path, 1, ExitClass.FAIL, "prior")
+
+        def request_start(_seconds: float) -> None:
+            crony_runtime.write_user_start_flag(tmp_path)
+
+        with (
+            mock.patch.object(
+                crony_runner,
+                "_daemon_restart_delay",
+                autospec=True,
+                return_value=0.1,
+            ),
+            mock.patch.object(
+                time, "sleep", autospec=True, side_effect=request_start
+            ),
+        ):
+            crony_runner._throttle_daemon_restart(
+                tmp_path, rearmed=False, launch_started_at=time.time()
+            )
+        assert not crony_runtime.user_start_flag_path(tmp_path).exists()
+        assert not crony_runtime.read_exit_history(tmp_path).runs
+
+    @pytest.mark.parametrize(
+        ("elapsed", "rearmed", "expected"),
+        [(3, False, 27), (31, False, 0), (3, True, 0), (-1, False, 30)],
+    )
+    def test_previous_launch_without_a_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        elapsed: int,
+        rearmed: bool,
+        expected: int,
+    ) -> None:
+        monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", "30")
+        monkeypatch.setattr(time, "time", lambda: 100.0)
+        pid = tmp_path / "run.pid"
+        pid.write_text("123")
+        os.utime(pid, (100 - elapsed, 100 - elapsed))
+        assert (
+            crony_runner._daemon_restart_delay(tmp_path, rearmed=rearmed)
+            == expected
+        )
+
+    def test_first_launch_and_live_instance_do_not_wait(
+        self, tmp_path: Path
+    ) -> None:
+        assert crony_runner._daemon_restart_delay(tmp_path, rearmed=False) == 0
+        (tmp_path / "run.pid").write_text("123")
+        with crony_runtime.acquire_lock(tmp_path / "run.lock"):
+            assert (
+                crony_runner._daemon_restart_delay(tmp_path, rearmed=False) == 0
+            )
+
+    def test_start_wakes_wait_before_lock_and_clears_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"d": {"command": "true", "daemon": True}}},
+            default_target_jobs=["d"],
+        )
+        snap = h.snap(cfg, "d")
+        sd = snap.state_dir
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "run.pid").write_text("123")
+        crony_runtime.record_daemon_exit(sd, 1, ExitClass.FAIL, "prior")
+        waits: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            assert not crony_runtime.run_in_progress(sd)
+            waits.append(seconds)
+            crony_runtime.write_user_start_flag(sd)
+
+        monkeypatch.setattr(time, "sleep", sleep)
+        assert crony_runner._run_job(snap) == int(ExitCode.DAEMON_EXITED)
+        assert waits == [0.1]
+        assert len(crony_runtime.read_exit_history(sd).runs) == 1
 
 
 class TestUserStop:

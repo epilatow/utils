@@ -214,8 +214,8 @@ class TestLaunchdFileMaterialization:
             (Interval.from_str("1h"), None),
             (OnDemand(), None),
             (None, None),
-            (Daemon(), DaemonSpec(restart_seconds=7)),
-            (None, DaemonSpec(restart_seconds=7)),
+            (Daemon(), DaemonSpec(respawn_floor_seconds=7)),
+            (None, DaemonSpec(respawn_floor_seconds=7)),
         ],
     )
     def test_service_policy_across_firing_modes(
@@ -770,7 +770,7 @@ class TestLaunchdDaemon:
     """A daemon plist starts at load and is respawned when its command
     exits non-zero; disabling it renders the plist inert."""
 
-    _DAEMON = DaemonSpec(restart_seconds=7)
+    _DAEMON = DaemonSpec(respawn_floor_seconds=7)
 
     def _plist(self, *, armed: bool) -> dict[str, Any]:
         spec = UnitSpec(

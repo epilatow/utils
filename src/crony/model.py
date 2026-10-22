@@ -182,9 +182,7 @@ def _daemon_spec(
     at boot, not merely left dormant)."""
     if not crony.unit.is_daemon(timing):
         return None
-    return crony.unit.DaemonSpec(
-        restart_seconds=crony.config.daemon_restart_seconds()
-    )
+    return crony.unit.DaemonSpec()
 
 
 def _run_argv(ref: crony.unit.EntityRef) -> tuple[str, ...]:

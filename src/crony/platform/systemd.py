@@ -135,7 +135,7 @@ def _render_service(
         # StartLimitIntervalSec=0 leaves restart-count policy to the unit's
         # command. An unarmed spec omits supervision and boot wiring.
         supervise = (
-            f"Restart=on-failure\nRestartSec={daemon.restart_seconds}\n"
+            f"Restart=on-failure\nRestartSec={daemon.respawn_floor_seconds}\n"
             if armed
             else ""
         )

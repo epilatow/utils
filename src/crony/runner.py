@@ -485,26 +485,23 @@ def _wait_for_user_active(
 
 
 def _delay_or_bypass(
-    delay_sec: int,
+    delay_sec: float,
     *,
     bypass_check: Callable[[], bool],
-    poll_sec: int = 30,
+    poll_sec: float = 30,
 ) -> bool:
     """Sleep up to `delay_sec`, polling `bypass_check` every
-    `poll_sec`. Returns True if the full delay elapsed; False if
-    `bypass_check` returned True mid-sleep. Used by the
-    interactive delay-then-reprompt path so a "Delay Job" choice
-    doesn't strand the runner in an unbreakable hour-long sleep
-    when the user changes their mind and starts manually.
+    `poll_sec`, including once after the final chunk. Returns True when
+    the delay ends without a bypass, False when one is observed.
     """
-    elapsed = 0
+    elapsed = 0.0
     while elapsed < delay_sec:
         if bypass_check():
             return False
         chunk = min(poll_sec, delay_sec - elapsed)
         time.sleep(chunk)
         elapsed += chunk
-    return True
+    return not bypass_check()
 
 
 _INTERACTIVE_BUTTONS = ["Cancel Job", "Delay Job", "Run Job"]
@@ -598,6 +595,43 @@ def _interactive_wait_and_prompt(
             return _InteractiveChoice.RUN
 
 
+def _daemon_restart_delay(state_dir: Path, *, rearmed: bool) -> float:
+    """Remaining launch spacing; a recorded result is not required.
+
+    run.pid's mtime is the previous instance's launch time and survives
+    an instance killed before it could record. No file means no prior run.
+    """
+    if rearmed or crony.runtime.run_in_progress(state_dir):
+        return 0.0
+    try:
+        launched_at = (state_dir / "run.pid").stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+    elapsed = max(0.0, time.time() - launched_at)
+    return max(0.0, crony.config.daemon_restart_seconds() - elapsed)
+
+
+def _throttle_daemon_restart(
+    state_dir: Path, *, rearmed: bool, launch_started_at: float
+) -> None:
+    """Wait before taking the run lock, honoring a start during that wait."""
+    delay = _daemon_restart_delay(state_dir, rearmed=rearmed)
+    if delay <= 0:
+        return
+
+    def rearm_requested() -> bool:
+        claimed = crony.runtime.consume_user_start_flag(
+            state_dir,
+            max_age_sec=crony.config.DAEMON_START_REARM_MAX_AGE_SECONDS,
+            launch_started_at=launch_started_at,
+        )
+        if claimed:
+            crony.runtime.clear_exit_history(state_dir)
+        return claimed
+
+    _delay_or_bypass(delay, bypass_check=rearm_requested, poll_sec=0.1)
+
+
 def _run_job(snap: crony.model.Job) -> int:
     """Run a single job from its applied snapshot.
 
@@ -649,12 +683,18 @@ def _run_job(snap: crony.model.Job) -> int:
         # already-exhausted state also means this launch could not be an
         # automatic restart (the prior run returned zero to stop them),
         # so login or another external start gets a fresh budget too.
+        launch_started_at = time.time()
         user_started = crony.runtime.consume_user_start_flag(
             sd,
             max_age_sec=crony.config.DAEMON_START_REARM_MAX_AGE_SECONDS,
+            launch_started_at=launch_started_at,
         )
-        if user_started or crony.runtime.daemon_retries_exhausted(sd):
+        rearmed = user_started or crony.runtime.daemon_retries_exhausted(sd)
+        if rearmed:
             crony.runtime.clear_exit_history(sd)
+        _throttle_daemon_restart(
+            sd, rearmed=rearmed, launch_started_at=launch_started_at
+        )
     notify_channels, notify_defaults, success_ratio = (
         crony.notify.resolve_notify_at_runtime(full_name)
     )

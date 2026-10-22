@@ -73,7 +73,9 @@ _DIR = Path("/unused")
 
 
 class TestSystemdRendering:
-    @pytest.mark.parametrize("daemon", [None, DaemonSpec(restart_seconds=7)])
+    @pytest.mark.parametrize(
+        "daemon", [None, DaemonSpec(respawn_floor_seconds=7)]
+    )
     @pytest.mark.parametrize("armed", [False, True])
     def test_stop_deadline_is_pinned(
         self, daemon: DaemonSpec | None, armed: bool
@@ -591,13 +593,13 @@ class TestSystemdAnalyzeVerify:
                 "default.daemon",
                 Daemon(),
                 PriorityClass.NORMAL,
-                DaemonSpec(restart_seconds=30),
+                DaemonSpec(respawn_floor_seconds=30),
             ),
             (
                 "default.daemon-disabled",
                 None,
                 PriorityClass.LOW,
-                DaemonSpec(restart_seconds=5),
+                DaemonSpec(respawn_floor_seconds=5),
             ),
         ]
         written: list[Path] = []
@@ -837,7 +839,7 @@ class TestSystemdDaemon:
     """A daemon renders a self-starting, restarting `.service` and no
     `.timer`; disabling it drops the boot wiring and stops it."""
 
-    _DAEMON = DaemonSpec(restart_seconds=7)
+    _DAEMON = DaemonSpec(respawn_floor_seconds=7)
 
     def _spec(self, *, armed: bool) -> UnitSpec:
         return UnitSpec(

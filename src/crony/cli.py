@@ -62,8 +62,10 @@ daemon, which runs continuously and gets five automatic restarts when it
 stops prematurely. An exhausted daemon stays loaded but stopped until the
 next login, `start`, `apply`, or `enable` starts a fresh retry budget.
 Stopping an enabled daemon will stop the currently running instance,
-but it will subsequently be automatically restarted. A disabled daemon
-stays stopped.
+but it will subsequently be automatically restarted. If the instance ran
+for less than the restart delay, crony waits for the rest of that delay
+before restarting it.
+A disabled daemon stays stopped.
 Jobs can also be managed manually (enabled/disabled independently of the
 underlying scheduler, and run at will via the `start` subcommand). Crony
 supports the following notification mechanisms for job failures:

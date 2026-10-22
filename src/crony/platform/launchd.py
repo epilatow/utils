@@ -245,7 +245,7 @@ def _render_plist(
         # floors the spacing between launches, including early failures.
         contents["RunAtLoad"] = True
         contents["KeepAlive"] = {"SuccessfulExit": False}
-        contents["ThrottleInterval"] = daemon.restart_seconds
+        contents["ThrottleInterval"] = daemon.respawn_floor_seconds
     elif isinstance(timing, Interval):
         contents["StartInterval"] = timing.total_seconds
     elif isinstance(timing, Schedule):

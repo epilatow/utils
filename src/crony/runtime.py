@@ -1057,19 +1057,27 @@ def user_start_flag_path(state_dir: Path) -> Path:
     return state_dir / "user-start.flag"
 
 
-def write_user_start_flag(state_dir: Path) -> None:
+def write_user_start_flag(
+    state_dir: Path, *, next_launch_only: bool = False
+) -> None:
     """Write the user-start sentinel just before kicking the
-    platform scheduler. Empty file -- presence is the signal. The
-    caller passes the entry's uuid-keyed state dir so the sentinel
+    platform scheduler. An empty request can bypass an in-flight wait;
+    a nonempty request is reserved for a later launch. The caller passes
+    the entry's uuid-keyed state dir so the sentinel
     lives alongside the other per-run files (run.lock, pending.flag,
     last-run.json).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    user_start_flag_path(state_dir).write_bytes(b"")
+    user_start_flag_path(state_dir).write_bytes(
+        b"1" if next_launch_only else b""
+    )
 
 
 def consume_user_start_flag(
-    state_dir: Path, *, max_age_sec: float | None = None
+    state_dir: Path,
+    *,
+    max_age_sec: float | None = None,
+    launch_started_at: float | None = None,
 ) -> bool:
     """Read-and-delete the user-start sentinel. Returns True when this
     caller claimed a start worth acting on (the runner should bypass
@@ -1083,18 +1091,59 @@ def consume_user_start_flag(
     passes a bound so an abandoned sentinel cannot be honored by an
     unrelated later launch; the interactive bypass, which is consumed by
     the run started by that request, passes none.
+
+    A daemon passes its launch time so an apply/enable request written
+    after it launched stays reserved for the replacement. Other callers
+    leave those requests for the replacement without bypassing an
+    interactive approval.
     """
-    return _consume_user_flag(user_start_flag_path(state_dir), max_age_sec)
+    return _consume_user_flag(
+        user_start_flag_path(state_dir),
+        max_age_sec,
+        launch_started_at=launch_started_at,
+        reject_nonempty=launch_started_at is None,
+    )
 
 
-def _consume_user_flag(path: Path, max_age_sec: float | None) -> bool:
+def _consume_user_flag(
+    path: Path,
+    max_age_sec: float | None,
+    *,
+    launch_started_at: float | None = None,
+    reject_nonempty: bool = False,
+) -> bool:
     """Claim one sentinel, rejecting an abandoned request when bounded."""
     try:
-        age_sec = time.time() - path.stat().st_mtime
+        requested_at = path.stat().st_mtime
+        age_sec = time.time() - requested_at
+        fresh = max_age_sec is None or age_sec <= max_age_sec
+        if (
+            fresh
+            and (launch_started_at is not None or reject_nonempty)
+            and path.read_bytes()
+        ):
+            # A launch-only request expires even for an interactive
+            # caller whose ordinary approval bypass has no age bound.
+            fresh = age_sec <= (
+                max_age_sec
+                if max_age_sec is not None
+                else crony.config.DAEMON_START_REARM_MAX_AGE_SECONDS
+            )
+            if reject_nonempty:
+                if fresh:
+                    # Leave a replacement's request for that launch.
+                    return False
+            elif (
+                fresh
+                and launch_started_at is not None
+                and requested_at > launch_started_at
+            ):
+                # This older launch must not claim a reload's bypass.
+                return False
         path.unlink()
     except FileNotFoundError:
         return False
-    return max_age_sec is None or age_sec <= max_age_sec
+    return fresh
 
 
 def read_pid_file(pid_path: Path) -> int | None:
@@ -1282,7 +1331,16 @@ def _rearm_daemon(snapshot: crony.model.Job) -> None:
             f"(run `crony apply` to reinstall it)"
         )
     clear_exit_history(snapshot.state_dir)
-    scheduler().start(name)
+    requested_start = not run_in_progress(snapshot.state_dir)
+    if requested_start:
+        write_user_start_flag(snapshot.state_dir)
+    accepted = False
+    try:
+        scheduler().start(name)
+        accepted = True
+    finally:
+        if requested_start and not accepted:
+            user_start_flag_path(snapshot.state_dir).unlink(missing_ok=True)
 
 
 def apply_one(
@@ -1528,7 +1586,20 @@ def _install_unit(
     together; `activate=False` skips the reload for a self-apply whose
     unit didn't change."""
     require_launchers(snapshot)
-    sched.install(snapshot.unit_spec(), activate=activate)
+    rearming = (
+        activate
+        and not snapshot.unit_disabled
+        and crony.unit.is_daemon(snapshot.timing)
+    )
+    if rearming:
+        write_user_start_flag(snapshot.state_dir, next_launch_only=True)
+    accepted = False
+    try:
+        sched.install(snapshot.unit_spec(), activate=activate)
+        accepted = True
+    finally:
+        if rearming and not accepted:
+            user_start_flag_path(snapshot.state_dir).unlink(missing_ok=True)
     _write_apply_state(snapshot)
 
 

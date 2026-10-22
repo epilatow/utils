@@ -15,10 +15,12 @@ import json
 import logging
 import math
 import os
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from enum import Enum, auto
 from pathlib import Path
@@ -9373,6 +9375,25 @@ class TestDaemonLifecycle:
         return h.sysd / f"crony-{h.full('d')}.service"
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    def test_restart_policy_is_live_without_unit_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", "30")
+        h.apply("d")
+        rendered = self._unit(h, platform).read_bytes()
+        if platform == "darwin":
+            assert plistlib.loads(rendered)["ThrottleInterval"] == 1
+        else:
+            assert b"RestartSec=1\n" in rendered
+        monkeypatch.setenv("CRONY_DAEMON_RESTART_SECONDS", "2")
+        h.calls.clear()
+        h.apply("d")
+        assert self._unit(h, platform).read_bytes() == rendered
+        assert not started_a_unit(h.calls)
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_status_shows_daemon_schedule(
         self, tmp_path: Path, monkeypatch: Any, platform: str
     ) -> None:
@@ -10070,6 +10091,10 @@ class TestDaemonLifecycle:
         h.apply("d")
         sd = h.state_dir("d")
         sd.mkdir(parents=True, exist_ok=True)
+        # The harness installs without launching a runner to claim the rearm.
+        assert crony_runtime.consume_user_start_flag(
+            sd, launch_started_at=time.time()
+        )
         with crony_runtime.acquire_lock(sd / "run.lock"):
             crony_commands.do_start(
                 jobs=["d"], wait=False, start_timeout=None, bundle=None
