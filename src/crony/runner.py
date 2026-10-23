@@ -646,7 +646,8 @@ def _run_job(snap: crony.model.Job) -> int:
     From the moment it publishes run.pid, a stop signal no longer kills
     the runner unrecorded. Until the command is spawned, a stop ends the
     run where it stands -- mid-gate, mid-approval-wait -- and records it
-    `canceled`, returning 128 + the signal (`_record_pre_command_stop`).
+    `canceled`, returning 128 + the signal, unless it is an operator stop
+    or a daemon disable, which records `stopped` instead.
     The guard's timeout hint does the same but records `timeout`, returning
     ExitCode.TIMEOUT and notifying like a command that timed out. Once the
     run's outcome is decided (the command spawned, the gate failed, the
@@ -654,14 +655,15 @@ def _run_job(snap: crony.model.Job) -> int:
     outcome is recorded; a running command dies on the stop itself
     (`_exec_command`).
 
-    An operator-stop signal records `stopped`, without notification or
-    exit-history changes. The command's own exit detail is preserved.
+    An operator stop or daemon disable records `stopped`, without notification
+    or exit-history changes. The command's own exit detail is preserved.
 
     For a daemon the code is instead a message to the supervisor about
     whether to restart: ExitCode.DAEMON_EXITED when the command exited
     cleanly (bring it back), and 0 for a gated skip, lock contention, or
-    an exhausted retry budget (leave it down). The retry budget is owned
-    here rather than by either scheduler so launchd and systemd behave
+    an exhausted retry budget or an operator stop while disabled (leave it
+    down). The retry budget is owned here rather than by either scheduler
+    so launchd and systemd behave
     identically.
     """
     full_name = str(snap.entity_name)
@@ -886,18 +888,16 @@ def _run_job(snap: crony.model.Job) -> int:
                 )
                 rc, sig = outcome.rc, outcome.signal
                 stop_signal = outcome.stop_signal
-                user_stopped = stop_signal == USER_STOP_SIGNAL
+                user_stopped = stop_signal == USER_STOP_SIGNAL or (
+                    not timed_out and _operator_stopped(snap, stop_signal)
+                )
                 if stop_signal is not None:
                     stop_signal = _termination_signal(stop_signal)
                 if user_stopped:
                     assert stop_signal is not None
                     exit_class = crony.model.ExitClass.STOPPED
                     exit_code: int | None = rc if sig is None else None
-                    surfaced_rc = (
-                        int(crony.errors.ExitCode.DAEMON_EXITED)
-                        if is_daemon
-                        else 128 + stop_signal
-                    )
+                    surfaced_rc = _stopped_process_exit(snap, stop_signal)
                     _write_crony_line(
                         log_file, log_path, "run stopped by user request"
                     )
@@ -1021,6 +1021,39 @@ def _run_job(snap: crony.model.Job) -> int:
         return int(crony.errors.ExitCode.LOCK_BUSY)
 
 
+def _daemon_disabled(snap: crony.model.Job) -> bool:
+    """Read the daemon's current arming state, including an in-flight disable.
+
+    A disable publishes its snapshot before the scheduler terminates the
+    old runner. A missing snapshot leaves the launch-time state authoritative.
+    """
+    try:
+        return crony.runtime.load_snapshot(snap.entity_ref).unit_disabled
+    except crony.errors.PreconditionError:
+        return snap.unit_disabled
+
+
+def _operator_stopped(snap: crony.model.Job, signum: int | None) -> bool:
+    """Recognize an explicit stop or termination during a daemon disable."""
+    return signum == USER_STOP_SIGNAL or (
+        signum is not None
+        and crony.unit.is_daemon(snap.timing)
+        and not snap.unit_disabled
+        and _daemon_disabled(snap)
+    )
+
+
+def _stopped_process_exit(snap: crony.model.Job, signum: int) -> int:
+    """An enabled daemon requests a restart; a disabled one stays down."""
+    if crony.unit.is_daemon(snap.timing):
+        return (
+            0
+            if _daemon_disabled(snap)
+            else int(crony.errors.ExitCode.DAEMON_EXITED)
+        )
+    return 128 + signum
+
+
 class _RunOutcome(NamedTuple):
     """How a job run ended, as its record states it: the class, the
     command's own exit code and the signal that killed it (each None where
@@ -1065,6 +1098,7 @@ def _record_outcome(
     if (
         crony.unit.is_daemon(snap.timing)
         and exit_class != crony.model.ExitClass.STOPPED
+        and not _daemon_disabled(snap)
     ):
         retry_history = crony.runtime.record_daemon_exit(
             sd, duration_sec, exit_class, ended_at
@@ -1191,19 +1225,20 @@ def _record_pre_command_stop(
     started_iso: str,
 ) -> int:
     """Record a job run stopped by `signum` before its command started,
-    and return its surfaced exit: DAEMON_EXITED for a user-stopped daemon,
-    otherwise 128 + `signum`, as for a signal-killed command. The guard passes
+    and return its surfaced exit: an enabled user-stopped daemon requests
+    a restart, a disabled one returns success, and other runs return
+    128 + `signum`, as for a signal-killed command. The guard passes
     that exit through, so the scheduler's view agrees with the record.
 
-    The run is `stopped` for an operator-stop signal, else `canceled`, with
-    the command's termination signal and whatever gate result it reached. It
+    The run is `stopped` for an operator stop or daemon disable, else
+    `canceled`, with the command's termination signal and gate result. It
     dispatches no notification and adds nothing to the exit history: a
     stop is neither an outcome of the command nor a daemon exiting on its
     own. Runs with every guard signal already ignored (`_raise_on_stop`
     disarms before raising), so a further one cannot cut the record short.
     """
     sd = snap.state_dir
-    user_stopped = signum == USER_STOP_SIGNAL
+    user_stopped = _operator_stopped(snap, signum)
     signum = _termination_signal(signum)
     _reclaim_interrupted_launch(sd)
     _write_crony_line(
@@ -1212,9 +1247,7 @@ def _record_pre_command_stop(
         f"run stopped by {_signal_label(signum)} before its command ran",
     )
     process_exit = (
-        int(crony.errors.ExitCode.DAEMON_EXITED)
-        if user_stopped and crony.unit.is_daemon(snap.timing)
-        else 128 + signum
+        _stopped_process_exit(snap, signum) if user_stopped else 128 + signum
     )
     result = crony.model.JobRunResult(
         host=crony.platform.current_host(),

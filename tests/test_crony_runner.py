@@ -5223,6 +5223,28 @@ class TestRunDaemon:
         assert crony_runner._run_job(h.snap(cfg, "d")) == 3
         assert h.last_run("d")["exit_class"] == "fail"
 
+    @pytest.mark.parametrize("command", ["true", "exit 3"])
+    def test_disabled_manual_run_does_not_spend_retries(
+        self, tmp_path: Path, monkeypatch: Any, command: str
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = self._cfg(h, command=command)
+        h.write_snap(cfg, "d", disabled=True)
+        snap = h.snap(cfg, "d").with_unit_disabled(True)
+        crony_runtime.record_daemon_exit(
+            snap.state_dir, 1, ExitClass.FAIL, crony_runtime.now_iso()
+        )
+        history = snap.state_dir / "exit-history.json"
+        before = history.read_bytes()
+
+        crony_runner._run_job(snap)
+
+        assert history.read_bytes() == before
+        assert "automatic retry" not in snap.log_path_resolved.read_text()
+        assert h.last_run("d")["exit_class"] == (
+            "ok" if command == "true" else "fail"
+        )
+
     def test_stops_after_five_automatic_retries(
         self, tmp_path: Path, monkeypatch: Any
     ) -> None:
@@ -5547,13 +5569,16 @@ class TestUserStop:
             )
         assert accepted == [True]
 
-    @pytest.mark.parametrize("daemon", [False, True])
+    @pytest.mark.parametrize(
+        "daemon,disable", [(False, False), (True, False), (True, True)]
+    )
     @pytest.mark.parametrize("rc", [0, 7])
     def test_command_stop_preserves_result_and_history(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         daemon: bool,
+        disable: bool,
         rc: int,
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
@@ -5586,7 +5611,11 @@ class TestUserStop:
         def stop_command(
             *_args: object, **_kwargs: object
         ) -> tuple[crony_runner._ExitOutcome, bool]:
-            return crony_runner._ExitOutcome(rc, None, signal.SIGUSR2), False
+            if disable:
+                h.write_snap(cfg, "j", disabled=True)
+            return crony_runner._ExitOutcome(
+                rc, None, signal.SIGTERM if disable else signal.SIGUSR2
+            ), False
 
         with (
             mock.patch.object(
@@ -5606,19 +5635,24 @@ class TestUserStop:
         assert rec["signal"] is None
         assert rec["stop_signal"] == signal.SIGTERM
         assert crony_runner.start_exit_code(rec) == 128 + signal.SIGTERM
-        assert code == (
+        expected = (
             int(ExitCode.DAEMON_EXITED) if daemon else 128 + signal.SIGTERM
         )
+        assert code == (0 if disable else expected)
         assert rec["process_exit"] == code
         assert (sd / "exit-history.json").read_bytes() == before
+        assert "automatic retry" not in snap.log_path_resolved.read_text()
         notify.assert_not_called()
 
-    @pytest.mark.parametrize("daemon", [False, True])
+    @pytest.mark.parametrize(
+        "daemon,disable", [(False, False), (True, False), (True, True)]
+    )
     def test_user_stop_before_command_is_recorded(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         daemon: bool,
+        disable: bool,
     ) -> None:
         h = _RunnerHarness(tmp_path, monkeypatch)
         cfg = h.config(
@@ -5638,18 +5672,43 @@ class TestUserStop:
         assert isinstance(snap, Job)
 
         def stopped_gate(_snap: Job) -> list[str] | None:
-            signal.raise_signal(signal.SIGUSR2)
+            if disable:
+                h.write_snap(cfg, "j", disabled=True)
+            signal.raise_signal(signal.SIGTERM if disable else signal.SIGUSR2)
             raise AssertionError("stop did not unwind the gate")
 
         with mock.patch.object(
             crony_runner, "_gate_argv", autospec=True, side_effect=stopped_gate
         ):
             code = crony_runner._run_job(snap)
-        assert code == (
+        expected = (
             int(ExitCode.DAEMON_EXITED) if daemon else 128 + signal.SIGTERM
         )
+        assert code == (0 if disable else expected)
         assert h.last_run("j")["exit_class"] == "stopped"
         assert crony_runtime.read_exit_history(snap.state_dir).runs == []
+
+    def test_disable_does_not_relabel_a_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = _RunnerHarness(tmp_path, monkeypatch)
+        cfg = h.config(
+            {"job": {"j": {"command": "true", "daemon": True}}},
+            default_target_jobs=["j"],
+        )
+        snap = h.snap(cfg, "j")
+
+        def timed_out(
+            *_args: object, **_kwargs: object
+        ) -> tuple[crony_runner._ExitOutcome, bool]:
+            h.write_snap(cfg, "j", disabled=True)
+            return crony_runner._ExitOutcome(0, 15, 15), True
+
+        with mock.patch.object(
+            crony_runner, "_exec_command", autospec=True, side_effect=timed_out
+        ):
+            assert crony_runner._run_job(snap) == int(ExitCode.TIMEOUT)
+        assert h.last_run("j")["exit_class"] == "timeout"
 
     def test_operator_stop_does_not_relabel_the_next_run(
         self,

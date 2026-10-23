@@ -1504,16 +1504,20 @@ class JobStatus(_DescribedStrEnum):
             "Jobs and groups. A run canceled or skipped before its command "
             "ran -- for an interactive job, one the user declined. A job "
             "whose command script is missing or not executable is canceled "
-            "when its gate passes or it has no gate. A job "
-            "stopped by the scheduler before its command started (its unit "
+            "when its gate passes or it has no gate. A scheduler stop "
+            "before a job's command started (its unit "
             "stopped or "
-            "reloaded during its gate or interactive wait) is canceled too."
+            "reloaded during its gate or interactive wait) is canceled too, "
+            "unless it stopped a daemon being disabled."
             " A scheduler stop also cancels a group during child dispatch."
         ),
     )
     STOPPED = (
         ExitClass.STOPPED,
-        "Jobs and groups. The last run was cut short by `crony stop`.",
+        (
+            "Jobs and groups. The last run was cut short by `crony stop`, "
+            "or a running daemon was stopped by `crony disable`."
+        ),
     )
     CRASHED = (
         "crashed",
@@ -1732,19 +1736,22 @@ class JobRunResult(_CommonRunResult):
     """Recorded as last-run.json for each completed job run. Its
     `process_exit` is 0 for ok / gated / canceled, the job's own code
     for fail, the timeout code, or 128+sig for a signal-killed child. A
-    run stopped by a signal before its command started is `canceled` too,
+    run stopped by the scheduler before its command started is `canceled` too,
     but carries that signal and a `process_exit` of 128+sig, with no
     `exit_code`. One that ran out its cap that early is an ordinary
     `timeout` -- the timeout code, and neither an `exit_code` nor a
     `signal`, since no command of its own ever ran.
 
-    A user stop records `stopped`, preserves the command's own exit detail,
-    and records the requested signal in `stop_signal`. It surfaces 128 plus
-    that signal, or DAEMON_EXITED for a daemon so supervision can restart it.
+    An operator stop, including a daemon disable, records `stopped`, preserves
+    the command's own exit detail, and records the requested signal in
+    `stop_signal`. This also applies before its command starts. A non-daemon
+    job surfaces 128 plus that signal.
 
     A daemon's `process_exit` is instead what the supervisor is being
-    told to do, so an ok run carries `ExitCode.DAEMON_EXITED` (restart
-    it). Exhausting the retry budget inverts that: `process_exit` is 0
+    told to do. An ok run or an operator stop of an enabled daemon carries
+    `ExitCode.DAEMON_EXITED` so it restarts automatically. An operator stop
+    of a disabled daemon carries 0 so it stays down.
+    Exhausting the retry budget also makes `process_exit` 0
     to stop the restarts, `exit_code` keeps the command's own code, and
     `exit_class` reads `fail` even when the command exited cleanly -- a
     continuous service crony has given up on keeping alive is not

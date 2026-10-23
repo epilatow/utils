@@ -168,11 +168,12 @@ job(s), --all, or --orphans.
 
 ### `enable [--all] [-b BUNDLE] [-s] [job ...]`
 
-Re-arm the named jobs' schedules (clear the operator-disable). Enabling an
-already-enabled daemon restarts one that an exhausted retry budget or a
-declined gate left stopped. With --sync, also wait for each daemon started by
-this enable to come up, bounded by its bundle's start-timeout-sec. Requires a
-target: job(s) or --all.
+Re-arm the named jobs' schedules (clear the operator-disable). Enabling a
+disabled daemon starts it, restarting its running instance if it was started
+manually. An already-enabled, running daemon is left running; one stopped
+after exhausting its retry budget or declining its gate is started again. With
+--sync, also wait for each daemon started by this enable to come up, bounded
+by its bundle's start-timeout-sec. Requires a target: job(s) or --all.
 
 - **`-s, --sync`**\
   Wait until the requested effect is in place; fail with the timeout exit code
@@ -182,8 +183,8 @@ target: job(s) or --all.
 
 Disarm the named jobs' schedules: loaded and startable, but not firing on
 their own. Disabling a daemon stops it; it stays stopped across a reboot until
-re-enabled. Waits for any run stopped by the update to end. Requires a target:
-job(s) or --all.
+re-enabled. This intentional stop does not consume retries. Waits for any run
+stopped by the update to end. Requires a target: job(s) or --all.
 
 ### `start [--all] [-b BUNDLE] [-s | -w] [--start-timeout START_TIMEOUT] [job ...]`
 
@@ -426,11 +427,13 @@ Send a synthetic failure notification.
   Jobs and groups. A run canceled or skipped before its command ran -- for an
   interactive job, one the user declined. A job whose command script is
   missing or not executable is canceled when its gate passes or it has no
-  gate. A job stopped by the scheduler before its command started (its unit
-  stopped or reloaded during its gate or interactive wait) is canceled too. A
-  scheduler stop also cancels a group during child dispatch.
+  gate. A scheduler stop before a job's command started (its unit stopped or
+  reloaded during its gate or interactive wait) is canceled too, unless it
+  stopped a daemon being disabled. A scheduler stop also cancels a group
+  during child dispatch.
 - **`stopped`**\
-  Jobs and groups. The last run was cut short by `crony stop`.
+  Jobs and groups. The last run was cut short by `crony stop`, or a running
+  daemon was stopped by `crony disable`.
 - **`crashed`**\
   Jobs and groups. The scheduler failed to launch the job or group, or it was
   killed/crashed before it could save its exit status to disk.

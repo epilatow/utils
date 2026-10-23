@@ -1072,6 +1072,25 @@ class TestDaemonSupervision:
             "disabled daemon was still being respawned"
         )
 
+    def test_disable_records_operator_stop(self, e2e: _CronyE2E) -> None:
+        e2e.write_bundle(
+            '[job.d]\ncommand = "sleep 300"\ndaemon = true\n', ["d"]
+        )
+        e2e.crony("apply", e2e.full("d"))
+        e2e.inject_isolated_env("d", restart=True)
+        sd = e2e.state_dir / E2E_BUNDLE / "d"
+        e2e.wait_until(
+            lambda: "exec: " in _read_text(sd / "run.log"),
+            timeout=60,
+            what="the daemon's command to start",
+        )
+        e2e.crony("disable", e2e.full("d"))
+        rec = json.loads((sd / "last-run.json").read_text())
+        assert rec["exit_class"] == "stopped"
+        assert rec["notifications"] == {}
+        assert "automatic retry" not in _read_text(sd / "run.log")
+        assert not (sd / "exit-history.json").exists()
+
     def test_starting_a_disabled_daemon_runs_it_once(
         self, e2e: _CronyE2E
     ) -> None:

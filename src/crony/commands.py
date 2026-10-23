@@ -1135,9 +1135,11 @@ def _resolve_bulk_names(
 def do_enable(jobs: list[str], bundle: str | None, sync: bool) -> None:
     """Re-arm the named jobs' schedules (clear the operator-disable).
 
-    Re-renders each installed unit with its pinned schedule and reloads
-    it, then clears `unit_disabled` on its snapshot. Names are full
-    namespaced (`<bundle>.<short>`); bare input is shorthand for
+    Restores each disabled entry's pinned schedule and clears
+    `unit_disabled` on its snapshot. Enabling a disabled daemon starts it;
+    if it was started manually while disabled, its running instance is
+    restarted. An already-enabled, running daemon is left running.
+    Names use `<bundle>.<short>`; bare input is shorthand for
     `default.<short>`. A rename (same uuid, new config name) is
     addressable by either name; a name mapping to different uuids in
     config vs on disk is rejected until `crony apply`. Refuses names not

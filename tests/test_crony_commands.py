@@ -9569,7 +9569,7 @@ class TestDaemonLifecycle:
     ) -> None:
         # Re-enabling puts the daemon back under supervision, so it
         # starts over rather than inheriting attempts spent before it
-        # was disabled (the stop itself records one).
+        # was disabled.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         self._daemon_cfg(h)
         h.apply("d")
@@ -9582,6 +9582,54 @@ class TestDaemonLifecycle:
 
         crony_commands.do_enable(jobs=["d"], bundle=None, sync=False)
         assert crony_runtime.read_exit_history(sd).runs == []
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin"])
+    @pytest.mark.parametrize("fail_install", [False, True])
+    def test_disable_is_visible_to_the_runner_before_reload(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        platform: str,
+        fail_install: bool,
+    ) -> None:
+        h = _ApplyHarness(tmp_path, monkeypatch, platform=platform)
+        self._daemon_cfg(h)
+        h.apply("d")
+        config = crony_runtime.load_config()
+        ref = config.current.by_full_name[h.full("d")]
+        current = config.current.job_from_ref(ref)
+        assert current is not None
+        seen: list[bool] = []
+
+        def install(
+            _sched: crony_platform.Scheduler,
+            _spec: object,
+            *,
+            activate: bool = True,
+        ) -> None:
+            assert activate
+            seen.append(
+                crony_runtime.load_snapshot(current.entity_ref).unit_disabled
+            )
+            if fail_install:
+                raise SubprocessError(1, ["reload"], "", "failed")
+
+        with patch.object(
+            crony_platform.Scheduler,
+            "install",
+            autospec=True,
+            side_effect=install,
+        ):
+            if fail_install:
+                with pytest.raises(SubprocessError):
+                    crony_commands.do_disable(jobs=["d"], bundle=None)
+            else:
+                crony_commands.do_disable(jobs=["d"], bundle=None)
+        assert seen == [True]
+        assert (
+            crony_runtime.load_snapshot(current.entity_ref).unit_disabled
+            is not fail_install
+        )
 
     def test_reapply_does_not_rearm_a_disabled_exhausted_daemon(
         self, tmp_path: Path, monkeypatch: Any

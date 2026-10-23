@@ -689,13 +689,18 @@ def acquire_lock(lock_path: Path) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a text file without exposing a partial write to readers."""
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     """Write `payload` as JSON to `path` via a tmp file + atomic rename,
     so a reader never observes a partial write. Insertion order is
     preserved (no `sort_keys=True`)."""
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
+    _atomic_write_text(path, json.dumps(payload, indent=2))
 
 
 def write_last_run(path: Path, payload: dict[str, Any]) -> None:
@@ -1244,9 +1249,9 @@ def _write_apply_state(
     snapshot.state_dir.mkdir(parents=True, exist_ok=True)
     if not snapshot.log_path_resolved.exists():
         snapshot.log_path_resolved.touch()
-    snapshot.snapshot_path.write_text(
+    _atomic_write_text(
+        snapshot.snapshot_path,
         json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
     _link_alias(snapshot)
 
@@ -1609,11 +1614,13 @@ def set_disabled(
     *,
     disabled: bool,
 ) -> bool:
-    """Flip one applied entry's operator-disabled state: re-render its
-    unit (schedule-stripped when disabling, with its schedule when
-    enabling), reload it, and re-persist its snapshot with the new
-    `unit_disabled`. Returns True when it changed something, False when
-    the entry was already in the requested state. Enabling an
+    """Flip one applied entry's operator-disabled state and update its units.
+
+    Disabling a daemon publishes its new snapshot before the unit reload
+    stops its runner, restoring the prior snapshot if installation fails.
+    Other transitions persist their new snapshot after installation.
+    Returns True when it changed something, False when the entry was
+    already in the requested state. Enabling an
     already-enabled daemon is the one case where "already in the
     requested state" still acts: one left stopped by an exhausted retry
     budget or a failed gate is started again with a fresh budget, so
@@ -1641,7 +1648,19 @@ def set_disabled(
         uv_path=_uv_executable(),
         crony_path=_crony_executable(),
     )
-    _install_unit(snapshot, scheduler())
+    stopping_daemon = disabled and crony.unit.is_daemon(snapshot.timing)
+    if stopping_daemon:
+        # The old runner reads this state when the scheduler stops it.
+        # Publish before reloading so it can distinguish an operator stop
+        # from a daemon exiting on its own.
+        _write_apply_state(snapshot)
+    installed = False
+    try:
+        _install_unit(snapshot, scheduler())
+        installed = True
+    finally:
+        if stopping_daemon and not installed:
+            _write_apply_state(current)
     if (
         not disabled
         and isinstance(snapshot, crony.model.Job)

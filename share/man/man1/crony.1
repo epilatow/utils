@@ -146,7 +146,8 @@ Combinable with \-b/\-\-bundle; mutually exclusive with positional names and \-\
 .TP
 \f[B]enable\f[R] [\-\-all] [\-b BUNDLE] [\-s] [job ...]\&
 Re\-arm the named jobs\(aq schedules (clear the operator\-disable).\&
-Enabling an already\-enabled daemon restarts one that an exhausted retry budget or a declined gate left stopped.\&
+Enabling a disabled daemon starts it, restarting its running instance if it was started manually.\&
+An already\-enabled, running daemon is left running; one stopped after exhausting its retry budget or declining its gate is started again.\&
 With \-\-sync, also wait for each daemon started by this enable to come up, bounded by its bundle\(aqs start\-timeout\-sec.\&
 Requires a target: job(s) or \-\-all.\&
 .RS
@@ -158,6 +159,7 @@ Wait until the requested effect is in place; fail with the timeout exit code if 
 \f[B]disable\f[R] [\-\-all] [\-b BUNDLE] [job ...]\&
 Disarm the named jobs\(aq schedules: loaded and startable, but not firing on their own.\&
 Disabling a daemon stops it; it stays stopped across a reboot until re\-enabled.\&
+This intentional stop does not consume retries.\&
 Waits for any run stopped by the update to end.\&
 Requires a target: job(s) or \-\-all.\&
 .TP
@@ -412,12 +414,12 @@ A declined gate skips the job even if its command script is missing or not execu
 Jobs and groups.\&
 A run canceled or skipped before its command ran \-\- for an interactive job, one the user declined.\&
 A job whose command script is missing or not executable is canceled when its gate passes or it has no gate.\&
-A job stopped by the scheduler before its command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too.\&
+A scheduler stop before a job\(aqs command started (its unit stopped or reloaded during its gate or interactive wait) is canceled too, unless it stopped a daemon being disabled.\&
 A scheduler stop also cancels a group during child dispatch.\&
 .TP
 \f[I]stopped\f[R]
 Jobs and groups.\&
-The last run was cut short by \(gacrony stop\(ga.\&
+The last run was cut short by \(gacrony stop\(ga, or a running daemon was stopped by \(gacrony disable\(ga.\&
 .TP
 \f[I]crashed\f[R]
 Jobs and groups.\&

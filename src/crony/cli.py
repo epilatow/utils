@@ -523,9 +523,11 @@ def _build_parser() -> StrictArgumentParser:
         help="Re-arm the named jobs' schedules.",
         description=(
             "Re-arm the named jobs' schedules (clear the "
-            "operator-disable). Enabling an already-enabled daemon "
-            "restarts one that an exhausted retry budget or a declined "
-            "gate left stopped. With --sync, also wait for each daemon "
+            "operator-disable). Enabling a disabled daemon starts it, "
+            "restarting its running instance if it was started manually. "
+            "An already-enabled, running daemon is left running; one "
+            "stopped after exhausting its retry budget or declining its "
+            "gate is started again. With --sync, also wait for each daemon "
             "started by this enable to come up, bounded by its bundle's "
             "start-timeout-sec. Requires a target: job(s) or --all."
         ),
@@ -548,7 +550,8 @@ def _build_parser() -> StrictArgumentParser:
         description=(
             "Disarm the named jobs' schedules: loaded and startable, "
             "but not firing on their own. Disabling a daemon stops it; "
-            "it stays stopped across a reboot until re-enabled. Waits "
+            "it stays stopped across a reboot until re-enabled. This "
+            "intentional stop does not consume retries. Waits "
             "for any run stopped by the update to end. "
             "Requires a target: job(s) or --all."
         ),
