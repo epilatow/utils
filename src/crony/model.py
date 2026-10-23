@@ -1540,18 +1540,6 @@ class JobStatus(_DescribedStrEnum):
             "keyboard focus)."
         ),
     )
-    DISABLED = (
-        "disabled",
-        (
-            "Daemons only. The daemon has been disabled via the `disable` "
-            "subcommand, so it is stopped and will not start itself again "
-            "-- neither at boot nor by a restart -- until it is "
-            "re-enabled. It can still be started manually via the "
-            "`start` subcommand. A scheduled job reports its last run's "
-            "outcome instead; its SCHEDULE cell carries the disabled "
-            "state."
-        ),
-    )
     NEVER = (
         "never",
         (

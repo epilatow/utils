@@ -221,10 +221,11 @@ replacement. Requires a target: job(s) or --all.
 ### `status [-a] [--cols COLS] [-b BUNDLE] [--config-current | --config-pending] [--exclude-healthy] [job ...]`
 
 Print resolved state per job. With no job arguments every job is shown; pass
-job names to restrict the table. Many columns are source-selected -- they show
-the pending (config) value by default, or the applied value under
---config-current -- and a trailing `^` on a value marks a divergence between
-the two.
+job names to restrict the table. SCHEDULE reports whether the job is armed;
+STATUS reports its current activity or last run's outcome, even when its
+schedule is disabled. Many columns are source-selected -- they show the
+pending (config) value by default, or the applied value under --config-current
+-- and a trailing `^` on a value marks a divergence between the two.
 
 - **`-a, --all`**\
   List all defined entries, including ones masked on the current host. Entries
@@ -443,12 +444,6 @@ Send a synthetic failure notification.
   Jobs only. An interactive job is either waiting for an active user, or
   waiting for that user to confirm execution (via a pop-up dialog, which must
   be clicked -- it does not take keyboard focus).
-- **`disabled`**\
-  Daemons only. The daemon has been disabled via the `disable` subcommand, so
-  it is stopped and will not start itself again -- neither at boot nor by a
-  restart -- until it is re-enabled. It can still be started manually via the
-  `start` subcommand. A scheduled job reports its last run's outcome instead;
-  its SCHEDULE cell carries the disabled state.
 - **`never`**\
   Jobs and groups. A newly deployed job or group that hasn't been run yet.
 - **`unknown`**\
@@ -489,8 +484,8 @@ or piped output is plain, where drift shows as a trailing `^` plus a footnote
 legend instead.
 
 - **`red`**\
-  CONFIG broken / error / missing / orphan; STATUS canceled / crashed /
-  disabled / fail / timeout; SCHEDULE disabled.
+  CONFIG broken / error / missing / orphan; STATUS canceled / crashed / fail /
+  timeout; SCHEDULE disabled.
 - **`yellow`**\
   CONFIG stale, plus any cell that diverged from the applied state (on a color
   stream its `^` marker is dropped in favor of the color).

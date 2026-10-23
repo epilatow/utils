@@ -217,7 +217,6 @@ def _derive_job_status(
     last_run: crony.model.LastRun | None,
     unit_last_exit: crony.platform.UnitLastExit | None,
     killed_on_timeout: bool = False,
-    disabled_daemon: bool = False,
 ) -> crony.model.JobStatus:
     """The entity's current run status from its runtime facts.
 
@@ -232,19 +231,10 @@ def _derive_job_status(
     `killed_on_timeout` is the guard's killed-flag: when a run crashed
     (never recorded) because the guard had to SIGKILL it on its timeout,
     the flag names the crash a `timeout` instead.
-
-    `disabled_daemon` reports `disabled` for a daemon the operator turned
-    off. A daemon's status is about whether it is up, and its last record
-    is an artifact of being stopped (a signal death, which would read
-    `fail`), so the last outcome is not the useful answer the way it is
-    for a scheduled job. It ranks below `is_running`: a disabled daemon
-    someone started by hand really is running.
     """
     js = crony.model.JobStatus
     if is_running:
         return js.PENDING if is_pending else js.RUNNING
-    if disabled_daemon:
-        return js.DISABLED
     if _crashed(is_running, run_pid, last_run, unit_last_exit):
         return js.TIMEOUT if killed_on_timeout else js.CRASHED
     if last_run is None or last_run.exit_class is None:
@@ -257,7 +247,6 @@ def _read_runtime_state(
     *,
     full_name: str | None,
     last_exits: dict[str, crony.platform.UnitLastExit] | None = None,
-    disabled_daemon: bool = False,
 ) -> crony.model.RuntimeState:
     """Snapshot the runtime state inside one state dir into a
     RuntimeState: the parsed last-run record, the last launch's start
@@ -270,9 +259,7 @@ def _read_runtime_state(
 
     `last_exits` is the scheduler's bulk last-launch map (keyed by full
     name); the entry for `full_name`, if any, feeds the crash
-    reconciliation in `_derive_job_status`. `disabled_daemon` comes from
-    the caller's parsed node (a state dir alone cannot say whether its
-    entry is a daemon) and reaches the same deriver.
+    reconciliation in `_derive_job_status`.
     """
     last_run: crony.model.LastRun | None = None
     last_run_path = state_dir / "last-run.json"
@@ -312,7 +299,6 @@ def _read_runtime_state(
         last_run,
         unit_last_exit,
         killed_on_timeout,
-        disabled_daemon,
     )
     return crony.model.RuntimeState(
         state_dir=state_dir,
@@ -493,8 +479,6 @@ def _build_current_graph(
                 uuid_dir,
                 full_name=full,
                 last_exits=last_exits,
-                disabled_daemon=snap.unit_disabled
-                and crony.unit.is_daemon(snap.timing),
             )
     # Broken entries get a runtime entry too -- the state dir
     # exists and carries the same per-run files (last-run.json /

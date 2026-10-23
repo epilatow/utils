@@ -151,7 +151,9 @@ holding persistent locks in global uv cache path.\
 # wrapping narrow enough to render verbatim in `crony status --help`.
 _STATUS_DESCRIPTION: str = """\
 Print resolved state per job. With no job arguments every job is shown;
-pass job names to restrict the table. Many columns are source-selected --
+pass job names to restrict the table. SCHEDULE reports whether the job is
+armed; STATUS reports its current activity or last run's outcome, even
+when its schedule is disabled. Many columns are source-selected --
 they show the pending (config) value by default, or the applied value
 under --config-current -- and a trailing `^` on a value marks a divergence
 between the two.\

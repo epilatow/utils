@@ -349,10 +349,9 @@ gated by platform checks.
   namespace. That rewrite is drift, so such a test cannot also assert on the
   CONFIG column.
 
-  The daemon rearm and sync cases use an isolated test launcher, so the
-  environment survives native unit rewrites by enable and apply. It invokes
-  the real CLI and scheduler while keeping every spawned runner in the test
-  namespace.
+  Tests that need the environment to survive native unit rewrites by enable
+  and apply use an isolated test launcher. It invokes the real CLI and
+  scheduler while keeping every spawned runner in the test namespace.
 
 - CI runs the full `--e2e` set on the Linux leg only. GitHub's hosted macOS
   runners are weak, throttled VMs that run the process-spawn-heavy borgadm

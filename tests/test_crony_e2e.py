@@ -1087,6 +1087,8 @@ class TestDaemonSupervision:
         e2e.crony("disable", e2e.full("d"))
         rec = json.loads((sd / "last-run.json").read_text())
         assert rec["exit_class"] == "stopped"
+        assert e2e.status_status(e2e.full("d")) == "stopped"
+        assert e2e.status_cells(e2e.full("d"), "schedule") == ["disabled"]
         assert rec["notifications"] == {}
         assert "automatic retry" not in _read_text(sd / "run.log")
         assert not (sd / "exit-history.json").exists()
@@ -1099,6 +1101,8 @@ class TestDaemonSupervision:
         # (launchd `KeepAlive`, systemd `Restart=`), so what starts is a
         # one-shot: the scheduler does not bring it back when it stops,
         # and it is still disabled for the next boot.
+        e2e.env["CRONY_DAEMON_RESTART_SECONDS"] = "1"
+        e2e.use_isolated_launcher()
         self._apply_daemon(e2e)
         self._wait_started(e2e, "the daemon to start")
         e2e.crony("disable", e2e.full("d"))
@@ -1117,9 +1121,8 @@ class TestDaemonSupervision:
         assert self._start_marker(e2e) == started, (
             "a started disabled daemon was respawned after it stopped"
         )
-        # Starting does not clear the operator-disable, so the entry
-        # reports disabled again once the run it started has ended.
-        assert e2e.status_status(e2e.full("d")) == "disabled"
+        assert e2e.status_status(e2e.full("d")) == "ok"
+        assert e2e.status_cells(e2e.full("d"), "schedule") == ["disabled"]
 
     def test_destroy_removes_a_running_daemon(self, e2e: _CronyE2E) -> None:
         # A daemon holds its run lock for its whole life, so destroy has
@@ -1148,7 +1151,7 @@ class TestDaemonSupervision:
             timeout=30,
             what="the disabled daemon's command to be killed",
         )
-        assert e2e.status_status(e2e.full("d")) == "disabled"
+        assert e2e.status_status(e2e.full("d")) == "crashed"
 
     def test_reapply_stops_the_old_command_before_starting_the_new(
         self, e2e: _CronyE2E
@@ -1620,6 +1623,8 @@ class TestUserStop:
             json.loads((sd / "last-run.json").read_text())["exit_class"]
             == "stopped"
         )
+        assert e2e.status_status(e2e.full("probe")) == "stopped"
+        assert e2e.status_cells(e2e.full("probe"), "schedule") == ["disabled"]
         time.sleep(3)
         assert not e2e.unit_running("probe")
 

@@ -9694,7 +9694,7 @@ class TestDaemonLifecycle:
                 return toks
         raise AssertionError(f"no status row for {full}")
 
-    def test_disabled_daemon_that_was_started_reads_disabled_running(
+    def test_disabled_daemon_can_run_without_rearming(
         self, tmp_path: Path, monkeypatch: Any, capsys: Any
     ) -> None:
         # Starting a disabled daemon starts it without clearing the
@@ -9713,10 +9713,10 @@ class TestDaemonLifecycle:
             cells = self._status_cells(capsys, h.full("d"))
         assert cells[2] == crony_model.ScheduleValue.DISABLED.value
         assert cells[3] == crony_model.JobStatus.RUNNING
-        # Once that run ends the lock frees and it reports disabled.
+        # This harness has no recorded outcome once the lock is released.
         assert (
             self._status_cells(capsys, h.full("d"))[3]
-            == crony_model.JobStatus.DISABLED
+            == crony_model.JobStatus.NEVER
         )
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
@@ -9982,19 +9982,41 @@ class TestDaemonLifecycle:
         crony_commands.do_disable(jobs=["d"], bundle=None)
         assert h.apply("d") == "unchanged"
 
-    def test_disabled_daemon_status_reads_disabled(
-        self, tmp_path: Path, monkeypatch: Any
+    @pytest.mark.parametrize(
+        "outcome,expected",
+        [
+            (None, crony_model.JobStatus.NEVER),
+            (crony_model.ExitClass.STOPPED, crony_model.JobStatus.STOPPED),
+            (crony_model.ExitClass.OK, crony_model.JobStatus.OK),
+            (crony_model.ExitClass.FAIL, crony_model.JobStatus.FAIL),
+            (crony_model.ExitClass.SIGNAL, crony_model.JobStatus.FAIL),
+            (crony_model.ExitClass.TIMEOUT, crony_model.JobStatus.TIMEOUT),
+        ],
+    )
+    def test_disabled_daemon_reports_its_run_outcome(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+        capsys: Any,
+        outcome: crony_model.ExitClass | None,
+        expected: crony_model.JobStatus,
     ) -> None:
-        # Stopping a daemon records a signal death, which would render
-        # `fail` -- a deliberately disabled daemon must not look broken.
         h = _ApplyHarness(tmp_path, monkeypatch, platform="linux")
         cfg = self._daemon_cfg(h)
         h.apply("d")
         crony_commands.do_disable(jobs=["d"], bundle=None)
         ref = crony_unit.EntityRef.from_str(h.ref("d", cfg))
         assert ref is not None
+        if outcome is not None:
+            crony_runtime.write_last_run(
+                h.state_dir("d") / "last-run.json",
+                {"exit_class": outcome, "process_exit": 0},
+            )
         state = crony_runtime.load_config().runtime[ref]
-        assert state.job_status == crony_model.JobStatus.DISABLED
+        assert state.job_status == expected
+        cells = self._status_cells(capsys, h.full("d"))
+        assert cells[2] == crony_model.ScheduleValue.DISABLED.value
+        assert cells[3] == expected
 
     @pytest.mark.parametrize("platform", ["linux", "darwin"])
     def test_leaving_the_mode_retires_the_daemon_unit(

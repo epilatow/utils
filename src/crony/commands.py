@@ -1917,7 +1917,6 @@ _RED_CELLS: dict[str, frozenset[str]] = {
             crony.model.JobStatus.TIMEOUT,
             crony.model.JobStatus.CANCELED,
             crony.model.JobStatus.CRASHED,
-            crony.model.JobStatus.DISABLED,
         }
     ),
     _StatusCols.SCHEDULE: frozenset({crony.model.ScheduleValue.DISABLED.value}),

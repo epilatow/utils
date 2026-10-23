@@ -2390,7 +2390,14 @@ class TestDeriveJobStatus:
         )
 
     def test_running(self) -> None:
-        assert self._status(is_running=True) == crony_model.JobStatus.RUNNING
+        assert (
+            self._status(
+                is_running=True,
+                last_run=self._last("fail", pid=100),
+                run_pid=999,
+            )
+            == crony_model.JobStatus.RUNNING
+        )
 
     def test_pending_when_interactive_wait(self) -> None:
         # A held lock plus the pending flag: an interactive job waiting
@@ -2647,36 +2654,7 @@ class TestUserStartFlagAge:
 
 
 class TestDaemonJobStatus:
-    """A daemon's STATUS cell is about whether it is up. A disabled one
-    reports `disabled` rather than the signal death that stopping it
-    recorded, which would otherwise read `fail`."""
-
-    def _derive(self, **kw: Any) -> Any:
-        args: dict[str, Any] = {
-            "is_running": False,
-            "is_pending": False,
-            "run_pid": None,
-            "last_run": None,
-            "unit_last_exit": None,
-        }
-        args.update(kw)
-        return crony_runtime._derive_job_status(**args)
-
-    def test_disabled_daemon_reports_disabled(self) -> None:
-        assert (
-            self._derive(disabled_daemon=True) == crony_model.JobStatus.DISABLED
-        )
-
-    def test_running_outranks_disabled(self) -> None:
-        # A disabled daemon someone started by hand really is running,
-        # and that is the more useful cell.
-        assert (
-            self._derive(is_running=True, disabled_daemon=True)
-            == crony_model.JobStatus.RUNNING
-        )
-
-    def test_enabled_daemon_is_unaffected(self) -> None:
-        assert self._derive() == crony_model.JobStatus.NEVER
+    """Daemon status follows live runtime facts and the recorded outcome."""
 
     def test_exhausted_daemon_preserves_failure_with_scheduler_success(
         self,
@@ -2692,10 +2670,8 @@ class TestDaemonJobStatus:
         # the scheduler recorded, and the pid matches the last run, so
         # neither `crashed` branch fires and the recorded fail stands.
         assert (
-            self._derive(
-                last_run=last_run,
-                unit_last_exit=scheduler_exit,
-                run_pid=123,
+            crony_runtime._derive_job_status(
+                False, False, 123, last_run, scheduler_exit
             )
             == crony_model.JobStatus.FAIL
         )
