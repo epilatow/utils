@@ -436,9 +436,45 @@ configured repository.
   JSON list of paths (relative to BACKUP_ROOT) that must be mountpoints before
   `create` proceeds.
 - **`BACKUP_SETS`**\
-  JSON object mapping each backup-set name to its `paths`, optional
-  `excludes`, and optional `create_options`; `create` writes one archive per
-  set (required).
+  JSON object mapping each backup-set name to its `paths` and optional
+  `excludes`, `patterns`, and `create_options`; `create` writes one archive
+  per set (required).
+
+## BACKUP SET PATTERNS
+
+Each BACKUP_SETS entry accepts an optional patterns list of native Borg
+--pattern arguments. An omitted or empty list adds no patterns. config
+validate checks that it is a list of non-empty strings; Borg checks the
+pattern syntax when create runs. See 'borg help patterns' for styles and
+matching rules.
+
+The excludes field and automatic macOS exclusions are passed before patterns,
+and list order is preserved. For most styles, the first matching rule wins, so
+existing excludes take precedence. Borg's pf: full-path patterns are a special
+case: their matches take precedence regardless of list order. They still
+require traversal to reach the path.
+
+Use + for inclusion, - for exclusion that continues traversing directories,
+and ! for exclusion that stops traversal. Place include exceptions before the
+ordinary exclusions they override.
+
+For example, preserve .md and .txt notes anywhere under directories named tmp,
+but exclude other contents of directories named tmp or cache:
+
+```text
+    "patterns": [
+        "+re:(^|/)tmp/.*\\.(md|txt)$",
+        "-re:(^|/)(tmp|cache)(/|$)"
+    ]
+```
+
+These names and extensions are case-sensitive: .tmp, .cache, and Cache are not
+matched. Borg still traverses the excluded directories to find notes. Other
+configured exclusions can still exclude those notes.
+
+create_options remains available for general Borg create flags and is passed
+before excludes and patterns. Pattern flags supplied there retain their
+command-line precedence.
 
 ## FILES
 

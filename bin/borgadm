@@ -162,11 +162,13 @@ _EXAMPLE_EXCLUDES: list[str] = [
 _EXAMPLE_BACKUP_SETS: dict[str, dict[str, list[str]]] = {
     "local": {
         "excludes": _EXAMPLE_EXCLUDES,
+        "patterns": [],
         "paths": ["Documents/", "Projects/"],
     },
     "fuse": {
         "create_options": ["--noacls", "--noctime", "--noxattrs"],
         "excludes": _EXAMPLE_EXCLUDES,
+        "patterns": [],
         "paths": ["Shared/"],
     },
 }
@@ -286,8 +288,8 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "BACKUP_SETS",
         {},
-        "JSON object mapping each backup-set name to its `paths`, "
-        "optional `excludes`, and optional `create_options`; `create` "
+        "JSON object mapping each backup-set name to its `paths` and "
+        "optional `excludes`, `patterns`, and `create_options`; `create` "
         "writes one archive per set",
         template_value=_EXAMPLE_BACKUP_SETS,
         required=True,
@@ -416,6 +418,16 @@ class Config:
         # first backup rather than letting create fail later.
         if require_backup_sets and not self.BACKUP_SETS:
             errors.append(f"BACKUP_SETS not defined in config: {path}")
+        for set_name, set_cfg in (self.BACKUP_SETS or {}).items():
+            patterns = set_cfg.get("patterns", [])
+            if not isinstance(patterns, list) or any(
+                not isinstance(pattern, str) or not pattern.strip()
+                for pattern in patterns
+            ):
+                errors.append(
+                    f"BACKUP_SETS[{set_name!r}].patterns must be a list "
+                    "of non-empty strings"
+                )
         if not any(
             [
                 self.PRUNE_KEEP_HOURLY,
@@ -2480,6 +2492,8 @@ def do_create(
                 excludes.extend(auto_excludes)
         for e in excludes:
             create_args += ["--exclude", e]
+        for pattern in set_cfg.get("patterns", []):
+            create_args += ["--pattern", pattern]
         archive_name = _ArchiveName(
             backup_name=cfg.BACKUP_NAME,
             set_name=set_name,
@@ -4040,6 +4054,41 @@ def _config_doc_items() -> list[tuple[str, str]]:
     return items
 
 
+_BACKUP_SET_PATTERNS = r"""Each BACKUP_SETS entry accepts an optional
+patterns list of native Borg --pattern arguments. An omitted or empty list
+adds no patterns.
+config validate checks that it is a list of non-empty strings; Borg checks
+the pattern syntax when create runs. See 'borg help patterns' for styles
+and matching rules.
+
+The excludes field and automatic macOS exclusions are passed before patterns,
+and list order is preserved. For most styles, the first matching rule wins,
+so existing excludes take precedence. Borg's pf: full-path patterns are a
+special case: their matches take precedence regardless of list order. They
+still require traversal to reach the path.
+
+Use + for inclusion, - for exclusion that continues traversing directories,
+and ! for exclusion that stops traversal. Place include exceptions before
+the ordinary exclusions they override.
+
+For example, preserve .md and .txt notes anywhere under directories named
+tmp, but exclude other contents of directories named tmp or cache:
+
+    "patterns": [
+        "+re:(^|/)tmp/.*\\.(md|txt)$",
+        "-re:(^|/)(tmp|cache)(/|$)"
+    ]
+
+These names and extensions are case-sensitive: .tmp, .cache, and Cache are
+not matched. Borg still traverses the excluded directories to find notes.
+Other configured exclusions can still exclude those notes.
+
+create_options remains available for general Borg create flags and is passed
+before excludes and patterns. Pattern flags supplied there retain their
+command-line precedence.
+"""
+
+
 def _files_doc_items() -> list[tuple[str, str]]:
     """The FILES reference, sourced from BASENAME and the CONFIG_FIELDS
     defaults so the paths can't drift from the code that defines them."""
@@ -4073,6 +4122,7 @@ MAN_SPEC = ManSpec(
     post_sections=[
         ItemsSection("AUTOMATION JOBS", _automate_jobs_reference().items),
         ItemsSection("CONFIGURATION", _config_doc_items()),
+        TextSection("BACKUP SET PATTERNS", _BACKUP_SET_PATTERNS),
         ItemsSection("FILES", _files_doc_items()),
     ],
     exit_status=[

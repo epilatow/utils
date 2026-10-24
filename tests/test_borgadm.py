@@ -3075,6 +3075,45 @@ class TestConfigCommands:
             assert ba.cli() == berr.ExitCode.CONFIG
 
     @pytest.mark.parametrize(
+        "patterns",
+        [[], ["+sh:**/tmp/**/*.md", "-sh:**/tmp", "!sh:**/cache"]],
+    )
+    def test_config_preserves_ordered_patterns(
+        self, tmp_path: Path, patterns: list[str]
+    ) -> None:
+        settings = {"s": {"paths": ["x"], "patterns": patterns}}
+        cfg_file = tmp_path / "patterns"
+        cfg_file.write_text(
+            f"BORG_REPO = /repo\nBACKUP_SETS = {json.dumps(settings)}\n"
+        )
+        cfg = ba.Config(str(cfg_file), {})
+        assert cfg.BACKUP_SETS["s"]["patterns"] == patterns
+
+    @pytest.mark.parametrize(
+        "patterns",
+        [None, "-sh:**/cache", 42, {}, [42], [None], [""], ["  "]],
+    )
+    def test_validate_rejects_invalid_patterns(
+        self, tmp_path: Path, patterns: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        settings = {"s": {"paths": ["x"], "patterns": patterns}}
+        cfg_file = tmp_path / "bad_patterns"
+        cfg_file.write_text(
+            f"BORG_REPO = /repo\nBACKUP_SETS = {json.dumps(settings)}\n"
+        )
+        with pytest.raises(
+            berr.ConfigError,
+            match="patterns must be a list of non-empty strings",
+        ):
+            ba.Config(str(cfg_file), {})
+        with patch(
+            "sys.argv",
+            ["borgadm", "config", "validate", "--config", str(cfg_file)],
+        ):
+            assert ba.cli() == berr.ExitCode.CONFIG
+        assert "BACKUP_SETS['s'].patterns" in caplog.text
+
+    @pytest.mark.parametrize(
         "repo",
         [
             "/./repo",
@@ -3242,6 +3281,7 @@ class TestConfigCommands:
             "--noxattrs",
         ]
         assert "create_options" not in cfg.BACKUP_SETS["local"]
+        assert all(s["patterns"] == [] for s in cfg.BACKUP_SETS.values())
 
     def test_config_fields_match_config(self, tmp_path: Path) -> None:
         """CONFIG_FIELDS covers exactly the settings Config reads -- so a
@@ -4511,6 +4551,155 @@ class TestCreateRoot:
         ):
             ba.do_create(False, False, True, root=str(tmp_path), keep=None)
         mount.assert_called_once_with(tmp_path / "mounted")
+
+
+class TestCreatePatterns:
+    @pytest.mark.parametrize("system", ["Linux", "Darwin"])
+    def test_patterns_follow_exclusions_without_mutating_config(
+        self, mock_cfg: ba.Config, tmp_path: Path, system: str
+    ) -> None:
+        for name in ("source", "Library"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "file").write_text("content")
+        patterns = ["+sh:**/tmp/**/*.md", "-sh:**/tmp", "!sh:**/cache"]
+        settings = {
+            "a": {
+                "paths": ["source/", "Library/"],
+                "create_options": ["--compression=lz4"],
+                "excludes": ["sh:**/protected"],
+                "patterns": patterns.copy(),
+            },
+            "b": {"paths": ["source/"]},
+        }
+        original = json.dumps(settings)
+        mock_cfg.BACKUP_SETS = settings
+        with (
+            patch.object(
+                ba.platform, "system", autospec=True, return_value=system
+            ),
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "run_borg", autospec=True) as run,
+        ):
+            ba.do_create(False, False, True, root=str(tmp_path), keep=None)
+        first = run.call_args_list[0].args[0]
+        start = first.index("--pattern")
+        expected = [
+            arg for pattern in patterns for arg in ("--pattern", pattern)
+        ]
+        assert first[start : start + len(expected)] == expected
+        assert first.index("--compression=lz4") < first.index("--exclude")
+        assert all(
+            index < start
+            for index, arg in enumerate(first)
+            if arg == "--exclude"
+        )
+        assert ("Library/Mobile Documents" in first) == (system == "Darwin")
+        assert "--pattern" not in run.call_args_list[1].args[0]
+        assert json.dumps(mock_cfg.BACKUP_SETS) == original
+
+
+@pytest.mark.e2e
+class TestE2ECreatePatterns:
+    def test_ordered_patterns_select_archived_files(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        always = {
+            "outside.txt",
+            ".tmp/keep.bin",
+            ".cache/keep.bin",
+            "upper/Cache/keep.bin",
+            "tmpish/keep.bin",
+            "cacheish/keep.bin",
+        }
+        notes = {
+            "tmp/nested/notes.md",
+            "tmp/nested/notes.txt",
+            "tmp/cache/notes.md",
+            "cache/tmp/notes.txt",
+        }
+        excluded = {
+            "tmp/nested/capture.json",
+            "tmp/upper.MD",
+            "tmp/folder.md/capture.bin",
+            "cache/notes.md",
+            "cache/capture.json",
+            "tmp/protected/notes.md",
+            "tmp/.venv/notes.txt",
+            ".venv/tmp/notes.md",
+        }
+        patterns = [
+            r"+re:(^|/)tmp/.*\.(md|txt)$",
+            r"-re:(^|/)(tmp|cache)(/|$)",
+        ]
+        settings: dict[str, dict[str, list[str]]] = {}
+        for name in ("set-a", "set-b"):
+            for relative in sorted(always | notes | excluded):
+                target = borg_e2e.backup_root / name / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("payload")
+            settings[name] = {
+                "paths": [f"{name}/"],
+                "excludes": ["sh:**/protected", "sh:**/.venv"],
+                "patterns": patterns if name == "set-a" else patterns[::-1],
+            }
+        _set_backup_sets(borg_e2e, settings)
+        borg_e2e.run("create", "--no-prune")
+        assert len(borg_e2e.archives()) == 2
+        for archive in borg_e2e.archives():
+            name = _parse_archive_name(archive).group("set")
+            paths = set(
+                borg_e2e.borg(
+                    "list", "--short", f"{borg_e2e.repo_path}::{archive}"
+                ).stdout.splitlines()
+            )
+            expected = always | (notes if name == "set-a" else set())
+            for relative in always | notes | excluded:
+                assert (f"{name}/{relative}" in paths) == (relative in expected)
+            assert f"{name}/{name}-file.txt" in paths
+
+    def test_full_path_patterns_keep_native_borg_precedence(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        path = "set-a/set-a-file.txt"
+        _set_backup_sets(
+            borg_e2e,
+            {
+                "set-a": {
+                    "paths": ["set-a/"],
+                    "excludes": [path],
+                    "patterns": [f"+pf:{path}"],
+                }
+            },
+        )
+        borg_e2e.run("create", "--no-prune")
+        archives = borg_e2e.archives()
+        assert len(archives) == 1
+        paths = borg_e2e.borg(
+            "list", "--short", f"{borg_e2e.repo_path}::{archives[0]}"
+        ).stdout.splitlines()
+        assert path in paths
+
+    def test_invalid_later_set_patterns_prevent_all_creates(
+        self, borg_e2e: BorgE2EFixture
+    ) -> None:
+        settings = {
+            "set-a": {"paths": ["set-a/"]},
+            "set-b": {"paths": ["set-b/"], "patterns": "-sh:**/tmp"},
+        }
+        lines = borg_e2e.config_path.read_text().splitlines()
+        borg_e2e.config_path.write_text(
+            "\n".join(
+                f"BACKUP_SETS = {json.dumps(settings)}"
+                if line.startswith("BACKUP_SETS =")
+                else line
+                for line in lines
+            )
+            + "\n"
+        )
+        result = borg_e2e.run("create", "--no-prune", check=False)
+        assert result.returncode == berr.ExitCode.CONFIG
+        assert "BACKUP_SETS['set-b'].patterns" in result.stderr
+        assert borg_e2e.archives() == []
 
 
 class TestCreateKeep:
