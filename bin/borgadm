@@ -772,100 +772,243 @@ def pump_stream(
 _SUDO_ARGV: tuple[str, ...] = ("sudo", "-n", "-E")
 
 
+def _cmd_timeout(slow: bool) -> int:
+    """`BORG_CMD_TIMEOUT` for a slow (borg or rsync) command, else
+    `CMD_TIMEOUT`; the field defaults before CFG is loaded."""
+    if CFG:
+        return CFG.BORG_CMD_TIMEOUT if slow else CFG.CMD_TIMEOUT
+    return cast(
+        int, _FIELDS["BORG_CMD_TIMEOUT" if slow else "CMD_TIMEOUT"].default
+    )
+
+
+# How much of a failed command's ssh log its failure message carries:
+# enough for how the session ended, not the connection setup before it.
+_SSH_LOG_TAIL_LINES = 10
+
+
+@functools.cache
+def _ssh_log_dir() -> Path:
+    """A directory private to this process for its ssh logs, removed at
+    exit. A private directory rather than files directly in the shared
+    temp dir: a sudo'd borg's ssh runs as root and opens the log borgadm
+    created, which Linux's fs.protected_regular refuses for a file another
+    user owns in a sticky world-writable directory such as /tmp."""
+    td = tempfile.TemporaryDirectory(
+        prefix=f"{BASENAME}-ssh-", ignore_cleanup_errors=True
+    )
+    atexit.register(td.cleanup)
+    return Path(td.name)
+
+
+class RunningCmd:
+    """A command borgadm has started, run through sudo when `sudo` is set,
+    with its stdout and stderr collected (and, with `allow_output`, passed
+    through to ours) as it runs. `wait()` finishes it and logs everything
+    about its outcome. `run_cmd` is the usual way to use one; start one
+    directly only for a command that must keep running while borgadm does
+    other work.
+
+    A borg command whose environment carries BORG_RSH -- one reaching a
+    remote repository -- gets an ssh log of its own: ssh logs at debug
+    level to a fresh file, and a failure message ends with the tail of
+    that log. With a log file ssh writes its own errors there instead of
+    to stderr, so the tail is also where those appear."""
+
+    def __init__(
+        self,
+        cmd: list[str],
+        *,
+        sudo: bool = False,
+        allow_output: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.borg = cmd[0] in borg_cmd()
+        self.timeout = _cmd_timeout(self.borg or cmd[0] == "rsync")
+        self.sudo = sudo
+        self.stopped = False
+        self.ssh_log: Path | None = None
+        env: Mapping[str, str] | None = kwargs.pop("env", None)
+        base_env = os.environ if env is None else env
+        rsh = base_env.get("BORG_RSH")
+        if self.borg and rsh:
+            fd, log = tempfile.mkstemp(dir=_ssh_log_dir(), suffix=".ssh.log")
+            os.close(fd)
+            self.ssh_log = Path(log)
+            env = {
+                **base_env,
+                "BORG_RSH": shlex.join(
+                    [*shlex.split(rsh), "-o", "LogLevel=DEBUG1", "-E", log]
+                ),
+            }
+        if sudo:
+            cmd = [*_SUDO_ARGV, *cmd]
+        self.cmd = cmd
+        self.cmd_str = shlex.join(cmd)
+        ssh_note = f" (ssh log: {self.ssh_log})" if self.ssh_log else ""
+        logger.debug(f"Running command: {self.cmd_str}{ssh_note}")
+        # Undecodable output is replaced rather than allowed to kill a
+        # pump thread, which would leave the command blocked on a full
+        # pipe.
+        self.proc: subprocess.Popen[str] = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            bufsize=1,
+            env=env,
+            **kwargs,
+        )
+        self._stdout = io.StringIO()
+        self._stderr = io.StringIO()
+        self._pumps = [
+            threading.Thread(
+                target=pump_stream,
+                args=(cast(TextIO, src), sink, acc, allow_output),
+                daemon=True,
+            )
+            for src, sink, acc in (
+                (self.proc.stdout, sys.stdout, self._stdout),
+                (self.proc.stderr, sys.stderr, self._stderr),
+            )
+        ]
+        for pump in self._pumps:
+            pump.start()
+
+    def poll(self) -> int | None:
+        return self.proc.poll()
+
+    def _signal(self, sig: signal.Signals) -> None:
+        """Send `sig` to the process. sudo relays a signal it receives --
+        all but SIGKILL -- to the command it runs. Whether the invoking
+        user may signal the sudo process depends on sudo's version and
+        configuration (some drop to full root while the command runs), so
+        a refused signal is sent through sudo instead."""
+        try:
+            self.proc.send_signal(sig)
+        except PermissionError:
+            if not self.sudo:
+                raise
+            name = sig.name.removeprefix("SIG")
+            run_cmd(["kill", f"-{name}", str(self.proc.pid)], sudo=True)
+
+    def stop(self) -> None:
+        """Stop the process: SIGTERM, then SIGKILL if it is still running
+        `CMD_TIMEOUT` seconds later. A SIGKILL ends the sudo process of a
+        sudo'd command, but not necessarily the command it runs. Raises
+        BorgadmError if the process outlives both signals."""
+        self.stopped = True
+        grace = _cmd_timeout(slow=False)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            self._signal(sig)
+            try:
+                self.proc.wait(grace)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        raise BorgadmError(
+            f"Could not stop {self.cmd_str} (pid {self.proc.pid})"
+        )
+
+    def _ssh_log_tail(self) -> str:
+        """The end of the ssh log, as a section to follow the stderr in a
+        failure message; empty when there is no log or it is empty."""
+        if self.ssh_log is None:
+            return ""
+        try:
+            lines = self.ssh_log.read_text(errors="replace").splitlines()
+        except OSError as e:
+            return f"\nssh log unreadable: {e}"
+        if not lines:
+            return ""
+        tail = "\n".join(lines[-_SSH_LOG_TAIL_LINES:])
+        return f"\nssh log (last {_SSH_LOG_TAIL_LINES} lines):\n{tail}"
+
+    def wait(
+        self,
+        timeout: float | None = None,
+        *,
+        errok: bool = False,
+        log_error: bool = True,
+        quiet_if: Callable[[str], bool] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Wait up to `timeout` seconds (None: indefinitely) for the
+        command to exit, stopping it if it has not, and return its result.
+
+        Its stderr is logged at debug level. A borg command's exit code 1
+        means it completed with warnings, which are logged as such. Any
+        other non-zero exit is a failure: logged unless `log_error` is
+        False, and raised as SubprocessError unless `errok` -- except one
+        whose stderr satisfies `quiet_if`, which is just returned."""
+        timed_out = ""
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = f" (timed out after {timeout}s)"
+            self.stop()
+        # A stopped sudo process may leave its command running and
+        # holding the output pipes open, so the pumps get a bounded wait.
+        for pump in self._pumps:
+            pump.join(_cmd_timeout(slow=False) if self.stopped else None)
+        if any(pump.is_alive() for pump in self._pumps):
+            logger.warning(
+                f"{self.cmd_str} was stopped, but its output is still open: "
+                "a process it started may still be running"
+            )
+        rc = self.proc.returncode
+        stdout = self._stdout.getvalue()
+        stderr = self._stderr.getvalue()
+        if stderr:
+            logger.debug(f"stderr:\n{stderr.strip()}")
+        result = subprocess.CompletedProcess(self.cmd, rc, stdout, stderr)
+
+        if self.borg and rc == ExitCode.WARNING:
+            # Borg exit code 1 means the operation completed with
+            # non-fatal warnings (e.g., files changed during backup).
+            logger.warning(
+                "Command %s completed with warnings (exit code %s):\n%s",
+                self.cmd_str,
+                rc,
+                stderr.strip(),
+            )
+            global _warning_occurred
+            _warning_occurred = True
+        elif rc != 0:
+            if quiet_if is not None and quiet_if(stderr):
+                return result
+            if log_error:
+                logger.error(
+                    "Command %s failed with exit code %s%s and stderr:\n%s%s",
+                    self.cmd_str,
+                    rc,
+                    timed_out,
+                    stderr.strip(),
+                    self._ssh_log_tail(),
+                )
+            if not errok:
+                raise SubprocessError(
+                    rc, self.cmd, output=stdout, stderr=stderr
+                )
+        return result
+
+
 def run_cmd(
     cmd: list[str],
     sudo: bool = False,
     errok: bool = False,
     allow_output: bool = False,
     log_error: bool = True,
+    quiet_if: Callable[[str], bool] | None = None,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
-    slow = cmd[0] in borg_cmd() + ["rsync"]
-    # Before CFG is loaded, fall back to the field defaults.
-    timeout: int = cast(
-        int, _FIELDS["BORG_CMD_TIMEOUT" if slow else "CMD_TIMEOUT"].default
-    )
-    if CFG:
-        timeout = CFG.BORG_CMD_TIMEOUT if slow else CFG.CMD_TIMEOUT
-    if sudo:
-        cmd = [*_SUDO_ARGV, *cmd]
-    cmd_str = shlex.join(cmd)
-    logger.debug(f"Running command: {cmd_str}")
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        **kwargs,
-    )
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-    stdout = cast(TextIO, proc.stdout)
-    stderr = cast(TextIO, proc.stderr)
-
-    t_stdout = threading.Thread(
-        target=pump_stream,
-        args=(stdout, sys.stdout, stdout_buf, allow_output),
-        daemon=True,
-    )
-    t_stdout.start()
-    t_stderr = threading.Thread(
-        target=pump_stream,
-        args=(stderr, sys.stderr, stderr_buf, allow_output),
-        daemon=True,
-    )
-    t_stderr.start()
-
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
-    t_stdout.join()
-    t_stderr.join()
-
-    stdout_str = stdout_buf.getvalue()
-    stderr_str = stderr_buf.getvalue()
-
-    if stderr_str:
-        logger.debug(f"stderr:\n{stderr_str.strip()}")
-
-    is_borg = "borg" in cmd[0] or "borg" in cmd
-    if is_borg and proc.returncode == ExitCode.WARNING:
-        # Borg exit code 1 means the operation completed with
-        # non-fatal warnings (e.g., files changed during backup).
-        logger.warning(
-            "Command %s completed with warnings (exit code %s):\n%s",
-            cmd_str,
-            proc.returncode,
-            stderr_str.strip(),
-        )
-        global _warning_occurred
-        _warning_occurred = True
-    elif proc.returncode != 0:
-        if log_error:
-            logger.error(
-                "Command %s failed with exit code %s and stderr:\n%s",
-                cmd_str,
-                proc.returncode,
-                stderr_str.strip(),
-            )
-        if not errok:
-            raise SubprocessError(
-                proc.returncode,
-                cmd,
-                output=stdout_str,
-                stderr=stderr_str,
-            )
-
-    return subprocess.CompletedProcess(
-        args=cmd,
-        returncode=proc.returncode,
-        stdout=stdout_str,
-        stderr=stderr_str,
+    """Run `cmd` to completion within its timeout (`BORG_CMD_TIMEOUT` for
+    borg and rsync, `CMD_TIMEOUT` otherwise). See `RunningCmd` for how it
+    runs and `RunningCmd.wait` for how its outcome is handled."""
+    running = RunningCmd(cmd, sudo=sudo, allow_output=allow_output, **kwargs)
+    return running.wait(
+        running.timeout, errok=errok, log_error=log_error, quiet_if=quiet_if
     )
 
 
@@ -916,20 +1059,6 @@ def _announce_lock_wait() -> None:
         "A borg lock is held, waiting up to %ss for it to release.",
         get_cfg().BORG_CMD_TIMEOUT,
     )
-
-
-def _raise_borg_failure(
-    args: list[str], returncode: int, stdout: str, stderr: str
-) -> typing.NoReturn:
-    """Log a failed borg command with its stderr and raise it, in the
-    same shape `run_cmd` uses for a command it does not tolerate."""
-    logger.error(
-        "Command %s failed with exit code %s and stderr:\n%s",
-        shlex.join(args),
-        returncode,
-        stderr.strip(),
-    )
-    raise SubprocessError(returncode, args, output=stdout, stderr=stderr)
 
 
 def run_borg(
@@ -996,19 +1125,11 @@ def run_borg(
     cfg = get_cfg()
     initial = run_cmd(
         _with_borg_flags(cmd, ["--lock-wait", str(cfg.LOCK_CHECK_TIMEOUT)]),
-        errok=True,
-        log_error=False,
+        quiet_if=_is_lock_timeout,
         **kwargs,
     )
     if initial.returncode in (ExitCode.SUCCESS, ExitCode.WARNING):
         return initial
-    if not _is_lock_timeout(initial.stderr):
-        _raise_borg_failure(
-            cast(list[str], initial.args),
-            initial.returncode,
-            initial.stdout,
-            initial.stderr,
-        )
     _announce_lock_wait()
     return run_cmd(
         _with_borg_flags(cmd, ["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)]),
@@ -1418,14 +1539,10 @@ def do_keep_update(archive: str, description: str) -> None:
 
 
 def is_mountpoint(path: Path) -> bool:
-    try:
-        output = subprocess.check_output(["mount"], text=True)
-        for line in output.splitlines():
-            if f" on {path} " in line:
-                return True
-    except subprocess.CalledProcessError:
-        pass
-    return False
+    result = run_cmd(["mount"], errok=True, log_error=False)
+    if result.returncode != 0:
+        return False
+    return any(f" on {path} " in line for line in result.stdout.splitlines())
 
 
 def _mounts_under(root: Path) -> list[tuple[Path, str]]:
@@ -1437,12 +1554,14 @@ def _mounts_under(root: Path) -> list[tuple[Path, str]]:
     yields an empty list rather than an exception.
     """
     try:
-        output = subprocess.check_output(["mount"], text=True)
-    except FileNotFoundError, subprocess.CalledProcessError:
+        result = run_cmd(["mount"], errok=True, log_error=False)
+    except FileNotFoundError:
+        return []
+    if result.returncode != 0:
         return []
     root_str = root.as_posix()
     found: list[tuple[Path, str]] = []
-    for line in output.splitlines():
+    for line in result.stdout.splitlines():
         m = re.match(r"\S+ on (.+) type (\S+)", line)
         if not m:
             continue
@@ -1491,190 +1610,6 @@ def _reclaim_stale_run_dirs(parent: Path, prefix: str, keep: Path) -> None:
 _MOUNT_POLL_SEC = 1.0
 
 
-class _ForegroundMount:
-    """A `borg mount -f` serving one archive for the life of an rsync run.
-
-    The borg process -- run through sudo when `sudo` is set -- stays a
-    child of borgadm, so its exit is observable and its stderr is ours.
-    A reader thread holds what borg writes while the mount starts -- the
-    caller decides whether that is a lock wait to retry or a failure to
-    report -- and once `relay()` is called it logs each later line as
-    `borg mount <archive>: <line>` as it arrives. A healthy mount writes
-    little or nothing at borg's default log level, so what gets relayed
-    is what explains a failure (an exception, an ssh disconnect),
-    timestamped and attributed to its mount. Undecodable bytes are
-    replaced rather than allowed to kill the reader, which would leave
-    borg blocked on a full stderr pipe.
-    """
-
-    def __init__(
-        self,
-        cmd: list[str],
-        archive_name: str,
-        mount_dir: Path,
-        env: Mapping[str, str] | None,
-        *,
-        sudo: bool,
-    ) -> None:
-        self.archive_name = archive_name
-        self.mount_dir = mount_dir
-        self.sudo = sudo
-        self.is_up = False
-        self._lock = threading.Lock()
-        self._held: list[str] = []
-        if sudo:
-            cmd = [*_SUDO_ARGV, *cmd]
-        logger.debug(f"Running command: {shlex.join(cmd)}")
-        self.proc: subprocess.Popen[str] = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
-        self._reader = threading.Thread(target=self._read_stderr, daemon=True)
-        self._reader.start()
-
-    def _read_stderr(self) -> None:
-        stderr = cast(TextIO, self.proc.stderr)
-        while line := stderr.readline():
-            with self._lock:
-                if self.is_up:
-                    self._log(line)
-                else:
-                    self._held.append(line)
-
-    def _log(self, line: str) -> None:
-        logger.warning(f"borg mount {self.archive_name}: {line.rstrip()}")
-
-    def relay(self) -> None:
-        """Mark the mount up: keep what borg wrote while it started at
-        debug level, as run_cmd keeps a successful command's stderr, then
-        log each later line as it arrives."""
-        with self._lock:
-            if self._held:
-                logger.debug(
-                    f"borg mount {self.archive_name} startup stderr:\n"
-                    f"{''.join(self._held).rstrip()}"
-                )
-            self._held.clear()
-            self.is_up = True
-
-    def mounted(self) -> bool:
-        # A stat-based check rather than parsing `mount` output, which
-        # `_mounts_under` tolerates failing and which renders some paths
-        # differently: either would leave a serving mount looking absent
-        # until the startup deadline.
-        return os.path.ismount(self.mount_dir)
-
-    def startup_stderr(self, timeout: float) -> str:
-        """What borg wrote before the mount came up, once the reader has
-        drained the pipe (waiting up to `timeout` for it)."""
-        self._reader.join(timeout)
-        with self._lock:
-            return "".join(self._held)
-
-    def drain(self, timeout: float) -> None:
-        """Wait up to `timeout` for everything borg wrote to be logged."""
-        self._reader.join(timeout)
-
-    def _terminate(self) -> bool:
-        """Send the process SIGTERM, returning whether it was delivered.
-
-        sudo relays a SIGTERM it receives to the command it runs, so
-        signalling the sudo process stops borg. Whether the invoking user
-        may signal sudo depends on its version and configuration (some
-        drop to full root while the command runs), so a refused signal is
-        retried through sudo itself."""
-        try:
-            self.proc.terminate()
-            return True
-        except PermissionError as e:
-            refused = str(e)
-        if self.sudo:
-            result = run_cmd(
-                ["kill", "-TERM", str(self.proc.pid)],
-                sudo=True,
-                errok=True,
-                log_error=False,
-            )
-            if result.returncode == 0:
-                return True
-            refused = result.stderr.strip()
-        logger.warning(
-            f"borg mount {self.archive_name} (pid {self.proc.pid}) "
-            f"could not be signalled: {refused}"
-        )
-        return False
-
-    def stop(self, timeout: float, *, terminate: bool = False) -> None:
-        """Reap the borg process. Without `terminate` it first gets
-        `timeout` seconds to exit on its own -- a `borg mount -f` does once
-        its filesystem is unmounted -- and is sent SIGTERM only if it is
-        still running; with `terminate` it is sent SIGTERM straight away.
-        A process still running `timeout` seconds after SIGTERM, or one
-        that cannot be signalled, is reported and left running. Never
-        raises, since it runs during cleanup."""
-        if not terminate:
-            try:
-                self.proc.wait(timeout)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"borg mount {self.archive_name} still running after "
-                    f"{timeout}s, terminating it"
-                )
-            else:
-                self.drain(timeout)
-                return
-        if not self._terminate():
-            return
-        try:
-            self.proc.wait(timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                f"borg mount {self.archive_name} (pid {self.proc.pid}) "
-                "did not exit on SIGTERM"
-            )
-            return
-        self.drain(timeout)
-
-
-def _launch_foreground_mount(
-    cmd: list[str],
-    archive_name: str,
-    mount_dir: Path,
-    *,
-    env: Mapping[str, str] | None,
-    sudo: bool,
-) -> _ForegroundMount:
-    """Start a `borg mount -f` `cmd` and wait for its mountpoint to
-    appear. Returns the mount either up (relaying its output) or with its
-    process exited before mounting -- `is_up` tells which. A mount that
-    neither comes up nor exits within `BORG_CMD_TIMEOUT` is sent SIGTERM
-    and raises."""
-    cfg = get_cfg()
-    mount = _ForegroundMount(cmd, archive_name, mount_dir, env, sudo=sudo)
-    deadline = time.monotonic() + cfg.BORG_CMD_TIMEOUT
-    while not mount.mounted():
-        if mount.proc.poll() is not None:
-            return mount
-        if time.monotonic() >= deadline:
-            mount.stop(cfg.CMD_TIMEOUT, terminate=True)
-            logger.error(
-                "borg mount of %s did not come up within %ss; stderr:\n%s",
-                archive_name,
-                cfg.BORG_CMD_TIMEOUT,
-                mount.startup_stderr(0).strip(),
-            )
-            raise BorgadmError(f"Timed out mounting {archive_name}")
-        time.sleep(_MOUNT_POLL_SEC)
-    mount.relay()
-    return mount
-
-
 def _start_foreground_mount(
     archive_ref: str,
     mount_dir: Path,
@@ -1682,9 +1617,10 @@ def _start_foreground_mount(
     bypass_lock: bool,
     scratch: Path,
     sudo: bool,
-) -> _ForegroundMount:
-    """Mount `archive_ref` on `mount_dir` with a `borg mount -f` kept as a
-    child process, returning once the mount is up.
+) -> RunningCmd:
+    """Mount `archive_ref` on `mount_dir` with a `borg mount -f` kept
+    running, returning it once the mount is up. borg logs at debug level,
+    so a failure reported for it shows what borg was doing.
 
     Locking follows `run_borg`: a `LOCK_CHECK_TIMEOUT` lock-wait first,
     then -- only if that attempt exits on borg's LockTimeout -- a retry
@@ -1692,12 +1628,14 @@ def _start_foreground_mount(
     `--bypass-lock` and throwaway cache and security dirs under
     `scratch`, which outlive this call (the process uses them for as
     long as it serves the mount) and are left for the caller to remove. A
-    mount that exits without coming up raises with what borg wrote.
+    mount that exits without coming up raises; one that neither comes up
+    nor exits within `BORG_CMD_TIMEOUT` is stopped and raises.
     """
     cfg = get_cfg()
     archive_name = archive_ref.split("::", 1)[1]
     cmd = borg_cmd() + [
         "mount",
+        "--debug",
         "-f",
         "-o",
         "allow_other",
@@ -1707,77 +1645,64 @@ def _start_foreground_mount(
 
     def launch(
         flags: list[str], env: Mapping[str, str] | None = None
-    ) -> _ForegroundMount:
-        return _launch_foreground_mount(
-            _with_borg_flags(cmd, flags),
-            archive_name,
-            mount_dir,
-            env=env,
-            sudo=sudo,
-        )
+    ) -> RunningCmd:
+        """Start the mount, returning once it is up or has exited."""
+        mount = RunningCmd(_with_borg_flags(cmd, flags), sudo=sudo, env=env)
+        deadline = time.monotonic() + cfg.BORG_CMD_TIMEOUT
+        # A stat-based check rather than parsing `mount` output, which
+        # `_mounts_under` tolerates failing and which renders some paths
+        # differently: either would leave a serving mount looking absent
+        # until the deadline.
+        while not os.path.ismount(mount_dir):
+            if mount.poll() is not None:
+                return mount
+            if time.monotonic() >= deadline:
+                mount.stop()
+                mount.wait(errok=True)
+                raise BorgadmError(f"Timed out mounting {archive_name}")
+            time.sleep(_MOUNT_POLL_SEC)
+        return mount
 
     if bypass_lock:
-        mount = launch(["--bypass-lock"], _bypass_lock_env(os.environ, scratch))
+        flags = ["--bypass-lock"]
+        mount = launch(flags, _bypass_lock_env(os.environ, scratch))
     else:
-        mount = launch(["--lock-wait", str(cfg.LOCK_CHECK_TIMEOUT)])
-        if not mount.is_up:
-            stderr = mount.startup_stderr(cfg.CMD_TIMEOUT)
-            if _is_lock_timeout(stderr):
-                # Kept at debug level, as run_cmd keeps any stderr, for
-                # the lock holder borg names.
-                logger.debug(f"stderr:\n{stderr.strip()}")
-                _announce_lock_wait()
-                mount = launch(["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)])
-    if mount.is_up:
+        flags = ["--lock-wait", str(cfg.LOCK_CHECK_TIMEOUT)]
+        mount = launch(flags)
+    if mount.poll() is None:
         return mount
-    _raise_borg_failure(
-        cast(list[str], mount.proc.args),
-        cast(int, mount.proc.returncode),
-        "",
-        mount.startup_stderr(cfg.CMD_TIMEOUT),
-    )
+    # Exited without mounting: a failure raises, except the LockTimeout
+    # of a first lock-wait, which is retried with the long wait.
+    first = mount.wait(quiet_if=None if bypass_lock else _is_lock_timeout)
+    if first.returncode not in (ExitCode.SUCCESS, ExitCode.WARNING):
+        _announce_lock_wait()
+        mount = launch(["--lock-wait", str(cfg.BORG_CMD_TIMEOUT)])
+        if mount.poll() is None:
+            return mount
+        mount.wait()
+    raise BorgadmError(f"borg mount of {archive_name} exited without mounting")
 
 
-def _report_dead_mounts(mounts: list[_ForegroundMount]) -> None:
-    """Log an error for each mount whose borg process has already exited,
-    i.e. stopped serving its archive before the run unmounted it -- the
-    cause of the ENOTCONN errors anything reading it then saw. Waits for
-    the process's own output (already relayed) to finish first, so the
-    summary follows it."""
+def _reap_mounts(mounts: list[RunningCmd], *, report: bool) -> None:
+    """Reap each mount's `borg mount -f` once its filesystem is unmounted,
+    stopping one still running `CMD_TIMEOUT` seconds later. With
+    `report`, each mount that failed is logged, one after another. Runs
+    during cleanup, so a mount that cannot be stopped is reported rather
+    than raised over the run's own error."""
     for mount in mounts:
-        rc = mount.proc.poll()
-        if rc is None:
-            continue
-        mount.drain(get_cfg().CMD_TIMEOUT)
-        how = f"signal {-rc}" if rc < 0 else f"exit code {rc}"
-        logger.error(
-            f"borg mount of {mount.archive_name} exited unexpectedly ({how})"
-        )
-
-
-def _reap_mounts(mounts: list[_ForegroundMount]) -> None:
-    """Reap each mount's borg process once its filesystem is unmounted."""
-    for mount in mounts:
-        mount.stop(get_cfg().CMD_TIMEOUT)
+        try:
+            mount.wait(get_cfg().CMD_TIMEOUT, errok=True, log_error=report)
+        except BorgadmError as e:
+            logger.warning(str(e))
 
 
 def check_sudo() -> bool:
-    cfg = get_cfg()
-
     try:
-        subprocess.run(
-            [*_SUDO_ARGV, "true"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=cfg.CMD_TIMEOUT,
-        )
-        return True
-    except subprocess.CalledProcessError:
-        return False
+        result = run_cmd(["true"], sudo=True, errok=True, log_error=False)
     except FileNotFoundError:
         # sudo not installed
         return False
+    return result.returncode == 0
 
 
 def backup_set_paths(
@@ -3147,8 +3072,9 @@ def do_rsync(
         )
         tmpdir = Path(tmpdir_ctx.name)
         bypass_root = tmpdir / "bypass"
-        mounts: list[_ForegroundMount] = []
-        dead_at_interrupt: list[_ForegroundMount] | None = None
+        mounts: list[RunningCmd] = []
+        mount_dirs: list[Path] = []
+        rsync_failed = False
         try:
             # Reclaim tmp dirs orphaned by a previously SIGKILLed run of
             # this same target.
@@ -3169,11 +3095,12 @@ def do_rsync(
                         sudo=True,
                     )
                 )
+                mount_dirs.append(mount_dir)
 
                 if not os.listdir(mount_dir):
                     raise BorgadmError(f"Empty archive mount: {archive_ref}")
 
-            lowerdir = ":".join(m.mount_dir.as_posix() for m in mounts)
+            lowerdir = ":".join(d.as_posix() for d in mount_dirs)
             upperdir = tmpdir / "upperdir"
             workdir = tmpdir / "workdir"
             merged = tmpdir / "merged"
@@ -3205,7 +3132,11 @@ def do_rsync(
             cmd += ["--delete"] if delete else []
             cmd += ["--dry-run"] if dry_run else []
             cmd += [merged.as_posix() + "/", target_dir.as_posix() + "/"]
-            run_cmd(cmd, allow_output=progress, sudo=True)
+            try:
+                run_cmd(cmd, allow_output=progress, sudo=True)
+            except SubprocessError:
+                rsync_failed = True
+                raise
 
             # Record the version we extraced
             (tdir_dirname / f".{BASENAME}_{tdir_basename}.ts").write_text(
@@ -3213,26 +3144,18 @@ def do_rsync(
             )
 
             logger.info(f"Finished rsync to: {target_dir}")
-        except KeyboardInterrupt:
-            # A SIGINT from the terminal reaches the mounts too, so only
-            # those already gone when it arrived died on their own.
-            dead_at_interrupt = [m for m in mounts if m.proc.poll() is not None]
-            raise
         finally:
-            # A mount whose borg process already exited died mid-run; say
-            # so before unmounting reaps the rest. Then cleanup root owned
-            # resources. The mount table, not bookkeeping, decides what
-            # comes down, so a mount stranded by a failure between mounting
-            # and any later step is still torn down before the
-            # TemporaryDirectory cleanup walks the tree. The overlay
-            # workdir and the bypass-lock cache dirs are root-owned and
-            # must be removed with sudo before that cleanup can clear the
-            # rest.
-            _report_dead_mounts(
-                mounts if dead_at_interrupt is None else dead_at_interrupt
-            )
+            # Cleanup root owned resources. The mount table, not
+            # bookkeeping, decides what comes down, so a mount stranded by
+            # a failure between mounting and any later step is still torn
+            # down before the TemporaryDirectory cleanup walks the tree.
+            # Unmounting ends each borg mount; a mount that failed is what
+            # explains a failed rsync, so it is reported only then. The
+            # overlay workdir and the bypass-lock cache dirs are
+            # root-owned and must be removed with sudo before that cleanup
+            # can clear the rest.
             _umount_tree(tmpdir)
-            _reap_mounts(mounts)
+            _reap_mounts(mounts, report=rsync_failed)
             run_cmd(
                 [
                     "rm",

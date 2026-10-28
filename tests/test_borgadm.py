@@ -2467,8 +2467,7 @@ class TestRunBorg:
                 str(mock_cfg.LOCK_CHECK_TIMEOUT),
                 mock_cfg.BORG_REPO,
             ],
-            errok=True,
-            log_error=False,
+            quiet_if=ba._is_lock_timeout,
         )
         assert "lock is held" not in caplog.text.lower()
 
@@ -2505,8 +2504,7 @@ class TestRunBorg:
                     str(mock_cfg.LOCK_CHECK_TIMEOUT),
                     mock_cfg.BORG_REPO,
                 ],
-                errok=True,
-                log_error=False,
+                quiet_if=ba._is_lock_timeout,
             ),
             call(
                 [
@@ -2537,35 +2535,25 @@ class TestRunBorg:
         assert actual is warning
         mock_run.assert_called_once()
 
-    def test_non_lock_failure_logs_and_raises_without_retry(
+    def test_non_lock_failure_raises_without_retry(
         self, mock_cfg: Any, caplog: Any
     ) -> None:
-        caplog.set_level(logging.ERROR)
-        cmd = [
-            "borg",
-            "create",
-            "--lock-wait",
-            str(mock_cfg.LOCK_CHECK_TIMEOUT),
-            mock_cfg.BORG_REPO,
-        ]
-        failure = subprocess.CompletedProcess(
-            args=cmd,
-            returncode=2,
-            stdout="partial output",
-            stderr="Connection closed by remote host",
+        """A first attempt failing for any reason but a lock timeout is
+        raised by run_cmd, which logs it; run_borg neither retries it nor
+        announces a lock wait."""
+        caplog.set_level(logging.INFO)
+        err = berr.SubprocessError(
+            2, ["borg"], output="", stderr="Connection closed by remote host"
         )
         with (
             patch.object(
-                ba, "run_cmd", autospec=True, return_value=failure
+                ba, "run_cmd", autospec=True, side_effect=err
             ) as mock_run,
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             pytest.raises(berr.SubprocessError) as exc,
         ):
             ba.run_borg(["borg", "create", mock_cfg.BORG_REPO], repo_write=True)
-        assert exc.value.returncode == 2
-        assert exc.value.stdout == "partial output"
-        assert exc.value.stderr == "Connection closed by remote host"
-        assert "failed with exit code 2" in caplog.text
+        assert exc.value is err
         assert "lock is held" not in caplog.text.lower()
         mock_run.assert_called_once()
 
@@ -2597,8 +2585,7 @@ class TestRunBorg:
         _, kwargs = mock_run.call_args
         assert kwargs["cwd"] == mock_cfg.BACKUP_ROOT
         assert kwargs["allow_output"] is True
-        assert kwargs["errok"] is True
-        assert kwargs["log_error"] is False
+        assert kwargs["quiet_if"] is ba._is_lock_timeout
 
 
 class TestRunCmdStatusHandling:
@@ -2618,9 +2605,29 @@ class TestRunCmdStatusHandling:
 
     @pytest.mark.usefixtures("mock_cfg")
     def test_borg_warning_flips_global_warning(self) -> None:
-        with patch.object(ba, "_warning_occurred", False):
-            ba.run_cmd(["false", "borg"], errok=True)
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["false"]),
+            patch.object(ba, "_warning_occurred", False),
+        ):
+            ba.run_cmd(["false"], errok=True)
             assert ba._warning_occurred is True
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_sudo_borg_exit_one_is_a_warning(self, caplog: Any) -> None:
+        """A borg command is known by its own argv, not by the sudo that
+        runs it."""
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba.subprocess, "Popen", autospec=True) as popen,
+            patch.object(ba, "_warning_occurred", False),
+        ):
+            popen.return_value.stdout = io.StringIO("")
+            popen.return_value.stderr = io.StringIO("file changed\n")
+            popen.return_value.returncode = 1
+            result = ba.run_cmd(["borg", "create"], sudo=True)
+            assert ba._warning_occurred is True
+        assert result.returncode == 1
+        assert "completed with warnings" in caplog.text
 
 
 class TestIsRemoteRepo:
@@ -2705,16 +2712,11 @@ class TestInitializeBorgEnvironmentSshGating:
 
 
 def _fake_foreground_mount(
-    _archive_ref: str, mount_dir: Path, **_kwargs: Any
+    _archive_ref: str, _mount_dir: Path, **_kwargs: Any
 ) -> Any:
     """Stand-in for `_start_foreground_mount` in tests that drive
-    `do_rsync` with the borg processes mocked out: a mount handle that
-    knows its mountpoint and whose process is still running."""
-    mount = Mock(spec=ba._ForegroundMount)
-    mount.mount_dir = mount_dir
-    mount.proc = Mock(spec=subprocess.Popen)
-    mount.proc.poll.return_value = None
-    return mount
+    `do_rsync` with the borg processes mocked out."""
+    return Mock(spec=ba.RunningCmd)
 
 
 _REAL_ISMOUNT = os.path.ismount
@@ -2729,7 +2731,7 @@ class _StandinBorg:
 
     def __init__(self, root: Path, lock_check_timeout: int) -> None:
         self.mount_dir = root / self.ARCHIVE
-        self.mount_dir.mkdir()
+        self.mount_dir.mkdir(parents=True)
         self.ctl = borgadm_mount_standin.control_dir(self.mount_dir)
         self.ctl.mkdir()
         (self.ctl / "short").write_text(str(lock_check_timeout))
@@ -2739,6 +2741,24 @@ class _StandinBorg:
 
     def touch(self, name: str) -> None:
         (self.ctl / name).touch()
+
+    def command(self, verb: str, *flags: str) -> list[str]:
+        """A borg command line that runs the stand-in, which takes its
+        control dir from the last argument."""
+        return [
+            sys.executable,
+            str(self.SCRIPT),
+            verb,
+            *flags,
+            self.mount_dir.as_posix(),
+        ]
+
+    def wait_serving(self) -> None:
+        """Wait for a stand-in started directly to start serving."""
+        deadline = time.monotonic() + 10
+        while not (self.ctl / "mounted").exists():
+            assert time.monotonic() < deadline, "stand-in never served"
+            time.sleep(0.01)
 
     def attempts(self) -> list[borgadm_mount_standin.Attempt]:
         lines = (self.ctl / "attempts.jsonl").read_text().splitlines()
@@ -2756,7 +2776,7 @@ class _StandinBorg:
 
     def start(
         self, scratch: Path, *, bypass_lock: bool = False
-    ) -> ba._ForegroundMount:
+    ) -> ba.RunningCmd:
         return ba._start_foreground_mount(
             f"repo::{self.ARCHIVE}",
             self.mount_dir,
@@ -2788,159 +2808,149 @@ def standin_fixture(tmp_path: Path, mock_cfg: Any) -> Iterator[_StandinBorg]:
     sb.touch("unmount")
 
 
-class TestForegroundMount:
-    """`borg mount -f` children: startup, lock retry, output relay,
-    death reporting, and reaping -- against real processes."""
+@pytest.fixture(name="ssh_logs")
+def ssh_logs_fixture(tmp_path: Path, monkeypatch: Any) -> Iterator[Path]:
+    """BORG_RSH set, as for a remote repository, with the ssh logs kept
+    in a directory of the test's own."""
+    logs = tmp_path / "ssh-logs"
+    logs.mkdir()
+    monkeypatch.setenv("BORG_RSH", "ssh -F /dev/null")
+    with patch.object(ba, "_ssh_log_dir", autospec=True, return_value=logs):
+        yield logs
 
-    def test_relays_output_and_reports_death_after_it(
-        self,
-        standin: _StandinBorg,
-        tmp_path: Path,
-        mock_cfg: Any,
-        caplog: Any,
+
+def _ssh_log_tail() -> str:
+    """The ssh section a failure message of a stand-in run ends with."""
+    tail = "\n".join(borgadm_mount_standin.SSH_LOG_LINES[-10:])
+    return f"ssh log (last 10 lines):\n{tail}"
+
+
+def _errors(caplog: Any) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+    ]
+
+
+class TestRunningCmd:
+    """How borgadm runs a command: per-command ssh logs, the failure
+    message, quiet failures, and stopping -- against real processes."""
+
+    def test_remote_borg_command_gets_its_own_ssh_log(
+        self, standin: _StandinBorg, ssh_logs: Path
     ) -> None:
-        """What borg writes while starting is kept at debug level; what it
-        writes while serving is logged under the mount's name, and a
-        mount that dies is reported after its own last words."""
-        caplog.set_level(logging.DEBUG)
-        standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        assert mount.is_up
-        argv = standin.attempts()[0]["argv"]
-        short_wait = str(mock_cfg.LOCK_CHECK_TIMEOUT)
-        assert argv[:4] == ["mount", "--lock-wait", short_wait, "-f"]
-        standin.touch("die")
-        mount.proc.wait(10)
-        ba._report_dead_mounts([mount])
-        startup = [
-            r.levelno
-            for r in caplog.records
-            if r.getMessage()
-            == "borg mount home-1of2 startup stderr:\nstarting"
+        """Each run of a borg command reaching a remote repository logs
+        ssh at debug level to a fresh file, through a BORG_RSH of its own;
+        the process-wide BORG_RSH is left alone."""
+        standin.set_mode("fail")
+        runs = [ba.RunningCmd(standin.command("list")) for _ in range(2)]
+        for run in runs:
+            run.wait(errok=True, log_error=False)
+        logs = [cast(Path, run.ssh_log) for run in runs]
+        assert logs[0] != logs[1]
+        assert {log.parent for log in logs} == {ssh_logs}
+        rshs = [shlex.split(cast(str, a["rsh"])) for a in standin.attempts()]
+        assert rshs == [
+            ["ssh", "-F", "/dev/null", "-o", "LogLevel=DEBUG1", "-E", str(log)]
+            for log in logs
         ]
-        assert startup == [logging.DEBUG]
-        messages = [r.getMessage() for r in caplog.records]
-        last_words = messages.index("borg mount home-1of2: Traceback: boom")
-        summary = messages.index(
-            "borg mount of home-1of2 exited unexpectedly (exit code 2)"
-        )
-        assert last_words < summary
-        mount.stop(10)
+        assert os.environ["BORG_RSH"] == "ssh -F /dev/null"
 
-    def test_report_skips_live_mounts_and_names_a_killing_signal(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
-    ) -> None:
-        standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        ba._report_dead_mounts([mount])
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
-        standin.touch("kill")
-        mount.proc.wait(10)
-        ba._report_dead_mounts([mount])
-        assert caplog.records[-1].getMessage() == (
-            "borg mount of home-1of2 exited unexpectedly (signal 9)"
-        )
-        mount.stop(10)
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_given_environment_is_kept(self, standin: _StandinBorg) -> None:
+        standin.set_mode("fail")
+        env = {**os.environ, "BORG_CACHE_DIR": "/x/cache"}
+        run = ba.RunningCmd(standin.command("list"), env=env)
+        run.wait(errok=True, log_error=False)
+        attempt = standin.attempts()[0]
+        assert attempt["cache"] == "/x/cache"
+        assert "-E" in shlex.split(cast(str, attempt["rsh"]))
 
-    def test_stop_reaps_once_unmounted(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
+    def test_no_ssh_log_without_borg_rsh(
+        self, standin: _StandinBorg, monkeypatch: Any
     ) -> None:
-        standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        standin.touch("unmount")
-        mount.stop(10)
-        assert mount.proc.returncode == 0
+        monkeypatch.delenv("BORG_RSH", raising=False)
+        standin.set_mode("fail")
+        run = ba.RunningCmd(standin.command("list"))
+        run.wait(errok=True, log_error=False)
+        assert run.ssh_log is None
+        assert standin.attempts()[0]["rsh"] is None
+
+    @pytest.mark.usefixtures("standin", "ssh_logs")
+    def test_non_borg_command_gets_no_ssh_log(self) -> None:
+        run = ba.RunningCmd(["true"])
+        run.wait()
+        assert run.ssh_log is None
+
+    def test_ssh_log_dir_is_private(self) -> None:
+        log_dir = ba._ssh_log_dir.__wrapped__()
+        assert log_dir.stat().st_mode & 0o777 == 0o700
+
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_failure_message_ends_with_the_ssh_log(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        cmd = standin.command("list")
+        with pytest.raises(berr.SubprocessError) as excinfo:
+            ba.run_cmd(cmd)
+        assert excinfo.value.stderr == "repository error: boom\n"
+        assert _errors(caplog) == [
+            (
+                f"Command {shlex.join(cmd)} failed with exit code 2 and "
+                f"stderr:\nrepository error: boom\n{_ssh_log_tail()}"
+            )
+        ]
+
+    def test_quiet_if_returns_a_matching_failure_unreported(
+        self, standin: _StandinBorg, mock_cfg: Any, caplog: Any
+    ) -> None:
+        standin.set_mode("lock")
+        cmd = standin.command(
+            "list", "--lock-wait", str(mock_cfg.LOCK_CHECK_TIMEOUT)
+        )
+        result = ba.run_cmd(cmd, quiet_if=ba._is_lock_timeout)
+        assert result.returncode == 2
+        assert ba._is_lock_timeout(result.stderr)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_stop_terminates_a_mount_that_outlives_the_wait(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
+    def test_quiet_if_leaves_other_failures_reported(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        with pytest.raises(berr.SubprocessError):
+            ba.run_cmd(standin.command("list"), quiet_if=ba._is_lock_timeout)
+        assert len(_errors(caplog)) == 1
+
+    def test_timeout_stops_the_command_and_says_so(
+        self, standin: _StandinBorg, caplog: Any
     ) -> None:
         standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        mount.stop(0.5)
-        assert mount.proc.returncode == -signal.SIGTERM
-        assert any(
-            r.getMessage()
-            == "borg mount home-1of2 still running after 0.5s, terminating it"
-            for r in caplog.records
+        run = ba.RunningCmd(standin.command("mount"))
+        assert run.wait(0.5, errok=True).returncode == -signal.SIGTERM
+        assert (
+            f"failed with exit code {-signal.SIGTERM} (timed out after 0.5s)"
+            in _errors(caplog)[0]
         )
 
-    def test_stop_gives_up_on_a_mount_ignoring_sigterm(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
+    def test_stop_follows_an_ignored_sigterm_with_sigkill(
+        self, standin: _StandinBorg, mock_cfg: Any
     ) -> None:
-        """A process that survives SIGTERM is reported and left alone
-        rather than blocking cleanup."""
         standin.set_mode("stubborn")
-        mount = standin.start(tmp_path / "scratch")
-        try:
-            mount.stop(0.5)
-            assert mount.proc.poll() is None
-            assert caplog.records[-1].getMessage() == (
-                f"borg mount home-1of2 (pid {mount.proc.pid}) did not exit "
-                "on SIGTERM"
-            )
-        finally:
-            mount.proc.kill()
-            mount.proc.wait(10)
+        run = ba.RunningCmd(standin.command("mount"))
+        standin.wait_serving()
+        with patch.object(mock_cfg, "CMD_TIMEOUT", 1):
+            run.stop()
+        assert run.poll() == -signal.SIGKILL
 
-    def test_start_passes_sudo_to_the_mount(self, mock_cfg: Any) -> None:
-        up = Mock(spec=ba._ForegroundMount)
-        up.is_up = True
-        with (
-            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
-            patch.object(
-                ba, "_launch_foreground_mount", autospec=True, return_value=up
-            ) as mock_launch,
-        ):
-            mount = ba._start_foreground_mount(
-                "repo::home-1of2",
-                Path("/t/home-1of2"),
-                bypass_lock=False,
-                scratch=Path("/t/bypass/home-1of2"),
-                sudo=True,
-            )
-        assert mount is up
-        assert mock_launch.call_args.args[0] == [
-            "borg",
-            "mount",
-            "--lock-wait",
-            str(mock_cfg.LOCK_CHECK_TIMEOUT),
-            "-f",
-            "-o",
-            "allow_other",
-            "repo::home-1of2",
-            "/t/home-1of2",
-        ]
-        assert mock_launch.call_args.kwargs["sudo"] is True
-
-    def test_sudo_mount_runs_borg_through_sudo(self) -> None:
-        with patch.object(ba.subprocess, "Popen", autospec=True) as popen:
-            popen.return_value.stderr = io.StringIO("")
-            ba._ForegroundMount(
-                ["borg", "mount", "-f"],
-                "home-1of2",
-                Path("/t/home-1of2"),
-                None,
-                sudo=True,
-            )
-        assert popen.call_args.args[0] == [
-            "sudo",
-            "-n",
-            "-E",
-            "borg",
-            "mount",
-            "-f",
-        ]
-
-    def test_refused_sigterm_is_sent_through_sudo(
-        self, standin: _StandinBorg, tmp_path: Path
+    def test_refused_signal_is_sent_through_sudo(
+        self, standin: _StandinBorg
     ) -> None:
         """When the invoking user may not signal the sudo process, the
-        SIGTERM goes through `sudo kill`, which sudo relays to borg."""
+        signal goes through `sudo kill`, which sudo relays to borg."""
         standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        mount.sudo = True
-        pid = mount.proc.pid
+        run = ba.RunningCmd(standin.command("mount"))
+        run.sudo = True
+        pid = run.proc.pid
 
         def sudo_kill(cmd: list[str], **_kwargs: Any) -> Any:
             os.kill(pid, signal.SIGTERM)
@@ -2948,8 +2958,8 @@ class TestForegroundMount:
 
         with (
             patch.object(
-                mount.proc,
-                "terminate",
+                run.proc,
+                "send_signal",
                 autospec=True,
                 side_effect=PermissionError("not permitted"),
             ),
@@ -2957,47 +2967,172 @@ class TestForegroundMount:
                 ba, "run_cmd", autospec=True, side_effect=sudo_kill
             ) as mock_run,
         ):
-            mount.stop(10, terminate=True)
-        mock_run.assert_called_once_with(
-            ["kill", "-TERM", str(pid)],
-            sudo=True,
-            errok=True,
-            log_error=False,
-        )
-        assert mount.proc.returncode == -signal.SIGTERM
+            run.stop()
+        mock_run.assert_called_once_with(["kill", "-TERM", str(pid)], sudo=True)
+        assert run.poll() == -signal.SIGTERM
 
-    def test_sigterm_refused_even_through_sudo_is_reported(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
+    def test_stop_raises_for_a_process_it_cannot_end(
+        self, standin: _StandinBorg, mock_cfg: Any
+    ) -> None:
+        standin.set_mode("serve")
+        run = ba.RunningCmd(standin.command("mount"))
+        try:
+            with (
+                patch.object(mock_cfg, "CMD_TIMEOUT", 1),
+                patch.object(run.proc, "send_signal", autospec=True),
+                pytest.raises(berr.BorgadmError, match="Could not stop"),
+            ):
+                run.stop()
+        finally:
+            run.proc.kill()
+            run.proc.wait(10)
+
+    def test_wait_after_stop_is_bounded_and_warns_of_leftovers(
+        self, standin: _StandinBorg, mock_cfg: Any, caplog: Any
+    ) -> None:
+        """A process that outlives the one stopped -- as a sudo'd command
+        can outlive its SIGKILLed sudo -- holds the output open; waiting
+        for that output gives up after the grace period, with a warning,
+        however the stop came about."""
+        standin.set_mode("orphan")
+        run = ba.RunningCmd(standin.command("mount"))
+        standin.wait_serving()
+        try:
+            with patch.object(mock_cfg, "CMD_TIMEOUT", 1):
+                started = time.monotonic()
+                run.stop()
+                result = run.wait(errok=True, log_error=False)
+                elapsed = time.monotonic() - started
+            assert result.returncode == -signal.SIGKILL
+            assert elapsed < 30
+            assert any(
+                r.levelno == logging.WARNING
+                and r.getMessage()
+                == (
+                    f"{run.cmd_str} was stopped, but its output is still "
+                    "open: a process it started may still be running"
+                )
+                for r in caplog.records
+            )
+        finally:
+            for attempt in standin.attempts():
+                if attempt["argv"][0] == "linger":
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(attempt["pid"], signal.SIGKILL)
+
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_failure_message_omits_an_empty_ssh_log(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        run = ba.RunningCmd(standin.command("list"))
+        run.proc.wait(10)
+        cast(Path, run.ssh_log).write_text("")
+        run.wait(errok=True)
+        assert _errors(caplog) == [
+            (
+                f"Command {run.cmd_str} failed with exit code 2 and stderr:\n"
+                "repository error: boom"
+            )
+        ]
+
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_failure_message_notes_an_unreadable_ssh_log(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        run = ba.RunningCmd(standin.command("list"))
+        run.proc.wait(10)
+        cast(Path, run.ssh_log).unlink()
+        run.wait(errok=True)
+        [error] = _errors(caplog)
+        assert error.startswith(
+            f"Command {run.cmd_str} failed with exit code 2 and stderr:\n"
+            "repository error: boom\nssh log unreadable: "
+        )
+
+    @pytest.mark.usefixtures("mock_cfg")
+    def test_sudo_runs_the_command_through_sudo(self) -> None:
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba.subprocess, "Popen", autospec=True) as popen,
+        ):
+            popen.return_value.stdout = io.StringIO("")
+            popen.return_value.stderr = io.StringIO("")
+            ba.RunningCmd(["true"], sudo=True)
+        assert popen.call_args.args[0] == ["sudo", "-n", "-E", "true"]
+
+    def test_timeout_follows_the_kind_of_command(self, mock_cfg: Any) -> None:
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba.subprocess, "Popen", autospec=True) as popen,
+        ):
+            popen.return_value.stdout = io.StringIO("")
+            popen.return_value.stderr = io.StringIO("")
+            timeouts = {
+                name: ba.RunningCmd([name], sudo=True).timeout
+                for name in ("borg", "rsync", "mount")
+            }
+        assert timeouts == {
+            "borg": mock_cfg.BORG_CMD_TIMEOUT,
+            "rsync": mock_cfg.BORG_CMD_TIMEOUT,
+            "mount": mock_cfg.CMD_TIMEOUT,
+        }
+
+
+class TestForegroundMount:
+    """Starting a `borg mount -f`: debug logging, lock retry, and startup
+    failures -- against real processes."""
+
+    def test_mounts_at_debug_level_and_returns_once_up(
+        self, standin: _StandinBorg, tmp_path: Path, mock_cfg: Any
     ) -> None:
         standin.set_mode("serve")
         mount = standin.start(tmp_path / "scratch")
-        mount.sudo = True
-        try:
-            with (
-                patch.object(
-                    mount.proc,
-                    "terminate",
-                    autospec=True,
-                    side_effect=PermissionError("not permitted"),
-                ),
-                patch.object(
-                    ba,
-                    "run_cmd",
-                    autospec=True,
-                    return_value=subprocess.CompletedProcess(
-                        [], 1, "", "kill: Operation not permitted\n"
-                    ),
-                ),
-            ):
-                mount.stop(10, terminate=True)
-            assert mount.proc.poll() is None
-            assert caplog.records[-1].getMessage() == (
-                f"borg mount home-1of2 (pid {mount.proc.pid}) could not be "
-                "signalled: kill: Operation not permitted"
+        assert mount.poll() is None
+        assert standin.attempts()[0]["argv"][:5] == [
+            "mount",
+            "--lock-wait",
+            str(mock_cfg.LOCK_CHECK_TIMEOUT),
+            "--debug",
+            "-f",
+        ]
+        standin.touch("unmount")
+        assert mount.wait(10).returncode == 0
+
+    def test_start_passes_sudo_to_the_mount(self, mock_cfg: Any) -> None:
+        with (
+            patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
+            patch.object(ba, "RunningCmd", autospec=True) as running,
+            patch.object(
+                ba.os.path, "ismount", autospec=True, return_value=True
+            ),
+        ):
+            running.return_value.poll.return_value = None
+            mount = ba._start_foreground_mount(
+                "repo::home-1of2",
+                Path("/t/home-1of2"),
+                bypass_lock=False,
+                scratch=Path("/t/bypass/home-1of2"),
+                sudo=True,
             )
-        finally:
-            mount.proc.kill()
-            mount.proc.wait(10)
+        assert mount is running.return_value
+        running.assert_called_once_with(
+            [
+                "borg",
+                "mount",
+                "--lock-wait",
+                str(mock_cfg.LOCK_CHECK_TIMEOUT),
+                "--debug",
+                "-f",
+                "-o",
+                "allow_other",
+                "repo::home-1of2",
+                "/t/home-1of2",
+            ],
+            sudo=True,
+            env=None,
+        )
 
     def test_lock_timeout_retries_with_long_wait_quietly(
         self,
@@ -3012,7 +3147,7 @@ class TestForegroundMount:
         caplog.set_level(logging.DEBUG)
         standin.set_mode("lock")
         mount = standin.start(tmp_path / "scratch")
-        assert mount.is_up
+        assert mount.poll() is None
         waits = [a["argv"][:3] for a in standin.attempts()]
         assert waits == [
             ["mount", "--lock-wait", str(mock_cfg.LOCK_CHECK_TIMEOUT)],
@@ -3029,35 +3164,42 @@ class TestForegroundMount:
             for r in caplog.records
         )
         standin.touch("unmount")
-        mount.stop(10)
+        mount.wait(10)
 
-    def test_exit_before_mounting_raises_with_stderr(
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_exit_before_mounting_raises_with_stderr_and_ssh_log(
         self, standin: _StandinBorg, tmp_path: Path, caplog: Any
     ) -> None:
         standin.set_mode("fail")
         with pytest.raises(berr.SubprocessError) as excinfo:
             standin.start(tmp_path / "scratch")
         assert excinfo.value.returncode == 2
-        assert "repository error: boom" in excinfo.value.stderr
-        errors = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
-        ]
+        errors = _errors(caplog)
         assert len(errors) == 1
-        assert "failed with exit code 2" in errors[0]
-        assert not any(
-            r.getMessage().startswith("borg mount ") for r in caplog.records
+        assert errors[0].endswith(
+            f"failed with exit code 2 and stderr:\n"
+            f"repository error: boom\n{_ssh_log_tail()}"
         )
 
-    def test_startup_deadline_terminates_and_raises(
+    def test_clean_exit_before_mounting_raises(
+        self, standin: _StandinBorg, tmp_path: Path
+    ) -> None:
+        standin.set_mode("quit")
+        with pytest.raises(
+            berr.BorgadmError, match="home-1of2 exited without mounting"
+        ):
+            standin.start(tmp_path / "scratch")
+        assert len(standin.attempts()) == 1
+
+    def test_startup_deadline_stops_and_raises(
         self,
         standin: _StandinBorg,
         tmp_path: Path,
         mock_cfg: Any,
         caplog: Any,
     ) -> None:
-        """A mount that neither comes up nor exits is terminated once --
-        without the exit-on-its-own grace an unmounted mount gets -- and
-        the run fails."""
+        """A mount that neither comes up nor exits is stopped, reported,
+        and fails the run."""
         standin.set_mode("hang")
         with (
             patch.object(mock_cfg, "BORG_CMD_TIMEOUT", 1),
@@ -3067,32 +3209,7 @@ class TestForegroundMount:
         pid = standin.attempts()[0]["pid"]
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
-        assert not any(
-            "still running" in r.getMessage() for r in caplog.records
-        )
-
-    def test_stop_survives_a_mount_it_cannot_signal(
-        self, standin: _StandinBorg, tmp_path: Path, caplog: Any
-    ) -> None:
-        """stop() runs during cleanup, so a refused signal is reported
-        rather than raised over the run's own error."""
-        standin.set_mode("serve")
-        mount = standin.start(tmp_path / "scratch")
-        try:
-            with patch.object(
-                mount.proc,
-                "terminate",
-                autospec=True,
-                side_effect=PermissionError("not permitted"),
-            ):
-                mount.stop(0.2)
-            assert caplog.records[-1].getMessage() == (
-                f"borg mount home-1of2 (pid {mount.proc.pid}) could not be "
-                "signalled: not permitted"
-            )
-        finally:
-            mount.proc.kill()
-            mount.proc.wait(10)
+        assert f"failed with exit code {-signal.SIGTERM}" in _errors(caplog)[0]
 
     def test_bypass_mounts_with_scratch_cache_dirs(
         self, standin: _StandinBorg, tmp_path: Path
@@ -3104,12 +3221,121 @@ class TestForegroundMount:
         standin.set_mode("serve")
         mount = standin.start(scratch, bypass_lock=True)
         attempt = standin.attempts()[0]
-        assert attempt["argv"][:3] == ["mount", "--bypass-lock", "-f"]
+        assert attempt["argv"][:4] == [
+            "mount",
+            "--bypass-lock",
+            "--debug",
+            "-f",
+        ]
         assert "--lock-wait" not in attempt["argv"]
         assert attempt["cache"] == (scratch / "cache").as_posix()
         assert attempt["security"] == (scratch / "security").as_posix()
         standin.touch("unmount")
-        mount.stop(10)
+        mount.wait(10)
+
+
+class TestReapMounts:
+    """Reaping a run's mounts once they are unmounted."""
+
+    @pytest.mark.usefixtures("ssh_logs")
+    def test_reports_each_failed_mount_in_turn(
+        self,
+        standin: _StandinBorg,
+        tmp_path: Path,
+        mock_cfg: Any,
+        caplog: Any,
+    ) -> None:
+        """With `report`, each mount that failed gets one message -- what
+        borg wrote, then the end of its own ssh log -- before the next."""
+        other = _StandinBorg(tmp_path / "other", mock_cfg.LOCK_CHECK_TIMEOUT)
+        stand_ins = [standin, other]
+        mounts = []
+        for sb in stand_ins:
+            sb.set_mode("serve")
+            mounts.append(ba.RunningCmd(sb.command("mount")))
+            sb.wait_serving()
+        for sb in stand_ins:
+            sb.touch("die")
+        ba._reap_mounts(mounts, report=True)
+        assert _errors(caplog) == [
+            f"Command {m.cmd_str} failed with exit code 2 and stderr:\n"
+            f"starting\nTraceback: boom\n{_ssh_log_tail()}"
+            for m in mounts
+        ]
+
+    def test_quiet_without_report(
+        self, standin: _StandinBorg, caplog: Any
+    ) -> None:
+        standin.set_mode("fail")
+        mount = ba.RunningCmd(standin.command("mount"))
+        ba._reap_mounts([mount], report=False)
+        assert mount.poll() == 2
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_stops_a_mount_that_outlives_the_wait(
+        self, standin: _StandinBorg, mock_cfg: Any, caplog: Any
+    ) -> None:
+        standin.set_mode("serve")
+        mount = ba.RunningCmd(standin.command("mount"))
+        with patch.object(mock_cfg, "CMD_TIMEOUT", 1):
+            ba._reap_mounts([mount], report=True)
+        assert mount.poll() == -signal.SIGTERM
+        assert "(timed out after 1s)" in _errors(caplog)[0]
+
+    def test_survives_a_mount_it_cannot_stop(
+        self,
+        standin: _StandinBorg,
+        tmp_path: Path,
+        mock_cfg: Any,
+        caplog: Any,
+    ) -> None:
+        """Reaping runs during cleanup, so a mount that cannot be stopped
+        is reported, and the mounts after it are still reaped."""
+        other = _StandinBorg(tmp_path / "other", mock_cfg.LOCK_CHECK_TIMEOUT)
+        standin.set_mode("serve")
+        other.set_mode("fail")
+        stuck = ba.RunningCmd(standin.command("mount"))
+        done = ba.RunningCmd(other.command("mount"))
+        try:
+            with (
+                patch.object(mock_cfg, "CMD_TIMEOUT", 1),
+                patch.object(stuck.proc, "send_signal", autospec=True),
+            ):
+                ba._reap_mounts([stuck, done], report=False)
+            assert stuck.poll() is None
+            assert done.poll() == 2
+            warnings = [
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == logging.WARNING
+            ]
+            assert warnings == [
+                f"Could not stop {stuck.cmd_str} (pid {stuck.proc.pid})"
+            ]
+        finally:
+            stuck.proc.kill()
+            stuck.proc.wait(10)
+
+
+class TestCheckSudo:
+    """check_sudo runs a no-op through borgadm's own sudo invocation."""
+
+    @pytest.mark.parametrize(("rc", "usable"), [(0, True), (1, False)])
+    def test_reports_whether_sudo_ran(self, rc: int, usable: bool) -> None:
+        result = subprocess.CompletedProcess(["sudo"], rc, "", "")
+        with patch.object(
+            ba, "run_cmd", autospec=True, return_value=result
+        ) as mock_run:
+            assert ba.check_sudo() is usable
+        mock_run.assert_called_once_with(
+            ["true"], sudo=True, errok=True, log_error=False
+        )
+
+    def test_sudo_not_installed(self) -> None:
+        with patch.object(
+            ba, "run_cmd", autospec=True, side_effect=FileNotFoundError("sudo")
+        ):
+            assert ba.check_sudo() is False
 
 
 class TestRsyncMountCleanup:
@@ -3126,16 +3352,21 @@ class TestRsyncMountCleanup:
         "tmpfs on /run type tmpfs (rw)\n"
     )
 
+    def _mount_table(
+        self, cmd: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """`run_cmd` as `mount` answers it, for _MOUNT_OUTPUT's table."""
+        out = self._MOUNT_OUTPUT if cmd == ["mount"] else ""
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
     def test_mounts_under_filters_to_subtree(self) -> None:
         """Only mounts at or under the run dir are returned; unrelated
         system mounts are ignored."""
         with patch.object(
-            ba.subprocess,
-            "check_output",
-            autospec=True,
-            return_value=self._MOUNT_OUTPUT,
-        ):
+            ba, "run_cmd", autospec=True, side_effect=self._mount_table
+        ) as mock_run:
             found = ba._mounts_under(Path("/t/.borgadm_borg-rsync.tmp.aaa"))
+        mock_run.assert_called_once_with(["mount"], errok=True, log_error=False)
         assert [(p.as_posix(), fs) for p, fs in found] == [
             ("/t/.borgadm_borg-rsync.tmp.aaa/home-fuse-1of2", "fuse"),
             ("/t/.borgadm_borg-rsync.tmp.aaa/home-local-2of2", "fuse"),
@@ -3143,40 +3374,40 @@ class TestRsyncMountCleanup:
         ]
 
     @pytest.mark.parametrize(
-        "err",
+        "outcome",
         [
             FileNotFoundError("mount"),
-            subprocess.CalledProcessError(1, ["mount"]),
+            subprocess.CompletedProcess(["mount"], 1, "partial on /t", ""),
         ],
+        ids=["absent", "failed"],
     )
     def test_mounts_under_empty_when_mount_unusable(
-        self, err: Exception
+        self, outcome: Exception | subprocess.CompletedProcess[str]
     ) -> None:
         """An unusable `mount` binary yields no mounts instead of an
         exception -- the helper runs as part of cleanup, where raising
         would mask the run's real error."""
-        with patch.object(
-            ba.subprocess, "check_output", autospec=True, side_effect=err
-        ):
-            assert ba._mounts_under(Path("/t/.borgadm_x.tmp.aaa")) == []
+        with patch.object(ba, "run_cmd", autospec=True) as mock_run:
+            if isinstance(outcome, Exception):
+                mock_run.side_effect = outcome
+            else:
+                mock_run.return_value = outcome
+            assert ba._mounts_under(Path("/t")) == []
 
     def test_umount_tree_unmounts_overlay_first(self) -> None:
         """The overlay 'merged' mount must be torn down before the fuse
         mounts it stacks on."""
-        with (
-            patch.object(
-                ba.subprocess,
-                "check_output",
-                autospec=True,
-                return_value=self._MOUNT_OUTPUT,
-            ),
-            patch.object(ba, "run_cmd", autospec=True) as mock_run,
-        ):
+        with patch.object(
+            ba, "run_cmd", autospec=True, side_effect=self._mount_table
+        ) as mock_run:
             ba._umount_tree(Path("/t/.borgadm_borg-rsync.tmp.aaa"))
-        umounted = [c.args[0][2] for c in mock_run.call_args_list]
+        umounts = [
+            c for c in mock_run.call_args_list if c.args[0][0] != "mount"
+        ]
+        umounted = [c.args[0][2] for c in umounts]
         assert len(umounted) == 3
         assert umounted[0].endswith("/merged")
-        for c in mock_run.call_args_list:
+        for c in umounts:
             assert c.args[0][:2] == ["umount", "-f"]
             assert c.kwargs == {"sudo": True, "errok": True}
 
@@ -3243,7 +3474,6 @@ class TestRsyncMountCleanup:
                 autospec=True,
                 side_effect=_fake_foreground_mount,
             ),
-            patch.object(ba, "_report_dead_mounts", autospec=True),
             patch.object(ba, "_reap_mounts", autospec=True),
             patch.object(
                 ba, "_mounts_under", autospec=True, side_effect=fake_mounts
@@ -3298,7 +3528,6 @@ class TestRsyncMountCleanup:
                 autospec=True,
                 side_effect=_fake_foreground_mount,
             ) as mock_mount,
-            patch.object(ba, "_report_dead_mounts", autospec=True),
             patch.object(ba, "_reap_mounts", autospec=True),
             patch.object(ba, "_mounts_under", autospec=True, return_value=[]),
             patch.object(ba, "run_cmd", autospec=True),
@@ -3369,28 +3598,33 @@ class TestRsyncMountCleanup:
         assert not any(c.args[0][0] == "rsync" for c in mock_run.call_args_list)
 
     @pytest.mark.parametrize(
-        "rsync_raises",
+        ("rsync_raises", "report"),
         [
-            None,
-            berr.SubprocessError(23, ["rsync"], output="", stderr="boom"),
-            KeyboardInterrupt(),
+            (None, False),
+            (
+                berr.SubprocessError(23, ["rsync"], output="", stderr="boom"),
+                True,
+            ),
+            (KeyboardInterrupt(), False),
         ],
         ids=["rsync-ok", "rsync-fails", "interrupted"],
     )
-    def test_do_rsync_reports_dead_mounts_then_unmounts_then_reaps(
-        self, tmp_path: Path, rsync_raises: BaseException | None
+    def test_do_rsync_unmounts_then_reaps_reporting_on_rsync_failure(
+        self,
+        tmp_path: Path,
+        rsync_raises: BaseException | None,
+        report: bool,
     ) -> None:
         """Each archive is mounted as root with its own bypass scratch
-        dir; cleanup -- whether or not rsync succeeded -- checks for mounts
-        whose borg process already died while they are still mounted,
-        then unmounts, then reaps the processes. A terminal interrupt
-        reaches the mounts too, so then only the mounts already dead when
-        it arrived are reported."""
+        dir, and the overlay stacks the mounts in archive order. Cleanup
+        -- whether or not rsync succeeded -- unmounts, then reaps the
+        mounts, reporting those that failed only when rsync did."""
         target = tmp_path / "borg-rsync"
         target.mkdir()
         archives = ["repo::home-fuse-1of2", "repo::home-local-2of2"]
         order: list[str] = []
         created: list[Any] = []
+        ran: list[list[str]] = []
 
         def fake_mount(archive_ref: str, mount_dir: Path, **kwargs: Any) -> Any:
             mount = _fake_foreground_mount(archive_ref, mount_dir, **kwargs)
@@ -3398,9 +3632,8 @@ class TestRsyncMountCleanup:
             return mount
 
         def fake_run(cmd: list[str], **_kwargs: Any) -> None:
+            ran.append(cmd)
             if cmd[0] == "rsync" and rsync_raises is not None:
-                # The first mount died mid-run, before any interrupt.
-                created[0].proc.poll.return_value = 2
                 raise rsync_raises
 
         with (
@@ -3421,12 +3654,6 @@ class TestRsyncMountCleanup:
             ) as mock_mount,
             patch.object(
                 ba,
-                "_report_dead_mounts",
-                autospec=True,
-                side_effect=lambda _m: order.append("report"),
-            ) as mock_report,
-            patch.object(
-                ba,
                 "_umount_tree",
                 autospec=True,
                 side_effect=lambda _r: order.append("umount"),
@@ -3435,7 +3662,7 @@ class TestRsyncMountCleanup:
                 ba,
                 "_reap_mounts",
                 autospec=True,
-                side_effect=lambda _m: order.append("reap"),
+                side_effect=lambda _m, **_kw: order.append("reap"),
             ) as mock_reap,
             patch.object(ba, "run_cmd", autospec=True, side_effect=fake_run),
             pytest.raises(type(rsync_raises))
@@ -3450,18 +3677,16 @@ class TestRsyncMountCleanup:
                 bypass_lock=False,
                 archive=None,
             )
-        assert order == ["report", "umount", "reap"]
-        mounts = mock_reap.call_args.args[0]
-        assert mounts == created
-        reported = mock_report.call_args.args[0]
-        if isinstance(rsync_raises, KeyboardInterrupt):
-            assert reported == [created[0]]
-        else:
-            assert reported is mounts
-        assert [m.mount_dir.name for m in mounts] == [
+        assert order == ["umount", "reap"]
+        assert mock_reap.call_args.args[0] == created
+        assert mock_reap.call_args.kwargs == {"report": report}
+        mount_dirs = [c.args[1] for c in mock_mount.call_args_list]
+        assert [d.name for d in mount_dirs] == [
             "home-fuse-1of2",
             "home-local-2of2",
         ]
+        overlay = next(c for c in ran if c[:3] == ["mount", "-t", "overlay"])
+        assert f"lowerdir={mount_dirs[0]}:{mount_dirs[1]}," in overlay[5]
         for c in mock_mount.call_args_list:
             mount_dir = c.args[1]
             assert c.kwargs == {
@@ -5049,14 +5274,17 @@ class TestCreateRoot:
         (source / "foo").write_text("backup content")
         mock_cfg.BACKUP_MOUNTS = [mount]
         monkeypatch.chdir(tmp_path)
+        mount_table = f"device on {source / 'mounted'} type ext4 (rw)\n"
         with (
             patch.object(ba, "borg_cmd", autospec=True, return_value=["borg"]),
             patch.object(ba, "run_borg", autospec=True) as run,
             patch.object(
-                ba.subprocess,
-                "check_output",
+                ba,
+                "run_cmd",
                 autospec=True,
-                return_value=f"device on {source / 'mounted'} type ext4 (rw)\n",
+                return_value=subprocess.CompletedProcess(
+                    ["mount"], 0, mount_table, ""
+                ),
             ),
         ):
             ba.do_create(False, False, True, root=root, keep=None)
@@ -5666,9 +5894,9 @@ class TestArchiveListing:
             autospec=True,
             side_effect=[
                 subprocess.CompletedProcess([], 0, old),
-                subprocess.CompletedProcess(
-                    cmd, 2 if failed else 0, "", "failure"
-                ),
+                berr.SubprocessError(2, cmd, output="", stderr="failure")
+                if failed
+                else subprocess.CompletedProcess(cmd, 0, "", ""),
                 subprocess.CompletedProcess([], 0, new),
             ],
         ) as run:
